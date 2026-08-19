@@ -5059,9 +5059,10 @@ mod tests {
         // Tiny MTU exercises the same Link/fragment path used by a constrained
         // adapter; all sync bytes remain encrypted session records.
         let (left, right) = MemoryLink::pair(128);
+        let now = Instant::now();
         for _ in 0..160 {
-            initiator.pump(&left).unwrap();
-            responder.pump(&right).unwrap();
+            initiator.pump_at(&left, now).unwrap();
+            responder.pump_at(&right, now).unwrap();
             if !initiator.backend().ingested.is_empty()
                 && responder
                     .backend()
