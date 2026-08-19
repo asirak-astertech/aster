@@ -45,6 +45,9 @@ jobs:
           version: 2026.4.28
           cache: false
 
+      - name: Install Rust quality components
+        run: rustup component add --toolchain 1.97.1 rustfmt clippy
+
       - name: Acquire Rust dependencies
         run: cargo fetch --locked
 

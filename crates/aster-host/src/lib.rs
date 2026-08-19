@@ -1587,14 +1587,14 @@ mod tests {
 
             let now = Instant::now();
             if now >= deadline {
-                return;
+                panic!("pair did not reach the expected state within {timeout:?}");
             }
             let Some(wakeup) = [left.next_wakeup(), right.next_wakeup()]
                 .into_iter()
                 .flatten()
                 .min()
             else {
-                return;
+                panic!("pair became quiescent before reaching the expected state");
             };
             std::thread::sleep(
                 wakeup
@@ -2053,7 +2053,7 @@ mod tests {
         right.configure_peer_carrier(left_id, right_link).unwrap();
         left.begin_sync(right_id).unwrap();
         right.begin_sync(left_id).unwrap();
-        drive_pair_until(&mut left, &mut right, Duration::from_secs(5), |right| {
+        drive_pair_until(&mut left, &mut right, Duration::from_secs(30), |right| {
             right.open_blob_reader(&scope, &topic, first.id()).is_ok()
                 && right.open_blob_reader(&scope, &topic, second.id()).is_ok()
         });
