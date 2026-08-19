@@ -1,0 +1,193 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  quality:
+    name: quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+
+      - name: Install repository toolchain
+        uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
+        with:
+          version: 2026.4.28
+          cache: false
+
+      - name: Acquire Rust dependencies
+        run: cargo fetch --locked
+
+      - name: Run formatting, lint, tests, bindings, and conformance
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: mise run check
+
+  macos-tests:
+    name: macOS tests
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+
+      - name: Install Rust 1.97.1
+        run: rustup toolchain install 1.97.1 --profile minimal
+
+      - name: Acquire Rust dependencies
+        run: cargo +1.97.1 fetch --locked
+
+      - name: Run workspace tests offline
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: cargo +1.97.1 test --locked --workspace --all-features
+
+  msrv:
+    name: Rust 1.90 MSRV
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+
+      - name: Install Rust 1.90.0
+        run: rustup toolchain install 1.90.0 --profile minimal
+
+      - name: Acquire Rust dependencies
+        run: cargo +1.90.0 fetch --locked
+
+      - name: Check all targets and features offline
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: cargo +1.90.0 check --locked --workspace --all-targets --all-features
+
+  dependency-policy:
+    name: dependency policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+
+      - name: Install Rust 1.97.1
+        run: rustup toolchain install 1.97.1 --profile minimal
+
+      - name: Install pinned policy tools
+        run: |
+          cargo +1.97.1 install --locked cargo-deny --version 0.20.2
+          cargo +1.97.1 install --locked cargo-audit --version 0.22.2
+
+      - name: Acquire dependency and advisory data
+        run: |
+          cargo +1.97.1 fetch --locked
+          cargo +1.97.1 fetch --locked --manifest-path fuzz/Cargo.toml
+          cargo +1.97.1 deny fetch all
+          cargo +1.97.1 audit --file Cargo.lock
+
+      - name: Enforce dependency policy offline
+        run: |
+          cargo +1.97.1 deny --locked --offline check
+          cargo +1.97.1 deny --manifest-path fuzz/Cargo.toml --config deny.toml --locked --offline check
+
+      - name: Audit the fuzz lockfile with the refreshed database
+        run: cargo +1.97.1 audit --no-fetch --file fuzz/Cargo.lock
+
+  fuzz-smoke:
+    name: bounded fuzz smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+
+      - name: Install pinned fuzz toolchain
+        run: |
+          rustup toolchain install nightly-2026-08-18 --profile minimal
+          cargo +nightly-2026-08-18 install --locked cargo-fuzz --version 0.13.2
+
+      - name: Acquire fuzz dependencies
+        run: cargo +nightly-2026-08-18 fetch --locked --manifest-path fuzz/Cargo.toml
+
+      - name: Run bounded fuzz campaigns offline
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: sh ./tools/run-fuzz-smoke.sh
+
+  required:
+    name: required
+    if: ${{ always() }}
+    needs:
+      - quality
+      - macos-tests
+      - msrv
+      - dependency-policy
+      - fuzz-smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every validation lane
+        env:
+          QUALITY_RESULT: ${{ needs.quality.result }}
+          MACOS_RESULT: ${{ needs.macos-tests.result }}
+          MSRV_RESULT: ${{ needs.msrv.result }}
+          POLICY_RESULT: ${{ needs.dependency-policy.result }}
+          FUZZ_RESULT: ${{ needs.fuzz-smoke.result }}
+        run: |
+          for result in \
+            "$QUALITY_RESULT" \
+            "$MACOS_RESULT" \
+            "$MSRV_RESULT" \
+            "$POLICY_RESULT" \
+            "$FUZZ_RESULT"
+          do
+            if [[ "$result" != "success" ]]; then
+              printf 'A required CI lane ended with status: %s\n' "$result" >&2
+              exit 1
+            fi
+          done
