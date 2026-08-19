@@ -1,0 +1,36 @@
+[package]
+name = "aster-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+aster-core = { path = "../crates/aster-core", features = ["adapter-sdk"] }
+libfuzzer-sys = "=0.4.13"
+
+[[bin]]
+name = "wire_decode"
+path = "fuzz_targets/wire_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fragment_decode"
+path = "fuzz_targets/fragment_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "envelope_inspect"
+path = "fuzz_targets/envelope_inspect.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
