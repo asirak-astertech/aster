@@ -92,3 +92,7 @@ traffic-analysis signals. See `docs/security.md`, `docs/protocol.md`, and
 
 See `CONTRIBUTING.md` for contribution requirements and `docs/ci.md` for the
 automated validation lanes and local equivalents.
+
+## License
+
+Licensed under the Apache License, Version 2.0. See `LICENSE`.

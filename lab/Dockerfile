@@ -24,4 +24,5 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /work/target/release/aster-lab /usr/local/bin/aster-lab
 COPY --from=build /work/target/release/aster-relay /usr/local/bin/aster-relay
+COPY LICENSE /usr/share/licenses/aster/LICENSE
 ENTRYPOINT ["/usr/local/bin/aster-lab"]
