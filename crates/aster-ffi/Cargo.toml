@@ -1,0 +1,23 @@
+[package]
+name = "aster-ffi"
+description = "C ABI for the Aster Mesh reference framework"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+aster-core = { version = "=0.1.0", path = "../aster-core", features = ["adapter-sdk"] }
+
+[lints.rust]
+# FFI pointer validation necessarily uses narrowly scoped unsafe blocks. The
+# safe Rust core continues to forbid unsafe code.
+unsafe_code = "allow"
+missing_docs = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

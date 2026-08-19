@@ -1,0 +1,13 @@
+[package]
+name = "aster-ble"
+description = "BTLE link adapter for the Aster Mesh Protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+aster-core = { version = "=0.1.0", path = "../aster-core", features = ["adapter-sdk"] }
+
+[lints]
+workspace = true
