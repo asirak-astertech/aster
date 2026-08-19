@@ -1,0 +1,17 @@
+[package]
+name = "aster-lab"
+description = "Deterministic fault-injection and scale laboratory for Aster Mesh"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+aster-core = { version = "=0.1.0", path = "../aster-core", features = ["adapter-sdk"] }
+aster-host = { version = "=0.1.0", path = "../aster-host" }
+aster-ip = { version = "=0.1.0", path = "../aster-ip" }
+getrandom.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true

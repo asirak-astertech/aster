@@ -1,0 +1,36 @@
+[package]
+name = "aster-core"
+description = "Transport-neutral reference core for the Aster Mesh Protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "aster_mesh"
+
+[features]
+default = []
+# Protocol internals used by separately versioned transport adapters,
+# conformance tooling, and the native boundary. Application code should use
+# the default high-level surface.
+adapter-sdk = []
+
+[dependencies]
+aes-gcm.workspace = true
+getrandom.workspace = true
+hkdf.workspace = true
+ml-dsa.workspace = true
+ml-kem.workspace = true
+minicbor.workspace = true
+p256.workspace = true
+rand_core.workspace = true
+rusqlite.workspace = true
+sha2.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

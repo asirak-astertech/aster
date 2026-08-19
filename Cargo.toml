@@ -1,0 +1,52 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/aster-core",
+  "crates/aster-host",
+  "crates/aster-ip",
+  "crates/aster-ble",
+  "crates/aster-ffi",
+  "crates/aster-conformance",
+  "crates/aster-lab",
+]
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+aes-gcm = { version = "=0.11.0", default-features = false, features = ["aes", "alloc", "zeroize"] }
+getrandom = { version = "=0.4.3", default-features = false, features = ["sys_rng"] }
+hkdf = "=0.13.0"
+ml-dsa = { version = "=0.1.1", default-features = false, features = ["alloc", "rand_core", "zeroize"] }
+ml-kem = { version = "=0.3.2", default-features = false, features = ["alloc", "hazmat", "zeroize"] }
+minicbor = { version = "=2.3.0", default-features = false }
+p256 = { version = "=0.14.0", default-features = false, features = ["arithmetic", "ecdh", "ecdsa", "std"] }
+proptest = { version = "=1.11.0", default-features = false, features = ["std"] }
+rand_core = "=0.10.1"
+rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled"] }
+sha2 = { version = "=0.11.0", features = ["zeroize"] }
+tokio = { version = "=1.51.4", default-features = false, features = ["io-util", "net", "rt-multi-thread", "sync", "time"] }
+zeroize = { version = "=1.9.0", features = ["derive", "std"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "allow"
+
+[workspace.lints.clippy]
+all = "warn"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = "z"
+# C ABI entry points contain every unwind before it reaches a foreign caller.
+# `abort` would bypass that containment and terminate an embedding host process.
+panic = "unwind"
+strip = "symbols"
+
+[profile.bench]
+debug = true

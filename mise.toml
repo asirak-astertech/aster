@@ -1,0 +1,27 @@
+[tools]
+rust = "1.97.1"
+go = "1.26.5"
+python = "3.13.7"
+
+[env]
+RUST_BACKTRACE = "1"
+PYTHONDONTWRITEBYTECODE = "1"
+
+[tasks.check]
+description = "Run format, lint, unit, binding, and conformance checks"
+run = [
+  "cargo fmt --all -- --check",
+  "cargo clippy --locked --workspace --all-targets --all-features -- -D warnings",
+  "cargo test --locked --workspace --all-features",
+  "cargo build --locked -p aster-ffi",
+  "cc -std=c11 -Wall -Wextra -Werror -pedantic -Ibindings/c -fsyntax-only bindings/c/header_smoke.c",
+  "c++ -std=c++17 -Wall -Wextra -Werror -pedantic -Ibindings/c -fsyntax-only bindings/c/header_smoke.cpp",
+  "cargo run --locked -p aster-conformance -- --self-test",
+  "python3 conformance/python_wire_oracle.py conformance/vectors/wire-v1.tsv",
+  "python3 -m unittest discover -s bindings/python/tests",
+  "GOCACHE=/tmp/aster-mesh-go-cache go -C bindings/go test -tags aster_workspace ./...",
+]
+
+[tasks.fuzz-smoke]
+description = "Run bounded sanitizer-instrumented decoder fuzz campaigns"
+run = "sh ./tools/run-fuzz-smoke.sh"
