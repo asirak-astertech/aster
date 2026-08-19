@@ -11,6 +11,7 @@ PYTHONDONTWRITEBYTECODE = "1"
 description = "Run format, lint, unit, binding, and conformance checks"
 run = [
   "cargo fmt --all -- --check",
+  "python3 tools/check-project-license.py",
   "cargo clippy --locked --workspace --all-targets --all-features -- -D warnings",
   "cargo test --locked --workspace --all-features",
   "cargo build --locked -p aster-ffi",

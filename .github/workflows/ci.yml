@@ -49,7 +49,9 @@ jobs:
         run: rustup component add --toolchain 1.97.1 rustfmt clippy
 
       - name: Acquire Rust dependencies
-        run: cargo fetch --locked
+        run: |
+          cargo fetch --locked
+          cargo fetch --locked --manifest-path fuzz/Cargo.toml
 
       - name: Run formatting, lint, tests, bindings, and conformance
         env:
