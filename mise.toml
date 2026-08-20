@@ -20,6 +20,8 @@ run = [
   "cargo run --locked -p aster-conformance -- --self-test",
   "python3 conformance/python_wire_oracle.py conformance/vectors/wire-v1.tsv",
   "python3 -m unittest discover -s bindings/python/tests",
+  "python3 -m unittest discover -s lab/tests",
+  "test -z \"$(gofmt -l bindings/go)\"",
   "GOCACHE=/tmp/aster-mesh-go-cache go -C bindings/go test -tags aster_workspace ./...",
 ]
 

@@ -9,7 +9,7 @@ single stable check name **`CI / required`**.
 
 | Check | Runner | Purpose |
 | --- | --- | --- |
-| `quality` | `ubuntu-24.04` | Runs `mise run check`: formatting, Apache-2.0-only project-license and package checks, Clippy with warnings denied, the full Rust workspace test suite, C ABI build and C/C++ header checks, Rust/Python conformance, and Python/Go binding tests. |
+| `quality` | `ubuntu-24.04` | Runs `mise run check`: Rust and Go formatting, Apache-2.0-only project-license and package checks, Clippy with warnings denied, the full Rust workspace test suite, C ABI build and C/C++ header checks, Rust/Python conformance, Python/Go binding tests, and the lab-controller tests. |
 | `macOS tests` | `macos-14` | Runs all Rust workspace tests on the supported Apple runner with Rust 1.97.1. |
 | `Rust 1.90 MSRV` | `ubuntu-24.04` | Checks every workspace target and feature with the declared minimum supported Rust version. |
 | `dependency policy` | `ubuntu-24.04` | Applies `deny.toml` to the root and fuzz dependency graphs and audits both lockfiles against a freshly downloaded RustSec database. |

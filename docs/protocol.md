@@ -3,7 +3,7 @@
 - Specification version: 0.1.0-draft.2
 - Wire major/minor: 1.0
 - Status: reference draft; not production-authorized
-- Date: 2026-08-18
+- Date: 2026-08-19
 
 The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** are
 normative. The protocol specification, not the Rust representation, is the
@@ -393,11 +393,44 @@ remain separate gates.
 
 ## 7. Causality
 
-A version vector records the greatest accepted counter for each publisher.
-Publishing captures the current vector before advancing the publisher's durable
-counter. The reference profile does not encode sparse exceptions or parent IDs;
-the permanent dot ledger detects counter reuse/equivocation while stored heads
-retain exact conflict versions.
+A version vector records the greatest represented counter for each publisher.
+Schema 12 does not maintain one transitive node-global publication clock. It
+maintains a direct-observation frontier for each exact `(topic, origin scope)`
+domain. Publishing captures that domain's frontier before advancing the
+publisher's node-global durable counter. Accepting an ordinary item or an
+authenticated bridged source advances only that item's own dot in its origin
+domain; the received item's asserted predecessor vector is not joined into the
+frontier. This rule prevents an authenticated publisher from manufacturing
+local evidence merely by signing arbitrary predecessor claims, but it is not a
+complete transitive causality construction.
+
+Each effective domain is the pointwise maximum of its exact rows and the
+reserved legacy sentinel rows with `topic = ''` and `scope = ''`. Empty topic
+and scope names are invalid protocol values, so the sentinel is SQLite-only and
+cannot collide with an admitted item. Migration from schema 11 copies the old
+node-global frontier verbatim into this sentinel and fails closed if it already
+exceeds 4,096 publishers. Sentinel rows are never advanced by normal schema-12
+acceptance. The exact-plus-sentinel union for any one domain is capped at 4,096
+distinct publishers; adding a new publisher to a saturated domain rejects the
+whole transaction. The number of domains and aggregate frontier rows are not
+currently bounded.
+
+The accepted-dot equivocation ledger remains node-global. The accepted Event
+sequence ledger is keyed by publisher, topic, scope, and sequence. Both survive
+normal item garbage collection, are not charged to item quota, and have no
+implemented pruning or aggregate bound. The reference profile does not encode
+sparse exceptions or parent IDs; these permanent ledgers detect reuse while
+stored heads retain exact conflict versions.
+
+This direct-dot design has a known transitivity limit. If A publishes `A1`, B
+accepts `A1` and publishes `B1`, then C accepts `B1` without `A1`, C's next
+publication records B's dot but not A's dot. Later receipt of `A1` can therefore
+appear concurrent with C's publication even though B's signed context named
+`A1`. Authentication proves who made a context claim, not that the claim is a
+truthful or complete observation. Per-key or per-Event-stream frontiers,
+transitive propagation with safe trust rules, aggregate-ledger bounds, and a
+safe retirement/checkpoint protocol remain release gates; causality is Partial,
+not production-accepted.
 
 For complete clocks `A` and `B`:
 
@@ -477,7 +510,8 @@ Empty manifests are canonical local objects, but envelope format 2 requires a
 nonzero route chunk count, so a zero-byte Blob is not publishable in this network
 profile. A manifest has at most 14,543 chunks and 1 MiB of bytes.
 The composite per-contact inventory is capped at 100,000 ObjectIDs with source
-envelopes inserted before Blob carriers. Content-authorized nodes retain both a
+envelopes inserted before Blob carriers. A source-envelope selection that alone
+exceeds the cap is rejected rather than silently truncated. Content-authorized nodes retain both a
 quota-accounted carrier and canonical encrypted chunk; route-only relays retain
 the carrier only. Since a transfer digest is not invertible to its route/index,
 local enumeration may reconstruct candidate objects from the authenticated route
@@ -508,12 +542,41 @@ The message flow is:
 1. `INTEREST`: authorized joined scopes and consume/carry filters.
 2. `SUMMARY`: immutable snapshot generation, root, and count.
 3. `PROBE` / `NODE`: descend only unequal radix branches.
-4. `OFFER`: exact differing typed object identifiers.
+4. `OFFER`: for a bounded root fast path, the exact complete selected root
+   inventory of typed object identifiers—not merely the differing identifiers.
 5. `WANT`: objects or block ranges accepted under quota/policy.
 6. `DATA`: one stable object byte range. Source-envelope DATA may separately
    carry its per-hop custody wrapper; Blob-chunk DATA MUST carry an empty
    forwarding field.
 7. `RECEIPT`: durably stored ranges for the typed object.
+
+One INTEREST admits at most 256 canonical topic selectors, 256 canonical scope
+selectors, and 4,096 topic-by-scope combinations. Both locally constructed and
+peer-supplied messages are checked with overflow-safe arithmetic before an
+inventory backend is consulted. Exceeding any bound fails the containing
+exchange; authorization filtering is not relied upon to bound database work.
+When the complete selected root inventory fits both the requesting peer's
+`max_offers` and the responder's local OFFER cap, a root PROBE receives that
+canonical sorted unique list in one OFFER. The requester accepts it only after
+the list count and recomputed sparse-inventory root exactly match the retained
+SUMMARY. A validated OFFER retires the matching tree traversal; exact delayed
+authenticated copies are bounded idempotent no-ops, while truncated, changed,
+unsolicited, or uncommitted lists fail closed. If either limit is exceeded, the
+responder sends the root NODE and uses ordinary exact Merkle descent.
+An unanswered root commitment may survive a local inventory refresh only as
+bounded metadata. It becomes active again only when a fresh authorized receive
+baseline causes the requester to reissue that exact root PROBE; retained
+unvalidated history by itself never authorizes an OFFER or creates durable work.
+For an admitted INTEREST, the reference passes the complete selector sets to one
+metadata-only inventory query rather than issuing one query for every
+topic-by-scope pair. SQLite applies a 100,001-row `LIMIT`, retains at most the
+first 100,000 metadata rows, and rejects the selection if the extra row exists;
+it never collects the remainder. The generic node facade independently rejects
+an over-limit vector returned by a non-SQLite `RecordStore`, so a bare node does
+not silently accept a backend that violates the contract. SQLite returns
+envelope identifiers, sealed lengths, and the bounded forwarding fields needed
+for policy; the sealed BLOB, publisher, causal context, logical key, and
+application payload metadata do not cross into the Rust inventory projection.
 
 The canonical first WANT for a Blob carrier has unknown total length, no missing
 ranges, and `need_forwarding = false`. After the first DATA establishes total
@@ -527,10 +590,15 @@ state are cleared, and the peer-neutral request returns to the canonical
 unknown-total/empty-range WANT. No inventory entry or successful receipt is
 created. Transient Store, I/O, and missing-chunk failures preserve progress.
 
-Equal roots end a partition without an inventory scan. A future optimization
-such as an IBLT or Bloom filter MAY be negotiated, but every ambiguity or
-overflow must fall back to the exact tree; no such optimization negotiation is
-implemented in profile 1.
+Equal roots end wire tree descent for a partition, but they do not eliminate the
+local inventory snapshot. Each endpoint first performs policy-filtered metadata
+selection and builds and hashes its sparse tree; that selection is capped at
+100,000 objects as described above. Local snapshot work is therefore bounded
+but proportional to selected inventory size, not to the set difference. After
+roots differ, `PROBE` / `NODE` descent confines wire comparison to unequal tree
+branches. A future optimization such as an IBLT or Bloom filter MAY be
+negotiated, but every ambiguity or overflow must fall back to the exact tree; no
+such optimization negotiation is implemented in profile 1.
 
 Every exchange names immutable roots. Verified objects commit immediately.
 Outstanding wants are stored by ObjectID/range, not by peer or session. Losing a
@@ -645,6 +713,14 @@ install only a narrower local topic/priority filter. Storage quota and source-
 signed TTL/custody rules apply independently and cannot be widened by that local
 filter.
 
+ObjectKind `4` authorization format `2` carries an `ASTRBCA2` delegated-control
+authentication bundle: a root-signed ControlAuthority credential and that
+identity's hybrid signature over the complete authorization policy and exact
+credential wrapper. The provider returns the authenticated signer NodeID, which
+is persisted with the authorization. The former format `1` and bare root-signed
+control shape are not accepted. Exact fields and signature input are in
+[envelope.md](envelope.md) §6.2.
+
 The semantic-version-2 bridge path decrypts protected route metadata, evaluates
 an authority-issued exact directed-edge policy plus a local narrowing filter,
 and creates a destination routing wrapper around the byte-identical format-2
@@ -663,7 +739,13 @@ receipts, outboxes, and custody remain representation specific.
 The reference implements every dependency arrival order, crash-durable pending
 state, restart reauthentication, receipt-aware inventory/serving, deterministic
 active-path selection with verified fallback, monotonic custody, dynamic
-filter/revocation/epoch checks, and quota/reference-counted lifecycle. The
+filter/revocation/epoch checks, and quota/reference-counted lifecycle. A bridge
+authorization is live only while its exact bytes have been reauthenticated in
+the current process, it is the applied enabled generation high-water, and its
+authority root, delegated control signer, and bridge identity are all
+unrevoked. The independently contiguous bridge-control chain remains keyed by
+stable `authority_id` across signer handoff; a revoked-signer pending suffix is
+rejected and must be reissued from the last applied head. The
 high-level Rust/C/Go/Python administration surface uses move-only enrollment and
 opaque durable 32-byte authorization/route handles; it does not expose sealed
 objects or keys. Cross-implementation, scale, physical-carrier, and independent
@@ -732,10 +814,39 @@ export keys, and general handshake extensions also remain separate release work.
 
 ## 14. Revocation, rekey, and zeroization
 
-Authority control records are dual-signed, FLASH-priority, non-evictable items
-containing mission, monotonic control sequence, previous-state hash, revoked
-credentials, and key epoch transitions. Lower sequences or a fork from an
-accepted state are security failures.
+Authority control records are FLASH-priority, non-evictable items containing
+mission, monotonic control sequence, previous-state hash, revoked credentials,
+and key epoch transitions. Each format-2 record embeds a root-signed
+ControlAuthority credential and is hybrid-signed by that delegated identity;
+the fielded bundle contains only the delegated node identity seed, never the
+authority-root signing seed. Both components of both hybrid signatures must
+verify. Lower sequences or a fork from an accepted state are security failures.
+
+The store persists the signer with every control and keys the one mission-wide
+head by stable `authority_id`, so changing delegated signers does not create an
+independent history. Revocation takes effect in chain order. A control from an
+already revoked signer is rejected before admission; if an earlier pending
+suffix becomes reachable only after its signer has been revoked, the entire
+unapplied dependent suffix is rejected and removed, and a live signer must
+reissue it from the exact applied head.
+
+This log is deliberately single-writer and provides no consensus among
+simultaneously active ControlAuthority credentials. Rotation therefore requires
+an operational handoff: the new signer needs its root-signed credential and the
+trusted exact current sequence/envelope head, and the old signer must cease
+writing before the new signer appends. Concurrent next-link claims are a fork
+and fail closed. Another pre-provisioned delegated signer can recover from loss
+or revocation of one signer only when it has that exact head. The root
+provisioner has no in-band override. Total history loss, intentional fork
+replacement, or recovery without an exact trusted head requires a separately
+specified root-signed control epoch/cutover plus an externally persisted
+high-water mark; neither mechanism is defined by this profile.
+
+Schema 11 is the first durable schema that attributes ordinary and bridge
+controls to their delegated signers. An empty schema-10 control state upgrades,
+but opening a schema-10 store containing any control row fails closed pending a
+future signed cutover/import procedure or creation of a fresh store. The
+implementation does not guess a signer for legacy rows.
 
 After receiving revocation, a node rejects new sessions and source attestations
 from that credential. ScopeEpoch format `0` remains a legacy activation of an
@@ -785,20 +896,47 @@ NOT create an incompatible adapter-specific fragmentation protocol. For an MTU
 too small for mandatory security overhead, the core uses the link's reported MTU.
 
 Reassembly is bounded globally and per authenticated adjacency. Duplicate
-segments are harmless; inconsistent overlap, length overflow, token reuse,
-excessive sparse state, and changed counts fail. Blob blocks bound RAM and stream
-to disk. The reference adjacency admits at most 16 incomplete logical frames
-using at most 4 MiB of aggregate reassembly bytes. Filling that volatile budget
-drops only incomplete fragment state so a retained sender can refill it;
-inconsistent reuse remains fatal.
+segments are harmless. Length overflow and excessive sparse state fail within
+the fragment operation. Malformed fragments, inconsistent overlap or changed
+counts, a route-hint mismatch, and unauthenticated transfer-token reuse are
+discardable carrier input: the driver evicts volatile reassembly when needed and
+continues without rebinding or failing the authenticated contact. Each partial
+transfer retains its exact adapter route independently of its transfer ID;
+anonymous and routed fragments, or fragments from two routed peers, cannot form
+one logical frame. An incomplete transfer idle for ten minutes is removed from
+both the route table and reassembler. At the 16-transfer limit, admission evicts
+the least-recently-active partial from both structures. Blob blocks bound RAM
+and stream to disk. The reference adjacency admits at most 16 incomplete logical
+frames using at most 4 MiB of aggregate reassembly bytes. Filling that volatile
+byte budget drops only incomplete fragment state so a retained sender can refill
+it. One pump processes at most 64 discardable carrier failures before yielding.
 
 After one logical transfer authenticates successfully, the driver retains a
 FIFO completion record keyed by adapter route and transfer identifier with the
 logical length and SHA-256 digest. The cache is capped at 1,024 entries.
 Identical repeats are ignored, while reuse of the same route/identifier for
-different completed logical bytes fails closed. Entries are recorded only after
-the handshake flight or session record authenticates; this cache is transport
-replay defense, not application-level ItemID deduplication.
+different completed logical bytes is discarded as unauthenticated carrier
+input. Entries are recorded only after the handshake flight or session record
+authenticates; this cache is transport replay defense, not application-level
+ItemID deduplication. Once a session record authenticates, a subsequent wire,
+synchronization, backend, or internal-contract failure is fatal to the contact;
+the discard rule cannot mask authenticated protocol errors.
+
+The runtime handshake receive path validates without consuming the current
+linear cryptographic state until a flight succeeds. A rejected ServerHello,
+ClientAuth, or ServerFinished therefore leaves the exact prior state and its
+single retained outbound flight available for retransmission; the runtime does
+not reconstruct the transition from a second provisioning-bundle copy. An
+adapter route is only a local routing hint. A configured route is exact,
+including the distinction between anonymous and routed delivery, and a mismatch
+is discarded before fragment decoding. An unknown contact permits bounded
+per-transfer route candidates until one complete logical handshake flight
+verifies; that flight's route becomes the candidate used for replies, and the
+route is committed when the full session authenticates. A valid or captured
+flight 1 can therefore pin an unknown responder to its apparent route even
+though the mission proof in that flight is not full peer identity. Deployment
+rate limits and contact replacement remain necessary for that residual; only
+the authenticated session identity can authorize or bind peer state.
 
 The adapter contract can report broadcast capability and the simulated BTLE seam
 can emit one opaque payload to multiple listeners. The reference does not define
@@ -809,43 +947,162 @@ must not be treated as broadcast validation.
 
 ## 16. Discovery and link profiles
 
-An IP local-discovery advertisement is exactly `type=1 u8 || nonce[16] ||
-proof[16]`. The nonce is fresh OS cryptographic randomness. The provisioned
-128-bit discovery token is never transmitted. The proof is the 16-byte output
-of HKDF-SHA-256 with salt `"aster/ip-discovery-proof/v1"`, IKM equal to
-the discovery token, info equal to the 16-byte nonce, and output length 16.
-Discovery identifies a
-candidate endpoint only; it cannot pass the fresh hybrid handshake. Manual and
-provisioned endpoints enter that same authentication path. Constrained modes do
+Every IP local-discovery packet is exactly 64 bytes and has mandatory zero
+padding. An advertisement is `type=1 u8 || nonce[16] || proof[16] || zero[31]`.
+The nonce is fresh OS cryptographic randomness. The provisioned 128-bit
+discovery token is never transmitted. The proof is the 16-byte output of
+HKDF-SHA-256 with salt `"aster/ip-discovery-proof/v1"`, IKM equal to the
+discovery token, info equal to the 16-byte nonce, and output length 16. A valid
+advertisement is not by itself a discovered endpoint. Its receiver draws a
+fresh 16-byte challenge and sends `type=5 u8 || announcement_nonce[16] ||
+challenge[16] || proof[16] || zero[15]`. The advertiser answers only while that
+announcement nonce remains in its own issuance cache, using the same format
+with type `6` and the response-role proof. Legacy 33- and 49-byte packets,
+trailing bytes, and nonzero padding are ignored.
+
+Both confirmation proofs use HKDF-SHA-256 with salt
+`"aster/ip-discovery-confirmation/v1"`, IKM equal to the discovery token, and
+output length 16. The challenge info is `1 u8 || announcement_nonce[16] ||
+challenge[16]`; the response info is the same transcript with role byte `2`.
+The receiver admits the candidate only when a valid response carries its exact
+outstanding challenge from the same socket address that supplied the
+advertisement. Admission consumes that exact `(source socket, announcement)`
+pending record, so a duplicate response does not discover the endpoint again.
+Recent local announcements are bounded at 128 entries. Emitted responses are
+deduplicated by `(source socket, announcement, challenge)`. A replay from one
+socket therefore cannot collide with or directly consume the exact pending
+record for another socket. It can still contend for the shared bounded caches:
+distributed replay across enough apparent sources can delay a legitimate
+exchange until entries expire. Pending records are bounded at 256 globally and
+8 per canonical source IP; emitted-response records are bounded at 1,024
+globally and 32 per canonical source IP. IPv4 and its IPv4-mapped IPv6 form
+share one quota. All three classes expire after 30 seconds and are pruned before
+lookup or reuse.
+
+This confirmation prevents a captured advertisement alone from redirecting a
+receiver to a passive replayer. It proves neither peer identity nor physical
+proximity: an active party that relays the challenge and response in real time
+can remain the apparent socket endpoint. Discovery therefore identifies only a
+bidirectionally reachable candidate. The fresh hybrid handshake remains
+mandatory for peer identity and authorization. Manual and provisioned endpoints
+enter that same authentication path. Equal 64-byte request and response sizes
+prevent discovery payload or IP/UDP-wire amplification when the response uses
+the request's source address family. They do not prove source ownership. A
+captured valid announcement—or a token holder's synthesized announcement—with a
+spoofed source can still consume up to that apparent source's bounded quota and
+the global pending quota. Distributed replay and large shared-NAT populations
+also contend for those finite caches. Public or hostile-link deployment
+therefore requires anti-spoofing and ingress rate controls. Constrained modes do
 not advertise.
 
-The link contract exposes MTU; ordered/reliable/broadcast capability; estimated
-bandwidth/loss/latency; cost; emission footprint; listen/discover/connect;
-send/receive. The SDK cannot choose a transport for an item.
+The current link contract exposes MTU, optional estimated bandwidth, cost,
+emission footprint, broadcast capability, nonblocking send/receive, discovery
+enablement, a retry floor, and the next requested wakeup. The SDK cannot choose
+a transport for an item. The reference runtime consumes MTU and retry timing;
+the high-level host currently selects configured carriers round-robin and does
+not yet optimize for cost, bandwidth, emission, or broadcast capability.
 
 The IP adapter prefixes opaque data with `type=0 u8` and accepts UDP datagrams no
-larger than 65,507 bytes. Its rendezvous registration is `type=2 ||
-pairing_token[32]`; the peer response is `type=3 || pairing_token[32] || address`,
+larger than 65,507 bytes only from an explicitly registered endpoint. A DATA
+datagram from any other source is discarded before route construction or core
+delivery. Explicit registration is either direct `register_peer` provisioning or
+an embedding's `register_endpoint` call after it selects a discovery- or
+rendezvous-produced candidate; discovering an address does not register its DATA
+route automatically. One nonblocking receive poll examines at most 64 UDP
+datagrams, including ignored control or unknown-source traffic, before yielding
+`None` to the host. This bounds adapter work per pump call; it does not promise
+fair delivery on a socket kept saturated by an attacker. Its rendezvous
+registration is exactly 160 bytes: `type=2 || pairing_token[32] || zero[127]`.
+Prior 33- and 64-byte registrations, nonzero padding, and zero tokens are
+ignored. The
+peer response is `type=3 || pairing_token[32] || address`,
 where address is `4 || IPv4[4] || port u16` or `6 || IPv6[16] || port u16`; and a
 punch is `type=4 || pairing_token[32]`. The response token MUST match a locally
-outstanding token before its address is used. The high-entropy pairing token is
-a rendezvous capability, not peer authentication, and is visible to the
-rendezvous service. Waiting registrations expire after 120 seconds. Reference
-bounds are 4,096 peers, 4,096 discovered addresses, 128 outstanding punch tokens,
-and 4,096 rendezvous registrations. Local/direct operation has no infrastructure
+outstanding token and the response MUST come from the server bound to that
+specific attempt before its address is used. A response is one-shot. Its peer
+address becomes the only source allowed to present the corresponding punch;
+`accept_punch` is the explicit exception for the reciprocal endpoint that has
+not first received a server response. Zero tokens are rejected. Client attempts
+are capped at 128 and expire after 120 seconds. Failed registration sends restore
+the exact prior attempt state. The high-entropy pairing token is a rendezvous
+capability, not peer authentication, and is visible to the rendezvous service.
+The service processes at most 64 datagrams per poll and admits 4,096 waiting
+registrations globally, at most 64 per canonical source IP. IPv4 and its
+IPv4-mapped IPv6 form share one quota. Waiting registrations have an absolute
+120-second lifetime that duplicate registration cannot refresh. The 160-byte
+request plus a conservative 48-byte IPv6 UDP/IP header is 208 bytes. The
+largest reflected chain attributable to one request is a 52-byte IPv6 peer
+response and a 33-byte punch, each with that 48-byte header, totaling 181
+bytes. This remains non-amplifying under the stated accounting model.
+
+Before sending either reply, the server atomically reserves their exact
+combined payload size from a global 4,096-byte response bucket that refills
+monotonically at 1,024 bytes per second and from a 1,024-byte bucket for each
+distinct canonical source IP that refills at 256 bytes per second. A pair whose
+two endpoints have the same canonical IP charges that source bucket once; a
+mixed-source pair charges the full pair to each source. IPv4 and its
+IPv4-mapped IPv6 form are one canonical source. Source-bucket state is capped
+at 4,096 entries and expires after 120 idle seconds. All required buckets are
+checked before any is deducted, and a missing source bucket is created only
+after a successful reservation. Exhaustion retains the first registration for
+a later retry. A send failure conservatively spends the reservation while
+retaining the waiting registration and its source count for a later attempt.
+These limits preserve global capacity for another source when one canonical
+source exhausts its share and bound repeated completed-pair egress. Hosts behind
+one NAT share a source budget. Rotating spoofed source IPs can still occupy the
+finite source-bucket table, so a publicly exposed UDP service requires
+deployment anti-spoofing and rate controls. Reference bounds are 4,096 peers and
+4,096 discovered addresses. Local/direct operation has no infrastructure
 dependency; restrictive NAT/firewall pairs may require rendezvous or the
 separately deployable opaque ciphertext relay.
 
-For a DATA datagram from an unknown socket address, the IP adapter creates a
-process-local 32-byte routing handle for the `Link` interface. It draws a fresh
-32-byte seed when the adapter instance opens and computes HKDF-SHA-256 with salt
-`"aster/ip-endpoint-handle/v1"`, IKM equal to that seed, info equal to the
-canonical address encoding above followed by a one-byte retry counter `0..15`,
-and output length 32. It selects the first nonzero value that does not collide
-with another address. This NodeID-shaped value is never a wire field or an
-authenticated identity and is stable only for that adapter instance. The runtime
-may latch it to route later handshake fragments, but authorization and peer
-state MUST use only the NodeID yielded by the authenticated core session.
+The reference ciphertext relay pairs two outbound TCP connections that present
+the same nonzero random 32-byte channel and otherwise copies length-delimited
+opaque frames. Default server admission permits 256 active pairs and 64 accepted
+sockets per source IP. Source accounting begins at accept and follows a socket
+through join validation, the waiting-channel map, and active forwarding; an
+IPv4-mapped IPv6 source is counted with the equivalent IPv4 address. An active
+pair is closed after 120 seconds without a successful read or write in either
+direction. Waiting channels are separately bounded at 4,096 and expire after
+120 seconds; at most 256 join validations are pending.
+
+`RelayLink::send` validates and copies at most one 65,535-byte frame, then uses
+nonblocking queue admission. Each inbound and outbound client queue is bounded
+at 256 frames and 4 MiB; saturation returns `WouldBlock`. Success means the
+outbound frame was accepted by the local queue, not that the TCP write completed.
+Socket writes run asynchronously. A later socket failure or ten-minute queued
+write deadline marks the link disconnected, closes it, and makes subsequent
+sends fail with `BrokenPipe`; it cannot retroactively fail an already returned
+send call. A complete four-byte inbound length header must arrive within 120
+seconds. After a valid length, the body deadline is `30 seconds + ceil(frame
+length * 8 / 1,024) seconds`; the maximum 65,535-byte frame therefore has 542
+seconds. This bounds partial-header/body retention while leaving margin for the
+requirements profile's low-single-digit-kbps link.
+
+The per-source default is deliberately configurable. Two relay endpoints behind
+one public NAT normally consume two of that address's 64 socket admissions, so a
+large shared-NAT deployment may need a higher value. Raising it reduces that
+source-level denial-of-service boundary but does not remove the global
+active-pair limit. A zero or monotonic-clock-unrepresentable active-pair idle
+timeout is rejected during relay configuration, and deadline construction also
+fails closed rather than panicking.
+
+The active idle timeout is a reclamation bound, not a proof against slow-client
+slot retention: any successful byte transfer resets it, while a legitimate pair
+that is completely quiet for the interval is closed. Automatic relay reconnect
+is not supplied by `RelayLink`; the embedding owns that policy.
+
+An embedding may explicitly turn a discovered or rendezvous-selected candidate
+address into a process-local 32-byte routing handle before beginning the
+authenticated handshake. The adapter draws a fresh 32-byte seed when it opens
+and computes HKDF-SHA-256 with salt `"aster/ip-endpoint-handle/v1"`, IKM equal
+to that seed, info equal to the canonical address encoding above followed by a
+one-byte retry counter `0..15`, and output length 32. It selects the first
+nonzero value that does not collide with another address. This NodeID-shaped
+value is never a wire field or an authenticated identity, is stable only for
+that adapter instance, and cannot by itself authorize peer state. Reusable host
+composition still requires the expected NodeID to be bound to the candidate
+before data exchange; automatic unknown-identity composition remains open.
 
 The BTLE crate is a platform-neutral seam for opaque service data, MTU reporting,
 L2CAP/GATT capability selection, and advertisement delivery. Its simulation can
@@ -906,11 +1163,14 @@ self-describing and forwardable by a node that cannot consume them.
 ## 18. Error and resource behavior
 
 All untrusted lengths/counts are checked before allocation and arithmetic is
-overflow checked. Invalid data fails the containing object/session without
-panicking. Authentication failure reveals one indistinguishable error externally.
-Rate, byte, fragment, partial-transfer, peer, and handshake limits are configured.
+overflow checked. Invalid authenticated data fails the containing object or
+contact without panicking. Unauthenticated carrier damage is discarded within
+the bounded work limits below. Authentication failure reveals one
+indistinguishable error externally. Rate, byte, fragment, partial-transfer,
+peer, and handshake limits are configured.
 
-The reference authenticated adjacency enforces these outbound/replay limits:
+The reference adapter and authenticated adjacency enforce these work,
+outbound, and replay limits:
 
 | Resource | Bound | Saturation behavior |
 |---|---:|---|
@@ -919,10 +1179,22 @@ The reference authenticated adjacency enforces these outbound/replay limits:
 | retained handshake flight | 1 entry | a causal authenticated next flight replaces or retires it |
 | combined pending logical bytes | 16 MiB | checked before every retry insert/refresh, outbox insert, and handshake replacement |
 | logical sends per pump | 128 | remaining due work keeps its monotonic deadline |
+| UDP datagrams examined per adapter poll | 64 | yields `None`; a later poll may continue queued input |
+| discardable unauthenticated carrier failures per runtime pump | 64 | yields with the contact intact; subsequent valid input can progress |
 | durable/deferred WANTs | 10,000 objects by default | compact metadata remains retryable without retaining ciphertext or payload |
-| incomplete fragment transfers | 16 transfers and 4 MiB aggregate | volatile incomplete state resets; authenticated retained senders refill it |
-| completed transfer records | 1,024 entries | FIFO eviction; conflicting route/transfer-ID reuse fails closed |
+| incomplete fragment transfers | 16 transfers, 4 MiB aggregate, 10-minute idle TTL | exact per-transfer routes prevent cross-route assembly; idle/least-recently-active partial route and reassembly state are evicted together |
+| completed transfer records | 1,024 entries | FIFO eviction; conflicting unauthenticated route/transfer-ID reuse is discarded within the per-pump failure budget |
+| discovery recent announcements | 128 entries, 30-second TTL | new announcement returns backpressure until an entry expires |
+| discovery pending confirmations | 256 globally, 8 per canonical source IP, 30-second TTL | exact source-socket/announcement key; excess admission is ignored |
+| discovery emitted responses | 1,024 globally, 32 per canonical source IP, 30-second TTL | exact source-socket/announcement/challenge key; excess admission is ignored |
+| rendezvous client attempts | 128 entries, 120-second TTL | zero tokens reject; responses are one-shot and bound to the attempt's server and selected peer endpoint |
+| rendezvous waiting registrations | 4,096 globally, 64 per canonical source IP, absolute 120-second TTL | at most 64 datagrams are processed per poll; duplicates cannot refresh lifetime; excess admission is ignored |
+| rendezvous global response egress | 4,096-byte burst, 1,024 bytes/second monotonic refill | both replies atomically reserve their exact combined payload bytes; exhaustion retains the first registration |
+| rendezvous per-source response egress | 1,024-byte burst, 256 bytes/second monotonic refill per distinct canonical source; 4,096 entries; 120-second idle TTL | each distinct source is charged the full pair once; IPv4-mapped IPv6 is canonicalized; shared NATs share a budget; source state is created only on successful atomic reservation |
+| relay inbound header/body | 120-second header; body is 30 seconds plus length at 1,024 bps (542 seconds maximum) | deadline closes the client link and releases queued capacity |
 | DATA production per WANT | 16 messages of at most 64 KiB payload each | each backend batch is queued before expanding the next WANT; excess returns backpressure |
+| INTEREST selectors | 256 topics, 256 scopes, 4,096 topic-by-scope work units | rejected before inventory selection |
+| policy-filtered inventory snapshot | 100,000 metadata objects | SQLite reads at most cap plus one in one query; cap-plus-one and over-limit custom-store results reject the exchange rather than truncate |
 
 The shared 16 MiB counter covers each retained retry's fixed `Message` value,
 every owned nested string/vector capacity, any duplicate variable prefix held in
@@ -939,9 +1211,16 @@ back to retained retry work when space opens. Non-WANT excess is rejected with
 explicit backpressure. This preserves receiver progress without claiming
 unbounded buffering or delivery under permanent loss.
 
-The Tier-2 baseline uses bounded queues, paged queries, one storage writer,
-streaming blobs, event-driven wakeups, and configurable duty cycles. No protocol
-component requires an in-memory mirror of the 10,000-item working set.
+The Tier-2 design uses bounded queues, one storage writer, streaming blobs,
+event-driven wakeups, and configurable duty cycles. Inventory selection and
+routine quota/garbage-collection lifecycle scans use metadata-only projections
+rather than materializing sealed envelopes or causal contexts. Those operations
+remain O(N) metadata scans and collect bounded result vectors in memory. Actual
+deletion victims and affected reducer groups still take the full decode path,
+and application projection materializes selected records. Paged/incremental
+maintenance and representative measurements remain release-scale gates, so the
+implementation does not yet establish the 10,000-item Tier-2 memory/latency
+target.
 
 Finite storage means convergence is defined over items retained by declared TTL
 and visible quota/eviction policy. Evictions and conflicts surface to the app.
@@ -984,6 +1263,11 @@ forbidden. The closed fixed-binary magic, kind, and role registries are in
   public recipient registry requires an independently persisted generation
   high-water mark after authority storage replacement. High-level rekey calls
   are shipped, but complete public-registry import/management is not.
+- Delegated authority keys remove the replicated authority-root signing seed,
+  but the control history is a single-writer authenticated log, not consensus.
+  Signer handoff requires a trusted exact head; total history loss and
+  authorized fork replacement have no defined root-signed epoch/reset or
+  external chain high-water mechanism in this profile.
 - Typed Blob chunk transfer and different-peer range resume are verified in the
   in-memory reference runtime, and a separate generated 101 MiB local streaming
   case passes with bounded component buffers. A combined 100+ MiB different-peer

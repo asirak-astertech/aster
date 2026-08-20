@@ -165,15 +165,15 @@ implementation version and conformance-vector digest under test.
 | ID | Group | Required evidence |
 |---|---|---|
 | V-WIRE | deterministic CBOR | exact accepted bytes and nonminimal/duplicate/indefinite/oversized rejection |
-| V-FIXED | fixed binary security objects | every `envelope.md` object at min/max bounds; truncation, trailing, reserved, length, ordering, and cross-field rejection |
+| V-FIXED | fixed binary security objects | every `envelope.md` object at min/max bounds, including `ASTRPB03`, delegated `ASTRCA02`, and `ASTRBCA2`; truncation, trailing, reserved, length, ordering, credential/signer substitution, and cross-field rejection |
 | V-BATCH | semantic-v2 content-committing batch | exact preamble/manifest/BatchID, content leaf, complete tree/padding/path, ObjectKind 3 proof route, format-3 compact suffix, missing-proof pending state, downgrade/mutation rejection, and serialized overhead |
-| V-BRIDGE | semantic-v2 cross-scope bridge | exact ObjectKind 4 authorization and ObjectKind 5 wrapper bytes; directed-edge/filter/path authentication; v1 suppression; source/Blob dependencies; arrival-order, restart, custody, revocation, fallback, quota, and unified-delivery behavior |
+| V-BRIDGE | semantic-v2 cross-scope bridge | exact ObjectKind 4 authorization-format-2 delegated signer authentication and ObjectKind 5 wrapper bytes; signer persistence/liveness, directed-edge/filter/path authentication, v1 suppression, source/Blob dependencies, arrival-order, restart, custody, revocation, fallback, quota, and unified-delivery behavior |
 | V-ID | identifiers | exact ItemID, raw-SHA-256 EnvelopeID, 33-byte typed ObjectID including semantic-v2 kind 3, BlobID, Blob transfer-object digest, ManifestDigest, ContentGroupID, NodeID, SingletonBatchID, and content-committing BatchID inputs |
-| V-CRYPTO | algorithms | NIST KAT provenance plus exact envelope, control, custody, Blob, and session vectors from `envelope.md` |
+| V-CRYPTO | algorithms | NIST KAT provenance plus exact envelope, root-credentialed delegated-control, custody, Blob, and session vectors from `envelope.md` |
 | V-HANDSHAKE | peer authentication | all four exact flights and transcript intermediates; tamper, replay, downgrade, proof, key-confirmation, and either-signature failure |
-| V-CAUSAL | dots and clocks | before/after/equal/concurrent/equivocation traces |
+| V-CAUSAL | dots and clocks | before/after/equal/concurrent/equivocation traces; schema-12 exact-domain isolation, schema-11 sentinel migration/reopen and pointwise maximum, 4,095/4,096/4,097 publisher boundaries with atomic ordinary/bridge rejection, and the explicit A-to-B-to-C non-transitivity trace |
 | V-CLASS | reducers | State projection, Event gaps, Record siblings/merge, canonical Blob manifest/chunks and local streaming |
-| V-MERKLE | exact anti-entropy | typed 33-byte ObjectIDs, 66-nibble tree roots, probe traces, equal-root short circuit, adversarial prefixes |
+| V-MERKLE | exact anti-entropy | typed 33-byte ObjectIDs, 66-nibble tree roots, probe traces, equal-root wire-descent short circuit with local snapshot accounting, adversarial prefixes, and 100,000/cap-plus-one snapshot behavior for SQLite and custom stores |
 | V-FRAG | carrier segments | every supported MTU, order, duplicate, truncation, overlap, bounds |
 | V-IP | IP control bytes | discovery proof vectors and nonce freshness; rendezvous token echo/address forms, TTL, source, and capacity rejection; local endpoint-handle collision and non-authorization tests |
 | V-EXT | evolution | optional skip/preserve and critical rejection |
@@ -214,6 +214,29 @@ metadata, and reject hostile maximum WANT-to-DATA fanout with explicit
 backpressure. The bounded completed-transfer cache rejects one adapter-route
 transfer identifier being reused for different authenticated logical bytes.
 
+Focused inventory-selection regressions exercise the same bound at small test
+sizes: the SQLite helper returns exactly the configured cap, requests only cap
+plus one rows in its single metadata-only query, and rejects the extra row; the
+generic node guard separately rejects an over-limit vector from a custom store.
+The production bound is 100,000 metadata objects. Equal roots avoid subsequent
+`PROBE` / `NODE` wire descent, but both peers still select and hash the local
+snapshot. These tests therefore establish a ceiling and wire short circuit, not
+difference-proportional local work. Because source descriptors are inserted
+first into the composite inventory, a snapshot containing exactly 100,000
+source descriptors leaves no capacity for Blob carrier ObjectIDs; fair or
+reserved carrier allocation remains an open scheduling concern.
+
+Schema-12 store regressions cover schema-11 frontier migration into the reserved
+`('', '')` sentinel, reopen behavior, exact `(topic, origin scope)` isolation,
+pointwise-max loading, and the 4,096-publisher effective-domain boundary. They
+also prove that ordinary and authenticated bridge-source overflow rolls back
+without accepted-dot or outbox residue, and that a received signed predecessor
+vector does not expand the local publication frontier. The last property is a
+trust containment rule, not evidence of complete causal propagation: the
+A-to-B-to-C trace remains non-transitive, per-key/per-stream domains are absent,
+and accepted-dot/Event ledgers plus aggregate frontier domains remain unbounded.
+V-CAUSAL and production causality therefore remain incomplete.
+
 These are reference-to-reference software subgates. They do not measure useful
 throughput at 3 kbps, Tier-2 RSS or battery use, permanent/adversarial loss, a
 live carrier, or physical hardware, and they do not satisfy A-05 or A-10 alone.
@@ -230,16 +253,37 @@ Python surface uses move-only enrollment and opaque 32-byte durable handles.
 This remains same-team reference evidence; it does not satisfy the independent
 SUT, 1,000-node bridge-scale, packet-capture, or physical-carrier gates.
 
-The core now passes a focused A-07 software subgate: a dual-signed chained
-ScopeEpoch format-1 control distributes freshly generated route/topic keys in
-hybrid recipient packages; a captured omitted node cannot open fresh content;
-route-only recipients cannot open content; and tamper, fork, rollback,
+The core now passes a focused A-07 software subgate: a root-credentialed,
+delegated-hybrid-signed chained ScopeEpoch format-1 control distributes freshly
+generated route/topic keys in hybrid recipient packages; a captured omitted
+node cannot open fresh content; route-only recipients cannot open content; and
+tamper, fork, rollback,
 out-of-order/reopen, and local-revocation cases do not install unauthorized keys.
 This is not the complete black-box administration scenario: the public recipient
 registry still needs an independently persisted generation high-water mark after
 authority-store replacement, and complete public-registry import/management is
 not shipped even though high-level rekey calls exist. Format `0`
 pre-provisioning is not evidence for A-07.
+
+The core also passes focused delegated-authority software regressions. They
+verify that `ASTRPB03` contains no authority-root signing seed, separately
+provisioned ControlAuthority nodes have distinct signing identities, and the
+provider rejects legacy root-signed control shapes, missing roles, credential
+substitution, and signature tamper. Store tests persist the authenticated signer,
+reject a signer/reservation mismatch, apply revocation in contiguous chain
+order, reject and remove a revoked signer's pending dependent suffix, and let a
+different live signer reissue that suffix on the same stable authority chain.
+The bridge path separately checks format-2 delegated authentication, signer
+persistence, revoked-signer suffix rejection, and loss of liveness after signer
+revocation. Schema-10 stores with existing ordinary or bridge controls fail
+closed rather than assigning those rows an inferred signer.
+
+These same-team unit/integration regressions are not a distributed authority
+protocol. They do not prove concurrent-writer consensus, automated signer
+rotation, root override, total-history recovery, or rollback resistance after
+complete control-store replacement. Those would require the separately
+specified root-signed epoch/cutover and external chain high-water described in
+[security.md](security.md).
 
 The core passes complementary A-11 software subgates. A generated 101 MiB local
 streaming case interrupts/reopens, deduplicates, reads back, and rejects tamper
@@ -288,6 +332,10 @@ assert traffic-flow confidentiality.
 apply(x, x) = apply(x)
 project(a, b) = project(b, a)
 join(join(a, b), c) = join(a, join(b, c))
+publication_frontier(topic, scope) = pointwise_max(exact_direct_dots, legacy_sentinel)
+an accepted signed predecessor claim does not become local direct observation
+an inventory snapshot has at most 100000 objects or selection fails without truncation
+equal Merkle roots imply no wire descent, not no local snapshot construction
 no concurrent head disappears without a dominating explicit revision
 eventually connected replicas with the same retention policy converge
 fragment/reassembly is invariant to MTU, duplicate, and arrival order
