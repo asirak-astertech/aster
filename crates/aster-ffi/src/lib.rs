@@ -3924,6 +3924,30 @@ mod tests {
         assert_eq!(aster_highest_supported_semantic_version(), 2);
     }
 
+    #[test]
+    fn format_three_fixture_opens_and_legacy_format_two_is_rejected() {
+        assert_eq!(&TEST_BUNDLE[..8], b"ASTRPB03");
+        let mut node = open_memory_with_bundle(TEST_BUNDLE);
+        assert_eq!(aster_node_close(&mut node), STATUS_OK);
+
+        // Preserve the exact format-3 body while presenting the legacy tag.
+        // The production parser must fail closed; the FFI adds no compatibility
+        // path for the former root-seed-bearing bundle format.
+        let mut legacy = TEST_BUNDLE.to_vec();
+        legacy[..8].copy_from_slice(b"ASTRPB02");
+        let options = AsterNodeOptions {
+            store_path: bytes(b":memory:"),
+            provisioning_bundle: bytes(&legacy),
+            ..AsterNodeOptions::default()
+        };
+        let mut rejected = AsterNode::default();
+        assert_eq!(
+            aster_node_open(&options, &mut rejected),
+            STATUS_SECURITY_ERROR
+        );
+        assert_eq!(rejected.value, 0);
+    }
+
     fn versioned<T>() -> (u32, u32) {
         (ABI_VERSION, struct_size::<T>())
     }

@@ -24,6 +24,15 @@ class BindingTests(unittest.TestCase):
         self.assertEqual(DEFAULT_SEMANTIC_VERSION, 2)
         self.assertEqual(HIGHEST_SUPPORTED_SEMANTIC_VERSION, 2)
 
+    def test_format_three_bundle_opens_and_legacy_format_two_is_rejected(self):
+        self.assertEqual(BUNDLE[:8], b"ASTRPB03")
+        with Node(":memory:", BUNDLE):
+            pass
+        legacy = b"ASTRPB02" + BUNDLE[8:]
+        with self.assertRaises(AsterError) as caught:
+            Node(":memory:", legacy)
+        self.assertEqual(caught.exception.status, 9)
+
     def test_offline_publish_query_binary(self):
         with tempfile.TemporaryDirectory() as directory:
             with Node(str(pathlib.Path(directory) / "mesh.db"), BUNDLE) as node:

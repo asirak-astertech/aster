@@ -291,6 +291,19 @@ impl Default for Limits {
     }
 }
 
+/// Maximum topic selectors admitted by one INTEREST message.
+pub const MAX_INTEREST_TOPICS: usize = 256;
+/// Maximum scope selectors admitted by one INTEREST message.
+pub const MAX_INTEREST_SCOPES: usize = 256;
+/// Maximum topic/scope combinations one INTEREST may ask a peer to evaluate.
+pub const MAX_INTEREST_WORK: usize = 4_096;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InterestDimension {
+    Topics,
+    Scopes,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WireError {
     MessageTooLarge,
@@ -316,6 +329,15 @@ pub enum WireError {
     UnknownMessageType(u64),
     InvalidField(&'static str),
     NonCanonicalSet(&'static str),
+    InterestDimensionLimit {
+        dimension: InterestDimension,
+        actual: usize,
+        maximum: usize,
+    },
+    InterestWorkLimit {
+        actual: usize,
+        maximum: usize,
+    },
     IntegerOverflow,
 }
 
@@ -1231,6 +1253,7 @@ fn ranges_value(ranges: &[ByteRange]) -> Value {
 fn validate_message(message: &Message) -> Result<(), WireError> {
     match message {
         Message::Interest(value) => {
+            validate_interest_work(value.topics.len(), value.scopes.len())?;
             validate_text_set(&value.topics, "topics")?;
             validate_text_set(&value.scopes, "scopes")?;
             if value.min_priority > 3 {
@@ -1325,6 +1348,36 @@ fn validate_message(message: &Message) -> Result<(), WireError> {
         }
     }
     Ok(())
+}
+
+pub(crate) fn validate_interest_work(
+    topic_count: usize,
+    scope_count: usize,
+) -> Result<usize, WireError> {
+    if topic_count > MAX_INTEREST_TOPICS {
+        return Err(WireError::InterestDimensionLimit {
+            dimension: InterestDimension::Topics,
+            actual: topic_count,
+            maximum: MAX_INTEREST_TOPICS,
+        });
+    }
+    if scope_count > MAX_INTEREST_SCOPES {
+        return Err(WireError::InterestDimensionLimit {
+            dimension: InterestDimension::Scopes,
+            actual: scope_count,
+            maximum: MAX_INTEREST_SCOPES,
+        });
+    }
+    let work = topic_count
+        .checked_mul(scope_count)
+        .ok_or(WireError::IntegerOverflow)?;
+    if work > MAX_INTEREST_WORK {
+        return Err(WireError::InterestWorkLimit {
+            actual: work,
+            maximum: MAX_INTEREST_WORK,
+        });
+    }
+    Ok(work)
 }
 
 pub(crate) fn validate_semantic_version(semantic_version: u16) -> Result<(), WireError> {
@@ -1513,6 +1566,12 @@ mod tests {
         Limits::default()
     }
 
+    fn selectors(prefix: &str, count: usize) -> Vec<String> {
+        (0..count)
+            .map(|index| format!("{prefix}-{index:04}"))
+            .collect()
+    }
+
     fn object_messages(id: ObjectId) -> Vec<Message> {
         vec![
             Message::Offer(Offer {
@@ -1615,6 +1674,105 @@ mod tests {
             ]
         );
         assert_eq!(decode_message(&encoded, limits()).unwrap(), message);
+    }
+
+    #[test]
+    fn interest_limits_bound_each_dimension_and_cartesian_work() {
+        let at_work_limit = Message::Interest(Interest {
+            exchange_id: 8,
+            topics: selectors("topic", 64),
+            scopes: selectors("scope", 64),
+            min_priority: 0,
+            max_offers: 256,
+        });
+        assert!(encode_message(&at_work_limit, limits()).is_ok());
+
+        let topic_limit = Message::Interest(Interest {
+            exchange_id: 9,
+            topics: selectors("topic", MAX_INTEREST_TOPICS),
+            scopes: selectors("scope", 1),
+            min_priority: 0,
+            max_offers: 256,
+        });
+        assert!(encode_message(&topic_limit, limits()).is_ok());
+
+        let scope_limit = Message::Interest(Interest {
+            exchange_id: 10,
+            topics: selectors("topic", 1),
+            scopes: selectors("scope", MAX_INTEREST_SCOPES),
+            min_priority: 0,
+            max_offers: 256,
+        });
+        assert!(encode_message(&scope_limit, limits()).is_ok());
+
+        let excess_topics = Message::Interest(Interest {
+            exchange_id: 11,
+            topics: selectors("topic", MAX_INTEREST_TOPICS + 1),
+            scopes: selectors("scope", 1),
+            min_priority: 0,
+            max_offers: 256,
+        });
+        assert_eq!(
+            encode_message(&excess_topics, limits()),
+            Err(WireError::InterestDimensionLimit {
+                dimension: InterestDimension::Topics,
+                actual: MAX_INTEREST_TOPICS + 1,
+                maximum: MAX_INTEREST_TOPICS,
+            })
+        );
+
+        let excess_scopes = Message::Interest(Interest {
+            exchange_id: 12,
+            topics: selectors("topic", 1),
+            scopes: selectors("scope", MAX_INTEREST_SCOPES + 1),
+            min_priority: 0,
+            max_offers: 256,
+        });
+        assert_eq!(
+            encode_message(&excess_scopes, limits()),
+            Err(WireError::InterestDimensionLimit {
+                dimension: InterestDimension::Scopes,
+                actual: MAX_INTEREST_SCOPES + 1,
+                maximum: MAX_INTEREST_SCOPES,
+            })
+        );
+
+        let excess_work = Message::Interest(Interest {
+            exchange_id: 13,
+            topics: selectors("topic", 65),
+            scopes: selectors("scope", 64),
+            min_priority: 0,
+            max_offers: 256,
+        });
+        assert_eq!(
+            encode_message(&excess_work, limits()),
+            Err(WireError::InterestWorkLimit {
+                actual: 65 * 64,
+                maximum: MAX_INTEREST_WORK,
+            })
+        );
+    }
+
+    #[test]
+    fn decoded_maximal_interest_is_rejected_by_protocol_limits() {
+        let message = Message::Interest(Interest {
+            exchange_id: 14,
+            topics: selectors("topic", Limits::default().max_collection_items),
+            scopes: selectors("scope", Limits::default().max_collection_items),
+            min_priority: 0,
+            max_offers: 256,
+        });
+        // Deliberately encode the CBOR value below message validation to model
+        // bytes supplied by an untrusted peer rather than a local producer.
+        let encoded = encode_value(&message_value(&message), limits()).unwrap();
+        assert_eq!(
+            decode_message(&encoded, limits()),
+            Err(WireError::InterestDimensionLimit {
+                dimension: InterestDimension::Topics,
+                actual: Limits::default().max_collection_items,
+                maximum: MAX_INTEREST_TOPICS,
+            })
+        );
     }
 
     #[test]

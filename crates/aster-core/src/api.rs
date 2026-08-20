@@ -1817,6 +1817,7 @@ mod tests {
             .store_mut()
             .set_scope_epoch(&ScopeEpoch {
                 authority,
+                signer: authority,
                 scope,
                 epoch,
                 control_sequence: epoch,
@@ -1838,7 +1839,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("authorization read failed: {error}"))
             .unwrap_or_else(|| panic!("authorization receipt was not durable"))
             .exact_bytes;
-        let (envelope_id, authorization) = {
+        let (envelope_id, authorization, control_signer) = {
             let verified = target
                 .inner
                 .envelopes()
@@ -1847,11 +1848,13 @@ mod tests {
             (
                 verified.envelope().envelope_id,
                 verified.envelope().authorization.clone(),
+                verified.control_signer(),
             )
         };
         let verified = StoreVerifiedBridgeAuthorization::from_provider(
             envelope_id,
             authorization,
+            control_signer,
             exact_bytes,
         )
         .unwrap_or_else(|error| panic!("authorization token failed: {error}"));

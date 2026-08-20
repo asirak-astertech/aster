@@ -535,6 +535,7 @@ impl ReferenceSemanticRuntimeBackend {
                 let value = StoreVerifiedBridgeAuthorization::from_provider(
                     envelope.envelope_id,
                     envelope.authorization.clone(),
+                    verified.control_signer(),
                     stored.exact_bytes.clone(),
                 )
                 .map_err(store_error)?;
@@ -1130,6 +1131,7 @@ impl ReferenceSemanticRuntimeBackend {
         let stored = StoreVerifiedBridgeAuthorization::from_provider(
             envelope.envelope_id,
             envelope.authorization.clone(),
+            verified.control_signer(),
             bytes,
         )
         .map_err(store_error)?;
@@ -1138,6 +1140,31 @@ impl ReferenceSemanticRuntimeBackend {
             .store_mut()
             .ingest_bridge_authorization(&stored)
             .map_err(store_error)?;
+        if let Some(rejected) = outcome.rejected_input() {
+            if self
+                .node_mut()
+                .store_mut()
+                .is_revoked(&envelope.authorization.authority_id)
+                .map_err(store_error)?
+            {
+                return Err(store_error(StoreError::BridgeControlAuthorityRevoked(
+                    envelope.authorization.authority_id,
+                )));
+            }
+            if self
+                .node_mut()
+                .store_mut()
+                .is_revoked(&rejected.signer)
+                .map_err(store_error)?
+            {
+                return Err(store_error(StoreError::BridgeControlSignerRevoked(
+                    rejected.signer,
+                )));
+            }
+            return Err(store_error(StoreError::Invalid(
+                "bridge control input was discarded with an invalid pending suffix".into(),
+            )));
+        }
         self.node_mut().finish_transfer(object_id)?;
 
         let mut promoted = Vec::new();
@@ -1195,6 +1222,9 @@ impl ReferenceSemanticRuntimeBackend {
                     })?,
                 ],
             },
+            BridgeControlOutcome::Rejected { signer, .. } => {
+                return Err(store_error(StoreError::BridgeControlSignerRevoked(signer)));
+            }
         };
         match disposition {
             RuntimeCommit::Committed { item_id, .. } => {
@@ -4122,8 +4152,13 @@ fn semantic_terminal_commit_error(error: &BlobRuntimeError) -> bool {
             | StoreError::Zeroized
             | StoreError::ControlFork
             | StoreError::ControlRollback
+            | StoreError::ControlSignerRevoked(_)
+            | StoreError::ControlAuthorityRevoked(_)
             | StoreError::BridgeControlFork
             | StoreError::BridgeControlRollback
+            | StoreError::BridgeControlSignerRevoked(_)
+            | StoreError::BridgeControlAuthorityRevoked(_)
+            | StoreError::LegacyControlMigrationRequired
             | StoreError::BridgeRouteIneligible => true,
         },
         BlobRuntimeError::Engine(_) => true,
