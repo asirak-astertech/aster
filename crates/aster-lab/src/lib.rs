@@ -1183,22 +1183,24 @@ pub fn run_shard(config: &ShardScenario) -> LabResult<LabMetrics> {
         )?;
         sender.configure_peer_carrier(receiver_id, sender_link)?;
         receiver.configure_peer_carrier(sender_id, receiver_link)?;
+        let delivery_subscription =
+            receiver.subscribe(topic.clone(), scope.clone(), Some(DataClass::Event), false)?;
+        let mut delivered_ids = BTreeSet::new();
         sender.begin_sync(receiver_id)?;
         receiver.begin_sync(sender_id)?;
         let before = metrics.pump_calls;
         let expected = usize::try_from(config.items)?;
         while metrics.pump_calls.saturating_sub(before) < config.max_pumps_per_edge {
             pump_pair(sender, receiver, &mut metrics.pump_calls)?;
-            if metrics.pump_calls.is_multiple_of(8)
-                && query_shard_event_count(
-                    receiver,
-                    &topic,
-                    &scope,
-                    config.shard_index,
-                    config.items,
-                )? == expected
-            {
-                break;
+            if metrics.pump_calls.is_multiple_of(8) {
+                for delivery in receiver.poll(delivery_subscription, expected.clamp(1, 4_096))? {
+                    let item = delivery.item.id;
+                    delivered_ids.insert(item);
+                    receiver.acknowledge(delivery_subscription, item)?;
+                }
+                if delivered_ids.len() == expected {
+                    break;
+                }
             }
             wait_for_pair(sender, receiver, metrics.pump_calls);
         }
@@ -1890,6 +1892,25 @@ mod tests {
     }
 
     #[test]
+    fn single_item_root_offer_converges_without_contact_teardown() {
+        let _guard = SCENARIO_TEST_LOCK.lock().unwrap();
+        let root = test_path("single-root-offer");
+        let metrics = run_transfer(&TransferScenario {
+            root: root.clone(),
+            seed: 1,
+            items: 1,
+            payload_bytes: 16 * 1_024,
+            restart_after_delivered_frames: None,
+            max_pumps: 30_000,
+            fault: FaultProfile::default(),
+        })
+        .unwrap();
+        assert!(metrics.converged);
+        assert_eq!(metrics.delivered_items, 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn shard_chain_republishes_received_objects() {
         let _guard = SCENARIO_TEST_LOCK.lock().unwrap();
         let root = test_path("shard");
@@ -1899,14 +1920,14 @@ mod tests {
             shard_index: 2,
             first_node: 20,
             nodes: 3,
-            items: 1,
+            items: 4,
             payload_bytes: 1_024,
             max_pumps_per_edge: 20_000,
             fault: FaultProfile::default(),
         })
         .unwrap();
         assert!(metrics.converged);
-        assert_eq!(metrics.delivered_items, 3);
+        assert_eq!(metrics.delivered_items, 12);
         fs::remove_dir_all(root).unwrap();
     }
 

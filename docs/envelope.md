@@ -4,12 +4,14 @@
 - Stable wire/cryptographic profile: `1`, suite `0x0001`
 - Negotiated semantic versions: default/highest `2`, compatibility `1`
 - Status: normative for the implemented reference profile
-- Date: 2026-08-18
+- Date: 2026-08-19
 
 The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY**
-are normative. This document defines every fixed binary security object emitted
-or accepted by the reference profile. It is the interoperability authority for
-these bytes; Rust types and local database rows are not wire formats.
+are normative. This document defines the base fixed binary security objects
+emitted or accepted by the reference profile. The semantic-version-2 batch
+additions are defined normatively in [protocol.md](protocol.md) §6.1; together,
+these sections are the interoperability authority for the fixed bytes. Rust
+types and local database rows are not wire formats.
 
 Replication messages are the deterministic-CBOR objects in `wire.cddl` and are
 not redefined here. A decoder MUST know from its containing protocol state
@@ -112,12 +114,17 @@ that 32-byte value itself is the input to both signature algorithms.
 
 | Object | Discriminator | Status and outer bound |
 |---|---|---|
-| Provisioning bundle | `"ASTRPB02"` | local secret-store format; not a network object |
+| Provisioning bundle | `"ASTRPB03"` | local secret-store format; not a network object |
 | Rekey recipient registry | `"ASTRRKR1"` | signed administrative artifact; at most 16 MiB; not a mesh replication object |
 | Authority credential body | none; embedded with `b32` | network security object; embedded bound 16 KiB |
-| Source envelope | `"ASTRENV2"` | network/stable-store object |
-| Revocation control | source-envelope kind `2` | protected inside `ASTRENV2` |
-| Scope-epoch control | source-envelope kind `3` | protected inside `ASTRENV2` |
+| Singleton source envelope | `"ASTRENV2"` | network/stable-store format-2 object; semantic versions 1 and 2 |
+| Compact batch source envelope | `"ASTRENV3"`, kind `1` | semantic-version-2 network/stable-store format-3 object; exact bytes in [protocol.md](protocol.md) §6.1 |
+| Source-batch proof | `"ASTRENV3"`, kind `3` | semantic-version-2 network/stable-store format-3 object; exact bytes in [protocol.md](protocol.md) §6.1 |
+| Revocation control | source-envelope kind `2`, protected `"ASTRCA02"` | delegated-control format 2 inside `ASTRENV2` |
+| Scope-epoch control | source-envelope kind `3`, protected `"ASTRCA02"` | delegated-control format 2 inside `ASTRENV2` |
+| Bridge authorization | `"ASTRBA01"`, protected ObjectKind `4` | semantic-version-2 authorization format 2; at most 65,536 bytes total |
+| Bridge route wrapper | `"ASTRBW01"`, protected ObjectKind `5` | semantic-version-2 wrapper format 1; at most 524,322 bytes total |
+| Bridge edge enrollment | `"ASTRBE01"` | provider-authenticated administrative capability; at most 32 KiB; not a mesh replication object |
 | Custody wrapper | `"ASTRFWD1"` | network, per forwarding hop; protected body at most 64 KiB including tag |
 | Handshake flight | `"ASTRHS01"` | network, at most 64 KiB per flight |
 | Protected transport frame | `"ASTRFR01"` | network; plaintext at most 16 MiB |
@@ -200,15 +207,15 @@ RouteCommitment =
 
 ### 3.2 Reference provisioning bundle — local only
 
-`ASTRPB02` is a local persistence/ingestion format containing secret material.
+`ASTRPB03` is a local persistence/ingestion format containing secret material.
 It MUST NOT be sent on the mesh, logged, included in captures, or treated as a
 cross-implementation provisioning protocol. Another implementation MAY use a
 platform keystore and a different local representation. The exact reference
 format is documented to make recovery and diagnostic inspection unambiguous:
 
 ```text
-magic                            "ASTRPB02"                    8
-bundle_version                   u16 = 2                        2
+magic                            "ASTRPB03"                    8
+bundle_version                   u16 = 3                        2
 mission                          32 bytes                       32
 authority_id                     32 bytes                       32
 authority_hybrid_verifying_key   encoded hybrid verifying key  variable
@@ -216,11 +223,9 @@ node_identity_seed               32 secret bytes                32
 serial                           u64, nonzero                    8
 roles                            u32                             4
 authority_credential_signature   encoded hybrid signature       variable
-has_control_signing_seed         u8 = 0 or 1                     1
-control_signing_seed             32 bytes iff flag = 1          0 or 32
 has_control_route_key            u8 = 0 or 1                     1
 control_route_key                32 bytes iff flag = 1          0 or 32
-route_grant_count                u16, 1..256                     2
+route_grant_count                u16, 0..256                     2
 route_grants                     repeated as below               variable
 content_grant_count              u16, 0..256                     2
 content_grants                   repeated as below               variable
@@ -231,13 +236,18 @@ Each route grant is `b16(scope) || epoch u64 || route_seed[32]`. Each content
 grant is `b16(scope) || b16(topic) || epoch u64 || content_seed[32]`. Duplicate
 `(scope, epoch)` route grants and duplicate `(scope, topic, epoch)` content
 grants are invalid. The reference writer orders them lexicographically, but the
-local reader does not assign interoperability meaning to record order.
+local reader does not assign interoperability meaning to record order. The
+Relay role bit MUST be present exactly when the route-grant count is nonzero,
+and the Reader role bit MUST be present exactly when the content-grant count is
+nonzero. The ControlAuthority role is independent of both grant counts.
 
-The control-signing-seed flag MUST be one exactly when the ControlAuthority role
-bit is set. The checksum is:
+Version 3 contains no provisioning-root or authority-root signing seed. A
+ControlAuthority bundle uses its unique `node_identity_seed` to sign controls;
+the corresponding authority-root-signed credential carries the
+ControlAuthority role. The checksum is:
 
 ```text
-HD("aster/provisioning-check/v2", every preceding bundle byte)
+HD("aster/provisioning-check/v3", every preceding bundle byte)
 ```
 
 The checksum detects accidental damage; it does not make this secret bundle
@@ -248,7 +258,7 @@ The reference provisioner derives values with `PKDF` as follows:
 | Result | Root | Label | Context |
 |---|---|---|---|
 | mission | provisioning root | not KDF: `HD("aster/mission/v1", root)` | — |
-| authority signing seed | provisioning root | `authority-signing-seed` | empty |
+| authority signing seed (provisioner only; never placed in a bundle) | provisioning root | `authority-signing-seed` | empty |
 | mission control-route key | provisioning root | `mission-control-route` | mission |
 | scope route seed | provisioning root | `scope-routing-epoch` | `b16(scope) || 0 || epoch u64` |
 | topic content seed | provisioning root | `topic-content-epoch` | `b16(scope) || 1 || b16(topic) || epoch u64` |
@@ -263,10 +273,13 @@ key, try `PKDF(identity_seed, "p256-static-ecdh-scalar", counter u16, 32)` for
 the same counter range and select the first valid nonzero scalar. Its credential
 field is the 33-byte compressed SEC1 public point. The ML-DSA-65 seed is
 `PKDF(identity_seed, "ml-dsa-65-signing-seed", empty, 32)`. The ML-KEM-768 seed
-is `PKDF(identity_seed, "ml-kem-768-seed", empty, 64)`. Authority signing keys
-use the same P-256 and ML-DSA expansion from the derived authority signing seed.
-Those local key-generation steps do not add network fields; interoperable peers
-depend only on the public credential and proof bytes above.
+is `PKDF(identity_seed, "ml-kem-768-seed", empty, 64)`. The offline
+provisioner's authority signing keys use the same P-256 and ML-DSA expansion
+from the derived authority signing seed. Those local key-generation steps do
+not add network fields; interoperable peers depend only on the public credential
+and proof bytes above. Capturing one fielded ControlAuthority bundle therefore
+compromises that delegated identity, not the authority-root signing seed or
+every other delegated identity.
 
 ## 4. Semantic item core and identifiers
 
@@ -427,9 +440,9 @@ group_input = scope_bytes || 0x00 || topic_bytes
 ContentGroupID = HD("aster/content-group/v1", group_input)
 ```
 
-### 5.4 Singleton source authentication
+### 5.4 Format-2 singleton source authentication
 
-Profile 1 implements only a one-item authentication manifest:
+Envelope format 2 implements a one-item authentication manifest:
 
 ```text
 SingletonManifest(item_id, batch_id, header) =
@@ -453,22 +466,39 @@ Blob route commitment from being substituted without invalidating the source
 signature.
 
 No multi-item batch certificate, proof, or credential cache reference is encoded
-by this version. The resulting singleton overhead is a known release limitation.
+inside an `ASTRENV2` format-2 object. Semantic-version-2 sessions also support
+the separate `ASTRENV3` format-3 source-batch proof and compact item
+representations defined in [protocol.md](protocol.md) §6.1. Those bytes MUST NOT
+be inserted into or reinterpreted as an `ASTRENV2` object; format 2 remains the
+singleton fallback for semantic-version-2 peers and the only source-envelope
+format accepted by semantic version 1.
 
 ## 6. Authority control objects
 
 Control objects use the `ASTRENV2` public header, route encryption in §5.1, the
 mission control-route key in place of a scope route seed, and no content
-ciphertext. Their protected plaintext starts with:
+ciphertext. Delegated-control format 2 is the only accepted control plaintext;
+the legacy root-signed shape is rejected. Its protected plaintext starts with:
 
 ```text
-kind                 u8 = outer kind
-mission              32 bytes
-authority_id         32 bytes
-control_sequence     u64, nonzero
-has_previous         u8 = 0 or 1
-previous_envelope_id 32 bytes iff has_previous = 1
+kind                            u8 = outer kind
+control_magic                   "ASTRCA02"                    8
+control_authentication_format   u16 = 2                        2
+mission                         32 bytes
+authority_id                    32 bytes
+control_authority_credential    b32(credential_body), 1..16384 bytes
+authority_credential_signature  encoded hybrid signature
+control_sequence                u64, nonzero
+has_previous                    u8 = 0 or 1
+previous_envelope_id            32 bytes iff has_previous = 1
 ```
+
+The embedded credential MUST validate under the configured hybrid root key whose
+derived identifier equals `authority_id`, MUST name the same mission, MUST use
+only registered role bits, and MUST contain the ControlAuthority role. Its
+`NodeID` is the delegated control signer. The credential and its authority
+signature are part of the signed control bytes, so credential or signer
+substitution invalidates the control.
 
 Sequence one MUST have no previous identifier. Every other sequence MUST have a
 previous identifier. The current format thereby rejects sequence zero and also
@@ -499,14 +529,16 @@ recipient_package_count           u16, 1..128
 recipient_packages                count packages, defined below
 ```
 
-After the complete kind-specific unsigned suffix, an encoded hybrid authority
-signature ends the protected plaintext. Both components sign:
+After the complete kind-specific unsigned suffix, the delegated identity's
+encoded hybrid signature ends the protected plaintext. Both components sign:
 
 ```text
-HD("aster/authority-control/v1", every preceding protected plaintext byte)
+HD("aster/delegated-control/v2", every preceding protected plaintext byte)
 ```
 
-The signature is not included in its own message.
+The signature is not included in its own message. Verification therefore
+requires both the authority-root hybrid signature on the delegated credential
+and the delegated identity's hybrid signature on the complete control.
 
 Packages MUST be in strictly increasing `recipient_node_id` order. A package is:
 
@@ -620,11 +652,40 @@ topic_grants                      count * (b16(topic) || content_key[32])
 
 Every clear echo MUST match its authenticated enclosing control and package, the
 topics MUST be strictly increasing, and recomputing the salted grant commitment
-MUST succeed. Outer AEAD, authority signature, chain syntax, bounds, ordering,
-and package-set hash are checked before durable ingest. An out-of-order control
-remains pending and MUST NOT mutate keys. Activation occurs only after the
-control becomes durably applied, including when a newly contiguous predecessor
-causes a pending control to become applied.
+MUST succeed. Outer AEAD, the root-signed delegated credential, the delegated
+control signature, chain syntax, bounds, ordering, and package-set hash are
+checked before durable ingest. An out-of-order control remains pending and MUST
+NOT mutate keys. Activation occurs only after the control becomes durably
+applied, including when a newly contiguous predecessor causes a pending control
+to become applied.
+
+The durable row records both stable `authority_id` and delegated signer NodeID.
+All delegated ControlAuthority identities for that authority append to the same
+mission-wide sequence/head namespace keyed by `authority_id`; signer rotation
+does not create a new chain. A control signed by an identity already revoked in
+the applied prefix is rejected. If activation reaches a pending control whose
+signer was revoked by an earlier link, that control and the entire unapplied
+suffix depending on it are reported as rejected and removed from pending
+activation and transmission. A live signer must reissue the suffix from the
+last exact applied head.
+
+This is a single-writer authenticated log, not consensus. A planned handoff
+requires the new signer to possess a root-signed ControlAuthority credential and
+the trusted exact current `(sequence, envelope_id)` head before it appends; the
+old signer must stop writing and should be revoked in the contiguous history.
+Two valid signers that concurrently claim the same next sequence create a fork,
+which fails closed. The root provisioner does not bypass or reset the chain.
+Recovery after loss of a delegated signer therefore requires another trusted
+delegated signer plus the exact head. Recovery after total history loss, or
+authorized replacement of a forked head, requires a separately specified
+root-signed control epoch/cutover and an externally retained high-water mark;
+this profile does not define either mechanism.
+
+SQLite schema-11 rows persist the signer. Opening a schema-10 store that already
+contains ordinary or bridge control rows fails closed because those legacy rows
+cannot be safely attributed to a delegated identity. Such a store requires a
+future signed cutover/import procedure or a fresh store; only an empty schema-10
+control state is upgraded automatically.
 
 A matching, nonrevoked recipient verifies its exact credential hash, performs
 both P-256 agreement and ML-KEM decapsulation, opens the package, and validates
@@ -688,6 +749,87 @@ a newer registry was deleted. A deployment MUST persist the last accepted
 generation in independent durable state and supply it as the minimum generation
 on import; using the zero-minimum convenience import after losing that state
 does not provide rollback detection.
+
+### 6.2 Semantic-v2 bridge delegated control authentication
+
+A semantic-version-2 ObjectKind `4` bridge authorization uses authorization
+format `2`. Its protected plaintext begins with the following canonical fields;
+the enabled-only policy fields retain the bounds in [protocol.md](protocol.md)
+§12:
+
+```text
+object_kind                       u8 = 4
+authorization_format              u16 = 2
+mission                           32 bytes
+authority_id                      32 bytes
+control_sequence                  u64, nonzero
+has_previous                      u8 = 0 or 1
+previous_authorization_id         32 bytes iff has_previous = 1
+authorization_key                 32 bytes
+generation                        u64, nonzero
+enabled                           u8 = 0 or 1
+bridge_node_id                    32 bytes
+source_scope                      b16(UTF-8), 1..128 bytes
+target_scope                      b16(UTF-8), 1..128 bytes
+enabled_policy                    present iff enabled = 1
+delegated_control_authentication  b32(bytes below)
+```
+
+When `enabled = 1`, `enabled_policy` is encoded in this order:
+
+```text
+source_route_epoch                u64, nonzero
+target_route_epoch                u64, nonzero
+source_route_commitment           32 bytes
+target_route_commitment           32 bytes
+allowed_priority_mask             u8, nonzero subset of 0x0f
+max_total_hops                    u8, 1..8
+topic_count                       u16, 1..128
+topics                            count * b16(UTF-8), strictly increasing
+bridge_credential                 b32(credential_body), 1..16384 bytes
+bridge_authority_signature        encoded hybrid signature
+```
+
+The enabled bridge credential is distinct from the delegated control credential:
+it MUST identify `bridge_node_id`, carry the Relay role, and bind the exact
+source and target route commitments.
+
+The delegated-control authentication bytes are:
+
+```text
+magic                            "ASTRBCA2"                    8
+authentication_format            u16 = 2                        2
+control_authority_credential     b32(credential_body), 1..16384 bytes
+authority_credential_signature   encoded hybrid signature
+delegated_control_signature      encoded hybrid signature
+```
+
+The embedded control credential MUST validate under the mission authority root
+and carry the ControlAuthority role. Its NodeID is persisted as the bridge
+control signer. The delegated signature verifies the 32-byte message:
+
+```text
+HD("aster/bridge-delegated-control/v2",
+   authorization_format u16 = 2 ||
+   semantic_protocol u16 = 2 ||
+   suite_id u16 = 0x0001 ||
+   every authorization plaintext byte before
+     delegated_control_authentication ||
+   b32(control_authority_credential) ||
+   authority_credential_signature)
+```
+
+Authorization format `1` and the former bare root-signature authentication
+shape are rejected at the cryptographic-provider boundary. Durable activation
+uses one independently contiguous bridge-control chain keyed by the stable
+`authority_id`, not one chain per delegated signer. An authorization is live
+only when its exact bytes have been reauthenticated in the current process, it
+is the applied enabled generation high-water for its authorization key, and the
+authority root identifier, delegated control signer, and bridge node are all
+unrevoked. Revoking any of those identities removes dependent active routes and
+outbound work while retaining the authenticated history needed for recovery and
+audit. A revoked-signing pending suffix is rejected and removed under the same
+reissue-from-the-last-head rule as ordinary controls.
 
 ## 7. Per-hop custody wrapper
 
@@ -1427,7 +1569,7 @@ sealed source envelope and require both the exact authenticated
 bytes alone is insufficient; a different route root or chunk count is a hard
 failure.
 
-## 11. Required rejection behavior and unresolved formats
+## 11. Required rejection behavior and format boundaries
 
 A conforming decoder rejects before semantic dispatch when any fixed magic,
 version, suite, kind, reserved byte, exact component length, count, ordering,
@@ -1435,10 +1577,14 @@ cross-field length, hash, AEAD tag, required signature, or trailing-byte rule
 above fails. Authentication errors exposed to an unauthenticated peer SHOULD be
 indistinguishable.
 
+Semantic-version-2 multi-item source authentication and inclusion proofs are
+implemented as the separate `ASTRENV3` format-3 objects defined normatively in
+[protocol.md](protocol.md) §6.1. They are not unresolved extensions to
+`ASTRENV2` and MUST be rejected by semantic-version-1 sessions.
+
 The following bytes are intentionally not invented by this draft because the
 reference implementation does not contain them:
 
-- multi-item source-authentication batches or inclusion proofs;
 - broadcast capsules, cookies, resumption tickets,
   or authority-signed downgrade authorizations; and
 - any portable local database, keystore, partial-range, or Blob file layout.

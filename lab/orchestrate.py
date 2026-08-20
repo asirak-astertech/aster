@@ -70,6 +70,7 @@ CPU_VALUE = re.compile(r"^(?:[1-9][0-9]*|0\.[0-9]+|[1-9][0-9]*\.[0-9]+)$")
 EXPECTED_DOCKERIGNORE = """**
 !Cargo.toml
 !Cargo.lock
+!LICENSE
 !crates/
 !crates/**
 !lab/
@@ -999,6 +1000,7 @@ def collect_build_inputs() -> list[BuildInput]:
         root_ignore,
         WORKSPACE / "Cargo.toml",
         WORKSPACE / "Cargo.lock",
+        WORKSPACE / "LICENSE",
         WORKSPACE / "lab" / "Dockerfile",
         dockerfile_ignore,
         WORKSPACE / "lab" / "debian.sources",
