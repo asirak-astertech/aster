@@ -1,11 +1,21 @@
 # Go binding
 
+Use this module when a Go application needs Aster's offline publish, query,
+subscription, conflict, batch, Blob, bridge, or rekey operations. Start with the
+[commented ten-minute quickstart](../../docs/quickstart/go.md); this page is the
+binding-specific build and lifecycle reference.
+
 Build or install the native library first. The binding links with
 `-laster_ffi` and does not embed a repository-relative library path. Use the
 platform linker configuration, or set `CGO_LDFLAGS` to add the directory that
 contains the matching shared/static library. `Open` accepts opaque
 authority-issued provisioning bytes; it does not derive identity or scope
 access from an application password or seed.
+
+The core application flow is `Open` → `Subscribe`/`Query` → `Publish` → `Poll`
+→ `Acknowledge` → `Close`. Publish returns after a durable local commit and does
+not wait for a peer. Subscriptions are durable and at-least-once; acknowledge
+only after the application has committed its own result.
 
 `ProtocolVersion()` is retained as the legacy name for replication-wire version
 `1`; new code should use `ReplicationWireVersion()`. The default and highest
@@ -25,8 +35,9 @@ finalizer exists as a leak backstop.
 
 `PublishBatch` atomically commits 2-64 ordered, same-route items and returns
 ordered receipts plus aggregate eviction IDs. `RetainedDual` is the safe
-default/zero-value policy; `BatchOnly` explicitly omits semantic-v1 singleton
-retention. Rejected batches consume no publisher counter or event sequence.
+default/zero-value policy; `BatchOnly` explicitly omits unchanged format-2
+singleton representations used by semantic-v1 peers. Rejected batches consume
+no publisher counter or event sequence.
 
 The high-level cross-scope surface consists of `CreateBridgeEnrollment`,
 `EnableBridge`, `DisableBridge`, `BridgeItem`, `ExtendBridgeRoute`, exact status
@@ -46,7 +57,10 @@ bytes, keys, provider state, transports, or synchronization internals.
 Large immutable values use `NewBlobWriter` and `OpenBlobReader`. The writer
 implements `io.Writer`, the reader implements `io.Reader`, and `Finish` is
 idempotent across retries. Generic `Publish(Blob, ...)` is rejected so a Blob
-payload cannot accidentally be collected into one native allocation.
+payload cannot accidentally be collected into one native allocation. Each Blob
+chunk is authenticated before `Read` returns it, but the whole-content digest is
+verified only at the read that reaches `io.EOF`; do not act on accumulated bytes
+before that boundary.
 `PublishBlobBatch` finalizes and atomically publishes 2-64 distinct writers;
 the writers remain retryable on failure, and `Finish` returns their matching
 batch receipts after success.

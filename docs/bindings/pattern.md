@@ -45,8 +45,9 @@ a crash until acknowledged.
 
 Explicit batch publication accepts 2–64 ordered items with one class, topic,
 scope, publisher, and active epoch. Retained dual representation is the safe
-default/zero-value policy; batch-only is an explicit opt-out from semantic-v1
-singleton retention. A successful result preserves receipt order and reports
+default/zero-value policy; batch-only is an explicit opt-out from retaining
+unchanged format-2 singleton representations for semantic-v1 peers. A
+successful result preserves publish-result order and reports
 aggregate post-insert evictions. Rejection commits no member and consumes no
 publisher counter or Event sequence.
 

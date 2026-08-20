@@ -1,5 +1,10 @@
 # Python binding
 
+Use this binding when a Python application needs Aster's offline publish, query,
+subscription, conflict, batch, Blob, bridge, or rekey operations. Start with the
+[commented five-minute quickstart](../../docs/quickstart/python.md); this page is
+the binding-specific reference and lifecycle guide.
+
 The `aster_mesh` package uses only Python's standard-library `ctypes`; it wraps
 the shipped ABI rather than reimplementing protocol or cryptographic behavior.
 Build `aster-ffi` first or set `ASTER_MESH_LIBRARY` to the matching shared
@@ -17,16 +22,40 @@ owned buffers are copied into Python values and released deterministically.
 Transport-owned sealed envelopes are intentionally not exposed by this
 application binding.
 
+The simplest application flow is:
+
+```python
+with Node(database_path, provisioning_bundle) as node:
+    subscription = node.subscribe("position.current", "mission/team/alpha")
+    receipt = node.publish(
+        DataClass.STATE,
+        "position.current",
+        "mission/team/alpha",
+        payload,
+        logical_key=b"unit-7",
+    )
+    for delivery in subscription.poll():
+        process(delivery.item)
+        subscription.acknowledge(delivery)
+```
+
+Publish succeeds after a durable local commit; it does not wait for a peer.
+Subscriptions are durable and at-least-once, so application processing should be
+idempotent and acknowledgment should follow the application's own commit.
+
 `Node.publish_batch()` atomically commits 2-64 ordered, same-route
 `BatchPublishItem` values. `BatchPublicationPolicy.RETAINED_DUAL` is the
-offline-safe default, while `BATCH_ONLY` explicitly omits semantic-v1 singleton
-retention. Results contain ordered receipts and aggregate eviction IDs;
-rejection consumes no publisher counter or event sequence.
+offline-safe default, while `BATCH_ONLY` explicitly omits unchanged format-2
+singleton representations used by semantic-v1 peers. Results contain ordered
+publish results and aggregate eviction IDs; rejection consumes no publisher
+counter or event sequence.
 
 Use `Node.blob_writer(...)` for large immutable values, stream bounded writes,
 then call `finish()` before `close()`. `Node.blob_reader(...)` returns a
 file-like raw reader whose `readinto()` authenticates incrementally into a
-caller-owned buffer. Generic `Node.publish(DataClass.BLOB, ...)` is rejected.
+caller-owned buffer. Each chunk is authenticated before delivery, but the
+whole-content digest is verified only at EOF; do not act on accumulated bytes
+before that boundary. Generic `Node.publish(DataClass.BLOB, ...)` is rejected.
 `Node.publish_blob_batch()` finalizes and atomically publishes 2-64 distinct
 writers. Writers remain retryable on failure, and their normal `finish()` calls
 return matching batch receipts after success.
