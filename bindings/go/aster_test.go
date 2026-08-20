@@ -26,6 +26,32 @@ func TestVersionSurfacesDistinguishWireFromSemantics(t *testing.T) {
 	}
 }
 
+func TestFormatThreeBundleOpensAndLegacyFormatTwoIsRejected(t *testing.T) {
+	bundle := testBundle(t)
+	if len(bundle) < 8 || !bytes.Equal(bundle[:8], []byte("ASTRPB03")) {
+		t.Fatalf("test provisioning bundle does not use format three")
+	}
+	node, err := Open(":memory:", bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = node.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	legacy := append([]byte(nil), bundle...)
+	copy(legacy[:8], []byte("ASTRPB02"))
+	rejected, err := Open(":memory:", legacy)
+	if rejected != nil {
+		_ = rejected.Close()
+		t.Fatal("legacy format-two provisioning bundle was accepted")
+	}
+	native, ok := err.(*Error)
+	if !ok || native.Status != 9 {
+		t.Fatalf("legacy format-two rejection=%#v", err)
+	}
+}
+
 func TestBlobStreamingRoundTripAndIdempotentFinish(t *testing.T) {
 	node, err := Open(filepath.Join(t.TempDir(), "mesh.db"), testBundle(t))
 	if err != nil {

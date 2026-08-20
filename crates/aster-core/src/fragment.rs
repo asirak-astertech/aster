@@ -164,6 +164,18 @@ impl Reassembler {
         }
     }
 
+    /// Discards one incomplete transfer and releases its aggregate byte budget.
+    ///
+    /// Returns whether the transfer existed. Callers that attach transport
+    /// metadata to a transfer can use this to evict both states atomically.
+    pub fn remove(&mut self, transfer_id: u64) -> bool {
+        let Some(removed) = self.transfers.remove(&transfer_id) else {
+            return false;
+        };
+        self.buffered_bytes = self.buffered_bytes.saturating_sub(removed.bytes);
+        true
+    }
+
     /// Adds a fragment. Duplicate fragments are harmless. Completion removes and
     /// returns the assembled message.
     pub fn push(&mut self, fragment: Fragment) -> Result<Option<Vec<u8>>, FragmentError> {
@@ -284,5 +296,26 @@ mod tests {
             reassembler.push(second),
             Err(super::FragmentError::MessageTooLarge)
         ));
+    }
+
+    #[test]
+    fn removing_a_partial_transfer_releases_its_budget() {
+        let first = Fragment {
+            transfer_id: 1,
+            index: 0,
+            count: 2,
+            payload: vec![1; 8],
+        };
+        let second = Fragment {
+            transfer_id: 2,
+            index: 0,
+            count: 2,
+            payload: vec![2; 8],
+        };
+        let mut reassembler = Reassembler::with_budget(1, 8);
+        assert!(reassembler.push(first).unwrap().is_none());
+        assert!(reassembler.remove(1));
+        assert!(!reassembler.remove(1));
+        assert!(reassembler.push(second).unwrap().is_none());
     }
 }

@@ -27,7 +27,12 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::path::Path;
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 12;
+// Schema-11 stores had one node-global frontier. Schema 12 preserves every one
+// of those observations in this domain, which cannot collide with validated
+// Topic or Scope values because both reject the empty string.
+const LEGACY_CAUSAL_TOPIC: &str = "";
+const LEGACY_CAUSAL_SCOPE: &str = "";
 const TRANSFER_STORAGE_KEY_DOMAIN: &[u8] = b"aster/transfer-storage-key/v1";
 const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
 const MAX_STAGED_OBJECT_BYTES: u64 = 4 * 1024 * 1024;
@@ -36,6 +41,8 @@ const MAX_STAGING_OBJECTS: u64 = 10_000;
 const MAX_STAGED_RANGES_PER_OBJECT: u64 = 4_095;
 const MAX_STAGED_RANGES_GLOBAL: u64 = 65_536;
 const MAX_BATCH_STORE_PAGE: usize = 1_024;
+pub(crate) const MAX_COMPOSITE_INVENTORY_OBJECTS: usize = 100_000;
+pub(crate) const INVENTORY_OBJECT_LIMIT_ERROR: &str = "composite inventory object limit exceeded";
 #[allow(dead_code)]
 const MAX_BRIDGE_STORE_BATCH: usize = 1_024;
 #[allow(dead_code)]
@@ -143,6 +150,94 @@ pub struct StoredItem {
     pub inserted_order: u64,
 }
 
+/// Metadata-only inventory row used to reconcile stable objects without
+/// materializing their source-sealed bytes or application/causal payloads.
+///
+/// Data rows retain exactly the fields needed for expiry and peer-route
+/// authorization. Applied controls are mission-wide and therefore carry no
+/// topic, scope, or route epoch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InventoryMetadata {
+    Data {
+        envelope_id: EnvelopeId,
+        total_len: u64,
+        priority: Priority,
+        scope: Scope,
+        key_epoch: u64,
+        ttl_ms: Option<u64>,
+        tombstone: bool,
+        custody_age_ms: u64,
+        custody_clock_id: Option<[u8; 16]>,
+        custody_tick_ms: Option<u64>,
+        custody_elapsed_available: bool,
+    },
+    Control {
+        envelope_id: EnvelopeId,
+        total_len: u64,
+    },
+}
+
+impl InventoryMetadata {
+    pub fn envelope_id(&self) -> EnvelopeId {
+        match self {
+            Self::Data { envelope_id, .. } | Self::Control { envelope_id, .. } => *envelope_id,
+        }
+    }
+
+    pub fn total_len(&self) -> u64 {
+        match self {
+            Self::Data { total_len, .. } | Self::Control { total_len, .. } => *total_len,
+        }
+    }
+
+    pub fn priority(&self) -> Priority {
+        match self {
+            Self::Data { priority, .. } => *priority,
+            Self::Control { .. } => Priority::Flash,
+        }
+    }
+
+    pub fn is_control(&self) -> bool {
+        matches!(self, Self::Control { .. })
+    }
+
+    pub fn route(&self) -> Option<(&Scope, u64)> {
+        match self {
+            Self::Data {
+                scope, key_epoch, ..
+            } => Some((scope, *key_epoch)),
+            Self::Control { .. } => None,
+        }
+    }
+
+    pub fn is_forwardable_at(&self, sample: Option<CustodySample>) -> bool {
+        match self {
+            Self::Control { .. }
+            | Self::Data {
+                tombstone: true, ..
+            }
+            | Self::Data { ttl_ms: None, .. } => true,
+            Self::Data {
+                ttl_ms,
+                custody_age_ms,
+                custody_clock_id,
+                custody_tick_ms,
+                custody_elapsed_available,
+                ..
+            } => custody_age_from_fields(
+                *ttl_ms,
+                *custody_age_ms,
+                *custody_clock_id,
+                *custody_tick_ms,
+                *custody_elapsed_available,
+                sample,
+            )
+            .zip(*ttl_ms)
+            .is_some_and(|(age, ttl)| age < ttl),
+        }
+    }
+}
+
 /// Stable transfer identifier, distinct from the semantic item identifier.
 pub type EnvelopeId = [u8; 32];
 
@@ -157,6 +252,7 @@ pub type EnvelopeId = [u8; 32];
 pub(crate) struct VerifiedBridgeAuthorization {
     envelope_id: EnvelopeId,
     authorization: BridgeAuthorization,
+    control_signer: NodeId,
     exact_bytes: Vec<u8>,
 }
 
@@ -165,6 +261,7 @@ impl VerifiedBridgeAuthorization {
     pub(crate) fn from_provider(
         envelope_id: EnvelopeId,
         authorization: BridgeAuthorization,
+        control_signer: NodeId,
         exact_bytes: Vec<u8>,
     ) -> Result<Self, StoreError> {
         authorization
@@ -181,6 +278,7 @@ impl VerifiedBridgeAuthorization {
         Ok(Self {
             envelope_id,
             authorization,
+            control_signer,
             exact_bytes,
         })
     }
@@ -195,6 +293,7 @@ impl VerifiedBridgeAuthorization {
 pub(crate) struct StoredBridgeAuthorization {
     pub(crate) envelope_id: EnvelopeId,
     pub(crate) authorization: BridgeAuthorization,
+    pub(crate) control_signer: NodeId,
     pub(crate) exact_bytes: Vec<u8>,
     pub(crate) applied: bool,
     pub(crate) inserted_order: u64,
@@ -218,10 +317,53 @@ pub(crate) enum BridgeControlOutcome {
     Pending {
         envelope_id: EnvelopeId,
     },
+    Rejected {
+        envelope_id: EnvelopeId,
+        signer: NodeId,
+        rejected: Vec<RejectedControl>,
+    },
     Applied {
         envelope_id: EnvelopeId,
         activated: Vec<StoredBridgeAuthorization>,
+        rejected: Vec<RejectedControl>,
     },
+}
+
+impl BridgeControlOutcome {
+    pub(crate) fn rejected_input(&self) -> Option<RejectedControl> {
+        match self {
+            Self::Rejected {
+                envelope_id,
+                signer,
+                ..
+            } => Some(RejectedControl {
+                envelope_id: *envelope_id,
+                signer: *signer,
+            }),
+            Self::Applied {
+                envelope_id,
+                rejected,
+                ..
+            } => rejected
+                .iter()
+                .find(|control| control.envelope_id == *envelope_id)
+                .copied(),
+            Self::Duplicate { .. } | Self::Pending { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BridgeControlStage {
+    Inserted,
+    Duplicate,
+    Rejected(RejectedControl),
+}
+
+#[derive(Default)]
+struct BridgeControlActivation {
+    activated: Vec<StoredBridgeAuthorization>,
+    rejected: Vec<RejectedControl>,
 }
 
 /// A route wrapper and exact source dependency which have both been verified
@@ -1044,6 +1186,7 @@ impl From<ChunkRange> for crate::wire::ByteRange {
 pub struct Revocation {
     pub subject: NodeId,
     pub authority: NodeId,
+    pub signer: NodeId,
     pub generation: u64,
     pub control_sequence: u64,
     pub previous_control: Option<EnvelopeId>,
@@ -1055,6 +1198,7 @@ pub struct Revocation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScopeEpoch {
     pub authority: NodeId,
+    pub signer: NodeId,
     pub scope: Scope,
     pub epoch: u64,
     pub control_sequence: u64,
@@ -1062,10 +1206,23 @@ pub struct ScopeEpoch {
     pub sealed_notice: Vec<u8>,
 }
 
+/// Stable mission control-chain namespace paired with the delegated identity
+/// authorized to append the reserved link.
+///
+/// `authority` remains stable across signer rotation. Chain heads must never be
+/// keyed by `signer`, because doing so would create an independent history for
+/// every delegated credential.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ControlPrincipal {
+    pub authority: NodeId,
+    pub signer: NodeId,
+}
+
 /// Authority control-chain reservation used before cryptographic sealing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ControlReservation {
     pub authority: NodeId,
+    pub signer: NodeId,
     pub previous_sequence: u64,
     pub sequence: u64,
     pub previous_control: Option<EnvelopeId>,
@@ -1084,12 +1241,21 @@ pub enum ControlKind {
 pub struct StoredControl {
     pub envelope_id: EnvelopeId,
     pub authority: NodeId,
+    pub signer: NodeId,
     pub sequence: u64,
     pub previous_control: Option<EnvelopeId>,
     pub kind: ControlKind,
     pub sealed: Vec<u8>,
     pub applied: bool,
     pub inserted_order: u64,
+}
+
+/// Authenticated control discarded because its stable authority or delegated
+/// signer was revoked, or because it followed an invalidated pending link.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RejectedControl {
+    pub envelope_id: EnvelopeId,
+    pub signer: NodeId,
 }
 
 /// Result of storing a control and advancing any now-contiguous chain prefix.
@@ -1101,10 +1267,46 @@ pub enum ControlOutcome {
     Pending {
         envelope_id: EnvelopeId,
     },
+    Rejected {
+        envelope_id: EnvelopeId,
+        signer: NodeId,
+        rejected: Vec<RejectedControl>,
+    },
     Applied {
         envelope_id: EnvelopeId,
         activated: Vec<StoredControl>,
+        rejected: Vec<RejectedControl>,
     },
+}
+
+impl ControlOutcome {
+    /// Returns the authenticated input rejected by this operation, even when
+    /// an unrelated pending prefix activated in the same transaction.
+    ///
+    /// Callers must not acknowledge or advertise the input as committed when
+    /// this returns `Some`; the independently listed `activated` prefix remains
+    /// durable and still needs provider activation.
+    pub fn rejected_input(&self) -> Option<RejectedControl> {
+        match self {
+            Self::Rejected {
+                envelope_id,
+                signer,
+                ..
+            } => Some(RejectedControl {
+                envelope_id: *envelope_id,
+                signer: *signer,
+            }),
+            Self::Applied {
+                envelope_id,
+                rejected,
+                ..
+            } => rejected
+                .iter()
+                .find(|control| control.envelope_id == *envelope_id)
+                .copied(),
+            Self::Duplicate { .. } | Self::Pending { .. } => None,
+        }
+    }
 }
 
 /// Persisted coarse peer and reconciliation state.
@@ -1140,8 +1342,13 @@ pub enum StoreError {
     Zeroized,
     ControlFork,
     ControlRollback,
+    ControlSignerRevoked(NodeId),
+    ControlAuthorityRevoked(NodeId),
     BridgeControlFork,
     BridgeControlRollback,
+    BridgeControlSignerRevoked(NodeId),
+    BridgeControlAuthorityRevoked(NodeId),
+    LegacyControlMigrationRequired,
     BridgeDependencyMissing,
     BridgeRouteIneligible,
     BridgeObjectReferenced,
@@ -1173,12 +1380,27 @@ impl Display for StoreError {
             Self::Zeroized => formatter.write_str("node has been zeroized"),
             Self::ControlFork => formatter.write_str("authority control chain fork detected"),
             Self::ControlRollback => formatter.write_str("authority control rollback detected"),
+            Self::ControlSignerRevoked(_) => {
+                formatter.write_str("delegated control signer is revoked")
+            }
+            Self::ControlAuthorityRevoked(_) => {
+                formatter.write_str("stable control authority is revoked")
+            }
             Self::BridgeControlFork => {
                 formatter.write_str("bridge authority control chain fork detected")
             }
             Self::BridgeControlRollback => {
                 formatter.write_str("bridge authorization generation rollback detected")
             }
+            Self::BridgeControlSignerRevoked(_) => {
+                formatter.write_str("delegated bridge-control signer is revoked")
+            }
+            Self::BridgeControlAuthorityRevoked(_) => {
+                formatter.write_str("stable bridge-control authority is revoked")
+            }
+            Self::LegacyControlMigrationRequired => formatter.write_str(
+                "schema-10 control state requires an explicit signed authority cutover or a fresh store",
+            ),
             Self::BridgeDependencyMissing => {
                 formatter.write_str("verified bridge dependency is missing")
             }
@@ -1237,6 +1459,16 @@ pub trait RecordStore {
         commit: LocalBatchCommit,
     ) -> Result<BatchCommitOutcome, StoreError>;
     fn ingest(&mut self, item: StoredItem) -> Result<ApplyOutcome, StoreError>;
+    /// Selects one exact topic/scope cross-product as a single bounded,
+    /// metadata-only inventory operation. The sets are canonical by type and
+    /// the protocol INTEREST work ceiling is enforced again at this boundary.
+    /// Implementations must reject rather than truncate when the result exceeds
+    /// the 100,000-object composite inventory ceiling.
+    fn select_inventory_metadata(
+        &mut self,
+        topics: &BTreeSet<Topic>,
+        scopes: &BTreeSet<Scope>,
+    ) -> Result<Vec<InventoryMetadata>, StoreError>;
     fn query(&mut self, query: &StoreQuery) -> Result<Vec<StoredItem>, StoreError>;
     fn get(&mut self, id: &ItemId) -> Result<Option<StoredItem>, StoreError>;
     #[doc(hidden)]
@@ -1309,7 +1541,10 @@ pub trait RecordStore {
         range: ChunkRange,
         max_bytes: usize,
     ) -> Result<Vec<u8>, StoreError>;
-    fn reserve_control(&mut self, authority: NodeId) -> Result<ControlReservation, StoreError>;
+    fn reserve_control(
+        &mut self,
+        principal: ControlPrincipal,
+    ) -> Result<ControlReservation, StoreError>;
     fn commit_local_control(
         &mut self,
         reservation: &ControlReservation,
@@ -1442,6 +1677,7 @@ pub trait RecordStore {
 pub struct VerifiedStoredControl {
     pub envelope_id: EnvelopeId,
     pub authority: NodeId,
+    pub signer: NodeId,
     pub sequence: u64,
     pub previous_control: Option<EnvelopeId>,
     pub kind: ControlKind,
@@ -1780,6 +2016,14 @@ impl SqliteStore {
         }
         if version == 9 {
             migrate_v9_to_v10(&connection)?;
+            version = 10;
+        }
+        if version == 10 {
+            migrate_v10_to_v11(&connection)?;
+            version = 11;
+        }
+        if version == 11 {
+            migrate_v11_to_v12(&connection)?;
         }
         persist_config(&connection, &config)?;
         Ok(Self {
@@ -4238,25 +4482,35 @@ impl SqliteStore {
     /// Crash-atomically stores one provider-authenticated bridge control in its
     /// independent semantic-v2 chain. Chain activation is performed separately
     /// so an out-of-order record cannot acquire authority merely by being stored.
-    pub(crate) fn stage_bridge_authorization(
+    fn stage_bridge_authorization(
         &mut self,
         verified: &VerifiedBridgeAuthorization,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<BridgeControlStage, StoreError> {
         let authorization_body = verified
             .authorization
             .encode()
             .map_err(|error| StoreError::Invalid(error.to_string()))?;
         let transaction = self.connection.transaction()?;
-        if let Some((stored_body, stored_exact)) = transaction
+        if let Some((stored_body, stored_signer, stored_exact)) = transaction
             .query_row(
-                "SELECT authorization_body,exact_bytes FROM bridge_authorization_controls\n\
+                "SELECT authorization_body,control_signer,exact_bytes\n\
+                 FROM bridge_authorization_controls\n\
                  WHERE envelope_id=?1",
                 params![verified.envelope_id.as_slice()],
-                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                },
             )
             .optional()?
         {
-            if stored_body != authorization_body || stored_exact != verified.exact_bytes {
+            if stored_body != authorization_body
+                || node_from_vec(stored_signer, "bridge control signer")? != verified.control_signer
+                || stored_exact != verified.exact_bytes
+            {
                 return Err(StoreError::Corrupt(
                     "bridge authorization identity maps to different bytes".into(),
                 ));
@@ -4264,7 +4518,16 @@ impl SqliteStore {
             transaction.commit()?;
             self.verified_bridge_authorizations
                 .insert(verified.envelope_id);
-            return Ok(false);
+            return Ok(BridgeControlStage::Duplicate);
+        }
+        if control_signer_revoked_tx(&transaction, verified.authorization.authority_id)?
+            || control_signer_revoked_tx(&transaction, verified.control_signer)?
+        {
+            transaction.commit()?;
+            return Ok(BridgeControlStage::Rejected(RejectedControl {
+                envelope_id: verified.envelope_id,
+                signer: verified.control_signer,
+            }));
         }
         if transaction
             .query_row(
@@ -4307,17 +4570,18 @@ impl SqliteStore {
         let enabled = verified.authorization.enabled.as_ref();
         transaction.execute(
             "INSERT INTO bridge_authorization_controls(\n\
-               envelope_id,mission_id,authority_id,sequence,previous_control_id,\n\
+               envelope_id,mission_id,authority_id,control_signer,sequence,previous_control_id,\n\
                authorization_key,generation,enabled,bridge_node_id,source_scope,target_scope,\n\
                source_route_epoch,target_route_epoch,source_route_commitment,target_route_commitment,\n\
                allowed_priority_mask,max_total_hops,authorization_body,exact_bytes,applied,\n\
                inserted_order,accounted_bytes)\n\
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,\n\
-                    ?18,?19,0,?20,?21)",
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,\n\
+                    ?19,?20,0,?21,?22)",
             params![
                 verified.envelope_id.as_slice(),
                 verified.authorization.mission_id.as_slice(),
                 verified.authorization.authority_id.as_slice(),
+                verified.control_signer.as_slice(),
                 sql_u64(
                     verified.authorization.control_sequence,
                     "bridge control sequence"
@@ -4372,7 +4636,7 @@ impl SqliteStore {
         transaction.commit()?;
         self.verified_bridge_authorizations
             .insert(verified.envelope_id);
-        Ok(true)
+        Ok(BridgeControlStage::Inserted)
     }
 
     /// Stores a provider-verified bridge control and advances only the
@@ -4382,30 +4646,48 @@ impl SqliteStore {
         &mut self,
         verified: &VerifiedBridgeAuthorization,
     ) -> Result<BridgeControlOutcome, StoreError> {
-        let inserted = self.stage_bridge_authorization(verified)?;
-        let activated =
+        let staged = self.stage_bridge_authorization(verified)?;
+        let mut activation =
             self.activate_bridge_authorization_prefix(verified.authorization.authority_id)?;
-        if !activated.is_empty() {
+        if let BridgeControlStage::Rejected(rejected) = staged
+            && !activation.rejected.contains(&rejected)
+        {
+            activation.rejected.push(rejected);
+        }
+        if !activation.activated.is_empty() {
             return Ok(BridgeControlOutcome::Applied {
                 envelope_id: verified.envelope_id,
-                activated,
+                activated: activation.activated,
+                rejected: activation.rejected,
             });
         }
-        if inserted {
-            Ok(BridgeControlOutcome::Pending {
+        if let Some(rejected) = activation
+            .rejected
+            .iter()
+            .find(|rejected| rejected.envelope_id == verified.envelope_id)
+            .copied()
+        {
+            return Ok(BridgeControlOutcome::Rejected {
+                envelope_id: rejected.envelope_id,
+                signer: rejected.signer,
+                rejected: activation.rejected,
+            });
+        }
+        match staged {
+            BridgeControlStage::Inserted => Ok(BridgeControlOutcome::Pending {
                 envelope_id: verified.envelope_id,
-            })
-        } else {
-            Ok(BridgeControlOutcome::Duplicate {
+            }),
+            BridgeControlStage::Duplicate => Ok(BridgeControlOutcome::Duplicate {
                 envelope_id: verified.envelope_id,
-            })
+            }),
+            BridgeControlStage::Rejected(_) => unreachable!("rejected stage handled above"),
         }
     }
 
     fn activate_bridge_authorization_prefix(
         &mut self,
         authority: NodeId,
-    ) -> Result<Vec<StoredBridgeAuthorization>, StoreError> {
+    ) -> Result<BridgeControlActivation, StoreError> {
         let transaction = self.connection.transaction()?;
         let head = transaction
             .query_row(
@@ -4423,13 +4705,15 @@ impl SqliteStore {
             None => (0, None),
         };
         let mut activated_ids = Vec::new();
+        let mut rejected_ids = Vec::new();
+        let mut result = BridgeControlActivation::default();
         loop {
             let next_sequence = sequence
                 .checked_add(1)
                 .ok_or(StoreError::BridgeControlRollback)?;
             let candidate = transaction
                 .query_row(
-                    "SELECT envelope_id,previous_control_id,authorization_key,generation,enabled,\n\
+                    "SELECT envelope_id,control_signer,previous_control_id,authorization_key,generation,enabled,\n\
                             applied,authorization_body\n\
                      FROM bridge_authorization_controls\n\
                      WHERE authority_id=?1 AND sequence=?2",
@@ -4440,21 +4724,24 @@ impl SqliteStore {
                     |row| {
                         Ok((
                             row.get::<_, Vec<u8>>(0)?,
-                            row.get::<_, Option<Vec<u8>>>(1)?,
-                            row.get::<_, Vec<u8>>(2)?,
-                            row.get::<_, i64>(3)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, Option<Vec<u8>>>(2)?,
+                            row.get::<_, Vec<u8>>(3)?,
                             row.get::<_, i64>(4)?,
                             row.get::<_, i64>(5)?,
-                            row.get::<_, Vec<u8>>(6)?,
+                            row.get::<_, i64>(6)?,
+                            row.get::<_, Vec<u8>>(7)?,
                         ))
                     },
                 )
                 .optional()?;
-            let Some((envelope_id, previous, key, generation, enabled, applied, body)) = candidate
+            let Some((envelope_id, signer, previous, key, generation, enabled, applied, body)) =
+                candidate
             else {
                 break;
             };
             let envelope_id = node_from_vec(envelope_id, "bridge control envelope")?;
+            let signer = node_from_vec(signer, "bridge control signer")?;
             if !self.verified_bridge_authorizations.contains(&envelope_id) {
                 break;
             }
@@ -4463,6 +4750,15 @@ impl SqliteStore {
                 .transpose()?;
             if previous != predecessor || applied != 0 {
                 return Err(StoreError::BridgeControlFork);
+            }
+            if control_signer_revoked_tx(&transaction, authority)?
+                || control_signer_revoked_tx(&transaction, signer)?
+            {
+                let rejected =
+                    purge_pending_bridge_control_suffix_tx(&transaction, authority, next_sequence)?;
+                rejected_ids.extend(rejected.iter().map(|control| control.envelope_id));
+                result.rejected.extend(rejected);
+                break;
             }
             let key = node_from_vec(key, "bridge authorization key")?;
             let generation = from_sql_u64(generation, "bridge authorization generation")?;
@@ -4588,7 +4884,11 @@ impl SqliteStore {
             self.verified_pending_bridge_wrappers.clear();
             self.verified_bridge_sources.clear();
         }
-        Ok(activated)
+        for envelope_id in rejected_ids {
+            self.verified_bridge_authorizations.remove(&envelope_id);
+        }
+        result.activated = activated;
+        Ok(result)
     }
 
     /// Returns the persisted generation high-water. The caller must still
@@ -4624,7 +4924,8 @@ impl SqliteStore {
                JOIN bridge_authorization_controls c ON c.envelope_id=h.envelope_id\n\
                WHERE h.envelope_id=?1 AND h.enabled=1 AND c.applied=1\n\
                  AND NOT EXISTS(SELECT 1 FROM revocations r\n\
-                                WHERE r.subject IN (c.authority_id,c.bridge_node_id))\n\
+                                WHERE r.subject IN\n\
+                                  (c.authority_id,c.control_signer,c.bridge_node_id))\n\
              )",
             params![envelope_id.as_slice()],
             |row| row.get::<_, i64>(0),
@@ -5255,9 +5556,10 @@ impl SqliteStore {
             .map(|value| from_sql_u64(value, "bridge target scope epoch"))
             .transpose()?;
         let revoked: i64 = self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM revocations WHERE subject IN (?1,?2))",
+            "SELECT EXISTS(SELECT 1 FROM revocations WHERE subject IN (?1,?2,?3))",
             params![
                 target.authorization.authority_id.as_slice(),
+                target.control_signer.as_slice(),
                 target.authorization.bridge_node_id.as_slice()
             ],
             |row| row.get(0),
@@ -6847,6 +7149,7 @@ impl SqliteStore {
             if !self.bridge_authorization_is_live(&hop.authorization_envelope_id)? {
                 return Err(StoreError::BridgeRouteIneligible);
             }
+            let control_signer = stored.control_signer;
             let authorization = stored.authorization;
             authorization_records.insert(
                 hop.authorization_envelope_id,
@@ -6906,9 +7209,10 @@ impl SqliteStore {
                 return Err(StoreError::BridgeRouteIneligible);
             }
             let revoked: i64 = self.connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM revocations WHERE subject IN (?1,?2))",
+                "SELECT EXISTS(SELECT 1 FROM revocations WHERE subject IN (?1,?2,?3))",
                 params![
                     authorization.authority_id.as_slice(),
+                    control_signer.as_slice(),
                     hop.bridge_node_id.as_slice()
                 ],
                 |row| row.get(0),
@@ -9183,7 +9487,8 @@ impl SqliteStore {
                  JOIN bridge_authorization_controls c ON c.envelope_id=h.envelope_id\n\
                  WHERE h.envelope_id=e.authorization_envelope_id AND h.enabled=1\n\
                    AND c.applied=1 AND NOT EXISTS(SELECT 1 FROM revocations r\n\
-                     WHERE r.subject IN (c.authority_id,c.bridge_node_id)))\n\
+                     WHERE r.subject IN\n\
+                       (c.authority_id,c.control_signer,c.bridge_node_id)))\n\
                THEN 1 ELSE 0 END),0)\n\
              FROM bridge_wrapper_authorizations e WHERE e.wrapper_envelope_id=?1",
             params![wrapper_envelope_id.as_slice()],
@@ -9772,20 +10077,21 @@ impl SqliteStore {
         let row = self
             .connection
             .query_row(
-                "SELECT authorization_body,exact_bytes,applied,inserted_order\n\
+                "SELECT authorization_body,control_signer,exact_bytes,applied,inserted_order\n\
                  FROM bridge_authorization_controls WHERE envelope_id=?1",
                 params![envelope_id.as_slice()],
                 |row| {
                     Ok((
                         row.get::<_, Vec<u8>>(0)?,
                         row.get::<_, Vec<u8>>(1)?,
-                        row.get::<_, i64>(2)?,
+                        row.get::<_, Vec<u8>>(2)?,
                         row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((body, exact_bytes, applied, inserted_order)) = row else {
+        let Some((body, control_signer, exact_bytes, applied, inserted_order)) = row else {
             return Ok(None);
         };
         if exact_object_id(&exact_bytes) != *envelope_id {
@@ -9807,6 +10113,7 @@ impl SqliteStore {
         Ok(Some(StoredBridgeAuthorization {
             envelope_id: *envelope_id,
             authorization,
+            control_signer: node_from_vec(control_signer, "bridge control signer")?,
             exact_bytes,
             applied: match applied {
                 0 => false,
@@ -10759,7 +11066,12 @@ fn accept_bridge_source_semantics_tx(
             "bridge source ItemID maps to a different exact carrier".into(),
         ));
     }
-    record_accepted_frontier_dot_tx(transaction, metadata.stamp.dot)?;
+    record_accepted_frontier_dot_tx(
+        transaction,
+        &metadata.topic,
+        &metadata.origin_scope,
+        metadata.stamp.dot,
+    )?;
     Ok(())
 }
 
@@ -11199,7 +11511,9 @@ fn create_schema(connection: &Connection) -> Result<(), StoreError> {
     migrate_v6_to_v7(connection)?;
     migrate_v7_to_v8(connection)?;
     migrate_v8_to_v9(connection)?;
-    migrate_v9_to_v10(connection)
+    migrate_v9_to_v10(connection)?;
+    migrate_v10_to_v11(connection)?;
+    migrate_v11_to_v12(connection)
 }
 
 fn migrate_v1_to_v2(connection: &Connection) -> Result<(), StoreError> {
@@ -11824,6 +12138,91 @@ fn migrate_v9_to_v10(connection: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
+fn migrate_v10_to_v11(connection: &Connection) -> Result<(), StoreError> {
+    let transaction = connection.unchecked_transaction()?;
+    let legacy_controls: i64 = transaction.query_row(
+        "SELECT (SELECT count(*) FROM controls) +
+                (SELECT count(*) FROM bridge_authorization_controls)",
+        [],
+        |row| row.get(0),
+    )?;
+    if legacy_controls != 0 {
+        return Err(StoreError::LegacyControlMigrationRequired);
+    }
+    transaction.execute_batch(
+        "ALTER TABLE controls ADD COLUMN signer BLOB CHECK(length(signer)=32);\n\
+         ALTER TABLE bridge_authorization_controls ADD COLUMN control_signer BLOB\n\
+           CHECK(length(control_signer)=32);\n\
+         CREATE TRIGGER controls_require_signer_insert\n\
+           BEFORE INSERT ON controls WHEN NEW.signer IS NULL BEGIN\n\
+             SELECT RAISE(ABORT,'control signer is required');\n\
+           END;\n\
+         CREATE TRIGGER controls_require_signer_update\n\
+           BEFORE UPDATE OF signer ON controls WHEN NEW.signer IS NULL BEGIN\n\
+             SELECT RAISE(ABORT,'control signer is required');\n\
+           END;\n\
+         CREATE TRIGGER bridge_controls_require_signer_insert\n\
+           BEFORE INSERT ON bridge_authorization_controls\n\
+           WHEN NEW.control_signer IS NULL BEGIN\n\
+             SELECT RAISE(ABORT,'bridge control signer is required');\n\
+           END;\n\
+         CREATE TRIGGER bridge_controls_require_signer_update\n\
+           BEFORE UPDATE OF control_signer ON bridge_authorization_controls\n\
+           WHEN NEW.control_signer IS NULL BEGIN\n\
+             SELECT RAISE(ABORT,'bridge control signer is required');\n\
+           END;\n\
+         CREATE INDEX controls_signer ON controls(signer,applied,sequence);\n\
+         CREATE INDEX bridge_controls_signer\n\
+           ON bridge_authorization_controls(control_signer,applied,sequence);\n\
+         PRAGMA user_version=11;",
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v11_to_v12(connection: &Connection) -> Result<(), StoreError> {
+    let transaction =
+        Transaction::new_unchecked(connection, rusqlite::TransactionBehavior::Immediate)?;
+    let legacy_count: i64 =
+        transaction.query_row("SELECT count(*) FROM causal_frontier", [], |row| row.get(0))?;
+    if legacy_count > MAX_CAUSAL_CONTEXT_ENTRIES as i64 {
+        return Err(StoreError::Corrupt(
+            "legacy causal frontier exceeds the protocol bound".into(),
+        ));
+    }
+    transaction.execute_batch(
+        "ALTER TABLE causal_frontier RENAME TO causal_frontier_v11;\n\
+         CREATE TABLE causal_frontier (\n\
+           topic TEXT NOT NULL,scope TEXT NOT NULL,\n\
+           publisher BLOB NOT NULL CHECK(length(publisher)=32),\n\
+           counter INTEGER NOT NULL CHECK(counter>0),\n\
+           CHECK((topic='' AND scope='') OR (topic<>'' AND scope<>'')),\n\
+           PRIMARY KEY(topic,scope,publisher)\n\
+         ) STRICT;",
+    )?;
+    transaction.execute(
+        "INSERT INTO causal_frontier(topic,scope,publisher,counter)\n\
+         SELECT ?1,?2,publisher,counter FROM causal_frontier_v11",
+        params![LEGACY_CAUSAL_TOPIC, LEGACY_CAUSAL_SCOPE],
+    )?;
+    let migrated_count: i64 = transaction.query_row(
+        "SELECT count(*) FROM causal_frontier WHERE topic=?1 AND scope=?2",
+        params![LEGACY_CAUSAL_TOPIC, LEGACY_CAUSAL_SCOPE],
+        |row| row.get(0),
+    )?;
+    if migrated_count != legacy_count {
+        return Err(StoreError::Corrupt(
+            "legacy causal frontier migration lost rows".into(),
+        ));
+    }
+    transaction.execute_batch(
+        "DROP TABLE causal_frontier_v11;\n\
+         PRAGMA user_version=12;",
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn persist_config(connection: &Connection, config: &StoreConfig) -> Result<(), StoreError> {
     let values = [
         ("max_items", config.max_items),
@@ -11933,6 +12332,227 @@ fn decode_item_row(row: &Row<'_>) -> rusqlite::Result<StoredItem> {
 
 const ITEM_COLUMNS: &str = "item_id,data_class,topic,scope,priority,publisher,causal_counter,causal_context,event_sequence,logical_key,ttl_ms,observed_at_ms,sealed,content_len,tombstone,key_epoch,version_status,inserted_order,envelope_id,custody_age_ms,custody_clock_id,custody_tick_ms,custody_elapsed_available";
 
+// Lifecycle maintenance needs stable grouping, retention, and elapsed-custody
+// metadata, but never the source-sealed envelope or causal context. Keeping a
+// separate projection prevents quota and garbage-collection scans from copying
+// those potentially large BLOBs across the SQLite boundary for every item.
+const LIFECYCLE_ITEM_COLUMNS: &str = "item_id,data_class,topic,scope,logical_key,ttl_ms,observed_at_ms,tombstone,version_status,custody_age_ms,custody_clock_id,custody_tick_ms,custody_elapsed_available";
+
+#[derive(Clone, Debug)]
+struct LifecycleItem {
+    id: ItemId,
+    class: DataClass,
+    topic: Topic,
+    scope: Scope,
+    logical_key: Vec<u8>,
+    ttl_ms: Option<u64>,
+    observed_at_ms: Option<u64>,
+    tombstone: bool,
+    status: VersionStatus,
+    custody_age_ms: u64,
+    custody_clock_id: Option<[u8; 16]>,
+    custody_tick_ms: Option<u64>,
+    custody_elapsed_available: bool,
+}
+
+impl LifecycleItem {
+    fn group_key(&self) -> (i64, String, String, Vec<u8>) {
+        (
+            class_to_i64(self.class),
+            self.topic.as_str().to_owned(),
+            self.scope.as_str().to_owned(),
+            self.logical_key.clone(),
+        )
+    }
+
+    fn is_expired_at(&self, sample: Option<CustodySample>) -> bool {
+        if self.tombstone {
+            return false;
+        }
+        self.ttl_ms
+            .zip(custody_age_from_fields(
+                self.ttl_ms,
+                self.custody_age_ms,
+                self.custody_clock_id,
+                self.custody_tick_ms,
+                self.custody_elapsed_available,
+                sample,
+            ))
+            .is_some_and(|(ttl, age)| age >= ttl)
+    }
+}
+
+fn decode_lifecycle_item_row(row: &Row<'_>) -> rusqlite::Result<LifecycleItem> {
+    fn conversion(error: StoreError) -> rusqlite::Error {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Blob, Box::new(error))
+    }
+
+    let ttl_ms = row
+        .get::<_, Option<i64>>(5)?
+        .map(|value| from_sql_u64(value, "lifecycle ttl"))
+        .transpose()
+        .map_err(conversion)?;
+    let observed_at_ms = row
+        .get::<_, Option<i64>>(6)?
+        .map(|value| from_sql_u64(value, "lifecycle observation time"))
+        .transpose()
+        .map_err(conversion)?;
+    let custody_clock_id = row
+        .get::<_, Option<Vec<u8>>>(10)?
+        .map(|value| clock_from_vec(value, "lifecycle custody clock id"))
+        .transpose()
+        .map_err(conversion)?;
+    let custody_tick_ms = row
+        .get::<_, Option<i64>>(11)?
+        .map(|value| from_sql_u64(value, "lifecycle custody tick"))
+        .transpose()
+        .map_err(conversion)?;
+    Ok(LifecycleItem {
+        id: item_from_vec(row.get(0)?, "lifecycle item id").map_err(conversion)?,
+        class: class_from_i64(row.get(1)?).map_err(conversion)?,
+        topic: Topic::new(row.get::<_, String>(2)?)
+            .map_err(|error| conversion(StoreError::Corrupt(error.to_string())))?,
+        scope: Scope::new(row.get::<_, String>(3)?)
+            .map_err(|error| conversion(StoreError::Corrupt(error.to_string())))?,
+        logical_key: row.get(4)?,
+        ttl_ms,
+        observed_at_ms,
+        tombstone: row.get::<_, i64>(7)? != 0,
+        status: status_from_i64(row.get(8)?).map_err(conversion)?,
+        custody_age_ms: from_sql_u64(row.get(9)?, "lifecycle custody age").map_err(conversion)?,
+        custody_clock_id,
+        custody_tick_ms,
+        custody_elapsed_available: row.get::<_, i64>(12)? != 0,
+    })
+}
+
+// `length(sealed)` is evaluated by SQLite and crosses the Rust boundary as an
+// integer. The source-sealed BLOB itself is deliberately absent from this
+// projection, as are semantic item IDs, publishers, causal contexts, logical
+// keys, and application length/payload metadata.
+const INVENTORY_ITEM_COLUMNS: &str = "0 AS object_kind,envelope_id,length(sealed) AS sealed_len,priority,scope,key_epoch,ttl_ms,tombstone,custody_age_ms,custody_clock_id,custody_tick_ms,custody_elapsed_available";
+const INVENTORY_CONTROL_COLUMNS: &str = "1 AS object_kind,envelope_id,length(sealed) AS sealed_len,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL";
+
+fn select_inventory_metadata_bounded(
+    connection: &Connection,
+    topics: &BTreeSet<Topic>,
+    scopes: &BTreeSet<Scope>,
+    max_objects: usize,
+) -> Result<Vec<InventoryMetadata>, StoreError> {
+    crate::wire::validate_interest_work(topics.len(), scopes.len())
+        .map_err(|error| StoreError::Invalid(error.to_string()))?;
+
+    use rusqlite::types::Value;
+    let query_limit = max_objects
+        .checked_add(1)
+        .ok_or_else(|| StoreError::Invalid(INVENTORY_OBJECT_LIMIT_ERROR.into()))?;
+    let query_limit = i64::try_from(query_limit)
+        .map_err(|_| StoreError::Invalid(INVENTORY_OBJECT_LIMIT_ERROR.into()))?;
+    let mut values =
+        Vec::<Value>::with_capacity(topics.len().saturating_add(scopes.len()).saturating_add(1));
+    let mut sql = if topics.is_empty() || scopes.is_empty() {
+        format!("SELECT {INVENTORY_CONTROL_COLUMNS} FROM controls WHERE applied=1")
+    } else {
+        let topic_parameters = std::iter::repeat_n("?", topics.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let scope_parameters = std::iter::repeat_n("?", scopes.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        values.extend(
+            topics
+                .iter()
+                .map(|topic| Value::from(topic.as_str().to_owned())),
+        );
+        values.extend(
+            scopes
+                .iter()
+                .map(|scope| Value::from(scope.as_str().to_owned())),
+        );
+        format!(
+            "SELECT {INVENTORY_ITEM_COLUMNS} FROM items INDEXED BY items_projection \
+             WHERE topic IN ({topic_parameters}) AND scope IN ({scope_parameters}) \
+             UNION ALL SELECT {INVENTORY_CONTROL_COLUMNS} FROM controls WHERE applied=1"
+        )
+    };
+    sql.push_str(" LIMIT ?");
+    values.push(Value::Integer(query_limit));
+
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map(
+        rusqlite::params_from_iter(values),
+        decode_inventory_metadata_row,
+    )?;
+    let mut metadata = Vec::new();
+    for row in rows {
+        let row = row?;
+        if metadata.len() == max_objects {
+            return Err(StoreError::Invalid(INVENTORY_OBJECT_LIMIT_ERROR.into()));
+        }
+        metadata.push(row);
+    }
+    Ok(metadata)
+}
+
+fn decode_inventory_metadata_row(row: &Row<'_>) -> rusqlite::Result<InventoryMetadata> {
+    fn conversion(error: StoreError) -> rusqlite::Error {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Blob, Box::new(error))
+    }
+
+    let object_kind: i64 = row.get(0)?;
+    let envelope_id = item_from_vec(row.get(1)?, "inventory envelope id").map_err(conversion)?;
+    let total_len = from_sql_u64(row.get(2)?, "inventory sealed length").map_err(conversion)?;
+    match object_kind {
+        0 => {
+            let priority = priority_from_i64(row.get(3)?).map_err(conversion)?;
+            let scope = Scope::new(row.get::<_, String>(4)?)
+                .map_err(|error| conversion(StoreError::Corrupt(error.to_string())))?;
+            let key_epoch = from_sql_u64(row.get(5)?, "inventory key epoch").map_err(conversion)?;
+            let ttl_ms = row
+                .get::<_, Option<i64>>(6)?
+                .map(|value| from_sql_u64(value, "inventory ttl"))
+                .transpose()
+                .map_err(conversion)?;
+            let custody_age_ms =
+                from_sql_u64(row.get(8)?, "inventory custody age").map_err(conversion)?;
+            let custody_clock_id = row
+                .get::<_, Option<Vec<u8>>>(9)?
+                .map(|value| {
+                    value.try_into().map_err(|_| {
+                        StoreError::Corrupt("inventory custody clock id is not 16 bytes".into())
+                    })
+                })
+                .transpose()
+                .map_err(conversion)?;
+            let custody_tick_ms = row
+                .get::<_, Option<i64>>(10)?
+                .map(|value| from_sql_u64(value, "inventory custody tick"))
+                .transpose()
+                .map_err(conversion)?;
+            Ok(InventoryMetadata::Data {
+                envelope_id,
+                total_len,
+                priority,
+                scope,
+                key_epoch,
+                ttl_ms,
+                tombstone: row.get::<_, i64>(7)? != 0,
+                custody_age_ms,
+                custody_clock_id,
+                custody_tick_ms,
+                custody_elapsed_available: row.get::<_, i64>(11)? != 0,
+            })
+        }
+        1 => Ok(InventoryMetadata::Control {
+            envelope_id,
+            total_len,
+        }),
+        _ => Err(conversion(StoreError::Corrupt(
+            "unknown inventory object kind".into(),
+        ))),
+    }
+}
+
 fn load_item_tx(
     transaction: &Transaction<'_>,
     id: &ItemId,
@@ -11945,35 +12565,75 @@ fn load_item_tx(
 }
 
 fn custody_age_at(item: &StoredItem, sample: Option<CustodySample>) -> Option<u64> {
-    if item.ttl_ms.is_none() {
-        if item.custody_elapsed_available
+    custody_age_from_fields(
+        item.ttl_ms,
+        item.custody_age_ms,
+        item.custody_clock_id,
+        item.custody_tick_ms,
+        item.custody_elapsed_available,
+        sample,
+    )
+}
+
+fn custody_age_from_fields(
+    ttl_ms: Option<u64>,
+    custody_age_ms: u64,
+    custody_clock_id: Option<[u8; 16]>,
+    custody_tick_ms: Option<u64>,
+    custody_elapsed_available: bool,
+    sample: Option<CustodySample>,
+) -> Option<u64> {
+    if ttl_ms.is_none() {
+        if custody_elapsed_available
             && let (Some(clock_id), Some(tick), Some(sample)) =
-                (item.custody_clock_id, item.custody_tick_ms, sample)
+                (custody_clock_id, custody_tick_ms, sample)
             && clock_id == sample.clock_id
             && sample.tick_ms >= tick
         {
-            return Some(
-                item.custody_age_ms
-                    .saturating_add(sample.tick_ms.saturating_sub(tick)),
-            );
+            return Some(custody_age_ms.saturating_add(sample.tick_ms.saturating_sub(tick)));
         }
-        return Some(item.custody_age_ms);
+        return Some(custody_age_ms);
     }
-    if !item.custody_elapsed_available {
+    if !custody_elapsed_available {
         return None;
     }
-    let (Some(clock_id), Some(tick), Some(sample)) =
-        (item.custody_clock_id, item.custody_tick_ms, sample)
+    let (Some(clock_id), Some(tick), Some(sample)) = (custody_clock_id, custody_tick_ms, sample)
     else {
         return None;
     };
     if clock_id != sample.clock_id || sample.tick_ms < tick {
         return None;
     }
-    Some(
-        item.custody_age_ms
-            .saturating_add(sample.tick_ms.saturating_sub(tick)),
-    )
+    Some(custody_age_ms.saturating_add(sample.tick_ms.saturating_sub(tick)))
+}
+
+fn advance_custody_fields(
+    ttl_ms: Option<u64>,
+    custody_age_ms: &mut u64,
+    custody_clock_id: &mut Option<[u8; 16]>,
+    custody_tick_ms: &mut Option<u64>,
+    custody_elapsed_available: &mut bool,
+    sample: Option<CustodySample>,
+) {
+    let effective = custody_age_from_fields(
+        ttl_ms,
+        *custody_age_ms,
+        *custody_clock_id,
+        *custody_tick_ms,
+        *custody_elapsed_available,
+        sample,
+    );
+    match (effective, sample) {
+        (Some(age), Some(sample)) if *custody_elapsed_available => {
+            *custody_age_ms = (*custody_age_ms).max(age);
+            *custody_clock_id = Some(sample.clock_id);
+            *custody_tick_ms = Some(sample.tick_ms);
+        }
+        (None, _) if ttl_ms.is_some() => {
+            *custody_elapsed_available = false;
+        }
+        _ => {}
+    }
 }
 
 fn advance_custody_tx(
@@ -11984,18 +12644,14 @@ fn advance_custody_tx(
     let Some(mut item) = load_item_tx(transaction, &id)? else {
         return Ok(None);
     };
-    let effective = custody_age_at(&item, sample);
-    match (effective, sample) {
-        (Some(age), Some(sample)) if item.custody_elapsed_available => {
-            item.custody_age_ms = item.custody_age_ms.max(age);
-            item.custody_clock_id = Some(sample.clock_id);
-            item.custody_tick_ms = Some(sample.tick_ms);
-        }
-        (None, _) if item.ttl_ms.is_some() => {
-            item.custody_elapsed_available = false;
-        }
-        _ => {}
-    }
+    advance_custody_fields(
+        item.ttl_ms,
+        &mut item.custody_age_ms,
+        &mut item.custody_clock_id,
+        &mut item.custody_tick_ms,
+        &mut item.custody_elapsed_available,
+        sample,
+    );
     transaction.execute(
         "UPDATE items SET custody_age_ms=?1,custody_clock_id=?2,custody_tick_ms=?3,\n\
            custody_elapsed_available=?4 WHERE item_id=?5",
@@ -12014,6 +12670,39 @@ fn advance_custody_tx(
         ],
     )?;
     Ok(Some(item))
+}
+
+fn advance_lifecycle_custody_tx(
+    transaction: &Transaction<'_>,
+    item: &mut LifecycleItem,
+    sample: Option<CustodySample>,
+) -> Result<(), StoreError> {
+    advance_custody_fields(
+        item.ttl_ms,
+        &mut item.custody_age_ms,
+        &mut item.custody_clock_id,
+        &mut item.custody_tick_ms,
+        &mut item.custody_elapsed_available,
+        sample,
+    );
+    transaction.execute(
+        "UPDATE items SET custody_age_ms=?1,custody_clock_id=?2,custody_tick_ms=?3,\n\
+           custody_elapsed_available=?4 WHERE item_id=?5",
+        params![
+            sql_u64(item.custody_age_ms, "custody age")?,
+            item.custody_clock_id.map(|value| value.to_vec()),
+            item.custody_tick_ms
+                .map(|value| sql_u64(value, "custody tick"))
+                .transpose()?,
+            if item.custody_elapsed_available {
+                1i64
+            } else {
+                0i64
+            },
+            item.id.as_slice()
+        ],
+    )?;
+    Ok(())
 }
 
 fn merge_duplicate_custody_tx(
@@ -12051,7 +12740,7 @@ fn merge_duplicate_custody_tx(
 }
 
 const CONTROL_COLUMNS: &str =
-    "envelope_id,authority,sequence,previous_control,kind,sealed,applied,inserted_order";
+    "envelope_id,authority,signer,sequence,previous_control,kind,sealed,applied,inserted_order";
 
 fn control_kind_from_i64(value: i64) -> Result<ControlKind, StoreError> {
     match value {
@@ -12075,13 +12764,14 @@ fn decode_control_row(row: &Row<'_>) -> rusqlite::Result<StoredControl> {
     Ok(StoredControl {
         envelope_id: item_from_vec(row.get(0)?, "control envelope id").map_err(conversion)?,
         authority: node_from_vec(row.get(1)?, "control authority").map_err(conversion)?,
-        sequence: from_sql_u64(row.get(2)?, "control sequence").map_err(conversion)?,
-        previous_control: optional_envelope_from_vec(row.get(3)?, "previous control")
+        signer: node_from_vec(row.get(2)?, "control signer").map_err(conversion)?,
+        sequence: from_sql_u64(row.get(3)?, "control sequence").map_err(conversion)?,
+        previous_control: optional_envelope_from_vec(row.get(4)?, "previous control")
             .map_err(conversion)?,
-        kind: control_kind_from_i64(row.get(4)?).map_err(conversion)?,
-        sealed: row.get(5)?,
-        applied: row.get::<_, i64>(6)? != 0,
-        inserted_order: from_sql_u64(row.get(7)?, "control inserted order").map_err(conversion)?,
+        kind: control_kind_from_i64(row.get(5)?).map_err(conversion)?,
+        sealed: row.get(6)?,
+        applied: row.get::<_, i64>(7)? != 0,
+        inserted_order: from_sql_u64(row.get(8)?, "control inserted order").map_err(conversion)?,
     })
 }
 
@@ -12108,11 +12798,13 @@ fn validate_control(control: &VerifiedStoredControl) -> Result<(), StoreError> {
     match (&control.kind, &control.revocation, &control.scope_epoch) {
         (ControlKind::Revocation, Some(effect), None)
             if effect.authority == control.authority
+                && effect.signer == control.signer
                 && effect.control_sequence == control.sequence
                 && effect.previous_control == control.previous_control
                 && effect.sealed_notice == control.sealed => {}
         (ControlKind::ScopeEpoch, None, Some(effect))
             if effect.authority == control.authority
+                && effect.signer == control.signer
                 && effect.control_sequence == control.sequence
                 && effect.previous_control == control.previous_control
                 && effect.sealed_notice == control.sealed => {}
@@ -12127,25 +12819,43 @@ fn validate_control(control: &VerifiedStoredControl) -> Result<(), StoreError> {
 
 fn validate_control_effect_order_tx(
     transaction: &Transaction<'_>,
-    control: &VerifiedStoredControl,
+    control: &StoredControl,
 ) -> Result<(), StoreError> {
     let (column, key, value): (&str, rusqlite::types::Value, u64) = match control.kind {
         ControlKind::Revocation => {
-            let effect = control.revocation.as_ref().expect("validated revocation");
-            ("subject", effect.subject.to_vec().into(), effect.generation)
+            let (subject, generation): (Vec<u8>, i64) = transaction.query_row(
+                "SELECT subject,generation FROM controls WHERE envelope_id=?1",
+                params![control.envelope_id.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            (
+                "subject",
+                node_from_vec(subject, "control effect subject")?
+                    .to_vec()
+                    .into(),
+                from_sql_u64(generation, "control effect generation")?,
+            )
         }
         ControlKind::ScopeEpoch => {
-            let effect = control.scope_epoch.as_ref().expect("validated scope epoch");
+            let (scope, epoch): (String, i64) = transaction.query_row(
+                "SELECT scope,epoch FROM controls WHERE envelope_id=?1",
+                params![control.envelope_id.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
             (
                 "scope",
-                effect.scope.as_str().to_owned().into(),
-                effect.epoch,
+                Scope::new(scope)
+                    .map_err(|error| StoreError::Corrupt(error.to_string()))?
+                    .as_str()
+                    .to_owned()
+                    .into(),
+                from_sql_u64(epoch, "control effect epoch")?,
             )
         }
     };
     let sql = format!(
         "SELECT authority,sequence,CASE kind WHEN 1 THEN generation ELSE epoch END \
-         FROM controls WHERE {column}=?1 ORDER BY sequence"
+         FROM controls WHERE applied=1 AND {column}=?1 ORDER BY sequence"
     );
     let mut statement = transaction.prepare(&sql)?;
     let rows = statement.query_map(params![key], |row| {
@@ -12173,13 +12883,200 @@ fn validate_control_effect_order_tx(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ControlInsert {
+    Inserted,
+    Duplicate,
+    Rejected(RejectedControl),
+}
+
+fn control_signer_revoked_tx(
+    transaction: &Transaction<'_>,
+    signer: NodeId,
+) -> Result<bool, StoreError> {
+    Ok(transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM revocations WHERE subject=?1)",
+        params![signer.as_slice()],
+        |row| row.get::<_, i64>(0),
+    )? != 0)
+}
+
+fn purge_pending_control_suffix_tx(
+    transaction: &Transaction<'_>,
+    authority: NodeId,
+    first_sequence: u64,
+) -> Result<Vec<RejectedControl>, StoreError> {
+    let rejected = {
+        let mut statement = transaction.prepare(
+            "SELECT envelope_id,signer FROM controls\n\
+             WHERE authority=?1 AND applied=0 AND sequence>=?2\n\
+             ORDER BY sequence,envelope_id",
+        )?;
+        statement
+            .query_map(
+                params![
+                    authority.as_slice(),
+                    sql_u64(first_sequence, "rejected control suffix sequence")?
+                ],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )?
+            .map(|row| {
+                let (envelope_id, signer) = row?;
+                Ok(RejectedControl {
+                    envelope_id: item_from_vec(envelope_id, "rejected control envelope")?,
+                    signer: node_from_vec(signer, "rejected control signer")?,
+                })
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?
+    };
+    transaction.execute(
+        "DELETE FROM controls WHERE authority=?1 AND applied=0 AND sequence>=?2",
+        params![
+            authority.as_slice(),
+            sql_u64(first_sequence, "rejected control suffix sequence")?
+        ],
+    )?;
+    Ok(rejected)
+}
+
+fn purge_pending_bridge_control_suffix_tx(
+    transaction: &Transaction<'_>,
+    authority: NodeId,
+    first_sequence: u64,
+) -> Result<Vec<RejectedControl>, StoreError> {
+    let rejected = {
+        let mut statement = transaction.prepare(
+            "SELECT envelope_id,control_signer FROM bridge_authorization_controls\n\
+             WHERE authority_id=?1 AND applied=0 AND sequence>=?2\n\
+             ORDER BY sequence,envelope_id",
+        )?;
+        statement
+            .query_map(
+                params![
+                    authority.as_slice(),
+                    sql_u64(first_sequence, "rejected bridge suffix sequence")?
+                ],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )?
+            .map(|row| {
+                let (envelope_id, signer) = row?;
+                Ok(RejectedControl {
+                    envelope_id: item_from_vec(envelope_id, "rejected bridge control")?,
+                    signer: node_from_vec(signer, "rejected bridge signer")?,
+                })
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?
+    };
+    let sequence = sql_u64(first_sequence, "rejected bridge suffix sequence")?;
+    for table in [
+        "bridge_authorization_topics",
+        "bridge_authorization_peer_receipts",
+        "bridge_authorization_peer_attempts",
+        "bridge_authorization_outbox",
+    ] {
+        transaction.execute(
+            &format!(
+                "DELETE FROM {table} WHERE envelope_id IN (\n\
+                   SELECT envelope_id FROM bridge_authorization_controls\n\
+                   WHERE authority_id=?1 AND applied=0 AND sequence>=?2)"
+            ),
+            params![authority.as_slice(), sequence],
+        )?;
+    }
+    transaction.execute(
+        "DELETE FROM bridge_authorization_controls\n\
+         WHERE authority_id=?1 AND applied=0 AND sequence>=?2",
+        params![authority.as_slice(), sequence],
+    )?;
+    Ok(rejected)
+}
+
+fn purge_revoked_principal_pending_suffixes_tx(
+    transaction: &Transaction<'_>,
+    principal: NodeId,
+) -> Result<Vec<RejectedControl>, StoreError> {
+    let ordinary_starts = {
+        let mut statement = transaction.prepare(
+            "SELECT authority,min(sequence) FROM controls\n\
+             WHERE applied=0 AND (signer=?1 OR authority=?1)\n\
+             GROUP BY authority ORDER BY authority",
+        )?;
+        statement
+            .query_map(params![principal.as_slice()], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let mut rejected = Vec::new();
+    for (authority, first_sequence) in ordinary_starts {
+        rejected.extend(purge_pending_control_suffix_tx(
+            transaction,
+            node_from_vec(authority, "pending control authority")?,
+            from_sql_u64(first_sequence, "pending control sequence")?,
+        )?);
+    }
+
+    let bridge_starts = {
+        let mut statement = transaction.prepare(
+            "SELECT authority_id,min(sequence) FROM bridge_authorization_controls\n\
+             WHERE applied=0 AND (control_signer=?1 OR authority_id=?1)\n\
+             GROUP BY authority_id ORDER BY authority_id",
+        )?;
+        statement
+            .query_map(params![principal.as_slice()], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for (authority, first_sequence) in bridge_starts {
+        rejected.extend(purge_pending_bridge_control_suffix_tx(
+            transaction,
+            node_from_vec(authority, "pending bridge control authority")?,
+            from_sql_u64(first_sequence, "pending bridge control sequence")?,
+        )?);
+    }
+    Ok(rejected)
+}
+
+fn remove_revoked_principal_bridge_routes_tx(
+    transaction: &Transaction<'_>,
+    principal: NodeId,
+) -> Result<(), StoreError> {
+    transaction.execute(
+        "DELETE FROM bridge_route_outbox WHERE wrapper_envelope_id IN (\n\
+           SELECT w.wrapper_envelope_id FROM bridge_route_wrappers w\n\
+           WHERE w.source_publisher=?1\n\
+           UNION\n\
+           SELECT d.wrapper_envelope_id FROM bridge_wrapper_authorizations d\n\
+           JOIN bridge_authorization_controls c\n\
+             ON c.envelope_id=d.authorization_envelope_id\n\
+           WHERE c.authority_id=?1 OR c.control_signer=?1 OR c.bridge_node_id=?1\n\
+         )",
+        params![principal.as_slice()],
+    )?;
+    transaction.execute(
+        "DELETE FROM bridge_active_routes WHERE wrapper_envelope_id IN (\n\
+           SELECT w.wrapper_envelope_id FROM bridge_route_wrappers w\n\
+           WHERE w.source_publisher=?1\n\
+           UNION\n\
+           SELECT d.wrapper_envelope_id FROM bridge_wrapper_authorizations d\n\
+           JOIN bridge_authorization_controls c\n\
+             ON c.envelope_id=d.authorization_envelope_id\n\
+           WHERE c.authority_id=?1 OR c.control_signer=?1 OR c.bridge_node_id=?1\n\
+         )",
+        params![principal.as_slice()],
+    )?;
+    Ok(())
+}
+
 fn insert_control_tx(
     transaction: &Transaction<'_>,
     control: &VerifiedStoredControl,
-) -> Result<bool, StoreError> {
+) -> Result<ControlInsert, StoreError> {
     validate_control(control)?;
     if let Some(existing) = load_control_tx(transaction, &control.envelope_id)? {
         if existing.authority != control.authority
+            || existing.signer != control.signer
             || existing.sequence != control.sequence
             || existing.previous_control != control.previous_control
             || existing.kind != control.kind
@@ -12187,7 +13084,15 @@ fn insert_control_tx(
         {
             return Err(StoreError::ControlFork);
         }
-        return Ok(false);
+        return Ok(ControlInsert::Duplicate);
+    }
+    if control_signer_revoked_tx(transaction, control.authority)?
+        || control_signer_revoked_tx(transaction, control.signer)?
+    {
+        return Ok(ControlInsert::Rejected(RejectedControl {
+            envelope_id: control.envelope_id,
+            signer: control.signer,
+        }));
     }
     let occupied: Option<Vec<u8>> = transaction
         .query_row(
@@ -12202,7 +13107,6 @@ fn insert_control_tx(
     if occupied.is_some() {
         return Err(StoreError::ControlFork);
     }
-    validate_control_effect_order_tx(transaction, control)?;
     let (subject, generation, scope, epoch, observed_at_ms) = match control.kind {
         ControlKind::Revocation => {
             let effect = control.revocation.as_ref().expect("validated revocation");
@@ -12230,12 +13134,13 @@ fn insert_control_tx(
     };
     let order = next_order(transaction)?;
     transaction.execute(
-        "INSERT INTO controls(envelope_id,authority,sequence,previous_control,kind,sealed,\n\
+        "INSERT INTO controls(envelope_id,authority,signer,sequence,previous_control,kind,sealed,\n\
            subject,generation,scope,epoch,observed_at_ms,applied,inserted_order)\n\
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,0,?12)",
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,0,?13)",
         params![
             control.envelope_id.as_slice(),
             control.authority.as_slice(),
+            control.signer.as_slice(),
             sql_u64(control.sequence, "control sequence")?,
             control.previous_control.map(|value| value.to_vec()),
             control.kind as u8 as i64,
@@ -12255,13 +13160,14 @@ fn insert_control_tx(
             sql_u64(order, "control outbox order")?
         ],
     )?;
-    Ok(true)
+    Ok(ControlInsert::Inserted)
 }
 
 fn apply_control_effect_tx(
     transaction: &Transaction<'_>,
     control: &StoredControl,
-) -> Result<(), StoreError> {
+) -> Result<Option<NodeId>, StoreError> {
+    let mut revoked_signer = None;
     match control.kind {
         ControlKind::Revocation => {
             let (subject, generation, observed): (Vec<u8>, i64, Option<i64>) = transaction
@@ -12286,7 +13192,7 @@ fn apply_control_effect_tx(
                 let old = from_sql_u64(old, "revocation generation")?;
                 if old >= generation {
                     return if old == generation && sealed == control.sealed {
-                        Ok(())
+                        Ok(Some(subject))
                     } else {
                         Err(StoreError::ControlRollback)
                     };
@@ -12312,6 +13218,8 @@ fn apply_control_effect_tx(
                  last_change_ms=excluded.last_change_ms,detail=excluded.detail",
                 params![subject.as_slice(), observed],
             )?;
+            remove_revoked_principal_bridge_routes_tx(transaction, subject)?;
+            revoked_signer = Some(subject);
         }
         ControlKind::ScopeEpoch => {
             let (scope, epoch): (String, i64) = transaction.query_row(
@@ -12331,7 +13239,7 @@ fn apply_control_effect_tx(
                 let old = from_sql_u64(old, "scope epoch")?;
                 if old >= epoch {
                     return if old == epoch && sealed == control.sealed {
-                        Ok(())
+                        Ok(None)
                     } else {
                         Err(StoreError::ControlRollback)
                     };
@@ -12344,13 +13252,19 @@ fn apply_control_effect_tx(
             )?;
         }
     }
-    Ok(())
+    Ok(revoked_signer)
+}
+
+#[derive(Default)]
+struct ControlActivation {
+    activated: Vec<StoredControl>,
+    rejected: Vec<RejectedControl>,
 }
 
 fn activate_control_chain_tx(
     transaction: &Transaction<'_>,
     authority: NodeId,
-) -> Result<Vec<StoredControl>, StoreError> {
+) -> Result<ControlActivation, StoreError> {
     let head: Option<(i64, Vec<u8>)> = transaction
         .query_row(
             "SELECT sequence,envelope_id FROM control_heads WHERE authority=?1",
@@ -12365,7 +13279,7 @@ fn activate_control_chain_tx(
         ),
         None => (0, None),
     };
-    let mut activated = Vec::new();
+    let mut result = ControlActivation::default();
     loop {
         let sql =
             format!("SELECT {CONTROL_COLUMNS} FROM controls WHERE authority=?1 AND sequence=?2");
@@ -12383,11 +13297,38 @@ fn activate_control_chain_tx(
         if next.previous_control != previous {
             return Err(StoreError::ControlFork);
         }
-        apply_control_effect_tx(transaction, &next)?;
+        if control_signer_revoked_tx(transaction, authority)?
+            || control_signer_revoked_tx(transaction, next.signer)?
+        {
+            if next.applied {
+                return Err(StoreError::Corrupt(
+                    "an applied control belongs to an earlier-revoked principal".into(),
+                ));
+            }
+            result.rejected.extend(purge_pending_control_suffix_tx(
+                transaction,
+                authority,
+                next.sequence,
+            )?);
+            break;
+        }
+        // Pending suffixes are durable transport inputs, not authority state.
+        // Only the already-applied prefix may constrain this effect, and the
+        // check is repeated here at the exact crash-atomic activation point.
+        validate_control_effect_order_tx(transaction, &next)?;
+        let revoked_signer = apply_control_effect_tx(transaction, &next)?;
         transaction.execute(
             "UPDATE controls SET applied=1 WHERE envelope_id=?1",
             params![next.envelope_id.as_slice()],
         )?;
+        if let Some(revoked_signer) = revoked_signer {
+            result
+                .rejected
+                .extend(purge_revoked_principal_pending_suffixes_tx(
+                    transaction,
+                    revoked_signer,
+                )?);
+        }
         transaction.execute(
             "INSERT INTO control_heads(authority,sequence,envelope_id) VALUES(?1,?2,?3)\n\
              ON CONFLICT(authority) DO UPDATE SET sequence=excluded.sequence,envelope_id=excluded.envelope_id",
@@ -12400,9 +13341,52 @@ fn activate_control_chain_tx(
         next.applied = true;
         sequence = next.sequence;
         previous = Some(next.envelope_id);
-        activated.push(next);
+        result.activated.push(next);
     }
-    Ok(activated)
+    Ok(result)
+}
+
+fn control_outcome(
+    envelope_id: EnvelopeId,
+    inserted: ControlInsert,
+    mut activation: ControlActivation,
+) -> ControlOutcome {
+    if let ControlInsert::Rejected(rejected) = inserted
+        && !activation.rejected.contains(&rejected)
+    {
+        activation.rejected.push(rejected);
+    }
+    if !activation.activated.is_empty() {
+        return ControlOutcome::Applied {
+            envelope_id,
+            activated: activation.activated,
+            rejected: activation.rejected,
+        };
+    }
+    if let ControlInsert::Rejected(rejected) = inserted {
+        return ControlOutcome::Rejected {
+            envelope_id: rejected.envelope_id,
+            signer: rejected.signer,
+            rejected: activation.rejected,
+        };
+    }
+    if let Some(rejected) = activation
+        .rejected
+        .iter()
+        .find(|rejected| rejected.envelope_id == envelope_id)
+        .copied()
+    {
+        return ControlOutcome::Rejected {
+            envelope_id: rejected.envelope_id,
+            signer: rejected.signer,
+            rejected: activation.rejected,
+        };
+    }
+    match inserted {
+        ControlInsert::Inserted => ControlOutcome::Pending { envelope_id },
+        ControlInsert::Duplicate => ControlOutcome::Duplicate { envelope_id },
+        ControlInsert::Rejected(_) => unreachable!("rejected insert handled above"),
+    }
 }
 
 fn load_group_tx(
@@ -12447,29 +13431,57 @@ fn same_batch_item_semantics(left: &StoredItem, right: &StoredItem) -> bool {
 
 fn record_accepted_frontier_dot_tx(
     transaction: &Transaction<'_>,
+    topic: &Topic,
+    scope: &Scope,
     dot: Dot,
 ) -> Result<(), StoreError> {
     // An authenticated publisher may assert arbitrary predecessor entries. Only
     // the envelope's own accepted dot is direct local evidence and may advance
-    // the context attached to a later local publication.
+    // the context attached to a later local publication in this exact domain.
+    // Schema-11 observations remain in the reserved legacy-global sentinel and
+    // count in every domain until a separately specified safe checkpoint exists.
     let publisher_known: bool = transaction.query_row(
-        "SELECT EXISTS(SELECT 1 FROM causal_frontier WHERE publisher=?1)",
-        params![dot.publisher.as_slice()],
+        "SELECT EXISTS(\n\
+           SELECT 1 FROM causal_frontier WHERE publisher=?1 AND\n\
+             ((topic=?2 AND scope=?3) OR (topic=?4 AND scope=?5))\n\
+         )",
+        params![
+            dot.publisher.as_slice(),
+            topic.as_str(),
+            scope.as_str(),
+            LEGACY_CAUSAL_TOPIC,
+            LEGACY_CAUSAL_SCOPE
+        ],
         |row| row.get(0),
     )?;
     if !publisher_known {
-        let publisher_count: i64 =
-            transaction.query_row("SELECT count(*) FROM causal_frontier", [], |row| row.get(0))?;
+        let publisher_count: i64 = transaction.query_row(
+            "SELECT count(*) FROM (\n\
+               SELECT publisher FROM causal_frontier WHERE topic=?1 AND scope=?2\n\
+               UNION\n\
+               SELECT publisher FROM causal_frontier WHERE topic=?3 AND scope=?4\n\
+             )",
+            params![
+                topic.as_str(),
+                scope.as_str(),
+                LEGACY_CAUSAL_TOPIC,
+                LEGACY_CAUSAL_SCOPE
+            ],
+            |row| row.get(0),
+        )?;
         if publisher_count >= MAX_CAUSAL_CONTEXT_ENTRIES as i64 {
             return Err(StoreError::Invalid(
-                "directly observed causal publisher limit reached".into(),
+                "directly observed causal publisher limit reached for domain".into(),
             ));
         }
     }
     transaction.execute(
-        "INSERT INTO causal_frontier(publisher,counter) VALUES(?1,?2)\n\
-         ON CONFLICT(publisher) DO UPDATE SET counter=max(counter,excluded.counter)",
+        "INSERT INTO causal_frontier(topic,scope,publisher,counter) VALUES(?1,?2,?3,?4)\n\
+         ON CONFLICT(topic,scope,publisher) DO UPDATE\n\
+           SET counter=max(counter,excluded.counter)",
         params![
+            topic.as_str(),
+            scope.as_str(),
             dot.publisher.as_slice(),
             sql_u64(dot.counter, "frontier counter")?
         ],
@@ -12677,7 +13689,7 @@ fn insert_item_tx(
             sql_u64(item.inserted_order, "outbox order")?
         ],
     )?;
-    record_accepted_frontier_dot_tx(transaction, item.stamp.dot)?;
+    record_accepted_frontier_dot_tx(transaction, &item.topic, &item.scope, item.stamp.dot)?;
     let evicted = if defer_quota {
         Vec::new()
     } else {
@@ -13301,10 +14313,13 @@ fn enforce_quotas_protected_tx(
 ) -> Result<Vec<ItemId>, StoreError> {
     let mut removed = Vec::new();
     if custody_sample.is_some() {
-        let sql = format!("SELECT {ITEM_COLUMNS} FROM items");
+        let sql = format!(
+            "SELECT {LIFECYCLE_ITEM_COLUMNS} FROM items\n\
+             WHERE tombstone=0 AND ttl_ms IS NOT NULL"
+        );
         let mut statement = transaction.prepare(&sql)?;
         let expired = statement
-            .query_map([], decode_item_row)?
+            .query_map([], decode_lifecycle_item_row)?
             .filter_map(|row| match row {
                 Ok(item)
                     if !protected.contains(&item.id)
@@ -13587,12 +14602,28 @@ fn verify_completed_object_tx(
     Ok(())
 }
 
-fn load_frontier(connection: &Connection) -> Result<VersionVector, StoreError> {
+fn load_frontier(
+    connection: &Connection,
+    topic: &Topic,
+    scope: &Scope,
+) -> Result<VersionVector, StoreError> {
     let mut frontier = VersionVector::default();
-    let mut statement = connection.prepare("SELECT publisher,counter FROM causal_frontier")?;
-    let rows = statement.query_map([], |row| {
-        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
-    })?;
+    let mut statement = connection.prepare(
+        "SELECT publisher,max(counter) FROM (\n\
+           SELECT publisher,counter FROM causal_frontier WHERE topic=?1 AND scope=?2\n\
+           UNION ALL\n\
+           SELECT publisher,counter FROM causal_frontier WHERE topic=?3 AND scope=?4\n\
+         ) GROUP BY publisher ORDER BY publisher",
+    )?;
+    let rows = statement.query_map(
+        params![
+            topic.as_str(),
+            scope.as_str(),
+            LEGACY_CAUSAL_TOPIC,
+            LEGACY_CAUSAL_SCOPE
+        ],
+        |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+    )?;
     for row in rows {
         let (publisher, counter) = row?;
         frontier.observe(Dot {
@@ -13622,6 +14653,12 @@ impl RecordStore for SqliteStore {
     ) -> Result<PublishReservation, StoreError> {
         if self.is_zeroized()? {
             return Err(StoreError::Zeroized);
+        }
+        let context = load_frontier(&self.connection, topic, scope)?;
+        if context.len() >= MAX_CAUSAL_CONTEXT_ENTRIES && context.counter(&publisher) == 0 {
+            return Err(StoreError::Invalid(
+                "directly observed causal publisher limit reached for domain".into(),
+            ));
         }
         let persisted_previous: i64 = self
             .connection
@@ -13678,7 +14715,7 @@ impl RecordStore for SqliteStore {
             counter,
             event_previous,
             event_sequence,
-            context: load_frontier(&self.connection)?,
+            context,
         })
     }
 
@@ -14109,6 +15146,19 @@ impl RecordStore for SqliteStore {
         Ok(outcome)
     }
 
+    fn select_inventory_metadata(
+        &mut self,
+        topics: &BTreeSet<Topic>,
+        scopes: &BTreeSet<Scope>,
+    ) -> Result<Vec<InventoryMetadata>, StoreError> {
+        select_inventory_metadata_bounded(
+            &self.connection,
+            topics,
+            scopes,
+            MAX_COMPOSITE_INVENTORY_OBJECTS,
+        )
+    }
+
     fn query(&mut self, query: &StoreQuery) -> Result<Vec<StoredItem>, StoreError> {
         use rusqlite::types::Value;
         let mut sql = format!("SELECT {ITEM_COLUMNS} FROM items WHERE 1=1");
@@ -14209,15 +15259,24 @@ impl RecordStore for SqliteStore {
         bytes.ok_or(StoreError::NotFound("item envelope"))
     }
 
-    fn reserve_control(&mut self, authority: NodeId) -> Result<ControlReservation, StoreError> {
+    fn reserve_control(
+        &mut self,
+        principal: ControlPrincipal,
+    ) -> Result<ControlReservation, StoreError> {
         if self.is_zeroized()? {
             return Err(StoreError::Zeroized);
+        }
+        if self.is_revoked(&principal.signer)? {
+            return Err(StoreError::ControlSignerRevoked(principal.signer));
+        }
+        if self.is_revoked(&principal.authority)? {
+            return Err(StoreError::ControlAuthorityRevoked(principal.authority));
         }
         let head: Option<(i64, Vec<u8>)> = self
             .connection
             .query_row(
                 "SELECT sequence,envelope_id FROM control_heads WHERE authority=?1",
-                params![authority.as_slice()],
+                params![principal.authority.as_slice()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
@@ -14229,7 +15288,8 @@ impl RecordStore for SqliteStore {
             None => (0, None),
         };
         Ok(ControlReservation {
-            authority,
+            authority: principal.authority,
+            signer: principal.signer,
             previous_sequence,
             sequence: previous_sequence
                 .checked_add(1)
@@ -14244,6 +15304,7 @@ impl RecordStore for SqliteStore {
         control: &VerifiedStoredControl,
     ) -> Result<ControlOutcome, StoreError> {
         if control.authority != reservation.authority
+            || control.signer != reservation.signer
             || control.sequence != reservation.sequence
             || control.previous_control != reservation.previous_control
         {
@@ -14269,25 +15330,16 @@ impl RecordStore for SqliteStore {
         if sequence != reservation.previous_sequence || envelope != reservation.previous_control {
             return Err(StoreError::CounterChanged);
         }
+        if control_signer_revoked_tx(&transaction, reservation.signer)? {
+            return Err(StoreError::ControlSignerRevoked(reservation.signer));
+        }
+        if control_signer_revoked_tx(&transaction, reservation.authority)? {
+            return Err(StoreError::ControlAuthorityRevoked(reservation.authority));
+        }
         let inserted = insert_control_tx(&transaction, control)?;
-        let activated = activate_control_chain_tx(&transaction, control.authority)?;
-        let refresh_bridge_liveness = !activated.is_empty();
-        let outcome = if activated.is_empty() {
-            if inserted {
-                ControlOutcome::Pending {
-                    envelope_id: control.envelope_id,
-                }
-            } else {
-                ControlOutcome::Duplicate {
-                    envelope_id: control.envelope_id,
-                }
-            }
-        } else {
-            ControlOutcome::Applied {
-                envelope_id: control.envelope_id,
-                activated,
-            }
-        };
+        let activation = activate_control_chain_tx(&transaction, control.authority)?;
+        let refresh_bridge_liveness = !activation.activated.is_empty();
+        let outcome = control_outcome(control.envelope_id, inserted, activation);
         transaction.commit()?;
         if refresh_bridge_liveness {
             self.clear_bridge_process_liveness();
@@ -14304,24 +15356,9 @@ impl RecordStore for SqliteStore {
         }
         let transaction = self.connection.transaction()?;
         let inserted = insert_control_tx(&transaction, control)?;
-        let activated = activate_control_chain_tx(&transaction, control.authority)?;
-        let refresh_bridge_liveness = !activated.is_empty();
-        let outcome = if activated.is_empty() {
-            if inserted {
-                ControlOutcome::Pending {
-                    envelope_id: control.envelope_id,
-                }
-            } else {
-                ControlOutcome::Duplicate {
-                    envelope_id: control.envelope_id,
-                }
-            }
-        } else {
-            ControlOutcome::Applied {
-                envelope_id: control.envelope_id,
-                activated,
-            }
-        };
+        let activation = activate_control_chain_tx(&transaction, control.authority)?;
+        let refresh_bridge_liveness = !activation.activated.is_empty();
+        let outcome = control_outcome(control.envelope_id, inserted, activation);
         transaction.commit()?;
         if refresh_bridge_liveness {
             self.clear_bridge_process_liveness();
@@ -14877,7 +15914,7 @@ impl RecordStore for SqliteStore {
         let sql = format!(
             "SELECT {columns},t.retain_until_ms FROM items i\n\
              LEFT JOIN tombstones t ON t.item_id=i.item_id",
-            columns = ITEM_COLUMNS
+            columns = LIFECYCLE_ITEM_COLUMNS
                 .split(',')
                 .map(|column| format!("i.{column}"))
                 .collect::<Vec<_>>()
@@ -14885,24 +15922,17 @@ impl RecordStore for SqliteStore {
         );
         let mut statement = transaction.prepare(&sql)?;
         let rows = statement.query_map([], |row| {
-            let item = decode_item_row(row)?;
-            let retain: Option<i64> = row.get(23)?;
-            Ok((item.id, retain))
+            let item = decode_lifecycle_item_row(row)?;
+            let retain: Option<i64> = row.get(13)?;
+            Ok((item, retain))
         })?;
         let raw_entries = rows.collect::<Result<Vec<_>, _>>()?;
         drop(statement);
         let mut entries = Vec::new();
         let mut concurrent_groups = BTreeSet::new();
-        for (id, retain) in raw_entries {
-            let Some(item) = advance_custody_tx(&transaction, id, custody_sample)? else {
-                continue;
-            };
-            let group_key = (
-                class_to_i64(item.class),
-                item.topic.as_str().to_owned(),
-                item.scope.as_str().to_owned(),
-                item.logical_key.clone(),
-            );
+        for (mut item, retain) in raw_entries {
+            advance_lifecycle_custody_tx(&transaction, &mut item, custody_sample)?;
+            let group_key = item.group_key();
             if item.status == VersionStatus::Concurrent {
                 concurrent_groups.insert(group_key);
             }
@@ -14916,12 +15946,7 @@ impl RecordStore for SqliteStore {
         let mut expired = Vec::new();
         let mut tombstone_groups = BTreeSet::new();
         for (item, retain) in entries {
-            let group_key = (
-                class_to_i64(item.class),
-                item.topic.as_str().to_owned(),
-                item.scope.as_str().to_owned(),
-                item.logical_key.clone(),
-            );
+            let group_key = item.group_key();
             let superseded_old = now_ms.is_some_and(|now| {
                 item.status != VersionStatus::Current
                     && item.observed_at_ms.is_some_and(|observed| {
@@ -15420,6 +16445,11 @@ impl RecordStore for SqliteStore {
         if let Some((generation, authority, notice)) = existing {
             let generation = from_sql_u64(generation, "revocation generation")?;
             if generation > revocation.generation {
+                purge_revoked_principal_pending_suffixes_tx(&transaction, revocation.subject)?;
+                remove_revoked_principal_bridge_routes_tx(&transaction, revocation.subject)?;
+                transaction.commit()?;
+                self.clear_bridge_process_liveness();
+                self.clear_verified_batch_proofs();
                 return Ok(false);
             }
             if generation == revocation.generation {
@@ -15430,6 +16460,11 @@ impl RecordStore for SqliteStore {
                         "conflicting revocations use the same generation".into(),
                     ));
                 }
+                purge_revoked_principal_pending_suffixes_tx(&transaction, revocation.subject)?;
+                remove_revoked_principal_bridge_routes_tx(&transaction, revocation.subject)?;
+                transaction.commit()?;
+                self.clear_bridge_process_liveness();
+                self.clear_verified_batch_proofs();
                 return Ok(false);
             }
         }
@@ -15463,30 +16498,8 @@ impl RecordStore for SqliteStore {
                     .transpose()?
             ],
         )?;
-        transaction.execute(
-            "DELETE FROM bridge_route_outbox WHERE wrapper_envelope_id IN (\n\
-               SELECT w.wrapper_envelope_id FROM bridge_route_wrappers w\n\
-               WHERE w.source_publisher=?1\n\
-               UNION\n\
-               SELECT d.wrapper_envelope_id FROM bridge_wrapper_authorizations d\n\
-               JOIN bridge_authorization_controls c\n\
-                 ON c.envelope_id=d.authorization_envelope_id\n\
-               WHERE c.authority_id=?1 OR c.bridge_node_id=?1\n\
-             )",
-            params![revocation.subject.as_slice()],
-        )?;
-        transaction.execute(
-            "DELETE FROM bridge_active_routes WHERE wrapper_envelope_id IN (\n\
-               SELECT w.wrapper_envelope_id FROM bridge_route_wrappers w\n\
-               WHERE w.source_publisher=?1\n\
-               UNION\n\
-               SELECT d.wrapper_envelope_id FROM bridge_wrapper_authorizations d\n\
-               JOIN bridge_authorization_controls c\n\
-                 ON c.envelope_id=d.authorization_envelope_id\n\
-               WHERE c.authority_id=?1 OR c.bridge_node_id=?1\n\
-             )",
-            params![revocation.subject.as_slice()],
-        )?;
+        purge_revoked_principal_pending_suffixes_tx(&transaction, revocation.subject)?;
+        remove_revoked_principal_bridge_routes_tx(&transaction, revocation.subject)?;
         transaction.commit()?;
         self.clear_bridge_process_liveness();
         self.clear_verified_batch_proofs();
@@ -15589,7 +16602,10 @@ impl RecordStore for SqliteStore {
              VALUES(?1,?2,?3,?4,?5)\n\
              ON CONFLICT(node_id) DO UPDATE SET peer_status=excluded.peer_status,\n\
                sync_status=excluded.sync_status,last_change_ms=excluded.last_change_ms,\n\
-               detail=excluded.detail",
+               detail=excluded.detail\n\
+             WHERE peers.peer_status IS NOT excluded.peer_status\n\
+                OR peers.sync_status IS NOT excluded.sync_status\n\
+                OR peers.detail IS NOT excluded.detail",
             params![
                 snapshot.node.as_slice(),
                 peer_status_to_i64(snapshot.peer),
@@ -15827,13 +16843,22 @@ fn sync_status_from_i64(value: i64) -> Result<SyncStatus, StoreError> {
 /// tests exercise the production schema without touching the filesystem.
 pub struct InMemoryStore {
     inner: SqliteStore,
+    #[cfg(test)]
+    inventory_selection_calls: usize,
 }
 
 impl InMemoryStore {
     pub fn new(config: StoreConfig) -> Result<Self, StoreError> {
         Ok(Self {
             inner: SqliteStore::open_in_memory(config)?,
+            #[cfg(test)]
+            inventory_selection_calls: 0,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inventory_selection_call_count(&self) -> usize {
+        self.inventory_selection_calls
     }
 }
 
@@ -15883,6 +16908,17 @@ impl RecordStore for InMemoryStore {
     }
     fn ingest(&mut self, item: StoredItem) -> Result<ApplyOutcome, StoreError> {
         self.inner.ingest(item)
+    }
+    fn select_inventory_metadata(
+        &mut self,
+        topics: &BTreeSet<Topic>,
+        scopes: &BTreeSet<Scope>,
+    ) -> Result<Vec<InventoryMetadata>, StoreError> {
+        #[cfg(test)]
+        {
+            self.inventory_selection_calls = self.inventory_selection_calls.saturating_add(1);
+        }
+        self.inner.select_inventory_metadata(topics, scopes)
     }
     fn query(&mut self, query: &StoreQuery) -> Result<Vec<StoredItem>, StoreError> {
         self.inner.query(query)
@@ -15989,8 +17025,11 @@ impl RecordStore for InMemoryStore {
         self.inner
             .read_item_envelope_range(envelope_id, range, max_bytes)
     }
-    fn reserve_control(&mut self, authority: NodeId) -> Result<ControlReservation, StoreError> {
-        self.inner.reserve_control(authority)
+    fn reserve_control(
+        &mut self,
+        principal: ControlPrincipal,
+    ) -> Result<ControlReservation, StoreError> {
+        self.inner.reserve_control(principal)
     }
     fn commit_local_control(
         &mut self,
@@ -16202,6 +17241,12 @@ mod sqlite_integration_tests {
         }
     }
 
+    fn indexed_publisher(index: usize) -> NodeId {
+        let mut publisher = [0_u8; 32];
+        publisher[..8].copy_from_slice(&(index as u64 + 1).to_be_bytes());
+        publisher
+    }
+
     fn local_batch_fixture(
         store: &mut SqliteStore,
         storage_policy: BatchStoragePolicy,
@@ -16295,7 +17340,27 @@ mod sqlite_integration_tests {
         previous_control: Option<EnvelopeId>,
         generation: u64,
     ) -> VerifiedStoredControl {
+        signed_revocation_control(
+            authority,
+            authority,
+            [44; 32],
+            sequence,
+            previous_control,
+            generation,
+        )
+    }
+
+    fn signed_revocation_control(
+        authority: NodeId,
+        signer: NodeId,
+        subject: NodeId,
+        sequence: u64,
+        previous_control: Option<EnvelopeId>,
+        generation: u64,
+    ) -> VerifiedStoredControl {
         let sealed = [
+            signer.as_slice(),
+            subject.as_slice(),
             sequence.to_be_bytes().as_slice(),
             generation.to_be_bytes().as_slice(),
         ]
@@ -16304,12 +17369,14 @@ mod sqlite_integration_tests {
         VerifiedStoredControl {
             envelope_id,
             authority,
+            signer,
             sequence,
             previous_control,
             kind: ControlKind::Revocation,
             revocation: Some(Revocation {
-                subject: [44; 32],
+                subject,
                 authority,
+                signer,
                 generation,
                 control_sequence: sequence,
                 previous_control,
@@ -16367,11 +17434,31 @@ mod sqlite_integration_tests {
         };
         let exact_bytes = b"provider-authenticated-ASTRBA01-object".to_vec();
         let envelope_id = exact_object_id(&exact_bytes);
-        VerifiedBridgeAuthorization::from_provider(envelope_id, authorization, exact_bytes).unwrap()
+        VerifiedBridgeAuthorization::from_provider(
+            envelope_id,
+            authorization,
+            [0x49; 32],
+            exact_bytes,
+        )
+        .unwrap()
     }
 
     fn bridge_authorization_successor(
         previous: &VerifiedBridgeAuthorization,
+        generation: u64,
+        enabled: bool,
+    ) -> VerifiedBridgeAuthorization {
+        bridge_authorization_successor_signed(
+            previous,
+            previous.control_signer,
+            generation,
+            enabled,
+        )
+    }
+
+    fn bridge_authorization_successor_signed(
+        previous: &VerifiedBridgeAuthorization,
+        control_signer: NodeId,
         generation: u64,
         enabled: bool,
     ) -> VerifiedBridgeAuthorization {
@@ -16387,10 +17474,45 @@ mod sqlite_integration_tests {
             authorization.control_sequence.to_be_bytes().as_slice(),
             generation.to_be_bytes().as_slice(),
             &[u8::from(enabled)],
+            control_signer.as_slice(),
         ]
         .concat();
         let envelope_id = exact_object_id(&exact_bytes);
-        VerifiedBridgeAuthorization::from_provider(envelope_id, authorization, exact_bytes).unwrap()
+        VerifiedBridgeAuthorization::from_provider(
+            envelope_id,
+            authorization,
+            control_signer,
+            exact_bytes,
+        )
+        .unwrap()
+    }
+
+    fn bridge_authorization_at_sequence_signed(
+        template: &VerifiedBridgeAuthorization,
+        control_signer: NodeId,
+        sequence: u64,
+        previous_control_id: EnvelopeId,
+        generation: u64,
+    ) -> VerifiedBridgeAuthorization {
+        let mut authorization = template.authorization.clone();
+        authorization.control_sequence = sequence;
+        authorization.previous_control_id = Some(previous_control_id);
+        authorization.generation = generation;
+        let exact_bytes = [
+            b"provider-authenticated-ASTRBA01-positioned".as_slice(),
+            sequence.to_be_bytes().as_slice(),
+            previous_control_id.as_slice(),
+            generation.to_be_bytes().as_slice(),
+            control_signer.as_slice(),
+        ]
+        .concat();
+        VerifiedBridgeAuthorization::from_provider(
+            exact_object_id(&exact_bytes),
+            authorization,
+            control_signer,
+            exact_bytes,
+        )
+        .unwrap()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -16448,13 +17570,20 @@ mod sqlite_integration_tests {
         ]
         .concat();
         let envelope_id = exact_object_id(&exact_bytes);
-        VerifiedBridgeAuthorization::from_provider(envelope_id, authorization, exact_bytes).unwrap()
+        VerifiedBridgeAuthorization::from_provider(
+            envelope_id,
+            authorization,
+            [0x49; 32],
+            exact_bytes,
+        )
+        .unwrap()
     }
 
     fn configure_bridge_epoch(store: &mut SqliteStore, scope: &str, epoch: u64) {
         store
             .set_scope_epoch(&ScopeEpoch {
                 authority: [0x42; 32],
+                signer: [0x42; 32],
                 scope: Scope::new(scope).unwrap(),
                 epoch,
                 control_sequence: epoch,
@@ -16579,6 +17708,51 @@ mod sqlite_integration_tests {
         }
     }
 
+    fn downgrade_schema_v12_to_v11_for_test(connection: &Connection) {
+        connection
+            .execute_batch(
+                "ALTER TABLE causal_frontier RENAME TO causal_frontier_v12;\n\
+                 CREATE TABLE causal_frontier (\n\
+                   publisher BLOB PRIMARY KEY CHECK(length(publisher)=32),\n\
+                   counter INTEGER NOT NULL CHECK(counter>0)\n\
+                 ) STRICT;\n\
+                 INSERT INTO causal_frontier(publisher,counter)\n\
+                   SELECT publisher,max(counter) FROM causal_frontier_v12 GROUP BY publisher;\n\
+                 DROP TABLE causal_frontier_v12;\n\
+                 PRAGMA user_version=11;",
+            )
+            .unwrap();
+    }
+
+    fn downgrade_empty_or_populated_schema_v11_to_v10(connection: &Connection) {
+        downgrade_schema_v12_to_v11_for_test(connection);
+        connection
+            .execute_batch(
+                "DROP INDEX controls_signer;\n\
+                 DROP INDEX bridge_controls_signer;\n\
+                 DROP TRIGGER controls_require_signer_insert;\n\
+                 DROP TRIGGER controls_require_signer_update;\n\
+                 DROP TRIGGER bridge_controls_require_signer_insert;\n\
+                 DROP TRIGGER bridge_controls_require_signer_update;\n\
+                 ALTER TABLE controls DROP COLUMN signer;\n\
+                 ALTER TABLE bridge_authorization_controls DROP COLUMN control_signer;\n\
+                 PRAGMA user_version=10;",
+            )
+            .unwrap();
+    }
+
+    fn schema_has_column(connection: &Connection, table: &str, column: &str) -> bool {
+        let sql = format!("PRAGMA table_info({table})");
+        let mut statement = connection.prepare(&sql).unwrap();
+        statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .iter()
+            .any(|name| name == column)
+    }
+
     fn ordinary_item_from_bridge_source(
         route: &VerifiedBridgeRoute,
         scope: Scope,
@@ -16615,6 +17789,560 @@ mod sqlite_integration_tests {
     fn bundled_sqlite_runtime_is_pinned() {
         let store = SqliteStore::open_in_memory(StoreConfig::default()).unwrap();
         assert_eq!(store.sqlite_version().unwrap(), "3.53.2");
+    }
+
+    #[test]
+    fn peer_last_change_advances_only_for_a_real_state_transition() {
+        let mut store = SqliteStore::open_in_memory(StoreConfig::default()).unwrap();
+        let node = [0x51; 32];
+        let initial = PeerSnapshot {
+            node,
+            peer: PeerStatus::Authenticating,
+            sync: SyncStatus::Reconciling,
+            last_change_ms: Some(10),
+            detail: None,
+        };
+        store.update_peer(&initial).unwrap();
+
+        let repeated = PeerSnapshot {
+            last_change_ms: Some(20),
+            ..initial.clone()
+        };
+        store.update_peer(&repeated).unwrap();
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT changes()", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "an identical peer snapshot must not write its SQLite row"
+        );
+        assert_eq!(store.peer(&node).unwrap(), Some(initial));
+
+        let transitioned = PeerSnapshot {
+            node,
+            peer: PeerStatus::Ready,
+            sync: SyncStatus::Transferring,
+            last_change_ms: Some(30),
+            detail: Some("authenticated transfer active".into()),
+        };
+        store.update_peer(&transitioned).unwrap();
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT changes()", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "a peer transition must update its SQLite row"
+        );
+        assert_eq!(store.peer(&node).unwrap(), Some(transitioned));
+    }
+
+    #[test]
+    fn empty_schema_v10_migrates_to_signer_aware_v11() {
+        let path = std::env::temp_dir().join(format!(
+            "aster-empty-v10-to-v11-{}-{}.sqlite3",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        drop(SqliteStore::open(&path, StoreConfig::default()).unwrap());
+        {
+            let connection = Connection::open(&path).unwrap();
+            downgrade_empty_or_populated_schema_v11_to_v10(&connection);
+            assert_eq!(
+                connection
+                    .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                10
+            );
+            assert!(!schema_has_column(&connection, "controls", "signer"));
+            assert!(!schema_has_column(
+                &connection,
+                "bridge_authorization_controls",
+                "control_signer"
+            ));
+        }
+
+        {
+            let reopened = SqliteStore::open(&path, StoreConfig::default()).unwrap();
+            assert_eq!(
+                reopened
+                    .connection
+                    .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                SCHEMA_VERSION
+            );
+            assert!(schema_has_column(
+                &reopened.connection,
+                "controls",
+                "signer"
+            ));
+            assert!(schema_has_column(
+                &reopened.connection,
+                "bridge_authorization_controls",
+                "control_signer"
+            ));
+        }
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("sqlite3-wal"));
+        let _ = fs::remove_file(path.with_extension("sqlite3-shm"));
+    }
+
+    #[test]
+    fn populated_schema_v10_requires_explicit_signer_migration() {
+        let path = std::env::temp_dir().join(format!(
+            "aster-populated-v10-to-v11-{}-{}.sqlite3",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        {
+            let mut store = SqliteStore::open(&path, StoreConfig::default()).unwrap();
+            store
+                .ingest_control(&revocation_control([0x71; 32], 1, None, 1))
+                .unwrap();
+            store
+                .ingest_bridge_authorization(&verified_bridge_authorization())
+                .unwrap();
+        }
+        {
+            let connection = Connection::open(&path).unwrap();
+            downgrade_empty_or_populated_schema_v11_to_v10(&connection);
+        }
+
+        assert!(matches!(
+            SqliteStore::open(&path, StoreConfig::default()),
+            Err(StoreError::LegacyControlMigrationRequired)
+        ));
+        {
+            let connection = Connection::open(&path).unwrap();
+            assert_eq!(
+                connection
+                    .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                10
+            );
+            assert!(!schema_has_column(&connection, "controls", "signer"));
+            assert!(!schema_has_column(
+                &connection,
+                "bridge_authorization_controls",
+                "control_signer"
+            ));
+        }
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("sqlite3-wal"));
+        let _ = fs::remove_file(path.with_extension("sqlite3-shm"));
+    }
+
+    #[test]
+    fn schema_v11_global_frontier_migrates_to_v12_sentinel_and_survives_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "aster-causal-v11-to-v12-{}-{}.sqlite3",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        drop(SqliteStore::open(&path, StoreConfig::default()).unwrap());
+        let legacy_a = [0xa1; 32];
+        let legacy_b = [0xb2; 32];
+        {
+            let connection = Connection::open(&path).unwrap();
+            downgrade_schema_v12_to_v11_for_test(&connection);
+            connection
+                .execute(
+                    "INSERT INTO causal_frontier(publisher,counter) VALUES(?1,7),(?2,9)",
+                    params![legacy_a.as_slice(), legacy_b.as_slice()],
+                )
+                .unwrap();
+        }
+
+        let topic = Topic::new("test.state").unwrap();
+        let scope = Scope::new("mission/test").unwrap();
+        {
+            let mut store = SqliteStore::open(&path, StoreConfig::default()).unwrap();
+            assert_eq!(
+                store
+                    .connection
+                    .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                SCHEMA_VERSION
+            );
+            let sentinel_rows: i64 = store
+                .connection
+                .query_row(
+                    "SELECT count(*) FROM causal_frontier WHERE topic=?1 AND scope=?2",
+                    params![LEGACY_CAUSAL_TOPIC, LEGACY_CAUSAL_SCOPE],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(sentinel_rows, 2);
+            let context = load_frontier(&store.connection, &topic, &scope).unwrap();
+            assert_eq!(context.counter(&legacy_a), 7);
+            assert_eq!(context.counter(&legacy_b), 9);
+
+            let transaction = store.connection.transaction().unwrap();
+            record_accepted_frontier_dot_tx(
+                &transaction,
+                &topic,
+                &scope,
+                Dot {
+                    publisher: legacy_a,
+                    counter: 11,
+                },
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+            let sentinel_a: i64 = store
+                .connection
+                .query_row(
+                    "SELECT counter FROM causal_frontier\n\
+                     WHERE topic=?1 AND scope=?2 AND publisher=?3",
+                    params![
+                        LEGACY_CAUSAL_TOPIC,
+                        LEGACY_CAUSAL_SCOPE,
+                        legacy_a.as_slice()
+                    ],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(sentinel_a, 7, "exact updates must not mutate the sentinel");
+
+            let mut item = test_item(0x6c, 1, None, 0, None);
+            let domain_only = [0xc3; 32];
+            item.stamp.dot.publisher = domain_only;
+            assert!(matches!(
+                store.ingest(item).unwrap(),
+                ApplyOutcome::Inserted { .. }
+            ));
+        }
+
+        {
+            let store = SqliteStore::open(&path, StoreConfig::default()).unwrap();
+            let exact = load_frontier(&store.connection, &topic, &scope).unwrap();
+            assert_eq!(exact.counter(&legacy_a), 11);
+            assert_eq!(exact.counter(&legacy_b), 9);
+            assert_eq!(exact.counter(&[0xc3; 32]), 1);
+
+            let unrelated_scope = Scope::new("mission/unrelated").unwrap();
+            let unrelated = load_frontier(&store.connection, &topic, &unrelated_scope).unwrap();
+            assert_eq!(unrelated.counter(&legacy_a), 7);
+            assert_eq!(unrelated.counter(&legacy_b), 9);
+            assert_eq!(unrelated.counter(&[0xc3; 32]), 0);
+        }
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("sqlite3-wal"));
+        let _ = fs::remove_file(path.with_extension("sqlite3-shm"));
+    }
+
+    #[test]
+    fn over_bound_schema_v11_frontier_fails_closed_without_schema_mutation() {
+        let path = std::env::temp_dir().join(format!(
+            "aster-causal-over-bound-v11-{}-{}.sqlite3",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        drop(SqliteStore::open(&path, StoreConfig::default()).unwrap());
+        {
+            let mut connection = Connection::open(&path).unwrap();
+            downgrade_schema_v12_to_v11_for_test(&connection);
+            let transaction = connection.transaction().unwrap();
+            for index in 0..=MAX_CAUSAL_CONTEXT_ENTRIES {
+                transaction
+                    .execute(
+                        "INSERT INTO causal_frontier(publisher,counter) VALUES(?1,1)",
+                        params![indexed_publisher(index).as_slice()],
+                    )
+                    .unwrap();
+            }
+            transaction.commit().unwrap();
+        }
+
+        assert!(matches!(
+            SqliteStore::open(&path, StoreConfig::default()),
+            Err(StoreError::Corrupt(_))
+        ));
+        {
+            let connection = Connection::open(&path).unwrap();
+            assert_eq!(
+                connection
+                    .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                11
+            );
+            assert!(!schema_has_column(&connection, "causal_frontier", "topic"));
+            assert_eq!(
+                connection
+                    .query_row("SELECT count(*) FROM causal_frontier", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                (MAX_CAUSAL_CONTEXT_ENTRIES + 1) as i64
+            );
+        }
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("sqlite3-wal"));
+        let _ = fs::remove_file(path.with_extension("sqlite3-shm"));
+    }
+
+    #[test]
+    fn inventory_projection_returns_metadata_without_materializing_sealed_or_causal_bytes() {
+        assert!(
+            INVENTORY_ITEM_COLUMNS
+                .split(',')
+                .all(|column| column.trim() != "sealed"),
+            "the inventory projection must never return the sealed BLOB"
+        );
+        assert!(INVENTORY_ITEM_COLUMNS.contains("length(sealed) AS sealed_len"));
+        assert!(!INVENTORY_ITEM_COLUMNS.contains("causal_context"));
+        assert!(!INVENTORY_ITEM_COLUMNS.contains("logical_key"));
+
+        let mut store = SqliteStore::open_in_memory(StoreConfig::default()).unwrap();
+        let sample = CustodySample {
+            clock_id: [0x35; 16],
+            tick_ms: 100,
+        };
+        let mut item = test_item(0x35, 1, Some(500), 20, Some(sample));
+        item.sealed = vec![0xa5; 1024 * 1024];
+        item.envelope_id = exact_object_id(&item.sealed);
+        let expected_envelope_id = item.envelope_id;
+        store.ingest(item).unwrap();
+
+        // A malformed causal payload makes the ordinary full-row decoder fail.
+        // The inventory projection remains valid because it never selects or
+        // decodes that field (nor any application payload field).
+        store
+            .connection
+            .execute("UPDATE items SET causal_context=x'ff'", [])
+            .unwrap();
+        assert!(matches!(
+            store.query(&StoreQuery {
+                include_recoverable_versions: true,
+                include_tombstones: true,
+                ..StoreQuery::default()
+            }),
+            Err(StoreError::Sqlite(_))
+        ));
+
+        let topics = BTreeSet::from([Topic::new("test.state").unwrap()]);
+        let scopes = BTreeSet::from([Scope::new("mission/test").unwrap()]);
+        let metadata = store.select_inventory_metadata(&topics, &scopes).unwrap();
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(metadata[0].envelope_id(), expected_envelope_id);
+        assert_eq!(metadata[0].total_len(), 1024 * 1024);
+        assert!(metadata[0].is_forwardable_at(Some(CustodySample {
+            clock_id: sample.clock_id,
+            tick_ms: 200,
+        })));
+        assert!(!metadata[0].is_forwardable_at(Some(CustodySample {
+            clock_id: sample.clock_id,
+            tick_ms: 700,
+        })));
+    }
+
+    #[test]
+    fn garbage_collection_lifecycle_scan_does_not_decode_sealed_or_causal_blobs() {
+        assert!(
+            LIFECYCLE_ITEM_COLUMNS
+                .split(',')
+                .all(|column| !matches!(column.trim(), "sealed" | "causal_context")),
+            "lifecycle scans must not return source-sealed or causal BLOBs"
+        );
+
+        let mut store = SqliteStore::open_in_memory(StoreConfig::default()).unwrap();
+        let mut item = test_item(0x36, 1, None, 0, None);
+        item.sealed = vec![0xa6; 1024 * 1024];
+        item.envelope_id = exact_object_id(&item.sealed);
+        let item_id = item.id;
+        store.ingest(item).unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE items SET causal_context=x'ff' WHERE item_id=?1",
+                params![item_id.as_slice()],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.query(&StoreQuery {
+                include_recoverable_versions: true,
+                include_tombstones: true,
+                ..StoreQuery::default()
+            }),
+            Err(StoreError::Sqlite(_))
+        ));
+        assert!(store.collect_garbage(None, None).unwrap().is_empty());
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT length(sealed) FROM items WHERE item_id=?1",
+                    params![item_id.as_slice()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1024 * 1024
+        );
+    }
+
+    #[test]
+    fn quota_expiry_lifecycle_scan_does_not_decode_protected_record_blobs() {
+        let sample = CustodySample {
+            clock_id: [0x37; 16],
+            tick_ms: 0,
+        };
+        let mut item = test_item(0x37, 1, Some(10), 0, Some(sample));
+        item.sealed = vec![0xa7; 1024 * 1024];
+        item.envelope_id = exact_object_id(&item.sealed);
+        let item_id = item.id;
+        let mut store = SqliteStore::open_in_memory(StoreConfig::default()).unwrap();
+        store.ingest(item).unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE items SET causal_context=x'ff' WHERE item_id=?1",
+                params![item_id.as_slice()],
+            )
+            .unwrap();
+
+        let config = store.config.clone();
+        let transaction = store.connection.transaction().unwrap();
+        let protected = BTreeSet::from([item_id]);
+        assert!(
+            enforce_quotas_protected_tx(
+                &transaction,
+                &config,
+                &protected,
+                Some(20),
+                Some(CustodySample {
+                    clock_id: sample.clock_id,
+                    tick_ms: 20,
+                }),
+            )
+            .unwrap()
+            .is_empty()
+        );
+        transaction.commit().unwrap();
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT count(*) FROM items WHERE item_id=?1",
+                    params![item_id.as_slice()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn lifecycle_gc_preserves_concurrent_tombstone_and_superseded_reducer_semantics() {
+        let config = StoreConfig {
+            tombstone_retention_ms: 10,
+            superseded_retention_ms: 10,
+            ..StoreConfig::default()
+        };
+        let mut store = SqliteStore::open_in_memory(config).unwrap();
+
+        let mut live = test_item(0x10, 1, None, 0, None);
+        live.stamp.dot.publisher = [0x10; 32];
+        live.logical_key = b"concurrent-tombstone".to_vec();
+        live.observed_at_ms = Some(0);
+        let mut tombstone = test_item(0x20, 1, None, 0, None);
+        tombstone.stamp.dot.publisher = [0x20; 32];
+        tombstone.logical_key = live.logical_key.clone();
+        tombstone.observed_at_ms = Some(0);
+        tombstone.tombstone = true;
+        store.ingest(live.clone()).unwrap();
+        store.ingest(tombstone.clone()).unwrap();
+        assert_eq!(
+            store.get(&live.id).unwrap().unwrap().status,
+            VersionStatus::Concurrent
+        );
+        assert_eq!(
+            store.get(&tombstone.id).unwrap().unwrap().status,
+            VersionStatus::Current
+        );
+
+        let mut base = test_item(0x30, 1, None, 0, None);
+        base.stamp.dot.publisher = [0x30; 32];
+        base.logical_key = b"causal-successor".to_vec();
+        base.observed_at_ms = Some(0);
+        let mut successor = test_item(0x31, 2, None, 0, None);
+        successor.stamp.dot.publisher = base.stamp.dot.publisher;
+        successor.stamp.context.observe(base.stamp.dot);
+        successor.logical_key = base.logical_key.clone();
+        successor.observed_at_ms = Some(0);
+        store.ingest(base.clone()).unwrap();
+        store.ingest(successor.clone()).unwrap();
+        assert_eq!(
+            store.get(&base.id).unwrap().unwrap().status,
+            VersionStatus::Superseded
+        );
+        assert_eq!(
+            store.get(&successor.id).unwrap().unwrap().status,
+            VersionStatus::Current
+        );
+
+        assert_eq!(
+            store.collect_garbage(Some(10), None).unwrap(),
+            vec![live.id, base.id]
+        );
+        assert!(store.get(&live.id).unwrap().is_none());
+        assert!(store.get(&base.id).unwrap().is_none());
+        assert_eq!(
+            store.get(&tombstone.id).unwrap().unwrap().status,
+            VersionStatus::Current
+        );
+        assert_eq!(
+            store.get(&successor.id).unwrap().unwrap().status,
+            VersionStatus::Current
+        );
+
+        assert_eq!(
+            store.collect_garbage(Some(10), None).unwrap(),
+            vec![tombstone.id]
+        );
+        assert!(store.get(&tombstone.id).unwrap().is_none());
+        assert_eq!(
+            store.get(&successor.id).unwrap().unwrap().status,
+            VersionStatus::Current
+        );
+    }
+
+    #[test]
+    fn inventory_projection_rejects_cap_plus_one_without_materializing_the_remainder() {
+        let mut store = SqliteStore::open_in_memory(StoreConfig::default()).unwrap();
+        for counter in 1..=3 {
+            let item = test_item(0x40 + counter as u8, counter, None, 0, None);
+            assert!(matches!(
+                store.ingest(item).unwrap(),
+                ApplyOutcome::Inserted { .. }
+            ));
+        }
+        let topics = BTreeSet::from([Topic::new("test.state").unwrap()]);
+        let scopes = BTreeSet::from([Scope::new("mission/test").unwrap()]);
+
+        assert_eq!(
+            select_inventory_metadata_bounded(&store.connection, &topics, &scopes, 3)
+                .unwrap()
+                .len(),
+            3
+        );
+        assert!(matches!(
+            select_inventory_metadata_bounded(&store.connection, &topics, &scopes, 2),
+            Err(StoreError::Invalid(message)) if message == INVENTORY_OBJECT_LIMIT_ERROR
+        ));
     }
 
     #[test]
@@ -16753,6 +18481,22 @@ mod sqlite_integration_tests {
         let local_publisher = [0x99; 32];
         let topic = Topic::new("test.state").unwrap();
         let scope = Scope::new("mission/test").unwrap();
+        let unrelated_topic = Topic::new("test.other").unwrap();
+        let unrelated_scope = Scope::new("mission/other").unwrap();
+        assert!(
+            store
+                .reserve_publish(local_publisher, DataClass::State, &unrelated_topic, &scope)
+                .unwrap()
+                .context
+                .is_empty()
+        );
+        assert!(
+            store
+                .reserve_publish(local_publisher, DataClass::State, &topic, &unrelated_scope)
+                .unwrap()
+                .context
+                .is_empty()
+        );
         let reservation = store
             .reserve_publish(local_publisher, DataClass::State, &topic, &scope)
             .unwrap();
@@ -16775,9 +18519,153 @@ mod sqlite_integration_tests {
         ));
         let frontier_publishers: i64 = store
             .connection
-            .query_row("SELECT count(*) FROM causal_frontier", [], |row| row.get(0))
+            .query_row(
+                "SELECT count(*) FROM causal_frontier WHERE topic=?1 AND scope=?2",
+                params![topic.as_str(), scope.as_str()],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(frontier_publishers, 2);
+    }
+
+    #[test]
+    fn domain_frontier_cap_is_distinct_atomic_and_isolated() {
+        let mut store = SqliteStore::open_in_memory(StoreConfig::default()).unwrap();
+        let topic = Topic::new("orders").unwrap();
+        let saturated_scope = Scope::new("mission/source").unwrap();
+        let unrelated_scope = Scope::new("mission/other").unwrap();
+        {
+            let transaction = store.connection.transaction().unwrap();
+            for index in 0..(MAX_CAUSAL_CONTEXT_ENTRIES - 1) {
+                transaction
+                    .execute(
+                        "INSERT INTO causal_frontier(topic,scope,publisher,counter)\n\
+                         VALUES(?1,?2,?3,1)",
+                        params![
+                            topic.as_str(),
+                            saturated_scope.as_str(),
+                            indexed_publisher(index).as_slice()
+                        ],
+                    )
+                    .unwrap();
+            }
+            // The same publisher in the compatibility sentinel counts once in
+            // the exact-plus-legacy union, so one final exact publisher remains
+            // admissible.
+            transaction
+                .execute(
+                    "INSERT INTO causal_frontier(topic,scope,publisher,counter)\n\
+                     VALUES(?1,?2,?3,2)",
+                    params![
+                        LEGACY_CAUSAL_TOPIC,
+                        LEGACY_CAUSAL_SCOPE,
+                        indexed_publisher(0).as_slice()
+                    ],
+                )
+                .unwrap();
+            record_accepted_frontier_dot_tx(
+                &transaction,
+                &topic,
+                &saturated_scope,
+                Dot {
+                    publisher: indexed_publisher(MAX_CAUSAL_CONTEXT_ENTRIES - 1),
+                    counter: 1,
+                },
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+        }
+
+        let saturated = load_frontier(&store.connection, &topic, &saturated_scope).unwrap();
+        assert_eq!(saturated.len(), MAX_CAUSAL_CONTEXT_ENTRIES);
+        assert_eq!(saturated.counter(&indexed_publisher(0)), 2);
+        assert!(
+            store
+                .reserve_publish([0xee; 32], DataClass::State, &topic, &saturated_scope)
+                .is_err(),
+            "a new local publisher must fail before sealing at the domain cap"
+        );
+        assert!(
+            store
+                .reserve_publish(
+                    indexed_publisher(0),
+                    DataClass::State,
+                    &topic,
+                    &saturated_scope
+                )
+                .is_ok(),
+            "a publisher already represented in the union may advance at the cap"
+        );
+
+        let counts_before: (i64, i64, i64) = store
+            .connection
+            .query_row(
+                "SELECT (SELECT count(*) FROM items),\n\
+                        (SELECT count(*) FROM accepted_dots),\n\
+                        (SELECT count(*) FROM outbox)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let mut rejected = test_item(0x6d, 1, None, 0, None);
+        rejected.topic = topic.clone();
+        rejected.scope = saturated_scope.clone();
+        rejected.stamp.dot.publisher = [0xee; 32];
+        assert!(matches!(
+            store.ingest(rejected),
+            Err(StoreError::Invalid(_))
+        ));
+        let counts_after: (i64, i64, i64) = store
+            .connection
+            .query_row(
+                "SELECT (SELECT count(*) FROM items),\n\
+                        (SELECT count(*) FROM accepted_dots),\n\
+                        (SELECT count(*) FROM outbox)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(counts_after, counts_before, "cap rejection must roll back");
+
+        let authorization = verified_bridge_authorization();
+        let route = verified_bridge_route(
+            &[&authorization],
+            0x74,
+            b"domain-cap-provider-authenticated-bridge-source",
+        );
+        let bridge_dots_before: i64 = store
+            .connection
+            .query_row("SELECT count(*) FROM accepted_dots", [], |row| row.get(0))
+            .unwrap();
+        let transaction = store.connection.transaction().unwrap();
+        assert!(matches!(
+            accept_bridge_source_semantics_tx(&transaction, &route.source),
+            Err(StoreError::Invalid(_))
+        ));
+        drop(transaction);
+        let bridge_dots_after: i64 = store
+            .connection
+            .query_row("SELECT count(*) FROM accepted_dots", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(bridge_dots_after, bridge_dots_before);
+
+        let mut accepted_elsewhere = test_item(0x6e, 1, None, 0, None);
+        accepted_elsewhere.topic = topic.clone();
+        accepted_elsewhere.scope = unrelated_scope.clone();
+        accepted_elsewhere.stamp.dot.publisher = [0xee; 32];
+        assert!(matches!(
+            store.ingest(accepted_elsewhere).unwrap(),
+            ApplyOutcome::Inserted { .. }
+        ));
+        let unrelated = load_frontier(&store.connection, &topic, &unrelated_scope).unwrap();
+        assert_eq!(unrelated.len(), 2, "sentinel plus one exact publisher");
+        assert_eq!(unrelated.counter(&[0xee; 32]), 1);
+        assert_eq!(
+            load_frontier(&store.connection, &topic, &saturated_scope)
+                .unwrap()
+                .len(),
+            MAX_CAUSAL_CONTEXT_ENTRIES
+        );
     }
 
     #[test]
@@ -16793,8 +18681,14 @@ mod sqlite_integration_tests {
         let verified = verified_bridge_authorization();
         {
             let mut store = SqliteStore::open(&path, StoreConfig::default()).unwrap();
-            assert!(store.stage_bridge_authorization(&verified).unwrap());
-            assert!(!store.stage_bridge_authorization(&verified).unwrap());
+            assert_eq!(
+                store.stage_bridge_authorization(&verified).unwrap(),
+                BridgeControlStage::Inserted
+            );
+            assert_eq!(
+                store.stage_bridge_authorization(&verified).unwrap(),
+                BridgeControlStage::Duplicate
+            );
             let stored = store
                 .stored_bridge_authorization(&verified.envelope_id)
                 .unwrap()
@@ -16930,6 +18824,7 @@ mod sqlite_integration_tests {
         let fork = VerifiedBridgeAuthorization::from_provider(
             exact_object_id(&fork_exact),
             fork_authorization,
+            first.control_signer,
             fork_exact,
         )
         .unwrap();
@@ -17172,6 +19067,7 @@ mod sqlite_integration_tests {
             store
                 .set_scope_epoch(&ScopeEpoch {
                     authority: [0x42; 32],
+                    signer: [0x42; 32],
                     scope: Scope::new("mission/target").unwrap(),
                     epoch: 6,
                     control_sequence: 6,
@@ -17223,6 +19119,7 @@ mod sqlite_integration_tests {
         let fresh_authorization = VerifiedBridgeAuthorization::from_provider(
             exact_object_id(&exact),
             successor_body,
+            successor.control_signer,
             exact,
         )
         .unwrap();
@@ -17237,19 +19134,18 @@ mod sqlite_integration_tests {
         store
             .promote_verified_bridge_route_at(&fresh_route, Some(bridge_sample(10)))
             .unwrap();
-        assert!(
-            store
-                .apply_revocation(&Revocation {
-                    subject: fresh_route.source.metadata.stamp.dot.publisher,
-                    authority: [0x42; 32],
-                    generation: 1,
-                    control_sequence: 1,
-                    previous_control: None,
-                    sealed_notice: b"source-publisher-revoked".to_vec(),
-                    observed_at_ms: None,
-                })
-                .unwrap()
+        let source_revocation = signed_revocation_control(
+            fresh_authorization.authorization.authority_id,
+            fresh_authorization.control_signer,
+            fresh_route.source.metadata.stamp.dot.publisher,
+            1,
+            None,
+            1,
         );
+        assert!(matches!(
+            store.ingest_control(&source_revocation).unwrap(),
+            ControlOutcome::Applied { .. }
+        ));
         assert!(
             store
                 .active_bridge_route(
@@ -17259,6 +19155,18 @@ mod sqlite_integration_tests {
                 )
                 .unwrap()
                 .is_none()
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT count(*) FROM bridge_route_outbox WHERE wrapper_envelope_id=?1",
+                    params![fresh_route.wrapper_envelope_id.as_slice()],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0,
+            "normal-chain revocation must immediately remove stale route work"
         );
         assert!(
             store
@@ -18109,6 +20017,7 @@ mod sqlite_integration_tests {
             .apply_revocation(&Revocation {
                 subject: revoked.source.metadata.stamp.dot.publisher,
                 authority: [0x70; 32],
+                signer: [0x70; 32],
                 generation: 1,
                 control_sequence: 1,
                 previous_control: None,
@@ -19128,6 +21037,631 @@ mod sqlite_integration_tests {
             store.ingest_control(&rollback),
             Err(StoreError::ControlRollback)
         ));
+    }
+
+    #[test]
+    fn revoked_signer_pending_suffix_is_rejected_and_recovery_signer_reuses_the_chain() {
+        let mut store = SqliteStore::open_in_memory(StoreConfig::default()).unwrap();
+        let authority = [0x20; 32];
+        let old_signer = [0x21; 32];
+        let recovery_signer = [0x22; 32];
+        let revoke_old =
+            signed_revocation_control(authority, recovery_signer, old_signer, 1, None, 1);
+        let bad_two = signed_revocation_control(
+            authority,
+            old_signer,
+            [0x23; 32],
+            2,
+            Some(revoke_old.envelope_id),
+            1,
+        );
+        let bad_three = signed_revocation_control(
+            authority,
+            old_signer,
+            [0x24; 32],
+            3,
+            Some(bad_two.envelope_id),
+            1,
+        );
+        assert!(matches!(
+            store.ingest_control(&bad_three).unwrap(),
+            ControlOutcome::Pending { .. }
+        ));
+        assert!(matches!(
+            store.ingest_control(&bad_two).unwrap(),
+            ControlOutcome::Pending { .. }
+        ));
+
+        let ControlOutcome::Applied {
+            activated,
+            rejected,
+            ..
+        } = store.ingest_control(&revoke_old).unwrap()
+        else {
+            panic!("the valid revocation prefix must commit");
+        };
+        assert_eq!(
+            activated
+                .iter()
+                .map(|control| control.envelope_id)
+                .collect::<Vec<_>>(),
+            vec![revoke_old.envelope_id]
+        );
+        assert_eq!(
+            rejected
+                .iter()
+                .map(|control| control.envelope_id)
+                .collect::<Vec<_>>(),
+            vec![bad_two.envelope_id, bad_three.envelope_id]
+        );
+        assert_eq!(store.applied_controls().unwrap().len(), 1);
+
+        let good_two = signed_revocation_control(
+            authority,
+            recovery_signer,
+            [0x25; 32],
+            2,
+            Some(revoke_old.envelope_id),
+            1,
+        );
+        let good_three = signed_revocation_control(
+            authority,
+            recovery_signer,
+            [0x26; 32],
+            3,
+            Some(good_two.envelope_id),
+            1,
+        );
+        assert!(matches!(
+            store.ingest_control(&good_three).unwrap(),
+            ControlOutcome::Pending { .. }
+        ));
+        let ControlOutcome::Applied { activated, .. } = store.ingest_control(&good_two).unwrap()
+        else {
+            panic!("recovery signer must continue the same mission chain");
+        };
+        assert_eq!(activated.len(), 2);
+        assert!(
+            activated
+                .iter()
+                .all(|control| control.signer == recovery_signer)
+        );
+        assert_eq!(store.applied_controls().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn far_future_revoked_signer_control_cannot_poison_recovery_after_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "aster-far-future-control-signer-{}-{}.sqlite3",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let authority = [0x27; 32];
+        let compromised_signer = [0x28; 32];
+        let recovery_signer = [0x29; 32];
+        let effect_subject = [0x2a; 32];
+        let revoke_compromised =
+            signed_revocation_control(authority, recovery_signer, compromised_signer, 1, None, 1);
+        let valid_two = signed_revocation_control(
+            authority,
+            recovery_signer,
+            effect_subject,
+            2,
+            Some(revoke_compromised.envelope_id),
+            2,
+        );
+        let poisoned_future = signed_revocation_control(
+            authority,
+            compromised_signer,
+            effect_subject,
+            1_000_000,
+            Some([0xee; 32]),
+            1,
+        );
+
+        {
+            let mut store = SqliteStore::open(&path, StoreConfig::default()).unwrap();
+            assert!(matches!(
+                store.ingest_control(&poisoned_future).unwrap(),
+                ControlOutcome::Pending { .. }
+            ));
+            assert!(matches!(
+                store.ingest_control(&valid_two).unwrap(),
+                ControlOutcome::Pending { .. }
+            ));
+        }
+        {
+            let mut reopened = SqliteStore::open(&path, StoreConfig::default()).unwrap();
+            let ControlOutcome::Applied {
+                activated,
+                rejected,
+                ..
+            } = reopened.ingest_control(&revoke_compromised).unwrap()
+            else {
+                panic!("revocation must purge the poisoned future and activate valid recovery");
+            };
+            assert_eq!(
+                activated
+                    .iter()
+                    .map(|control| control.envelope_id)
+                    .collect::<Vec<_>>(),
+                vec![revoke_compromised.envelope_id, valid_two.envelope_id]
+            );
+            assert_eq!(
+                rejected
+                    .iter()
+                    .map(|control| control.envelope_id)
+                    .collect::<Vec<_>>(),
+                vec![poisoned_future.envelope_id]
+            );
+        }
+        {
+            let mut reopened = SqliteStore::open(&path, StoreConfig::default()).unwrap();
+            assert_eq!(
+                reopened
+                    .connection
+                    .query_row(
+                        "SELECT count(*) FROM controls WHERE envelope_id=?1",
+                        params![poisoned_future.envelope_id.as_slice()],
+                        |row| row.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                reopened
+                    .applied_controls()
+                    .unwrap()
+                    .iter()
+                    .map(|control| control.envelope_id)
+                    .collect::<Vec<_>>(),
+                vec![revoke_compromised.envelope_id, valid_two.envelope_id]
+            );
+
+            let rollback = signed_revocation_control(
+                authority,
+                recovery_signer,
+                effect_subject,
+                3,
+                Some(valid_two.envelope_id),
+                1,
+            );
+            assert!(matches!(
+                reopened.ingest_control(&rollback),
+                Err(StoreError::ControlRollback)
+            ));
+            assert_eq!(
+                reopened
+                    .connection
+                    .query_row(
+                        "SELECT count(*) FROM controls WHERE envelope_id=?1",
+                        params![rollback.envelope_id.as_slice()],
+                        |row| row.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                0,
+                "a rejected contiguous rollback must not occupy the chain"
+            );
+        }
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("sqlite3-wal"));
+        let _ = fs::remove_file(path.with_extension("sqlite3-shm"));
+    }
+
+    #[test]
+    fn far_future_revoked_bridge_signer_is_purged_without_deleting_valid_prefix() {
+        let path = std::env::temp_dir().join(format!(
+            "aster-far-future-bridge-signer-{}-{}.sqlite3",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let first = verified_bridge_authorization();
+        let recovery_signer = first.control_signer;
+        let compromised_signer = [0x4a; 32];
+        let valid_two = bridge_authorization_successor_signed(&first, recovery_signer, 2, true);
+        let poisoned_future = bridge_authorization_at_sequence_signed(
+            &first,
+            compromised_signer,
+            1_000_000,
+            [0xed; 32],
+            1,
+        );
+        let revoke_compromised =
+            signed_revocation_control([0x4b; 32], recovery_signer, compromised_signer, 1, None, 1);
+
+        {
+            let mut store = SqliteStore::open(&path, StoreConfig::default()).unwrap();
+            assert!(matches!(
+                store.ingest_bridge_authorization(&poisoned_future).unwrap(),
+                BridgeControlOutcome::Pending { .. }
+            ));
+            assert!(matches!(
+                store.ingest_bridge_authorization(&valid_two).unwrap(),
+                BridgeControlOutcome::Pending { .. }
+            ));
+        }
+        {
+            let mut reopened = SqliteStore::open(&path, StoreConfig::default()).unwrap();
+            let ControlOutcome::Applied { rejected, .. } =
+                reopened.ingest_control(&revoke_compromised).unwrap()
+            else {
+                panic!("ordinary revocation must activate and purge bridge signer poison");
+            };
+            assert_eq!(
+                rejected
+                    .iter()
+                    .map(|control| control.envelope_id)
+                    .collect::<Vec<_>>(),
+                vec![poisoned_future.envelope_id]
+            );
+            assert!(
+                reopened
+                    .stored_bridge_authorization(&poisoned_future.envelope_id)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                reopened
+                    .stored_bridge_authorization(&valid_two.envelope_id)
+                    .unwrap()
+                    .is_some(),
+                "the valid earlier candidate from the recovery signer must survive"
+            );
+        }
+        {
+            let mut reopened = SqliteStore::open(&path, StoreConfig::default()).unwrap();
+            assert!(
+                reopened
+                    .stored_bridge_authorization(&poisoned_future.envelope_id)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(matches!(
+                reopened.ingest_bridge_authorization(&first).unwrap(),
+                BridgeControlOutcome::Applied { ref activated, .. } if activated.len() == 1
+            ));
+            assert!(matches!(
+                reopened.ingest_bridge_authorization(&valid_two).unwrap(),
+                BridgeControlOutcome::Applied { ref activated, .. } if activated.len() == 1
+            ));
+            assert_eq!(
+                reopened
+                    .active_bridge_authorization(&valid_two.authorization.authorization_key)
+                    .unwrap()
+                    .unwrap()
+                    .envelope_id,
+                valid_two.envelope_id
+            );
+
+            let rollback =
+                bridge_authorization_successor_signed(&valid_two, recovery_signer, 1, true);
+            assert!(matches!(
+                reopened.ingest_bridge_authorization(&rollback),
+                Err(StoreError::BridgeControlRollback)
+            ));
+            assert_eq!(
+                reopened
+                    .active_bridge_authorization(&valid_two.authorization.authorization_key)
+                    .unwrap()
+                    .unwrap()
+                    .envelope_id,
+                valid_two.envelope_id
+            );
+        }
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("sqlite3-wal"));
+        let _ = fs::remove_file(path.with_extension("sqlite3-shm"));
+    }
+
+    #[test]
+    fn stable_authority_self_revocation_is_a_durable_terminal_chain_link() {
+        let path = std::env::temp_dir().join(format!(
+            "aster-terminal-authority-revocation-{}-{}.sqlite3",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bridge_first = verified_bridge_authorization();
+        let authority = bridge_first.authorization.authority_id;
+        let current_signer = bridge_first.control_signer;
+        let recovery_signer = [0x4c; 32];
+        let self_revocation =
+            signed_revocation_control(authority, current_signer, authority, 1, None, 1);
+        let pending_delegate = signed_revocation_control(
+            authority,
+            recovery_signer,
+            [0x4d; 32],
+            2,
+            Some(self_revocation.envelope_id),
+            1,
+        );
+        let pending_bridge =
+            bridge_authorization_successor_signed(&bridge_first, recovery_signer, 2, true);
+
+        {
+            let mut store = SqliteStore::open(&path, StoreConfig::default()).unwrap();
+            assert!(matches!(
+                store.ingest_control(&pending_delegate).unwrap(),
+                ControlOutcome::Pending { .. }
+            ));
+            assert!(matches!(
+                store.ingest_bridge_authorization(&pending_bridge).unwrap(),
+                BridgeControlOutcome::Pending { .. }
+            ));
+            let ControlOutcome::Applied {
+                activated,
+                rejected,
+                ..
+            } = store.ingest_control(&self_revocation).unwrap()
+            else {
+                panic!("authority self-revocation must apply as its final link");
+            };
+            assert_eq!(
+                activated
+                    .iter()
+                    .map(|control| control.envelope_id)
+                    .collect::<Vec<_>>(),
+                vec![self_revocation.envelope_id]
+            );
+            assert_eq!(
+                rejected
+                    .iter()
+                    .map(|control| control.envelope_id)
+                    .collect::<Vec<_>>(),
+                vec![pending_delegate.envelope_id, pending_bridge.envelope_id]
+            );
+        }
+        {
+            let mut reopened = SqliteStore::open(&path, StoreConfig::default()).unwrap();
+            assert!(reopened.is_revoked(&authority).unwrap());
+            assert_eq!(reopened.applied_controls().unwrap().len(), 1);
+            assert!(matches!(
+                reopened.reserve_control(ControlPrincipal {
+                    authority,
+                    signer: recovery_signer,
+                }),
+                Err(StoreError::ControlAuthorityRevoked(node)) if node == authority
+            ));
+
+            let ordinary_outcome = reopened.ingest_control(&pending_delegate).unwrap();
+            assert!(matches!(ordinary_outcome, ControlOutcome::Rejected { .. }));
+            assert_eq!(
+                ordinary_outcome.rejected_input(),
+                Some(RejectedControl {
+                    envelope_id: pending_delegate.envelope_id,
+                    signer: recovery_signer,
+                })
+            );
+            let bridge_outcome = reopened
+                .ingest_bridge_authorization(&pending_bridge)
+                .unwrap();
+            assert!(matches!(
+                bridge_outcome,
+                BridgeControlOutcome::Rejected { .. }
+            ));
+            assert_eq!(
+                bridge_outcome.rejected_input(),
+                Some(RejectedControl {
+                    envelope_id: pending_bridge.envelope_id,
+                    signer: recovery_signer,
+                })
+            );
+        }
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("sqlite3-wal"));
+        let _ = fs::remove_file(path.with_extension("sqlite3-shm"));
+    }
+
+    #[test]
+    fn rejected_insert_is_reported_when_an_unrelated_pending_link_activates() {
+        let mut store = SqliteStore::open_in_memory(StoreConfig::default()).unwrap();
+        let authority = [0x30; 32];
+        let live_signer = [0x31; 32];
+        let revoked_signer = [0x32; 32];
+        store
+            .apply_revocation(&Revocation {
+                subject: revoked_signer,
+                authority,
+                signer: live_signer,
+                generation: 1,
+                control_sequence: 1,
+                previous_control: None,
+                sealed_notice: b"provider-authenticated-signer-revocation".to_vec(),
+                observed_at_ms: None,
+            })
+            .unwrap();
+        let valid = signed_revocation_control(authority, live_signer, [0x33; 32], 1, None, 1);
+        {
+            let transaction = store.connection.transaction().unwrap();
+            assert_eq!(
+                insert_control_tx(&transaction, &valid).unwrap(),
+                ControlInsert::Inserted
+            );
+            transaction.commit().unwrap();
+        }
+        let rejected = signed_revocation_control(
+            authority,
+            revoked_signer,
+            [0x34; 32],
+            2,
+            Some(valid.envelope_id),
+            1,
+        );
+        let ControlOutcome::Applied {
+            activated,
+            rejected: rejected_controls,
+            ..
+        } = store.ingest_control(&rejected).unwrap()
+        else {
+            panic!("the staged valid link must activate");
+        };
+        assert_eq!(activated.len(), 1);
+        assert_eq!(activated[0].envelope_id, valid.envelope_id);
+        assert_eq!(
+            rejected_controls,
+            vec![RejectedControl {
+                envelope_id: rejected.envelope_id,
+                signer: revoked_signer,
+            }]
+        );
+        let outcome = ControlOutcome::Applied {
+            envelope_id: rejected.envelope_id,
+            activated,
+            rejected: rejected_controls,
+        };
+        assert_eq!(
+            outcome.rejected_input(),
+            Some(RejectedControl {
+                envelope_id: rejected.envelope_id,
+                signer: revoked_signer,
+            }),
+            "transport callers must not acknowledge the rejected input as committed"
+        );
+    }
+
+    #[test]
+    fn signer_substitution_and_reservation_signer_mismatch_fail_closed() {
+        let mut store = SqliteStore::open_in_memory(StoreConfig::default()).unwrap();
+        let authority = [0x40; 32];
+        let reserved_signer = [0x41; 32];
+        let substituted_signer = [0x42; 32];
+        let reservation = store
+            .reserve_control(ControlPrincipal {
+                authority,
+                signer: reserved_signer,
+            })
+            .unwrap();
+        let mismatched = signed_revocation_control(
+            authority,
+            substituted_signer,
+            [0x43; 32],
+            reservation.sequence,
+            reservation.previous_control,
+            1,
+        );
+        assert!(matches!(
+            store.commit_local_control(&reservation, &mismatched),
+            Err(StoreError::Invalid(_))
+        ));
+
+        let accepted =
+            signed_revocation_control(authority, reserved_signer, [0x44; 32], 1, None, 1);
+        store.ingest_control(&accepted).unwrap();
+        let mut substituted = accepted.clone();
+        substituted.signer = substituted_signer;
+        substituted.revocation.as_mut().unwrap().signer = substituted_signer;
+        assert!(matches!(
+            store.ingest_control(&substituted),
+            Err(StoreError::ControlFork)
+        ));
+    }
+
+    #[test]
+    fn bridge_revoked_signer_suffix_is_rejected_and_no_longer_live() {
+        let mut store = SqliteStore::open_in_memory(StoreConfig::default()).unwrap();
+        let recovery_signer = [0x49; 32];
+        let old_signer = [0x4a; 32];
+        let first = verified_bridge_authorization();
+        assert_eq!(first.control_signer, recovery_signer);
+        let bad_two = bridge_authorization_successor_signed(&first, old_signer, 2, true);
+        let bad_three = bridge_authorization_successor_signed(&bad_two, old_signer, 3, true);
+        assert!(matches!(
+            store.ingest_bridge_authorization(&bad_three).unwrap(),
+            BridgeControlOutcome::Pending { .. }
+        ));
+        assert!(matches!(
+            store.ingest_bridge_authorization(&bad_two).unwrap(),
+            BridgeControlOutcome::Pending { .. }
+        ));
+        store
+            .apply_revocation(&Revocation {
+                subject: old_signer,
+                authority: first.authorization.authority_id,
+                signer: recovery_signer,
+                generation: 1,
+                control_sequence: 1,
+                previous_control: None,
+                sealed_notice: b"provider-authenticated-old-signer-revocation".to_vec(),
+                observed_at_ms: None,
+            })
+            .unwrap();
+        assert!(
+            store
+                .stored_bridge_authorization(&bad_two.envelope_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .stored_bridge_authorization(&bad_three.envelope_id)
+                .unwrap()
+                .is_none()
+        );
+        let BridgeControlOutcome::Applied { activated, .. } =
+            store.ingest_bridge_authorization(&first).unwrap()
+        else {
+            panic!("the recovery signer must activate the first bridge link");
+        };
+        assert_eq!(activated.len(), 1);
+
+        let BridgeControlOutcome::Rejected { rejected, .. } =
+            store.ingest_bridge_authorization(&bad_two).unwrap()
+        else {
+            panic!("the reauthenticated revoked-signer suffix must be rejected");
+        };
+        assert_eq!(
+            rejected
+                .iter()
+                .map(|control| control.envelope_id)
+                .collect::<Vec<_>>(),
+            vec![bad_two.envelope_id]
+        );
+        let good_two = bridge_authorization_successor_signed(&first, recovery_signer, 2, true);
+        let good_three = bridge_authorization_successor_signed(&good_two, recovery_signer, 3, true);
+        assert!(matches!(
+            store.ingest_bridge_authorization(&good_three).unwrap(),
+            BridgeControlOutcome::Pending { .. }
+        ));
+        let BridgeControlOutcome::Applied { activated, .. } =
+            store.ingest_bridge_authorization(&good_two).unwrap()
+        else {
+            panic!("the recovery bridge signer must reuse the chain suffix");
+        };
+        assert_eq!(activated.len(), 2);
+
+        let current = store
+            .active_bridge_authorization(&good_two.authorization.authorization_key)
+            .unwrap()
+            .unwrap();
+        store
+            .apply_revocation(&Revocation {
+                subject: current.control_signer,
+                authority: current.authorization.authority_id,
+                signer: [0x4b; 32],
+                generation: 1,
+                control_sequence: 2,
+                previous_control: None,
+                sealed_notice: b"provider-authenticated-current-signer-revocation".to_vec(),
+                observed_at_ms: None,
+            })
+            .unwrap();
+        assert!(matches!(
+            store.ingest_bridge_authorization(&good_two).unwrap(),
+            BridgeControlOutcome::Duplicate { .. }
+        ));
+        assert!(
+            !store
+                .bridge_authorization_is_live(&current.envelope_id)
+                .unwrap()
+        );
     }
 
     #[test]

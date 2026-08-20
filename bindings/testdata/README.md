@@ -10,7 +10,7 @@ owned by the Rust provisioning provider and is deliberately not part of the C
 ABI or either language binding. Regenerate it whenever that provider's format
 version changes; never replace it with operational credential material.
 
-It was generated on 2026-08-18 by the checked-in
+It was generated on 2026-08-19 by the checked-in
 `aster-ffi/generate_test_fixture` helper, using the reference provisioner and a
 public constant authority seed. The node has only epoch 0/1 member grants for
 `mission/team/alpha` and the four canonical binding-test topics. Reproduce the
@@ -22,4 +22,4 @@ cargo run -p aster-ffi --example generate_test_fixture -- \
 ```
 
 Current SHA-256:
-`fe69bae579e25b6fa2fd4f9e93656ef3ea5d25290ea213a1c0b78adcba87e860`.
+`1a6caf5de104f31a5a13d3611b8ad122fcd2e609b35c74d47705f6f561c542fe`.

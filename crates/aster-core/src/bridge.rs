@@ -11,7 +11,7 @@ use std::fmt;
 
 pub(crate) const AUTHORIZATION_MAGIC: &[u8; 8] = b"ASTRBA01";
 pub(crate) const WRAPPER_MAGIC: &[u8; 8] = b"ASTRBW01";
-pub(crate) const AUTHORIZATION_FORMAT: u16 = 1;
+pub(crate) const AUTHORIZATION_FORMAT: u16 = 2;
 pub(crate) const WRAPPER_FORMAT: u16 = 1;
 pub(crate) const SEMANTIC_PROTOCOL: u16 = 2;
 pub(crate) const COMPLETE_SUITE: u16 = 0x0001;
@@ -32,8 +32,12 @@ const MAX_AUTHORIZATION_PROTECTED_BYTES: usize =
     MAX_AUTHORIZATION_TOTAL_BYTES - BRIDGE_PUBLIC_HEADER_BYTES;
 const MAX_WRAPPER_PLAINTEXT_BYTES: usize = MAX_WRAPPER_PROTECTED_BYTES - GCM_TAG_BYTES;
 const MAX_CREDENTIAL_BYTES: usize = 16 * 1024;
+const MAX_CONTROL_AUTHENTICATION_BYTES: usize =
+    8 + 2 + 4 + MAX_CREDENTIAL_BYTES + HYBRID_SIGNATURE_BYTES * 2;
 const AUTHORIZATION_KEY_DOMAIN: &[u8] = b"aster/bridge-authorization-key/v1";
-const AUTHORIZATION_CONTROL_DOMAIN: &[u8] = b"aster/bridge-authorization-control/v1";
+const AUTHORIZATION_CONTROL_DOMAIN: &[u8] = b"aster/bridge-delegated-control/v2";
+const CONTROL_AUTHENTICATION_MAGIC: &[u8; 8] = b"ASTRBCA2";
+const CONTROL_AUTHENTICATION_FORMAT: u16 = 2;
 const HOP_SIGNATURE_DOMAIN: &[u8] = b"aster/bridge-hop-signature/v1";
 const HOP_ID_DOMAIN: &[u8] = b"aster/bridge-hop-id/v1";
 const ROUTE_ID_DOMAIN: &[u8] = b"aster/bridge-route-id/v1";
@@ -85,6 +89,12 @@ pub(crate) struct BridgeAuthorization {
     pub(crate) target_scope: Scope,
     pub(crate) enabled: Option<EnabledAuthorization>,
     pub(crate) authority_control_signature: Vec<u8>,
+}
+
+pub(crate) struct DelegatedControlAuthentication {
+    pub(crate) credential_body: Vec<u8>,
+    pub(crate) authority_credential_signature: Vec<u8>,
+    pub(crate) control_signature: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -182,6 +192,56 @@ fn validate_hybrid_signature(bytes: &[u8]) -> Result<(), BridgeCodecError> {
     Ok(())
 }
 
+pub(crate) fn encode_delegated_control_authentication(
+    credential_body: &[u8],
+    authority_credential_signature: &[u8],
+    control_signature: &[u8],
+) -> Result<Vec<u8>, BridgeCodecError> {
+    if credential_body.is_empty() || credential_body.len() > MAX_CREDENTIAL_BYTES {
+        return Err(BridgeCodecError::Invalid("control credential"));
+    }
+    validate_hybrid_signature(authority_credential_signature)?;
+    validate_hybrid_signature(control_signature)?;
+    let mut out = Vec::new();
+    out.extend_from_slice(CONTROL_AUTHENTICATION_MAGIC);
+    out.extend_from_slice(&CONTROL_AUTHENTICATION_FORMAT.to_be_bytes());
+    push_u32_bytes(&mut out, credential_body)?;
+    out.extend_from_slice(authority_credential_signature);
+    out.extend_from_slice(control_signature);
+    if out.len() > MAX_CONTROL_AUTHENTICATION_BYTES {
+        return Err(BridgeCodecError::SizeLimit);
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_delegated_control_authentication(
+    bytes: &[u8],
+) -> Result<DelegatedControlAuthentication, BridgeCodecError> {
+    if bytes.len() > MAX_CONTROL_AUTHENTICATION_BYTES {
+        return Err(BridgeCodecError::SizeLimit);
+    }
+    let mut reader = Reader::new(bytes);
+    if reader.take(CONTROL_AUTHENTICATION_MAGIC.len())? != CONTROL_AUTHENTICATION_MAGIC
+        || reader.u16()? != CONTROL_AUTHENTICATION_FORMAT
+    {
+        return Err(BridgeCodecError::Invalid("control authentication format"));
+    }
+    let credential_body = reader.u32_bytes(MAX_CREDENTIAL_BYTES)?.to_vec();
+    if credential_body.is_empty() {
+        return Err(BridgeCodecError::Invalid("control credential"));
+    }
+    let authority_credential_signature = reader.take(HYBRID_SIGNATURE_BYTES)?.to_vec();
+    let control_signature = reader.take(HYBRID_SIGNATURE_BYTES)?.to_vec();
+    reader.finish()?;
+    validate_hybrid_signature(&authority_credential_signature)?;
+    validate_hybrid_signature(&control_signature)?;
+    Ok(DelegatedControlAuthentication {
+        credential_body,
+        authority_credential_signature,
+        control_signature,
+    })
+}
+
 fn validate_priority_mask(mask: u8) -> Result<(), BridgeCodecError> {
     if mask == 0 || mask & !0x0f != 0 {
         return Err(BridgeCodecError::Invalid("priority mask"));
@@ -215,7 +275,13 @@ impl BridgeAuthorization {
         {
             return Err(BridgeCodecError::Invalid("authorization identity"));
         }
-        validate_hybrid_signature(&self.authority_control_signature)?;
+        // Provider-issued semantic-v2 values carry the complete delegated authentication
+        // bundle. The fixed signature shape remains accepted here only because this type is also
+        // the provider-verified durable token's structural model; the cryptographic provider
+        // rejects that placeholder/legacy shape at its authentication boundary.
+        if decode_delegated_control_authentication(&self.authority_control_signature).is_err() {
+            validate_hybrid_signature(&self.authority_control_signature)?;
+        }
         if let Some(enabled) = &self.enabled {
             if enabled.source_route_epoch == 0
                 || enabled.target_route_epoch == 0
@@ -236,8 +302,18 @@ impl BridgeAuthorization {
         Ok(())
     }
 
-    pub(crate) fn control_signature_digest(&self) -> Result<[u8; 32], BridgeCodecError> {
-        let bytes = self.encode_inner(false)?;
+    pub(crate) fn control_signature_digest(
+        &self,
+        credential_body: &[u8],
+        authority_credential_signature: &[u8],
+    ) -> Result<[u8; 32], BridgeCodecError> {
+        if credential_body.is_empty() || credential_body.len() > MAX_CREDENTIAL_BYTES {
+            return Err(BridgeCodecError::Invalid("control credential"));
+        }
+        validate_hybrid_signature(authority_credential_signature)?;
+        let mut bytes = self.encode_inner(false)?;
+        push_u32_bytes(&mut bytes, credential_body)?;
+        bytes.extend_from_slice(authority_credential_signature);
         Ok(hash_input(AUTHORIZATION_CONTROL_DOMAIN, &bytes))
     }
 
@@ -252,6 +328,7 @@ impl BridgeAuthorization {
     fn encode_inner(&self, signature: bool) -> Result<Vec<u8>, BridgeCodecError> {
         let mut out = Vec::new();
         out.push(AUTHORIZATION_KIND);
+        out.extend_from_slice(&AUTHORIZATION_FORMAT.to_be_bytes());
         out.extend_from_slice(&self.mission_id);
         out.extend_from_slice(&self.authority_id);
         out.extend_from_slice(&self.control_sequence.to_be_bytes());
@@ -281,7 +358,7 @@ impl BridgeAuthorization {
             out.extend_from_slice(&enabled.authority_credential_signature);
         }
         if signature {
-            out.extend_from_slice(&self.authority_control_signature);
+            push_u32_bytes(&mut out, &self.authority_control_signature)?;
         }
         Ok(out)
     }
@@ -291,7 +368,7 @@ impl BridgeAuthorization {
             return Err(BridgeCodecError::SizeLimit);
         }
         let mut reader = Reader::new(bytes);
-        if reader.u8()? != AUTHORIZATION_KIND {
+        if reader.u8()? != AUTHORIZATION_KIND || reader.u16()? != AUTHORIZATION_FORMAT {
             return Err(BridgeCodecError::Invalid("authorization kind"));
         }
         let mission_id = reader.array()?;
@@ -339,7 +416,8 @@ impl BridgeAuthorization {
         } else {
             None
         };
-        let authority_control_signature = reader.take(HYBRID_SIGNATURE_BYTES)?.to_vec();
+        let authority_control_signature =
+            reader.u32_bytes(MAX_CONTROL_AUTHENTICATION_BYTES)?.to_vec();
         reader.finish()?;
         let value = Self {
             mission_id,
@@ -1019,7 +1097,13 @@ mod tests {
 
     #[test]
     fn authorization_round_trip_is_exact_and_fail_closed() {
-        let value = authorization(1, None, 1, true);
+        let mut value = authorization(1, None, 1, true);
+        value.authority_control_signature = encode_delegated_control_authentication(
+            &[0x50; 128],
+            &signature(0x51),
+            &signature(0x52),
+        )
+        .unwrap();
         value.validate().unwrap();
         let encoded = value.encode().unwrap();
         assert_eq!(BridgeAuthorization::decode(&encoded).unwrap(), value);
@@ -1030,7 +1114,25 @@ mod tests {
                 .unwrap(),
             encoded
         );
-        assert_eq!(value.control_signature_digest().unwrap().len(), 32);
+        assert_eq!(
+            value
+                .control_signature_digest(&[0x51; 128], &signature(0x52))
+                .unwrap()
+                .len(),
+            32
+        );
+        let authentication =
+            decode_delegated_control_authentication(&value.authority_control_signature).unwrap();
+        assert_eq!(authentication.credential_body, vec![0x50; 128]);
+        assert_eq!(
+            authentication.authority_credential_signature,
+            signature(0x51)
+        );
+        assert_eq!(authentication.control_signature, signature(0x52));
+
+        let mut legacy_format = encoded.clone();
+        legacy_format[1..3].copy_from_slice(&1u16.to_be_bytes());
+        assert!(BridgeAuthorization::decode(&legacy_format).is_err());
 
         let mut trailing = encoded.clone();
         trailing.push(0);

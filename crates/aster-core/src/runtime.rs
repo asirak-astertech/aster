@@ -3,9 +3,10 @@
 //! This is deliberately not an application API.  It is the composition root
 //! for four-flight mutual authentication, replay-protected session records,
 //! deterministic sync messages, bounded fragmentation, and a pluggable Link.
-//! Before `ReferenceAuthenticatedSession` exists, received bytes can only be
-//! consumed as the expected handshake flight; wire DATA and inventory messages
-//! are never decoded or passed to the backend.
+//! Before `ReferenceAuthenticatedSession` exists, received bytes are examined
+//! only as the expected handshake flight; a rejected flight leaves the exact
+//! transition state intact, and wire DATA and inventory messages are never
+//! decoded or passed to the backend.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
@@ -27,7 +28,7 @@ use crate::inventory::SparseInventory;
 use crate::link::Link;
 use crate::model::{ItemId, NodeId, Priority};
 use crate::scheduler::Scheduler;
-use crate::store::{ApplyOutcome, ChunkRange, RecordStore};
+use crate::store::{ApplyOutcome, ChunkRange, MAX_COMPOSITE_INVENTORY_OBJECTS, RecordStore};
 use crate::sync::{InterestFilter, InventoryPurpose, SyncAction, SyncError, SyncEvent, SyncState};
 use crate::wire::{
     self, ByteRange, Data, EnvelopeId, Limits, Message, ObjectId, ObjectKind, WantItem, WireError,
@@ -312,7 +313,9 @@ const MAX_DATA_PAYLOAD_BYTES: usize = 64 * 1024;
 const MAX_DATA_MESSAGES_PER_WANT: usize = 16;
 const MAX_IN_FLIGHT_LOGICAL_FRAMES: usize = 16;
 const MAX_REASSEMBLY_BYTES: usize = 4 * 1024 * 1024;
+const PARTIAL_TRANSFER_IDLE_TTL: Duration = Duration::from_secs(10 * 60);
 const MAX_RECEIVED_FRAMES_PER_PUMP: usize = 4_096;
+const MAX_UNAUTHENTICATED_FAILURES_PER_PUMP: usize = 64;
 const MAX_PENDING_RETRIES: usize = 128;
 const MAX_PENDING_OUTBOX: usize = 128;
 /// Exact cap over retained retry messages and transport epochs, deferred WANT
@@ -510,6 +513,36 @@ struct CompletedTransfer {
     logical_digest: [u8; 32],
 }
 
+/// Adapter routing metadata is not the authenticated protocol identity. Keep
+/// anonymous delivery distinct from a routed contact so neither form can be
+/// silently substituted for the other during fragmentation or after session
+/// establishment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CarrierRoute {
+    Anonymous,
+    Routed(NodeId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PartialTransferRoute {
+    route: CarrierRoute,
+    first_seen: Instant,
+    last_seen: Instant,
+}
+
+impl CarrierRoute {
+    fn from_peer(peer: Option<NodeId>) -> Self {
+        peer.map_or(Self::Anonymous, Self::Routed)
+    }
+
+    fn peer(self) -> Option<NodeId> {
+        match self {
+            Self::Anonymous => None,
+            Self::Routed(peer) => Some(peer),
+        }
+    }
+}
+
 /// One authenticated adjacency.  The type remains crate-internal so public
 /// application APIs cannot select links, construct wire messages, or bypass
 /// authorization policy.
@@ -518,7 +551,9 @@ pub struct RuntimeDriver<B: RuntimeBackend> {
     sync: SyncState,
     backend: B,
     start_request: Option<StartRequest>,
-    peer_hint: Option<NodeId>,
+    committed_route: Option<CarrierRoute>,
+    candidate_route: Option<CarrierRoute>,
+    fragment_routes: BTreeMap<u64, PartialTransferRoute>,
     wire_limits: Limits,
     reassembler: Reassembler,
     outbox: VecDeque<Outbound>,
@@ -592,7 +627,9 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
             sync,
             backend,
             start_request: Some(start_request),
-            peer_hint,
+            committed_route: peer_hint.map(CarrierRoute::Routed),
+            candidate_route: None,
+            fragment_routes: BTreeMap::new(),
             wire_limits: Limits::default(),
             reassembler: Reassembler::with_budget(
                 MAX_IN_FLIGHT_LOGICAL_FRAMES,
@@ -654,7 +691,9 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
             sync,
             backend,
             start_request,
-            peer_hint,
+            committed_route: peer_hint.map(CarrierRoute::Routed),
+            candidate_route: None,
+            fragment_routes: BTreeMap::new(),
             wire_limits: Limits::default(),
             reassembler: Reassembler::with_budget(
                 MAX_IN_FLIGHT_LOGICAL_FRAMES,
@@ -685,6 +724,92 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
             SessionPhase::Authenticated(session) => Some(session.peer_identity()),
             _ => None,
         }
+    }
+
+    fn outbound_route(&self) -> Option<NodeId> {
+        self.committed_route
+            .or(self.candidate_route)
+            .and_then(CarrierRoute::peer)
+    }
+
+    fn reset_reassembly(&mut self) {
+        self.reassembler =
+            Reassembler::with_budget(MAX_IN_FLIGHT_LOGICAL_FRAMES, MAX_REASSEMBLY_BYTES);
+        self.fragment_routes.clear();
+    }
+
+    fn expire_partial_transfers(&mut self, now: Instant) {
+        let expired = self
+            .fragment_routes
+            .iter()
+            .filter_map(|(transfer_id, partial)| {
+                (now.saturating_duration_since(partial.last_seen) > PARTIAL_TRANSFER_IDLE_TTL)
+                    .then_some(*transfer_id)
+            })
+            .collect::<Vec<_>>();
+        for transfer_id in expired {
+            self.fragment_routes.remove(&transfer_id);
+            self.reassembler.remove(transfer_id);
+        }
+    }
+
+    fn retain_authenticated_route(&mut self, route: CarrierRoute) {
+        if self.committed_route.is_some() || !self.logical_authenticated {
+            return;
+        }
+        // The route becomes a session candidate only after a complete logical
+        // flight verifies at the current handshake phase. For a responder,
+        // flight 1 proves mission membership but not yet the initiator's full
+        // peer identity. Syntactically valid incomplete fragments cannot pin an
+        // unknown-peer contact.
+        self.candidate_route = Some(route);
+        let incompatible = self
+            .fragment_routes
+            .iter()
+            .filter_map(|(transfer_id, partial)| (partial.route != route).then_some(*transfer_id))
+            .collect::<Vec<_>>();
+        for transfer_id in incompatible {
+            self.fragment_routes.remove(&transfer_id);
+            self.reassembler.remove(transfer_id);
+        }
+        if self.is_authenticated() {
+            self.committed_route = Some(route);
+            self.candidate_route = None;
+        }
+    }
+
+    fn admit_fragment_route(
+        &mut self,
+        transfer_id: u64,
+        route: CarrierRoute,
+        now: Instant,
+    ) -> bool {
+        if let Some(partial) = self.fragment_routes.get_mut(&transfer_id) {
+            if partial.route != route {
+                return false;
+            }
+            partial.last_seen = now;
+            return true;
+        }
+        if self.fragment_routes.len() >= MAX_IN_FLIGHT_LOGICAL_FRAMES
+            && let Some(oldest) = self
+                .fragment_routes
+                .iter()
+                .min_by_key(|(id, partial)| (partial.last_seen, partial.first_seen, **id))
+                .map(|(id, _)| *id)
+        {
+            self.fragment_routes.remove(&oldest);
+            self.reassembler.remove(oldest);
+        }
+        self.fragment_routes.insert(
+            transfer_id,
+            PartialTransferRoute {
+                route,
+                first_seen: now,
+                last_seen: now,
+            },
+        );
+        true
     }
 
     /// Authenticated semantic capability selected for this peer session.
@@ -752,30 +877,12 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
     /// The driver never sleeps or polls internally; an embedding event loop can
     /// wait until this instant, link readiness, or an application command.
     pub fn next_wakeup(&self, link: &dyn Link) -> Option<Instant> {
-        let guarded = self.guarded_retry_epoch();
         let retry = self
             .outbox
             .iter()
-            .filter_map(|entry| {
-                guarded
-                    .as_ref()
-                    .is_none_or(|(_, guarded_priority)| entry.priority > *guarded_priority)
-                    .then_some(entry.due)
-            })
-            .chain(self.retries.iter().filter_map(|(key, entry)| {
-                guarded
-                    .as_ref()
-                    .is_none_or(|(guarded_key, guarded_priority)| {
-                        guarded_key == key || entry.priority > *guarded_priority
-                    })
-                    .then_some(entry.due)
-            }))
-            .chain(self.deferred_wants.values().filter_map(|entry| {
-                guarded
-                    .as_ref()
-                    .is_none_or(|(_, guarded_priority)| entry.priority > *guarded_priority)
-                    .then_some(entry.due)
-            }))
+            .map(|entry| entry.due)
+            .chain(self.retries.values().map(|entry| entry.due))
+            .chain(self.deferred_wants.values().map(|entry| entry.due))
             .chain(self.handshake_retry.iter().map(|entry| entry.due))
             .chain(self.inventory_refresh_retry.iter().map(|entry| entry.due))
             .min();
@@ -786,27 +893,14 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
         }
     }
 
-    fn guarded_retry_epoch(&self) -> Option<(RetryKey, Priority)> {
-        self.retries
-            .iter()
-            .filter_map(|(key, entry)| {
-                let epoch = entry.transport_epoch.as_ref()?;
-                (self
-                    .secure_records_sealed
-                    .saturating_sub(epoch.sealed_ordinal)
-                    >= SECURE_REPLAY_WINDOW_RECORDS)
-                    .then_some((key, entry.priority, epoch.sealed_ordinal))
-            })
-            .min_by_key(|(key, _, ordinal)| (*ordinal, *key))
-            .map(|(key, priority, _)| (key.clone(), priority))
-    }
-
     fn pump_at(&mut self, link: &dyn Link, now: Instant) -> Result<usize, RuntimeError> {
         self.clock = now;
         self.retry_pending_inventory_refresh();
+        self.expire_partial_transfers(now);
         let mut completed = 0_usize;
         let mut send_budget = MAX_RETRY_SENDS_PER_PUMP;
         let mut received_frames = 0_usize;
+        let mut unauthenticated_failures = 0_usize;
         let mut deferred_send_error = None;
         if let Err(error) = self.flush(link, &mut send_budget) {
             match error {
@@ -815,42 +909,89 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
             }
         }
         while received_frames < MAX_RECEIVED_FRAMES_PER_PUMP {
+            if send_budget == 0 && !self.outbox.is_empty() {
+                // Do not keep accepting authenticated work after this pass
+                // has exhausted its send budget while a one-shot response is
+                // waiting. Yield to the embedding loop so the next pump can
+                // drain that response before receiving more DATA. This keeps
+                // advisory RECEIPTs from being crowded out by a large WANT
+                // burst without raising any count or byte ceiling.
+                break;
+            }
             let Some(received) = link.try_receive()? else {
                 break;
             };
             received_frames = received_frames.saturating_add(1);
-            if let Some(route) = received.peer {
-                match self.peer_hint {
-                    None => self.peer_hint = Some(route),
-                    Some(expected) if expected == route => {}
-                    Some(_) => {
-                        self.phase = SessionPhase::Failed;
-                        return Err(RuntimeError::TransportPeerChanged);
-                    }
+            let carrier_route = CarrierRoute::from_peer(received.peer);
+            if self
+                .committed_route
+                .is_some_and(|expected| expected != carrier_route)
+                || self
+                    .candidate_route
+                    .is_some_and(|expected| expected != carrier_route)
+            {
+                // A configured or authenticated route is exact, including the
+                // distinction between anonymous and routed delivery. Compare
+                // before parsing attacker-controlled fragment bytes.
+                unauthenticated_failures = unauthenticated_failures.saturating_add(1);
+                if unauthenticated_failures >= MAX_UNAUTHENTICATED_FAILURES_PER_PUMP {
+                    break;
                 }
+                continue;
             }
-            let fragment = Fragment::decode(&received.bytes)?;
+            let fragment = match Fragment::decode(&received.bytes) {
+                Ok(fragment) => fragment,
+                Err(FragmentError::Malformed) => {
+                    unauthenticated_failures = unauthenticated_failures.saturating_add(1);
+                    if unauthenticated_failures >= MAX_UNAUTHENTICATED_FAILURES_PER_PUMP {
+                        break;
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
             let transfer_id = fragment.transfer_id;
+            if !self.admit_fragment_route(transfer_id, carrier_route, now) {
+                // Reassembly is keyed by transfer identifier, so retain a
+                // parallel exact-route key and never combine fragments
+                // received anonymously and/or through different routes.
+                unauthenticated_failures = unauthenticated_failures.saturating_add(1);
+                if unauthenticated_failures >= MAX_UNAUTHENTICATED_FAILURES_PER_PUMP {
+                    break;
+                }
+                continue;
+            }
             let reassembled = match self.reassembler.push(fragment.clone()) {
                 Ok(value) => value,
                 Err(FragmentError::MessageTooLarge) => {
                     // The bounded set can fill with incomplete transfers on a
                     // lossy link. Drop only volatile partial reassembly state;
                     // retained senders will refill it. Inconsistent reuse is
-                    // deliberately not recovered here and remains fatal.
-                    self.reassembler = Reassembler::with_budget(
-                        MAX_IN_FLIGHT_LOGICAL_FRAMES,
-                        MAX_REASSEMBLY_BYTES,
-                    );
+                    // handled below as bounded unauthenticated carrier input.
+                    self.reset_reassembly();
+                    self.admit_fragment_route(transfer_id, carrier_route, now);
                     self.reassembler.push(fragment)?
+                }
+                Err(FragmentError::Inconsistent) => {
+                    self.fragment_routes.remove(&transfer_id);
+                    self.reassembler.remove(transfer_id);
+                    unauthenticated_failures = unauthenticated_failures.saturating_add(1);
+                    if unauthenticated_failures >= MAX_UNAUTHENTICATED_FAILURES_PER_PUMP {
+                        break;
+                    }
+                    continue;
                 }
                 Err(error) => return Err(error.into()),
             };
             if let Some(logical) = reassembled {
+                let completed_route = self
+                    .fragment_routes
+                    .remove(&transfer_id)
+                    .map_or(carrier_route, |partial| partial.route);
                 // Cache keys use only the stable adapter route. The
                 // cryptographic peer becomes known during the handshake and
                 // therefore cannot serve as a stable pre/post-flight key.
-                let peer = self.peer_hint;
+                let peer = completed_route.peer();
                 let logical_digest: [u8; 32] = Sha256::digest(&logical).into();
                 if let Some(previous) = self
                     .completed_transfers
@@ -861,14 +1002,24 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
                     if previous.logical_len != logical.len()
                         || previous.logical_digest != logical_digest
                     {
-                        self.phase = SessionPhase::Failed;
-                        return Err(RuntimeError::TransferIdReuse);
+                        unauthenticated_failures = unauthenticated_failures.saturating_add(1);
+                        if unauthenticated_failures >= MAX_UNAUTHENTICATED_FAILURES_PER_PUMP {
+                            break;
+                        }
                     }
                     continue;
                 }
 
                 self.logical_authenticated = false;
                 let result = self.receive_logical(&logical);
+                self.retain_authenticated_route(completed_route);
+                if matches!(result, Err(RuntimeError::Session(_))) && !self.logical_authenticated {
+                    unauthenticated_failures = unauthenticated_failures.saturating_add(1);
+                    if unauthenticated_failures >= MAX_UNAUTHENTICATED_FAILURES_PER_PUMP {
+                        break;
+                    }
+                    continue;
+                }
                 if self.logical_authenticated {
                     let transfer = CompletedTransfer {
                         peer,
@@ -960,7 +1111,7 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
             };
             let retry_control_after_backpressure = matches!(
                 message,
-                Message::Summary(_) | Message::Probe(_) | Message::Node(_)
+                Message::Interest(_) | Message::Summary(_) | Message::Probe(_) | Message::Node(_)
             );
             let complete_receipt =
                 matches!(&message, Message::Receipt(receipt) if receipt.complete);
@@ -1125,24 +1276,43 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
             if handled.is_ok() && complete_receipt {
                 self.inventory_refresh_retry = None;
             }
+            if self.irreversible_generation != irreversible_checkpoint
+                && matches!(handled, Err(RuntimeError::Backpressure))
+            {
+                // The object disposition or peer acknowledgement is already
+                // durable and the derived inventory refresh remains
+                // represented by `inventory_refresh_retry`. Queue pressure is
+                // therefore retryable host flow control, not a failed
+                // authenticated contact. Other post-commit failures still
+                // propagate.
+                return Ok(());
+            }
             return handled;
         }
 
         let phase = std::mem::replace(&mut self.phase, SessionPhase::Failed);
         match phase {
             SessionPhase::Initiator(initiator) => {
-                let (pending, third_flight) = initiator
-                    .receive_server(bytes)
-                    .map_err(|error| RuntimeError::Session(error.to_string()))?;
+                let (pending, third_flight) = match initiator.receive_server_retryable(bytes) {
+                    Ok(transition) => transition,
+                    Err((initiator, error)) => {
+                        self.phase = SessionPhase::Initiator(initiator);
+                        return Err(RuntimeError::Session(error.to_string()));
+                    }
+                };
                 self.logical_authenticated = true;
                 self.handshake_retry = None;
                 self.phase = SessionPhase::InitiatorAwaitingFinished(pending);
                 self.queue_handshake(third_flight)
             }
             SessionPhase::InitiatorAwaitingFinished(pending) => {
-                let session = pending
-                    .receive_finished(bytes)
-                    .map_err(|error| RuntimeError::Session(error.to_string()))?;
+                let session = match pending.receive_finished_retryable(bytes) {
+                    Ok(session) => session,
+                    Err((pending, error)) => {
+                        self.phase = SessionPhase::InitiatorAwaitingFinished(pending);
+                        return Err(RuntimeError::Session(error.to_string()));
+                    }
+                };
                 self.logical_authenticated = true;
                 self.handshake_retry = None;
                 self.phase = SessionPhase::Authenticated(session);
@@ -1174,18 +1344,26 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
                 finalized
             }
             SessionPhase::Responder(responder) => {
-                let (pending, second_flight) = responder
-                    .receive_client(bytes)
-                    .map_err(|error| RuntimeError::Session(error.to_string()))?;
+                let (pending, second_flight) = match responder.receive_client_retryable(bytes) {
+                    Ok(transition) => transition,
+                    Err((responder, error)) => {
+                        self.phase = SessionPhase::Responder(responder);
+                        return Err(RuntimeError::Session(error.to_string()));
+                    }
+                };
                 self.logical_authenticated = true;
                 self.handshake_retry = None;
                 self.phase = SessionPhase::ResponderPending(pending);
                 self.queue_handshake(second_flight)
             }
             SessionPhase::ResponderPending(pending) => {
-                let (session, fourth_flight) = pending
-                    .receive_client_auth(bytes)
-                    .map_err(|error| RuntimeError::Session(error.to_string()))?;
+                let (session, fourth_flight) = match pending.receive_client_auth_retryable(bytes) {
+                    Ok(transition) => transition,
+                    Err((pending, error)) => {
+                        self.phase = SessionPhase::ResponderPending(pending);
+                        return Err(RuntimeError::Session(error.to_string()));
+                    }
+                };
                 self.logical_authenticated = true;
                 self.handshake_retry = None;
                 self.phase = SessionPhase::Authenticated(session);
@@ -1321,10 +1499,46 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
             ),
             _ => return Err(RuntimeError::FailedState),
         };
+        let initial = if initial
+            .iter()
+            .all(|action| matches!(action, SyncAction::Serve(_)))
+        {
+            // A peer may coalesce multiple WANT items in hash order. Rank the
+            // bounded batch by authenticated local precedence before reading
+            // payloads so flow control cannot leave a later FLASH object
+            // behind earlier ROUTINE work solely because of its ObjectID.
+            let mut ranked = Vec::with_capacity(initial.len());
+            for action in initial {
+                let SyncAction::Serve(want) = action else {
+                    unreachable!("all actions were checked as Serve")
+                };
+                ensure_object_allowed(want.object_id, semantic_version)?;
+                let priority = self
+                    .backend
+                    .object_priority(want.object_id)
+                    .map_err(|error| RuntimeError::Backend(error.to_string()))?;
+                ranked.push((priority, want.object_id, SyncAction::Serve(want)));
+            }
+            ranked.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+            ranked.into_iter().map(|(_, _, action)| action).collect()
+        } else {
+            initial
+        };
         let mut actions: VecDeque<_> = initial.into();
+        let mut data_saturated = false;
         while let Some(action) = actions.pop_front() {
             match action {
-                SyncAction::Send(message) => self.queue_sync_message(&message)?,
+                SyncAction::Send(message) => match self.queue_sync_message(&message) {
+                    Ok(()) => {}
+                    Err(RuntimeError::Backpressure) if matches!(message, Message::Receipt(_)) => {
+                        // A RECEIPT is advisory and its DATA sender retains the
+                        // causal retry. When the bounded one-shot queue is
+                        // full, omit this copy and re-acknowledge the sender's
+                        // next authenticated DATA retry instead of failing the
+                        // whole contact.
+                    }
+                    Err(error) => return Err(error),
+                },
                 SyncAction::SelectInventory {
                     request_id,
                     purpose,
@@ -1404,6 +1618,9 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
                     )?);
                 }
                 SyncAction::Serve(want) => {
+                    if data_saturated {
+                        continue;
+                    }
                     ensure_object_allowed(want.object_id, semantic_version)?;
                     let exchange_id = self
                         .sync
@@ -1420,12 +1637,22 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
                         )
                         .map_err(|error| RuntimeError::Backend(error.to_string()))?;
                     self.validate_served_data(exchange_id, &want, &data)?;
-                    // Process this bounded backend result before asking the
-                    // backend to expand another WANT. With a maximum-size
-                    // inbound WANT this prevents the action queue itself from
-                    // retaining every peer-requested DATA payload at once.
-                    for data in data.into_iter().rev() {
-                        actions.push_front(SyncAction::Send(Message::Data(data)));
+                    // A WANT is a retained causal request until the receiver
+                    // durably completes the object. Treat DATA queue
+                    // saturation as hop-local flow control: keep every hard
+                    // count/byte ceiling, stop expanding this WANT batch, and
+                    // let the peer's authenticated retry regenerate the
+                    // omitted ranges after receipts release capacity. Other
+                    // queue failures remain contact failures.
+                    for data in data {
+                        match self.queue_sync_message(&Message::Data(data)) {
+                            Ok(()) => {}
+                            Err(RuntimeError::Backpressure) => {
+                                data_saturated = true;
+                                break;
+                            }
+                            Err(error) => return Err(error),
+                        }
                     }
                 }
                 SyncAction::CompleteObject {
@@ -1475,6 +1702,8 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
                     self.irreversible_generation = self.irreversible_generation.wrapping_add(1);
                     match disposition {
                         RuntimeCommit::Committed { item_id, promoted } => {
+                            let was_new_wanted = !self.sync.inventory().contains(&object_id)
+                                && self.sync.wants().contains(&object_id);
                             let mut committed_actions = match self.sync.apply_for_semantic_version(
                                 SyncEvent::ObjectCommitted { object_id, item_id },
                                 semantic_version,
@@ -1485,6 +1714,17 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
                                     return Err(error.into());
                                 }
                             };
+                            if was_new_wanted {
+                                let exchange_id = self
+                                    .sync
+                                    .active_exchange_id()
+                                    .ok_or(RuntimeError::FailedState)?;
+                                self.retire_completed_want_and_refill_window(
+                                    exchange_id,
+                                    semantic_version,
+                                    object_id,
+                                );
+                            }
                             for promoted in promoted {
                                 if let Err(error) =
                                     ensure_object_allowed(promoted, semantic_version)
@@ -1865,6 +2105,84 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
             .or_insert(deferred);
     }
 
+    fn retire_completed_want_and_refill_window(
+        &mut self,
+        exchange_id: u64,
+        semantic_version: u16,
+        object_id: ObjectId,
+    ) {
+        self.retries.remove(&RetryKey::Want(exchange_id, object_id));
+        self.deferred_wants.remove(&object_id);
+
+        // Completion frees one bounded receiver request slot and, after the
+        // already-queued RECEIPT arrives, one sender DATA slot. ACK-clock one
+        // sleeping request into that opening instead of waking the whole
+        // overflow set or waiting for its prior exponential deadline.
+        let candidate = self
+            .retries
+            .iter()
+            .filter_map(|(key, entry)| {
+                let RetryKey::Want(candidate_exchange, candidate_id) = key else {
+                    return None;
+                };
+                (*candidate_exchange == exchange_id
+                    && entry.semantic_version == semantic_version
+                    && self.sync.retry_want_item(*candidate_id).is_some())
+                .then_some((
+                    std::cmp::Reverse(entry.priority),
+                    entry.sequence,
+                    *candidate_id,
+                    true,
+                ))
+            })
+            .chain(
+                self.deferred_wants
+                    .iter()
+                    .filter(|(candidate_id, entry)| {
+                        entry.exchange_id == exchange_id
+                            && entry.semantic_version == semantic_version
+                            && self.sync.retry_want_item(**candidate_id).is_some()
+                    })
+                    .map(|(candidate_id, entry)| {
+                        (
+                            std::cmp::Reverse(entry.priority),
+                            entry.sequence,
+                            *candidate_id,
+                            false,
+                        )
+                    }),
+            )
+            .min();
+        let Some((_, _, candidate, retained)) = candidate else {
+            return;
+        };
+        let sequence = self.next_retry_sequence;
+        self.next_retry_sequence = self.next_retry_sequence.wrapping_add(1);
+        if retained {
+            let Some(entry) = self
+                .retries
+                .get_mut(&RetryKey::Want(exchange_id, candidate))
+            else {
+                return;
+            };
+            entry.due = entry.due.min(self.clock);
+            entry.sequence = sequence;
+            // The prior WANT may already be in the peer's completed-transfer
+            // cache even though DATA pressure prevented it from serving the
+            // request. New durable credit must therefore use a fresh secure
+            // transport epoch so the peer reprocesses the causal request.
+            entry.transport_epoch = None;
+            entry.unchanged_sends = 0;
+        } else if let Some(entry) = self.deferred_wants.get_mut(&candidate) {
+            entry.due = entry.due.min(self.clock);
+            entry.sequence = sequence;
+            entry.transport_epoch = None;
+        }
+        // Whether retained or deferred, move the accelerated request behind
+        // older same-priority sleepers. Charged attempts remain, so repeated
+        // completion cannot erase backoff state.
+    }
+
     fn demote_retry(&mut self, key: &RetryKey) {
         let Some(entry) = self.retries.remove(key) else {
             return;
@@ -1996,6 +2314,8 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
                 }
                 return Err(RuntimeError::Backpressure);
             }
+            let sequence = self.next_retry_sequence;
+            self.next_retry_sequence = self.next_retry_sequence.wrapping_add(1);
             let entry = self
                 .retries
                 .get_mut(&key)
@@ -2005,6 +2325,11 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
             entry.transport_epoch = None;
             entry.unchanged_sends = 0;
             entry.due = self.clock;
+            // A semantic refresh is new causal work. Give it a fresh FIFO
+            // position so a RECEIPT queued immediately before an updated WANT
+            // reaches the sender first and releases the DATA slot needed for
+            // the newly requested tail.
+            entry.sequence = sequence;
             entry.retained_bytes = retained_bytes;
             entry.semantic_version = semantic_version;
             if let RetryKey::Want(_, object_id) = key {
@@ -2108,6 +2433,19 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
                     node.prefix.clone(),
                 ));
             }
+            Message::Offer(offer) => {
+                // A complete validated root OFFER resolves every branch of
+                // this snapshot. Retire child Probe retries too; otherwise a
+                // delayed response can restart the superseded Merkle walk.
+                self.retries.retain(|key, _| {
+                    !matches!(
+                        key,
+                        RetryKey::Probe(exchange_id, snapshot_id, ..)
+                            if *exchange_id == offer.exchange_id
+                                && *snapshot_id == offer.snapshot_id
+                    )
+                });
+            }
             Message::Receipt(receipt) => {
                 self.retries.retain(|key, entry| {
                     let RetryKey::Data(exchange_id, object_id, total_len, start, end) = key else {
@@ -2133,17 +2471,44 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
             }
             Message::Want(want) => {
                 self.retries.retain(|key, _| {
-                    !matches!(
-                        key,
+                    match key {
                         RetryKey::Node(exchange_id, _, wire::OBJECT_ID_NIBBLES, prefix)
                             if *exchange_id == want.exchange_id
                                 && want.items.iter().any(|item| {
                                     prefix.as_slice() == item.object_id.to_wire_bytes().as_slice()
-                                })
-                    )
+                                }) =>
+                        {
+                            false
+                        }
+                        RetryKey::Data(exchange_id, object_id, total_len, start, end)
+                            if *exchange_id == want.exchange_id =>
+                        {
+                            let Some(item) =
+                                want.items.iter().find(|item| item.object_id == *object_id)
+                            else {
+                                return true;
+                            };
+                            if item.total_len != Some(*total_len) || item.need_forwarding {
+                                return true;
+                            }
+                            // An authenticated exact-range WANT is also safe
+                            // hop-local negative acknowledgement: ranges it no
+                            // longer lists are durably present at that peer.
+                            // Retire only superseded DATA retries so a delayed
+                            // RECEIPT cannot block the newly requested tail.
+                            // This does not record peer possession in the
+                            // backend; only RECEIPT retains that authority.
+                            start < end
+                                && item
+                                    .missing
+                                    .iter()
+                                    .any(|range| range.start < *end && *start < range.end)
+                        }
+                        _ => true,
+                    }
                 });
             }
-            Message::Interest(_) | Message::Offer(_) | Message::Data(_) => {}
+            Message::Interest(_) | Message::Data(_) => {}
         }
         Ok(())
     }
@@ -2232,7 +2597,7 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
             let offset = transport_fragment_emission_offset(fragments.len(), repair_round);
             fragments.rotate_left(offset);
         }
-        let target = self.peer_hint.or_else(|| self.authenticated_peer());
+        let target = self.outbound_route();
         for fragment in fragments {
             link.send(target, &fragment.encode()?)?;
         }
@@ -2559,7 +2924,6 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
                 && live_wants.contains(object_id)
                 && Some(entry.semantic_version) == selected_semantic_version
         });
-        let guarded_retry = self.guarded_retry_epoch();
 
         // Promote due durable WANTs back into the retained retry set whenever
         // capacity becomes available. A higher-precedence WANT may displace a
@@ -2569,12 +2933,7 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
         let mut promotions: Vec<_> = self
             .deferred_wants
             .iter()
-            .filter(|(_, entry)| {
-                entry.due <= self.clock
-                    && guarded_retry
-                        .as_ref()
-                        .is_none_or(|(_, guarded_priority)| entry.priority > *guarded_priority)
-            })
+            .filter(|(_, entry)| entry.due <= self.clock)
             .map(|(object_id, entry)| (*object_id, entry.priority, entry.sequence))
             .collect();
         promotions.sort_by(|left, right| {
@@ -2605,12 +2964,7 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
         let mut due: Vec<_> = self
             .outbox
             .iter()
-            .filter(|entry| {
-                entry.due <= self.clock
-                    && guarded_retry
-                        .as_ref()
-                        .is_none_or(|(_, guarded_priority)| entry.priority > *guarded_priority)
-            })
+            .filter(|entry| entry.due <= self.clock)
             .map(|entry| {
                 (
                     DueWork::Outbox(entry.sequence),
@@ -2621,14 +2975,7 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
             .chain(
                 self.retries
                     .iter()
-                    .filter(|(key, entry)| {
-                        entry.due <= self.clock
-                            && guarded_retry.as_ref().is_none_or(
-                                |(guarded_key, guarded_priority)| {
-                                    guarded_key == *key || entry.priority > *guarded_priority
-                                },
-                            )
-                    })
+                    .filter(|(_, entry)| entry.due <= self.clock)
                     .map(|(key, entry)| {
                         (
                             DueWork::Retained(key.clone()),
@@ -2640,12 +2987,7 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
             .chain(
                 self.deferred_wants
                     .iter()
-                    .filter(|(_, entry)| {
-                        entry.due <= self.clock
-                            && guarded_retry.as_ref().is_none_or(|(_, guarded_priority)| {
-                                entry.priority > *guarded_priority
-                            })
-                    })
+                    .filter(|(_, entry)| entry.due <= self.clock)
                     .map(|(object_id, entry)| {
                         (
                             DueWork::Deferred(*object_id),
@@ -2977,8 +3319,6 @@ fn packed_prefix_is_strict_parent(
         parent_nibble == child_nibble
     })
 }
-
-const MAX_COMPOSITE_INVENTORY_OBJECTS: usize = 100_000;
 
 /// Engine plus encrypted Blob carrier store used by the authenticated runtime.
 /// Source envelopes remain the sole authorization root for every advertised or
@@ -4683,18 +5023,71 @@ mod tests {
         exchange_id: u64,
         object_id: ObjectId,
     ) {
+        let offer = pending_offer_for(receiver, exchange_id, [object_id]);
         let actions = receiver
             .sync
-            .apply(SyncEvent::Receive(Message::Offer(crate::wire::Offer {
-                exchange_id,
-                object_ids: vec![object_id],
-                snapshot_id: 1,
-            })))
+            .apply(SyncEvent::Receive(Message::Offer(offer)))
             .unwrap();
         receiver.handle_actions(actions).unwrap();
         receiver.retries.clear();
         receiver.deferred_wants.clear();
         receiver.outbox.clear();
+    }
+
+    fn pending_offer_for(
+        receiver: &mut RuntimeDriver<FakeBackend>,
+        exchange_id: u64,
+        object_ids: impl IntoIterator<Item = ObjectId>,
+    ) -> crate::wire::Offer {
+        let inventory = SparseInventory::from_ids(object_ids);
+        let summary = Message::Summary(crate::wire::Summary {
+            exchange_id,
+            root_hash: inventory.root_hash(),
+            item_count: inventory.item_count(),
+            snapshot_id: inventory.snapshot_id(),
+        });
+        let mut actions = receiver
+            .sync
+            .apply(SyncEvent::Receive(summary.clone()))
+            .unwrap();
+        let is_root_probe = |action: &SyncAction| {
+            matches!(
+                action,
+                SyncAction::Send(Message::Probe(crate::wire::Probe {
+                    prefix_nibbles: 0,
+                    ..
+                }))
+            )
+        };
+        if !actions.iter().any(is_root_probe) {
+            let start_actions = receiver
+                .sync
+                .apply(SyncEvent::Start {
+                    exchange_id,
+                    topics: vec!["alpha".into()],
+                    scopes: vec!["mission/team".into()],
+                    min_priority: Priority::Routine as u8,
+                })
+                .unwrap();
+            receiver.handle_actions(start_actions).unwrap();
+            receiver.retries.clear();
+            receiver.deferred_wants.clear();
+            receiver.outbox.clear();
+            actions = receiver.sync.apply(SyncEvent::Receive(summary)).unwrap();
+        }
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            SyncAction::Send(Message::Probe(crate::wire::Probe {
+                prefix_nibbles: 0,
+                ..
+            }))
+        )));
+        crate::wire::Offer {
+            exchange_id,
+            object_ids: inventory
+                .ids_under(&crate::inventory::NibblePrefix::root(), inventory.len()),
+            snapshot_id: inventory.snapshot_id(),
+        }
     }
 
     fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
@@ -4741,10 +5134,8 @@ mod tests {
         for part in fragment::fragment(&plaintext, 256, 1).unwrap() {
             attacker.send(None, &part.encode().unwrap()).unwrap();
         }
-        assert!(matches!(
-            responder.pump(&victim),
-            Err(RuntimeError::Session(_))
-        ));
+        assert_eq!(responder.pump(&victim).unwrap(), 0);
+        assert!(matches!(responder.phase, SessionPhase::Responder(_)));
         assert!(responder.backend().partial.is_empty());
         assert!(responder.backend().selections.is_empty());
         assert!(responder.backend().ingested.is_empty());
@@ -5315,6 +5706,224 @@ mod tests {
     }
 
     #[test]
+    fn dropped_root_offer_and_invalid_offer_preserve_probe_retry_until_convergence() {
+        let (mut receiver, mut provider, left, right, mut now) =
+            authenticated_runtime_pair(92, Priority::Routine);
+        receiver.retries.clear();
+        receiver.deferred_wants.clear();
+        receiver.outbox.clear();
+        provider.retries.clear();
+        provider.deferred_wants.clear();
+        provider.outbox.clear();
+        left.inbound.lock().unwrap().clear();
+        right.inbound.lock().unwrap().clear();
+        left.capture.lock().unwrap().clear();
+        right.capture.lock().unwrap().clear();
+
+        let sealed = b"root-offer-retry-object".to_vec();
+        let object_id = ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(&sealed));
+        let remote = SparseInventory::from_ids([object_id]);
+        provider
+            .backend_mut()
+            .available
+            .insert(object_id, sealed.clone());
+        provider
+            .backend_mut()
+            .priorities
+            .insert(object_id, Priority::Routine);
+        provider.local_inventory_changed().unwrap();
+        assert!(
+            provider
+                .sync
+                .selected_serve_inventory()
+                .is_some_and(|inventory| inventory.contains(&object_id))
+        );
+
+        // Isolate the root-OFFER exchange from the bidirectional refresh
+        // controls that selected the provider's new authorized inventory.
+        provider.retries.clear();
+        provider.deferred_wants.clear();
+        provider.outbox.clear();
+        provider
+            .queue_sync_message(&Message::Summary(crate::wire::Summary {
+                exchange_id: 92,
+                root_hash: remote.root_hash(),
+                item_count: remote.item_count(),
+                snapshot_id: remote.snapshot_id(),
+            }))
+            .unwrap();
+        provider.pump_at(&right, now).unwrap();
+        receiver.pump_at(&left, now).unwrap();
+
+        let root_probe = RetryKey::Probe(92, remote.snapshot_id(), 0, Vec::new());
+        let first_probe_transfer = receiver.retries[&root_probe]
+            .transport_epoch
+            .as_ref()
+            .expect("root Probe was transmitted after SUMMARY")
+            .transfer_id;
+        assert_eq!(receiver.retries[&root_probe].attempts, 1);
+
+        // The Probe is already waiting at the provider. Its generated OFFER
+        // is a one-shot record, so arrange to lose that exact next transfer.
+        let first_offer_transfer = provider.next_transfer_id;
+        right.force_drop_transfer(first_offer_transfer);
+        provider.pump_at(&right, now).unwrap();
+        assert!(receiver.retries.contains_key(&root_probe));
+        assert!(!receiver.sync.wants().contains(&object_id));
+        assert!(
+            right.capture.lock().unwrap().iter().any(|frame| {
+                Fragment::decode(frame).unwrap().transfer_id == first_offer_transfer
+            })
+        );
+        assert!(
+            !receiver
+                .completed_transfers
+                .iter()
+                .any(|transfer| { transfer.transfer_id == first_offer_transfer })
+        );
+
+        // A separately authenticated but truncated OFFER must fail before it
+        // can acknowledge the root Probe or create durable object requests.
+        provider
+            .queue_sync_message(&Message::Offer(crate::wire::Offer {
+                exchange_id: 92,
+                object_ids: Vec::new(),
+                snapshot_id: remote.snapshot_id(),
+            }))
+            .unwrap();
+        provider.pump_at(&right, now).unwrap();
+        assert!(matches!(
+            receiver.pump_at(&left, now),
+            Err(RuntimeError::Sync(SyncError::SnapshotMismatch))
+        ));
+        assert!(receiver.retries.contains_key(&root_probe));
+        assert!(!receiver.sync.wants().contains(&object_id));
+
+        let initial_attempts = receiver.retries[&root_probe].attempts;
+        let mut maximum_attempts = initial_attempts;
+        let mut probe_transfers = BTreeSet::from([first_probe_transfer]);
+        for _ in 0..=MAX_SUCCESSFUL_RECORD_REPAIR_ROUNDS {
+            let Some(due) = receiver.retries.get(&root_probe).map(|entry| entry.due) else {
+                break;
+            };
+            now = due;
+            receiver.pump_at(&left, now).unwrap();
+            if let Some(entry) = receiver.retries.get(&root_probe) {
+                maximum_attempts = maximum_attempts.max(entry.attempts);
+                probe_transfers.insert(
+                    entry
+                        .transport_epoch
+                        .as_ref()
+                        .expect("transmitted root Probe retains its transport epoch")
+                        .transfer_id,
+                );
+            }
+            provider.pump_at(&right, now).unwrap();
+            receiver.pump_at(&left, now).unwrap();
+        }
+
+        assert!(
+            !receiver.retries.contains_key(&root_probe),
+            "a validated regenerated OFFER retires the root Probe"
+        );
+        assert!(receiver.sync.wants().contains(&object_id));
+        assert!(maximum_attempts > initial_attempts);
+        assert!(
+            probe_transfers.len() >= 2,
+            "the Probe rotated to a fresh record"
+        );
+
+        for _ in 0..64 {
+            now += Duration::from_secs(70);
+            provider.pump_at(&right, now).unwrap();
+            receiver.pump_at(&left, now).unwrap();
+            if receiver.sync.inventory().contains(&object_id) {
+                break;
+            }
+        }
+        assert!(receiver.sync.inventory().contains(&object_id));
+        assert_eq!(receiver.backend().ingested, vec![(object_id, [0xa5; 32])]);
+    }
+
+    #[test]
+    fn delayed_authenticated_single_item_offer_is_idempotent_after_commit() {
+        let (mut receiver, mut provider, left, right, mut now) =
+            authenticated_runtime_pair(97, Priority::Routine);
+        receiver.retries.clear();
+        receiver.deferred_wants.clear();
+        receiver.outbox.clear();
+        provider.retries.clear();
+        provider.deferred_wants.clear();
+        provider.outbox.clear();
+        left.inbound.lock().unwrap().clear();
+        right.inbound.lock().unwrap().clear();
+
+        let sealed = vec![0x5c; 16 * 1_024];
+        let object_id = ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(&sealed));
+        provider.backend_mut().available.insert(object_id, sealed);
+        let offer = pending_offer_for(&mut receiver, 97, [object_id]);
+        let snapshot_id = offer.snapshot_id;
+        receiver
+            .queue_sync_message(&Message::Probe(crate::wire::Probe {
+                exchange_id: 97,
+                prefix: Vec::new(),
+                prefix_nibbles: 0,
+                snapshot_id,
+            }))
+            .unwrap();
+        receiver
+            .queue_sync_message(&Message::Probe(crate::wire::Probe {
+                exchange_id: 97,
+                prefix: vec![0x10],
+                prefix_nibbles: 1,
+                snapshot_id,
+            }))
+            .unwrap();
+        for entry in receiver.retries.values_mut() {
+            entry.due = now + Duration::from_secs(3_600);
+        }
+
+        provider
+            .queue_sync_message(&Message::Offer(offer.clone()))
+            .unwrap();
+        provider.pump_at(&right, now).unwrap();
+        receiver.pump_at(&left, now).unwrap();
+        assert!(receiver.sync.wants().contains(&object_id));
+        assert!(!receiver.retries.keys().any(|key| matches!(
+            key,
+            RetryKey::Probe(97, actual_snapshot, ..) if *actual_snapshot == snapshot_id
+        )));
+
+        for _ in 0..64 {
+            now += Duration::from_secs(70);
+            provider.pump_at(&right, now).unwrap();
+            receiver.pump_at(&left, now).unwrap();
+            if receiver.sync.inventory().contains(&object_id) {
+                break;
+            }
+        }
+        assert!(receiver.sync.inventory().contains(&object_id));
+        assert_eq!(receiver.backend().ingested, vec![(object_id, [0xa5; 32])]);
+
+        // Isolate a delayed fresh authenticated retransmission after the
+        // commit-triggered local inventory refresh retired the old traversal.
+        receiver.retries.clear();
+        receiver.deferred_wants.clear();
+        receiver.outbox.clear();
+        provider.retries.clear();
+        provider.deferred_wants.clear();
+        provider.outbox.clear();
+        left.inbound.lock().unwrap().clear();
+        right.inbound.lock().unwrap().clear();
+        provider.queue_sync_message(&Message::Offer(offer)).unwrap();
+        provider.pump_at(&right, now).unwrap();
+        receiver.pump_at(&left, now).unwrap();
+        assert!(receiver.is_authenticated());
+        assert!(receiver.sync.wants().is_empty());
+        assert!(receiver.sync.inventory().contains(&object_id));
+    }
+
+    #[test]
     fn live_retry_deadlines_and_due_order_follow_authenticated_priority() {
         let (left_bundle, right_bundle) = bundles();
         let mut left_driver = RuntimeDriver::initiator(
@@ -5397,6 +6006,11 @@ mod tests {
         assert_eq!(right_driver.retries[&flash_key].attempts, 1);
         assert_eq!(right_driver.retries[&routine_key].attempts, 0);
         assert!(right_driver.retries[&flash_key].due > right_driver.retries[&routine_key].due);
+        assert_eq!(right_driver.next_wakeup(&right), Some(now));
+
+        right_driver.pump_at(&right, now).unwrap();
+        assert_eq!(right_driver.retries[&flash_key].attempts, 1);
+        assert_eq!(right_driver.retries[&routine_key].attempts, 1);
         assert_eq!(
             right_driver.next_wakeup(&right),
             Some(right_driver.retries[&flash_key].due)
@@ -5466,18 +6080,7 @@ mod tests {
 
         let payload = b"fresh authenticated retry".to_vec();
         let object_id = ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(&payload));
-        let actions = receiver
-            .sync
-            .apply(SyncEvent::Receive(Message::Offer(crate::wire::Offer {
-                exchange_id: 79,
-                object_ids: vec![object_id],
-                snapshot_id: 1,
-            })))
-            .unwrap();
-        receiver.handle_actions(actions).unwrap();
-        receiver.retries.clear();
-        receiver.deferred_wants.clear();
-        receiver.outbox.clear();
+        prepare_expected_object(&mut receiver, 79, object_id);
 
         sender
             .backend_mut()
@@ -6073,7 +6676,7 @@ mod tests {
     }
 
     #[test]
-    fn aged_routine_epoch_does_not_block_new_flash_work() {
+    fn stale_routine_epoch_waits_for_due_time_without_blocking_flash() {
         let (_receiver, mut sender, _left, right, now) =
             authenticated_runtime_pair(83, Priority::Routine);
         let interest = Message::Interest(crate::wire::Interest {
@@ -6086,13 +6689,15 @@ mod tests {
         sender.queue_sync_message(&interest).unwrap();
         sender.pump_at(&right, now).unwrap();
         let key = RetryKey::Interest(83);
-        let old_ordinal = sender.retries[&key]
+        let old_epoch = sender.retries[&key]
             .transport_epoch
             .as_ref()
             .unwrap()
-            .sealed_ordinal;
-        sender.secure_records_sealed = old_ordinal + SECURE_REPLAY_WINDOW_RECORDS;
-        sender.retries.get_mut(&key).unwrap().due = now;
+            .clone();
+        let old_attempts = sender.retries[&key].attempts;
+        sender.secure_records_sealed = old_epoch.sealed_ordinal + SECURE_REPLAY_WINDOW_RECORDS;
+        let routine_due = now + Duration::from_secs(64);
+        sender.retries.get_mut(&key).unwrap().due = routine_due;
         right.capture.lock().unwrap().clear();
 
         let marker_id = ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(b"flash-marker"));
@@ -6108,20 +6713,30 @@ mod tests {
         sender
             .queue_logical_once(plaintext, Priority::Flash, semantic_version)
             .unwrap();
-        assert!(sender.guarded_retry_epoch().is_some());
+        assert_eq!(sender.next_wakeup(&right), Some(now));
 
         sender.pump_at(&right, now).unwrap();
-        let capture = right.capture.lock().unwrap();
-        let first_dispatched = Fragment::decode(capture.first().unwrap())
-            .unwrap()
-            .transfer_id;
-        let rotated_routine = sender.retries[&key]
-            .transport_epoch
-            .as_ref()
-            .unwrap()
-            .transfer_id;
-        assert!(first_dispatched < rotated_routine);
         assert!(sender.outbox.is_empty());
+        assert_eq!(sender.retries[&key].attempts, old_attempts);
+        assert_eq!(
+            sender.retries[&key]
+                .transport_epoch
+                .as_ref()
+                .unwrap()
+                .transfer_id,
+            old_epoch.transfer_id
+        );
+        assert_eq!(sender.next_wakeup(&right), Some(routine_due));
+
+        right.capture.lock().unwrap().clear();
+        sender.pump_at(&right, routine_due).unwrap();
+        let rotated_epoch = sender.retries[&key].transport_epoch.as_ref().unwrap();
+        assert_ne!(rotated_epoch.transfer_id, old_epoch.transfer_id);
+        assert_eq!(sender.retries[&key].attempts, old_attempts + 1);
+        let dispatched = Fragment::decode(right.capture.lock().unwrap().first().unwrap())
+            .unwrap()
+            .transfer_id;
+        assert_eq!(dispatched, rotated_epoch.transfer_id);
     }
 
     #[test]
@@ -6162,6 +6777,199 @@ mod tests {
 
         assert_eq!(receiver.pump_at(&left, now).unwrap(), 0);
         assert_eq!(left.inbound.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn stale_future_retry_does_not_preempt_equal_priority_receipt() {
+        let (mut receiver, _sender, left, right, now) =
+            authenticated_runtime_pair(841, Priority::Routine);
+        receiver.retries.clear();
+        receiver.deferred_wants.clear();
+        receiver.outbox.clear();
+        left.inbound.lock().unwrap().clear();
+        right.inbound.lock().unwrap().clear();
+
+        receiver
+            .queue_sync_message(&Message::Interest(crate::wire::Interest {
+                exchange_id: 841,
+                topics: vec!["alpha".into()],
+                scopes: vec!["mission/team".into()],
+                min_priority: Priority::Routine as u8,
+                max_offers: 1,
+            }))
+            .unwrap();
+        receiver.pump_at(&left, now).unwrap();
+        let retry_key = RetryKey::Interest(841);
+        let old_epoch = receiver.retries[&retry_key]
+            .transport_epoch
+            .as_ref()
+            .unwrap()
+            .clone();
+        let old_attempts = receiver.retries[&retry_key].attempts;
+        let retry_due = now + Duration::from_secs(64);
+        receiver.retries.get_mut(&retry_key).unwrap().due = retry_due;
+        receiver.secure_records_sealed = old_epoch.sealed_ordinal + SECURE_REPLAY_WINDOW_RECORDS;
+        right.inbound.lock().unwrap().clear();
+        left.capture.lock().unwrap().clear();
+
+        let marker_id = ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(b"pump-yield-marker"));
+        let receipt = Message::Receipt(wire::Receipt {
+            exchange_id: 841,
+            object_id: marker_id,
+            total_len: 1,
+            received: vec![ByteRange { start: 0, end: 1 }],
+            complete: true,
+        });
+        receiver.queue_sync_message(&receipt).unwrap();
+        let waiting_sequence = receiver.outbox.front().unwrap().sequence;
+        let sealed_before = receiver.secure_records_sealed;
+        assert_eq!(receiver.next_wakeup(&left), Some(now));
+
+        assert_eq!(receiver.pump_at(&left, now).unwrap(), 0);
+        assert_eq!(receiver.secure_records_sealed, sealed_before + 1);
+        assert_eq!(receiver.retries[&retry_key].attempts, old_attempts);
+        assert_eq!(
+            receiver.retries[&retry_key]
+                .transport_epoch
+                .as_ref()
+                .unwrap()
+                .transfer_id,
+            old_epoch.transfer_id
+        );
+        let first_dispatched = Fragment::decode(left.capture.lock().unwrap().first().unwrap())
+            .unwrap()
+            .transfer_id;
+        assert_ne!(first_dispatched, old_epoch.transfer_id);
+        assert!(
+            receiver
+                .outbox
+                .iter()
+                .all(|entry| entry.sequence != waiting_sequence)
+        );
+        assert_eq!(receiver.next_wakeup(&left), Some(retry_due));
+
+        left.capture.lock().unwrap().clear();
+        receiver.pump_at(&left, retry_due).unwrap();
+        let rotated_epoch = receiver.retries[&retry_key]
+            .transport_epoch
+            .as_ref()
+            .unwrap();
+        assert_ne!(rotated_epoch.transfer_id, old_epoch.transfer_id);
+        assert_eq!(receiver.retries[&retry_key].attempts, old_attempts + 1);
+    }
+
+    #[test]
+    fn full_replay_window_does_not_starve_one_shot_and_reseals_retry_on_demand() {
+        let (mut receiver, _sender, left, right, now) =
+            authenticated_runtime_pair(842, Priority::Routine);
+        receiver.retries.clear();
+        receiver.deferred_wants.clear();
+        receiver.outbox.clear();
+        left.inbound.lock().unwrap().clear();
+        right.inbound.lock().unwrap().clear();
+
+        for index in 0..MAX_RETRY_SENDS_PER_PUMP {
+            let object_id = ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(
+                &u64::try_from(index).unwrap().to_le_bytes(),
+            ));
+            receiver
+                .backend_mut()
+                .priorities
+                .insert(object_id, Priority::Routine);
+            receiver
+                .queue_sync_message(&Message::Data(Data {
+                    exchange_id: 842,
+                    object_id,
+                    total_len: 1,
+                    offset: 0,
+                    payload: vec![index as u8],
+                    forwarding: b"authenticated-forwarding".to_vec(),
+                }))
+                .unwrap();
+        }
+        let marker_id = ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(b"pump-yield-marker"));
+        let receipt = Message::Receipt(wire::Receipt {
+            exchange_id: 842,
+            object_id: marker_id,
+            total_len: 1,
+            received: vec![ByteRange { start: 0, end: 1 }],
+            complete: true,
+        });
+        receiver.queue_sync_message(&receipt).unwrap();
+        let waiting_sequence = receiver.outbox.front().unwrap().sequence;
+
+        assert_eq!(receiver.pump_at(&left, now).unwrap(), 0);
+        assert_eq!(receiver.outbox.len(), 1);
+        assert_eq!(receiver.retries.len(), MAX_RETRY_SENDS_PER_PUMP);
+
+        let oldest_key = receiver
+            .retries
+            .iter()
+            .min_by_key(|(_, entry)| entry.transport_epoch.as_ref().unwrap().sealed_ordinal)
+            .map(|(key, _)| key.clone())
+            .unwrap();
+        let retry_due = receiver.retries[&oldest_key].due;
+        for (key, entry) in &mut receiver.retries {
+            if *key != oldest_key {
+                entry.due = retry_due + Duration::from_secs(60);
+            }
+        }
+        let retry_snapshot = receiver
+            .retries
+            .iter()
+            .map(|(key, entry)| {
+                (
+                    key.clone(),
+                    (
+                        entry.attempts,
+                        entry.transport_epoch.as_ref().unwrap().transfer_id,
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let sealed_before_receipt = receiver.secure_records_sealed;
+        right.inbound.lock().unwrap().clear();
+
+        receiver.pump_at(&left, now).unwrap();
+        assert!(
+            receiver
+                .outbox
+                .iter()
+                .all(|entry| entry.sequence != waiting_sequence)
+        );
+        assert_eq!(receiver.secure_records_sealed, sealed_before_receipt + 1);
+        let after_receipt = receiver
+            .retries
+            .iter()
+            .map(|(key, entry)| {
+                (
+                    key.clone(),
+                    (
+                        entry.attempts,
+                        entry.transport_epoch.as_ref().unwrap().transfer_id,
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(after_receipt, retry_snapshot);
+        assert_eq!(receiver.next_wakeup(&left), Some(retry_due));
+
+        let old_epoch = receiver.retries[&oldest_key]
+            .transport_epoch
+            .as_ref()
+            .unwrap()
+            .clone();
+        receiver.pump_at(&left, retry_due).unwrap();
+        let refreshed = receiver.retries[&oldest_key]
+            .transport_epoch
+            .as_ref()
+            .unwrap();
+        assert_ne!(refreshed.transfer_id, old_epoch.transfer_id);
+        assert!(refreshed.sealed_ordinal > old_epoch.sealed_ordinal);
+        assert_eq!(
+            receiver.retries[&oldest_key].attempts,
+            retry_snapshot[&oldest_key].0 + 1
+        );
     }
 
     #[test]
@@ -6275,7 +7083,7 @@ mod tests {
 
     #[test]
     fn saturated_retry_set_keeps_and_reschedules_durable_want_progress() {
-        let (_left_driver, mut driver, _left, right, now) =
+        let (mut driver, _right_driver, left, _right, now) =
             authenticated_runtime_pair(77, Priority::Routine);
         let payload = vec![0x33; 1_024];
 
@@ -6319,13 +7127,10 @@ mod tests {
         assert_eq!(driver.outbox.len(), MAX_PENDING_OUTBOX);
 
         let wanted_id = ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(b"durable-want"));
+        let offer = pending_offer_for(&mut driver, 77, [wanted_id]);
         let actions = driver
             .sync
-            .apply(SyncEvent::Receive(Message::Offer(crate::wire::Offer {
-                exchange_id: 77,
-                object_ids: vec![wanted_id],
-                snapshot_id: 1,
-            })))
+            .apply(SyncEvent::Receive(Message::Offer(offer)))
             .unwrap();
         driver.handle_actions(actions).unwrap();
         assert!(driver.sync.wants().contains(&wanted_id));
@@ -6339,23 +7144,23 @@ mod tests {
         for entry in driver.retries.values_mut() {
             entry.due = now + Duration::from_secs(3_600);
         }
-        right.capture.lock().unwrap().clear();
-        driver.pump_at(&right, now).unwrap();
+        left.capture.lock().unwrap().clear();
+        driver.pump_at(&left, now).unwrap();
         let deferred = driver
             .deferred_wants
             .get(&wanted_id)
             .expect("durable WANT remains represented while slots are saturated");
         assert_eq!(deferred.attempts, 1);
         assert!(deferred.due > now);
-        assert!(!right.capture.lock().unwrap().is_empty());
+        assert!(!left.capture.lock().unwrap().is_empty());
         assert!(driver.sync.wants().contains(&wanted_id));
 
         // Once acknowledged work frees slots, the same durable request is
         // promoted to a retained retry without an application re-request.
         driver.retries.clear();
         let retry_at = deferred.due;
-        right.capture.lock().unwrap().clear();
-        driver.pump_at(&right, retry_at).unwrap();
+        left.capture.lock().unwrap().clear();
+        driver.pump_at(&left, retry_at).unwrap();
         assert!(!driver.deferred_wants.contains_key(&wanted_id));
         assert!(driver.retries.contains_key(&RetryKey::Want(77, wanted_id)));
         assert!(driver.sync.wants().contains(&wanted_id));
@@ -6363,7 +7168,7 @@ mod tests {
     }
 
     #[test]
-    fn maximum_want_fanout_backpressures_before_expanding_all_payloads() {
+    fn maximum_want_fanout_uses_bounded_flow_control_without_contact_failure() {
         let (_left_driver, mut driver, _left, _right, _now) =
             authenticated_runtime_pair(78, Priority::Routine);
         driver.backend_mut().fanout_messages = MAX_DATA_MESSAGES_PER_WANT;
@@ -6383,6 +7188,7 @@ mod tests {
             });
         }
         items.sort_by_key(|item| item.object_id);
+        let replay = items.last().cloned().unwrap();
         let actions = driver
             .sync
             .apply(SyncEvent::Receive(Message::Want(crate::wire::Want {
@@ -6392,13 +7198,179 @@ mod tests {
             .unwrap();
         assert_eq!(actions.len(), 128);
 
-        assert!(matches!(
-            driver.handle_actions(actions),
-            Err(RuntimeError::Backpressure)
-        ));
-        assert!(driver.backend().data_requests < 128);
+        driver.handle_actions(actions).unwrap();
+        let requests_before_replay = driver.backend().data_requests;
+        assert!(requests_before_replay > 0);
+        assert!(requests_before_replay < 128);
         assert!(driver.retries.len() <= MAX_PENDING_RETRIES);
         assert!(driver.outbox.len() <= MAX_PENDING_OUTBOX);
+        assert!(driver.pending_logical_bytes() <= MAX_PENDING_LOGICAL_BYTES);
+
+        // The requester retains every incomplete WANT. Once receipts free
+        // capacity, replay of a previously skipped singleton resumes that
+        // exact object without rebuilding the inventory exchange.
+        driver.retries.clear();
+        driver
+            .handle_actions(vec![SyncAction::Serve(replay.clone())])
+            .unwrap();
+        assert_eq!(driver.backend().data_requests, requests_before_replay + 1);
+        assert!(driver.retries.contains_key(&RetryKey::Data(
+            78,
+            replay.object_id,
+            u64::try_from(MAX_DATA_PAYLOAD_BYTES * MAX_DATA_MESSAGES_PER_WANT).unwrap(),
+            0,
+            u64::try_from(MAX_DATA_PAYLOAD_BYTES).unwrap(),
+        )));
+    }
+
+    #[test]
+    fn refreshed_want_retires_superseded_data_before_serving_tail() {
+        let (_peer, mut driver, _left, _right, _now) =
+            authenticated_runtime_pair(782, Priority::Routine);
+        driver.retries.clear();
+        driver.deferred_wants.clear();
+        driver.outbox.clear();
+        let payload = vec![0x7b; 65_927];
+        let object_id = ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(&payload));
+        driver
+            .backend_mut()
+            .available
+            .insert(object_id, payload.clone());
+        driver
+            .backend_mut()
+            .priorities
+            .insert(object_id, Priority::Routine);
+        driver
+            .queue_sync_message(&Message::Data(Data {
+                exchange_id: 782,
+                object_id,
+                total_len: payload.len() as u64,
+                offset: 0,
+                payload: payload[..65_536].to_vec(),
+                forwarding: b"authenticated-forwarding".to_vec(),
+            }))
+            .unwrap();
+        let prefix_key = RetryKey::Data(782, object_id, payload.len() as u64, 0, 65_536);
+        for index in 0..(MAX_PENDING_RETRIES - 1) {
+            let filler = ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(
+                &u64::try_from(index).unwrap().to_le_bytes(),
+            ));
+            driver
+                .queue_sync_message(&Message::Data(Data {
+                    exchange_id: 782,
+                    object_id: filler,
+                    total_len: 1,
+                    offset: 0,
+                    payload: vec![index as u8],
+                    forwarding: b"authenticated-forwarding".to_vec(),
+                }))
+                .unwrap();
+        }
+        assert_eq!(driver.retries.len(), MAX_PENDING_RETRIES);
+
+        let tail = WantItem {
+            object_id,
+            total_len: Some(payload.len() as u64),
+            missing: vec![ByteRange {
+                start: 65_536,
+                end: payload.len() as u64,
+            }],
+            need_forwarding: false,
+        };
+        let refreshed = Message::Want(crate::wire::Want {
+            exchange_id: 782,
+            items: vec![tail.clone()],
+        });
+        driver.observe_authenticated_message(&refreshed).unwrap();
+        assert!(!driver.retries.contains_key(&prefix_key));
+        assert_eq!(driver.retries.len(), MAX_PENDING_RETRIES - 1);
+
+        driver
+            .handle_actions(vec![SyncAction::Serve(tail.clone())])
+            .unwrap();
+        let tail_key = RetryKey::Data(
+            782,
+            object_id,
+            payload.len() as u64,
+            65_536,
+            payload.len() as u64,
+        );
+        assert!(driver.retries.contains_key(&tail_key));
+        assert_eq!(driver.retries.len(), MAX_PENDING_RETRIES);
+        driver.observe_authenticated_message(&refreshed).unwrap();
+        assert!(
+            driver.retries.contains_key(&tail_key),
+            "a DATA retry that still intersects the exact missing range remains live"
+        );
+        assert!(driver.pending_logical_bytes() <= MAX_PENDING_LOGICAL_BYTES);
+    }
+
+    #[test]
+    fn serve_flow_control_still_admits_later_flash_data() {
+        let (_peer, mut driver, _left, _right, _now) =
+            authenticated_runtime_pair(781, Priority::Routine);
+        for index in 0..MAX_PENDING_RETRIES {
+            let object_id = ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(
+                &u64::try_from(index).unwrap().to_le_bytes(),
+            ));
+            driver
+                .queue_sync_message(&Message::Data(Data {
+                    exchange_id: 781,
+                    object_id,
+                    total_len: 1,
+                    offset: 0,
+                    payload: vec![index as u8],
+                    forwarding: b"authenticated-forwarding".to_vec(),
+                }))
+                .unwrap();
+        }
+        assert_eq!(driver.retries.len(), MAX_PENDING_RETRIES);
+
+        let routine_id =
+            ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(b"later-routine-serve"));
+        let flash_id = ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(b"later-flash-serve"));
+        driver
+            .backend_mut()
+            .available
+            .insert(routine_id, b"r".to_vec());
+        driver
+            .backend_mut()
+            .available
+            .insert(flash_id, b"f".to_vec());
+        driver
+            .backend_mut()
+            .priorities
+            .insert(routine_id, Priority::Routine);
+        driver
+            .backend_mut()
+            .priorities
+            .insert(flash_id, Priority::Flash);
+        let want = |object_id| WantItem {
+            object_id,
+            total_len: None,
+            missing: Vec::new(),
+            need_forwarding: true,
+        };
+
+        driver
+            .handle_actions(vec![
+                SyncAction::Serve(want(routine_id)),
+                SyncAction::Serve(want(flash_id)),
+            ])
+            .unwrap();
+
+        assert_eq!(driver.backend().data_requests, 2);
+        assert!(
+            !driver
+                .retries
+                .contains_key(&RetryKey::Data(781, routine_id, 1, 0, 1))
+        );
+        assert!(
+            driver
+                .retries
+                .contains_key(&RetryKey::Data(781, flash_id, 1, 0, 1))
+        );
+        assert_eq!(driver.retries.len(), MAX_PENDING_RETRIES);
         assert!(driver.pending_logical_bytes() <= MAX_PENDING_LOGICAL_BYTES);
     }
 
@@ -6559,6 +7531,85 @@ mod tests {
     }
 
     #[test]
+    fn interest_summary_backpressure_restores_and_retries_authenticated_control() {
+        let (mut sender, mut receiver, left, right, mut now) =
+            authenticated_runtime_pair(851, Priority::Routine);
+        sender.retries.clear();
+        sender.deferred_wants.clear();
+        sender.outbox.clear();
+        receiver.retries.clear();
+        receiver.deferred_wants.clear();
+        receiver.outbox.clear();
+        left.inbound.lock().unwrap().clear();
+        right.inbound.lock().unwrap().clear();
+
+        for index in 0..MAX_PENDING_RETRIES {
+            let object_id = ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(
+                &u64::try_from(index).unwrap().to_le_bytes(),
+            ));
+            receiver
+                .backend_mut()
+                .priorities
+                .insert(object_id, Priority::Flash);
+            receiver
+                .queue_sync_message(&Message::Data(Data {
+                    exchange_id: 851,
+                    object_id,
+                    total_len: 1,
+                    offset: 0,
+                    payload: vec![index as u8],
+                    forwarding: b"authenticated-forwarding".to_vec(),
+                }))
+                .unwrap();
+        }
+        for entry in receiver.retries.values_mut() {
+            entry.due = now + Duration::from_secs(3_600);
+        }
+
+        sender
+            .queue_sync_message(&Message::Interest(crate::wire::Interest {
+                exchange_id: 851,
+                topics: vec!["alpha".into()],
+                scopes: vec!["mission/team".into()],
+                min_priority: Priority::Routine as u8,
+                max_offers: 1,
+            }))
+            .unwrap();
+        let interest_key = RetryKey::Interest(851);
+        sender.pump_at(&left, now).unwrap();
+        receiver.pump_at(&right, now).unwrap();
+
+        assert!(receiver.is_authenticated());
+        assert!(sender.retries.contains_key(&interest_key));
+        assert_eq!(receiver.retries.len(), MAX_PENDING_RETRIES);
+        assert!(
+            !receiver
+                .retries
+                .keys()
+                .any(|key| matches!(key, RetryKey::Summary(851, _)))
+        );
+        receiver.retries.clear();
+        for _ in 0..=MAX_SUCCESSFUL_RECORD_REPAIR_ROUNDS + 2 {
+            let Some(due) = sender.retries.get(&interest_key).map(|entry| entry.due) else {
+                break;
+            };
+            now = due;
+            sender.pump_at(&left, now).unwrap();
+            receiver.pump_at(&right, now).unwrap();
+            sender.pump_at(&left, now).unwrap();
+        }
+
+        assert!(!sender.retries.contains_key(&interest_key));
+        assert!(
+            receiver
+                .retries
+                .keys()
+                .any(|key| matches!(key, RetryKey::Summary(851, _)))
+        );
+        assert!(receiver.is_authenticated());
+    }
+
+    #[test]
     fn oversized_offer_rolls_back_every_partially_inserted_want() {
         let (sender_bundle, receiver_bundle) = bundles();
         let mut sender = RuntimeDriver::initiator(
@@ -6617,13 +7668,8 @@ mod tests {
             ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(b"offer-second")),
         ];
         object_ids.sort_unstable();
-        sender
-            .queue_sync_message(&Message::Offer(crate::wire::Offer {
-                exchange_id: 827,
-                object_ids,
-                snapshot_id: 1,
-            }))
-            .unwrap();
+        let offer = pending_offer_for(&mut receiver, 827, object_ids);
+        sender.queue_sync_message(&Message::Offer(offer)).unwrap();
         sender.pump_at(&left, now).unwrap();
 
         assert!(matches!(
@@ -6772,12 +7818,29 @@ mod tests {
     }
 
     #[test]
-    fn receipt_backpressure_rolls_back_data_and_reissues_durable_want() {
-        let (mut receiver, mut sender, left, right, mut now) =
+    fn post_commit_backpressure_keeps_commit_once_and_retries_inventory_refresh() {
+        let (mut receiver, mut sender, left, right, now) =
             authenticated_runtime_pair(90, Priority::Routine);
         let payload = b"receipt-backpressure".to_vec();
         let object_id = ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(&payload));
         prepare_expected_object(&mut receiver, 90, object_id);
+        let serve_actions = receiver
+            .sync
+            .apply(SyncEvent::Receive(Message::Interest(
+                crate::wire::Interest {
+                    exchange_id: 90,
+                    topics: vec!["alpha".into()],
+                    scopes: vec!["mission/team".into()],
+                    min_priority: Priority::Routine as u8,
+                    max_offers: 1,
+                },
+            )))
+            .unwrap();
+        receiver.handle_actions(serve_actions).unwrap();
+        assert!(receiver.sync.selected_serve_inventory().is_some());
+        receiver.retries.clear();
+        receiver.deferred_wants.clear();
+        receiver.outbox.clear();
         sender
             .backend_mut()
             .priorities
@@ -6815,11 +7878,65 @@ mod tests {
                 }))
                 .unwrap();
         }
-        let marker_id = ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(b"full-outbox"));
+        for entry in receiver.retries.values_mut() {
+            entry.due = now + Duration::from_secs(3_600);
+        }
+
+        sender.pump_at(&right, now).unwrap();
+        receiver.pump_at(&left, now).unwrap();
+        assert!(receiver.sync.inventory().contains(&object_id));
+        assert_eq!(receiver.backend().ingested.len(), 1);
+        let retry_due = receiver
+            .inventory_refresh_retry
+            .as_ref()
+            .expect("committed object retains its blocked inventory refresh")
+            .due;
+
+        receiver.retries.clear();
+        receiver.pump_at(&left, retry_due).unwrap();
+        assert!(receiver.inventory_refresh_retry.is_none());
+
+        sender.pump_at(&right, retry_due).unwrap();
+        receiver.pump_at(&left, retry_due).unwrap();
+        assert_eq!(receiver.backend().ingested.len(), 1);
+        assert!(receiver.sync.inventory().contains(&object_id));
+    }
+
+    #[test]
+    fn dropped_partial_receipt_is_reissued_and_retires_data_retry() {
+        let (mut receiver, mut sender, left, right, mut now) =
+            authenticated_runtime_pair(901, Priority::Routine);
+        receiver.retries.clear();
+        receiver.deferred_wants.clear();
+        receiver.outbox.clear();
+        sender.retries.clear();
+        sender.deferred_wants.clear();
+        sender.outbox.clear();
+        let payload = b"partial-receipt".to_vec();
+        let object_id = ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(&payload));
+        prepare_expected_object(&mut receiver, 901, object_id);
+        sender
+            .backend_mut()
+            .priorities
+            .insert(object_id, Priority::Routine);
+        let partial_end = 4_u64;
+        let data = Message::Data(Data {
+            exchange_id: 901,
+            object_id,
+            total_len: payload.len() as u64,
+            offset: 0,
+            payload: payload[..partial_end as usize].to_vec(),
+            forwarding: b"authenticated-forwarding".to_vec(),
+        });
+        sender.queue_sync_message(&data).unwrap();
+        let data_key = RetryKey::Data(901, object_id, payload.len() as u64, 0, partial_end);
+
+        let marker_id =
+            ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(b"partial-receipt-outbox"));
         for _ in 0..MAX_PENDING_OUTBOX {
             let (semantic_version, plaintext) = receiver
                 .encode_message(&Message::Receipt(wire::Receipt {
-                    exchange_id: 90,
+                    exchange_id: 901,
                     object_id: marker_id,
                     total_len: 1,
                     received: Vec::new(),
@@ -6827,40 +7944,48 @@ mod tests {
                 }))
                 .unwrap();
             receiver
-                .queue_logical_once(plaintext, Priority::Routine, semantic_version)
+                .queue_logical_once(plaintext, Priority::Flash, semantic_version)
                 .unwrap();
+        }
+        for entry in &mut receiver.outbox {
+            entry.due = now + Duration::from_secs(3_600);
         }
 
         sender.pump_at(&right, now).unwrap();
-        assert!(matches!(
-            receiver.pump_at(&left, now),
-            Err(RuntimeError::Backpressure)
-        ));
-        assert!(receiver.backend().ingested.is_empty());
-        assert!(receiver.sync.wants().contains(&object_id));
-        assert!(
-            receiver
-                .retries
-                .contains_key(&RetryKey::Want(90, object_id))
-                || receiver.deferred_wants.contains_key(&object_id)
+        receiver.pump_at(&left, now).unwrap();
+        assert!(sender.retries.contains_key(&data_key));
+        assert_eq!(
+            receiver.sync.retry_want_item(object_id).unwrap().missing,
+            vec![ByteRange {
+                start: partial_end,
+                end: payload.len() as u64,
+            }]
         );
 
-        receiver.outbox.clear();
+        // This case isolates duplicate-DATA receipt regeneration: drop the
+        // newly introduced progress WANT as well as the saturated receipt,
+        // while leaving its durable retry represented beyond this test's
+        // DATA-repair horizon.
+        right.inbound.lock().unwrap().clear();
         receiver
             .retries
-            .retain(|key, _| matches!(key, RetryKey::Want(90, id) if *id == object_id));
-        right.inbound.lock().unwrap().clear();
-        for _ in 0..16 {
-            now += Duration::from_secs(70);
-            receiver.pump_at(&left, now).unwrap();
+            .get_mut(&RetryKey::Want(901, object_id))
+            .unwrap()
+            .due = now + Duration::from_secs(3_600);
+        receiver.outbox.clear();
+        for _ in 0..=MAX_SUCCESSFUL_RECORD_REPAIR_ROUNDS {
+            let Some(due) = sender.retries.get(&data_key).map(|entry| entry.due) else {
+                break;
+            };
+            now = due;
             sender.pump_at(&right, now).unwrap();
             receiver.pump_at(&left, now).unwrap();
-            if receiver.backend().ingested.len() == 1 {
-                break;
-            }
+            sender.pump_at(&right, now).unwrap();
         }
-        assert_eq!(receiver.backend().ingested.len(), 1);
-        assert!(receiver.sync.inventory().contains(&object_id));
+
+        assert!(!sender.retries.contains_key(&data_key));
+        assert!(receiver.backend().ingested.is_empty());
+        assert!(receiver.sync.wants().contains(&object_id));
     }
 
     #[test]
@@ -6910,7 +8035,7 @@ mod tests {
             action,
             SyncAction::StoreChunk { object_id: stored, .. } if *stored == object_id
         )));
-        driver
+        let stored_actions = driver
             .sync
             .apply(SyncEvent::ChunkStored {
                 object_id,
@@ -6921,6 +8046,18 @@ mod tests {
                 },
             })
             .unwrap();
+        assert!(stored_actions.iter().any(|action| matches!(
+            action,
+            SyncAction::Send(Message::Want(want))
+                if want.items.iter().any(|item| {
+                    item.object_id == object_id
+                        && item.missing == vec![ByteRange {
+                            start: stored_end,
+                            end: payload.len() as u64,
+                        }]
+                })
+        )));
+        driver.handle_actions(stored_actions).unwrap();
         let refreshed_item = driver.sync.retry_want_item(object_id).unwrap();
         assert_eq!(
             refreshed_item.missing,
@@ -6929,16 +8066,18 @@ mod tests {
                 end: payload.len() as u64,
             }]
         );
-        driver
-            .queue_retry_message(
-                RetryKey::Want(91, object_id),
-                Message::Want(crate::wire::Want {
-                    exchange_id: 91,
-                    items: vec![refreshed_item],
-                }),
-                Priority::Routine,
-            )
-            .unwrap();
+        let refreshed_retry = driver
+            .retries
+            .get(&RetryKey::Want(91, object_id))
+            .expect("durable progress must promote the refreshed WANT");
+        assert_eq!(refreshed_retry.due, now);
+        assert_eq!(
+            refreshed_retry.message,
+            Message::Want(crate::wire::Want {
+                exchange_id: 91,
+                items: vec![refreshed_item],
+            })
+        );
         let (new_transfer_id, _) = driver
             .prepare_retry_transport_epoch(
                 &RetryKey::Want(91, object_id),
@@ -6947,6 +8086,311 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_ne!(new_transfer_id, old_transfer_id);
+    }
+
+    #[test]
+    fn durable_progress_orders_receipt_before_refreshed_retained_want() {
+        let (_peer, mut driver, _left, _right, now) =
+            authenticated_runtime_pair(912, Priority::Routine);
+        driver.retries.clear();
+        driver.deferred_wants.clear();
+        driver.outbox.clear();
+        let payload = vec![0x5a; 65_927];
+        let object_id = ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(&payload));
+        prepare_expected_object(&mut driver, 912, object_id);
+        let initial_want = Message::Want(crate::wire::Want {
+            exchange_id: 912,
+            items: vec![driver.sync.retry_want_item(object_id).unwrap()],
+        });
+        driver.queue_sync_message(&initial_want).unwrap();
+        let key = RetryKey::Want(912, object_id);
+        let old_sequence = driver.retries[&key].sequence;
+        driver.retries.get_mut(&key).unwrap().attempts = 7;
+        driver.retries.get_mut(&key).unwrap().due = now + Duration::from_secs(64);
+
+        let stored_end = 65_536_u64;
+        let receive_actions = driver
+            .sync
+            .apply(SyncEvent::Receive(Message::Data(Data {
+                exchange_id: 912,
+                object_id,
+                total_len: payload.len() as u64,
+                offset: 0,
+                payload: payload[..stored_end as usize].to_vec(),
+                forwarding: b"authenticated-forwarding".to_vec(),
+            })))
+            .unwrap();
+        assert!(matches!(
+            receive_actions.as_slice(),
+            [SyncAction::StoreChunk { .. }]
+        ));
+        let stored_actions = driver
+            .sync
+            .apply(SyncEvent::ChunkStored {
+                object_id,
+                total_len: payload.len() as u64,
+                range: ByteRange {
+                    start: 0,
+                    end: stored_end,
+                },
+            })
+            .unwrap();
+        driver.handle_actions(stored_actions).unwrap();
+
+        let receipt_sequence = driver
+            .outbox
+            .front()
+            .expect("partial progress must queue a receipt")
+            .sequence;
+        let refreshed = &driver.retries[&key];
+        assert_eq!(refreshed.attempts, 7);
+        assert_eq!(refreshed.due, now);
+        assert!(refreshed.transport_epoch.is_none());
+        assert!(refreshed.sequence > old_sequence);
+        assert!(receipt_sequence < refreshed.sequence);
+        assert!(matches!(
+            &refreshed.message,
+            Message::Want(crate::wire::Want { items, .. })
+                if items == &[crate::wire::WantItem {
+                    object_id,
+                    total_len: Some(payload.len() as u64),
+                    missing: vec![ByteRange {
+                        start: stored_end,
+                        end: payload.len() as u64,
+                    }],
+                    need_forwarding: false,
+                }]
+        ));
+    }
+
+    #[test]
+    fn completed_want_refills_exactly_one_sleeping_window_slot() {
+        let (_peer, mut driver, _left, right, now) =
+            authenticated_runtime_pair(913, Priority::Routine);
+        driver.retries.clear();
+        driver.deferred_wants.clear();
+        driver.outbox.clear();
+        let completed = ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(b"completed"));
+        let sleeping_old = ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(b"sleeping-old"));
+        let sleeping_new = ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(b"sleeping-new"));
+        let offer = pending_offer_for(&mut driver, 913, [completed, sleeping_old, sleeping_new]);
+        let actions = driver
+            .sync
+            .apply(SyncEvent::Receive(Message::Offer(offer)))
+            .unwrap();
+        driver.handle_actions(actions).unwrap();
+        driver
+            .prepare_retry_transport_epoch(
+                &RetryKey::Want(913, sleeping_old),
+                right.characteristics().mtu,
+            )
+            .unwrap();
+        driver.demote_retry(&RetryKey::Want(913, sleeping_old));
+        driver.demote_retry(&RetryKey::Want(913, sleeping_new));
+        let sleeping_due = now + Duration::from_secs(64);
+        {
+            let entry = driver.deferred_wants.get_mut(&sleeping_old).unwrap();
+            entry.attempts = 7;
+            entry.due = sleeping_due;
+            entry.sequence = 50;
+        }
+        {
+            let entry = driver.deferred_wants.get_mut(&sleeping_new).unwrap();
+            entry.attempts = 9;
+            entry.due = sleeping_due;
+            entry.sequence = 51;
+        }
+        driver.next_retry_sequence = 100;
+        let receipt = Message::Receipt(wire::Receipt {
+            exchange_id: 913,
+            object_id: completed,
+            total_len: 1,
+            received: vec![ByteRange { start: 0, end: 1 }],
+            complete: true,
+        });
+        driver.queue_sync_message(&receipt).unwrap();
+        let receipt_sequence = driver.outbox.front().unwrap().sequence;
+
+        driver.retire_completed_want_and_refill_window(913, wire::SEMANTIC_PROTOCOL_V2, completed);
+
+        assert!(!driver.retries.contains_key(&RetryKey::Want(913, completed)));
+        let accelerated = &driver.deferred_wants[&sleeping_old];
+        assert_eq!(accelerated.attempts, 7);
+        assert_eq!(accelerated.due, now);
+        assert!(accelerated.sequence > receipt_sequence);
+        assert!(accelerated.transport_epoch.is_none());
+        let untouched = &driver.deferred_wants[&sleeping_new];
+        assert_eq!(untouched.attempts, 9);
+        assert_eq!(untouched.due, sleeping_due);
+        assert_eq!(untouched.sequence, 51);
+        assert!(driver.retries.len() <= MAX_PENDING_RETRIES);
+        assert!(driver.pending_logical_bytes() <= MAX_PENDING_LOGICAL_BYTES);
+    }
+
+    #[test]
+    fn completed_want_wakes_one_retained_request_without_advancing_time() {
+        let (_peer, mut driver, _left, right, now) =
+            authenticated_runtime_pair(914, Priority::Routine);
+        driver.retries.clear();
+        driver.deferred_wants.clear();
+        driver.outbox.clear();
+        let completed = ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(b"completed-slot"));
+        let sleeping_old = ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(b"retained-old"));
+        let sleeping_new = ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(b"retained-new"));
+        let offer = pending_offer_for(&mut driver, 914, [completed, sleeping_old, sleeping_new]);
+        let actions = driver
+            .sync
+            .apply(SyncEvent::Receive(Message::Offer(offer)))
+            .unwrap();
+        driver.handle_actions(actions).unwrap();
+        driver
+            .prepare_retry_transport_epoch(
+                &RetryKey::Want(914, sleeping_old),
+                right.characteristics().mtu,
+            )
+            .unwrap();
+        let sleeping_due = now + Duration::from_secs(64);
+        {
+            let entry = driver
+                .retries
+                .get_mut(&RetryKey::Want(914, sleeping_old))
+                .unwrap();
+            entry.attempts = 7;
+            entry.due = sleeping_due;
+            entry.sequence = 50;
+        }
+        {
+            let entry = driver
+                .retries
+                .get_mut(&RetryKey::Want(914, sleeping_new))
+                .unwrap();
+            entry.attempts = 9;
+            entry.due = sleeping_due;
+            entry.sequence = 51;
+        }
+        driver.next_retry_sequence = 100;
+        driver
+            .queue_sync_message(&Message::Receipt(wire::Receipt {
+                exchange_id: 914,
+                object_id: completed,
+                total_len: 1,
+                received: vec![ByteRange { start: 0, end: 1 }],
+                complete: true,
+            }))
+            .unwrap();
+        let receipt_sequence = driver.outbox.front().unwrap().sequence;
+
+        driver.retire_completed_want_and_refill_window(914, wire::SEMANTIC_PROTOCOL_V2, completed);
+
+        assert!(!driver.retries.contains_key(&RetryKey::Want(914, completed)));
+        let accelerated = &driver.retries[&RetryKey::Want(914, sleeping_old)];
+        assert_eq!(accelerated.attempts, 7);
+        assert_eq!(accelerated.due, now);
+        assert!(accelerated.sequence > receipt_sequence);
+        assert!(accelerated.transport_epoch.is_none());
+        let untouched = &driver.retries[&RetryKey::Want(914, sleeping_new)];
+        assert_eq!(untouched.attempts, 9);
+        assert_eq!(untouched.due, sleeping_due);
+        assert_eq!(untouched.sequence, 51);
+        assert!(driver.deferred_wants.is_empty());
+        assert!(driver.retries.len() <= MAX_PENDING_RETRIES);
+        assert!(driver.pending_logical_bytes() <= MAX_PENDING_LOGICAL_BYTES);
+    }
+
+    #[test]
+    fn receipt_queue_saturation_is_advisory_flow_control() {
+        let (_peer, mut driver, _left, _right, _now) =
+            authenticated_runtime_pair(911, Priority::Routine);
+        let marker_id =
+            ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(b"receipt-flow-marker"));
+        let receipt = Message::Receipt(wire::Receipt {
+            exchange_id: 911,
+            object_id: marker_id,
+            total_len: 1,
+            received: vec![ByteRange { start: 0, end: 1 }],
+            complete: true,
+        });
+        for _ in 0..MAX_PENDING_OUTBOX {
+            let (semantic_version, plaintext) = driver.encode_message(&receipt).unwrap();
+            driver
+                .queue_logical_once(plaintext, Priority::Flash, semantic_version)
+                .unwrap();
+        }
+
+        driver
+            .handle_actions(vec![SyncAction::Send(receipt.clone())])
+            .unwrap();
+        assert_eq!(driver.outbox.len(), MAX_PENDING_OUTBOX);
+        assert!(driver.pending_logical_bytes() <= MAX_PENDING_LOGICAL_BYTES);
+
+        driver.outbox.clear();
+        driver
+            .handle_actions(vec![SyncAction::Send(receipt)])
+            .unwrap();
+        assert_eq!(driver.outbox.len(), 1);
+    }
+
+    #[test]
+    fn complete_receipt_refresh_backpressure_is_retried_without_contact_failure() {
+        let (mut receiver, mut sender, left, right, now) =
+            authenticated_runtime_pair(912, Priority::Routine);
+        receiver.retries.clear();
+        receiver.deferred_wants.clear();
+        receiver.outbox.clear();
+        receiver.backend_mut().receipts.clear();
+        for index in 0..MAX_PENDING_RETRIES {
+            let object_id = ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(
+                &u64::try_from(index).unwrap().to_be_bytes(),
+            ));
+            receiver
+                .backend_mut()
+                .priorities
+                .insert(object_id, Priority::Flash);
+            receiver
+                .queue_sync_message(&Message::Data(Data {
+                    exchange_id: 912,
+                    object_id,
+                    total_len: 1,
+                    offset: 0,
+                    payload: vec![index as u8],
+                    forwarding: b"authenticated-forwarding".to_vec(),
+                }))
+                .unwrap();
+        }
+        for entry in receiver.retries.values_mut() {
+            entry.due = now + Duration::from_secs(3_600);
+        }
+        assert_eq!(receiver.retries.len(), MAX_PENDING_RETRIES);
+
+        let acknowledged_id =
+            ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(b"durable-receipt-pressure"));
+        sender
+            .queue_sync_message(&Message::Receipt(wire::Receipt {
+                exchange_id: 912,
+                object_id: acknowledged_id,
+                total_len: 1,
+                received: vec![ByteRange { start: 0, end: 1 }],
+                complete: true,
+            }))
+            .unwrap();
+        sender.pump_at(&right, now).unwrap();
+
+        receiver.pump_at(&left, now).unwrap();
+        assert!(receiver.is_authenticated());
+        assert_eq!(receiver.backend().receipts.len(), 1);
+        let retry_due = receiver
+            .inventory_refresh_retry
+            .as_ref()
+            .expect("durable acknowledgement retains its blocked refresh")
+            .due;
+
+        // Model the peer acknowledgements that release the retained send
+        // capacity, then prove the scheduled refresh completes without
+        // applying the durable receipt a second time.
+        receiver.retries.clear();
+        receiver.pump_at(&left, retry_due).unwrap();
+        assert!(receiver.inventory_refresh_retry.is_none());
+        assert_eq!(receiver.backend().receipts.len(), 1);
     }
 
     #[test]
@@ -6984,7 +8428,7 @@ mod tests {
     }
 
     #[test]
-    fn transport_route_is_latched_for_replies_and_peer_changes_fail_closed() {
+    fn transport_route_is_latched_for_replies_and_other_routes_are_discarded() {
         let (initiator_bundle, responder_bundle) = bundles();
         let mut initiator = RuntimeDriver::initiator(
             initiator_bundle,
@@ -7020,6 +8464,14 @@ mod tests {
         }
         assert!(initiator.is_authenticated());
         assert!(responder.is_authenticated());
+        assert_eq!(
+            initiator.committed_route,
+            Some(CarrierRoute::Routed(right_route))
+        );
+        assert_eq!(
+            responder.committed_route,
+            Some(CarrierRoute::Routed(left_route))
+        );
         assert!(left.targets.lock().unwrap().contains(&Some(right_route)));
         assert!(
             right
@@ -7032,16 +8484,714 @@ mod tests {
 
         left.inbound.lock().unwrap().push_back(ReceivedFrame {
             peer: Some(changed_route),
-            bytes: Vec::new(),
+            bytes: Fragment {
+                transfer_id: 8_999,
+                index: 0,
+                count: 1,
+                payload: b"syntactically-valid-wrong-route".to_vec(),
+            }
+            .encode()
+            .unwrap(),
         });
-        assert_eq!(
-            initiator.pump(&left).unwrap_err().to_string(),
-            RuntimeError::TransportPeerChanged.to_string()
+        assert!(initiator.pump(&left).is_ok());
+        assert!(initiator.is_authenticated());
+
+        let receipt_id =
+            ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(b"right-route-progress"));
+        responder
+            .queue_sync_message(&Message::Receipt(wire::Receipt {
+                exchange_id: 19,
+                object_id: receipt_id,
+                total_len: 1,
+                received: Vec::new(),
+                complete: false,
+            }))
+            .unwrap();
+        responder.pump(&right).unwrap();
+        initiator.pump(&left).unwrap();
+        assert!(
+            initiator
+                .backend()
+                .receipts
+                .iter()
+                .any(|(_, _, receipt)| receipt.object_id == receipt_id)
         );
     }
 
     #[test]
-    fn completed_transfer_cache_rejects_conflicting_identifier_reuse() {
+    fn configured_route_rejects_anonymous_flights_and_keeps_exact_send_target() {
+        let (initiator_bundle, responder_bundle) = bundles();
+        let left_route = [0x51; 32];
+        let right_route = [0x52; 32];
+        let mut initiator = RuntimeDriver::initiator(
+            initiator_bundle,
+            SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
+            FakeBackend::default(),
+            StartRequest {
+                exchange_id: 20,
+                topics: vec!["alpha".into()],
+                scopes: vec!["mission/team".into()],
+                min_priority: Priority::Routine as u8,
+            },
+            Some(right_route),
+        )
+        .unwrap();
+        let mut responder = RuntimeDriver::responder(
+            responder_bundle,
+            SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
+            FakeBackend::default(),
+            Some(left_route),
+        )
+        .unwrap();
+        let (left, right) = MemoryLink::pair_with_routes(256, Some(left_route), Some(right_route));
+
+        initiator.pump(&left).unwrap();
+        {
+            let mut inbound = right.inbound.lock().unwrap();
+            let legitimate = inbound.pop_front().unwrap();
+            inbound.push_front(legitimate.clone());
+            inbound.push_front(ReceivedFrame {
+                peer: None,
+                bytes: legitimate.bytes,
+            });
+        }
+        right.allow_receives(1);
+        assert_eq!(responder.pump(&right).unwrap(), 0);
+        assert!(matches!(responder.phase, SessionPhase::Responder(_)));
+
+        right.allow_receives(usize::MAX);
+        for _ in 0..32 {
+            responder.pump(&right).unwrap();
+            initiator.pump(&left).unwrap();
+            if initiator.is_authenticated() && responder.is_authenticated() {
+                break;
+            }
+        }
+        assert!(initiator.is_authenticated());
+        assert!(responder.is_authenticated());
+        assert!(
+            left.targets
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|target| *target == Some(right_route))
+        );
+        assert!(
+            right
+                .targets
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|target| *target == Some(left_route))
+        );
+    }
+
+    #[test]
+    fn authenticated_anonymous_route_cannot_latch_a_later_routed_source() {
+        let (initiator_bundle, responder_bundle) = bundles();
+        let mut initiator = RuntimeDriver::initiator(
+            initiator_bundle,
+            SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
+            FakeBackend::default(),
+            StartRequest {
+                exchange_id: 21,
+                topics: vec!["alpha".into()],
+                scopes: vec!["mission/team".into()],
+                min_priority: Priority::Routine as u8,
+            },
+            None,
+        )
+        .unwrap();
+        let mut responder = RuntimeDriver::responder(
+            responder_bundle,
+            SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
+            FakeBackend::default(),
+            None,
+        )
+        .unwrap();
+        let (left, right) = MemoryLink::pair(256);
+        for _ in 0..32 {
+            initiator.pump(&left).unwrap();
+            responder.pump(&right).unwrap();
+            if initiator.is_authenticated() && responder.is_authenticated() {
+                break;
+            }
+        }
+        assert!(initiator.is_authenticated());
+        assert!(responder.is_authenticated());
+        assert_eq!(initiator.committed_route, Some(CarrierRoute::Anonymous));
+        assert_eq!(responder.committed_route, Some(CarrierRoute::Anonymous));
+        left.targets.lock().unwrap().clear();
+        right.targets.lock().unwrap().clear();
+
+        left.inbound.lock().unwrap().push_back(ReceivedFrame {
+            peer: Some([0x53; 32]),
+            bytes: Fragment {
+                transfer_id: 80_001,
+                index: 0,
+                count: 1,
+                payload: b"routed-after-anonymous-authentication".to_vec(),
+            }
+            .encode()
+            .unwrap(),
+        });
+        initiator.pump(&left).unwrap();
+        assert_eq!(initiator.committed_route, Some(CarrierRoute::Anonymous));
+
+        let receipt_id =
+            ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(b"anonymous-route-progress"));
+        responder
+            .queue_sync_message(&Message::Receipt(wire::Receipt {
+                exchange_id: 21,
+                object_id: receipt_id,
+                total_len: 1,
+                received: Vec::new(),
+                complete: false,
+            }))
+            .unwrap();
+        responder.pump(&right).unwrap();
+        initiator.pump(&left).unwrap();
+        assert!(
+            initiator
+                .backend()
+                .receipts
+                .iter()
+                .any(|(_, _, receipt)| receipt.object_id == receipt_id)
+        );
+        assert!(left.targets.lock().unwrap().iter().all(Option::is_none));
+        assert!(right.targets.lock().unwrap().iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn fragments_from_different_candidate_routes_cannot_form_one_handshake_flight() {
+        let (initiator_bundle, responder_bundle) = bundles();
+        let route = [0x61; 32];
+        let other_route = [0x62; 32];
+        let mut initiator = RuntimeDriver::initiator(
+            initiator_bundle,
+            SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
+            FakeBackend::default(),
+            StartRequest {
+                exchange_id: 22,
+                topics: vec!["alpha".into()],
+                scopes: vec!["mission/team".into()],
+                min_priority: Priority::Routine as u8,
+            },
+            None,
+        )
+        .unwrap();
+        let mut responder = RuntimeDriver::responder(
+            responder_bundle,
+            SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
+            FakeBackend::default(),
+            None,
+        )
+        .unwrap();
+        let (left, right) = MemoryLink::pair_with_routes(96, Some(route), Some([0x63; 32]));
+
+        initiator.pump(&left).unwrap();
+        let correct_final = {
+            let mut inbound = right.inbound.lock().unwrap();
+            assert!(inbound.len() > 1);
+            let final_frame = inbound.back_mut().unwrap();
+            let correct = final_frame.bytes.clone();
+            final_frame.peer = Some(other_route);
+            correct
+        };
+        assert_eq!(responder.pump(&right).unwrap(), 0);
+        assert!(matches!(responder.phase, SessionPhase::Responder(_)));
+        let transfer_id = Fragment::decode(&correct_final).unwrap().transfer_id;
+        assert_eq!(
+            responder.candidate_route, None,
+            "an incomplete transfer must not pin the contact route"
+        );
+        assert_eq!(
+            responder.fragment_routes[&transfer_id].route,
+            CarrierRoute::Routed(route)
+        );
+
+        right.inbound.lock().unwrap().push_back(ReceivedFrame {
+            peer: Some(route),
+            bytes: correct_final,
+        });
+        assert_eq!(responder.pump(&right).unwrap(), 1);
+        assert!(matches!(responder.phase, SessionPhase::ResponderPending(_)));
+        assert!(
+            right
+                .targets
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|target| *target == Some(route))
+        );
+    }
+
+    #[test]
+    fn anonymous_and_routed_fragments_cannot_form_one_handshake_flight() {
+        let (initiator_bundle, responder_bundle) = bundles();
+        let route = [0x71; 32];
+        let mut initiator = RuntimeDriver::initiator(
+            initiator_bundle,
+            SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
+            FakeBackend::default(),
+            StartRequest {
+                exchange_id: 23,
+                topics: vec!["alpha".into()],
+                scopes: vec!["mission/team".into()],
+                min_priority: Priority::Routine as u8,
+            },
+            None,
+        )
+        .unwrap();
+        let mut responder = RuntimeDriver::responder(
+            responder_bundle,
+            SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
+            FakeBackend::default(),
+            None,
+        )
+        .unwrap();
+        let (left, right) = MemoryLink::pair_with_routes(96, None, Some(route));
+
+        initiator.pump(&left).unwrap();
+        let routed_remainder = {
+            let mut inbound = right.inbound.lock().unwrap();
+            assert!(inbound.len() > 1);
+            inbound
+                .iter_mut()
+                .skip(1)
+                .map(|frame| {
+                    frame.peer = Some(route);
+                    frame.bytes.clone()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(responder.pump(&right).unwrap(), 0);
+        assert!(matches!(responder.phase, SessionPhase::Responder(_)));
+        let transfer_id = Fragment::decode(&routed_remainder[0]).unwrap().transfer_id;
+        assert_eq!(
+            responder.candidate_route, None,
+            "an incomplete anonymous transfer must not pin the contact route"
+        );
+        assert_eq!(
+            responder.fragment_routes[&transfer_id].route,
+            CarrierRoute::Anonymous
+        );
+
+        for bytes in routed_remainder {
+            right
+                .inbound
+                .lock()
+                .unwrap()
+                .push_back(ReceivedFrame { peer: None, bytes });
+        }
+        assert_eq!(responder.pump(&right).unwrap(), 1);
+        assert!(matches!(responder.phase, SessionPhase::ResponderPending(_)));
+        assert!(right.targets.lock().unwrap().iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn incomplete_route_does_not_exclude_a_complete_authenticated_flight_on_another_route() {
+        let (initiator_bundle, responder_bundle) = bundles();
+        let incomplete_route = [0x72; 32];
+        let authenticated_route = [0x73; 32];
+        let mut initiator = RuntimeDriver::initiator(
+            initiator_bundle,
+            SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
+            FakeBackend::default(),
+            StartRequest {
+                exchange_id: 24,
+                topics: vec!["alpha".into()],
+                scopes: vec!["mission/team".into()],
+                min_priority: Priority::Routine as u8,
+            },
+            None,
+        )
+        .unwrap();
+        let mut responder = RuntimeDriver::responder(
+            responder_bundle,
+            SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
+            FakeBackend::default(),
+            None,
+        )
+        .unwrap();
+        let (left, right) =
+            MemoryLink::pair_with_routes(96, Some(incomplete_route), Some([0x74; 32]));
+
+        initiator.pump(&left).unwrap();
+        let captured = right.inbound.lock().unwrap().drain(..).collect::<Vec<_>>();
+        assert!(captured.len() > 1);
+        right.inbound.lock().unwrap().push_back(captured[0].clone());
+        for frame in captured {
+            let mut fragment = Fragment::decode(&frame.bytes).unwrap();
+            fragment.transfer_id = fragment.transfer_id.saturating_add(10_000);
+            right.inbound.lock().unwrap().push_back(ReceivedFrame {
+                peer: Some(authenticated_route),
+                bytes: fragment.encode().unwrap(),
+            });
+        }
+
+        assert_eq!(responder.pump(&right).unwrap(), 1);
+        assert!(matches!(responder.phase, SessionPhase::ResponderPending(_)));
+        assert_eq!(
+            responder.candidate_route,
+            Some(CarrierRoute::Routed(authenticated_route))
+        );
+        assert!(responder.fragment_routes.is_empty());
+        assert!(
+            right
+                .targets
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|target| *target == Some(authenticated_route))
+        );
+    }
+
+    #[test]
+    fn idle_partial_route_and_reassembly_state_expire_together() {
+        let (_, responder_bundle) = bundles();
+        let mut responder = RuntimeDriver::responder(
+            responder_bundle,
+            SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
+            FakeBackend::default(),
+            None,
+        )
+        .unwrap();
+        let (_, right) = MemoryLink::pair(256);
+        let route = [0x75; 32];
+        let now = Instant::now();
+        right.inbound.lock().unwrap().push_back(ReceivedFrame {
+            peer: Some(route),
+            bytes: Fragment {
+                transfer_id: 90_000,
+                index: 0,
+                count: 2,
+                payload: b"first".to_vec(),
+            }
+            .encode()
+            .unwrap(),
+        });
+        assert_eq!(responder.pump_at(&right, now).unwrap(), 0);
+        assert!(responder.fragment_routes.contains_key(&90_000));
+
+        let expired = now + PARTIAL_TRANSFER_IDLE_TTL + Duration::from_millis(1);
+        assert_eq!(responder.pump_at(&right, expired).unwrap(), 0);
+        assert!(!responder.fragment_routes.contains_key(&90_000));
+
+        right.inbound.lock().unwrap().push_back(ReceivedFrame {
+            peer: Some(route),
+            bytes: Fragment {
+                transfer_id: 90_000,
+                index: 1,
+                count: 2,
+                payload: b"second".to_vec(),
+            }
+            .encode()
+            .unwrap(),
+        });
+        assert_eq!(responder.pump_at(&right, expired).unwrap(), 0);
+        assert!(
+            responder.fragment_routes.contains_key(&90_000),
+            "the second fragment must start a new partial, not complete expired state"
+        );
+    }
+
+    #[test]
+    fn forged_server_hello_preserves_initiator_state_and_valid_flight_converges() {
+        let (initiator_bundle, responder_bundle) = bundles();
+        let mut initiator = RuntimeDriver::initiator(
+            initiator_bundle,
+            SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
+            FakeBackend::default(),
+            StartRequest {
+                exchange_id: 96,
+                topics: vec!["alpha".into()],
+                scopes: vec!["mission/team".into()],
+                min_priority: Priority::Routine as u8,
+            },
+            None,
+        )
+        .unwrap();
+        let mut responder = RuntimeDriver::responder(
+            responder_bundle,
+            SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
+            FakeBackend::default(),
+            None,
+        )
+        .unwrap();
+        let (left, right) = MemoryLink::pair(256);
+        let now = Instant::now();
+
+        initiator.pump_at(&left, now).unwrap();
+        responder.pump_at(&right, now).unwrap();
+        let captured = right.captured_logical_through(1);
+        assert_eq!(captured.len(), 1);
+        let mut forged_server_hello = captured[0].clone();
+        *forged_server_hello.last_mut().unwrap() ^= 0x80;
+        let forged = fragment::fragment(&forged_server_hello, 256, 90_000).unwrap();
+        left.allow_receives(forged.len());
+        for fragment in forged.into_iter().rev() {
+            left.inbound.lock().unwrap().push_front(ReceivedFrame {
+                peer: None,
+                bytes: fragment.encode().unwrap(),
+            });
+        }
+
+        assert_eq!(initiator.pump_at(&left, now).unwrap(), 0);
+        assert!(matches!(initiator.phase, SessionPhase::Initiator(_)));
+        assert!(initiator.handshake_retry.is_some());
+
+        left.allow_receives(usize::MAX);
+        initiator.pump_at(&left, now).unwrap();
+        responder.pump_at(&right, now).unwrap();
+        initiator.pump_at(&left, now).unwrap();
+        assert!(initiator.is_authenticated());
+        assert!(responder.is_authenticated());
+    }
+
+    #[test]
+    fn forged_client_auth_preserves_responder_state_and_valid_flight_converges() {
+        let (initiator_bundle, responder_bundle) = bundles();
+        let mut initiator = RuntimeDriver::initiator(
+            initiator_bundle,
+            SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
+            FakeBackend::default(),
+            StartRequest {
+                exchange_id: 94,
+                topics: vec!["alpha".into()],
+                scopes: vec!["mission/team".into()],
+                min_priority: Priority::Routine as u8,
+            },
+            None,
+        )
+        .unwrap();
+        let mut responder = RuntimeDriver::responder(
+            responder_bundle,
+            SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
+            FakeBackend::default(),
+            None,
+        )
+        .unwrap();
+        let (left, right) = MemoryLink::pair(256);
+        let now = Instant::now();
+
+        initiator.pump_at(&left, now).unwrap();
+        responder.pump_at(&right, now).unwrap();
+        initiator.pump_at(&left, now).unwrap();
+        assert!(matches!(responder.phase, SessionPhase::ResponderPending(_)));
+
+        let captured = left.captured_logical_through(2);
+        assert_eq!(captured.len(), 2);
+        let mut forged_client_auth = captured[1].clone();
+        *forged_client_auth.last_mut().unwrap() ^= 0x80;
+        let forged = fragment::fragment(&forged_client_auth, 256, 90_001).unwrap();
+        right.allow_receives(forged.len());
+        for fragment in forged.into_iter().rev() {
+            right.inbound.lock().unwrap().push_front(ReceivedFrame {
+                peer: None,
+                bytes: fragment.encode().unwrap(),
+            });
+        }
+        assert_eq!(responder.pump_at(&right, now).unwrap(), 0);
+        assert!(matches!(responder.phase, SessionPhase::ResponderPending(_)));
+        assert!(responder.handshake_retry.is_some());
+
+        right.allow_receives(usize::MAX);
+        responder.pump_at(&right, now).unwrap();
+        initiator.pump_at(&left, now).unwrap();
+        assert!(initiator.is_authenticated());
+        assert!(responder.is_authenticated());
+    }
+
+    #[test]
+    fn forged_server_finished_preserves_initiator_state_and_valid_flight_converges() {
+        let (initiator_bundle, responder_bundle) = bundles();
+        let mut initiator = RuntimeDriver::initiator(
+            initiator_bundle,
+            SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
+            FakeBackend::default(),
+            StartRequest {
+                exchange_id: 95,
+                topics: vec!["alpha".into()],
+                scopes: vec!["mission/team".into()],
+                min_priority: Priority::Routine as u8,
+            },
+            None,
+        )
+        .unwrap();
+        let mut responder = RuntimeDriver::responder(
+            responder_bundle,
+            SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
+            FakeBackend::default(),
+            None,
+        )
+        .unwrap();
+        let (left, right) = MemoryLink::pair(256);
+        let now = Instant::now();
+
+        initiator.pump_at(&left, now).unwrap();
+        responder.pump_at(&right, now).unwrap();
+        initiator.pump_at(&left, now).unwrap();
+        assert!(matches!(
+            initiator.phase,
+            SessionPhase::InitiatorAwaitingFinished(_)
+        ));
+
+        responder.pump_at(&right, now).unwrap();
+        assert!(responder.is_authenticated());
+        let captured = right.captured_logical_through(2);
+        assert_eq!(captured.len(), 2);
+        let mut forged_server_finished = captured[1].clone();
+        *forged_server_finished.last_mut().unwrap() ^= 0x80;
+        let forged = fragment::fragment(&forged_server_finished, 256, 90_002).unwrap();
+        left.allow_receives(forged.len());
+        for fragment in forged.into_iter().rev() {
+            left.inbound.lock().unwrap().push_front(ReceivedFrame {
+                peer: None,
+                bytes: fragment.encode().unwrap(),
+            });
+        }
+        assert_eq!(initiator.pump_at(&left, now).unwrap(), 0);
+        assert!(matches!(
+            initiator.phase,
+            SessionPhase::InitiatorAwaitingFinished(_)
+        ));
+        assert!(initiator.handshake_retry.is_some());
+
+        left.allow_receives(usize::MAX);
+        initiator.pump_at(&left, now).unwrap();
+        assert!(initiator.is_authenticated());
+        assert!(responder.is_authenticated());
+    }
+
+    #[test]
+    fn unauthenticated_carrier_failures_are_bounded_without_masking_authenticated_errors() {
+        let (initiator_bundle, responder_bundle) = bundles();
+        let left_route = [0x41; 32];
+        let right_route = [0x42; 32];
+        let mut initiator = RuntimeDriver::initiator(
+            initiator_bundle,
+            SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
+            FakeBackend::default(),
+            StartRequest {
+                exchange_id: 93,
+                topics: vec!["alpha".into()],
+                scopes: vec!["mission/team".into()],
+                min_priority: Priority::Routine as u8,
+            },
+            Some(right_route),
+        )
+        .unwrap();
+        let mut responder = RuntimeDriver::responder(
+            responder_bundle,
+            SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
+            FakeBackend::default(),
+            Some(left_route),
+        )
+        .unwrap();
+        let (left, right) = MemoryLink::pair_with_routes(256, Some(left_route), Some(right_route));
+        let mut now = Instant::now();
+
+        right.inbound.lock().unwrap().push_back(ReceivedFrame {
+            peer: Some([0x43; 32]),
+            bytes: Fragment {
+                transfer_id: 8_999,
+                index: 0,
+                count: 1,
+                payload: b"syntactically-valid-wrong-route-client-flight".to_vec(),
+            }
+            .encode()
+            .unwrap(),
+        });
+        right.inbound.lock().unwrap().push_back(ReceivedFrame {
+            peer: Some(left_route),
+            bytes: Fragment {
+                transfer_id: 9_000,
+                index: 0,
+                count: 1,
+                payload: b"syntactically-valid-invalid-client-flight".to_vec(),
+            }
+            .encode()
+            .unwrap(),
+        });
+        assert_eq!(responder.pump_at(&right, now).unwrap(), 0);
+        assert!(matches!(responder.phase, SessionPhase::Responder(_)));
+
+        for _ in 0..64 {
+            now += Duration::from_secs(60);
+            initiator.pump_at(&left, now).unwrap();
+            responder.pump_at(&right, now).unwrap();
+            if initiator.is_authenticated() && responder.is_authenticated() {
+                break;
+            }
+        }
+        assert!(initiator.is_authenticated());
+        assert!(responder.is_authenticated());
+
+        initiator.retries.clear();
+        initiator.deferred_wants.clear();
+        initiator.outbox.clear();
+        responder.retries.clear();
+        responder.deferred_wants.clear();
+        responder.outbox.clear();
+        left.inbound.lock().unwrap().clear();
+        right.inbound.lock().unwrap().clear();
+
+        for index in 0..MAX_UNAUTHENTICATED_FAILURES_PER_PUMP {
+            let bytes = if index == 0 {
+                Vec::new()
+            } else {
+                Fragment {
+                    transfer_id: 10_000 + index as u64,
+                    index: 0,
+                    count: 1,
+                    payload: b"not-an-authenticated-session-record".to_vec(),
+                }
+                .encode()
+                .unwrap()
+            };
+            left.inbound.lock().unwrap().push_back(ReceivedFrame {
+                peer: Some(right_route),
+                bytes,
+            });
+        }
+        let receipt_id = ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(b"carrier-fairness"));
+        responder
+            .queue_sync_message(&Message::Receipt(wire::Receipt {
+                exchange_id: 93,
+                object_id: receipt_id,
+                total_len: 1,
+                received: Vec::new(),
+                complete: false,
+            }))
+            .unwrap();
+        responder.pump_at(&right, now).unwrap();
+
+        assert_eq!(initiator.pump_at(&left, now).unwrap(), 0);
+        assert!(initiator.is_authenticated());
+        assert!(initiator.backend().receipts.is_empty());
+        assert_eq!(initiator.pump_at(&left, now).unwrap(), 1);
+        assert_eq!(initiator.backend().receipts.len(), 1);
+        assert_eq!(initiator.backend().receipts[0].2.object_id, receipt_id);
+
+        let authenticated_invalid = responder
+            .seal_plaintext(b"authenticated-but-not-a-wire-message")
+            .unwrap();
+        let transfer_id = responder.take_transfer_id().unwrap();
+        for fragment in fragment::fragment(&authenticated_invalid, 256, transfer_id).unwrap() {
+            right
+                .send(Some(left_route), &fragment.encode().unwrap())
+                .unwrap();
+        }
+        assert!(matches!(
+            initiator.pump_at(&left, now),
+            Err(RuntimeError::Wire(_))
+        ));
+        assert_eq!(initiator.backend().receipts.len(), 1);
+    }
+
+    #[test]
+    fn completed_transfer_cache_drops_unauthenticated_conflicting_identifier_reuse() {
         let (initiator_bundle, responder_bundle) = bundles();
         let mut initiator = RuntimeDriver::initiator(
             initiator_bundle,
@@ -7089,12 +9239,8 @@ mod tests {
             .encode()
             .unwrap(),
         });
-        let reuse = initiator.pump(&left);
-        assert!(
-            matches!(reuse, Err(RuntimeError::TransferIdReuse)),
-            "unexpected conflicting-reuse result: {reuse:?}"
-        );
-        assert!(matches!(initiator.phase, SessionPhase::Failed));
+        assert!(initiator.pump(&left).is_ok());
+        assert!(initiator.is_authenticated());
 
         for offset in 0..MAX_COMPLETED_TRANSFERS + 5 {
             initiator.remember_completed_transfer(CompletedTransfer {

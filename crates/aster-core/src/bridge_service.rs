@@ -396,18 +396,20 @@ impl<'a> ReferenceBridgeService<'a> {
         request: EnableBridgeAuthorizationRequest,
     ) -> Result<IssuedBridgeAuthorization, BridgeServiceError> {
         self.require_live_store()?;
-        let authority_id = self
+        let principal = self
             .provider
-            .control_authority()
+            .control_principal()
             .ok_or(BridgeServiceError::Invalid(
                 "provider is not the mission control authority",
             ))?;
+        let authority_id = principal.authority;
         let enrollment = self
             .provider
             .open_bridge_edge_enrollment(&request.enrollment)?;
         let claims = ReferenceEnvelopeSealer::bridge_edge_enrollment_claims(&enrollment);
         if claims.mission_id != self.mission_id
             || self.store.is_revoked(&authority_id)?
+            || self.store.is_revoked(&principal.signer)?
             || self.store.is_revoked(&claims.bridge_node_id)?
             || self.store.scope_epoch(&claims.source_scope)? != claims.source_route_epoch
             || self.store.scope_epoch(&claims.target_scope)? != claims.target_route_epoch
@@ -464,13 +466,14 @@ impl<'a> ReferenceBridgeService<'a> {
         request: DisableBridgeAuthorizationRequest,
     ) -> Result<IssuedBridgeAuthorization, BridgeServiceError> {
         self.require_live_store()?;
-        let authority_id = self
+        let principal = self
             .provider
-            .control_authority()
+            .control_principal()
             .ok_or(BridgeServiceError::Invalid(
                 "provider is not the mission control authority",
             ))?;
-        if self.store.is_revoked(&authority_id)? {
+        let authority_id = principal.authority;
+        if self.store.is_revoked(&authority_id)? || self.store.is_revoked(&principal.signer)? {
             return Err(BridgeServiceError::Invalid(
                 "revoked authority cannot issue bridge controls",
             ));
@@ -820,12 +823,30 @@ impl<'a> ReferenceBridgeService<'a> {
         let store_verified = StoreVerifiedAuthorization::from_provider(
             envelope.envelope_id,
             envelope.authorization.clone(),
+            verified.control_signer(),
             exact_bytes.to_vec(),
         )?;
-        match self.store.ingest_bridge_authorization(&store_verified)? {
+        let outcome = self.store.ingest_bridge_authorization(&store_verified)?;
+        if outcome.rejected_input().is_some() {
+            let message = if self
+                .store
+                .is_revoked(&envelope.authorization.authority_id)?
+            {
+                "bridge control authority was revoked by the mission chain"
+            } else {
+                "bridge control signer was revoked by the mission chain"
+            };
+            return Err(BridgeServiceError::Invalid(message));
+        }
+        match outcome {
             BridgeControlOutcome::Applied { .. }
             | BridgeControlOutcome::Duplicate { .. }
             | BridgeControlOutcome::Pending { .. } => {}
+            BridgeControlOutcome::Rejected { .. } => {
+                return Err(BridgeServiceError::Invalid(
+                    "bridge control signer was revoked by the mission chain",
+                ));
+            }
         }
         Ok(verified)
     }
@@ -840,6 +861,7 @@ impl<'a> ReferenceBridgeService<'a> {
         let verified = self.authenticate_and_ingest_authorization(&stored.exact_bytes)?;
         if verified.envelope().envelope_id != stored.envelope_id
             || verified.envelope().authorization != stored.authorization
+            || verified.control_signer() != stored.control_signer
         {
             return Err(BridgeServiceError::Invalid(
                 "stored bridge authorization differs from provider verification",
@@ -862,6 +884,7 @@ impl<'a> ReferenceBridgeService<'a> {
             || active.envelope_id != stored.envelope_id
             || authorization.mission_id != self.mission_id
             || self.store.is_revoked(&authorization.authority_id)?
+            || self.store.is_revoked(&stored.control_signer)?
             || self.store.is_revoked(&authorization.bridge_node_id)?
             || self.store.scope_epoch(&authorization.source_scope)? != enabled.source_route_epoch
             || self.store.scope_epoch(&authorization.target_scope)? != enabled.target_route_epoch
@@ -1317,6 +1340,7 @@ mod tests {
         store
             .set_scope_epoch(&ScopeEpoch {
                 authority,
+                signer: authority,
                 scope: scope(scope_name),
                 epoch,
                 control_sequence: epoch,
@@ -1677,6 +1701,7 @@ mod tests {
             .apply_revocation(&crate::store::Revocation {
                 subject: fixture.bridge.identity(),
                 authority: fixture.authority.control_authority().unwrap_or([0; 32]),
+                signer: fixture.authority.identity(),
                 generation: 1,
                 control_sequence: 99,
                 previous_control: None,

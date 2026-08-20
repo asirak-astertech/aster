@@ -22,6 +22,7 @@ use crate::wire::{
 const SNAPSHOT_VERSION: u64 = 2;
 const MAX_PROGRESS_RANGES: usize = 4_095;
 const MAX_BITMAP_BYTES: usize = 1_048_576;
+const MAX_ROOT_OFFER_HISTORY: usize = 8;
 
 mod snapshot_key {
     pub const VERSION: u64 = 0;
@@ -49,6 +50,7 @@ pub enum SyncError {
     ProgressTooFragmented,
     ProgressTooLarge,
     WantLimit,
+    OfferLimit,
     ProbeLimit,
     InventoryNotSelected(InventoryPurpose),
     InventorySelectionMismatch,
@@ -594,12 +596,32 @@ struct ExchangeState {
     id: u64,
     local_interest: Option<InterestFilter>,
     peer_interest: Option<InterestFilter>,
+    peer_max_offers: Option<u32>,
     selection_requested: BTreeMap<InventoryPurpose, u64>,
     pending_summary: Option<Summary>,
     remote_snapshot: Option<(Digest32, u64)>,
+    pending_root_probe: Option<RootProbeExpectation>,
+    /// Recently issued root probes and whether their complete response was
+    /// validated. The retained filter prevents a late response from crossing
+    /// an interest-policy change.
+    root_offer_history: Vec<RootOfferRecord>,
     probes_sent: BTreeSet<(u64, NibblePrefix)>,
     expected_nodes: BTreeMap<(u64, NibblePrefix), (Digest32, u64)>,
     summary_sent: Option<(Digest32, u64)>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RootProbeExpectation {
+    snapshot_id: u64,
+    root_hash: Digest32,
+    item_count: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RootOfferRecord {
+    expectation: RootProbeExpectation,
+    filter: InterestFilter,
+    validated: bool,
 }
 
 impl ExchangeState {
@@ -608,9 +630,12 @@ impl ExchangeState {
             id,
             local_interest: None,
             peer_interest: None,
+            peer_max_offers: None,
             selection_requested: BTreeMap::new(),
             pending_summary: None,
             remote_snapshot: None,
+            pending_root_probe: None,
+            root_offer_history: Vec::new(),
             probes_sent: BTreeSet::new(),
             expected_nodes: BTreeMap::new(),
             summary_sent: None,
@@ -870,9 +895,16 @@ impl SyncState {
             // independent serve direction, including its pending authorized
             // inventory selection. Only our receive direction is restarted.
             let exchange = self.active.as_mut().ok_or(SyncError::NoActiveExchange)?;
+            let filter_changed = exchange.local_interest.as_ref() != Some(&filter);
+            if filter_changed {
+                exchange
+                    .root_offer_history
+                    .retain(|record| record.validated);
+            }
             exchange.local_interest = Some(filter.clone());
             exchange.pending_summary = None;
             exchange.remote_snapshot = None;
+            exchange.pending_root_probe = None;
             exchange.probes_sent.clear();
             exchange.expected_nodes.clear();
             exchange
@@ -906,6 +938,7 @@ impl SyncState {
         let mut actions = Vec::new();
         match message {
             Message::Interest(interest) => {
+                let peer_max_offers = interest.max_offers;
                 let filter = InterestFilter::from_interest(&interest);
                 let changed = self
                     .active
@@ -921,6 +954,10 @@ impl SyncState {
                         .selection_requested
                         .remove(&InventoryPurpose::ServePeer);
                 }
+                self.active
+                    .as_mut()
+                    .ok_or(SyncError::NoActiveExchange)?
+                    .peer_max_offers = Some(peer_max_offers);
                 self.push_selection(InventoryPurpose::ServePeer, filter, &mut actions)?;
                 if !changed && self.serve_inventory.is_some() {
                     self.push_summary(&mut actions, true)?;
@@ -982,14 +1019,39 @@ impl SyncState {
         match purpose {
             InventoryPurpose::ReceiveBaseline => {
                 self.receive_inventory = Some(inventory);
-                let pending = self
-                    .active
-                    .as_mut()
-                    .ok_or(SyncError::NoActiveExchange)?
-                    .pending_summary
-                    .take();
+                let (pending, resume) = {
+                    let exchange = self.active.as_mut().ok_or(SyncError::NoActiveExchange)?;
+                    let pending = exchange.pending_summary.take();
+                    let resume = pending.is_none().then(|| {
+                        exchange
+                            .root_offer_history
+                            .iter()
+                            .rev()
+                            .find(|record| !record.validated && record.filter == filter)
+                            .map(|record| record.expectation)
+                    });
+                    (pending, resume.flatten())
+                };
                 if let Some(summary) = pending {
                     self.receive_summary(summary, &mut actions)?;
+                } else if let Some(expectation) = resume {
+                    // A refresh retired the live traversal, but an exact root
+                    // response may already be in flight. Reissue only the
+                    // newest unanswered commitment after the backend has
+                    // selected a fresh authorized baseline. This restores the
+                    // full active-response checks; history alone never admits
+                    // new durable work.
+                    self.active
+                        .as_mut()
+                        .ok_or(SyncError::NoActiveExchange)?
+                        .remote_snapshot = Some((expectation.root_hash, expectation.snapshot_id));
+                    self.push_probe(
+                        NibblePrefix::root(),
+                        expectation.snapshot_id,
+                        expectation.root_hash,
+                        expectation.item_count,
+                        &mut actions,
+                    )?;
                 }
             }
             InventoryPurpose::ServePeer => {
@@ -1024,7 +1086,23 @@ impl SyncState {
             != Some(remote);
         if changed {
             let exchange = self.active.as_mut().ok_or(SyncError::NoActiveExchange)?;
+            let replacement = RootProbeExpectation {
+                snapshot_id: summary.snapshot_id,
+                root_hash: summary.root_hash,
+                item_count: summary.item_count,
+            };
+            if let Some(filter) = exchange.local_interest.clone() {
+                // A newer SUMMARY supersedes every unanswered root commitment
+                // for this receive filter. Otherwise a later local refresh
+                // could reissue an older Probe and admit its delayed OFFER.
+                // Validated records remain bounded exact replay no-ops, and an
+                // already-retained exact replacement may be reused below.
+                exchange.root_offer_history.retain(|record| {
+                    record.validated || record.filter != filter || record.expectation == replacement
+                });
+            }
             exchange.remote_snapshot = Some(remote);
+            exchange.pending_root_probe = None;
             exchange.probes_sent.clear();
             exchange.expected_nodes.clear();
         }
@@ -1047,16 +1125,44 @@ impl SyncState {
         actions: &mut Vec<SyncAction>,
     ) -> Result<(), SyncError> {
         let prefix = NibblePrefix::new(probe.prefix, probe.prefix_nibbles)?;
-        let serve_inventory = self
-            .serve_inventory
-            .as_ref()
-            .ok_or(SyncError::InventoryNotSelected(InventoryPurpose::ServePeer))?;
+        let Some(serve_inventory) = self.serve_inventory.as_ref() else {
+            // A local commit or acknowledgement can invalidate the served
+            // snapshot while the peer's retained PROBE is still in flight.
+            // Keep the authenticated peer filter authoritative, ensure its
+            // replacement selection remains requested, and let the retained
+            // PROBE or the fresh SUMMARY resume causally after selection.
+            let filter = self
+                .active
+                .as_ref()
+                .and_then(|exchange| exchange.peer_interest.clone())
+                .ok_or(SyncError::InventoryNotSelected(InventoryPurpose::ServePeer))?;
+            self.push_selection(InventoryPurpose::ServePeer, filter, actions)?;
+            return Ok(());
+        };
         if probe.snapshot_id != serve_inventory.snapshot_id() {
             self.push_summary(actions, true)?;
             return Ok(());
         }
-        let node = serve_inventory.node(&prefix);
         let exchange_id = self.exchange_id()?;
+        let peer_max_offers = self
+            .active
+            .as_ref()
+            .and_then(|exchange| exchange.peer_max_offers)
+            .ok_or(SyncError::NoActiveExchange)?;
+        if prefix.is_empty()
+            && serve_inventory.item_count() <= u64::from(peer_max_offers)
+            && serve_inventory.item_count()
+                <= u64::try_from(self.config.max_offer_ids)
+                    .map_err(|_| SyncError::InvalidConfig("maximum offer identifiers"))?
+        {
+            actions.push(SyncAction::Send(Message::Offer(Offer {
+                exchange_id,
+                object_ids: serve_inventory.ids_under(&prefix, self.config.max_offer_ids),
+                snapshot_id: probe.snapshot_id,
+            })));
+            return Ok(());
+        }
+        let node = serve_inventory.node(&prefix);
         actions.push(SyncAction::Send(Message::Node(Node {
             exchange_id,
             prefix: node.prefix.packed().to_vec(),
@@ -1101,8 +1207,20 @@ impl SyncState {
                     .expected_nodes
                     .get(&(node.snapshot_id, prefix.clone()))
             })
-            .copied()
-            .ok_or(SyncError::SnapshotMismatch)?;
+            .copied();
+        let Some(expected) = expected else {
+            if self.active.as_ref().is_some_and(|exchange| {
+                exchange.root_offer_history.iter().any(|record| {
+                    record.validated && record.expectation.snapshot_id == node.snapshot_id
+                })
+            }) {
+                // A complete root OFFER retires the whole traversal. NODE
+                // responses already in flight for that resolved snapshot are
+                // authenticated but have no remaining state to advance.
+                return Ok(());
+            }
+            return Err(SyncError::SnapshotMismatch);
+        };
         if expected != (node.hash, node.item_count) {
             return Err(SyncError::SnapshotMismatch);
         }
@@ -1129,6 +1247,7 @@ impl SyncState {
             ))?
             .node(&prefix);
         if remote.hash == local.hash {
+            self.clear_pending_root_probe(node.snapshot_id, &prefix, expected);
             return Ok(());
         }
 
@@ -1148,6 +1267,7 @@ impl SyncState {
                     )));
                 }
             }
+            self.clear_pending_root_probe(node.snapshot_id, &prefix, expected);
             return Ok(());
         }
 
@@ -1168,6 +1288,7 @@ impl SyncState {
                 )?;
             }
         }
+        self.clear_pending_root_probe(node.snapshot_id, &prefix, expected);
         Ok(())
     }
 
@@ -1176,23 +1297,122 @@ impl SyncState {
         offer: Offer,
         actions: &mut Vec<SyncAction>,
     ) -> Result<(), SyncError> {
-        let mut requested = Vec::new();
-        for id in offer.object_ids {
-            if self.inventory.contains(&id) {
-                continue;
+        if offer.object_ids.len() > self.config.max_offer_ids {
+            return Err(SyncError::OfferLimit);
+        }
+        let offered_count =
+            u64::try_from(offer.object_ids.len()).map_err(|_| SyncError::OfferLimit)?;
+        let offered_inventory = SparseInventory::from_ids(offer.object_ids.iter().copied());
+        let commitment = RootProbeExpectation {
+            snapshot_id: offer.snapshot_id,
+            root_hash: offered_inventory.root_hash(),
+            item_count: offered_count,
+        };
+        let pending = self
+            .active
+            .as_ref()
+            .and_then(|exchange| exchange.pending_root_probe);
+        let matching_record = self.active.as_ref().and_then(|exchange| {
+            let filter = exchange.local_interest.as_ref()?;
+            exchange
+                .root_offer_history
+                .iter()
+                .position(|record| record.expectation == commitment && &record.filter == filter)
+        });
+        let Some(record_index) = matching_record else {
+            return Err(SyncError::SnapshotMismatch);
+        };
+        let active_response = pending == Some(commitment);
+        if !active_response {
+            let record = &self
+                .active
+                .as_ref()
+                .ok_or(SyncError::NoActiveExchange)?
+                .root_offer_history[record_index];
+            if record.validated {
+                // The original response already passed the root/count/list
+                // commitment and admitted all derived durable work. A fresh
+                // authenticated retransmission is therefore an exact no-op.
+                return Ok(());
             }
-            if self.request_object(id)? {
-                self.bump_revision()?;
-            }
-            if self
-                .wants
-                .get(&id)
-                .is_some_and(|progress| !progress.is_complete())
+            // Merely retaining a bounded record proves that a Probe once
+            // existed, not that its traversal is still current. Only a fresh
+            // authorized baseline may restore it to active state above.
+            return Err(SyncError::SnapshotMismatch);
+        } else {
+            let remote_snapshot = self
+                .active
+                .as_ref()
+                .and_then(|exchange| exchange.remote_snapshot)
+                .ok_or(SyncError::SnapshotMismatch)?;
+            let root = NibblePrefix::root();
+            let expected_node = self.active.as_ref().and_then(|exchange| {
+                exchange
+                    .expected_nodes
+                    .get(&(offer.snapshot_id, root.clone()))
+                    .copied()
+            });
+            let root_was_probed = self.active.as_ref().is_some_and(|exchange| {
+                exchange
+                    .probes_sent
+                    .contains(&(offer.snapshot_id, root.clone()))
+            });
+            if remote_snapshot != (commitment.root_hash, commitment.snapshot_id)
+                || expected_node != Some((commitment.root_hash, commitment.item_count))
+                || !root_was_probed
             {
-                requested.push(id);
+                return Err(SyncError::SnapshotMismatch);
             }
         }
+
+        let newly_requested = offer
+            .object_ids
+            .iter()
+            .copied()
+            .filter(|id| !self.inventory.contains(id) && !self.wants.contains(id))
+            .collect::<Vec<_>>();
+        let wants_after = self
+            .wants
+            .len()
+            .checked_add(newly_requested.len())
+            .ok_or(SyncError::WantLimit)?;
+        if wants_after > self.config.max_durable_wants {
+            return Err(SyncError::WantLimit);
+        }
+        let revision_increment =
+            u64::try_from(newly_requested.len()).map_err(|_| SyncError::RevisionExhausted)?;
+        self.durable_revision
+            .checked_add(revision_increment)
+            .ok_or(SyncError::RevisionExhausted)?;
+
+        for id in &newly_requested {
+            let inserted = self.request_object(*id)?;
+            debug_assert!(inserted);
+            self.bump_revision()?;
+        }
+        let requested = offer
+            .object_ids
+            .into_iter()
+            .filter(|id| {
+                !self.inventory.contains(id)
+                    && self
+                        .wants
+                        .get(id)
+                        .is_some_and(|progress| !progress.is_complete())
+            })
+            .collect::<Vec<_>>();
         self.push_want_ids(&requested, actions);
+        let exchange = self.active.as_mut().ok_or(SyncError::NoActiveExchange)?;
+        if exchange.pending_root_probe == Some(commitment) {
+            exchange.pending_root_probe = None;
+        }
+        exchange
+            .probes_sent
+            .retain(|(snapshot_id, _)| *snapshot_id != commitment.snapshot_id);
+        exchange
+            .expected_nodes
+            .retain(|(snapshot_id, _), _| *snapshot_id != commitment.snapshot_id);
+        exchange.root_offer_history[record_index].validated = true;
         Ok(())
     }
 
@@ -1252,17 +1472,21 @@ impl SyncState {
             start: data.offset,
             end,
         };
-        let received = self
-            .wants
-            .get(&data.object_id)
-            .expect("want was established")
-            .received_ranges();
+        let (received, complete) = {
+            let progress = self
+                .wants
+                .get(&data.object_id)
+                .expect("want was established");
+            (progress.received_ranges().to_vec(), progress.is_complete())
+        };
         let pending = self
             .pending_writes
             .get(&data.object_id)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        let pieces = uncovered_ranges(extent, received, pending);
+        let pieces = uncovered_ranges(extent, &received, pending);
+        let duplicate_is_durable =
+            extent.start < extent.end && pieces.is_empty() && range_is_covered(&received, extent);
         let mut updated_pending = pending.to_vec();
         for piece in &pieces {
             updated_pending = insert_range(&updated_pending, *piece);
@@ -1284,6 +1508,19 @@ impl SyncState {
                 offset: piece.start,
                 bytes: data.payload[relative_start..relative_end].to_vec(),
             });
+        }
+        if duplicate_is_durable && let Some(exchange_id) = self.active_exchange_id() {
+            // The first partial RECEIPT may have been omitted under bounded
+            // one-shot queue pressure. Re-acknowledge current durable truth
+            // when the retained sender retries an already-covered DATA range;
+            // never acknowledge bytes that exist only in pending writes.
+            actions.push(SyncAction::Send(Message::Receipt(Receipt {
+                exchange_id,
+                object_id: data.object_id,
+                total_len: data.total_len,
+                received,
+                complete,
+            })));
         }
         self.push_complete_if_ready(data.object_id, actions);
         Ok(())
@@ -1331,6 +1568,12 @@ impl SyncState {
         }
         if complete {
             self.push_complete_if_ready(object_id, &mut actions);
+        } else {
+            // Durable progress changes the exact missing ranges. Refresh the
+            // retained WANT immediately instead of waiting for its existing
+            // exponential retry deadline; otherwise bounded sender pressure
+            // can turn every omitted tail into a full backoff interval.
+            self.push_want_ids(&[object_id], &mut actions);
         }
         Ok(actions)
     }
@@ -1523,6 +1766,11 @@ impl SyncState {
             exchange.selection_requested.clear();
             exchange.pending_summary = None;
             exchange.remote_snapshot = None;
+            exchange.pending_root_probe = None;
+            // Keep the bounded commitment while disabling the live traversal.
+            // A fresh authorized receive selection explicitly reissues at most
+            // the newest matching unanswered root Probe before its response
+            // can create work. Validated commitments remain safe no-ops.
             exchange.probes_sent.clear();
             exchange.expected_nodes.clear();
             exchange.summary_sent = None;
@@ -1640,6 +1888,32 @@ impl SyncState {
         if !exchange.probes_sent.insert((snapshot_id, prefix.clone())) {
             return Ok(());
         }
+        if prefix.is_empty() {
+            let expectation = RootProbeExpectation {
+                snapshot_id,
+                root_hash: expected_hash,
+                item_count: expected_count,
+            };
+            exchange.pending_root_probe = Some(expectation);
+            let filter = exchange
+                .local_interest
+                .clone()
+                .ok_or(SyncError::NoActiveExchange)?;
+            if !exchange
+                .root_offer_history
+                .iter()
+                .any(|record| record.expectation == expectation && record.filter == filter)
+            {
+                if exchange.root_offer_history.len() == MAX_ROOT_OFFER_HISTORY {
+                    exchange.root_offer_history.remove(0);
+                }
+                exchange.root_offer_history.push(RootOfferRecord {
+                    expectation,
+                    filter,
+                    validated: false,
+                });
+            }
+        }
         actions.push(SyncAction::Send(Message::Probe(Probe {
             exchange_id: exchange.id,
             prefix: prefix.packed().to_vec(),
@@ -1647,6 +1921,37 @@ impl SyncState {
             snapshot_id,
         })));
         Ok(())
+    }
+
+    fn clear_pending_root_probe(
+        &mut self,
+        snapshot_id: u64,
+        prefix: &NibblePrefix,
+        expected: (Digest32, u64),
+    ) {
+        if !prefix.is_empty() {
+            return;
+        }
+        let Some(exchange) = self.active.as_mut() else {
+            return;
+        };
+        let expectation = RootProbeExpectation {
+            snapshot_id,
+            root_hash: expected.0,
+            item_count: expected.1,
+        };
+        if exchange.pending_root_probe == Some(expectation) {
+            exchange.pending_root_probe = None;
+        }
+        // A validated root NODE selects ordinary Merkle descent and retires
+        // the alternative complete-root OFFER response for this Probe. A
+        // delayed OFFER must not revive work after the traversal advanced.
+        let local_filter = exchange.local_interest.clone();
+        exchange.root_offer_history.retain(|record| {
+            record.validated
+                || record.expectation != expectation
+                || local_filter.as_ref() != Some(&record.filter)
+        });
     }
 
     fn push_want_ids(&self, ids: &[ObjectId], actions: &mut Vec<SyncAction>) {
@@ -1984,6 +2289,12 @@ mod tests {
         ObjectId::for_envelope(crate::wire::EnvelopeId::from_bytes([byte; 32]))
     }
 
+    fn selectors(prefix: &str, count: usize) -> Vec<String> {
+        (0..count)
+            .map(|index| format!("{prefix}-{index:04}"))
+            .collect()
+    }
+
     fn start(state: &mut SyncState, exchange_id: u64) {
         state
             .apply(SyncEvent::Start {
@@ -2007,6 +2318,98 @@ mod tests {
                 _ => None,
             })
             .expect("selection action")
+    }
+
+    fn start_with_baseline(state: &mut SyncState, exchange_id: u64, inventory: SparseInventory) {
+        let actions = state
+            .apply(SyncEvent::Start {
+                exchange_id,
+                topics: vec!["mission".into()],
+                scopes: vec!["team".into()],
+                min_priority: 0,
+            })
+            .unwrap();
+        let (request_id, filter) = selection(&actions, InventoryPurpose::ReceiveBaseline);
+        state
+            .apply(SyncEvent::InventorySelected {
+                exchange_id,
+                request_id,
+                purpose: InventoryPurpose::ReceiveBaseline,
+                filter,
+                inventory,
+            })
+            .unwrap();
+    }
+
+    fn pending_root_offer(
+        state: &mut SyncState,
+        exchange_id: u64,
+        remote: &SparseInventory,
+    ) -> Offer {
+        let actions = state
+            .apply(SyncEvent::Receive(Message::Summary(Summary {
+                exchange_id,
+                root_hash: remote.root_hash(),
+                item_count: remote.item_count(),
+                snapshot_id: remote.snapshot_id(),
+            })))
+            .unwrap();
+        assert_eq!(
+            actions,
+            vec![SyncAction::Send(Message::Probe(Probe {
+                exchange_id,
+                prefix: Vec::new(),
+                prefix_nibbles: 0,
+                snapshot_id: remote.snapshot_id(),
+            }))]
+        );
+        Offer {
+            exchange_id,
+            object_ids: remote.ids_under(&NibblePrefix::root(), remote.len()),
+            snapshot_id: remote.snapshot_id(),
+        }
+    }
+
+    fn assert_rejected_offer_preserves_state(
+        state: &mut SyncState,
+        offer: Offer,
+        expected: SyncError,
+    ) {
+        let before = state.clone();
+        assert_eq!(
+            state.apply(SyncEvent::Receive(Message::Offer(offer))),
+            Err(expected)
+        );
+        assert_eq!(state.snapshot(), before.snapshot());
+        assert_eq!(state.active, before.active);
+        assert_eq!(state.inventory, before.inventory);
+        assert_eq!(state.receive_inventory, before.receive_inventory);
+        assert_eq!(state.serve_inventory, before.serve_inventory);
+        assert_eq!(state.pending_writes, before.pending_writes);
+        assert_eq!(state.forwarding, before.forwarding);
+        assert_eq!(state.commit_pending, before.commit_pending);
+    }
+
+    #[test]
+    fn local_interest_work_is_rejected_before_inventory_selection() {
+        let mut state = SyncState::new(SyncConfig::default(), SparseInventory::new()).unwrap();
+        let error = state
+            .apply(SyncEvent::Start {
+                exchange_id: 17,
+                topics: selectors("topic", 65),
+                scopes: selectors("scope", 64),
+                min_priority: 0,
+            })
+            .unwrap_err();
+        assert_eq!(
+            error,
+            SyncError::Wire(WireError::InterestWorkLimit {
+                actual: 65 * 64,
+                maximum: wire::MAX_INTEREST_WORK,
+            })
+        );
+        assert!(state.active.is_none());
+        assert_eq!(state.next_selection_id, 1);
     }
 
     #[test]
@@ -2266,6 +2669,719 @@ mod tests {
     }
 
     #[test]
+    fn delayed_probe_waits_for_pending_serve_inventory_reselection() {
+        let mut state = SyncState::new(SyncConfig::default(), SparseInventory::new()).unwrap();
+        let peer_actions = state
+            .apply(SyncEvent::Receive(Message::Interest(Interest {
+                exchange_id: 14,
+                topics: vec!["alpha".into()],
+                scopes: vec!["mission/team".into()],
+                min_priority: 1,
+                max_offers: 8,
+            })))
+            .unwrap();
+        let (request_id, filter) = selection(&peer_actions, InventoryPurpose::ServePeer);
+        let old_inventory = SparseInventory::from_ids([id(1)]);
+        state
+            .apply(SyncEvent::InventorySelected {
+                exchange_id: 14,
+                request_id,
+                purpose: InventoryPurpose::ServePeer,
+                filter,
+                inventory: old_inventory.clone(),
+            })
+            .unwrap();
+
+        let refresh_actions = state.apply(SyncEvent::LocalInventoryChanged).unwrap();
+        let (request_id, filter) = selection(&refresh_actions, InventoryPurpose::ServePeer);
+        let delayed_actions = state
+            .apply(SyncEvent::Receive(Message::Probe(Probe {
+                exchange_id: 14,
+                prefix: Vec::new(),
+                prefix_nibbles: 0,
+                snapshot_id: old_inventory.snapshot_id(),
+            })))
+            .unwrap();
+        assert!(delayed_actions.is_empty());
+
+        let replacement = SparseInventory::from_ids([id(1), id(2)]);
+        let selected_actions = state
+            .apply(SyncEvent::InventorySelected {
+                exchange_id: 14,
+                request_id,
+                purpose: InventoryPurpose::ServePeer,
+                filter,
+                inventory: replacement.clone(),
+            })
+            .unwrap();
+        assert!(selected_actions.iter().any(|action| matches!(
+            action,
+            SyncAction::Send(Message::Summary(Summary { snapshot_id, .. }))
+                if *snapshot_id == replacement.snapshot_id()
+        )));
+    }
+
+    #[test]
+    fn root_probe_offer_respects_current_peer_and_local_limits() {
+        let inventory = SparseInventory::from_ids([id(1), id(2)]);
+        let mut state = SyncState::new(
+            SyncConfig {
+                max_offer_ids: 2,
+                ..SyncConfig::default()
+            },
+            SparseInventory::new(),
+        )
+        .unwrap();
+        let actions = state
+            .apply(SyncEvent::Receive(Message::Interest(Interest {
+                exchange_id: 41,
+                topics: vec!["mission".into()],
+                scopes: vec!["team".into()],
+                min_priority: 0,
+                max_offers: 1,
+            })))
+            .unwrap();
+        let (request_id, filter) = selection(&actions, InventoryPurpose::ServePeer);
+        state
+            .apply(SyncEvent::InventorySelected {
+                exchange_id: 41,
+                request_id,
+                purpose: InventoryPurpose::ServePeer,
+                filter,
+                inventory: inventory.clone(),
+            })
+            .unwrap();
+
+        let root_probe = Message::Probe(Probe {
+            exchange_id: 41,
+            prefix: Vec::new(),
+            prefix_nibbles: 0,
+            snapshot_id: inventory.snapshot_id(),
+        });
+        assert!(matches!(
+            state
+                .apply(SyncEvent::Receive(root_probe.clone()))
+                .unwrap()
+                .as_slice(),
+            [SyncAction::Send(Message::Node(Node {
+                prefix_nibbles: 0,
+                ..
+            }))]
+        ));
+
+        state
+            .apply(SyncEvent::Receive(Message::Interest(Interest {
+                exchange_id: 41,
+                topics: vec!["mission".into()],
+                scopes: vec!["team".into()],
+                min_priority: 0,
+                max_offers: 2,
+            })))
+            .unwrap();
+        assert_eq!(
+            state.apply(SyncEvent::Receive(root_probe)).unwrap(),
+            vec![SyncAction::Send(Message::Offer(Offer {
+                exchange_id: 41,
+                object_ids: vec![id(1), id(2)],
+                snapshot_id: inventory.snapshot_id(),
+            }))]
+        );
+
+        let mut locally_bounded = SyncState::new(
+            SyncConfig {
+                max_offer_ids: 1,
+                ..SyncConfig::default()
+            },
+            SparseInventory::new(),
+        )
+        .unwrap();
+        let actions = locally_bounded
+            .apply(SyncEvent::Receive(Message::Interest(Interest {
+                exchange_id: 42,
+                topics: vec!["mission".into()],
+                scopes: vec!["team".into()],
+                min_priority: 0,
+                max_offers: 2,
+            })))
+            .unwrap();
+        let (request_id, filter) = selection(&actions, InventoryPurpose::ServePeer);
+        locally_bounded
+            .apply(SyncEvent::InventorySelected {
+                exchange_id: 42,
+                request_id,
+                purpose: InventoryPurpose::ServePeer,
+                filter,
+                inventory: inventory.clone(),
+            })
+            .unwrap();
+        assert!(matches!(
+            locally_bounded
+                .apply(SyncEvent::Receive(Message::Probe(Probe {
+                    exchange_id: 42,
+                    prefix: Vec::new(),
+                    prefix_nibbles: 0,
+                    snapshot_id: inventory.snapshot_id(),
+                })))
+                .unwrap()
+                .as_slice(),
+            [SyncAction::Send(Message::Node(Node {
+                prefix_nibbles: 0,
+                ..
+            }))]
+        ));
+    }
+
+    #[test]
+    fn complete_root_offer_is_hash_validated_before_requesting_missing_objects() {
+        let local = SparseInventory::from_ids([id(1)]);
+        let remote = SparseInventory::from_ids([id(1), id(2)]);
+        let mut state = SyncState::new(SyncConfig::default(), local.clone()).unwrap();
+        start_with_baseline(&mut state, 43, local);
+        let offer = pending_root_offer(&mut state, 43, &remote);
+
+        let actions = state
+            .apply(SyncEvent::Receive(Message::Offer(offer)))
+            .unwrap();
+        assert_eq!(state.durable_revision(), 1);
+        assert!(!state.wants().contains(&id(1)));
+        assert!(state.wants().contains(&id(2)));
+        assert_eq!(
+            actions,
+            vec![SyncAction::Send(Message::Want(Want {
+                exchange_id: 43,
+                items: vec![WantItem {
+                    object_id: id(2),
+                    total_len: None,
+                    missing: Vec::new(),
+                    need_forwarding: true,
+                }],
+            }))]
+        );
+        assert_eq!(
+            state
+                .active
+                .as_ref()
+                .and_then(|exchange| exchange.pending_root_probe),
+            None
+        );
+        let exchange = state.active.as_ref().unwrap();
+        assert!(
+            !exchange
+                .probes_sent
+                .iter()
+                .any(|(snapshot_id, _)| *snapshot_id == remote.snapshot_id())
+        );
+        assert!(
+            !exchange
+                .expected_nodes
+                .keys()
+                .any(|(snapshot_id, _)| *snapshot_id == remote.snapshot_id())
+        );
+    }
+
+    #[test]
+    fn validated_single_item_offer_is_idempotent_after_local_commit_refresh() {
+        let remote = SparseInventory::from_ids([id(1)]);
+        let mut state = SyncState::new(SyncConfig::default(), SparseInventory::new()).unwrap();
+        start_with_baseline(&mut state, 54, SparseInventory::new());
+        let offer = pending_root_offer(&mut state, 54, &remote);
+        state
+            .apply(SyncEvent::Receive(Message::Offer(offer.clone())))
+            .unwrap();
+        state
+            .apply(SyncEvent::LocalObjectAdded { object_id: id(1) })
+            .unwrap();
+
+        let before_duplicate = state.clone();
+        assert!(
+            state
+                .apply(SyncEvent::Receive(Message::Offer(offer.clone())))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(state.snapshot(), before_duplicate.snapshot());
+        assert_eq!(state.active, before_duplicate.active);
+        assert_eq!(state.inventory, before_duplicate.inventory);
+
+        let mut truncated = offer.clone();
+        truncated.object_ids.clear();
+        assert_rejected_offer_preserves_state(&mut state, truncated, SyncError::SnapshotMismatch);
+        let mut forged = offer;
+        forged.object_ids[0] = id(2);
+        assert_rejected_offer_preserves_state(&mut state, forged, SyncError::SnapshotMismatch);
+    }
+
+    #[test]
+    fn late_unanswered_offer_requires_the_same_interest_and_fresh_authorized_baseline() {
+        let remote = SparseInventory::from_ids([id(1)]);
+        let mut same_interest =
+            SyncState::new(SyncConfig::default(), SparseInventory::new()).unwrap();
+        start_with_baseline(&mut same_interest, 56, SparseInventory::new());
+        let offer = pending_root_offer(&mut same_interest, 56, &remote);
+        let restart_actions = same_interest
+            .apply(SyncEvent::Start {
+                exchange_id: 56,
+                topics: vec!["mission".into()],
+                scopes: vec!["team".into()],
+                min_priority: 0,
+            })
+            .unwrap();
+        assert_rejected_offer_preserves_state(
+            &mut same_interest,
+            offer.clone(),
+            SyncError::SnapshotMismatch,
+        );
+        let (request_id, filter) = selection(&restart_actions, InventoryPurpose::ReceiveBaseline);
+        let resume_actions = same_interest
+            .apply(SyncEvent::InventorySelected {
+                exchange_id: 56,
+                request_id,
+                purpose: InventoryPurpose::ReceiveBaseline,
+                filter,
+                inventory: SparseInventory::new(),
+            })
+            .unwrap();
+        assert!(resume_actions.iter().any(|action| matches!(
+            action,
+            SyncAction::Send(Message::Probe(Probe {
+                exchange_id: 56,
+                prefix_nibbles: 0,
+                ..
+            }))
+        )));
+        same_interest
+            .apply(SyncEvent::Receive(Message::Offer(offer)))
+            .unwrap();
+        assert!(same_interest.wants().contains(&id(1)));
+
+        let mut changed_interest =
+            SyncState::new(SyncConfig::default(), SparseInventory::new()).unwrap();
+        start_with_baseline(&mut changed_interest, 57, SparseInventory::new());
+        let offer = pending_root_offer(&mut changed_interest, 57, &remote);
+        let changed_actions = changed_interest
+            .apply(SyncEvent::Start {
+                exchange_id: 57,
+                topics: vec!["different".into()],
+                scopes: vec!["team".into()],
+                min_priority: 0,
+            })
+            .unwrap();
+        let (request_id, filter) = selection(&changed_actions, InventoryPurpose::ReceiveBaseline);
+        changed_interest
+            .apply(SyncEvent::InventorySelected {
+                exchange_id: 57,
+                request_id,
+                purpose: InventoryPurpose::ReceiveBaseline,
+                filter,
+                inventory: SparseInventory::new(),
+            })
+            .unwrap();
+        assert_rejected_offer_preserves_state(
+            &mut changed_interest,
+            offer,
+            SyncError::SnapshotMismatch,
+        );
+
+        let mut changed_authority =
+            SyncState::new(SyncConfig::default(), SparseInventory::new()).unwrap();
+        start_with_baseline(&mut changed_authority, 58, SparseInventory::new());
+        let offer = pending_root_offer(&mut changed_authority, 58, &remote);
+        let refresh_actions = changed_authority
+            .apply(SyncEvent::LocalInventoryChanged)
+            .unwrap();
+        assert_rejected_offer_preserves_state(
+            &mut changed_authority,
+            offer.clone(),
+            SyncError::SnapshotMismatch,
+        );
+        let (request_id, filter) = selection(&refresh_actions, InventoryPurpose::ReceiveBaseline);
+        let resume_actions = changed_authority
+            .apply(SyncEvent::InventorySelected {
+                exchange_id: 58,
+                request_id,
+                purpose: InventoryPurpose::ReceiveBaseline,
+                filter,
+                inventory: SparseInventory::new(),
+            })
+            .unwrap();
+        assert!(resume_actions.iter().any(|action| matches!(
+            action,
+            SyncAction::Send(Message::Probe(Probe {
+                exchange_id: 58,
+                prefix_nibbles: 0,
+                ..
+            }))
+        )));
+        changed_authority
+            .apply(SyncEvent::Receive(Message::Offer(offer)))
+            .unwrap();
+        assert!(changed_authority.wants().contains(&id(1)));
+    }
+
+    #[test]
+    fn offer_first_retires_traversal_and_ignores_delayed_root_node() {
+        let remote = SparseInventory::from_ids([id(1)]);
+        let mut state = SyncState::new(SyncConfig::default(), SparseInventory::new()).unwrap();
+        start_with_baseline(&mut state, 55, SparseInventory::new());
+        let offer = pending_root_offer(&mut state, 55, &remote);
+        state
+            .apply(SyncEvent::Receive(Message::Offer(offer)))
+            .unwrap();
+        let node = remote.node(&NibblePrefix::root());
+        let before_node = state.clone();
+        assert!(
+            state
+                .apply(SyncEvent::Receive(Message::Node(Node {
+                    exchange_id: 55,
+                    prefix: Vec::new(),
+                    prefix_nibbles: 0,
+                    hash: node.hash,
+                    item_count: node.item_count,
+                    children: node
+                        .children
+                        .into_iter()
+                        .map(|child| ChildSummary {
+                            nibble: child.nibble,
+                            hash: child.hash,
+                            item_count: child.item_count,
+                        })
+                        .collect(),
+                    snapshot_id: remote.snapshot_id(),
+                })))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(state.snapshot(), before_node.snapshot());
+        assert_eq!(state.active, before_node.active);
+    }
+
+    #[test]
+    fn invalid_root_offers_preserve_traversal_and_durable_state() {
+        let remote = SparseInventory::from_ids([id(1), id(2)]);
+
+        let mut unsolicited =
+            SyncState::new(SyncConfig::default(), SparseInventory::new()).unwrap();
+        start_with_baseline(&mut unsolicited, 44, SparseInventory::new());
+        assert_rejected_offer_preserves_state(
+            &mut unsolicited,
+            Offer {
+                exchange_id: 44,
+                object_ids: vec![id(1), id(2)],
+                snapshot_id: remote.snapshot_id(),
+            },
+            SyncError::SnapshotMismatch,
+        );
+
+        let mut stale = SyncState::new(SyncConfig::default(), SparseInventory::new()).unwrap();
+        start_with_baseline(&mut stale, 45, SparseInventory::new());
+        let mut stale_offer = pending_root_offer(&mut stale, 45, &remote);
+        stale_offer.snapshot_id = stale_offer.snapshot_id.wrapping_add(1);
+        assert_rejected_offer_preserves_state(&mut stale, stale_offer, SyncError::SnapshotMismatch);
+
+        let mut truncated = SyncState::new(SyncConfig::default(), SparseInventory::new()).unwrap();
+        start_with_baseline(&mut truncated, 46, SparseInventory::new());
+        let mut truncated_offer = pending_root_offer(&mut truncated, 46, &remote);
+        truncated_offer.object_ids.pop();
+        assert_rejected_offer_preserves_state(
+            &mut truncated,
+            truncated_offer,
+            SyncError::SnapshotMismatch,
+        );
+
+        let mut forged = SyncState::new(SyncConfig::default(), SparseInventory::new()).unwrap();
+        start_with_baseline(&mut forged, 47, SparseInventory::new());
+        let mut forged_offer = pending_root_offer(&mut forged, 47, &remote);
+        forged_offer.object_ids[1] = id(3);
+        assert_rejected_offer_preserves_state(
+            &mut forged,
+            forged_offer,
+            SyncError::SnapshotMismatch,
+        );
+
+        for (exchange_id, object_ids) in [(48, vec![id(2), id(1)]), (49, vec![id(1), id(1)])] {
+            let mut noncanonical =
+                SyncState::new(SyncConfig::default(), SparseInventory::new()).unwrap();
+            start_with_baseline(&mut noncanonical, exchange_id, SparseInventory::new());
+            pending_root_offer(&mut noncanonical, exchange_id, &remote);
+            assert_rejected_offer_preserves_state(
+                &mut noncanonical,
+                Offer {
+                    exchange_id,
+                    object_ids,
+                    snapshot_id: remote.snapshot_id(),
+                },
+                SyncError::Wire(WireError::NonCanonicalSet("offered identifiers")),
+            );
+        }
+
+        let mut oversized = SyncState::new(
+            SyncConfig {
+                max_offer_ids: 1,
+                ..SyncConfig::default()
+            },
+            SparseInventory::new(),
+        )
+        .unwrap();
+        start_with_baseline(&mut oversized, 50, SparseInventory::new());
+        let oversized_offer = pending_root_offer(&mut oversized, 50, &remote);
+        assert_rejected_offer_preserves_state(
+            &mut oversized,
+            oversized_offer,
+            SyncError::OfferLimit,
+        );
+    }
+
+    #[test]
+    fn valid_root_offer_resource_failure_is_transactional() {
+        let remote = SparseInventory::from_ids([id(1)]);
+        let mut wants = DurableWants::new();
+        wants
+            .request(id(9), SyncConfig::default().progress_chunk_size)
+            .unwrap();
+        let mut bounded = SyncState::restore(
+            SyncConfig {
+                max_durable_wants: 1,
+                ..SyncConfig::default()
+            },
+            SparseInventory::new(),
+            SyncSnapshot { revision: 7, wants },
+        )
+        .unwrap();
+        start_with_baseline(&mut bounded, 52, SparseInventory::new());
+        let offer = pending_root_offer(&mut bounded, 52, &remote);
+        assert_rejected_offer_preserves_state(&mut bounded, offer, SyncError::WantLimit);
+
+        let mut exhausted = SyncState::restore(
+            SyncConfig::default(),
+            SparseInventory::new(),
+            SyncSnapshot {
+                revision: u64::MAX,
+                wants: DurableWants::new(),
+            },
+        )
+        .unwrap();
+        start_with_baseline(&mut exhausted, 53, SparseInventory::new());
+        let offer = pending_root_offer(&mut exhausted, 53, &remote);
+        assert_rejected_offer_preserves_state(&mut exhausted, offer, SyncError::RevisionExhausted);
+    }
+
+    #[test]
+    fn root_node_retires_unvalidated_offer_history_and_rejects_delayed_offer() {
+        let remote = SparseInventory::from_ids([id(1)]);
+        let mut state = SyncState::new(SyncConfig::default(), SparseInventory::new()).unwrap();
+        start_with_baseline(&mut state, 51, SparseInventory::new());
+        let delayed_offer = pending_root_offer(&mut state, 51, &remote);
+        let node = remote.node(&NibblePrefix::root());
+        state
+            .apply(SyncEvent::Receive(Message::Node(Node {
+                exchange_id: 51,
+                prefix: Vec::new(),
+                prefix_nibbles: 0,
+                hash: node.hash,
+                item_count: node.item_count,
+                children: node
+                    .children
+                    .into_iter()
+                    .map(|child| ChildSummary {
+                        nibble: child.nibble,
+                        hash: child.hash,
+                        item_count: child.item_count,
+                    })
+                    .collect(),
+                snapshot_id: remote.snapshot_id(),
+            })))
+            .unwrap();
+        assert_eq!(
+            state
+                .active
+                .as_ref()
+                .and_then(|exchange| exchange.pending_root_probe),
+            None
+        );
+        assert!(
+            state
+                .active
+                .as_ref()
+                .is_some_and(|exchange| exchange.root_offer_history.is_empty())
+        );
+        assert_rejected_offer_preserves_state(
+            &mut state,
+            delayed_offer,
+            SyncError::SnapshotMismatch,
+        );
+    }
+
+    #[test]
+    fn changed_summary_retires_superseded_offer_before_node_and_refresh() {
+        let inventory_a = SparseInventory::from_ids([id(1)]);
+        let inventory_b = SparseInventory::from_ids([id(2)]);
+        let mut state = SyncState::new(SyncConfig::default(), SparseInventory::new()).unwrap();
+        start_with_baseline(&mut state, 59, SparseInventory::new());
+        let delayed_offer_a = pending_root_offer(&mut state, 59, &inventory_a);
+        let commitment_a = RootProbeExpectation {
+            snapshot_id: inventory_a.snapshot_id(),
+            root_hash: inventory_a.root_hash(),
+            item_count: inventory_a.item_count(),
+        };
+
+        let replacement_actions = state
+            .apply(SyncEvent::Receive(Message::Summary(Summary {
+                exchange_id: 59,
+                root_hash: inventory_b.root_hash(),
+                item_count: inventory_b.item_count(),
+                snapshot_id: inventory_b.snapshot_id(),
+            })))
+            .unwrap();
+        assert!(replacement_actions.iter().any(|action| matches!(
+            action,
+            SyncAction::Send(Message::Probe(Probe {
+                exchange_id: 59,
+                snapshot_id,
+                prefix_nibbles: 0,
+                ..
+            })) if *snapshot_id == inventory_b.snapshot_id()
+        )));
+        assert!(state.active.as_ref().is_some_and(|exchange| {
+            exchange
+                .root_offer_history
+                .iter()
+                .all(|record| record.validated || record.expectation != commitment_a)
+        }));
+
+        let node_b = inventory_b.node(&NibblePrefix::root());
+        state
+            .apply(SyncEvent::Receive(Message::Node(Node {
+                exchange_id: 59,
+                prefix: Vec::new(),
+                prefix_nibbles: 0,
+                hash: node_b.hash,
+                item_count: node_b.item_count,
+                children: node_b
+                    .children
+                    .into_iter()
+                    .map(|child| ChildSummary {
+                        nibble: child.nibble,
+                        hash: child.hash,
+                        item_count: child.item_count,
+                    })
+                    .collect(),
+                snapshot_id: inventory_b.snapshot_id(),
+            })))
+            .unwrap();
+        assert!(
+            state
+                .active
+                .as_ref()
+                .is_some_and(|exchange| exchange.root_offer_history.is_empty())
+        );
+
+        let refresh_actions = state.apply(SyncEvent::LocalInventoryChanged).unwrap();
+        let (request_id, filter) = selection(&refresh_actions, InventoryPurpose::ReceiveBaseline);
+        let selected_actions = state
+            .apply(SyncEvent::InventorySelected {
+                exchange_id: 59,
+                request_id,
+                purpose: InventoryPurpose::ReceiveBaseline,
+                filter,
+                inventory: SparseInventory::new(),
+            })
+            .unwrap();
+        assert!(!selected_actions.iter().any(|action| matches!(
+            action,
+            SyncAction::Send(Message::Probe(Probe {
+                prefix_nibbles: 0,
+                ..
+            }))
+        )));
+        assert_rejected_offer_preserves_state(
+            &mut state,
+            delayed_offer_a,
+            SyncError::SnapshotMismatch,
+        );
+    }
+
+    #[test]
+    fn root_offer_history_is_capped_resumes_newest_and_rejects_evicted_offer() {
+        let mut state = SyncState::new(SyncConfig::default(), SparseInventory::new()).unwrap();
+        start_with_baseline(&mut state, 60, SparseInventory::new());
+        let commitment_count = MAX_ROOT_OFFER_HISTORY + 2;
+        let mut offers = Vec::with_capacity(commitment_count);
+
+        for index in 0..commitment_count {
+            let byte = u8::try_from(index + 1).expect("small bounded test index");
+            let inventory = SparseInventory::from_ids([id(byte)]);
+            let offer = pending_root_offer(&mut state, 60, &inventory);
+            offers.push(offer.clone());
+            if index + 1 < commitment_count {
+                state
+                    .apply(SyncEvent::Receive(Message::Offer(offer)))
+                    .unwrap();
+            }
+            assert!(state.active.as_ref().is_some_and(|exchange| {
+                exchange.root_offer_history.len() <= MAX_ROOT_OFFER_HISTORY
+            }));
+        }
+
+        let oldest_evicted = offers.first().cloned().expect("oldest OFFER");
+        let newest_unanswered = offers.last().cloned().expect("newest OFFER");
+        assert_eq!(
+            state
+                .active
+                .as_ref()
+                .expect("active exchange")
+                .root_offer_history
+                .len(),
+            MAX_ROOT_OFFER_HISTORY
+        );
+
+        let refresh_actions = state.apply(SyncEvent::LocalInventoryChanged).unwrap();
+        let (request_id, filter) = selection(&refresh_actions, InventoryPurpose::ReceiveBaseline);
+        let resume_actions = state
+            .apply(SyncEvent::InventorySelected {
+                exchange_id: 60,
+                request_id,
+                purpose: InventoryPurpose::ReceiveBaseline,
+                filter,
+                inventory: SparseInventory::new(),
+            })
+            .unwrap();
+        assert!(resume_actions.iter().any(|action| matches!(
+            action,
+            SyncAction::Send(Message::Probe(Probe {
+                exchange_id: 60,
+                snapshot_id,
+                prefix_nibbles: 0,
+                ..
+            })) if *snapshot_id == newest_unanswered.snapshot_id
+        )));
+        state
+            .apply(SyncEvent::Receive(Message::Offer(
+                newest_unanswered.clone(),
+            )))
+            .unwrap();
+        assert!(
+            state
+                .wants()
+                .contains(newest_unanswered.object_ids.first().expect("newest object"))
+        );
+        assert_eq!(
+            state
+                .active
+                .as_ref()
+                .expect("active exchange")
+                .root_offer_history
+                .len(),
+            MAX_ROOT_OFFER_HISTORY
+        );
+
+        assert_rejected_offer_preserves_state(
+            &mut state,
+            oldest_evicted,
+            SyncError::SnapshotMismatch,
+        );
+    }
+
+    #[test]
     fn stale_or_unrequested_inventory_selection_is_rejected() {
         let mut state = SyncState::new(SyncConfig::default(), SparseInventory::new()).unwrap();
         let actions = state
@@ -2343,13 +3459,11 @@ mod tests {
     #[test]
     fn duplicate_and_reordered_data_only_store_missing_bytes_once() {
         let mut state = SyncState::new(SyncConfig::default(), SparseInventory::new()).unwrap();
-        start(&mut state, 10);
+        start_with_baseline(&mut state, 10, SparseInventory::new());
+        let remote = SparseInventory::from_ids([id(1)]);
+        let offer = pending_root_offer(&mut state, 10, &remote);
         state
-            .apply(SyncEvent::Receive(Message::Offer(Offer {
-                exchange_id: 10,
-                object_ids: vec![id(1)],
-                snapshot_id: 20,
-            })))
+            .apply(SyncEvent::Receive(Message::Offer(offer)))
             .unwrap();
 
         let second = Message::Data(Data {
@@ -2392,13 +3506,11 @@ mod tests {
     #[test]
     fn checkpoint_resumes_missing_ranges_with_a_different_exchange() {
         let mut state = SyncState::new(SyncConfig::default(), SparseInventory::new()).unwrap();
-        start(&mut state, 10);
+        start_with_baseline(&mut state, 10, SparseInventory::new());
+        let remote = SparseInventory::from_ids([id(2)]);
+        let offer = pending_root_offer(&mut state, 10, &remote);
         state
-            .apply(SyncEvent::Receive(Message::Offer(Offer {
-                exchange_id: 10,
-                object_ids: vec![id(2)],
-                snapshot_id: 20,
-            })))
+            .apply(SyncEvent::Receive(Message::Offer(offer)))
             .unwrap();
         state
             .apply(SyncEvent::Receive(Message::Data(Data {
@@ -2530,6 +3642,84 @@ mod tests {
                 total_len: 4,
                 received: vec![ByteRange { start: 0, end: 4 }],
                 complete: true,
+            }))]
+        );
+    }
+
+    #[test]
+    fn duplicate_durable_partial_data_reissues_current_receipt() {
+        let object_id = id(10);
+        let mut state = SyncState::new(
+            SyncConfig {
+                accept_unsolicited_data: true,
+                ..SyncConfig::default()
+            },
+            SparseInventory::new(),
+        )
+        .unwrap();
+        start(&mut state, 13);
+        let data = Message::Data(Data {
+            exchange_id: 13,
+            object_id,
+            total_len: 8,
+            offset: 0,
+            payload: b"part".to_vec(),
+            forwarding: b"forward".to_vec(),
+        });
+        let first = state.apply(SyncEvent::Receive(data.clone())).unwrap();
+        assert!(first.iter().any(|action| matches!(
+            action,
+            SyncAction::StoreChunk {
+                object_id: stored,
+                offset: 0,
+                bytes,
+                ..
+            } if *stored == object_id && bytes == b"part"
+        )));
+        assert!(
+            state
+                .apply(SyncEvent::Receive(data.clone()))
+                .unwrap()
+                .is_empty(),
+            "bytes covered only by a pending write are not acknowledged"
+        );
+        let stored_actions = state
+            .apply(SyncEvent::ChunkStored {
+                object_id,
+                total_len: 8,
+                range: ByteRange { start: 0, end: 4 },
+            })
+            .unwrap();
+        assert_eq!(
+            stored_actions,
+            vec![
+                SyncAction::Send(Message::Receipt(Receipt {
+                    exchange_id: 13,
+                    object_id,
+                    total_len: 8,
+                    received: vec![ByteRange { start: 0, end: 4 }],
+                    complete: false,
+                })),
+                SyncAction::Send(Message::Want(Want {
+                    exchange_id: 13,
+                    items: vec![WantItem {
+                        object_id,
+                        total_len: Some(8),
+                        missing: vec![ByteRange { start: 4, end: 8 }],
+                        need_forwarding: false,
+                    }],
+                })),
+            ]
+        );
+
+        assert_eq!(
+            state.apply(SyncEvent::Receive(data)).unwrap(),
+            vec![SyncAction::Send(Message::Receipt(Receipt {
+                exchange_id: 13,
+                object_id,
+                total_len: 8,
+                received: vec![ByteRange { start: 0, end: 4 }],
+                complete: false,
             }))]
         );
     }

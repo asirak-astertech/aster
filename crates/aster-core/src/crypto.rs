@@ -1184,33 +1184,65 @@ impl fmt::Debug for OpenedHandshakeAuth {
     }
 }
 
+impl Drop for OpenedHandshakeAuth {
+    fn drop(&mut self) {
+        self.credential_context.zeroize();
+        if let Some(signature) = self.signature.ecdsa_p256.as_mut() {
+            signature.zeroize();
+        }
+        if let Some(signature) = self.signature.ml_dsa_65.as_mut() {
+            signature.zeroize();
+        }
+        self.encoded.zeroize();
+        self.public_transcript_hash.zeroize();
+    }
+}
+
 impl OpenedHandshakeAuth {
     pub(crate) fn credential_context(&self) -> &[u8] {
         &self.credential_context
     }
+
+    fn into_encoded(mut self) -> Vec<u8> {
+        std::mem::take(&mut self.encoded)
+    }
 }
 
 fn decode_handshake_auth(
-    encoded: Vec<u8>,
+    mut encoded: Vec<u8>,
     role: HandshakeAuthRole,
-    public_transcript_hash: Hash32,
+    mut public_transcript_hash: Hash32,
 ) -> Result<OpenedHandshakeAuth, CryptoError> {
-    let mut remaining = encoded.as_slice();
-    let credential_context = read_len_prefixed(&mut remaining)?;
-    if credential_context.len() > MAX_HANDSHAKE_AUTH_CONTEXT {
-        return Err(CryptoError::LengthExceeded);
-    }
-    let classical = read_len_prefixed(&mut remaining)?;
-    let post_quantum = read_len_prefixed(&mut remaining)?;
-    if !remaining.is_empty() {
-        return Err(CryptoError::InvalidHandshake);
-    }
+    let parsed = (|| {
+        let mut remaining = encoded.as_slice();
+        let credential_context = read_len_prefixed(&mut remaining)?;
+        if credential_context.len() > MAX_HANDSHAKE_AUTH_CONTEXT {
+            return Err(CryptoError::LengthExceeded);
+        }
+        let classical = read_len_prefixed(&mut remaining)?;
+        let post_quantum = read_len_prefixed(&mut remaining)?;
+        if !remaining.is_empty() {
+            return Err(CryptoError::InvalidHandshake);
+        }
+        Ok((
+            credential_context.to_vec(),
+            HybridSignature {
+                ecdsa_p256: Some(classical.to_vec()),
+                ml_dsa_65: Some(post_quantum.to_vec()),
+            },
+        ))
+    })();
+    let (credential_context, signature) = match parsed {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            encoded.zeroize();
+            public_transcript_hash.zeroize();
+            return Err(error);
+        }
+    };
     Ok(OpenedHandshakeAuth {
-        credential_context: credential_context.to_vec(),
-        signature: HybridSignature {
-            ecdsa_p256: Some(classical.to_vec()),
-            ml_dsa_65: Some(post_quantum.to_vec()),
-        },
+        credential_context,
+        signature,
         encoded,
         role,
         public_transcript_hash,
@@ -1413,8 +1445,17 @@ impl<P: CryptoProvider> InitiatorHandshake<P> {
         ))
     }
 
+    #[cfg(test)]
     pub(crate) fn open_server_auth(
         self,
+        provider: &P,
+        server_hello: &ServerHello,
+    ) -> Result<(InitiatorHandshakePending, OpenedHandshakeAuth), CryptoError> {
+        self.open_server_auth_borrowed(provider, server_hello)
+    }
+
+    pub(crate) fn open_server_auth_borrowed(
+        &self,
         provider: &P,
         server_hello: &ServerHello,
     ) -> Result<(InitiatorHandshakePending, OpenedHandshakeAuth), CryptoError> {
@@ -1500,7 +1541,7 @@ impl InitiatorHandshakePending {
         provider.verify(expected_responder_key, &message, &opened.signature)?;
         Ok(InitiatorHandshakeAuthenticated {
             public_transcript_hash: self.public_transcript_hash,
-            server_auth: opened.encoded,
+            server_auth: opened.into_encoded(),
             schedule: self.schedule,
         })
     }
@@ -1561,11 +1602,21 @@ pub(crate) struct InitiatorHandshakeAwaitingFinished {
 }
 
 impl InitiatorHandshakeAwaitingFinished {
+    #[cfg(test)]
     pub(crate) fn finish<P: CryptoProvider>(
         self,
         provider: &P,
         finished: &ServerFinished,
     ) -> Result<SessionKeys, CryptoError> {
+        self.verify_finished(provider, finished)?;
+        Ok(self.into_session_keys())
+    }
+
+    pub(crate) fn verify_finished<P: CryptoProvider>(
+        &self,
+        provider: &P,
+        finished: &ServerFinished,
+    ) -> Result<(), CryptoError> {
         let aad = protection_aad(SERVER_FINISHED_DOMAIN, &self.final_transcript_hash);
         let mut plaintext = provider
             .open(
@@ -1579,13 +1630,17 @@ impl InitiatorHandshakeAwaitingFinished {
         if !matches {
             return Err(CryptoError::KeyConfirmationFailed);
         }
-        Ok(SessionKeys {
+        Ok(())
+    }
+
+    pub(crate) fn into_session_keys(self) -> SessionKeys {
+        SessionKeys {
             transmit: self.schedule.initiator_to_responder,
             receive: self.schedule.responder_to_initiator,
             transcript_hash: self.final_transcript_hash,
             selected_version: self.schedule.selected_version,
             selected_suite: self.schedule.selected_suite,
-        })
+        }
     }
 }
 
@@ -1691,11 +1746,29 @@ pub(crate) struct ResponderHandshake {
 }
 
 impl ResponderHandshake {
+    #[cfg(test)]
     pub(crate) fn open_client_auth<P: CryptoProvider>(
         self,
         provider: &P,
         client_finish: &ClientFinish,
     ) -> Result<(ResponderHandshakePending, OpenedHandshakeAuth), CryptoError> {
+        let (final_hash, opened) = self.inspect_client_auth(provider, client_finish)?;
+        Ok((
+            ResponderHandshakePending {
+                public_transcript_hash: self.public_transcript_hash,
+                final_transcript_hash: final_hash,
+                server_auth: self.server_auth,
+                schedule: self.schedule,
+            },
+            opened,
+        ))
+    }
+
+    pub(crate) fn inspect_client_auth<P: CryptoProvider>(
+        &self,
+        provider: &P,
+        client_finish: &ClientFinish,
+    ) -> Result<(Hash32, OpenedHandshakeAuth), CryptoError> {
         let aad = protection_aad(CLIENT_AUTH_PROTECTION_DOMAIN, &self.public_transcript_hash);
         let encoded = provider.open(
             &self.schedule.client_auth_protection,
@@ -1720,18 +1793,52 @@ impl ResponderHandshake {
             &final_hash,
             &client_finish.confirmation,
         )?;
-        Ok((
-            ResponderHandshakePending {
-                public_transcript_hash: self.public_transcript_hash,
-                final_transcript_hash: final_hash,
-                server_auth: self.server_auth,
-                schedule: self.schedule,
-            },
-            opened,
-        ))
+        Ok((final_hash, opened))
+    }
+
+    pub(crate) fn verify_client_auth<P: CryptoProvider>(
+        &self,
+        provider: &P,
+        opened: &OpenedHandshakeAuth,
+        expected_initiator_key: &HybridVerifyingKey,
+    ) -> Result<(), CryptoError> {
+        if opened.role != HandshakeAuthRole::Client
+            || opened.public_transcript_hash != self.public_transcript_hash
+        {
+            return Err(CryptoError::InvalidHandshake);
+        }
+        let message = auth_message(
+            CLIENT_AUTH_DOMAIN,
+            &self.public_transcript_hash,
+            Some(&self.server_auth),
+            &opened.credential_context,
+        )?;
+        provider.verify(expected_initiator_key, &message, &opened.signature)
+    }
+
+    pub(crate) fn seal_server_finished<P: CryptoProvider>(
+        &self,
+        provider: &mut P,
+        final_transcript_hash: &Hash32,
+    ) -> Result<ServerFinished, CryptoError> {
+        let aad = protection_aad(SERVER_FINISHED_DOMAIN, final_transcript_hash);
+        let protected_finished =
+            provider.seal(&self.schedule.server_finished, final_transcript_hash, &aad)?;
+        Ok(ServerFinished { protected_finished })
+    }
+
+    pub(crate) fn into_session_keys(self, final_transcript_hash: Hash32) -> SessionKeys {
+        SessionKeys {
+            transmit: self.schedule.responder_to_initiator,
+            receive: self.schedule.initiator_to_responder,
+            transcript_hash: final_transcript_hash,
+            selected_version: self.schedule.selected_version,
+            selected_suite: self.schedule.selected_suite,
+        }
     }
 }
 
+#[cfg(test)]
 pub(crate) struct ResponderHandshakePending {
     public_transcript_hash: Hash32,
     final_transcript_hash: Hash32,
@@ -1739,6 +1846,7 @@ pub(crate) struct ResponderHandshakePending {
     schedule: HandshakeSchedule,
 }
 
+#[cfg(test)]
 impl ResponderHandshakePending {
     pub(crate) fn authenticate_client<P: CryptoProvider>(
         self,

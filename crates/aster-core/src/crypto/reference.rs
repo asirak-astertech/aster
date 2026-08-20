@@ -27,7 +27,7 @@ use crate::model::{
     CausalStamp, DataClass, Dot, MAX_CAUSAL_CONTEXT_ENTRIES, NodeId, Priority, Scope, Topic,
     VersionVector,
 };
-use crate::store::{Revocation, ScopeEpoch, SqliteStore};
+use crate::store::{ControlPrincipal, Revocation, ScopeEpoch, SqliteStore};
 use aes_gcm::{
     Aes256Gcm,
     aead::{AeadInOut, KeyInit, array::Array},
@@ -50,9 +50,9 @@ use std::fmt;
 use std::path::Path;
 use zeroize::Zeroize;
 
-const BUNDLE_MAGIC: &[u8; 8] = b"ASTRPB02";
-const BUNDLE_VERSION: u16 = 2;
-const BUNDLE_CHECKSUM_DOMAIN: &[u8] = b"aster/provisioning-check/v2";
+const BUNDLE_MAGIC: &[u8; 8] = b"ASTRPB03";
+const BUNDLE_VERSION: u16 = 3;
+const BUNDLE_CHECKSUM_DOMAIN: &[u8] = b"aster/provisioning-check/v3";
 const KDF_SALT: &[u8] = b"aster/reference-provisioning/v2";
 const MAX_GRANTS: usize = 256;
 const MAX_ACCESS_EPOCHS: usize = 32;
@@ -97,7 +97,9 @@ const ROUTE_KEY_LABEL: &[u8] = b"aster/route-key/v1";
 const CONTENT_KEY_LABEL: &[u8] = b"aster/content-key/v1";
 const CONTENT_NONCE_LABEL: &[u8] = b"aster/content-nonce/v1";
 const CONTENT_GROUP_DOMAIN: &[u8] = b"aster/content-group/v1";
-const CONTROL_SIGNATURE_DOMAIN: &[u8] = b"aster/authority-control/v1";
+const CONTROL_AUTHENTICATION_MAGIC: &[u8; 8] = b"ASTRCA02";
+const CONTROL_AUTHENTICATION_FORMAT: u16 = 2;
+const CONTROL_SIGNATURE_DOMAIN: &[u8] = b"aster/delegated-control/v2";
 const REKEY_CREDENTIAL_DOMAIN: &[u8] = b"aster/rekey-credential/v1";
 const REKEY_GRANT_DOMAIN: &[u8] = b"aster/rekey-grant/v1";
 const REKEY_PACKAGE_SET_DOMAIN: &[u8] = b"aster/rekey-package-set/v1";
@@ -449,7 +451,6 @@ pub struct ProvisioningBundle {
     serial: u64,
     roles: u32,
     credential_signature: HybridSignature,
-    control_signing_seed: Option<Secret32>,
     control_route_key: Option<Secret32>,
     route_grants: Vec<RouteGrant>,
     content_grants: Vec<ContentGrant>,
@@ -500,20 +501,11 @@ impl ProvisioningBundle {
             return Err(invalid_bundle());
         }
         let credential_signature = decode_signature(&mut reader)?;
-        let control_signing_seed = match reader.u8()? {
-            0 => None,
-            1 => Some(Secret32::new(reader.array::<32>()?)),
-            _ => return Err(invalid_bundle()),
-        };
         let control_route_key = match reader.u8()? {
             0 => None,
             1 => Some(Secret32::new(reader.array::<32>()?)),
             _ => return Err(invalid_bundle()),
         };
-        if control_signing_seed.is_some() != (roles & ROLE_CONTROL_AUTHORITY != 0) {
-            return Err(invalid_bundle());
-        }
-
         let route_count = usize::from(reader.u16()?);
         if route_count > MAX_GRANTS {
             return Err(invalid_bundle());
@@ -567,7 +559,6 @@ impl ProvisioningBundle {
             serial,
             roles,
             credential_signature,
-            control_signing_seed,
             control_route_key,
             route_grants,
             content_grants,
@@ -587,13 +578,6 @@ impl ProvisioningBundle {
         bytes.extend_from_slice(&self.serial.to_be_bytes());
         bytes.extend_from_slice(&self.roles.to_be_bytes());
         encode_signature(&mut bytes, &self.credential_signature)?;
-        match &self.control_signing_seed {
-            Some(seed) => {
-                bytes.push(1);
-                bytes.extend_from_slice(seed.expose());
-            }
-            None => bytes.push(0),
-        }
         match &self.control_route_key {
             Some(key) => {
                 bytes.push(1);
@@ -625,7 +609,6 @@ impl ProvisioningBundle {
     /// Rapidly erases all secret fields held by this object.
     pub fn zeroize(&mut self) {
         self.identity_seed = None;
-        self.control_signing_seed = None;
         self.control_route_key = None;
         self.route_grants.clear();
         self.content_grants.clear();
@@ -651,7 +634,6 @@ impl Drop for ProvisioningBundle {
 pub struct ReferenceProvisioner {
     root: Option<Secret32>,
     provider: RustCryptoProvider<SysRng>,
-    authority_signing_seed: Secret32,
     authority_signing_key: RustCryptoSigningKey,
     authority_verifying_key: HybridVerifyingKey,
     authority_id: NodeId,
@@ -695,7 +677,6 @@ impl ReferenceProvisioner {
         Ok(Self {
             root: Some(root),
             provider,
-            authority_signing_seed: authority_seed,
             authority_signing_key,
             authority_verifying_key,
             authority_id,
@@ -952,8 +933,6 @@ impl ReferenceProvisioner {
             serial,
             roles,
             credential_signature,
-            control_signing_seed: control_authority
-                .then(|| Secret32::new(*self.authority_signing_seed.expose())),
             control_route_key: Some(control_route_key),
             route_grants,
             content_grants,
@@ -963,7 +942,6 @@ impl ReferenceProvisioner {
     /// Erases the issuing root and authority signing capability.
     pub fn zeroize(&mut self) {
         self.root = None;
-        self.authority_signing_seed.zeroize();
         self.authority_signing_key.zeroize_key();
     }
 }
@@ -1155,12 +1133,17 @@ impl fmt::Debug for VerifiedBridgeEdgeEnrollment {
 pub(crate) struct VerifiedBridgeAuthorization {
     envelope: AuthorizationEnvelope,
     bridge_verifying_key: Option<HybridVerifyingKey>,
+    control_signer: NodeId,
 }
 
 #[allow(dead_code)]
 impl VerifiedBridgeAuthorization {
     pub(crate) fn envelope(&self) -> &AuthorizationEnvelope {
         &self.envelope
+    }
+
+    pub(crate) fn control_signer(&self) -> NodeId {
+        self.control_signer
     }
 }
 
@@ -1315,7 +1298,6 @@ pub struct ReferenceEnvelopeSealer {
     signing_key: RustCryptoSigningKey,
     p256_ecdh_secret: Option<P256SecretKey>,
     kem_decapsulation_key: Option<MlKemDecapsulationKey>,
-    control_signing_key: Option<RustCryptoSigningKey>,
     control_route_key: Option<Secret32>,
     route_grants: Vec<RouteGrant>,
     content_grants: Vec<ContentGrant>,
@@ -1386,17 +1368,6 @@ impl ReferenceEnvelopeSealer {
             roles: bundle.roles,
             route_grant_commitments,
         };
-        let control_signing_key = bundle
-            .control_signing_seed
-            .as_ref()
-            .map(|value| derive_signing_key(value.expose()))
-            .transpose()?;
-        if let Some(key) = &control_signing_key {
-            let public = provider.verifying_key(key).map_err(reference_open_error)?;
-            if public != bundle.authority_verifying_key {
-                return Err(authentication_failed());
-            }
-        }
         let control_route_key = bundle.control_route_key.take();
         let route_grants = std::mem::take(&mut bundle.route_grants);
         let content_grants = std::mem::take(&mut bundle.content_grants);
@@ -1413,7 +1384,6 @@ impl ReferenceEnvelopeSealer {
             signing_key,
             p256_ecdh_secret: Some(p256_ecdh_secret),
             kem_decapsulation_key: Some(kem_decapsulation_key),
-            control_signing_key,
             control_route_key,
             route_grants,
             content_grants,
@@ -1440,8 +1410,7 @@ impl ReferenceEnvelopeSealer {
         recipients: Vec<ScopeRekeyRecipient>,
     ) -> Result<(ScopeRekeyPlan, u64), EnvelopeError> {
         self.ensure_live()?;
-        if self.credential.roles & ROLE_CONTROL_AUTHORITY == 0 || self.control_signing_key.is_none()
-        {
+        if self.credential.roles & ROLE_CONTROL_AUTHORITY == 0 {
             return Err(EnvelopeError("node is not a control authority".into()));
         }
         let (generation, credentials) = verify_rekey_registry(
@@ -1911,16 +1880,19 @@ impl ReferenceEnvelopeSealer {
         previous: Option<crate::store::EnvelopeId>,
     ) -> Result<Vec<u8>, EnvelopeError> {
         self.ensure_live()?;
-        if self.credential.roles & ROLE_CONTROL_AUTHORITY == 0 || self.control_signing_key.is_none()
-        {
+        if self.credential.roles & ROLE_CONTROL_AUTHORITY == 0 {
             return Err(EnvelopeError(
                 "credential is not a control authority".into(),
             ));
         }
         let mut body = Vec::new();
         body.push(kind as u8);
+        body.extend_from_slice(CONTROL_AUTHENTICATION_MAGIC);
+        body.extend_from_slice(&CONTROL_AUTHENTICATION_FORMAT.to_be_bytes());
         body.extend_from_slice(&self.mission);
         body.extend_from_slice(&self.authority_id);
+        push_u32_bytes(&mut body, &self.credential.body)?;
+        encode_signature(&mut body, &self.credential.signature)?;
         if sequence == 0 || (sequence == 1) != previous.is_none() {
             return Err(EnvelopeError("invalid authority control chain link".into()));
         }
@@ -1940,14 +1912,10 @@ impl ReferenceEnvelopeSealer {
         kind: EnvelopeKind,
         mut unsigned_control: Vec<u8>,
     ) -> Result<Vec<u8>, EnvelopeError> {
-        let signing_key = self
-            .control_signing_key
-            .as_ref()
-            .ok_or_else(authentication_failed)?;
         let digest = hash_domain(CONTROL_SIGNATURE_DOMAIN, &unsigned_control);
         let signature = self
             .provider
-            .sign(signing_key, &digest)
+            .sign(&self.signing_key, &digest)
             .map_err(envelope_crypto_error)?;
         encode_signature(&mut unsigned_control, &signature)?;
         let mut selector = [0u8; SELECTOR_LEN];
@@ -2262,6 +2230,7 @@ impl ReferenceEnvelopeSealer {
         local_revoked: bool,
     ) -> Result<(), EnvelopeError> {
         let DecodedControl::ScopeEpoch {
+            signer: _,
             sequence,
             previous,
             scope,
@@ -2346,10 +2315,6 @@ impl ReferenceEnvelopeSealer {
             return;
         }
         self.signing_key.zeroize_key();
-        if let Some(key) = &mut self.control_signing_key {
-            key.zeroize_key();
-        }
-        self.control_signing_key = None;
         self.control_route_key = None;
         self.p256_ecdh_secret = None;
         self.kem_decapsulation_key = None;
@@ -2371,7 +2336,6 @@ impl ReferenceEnvelopeSealer {
         self.ensure_live()?;
         if bytes.len() > MAX_BRIDGE_EDGE_ENROLLMENT_BYTES
             || self.credential.roles & ROLE_CONTROL_AUTHORITY == 0
-            || self.control_signing_key.is_none()
         {
             return Err(authentication_failed());
         }
@@ -2481,7 +2445,7 @@ impl ReferenceEnvelopeSealer {
     fn verify_bridge_authorization_internal(
         &self,
         authorization: &BridgeAuthorization,
-    ) -> Result<Option<HybridVerifyingKey>, EnvelopeError> {
+    ) -> Result<(Option<HybridVerifyingKey>, NodeId), EnvelopeError> {
         self.ensure_live()?;
         authorization
             .validate()
@@ -2492,21 +2456,40 @@ impl ReferenceEnvelopeSealer {
             return Err(authentication_failed());
         }
 
+        let control_authentication = bridge::decode_delegated_control_authentication(
+            &authorization.authority_control_signature,
+        )
+        .map_err(bridge_authentication_error)?;
+        let authority_credential_signature =
+            decode_exact_hybrid_signature(&control_authentication.authority_credential_signature)?;
+        let control_credential = decode_credential(
+            control_authentication.credential_body.clone(),
+            authority_credential_signature,
+            &self.mission,
+            &self.authority_verifying_key,
+            &self.provider,
+        )?;
+        if control_credential.roles & ROLE_CONTROL_AUTHORITY == 0 {
+            return Err(authentication_failed());
+        }
         let control_signature =
-            decode_exact_hybrid_signature(&authorization.authority_control_signature)?;
+            decode_exact_hybrid_signature(&control_authentication.control_signature)?;
         let control_digest = authorization
-            .control_signature_digest()
+            .control_signature_digest(
+                &control_authentication.credential_body,
+                &control_authentication.authority_credential_signature,
+            )
             .map_err(bridge_authentication_error)?;
         self.provider
             .verify(
-                &self.authority_verifying_key,
+                &control_credential.verifying_key,
                 &control_digest,
                 &control_signature,
             )
             .map_err(envelope_crypto_error)?;
 
         let Some(enabled) = &authorization.enabled else {
-            return Ok(None);
+            return Ok((None, control_credential.identity));
         };
         let credential_signature =
             decode_exact_hybrid_signature(&enabled.authority_credential_signature)?;
@@ -2540,7 +2523,7 @@ impl ReferenceEnvelopeSealer {
             enabled.target_route_epoch,
             &enabled.target_route_commitment,
         )?;
-        Ok(Some(credential.verifying_key))
+        Ok((Some(credential.verifying_key), control_credential.identity))
     }
 
     fn verify_local_bridge_route_commitment(
@@ -3368,18 +3351,22 @@ impl BridgeCryptoProvider for ReferenceEnvelopeSealer {
                 &enabled.target_route_commitment,
             )?;
         }
-        let signing_key = self
-            .control_signing_key
-            .as_ref()
-            .ok_or_else(authentication_failed)?;
+        let authority_credential_signature =
+            encode_exact_hybrid_signature(&self.credential.signature)?;
         let digest = authorization
-            .control_signature_digest()
+            .control_signature_digest(&self.credential.body, &authority_credential_signature)
             .map_err(bridge_authentication_error)?;
         let signature = self
             .provider
-            .sign(signing_key, &digest)
+            .sign(&self.signing_key, &digest)
             .map_err(envelope_crypto_error)?;
-        authorization.authority_control_signature = encode_exact_hybrid_signature(&signature)?;
+        authorization.authority_control_signature =
+            bridge::encode_delegated_control_authentication(
+                &self.credential.body,
+                &authority_credential_signature,
+                &encode_exact_hybrid_signature(&signature)?,
+            )
+            .map_err(bridge_authentication_error)?;
         self.verify_bridge_authorization_internal(&authorization)?;
 
         let mut plaintext = authorization
@@ -3450,13 +3437,15 @@ impl BridgeCryptoProvider for ReferenceEnvelopeSealer {
         let decoded = BridgeAuthorization::decode(&plaintext).map_err(bridge_authentication_error);
         plaintext.zeroize();
         let authorization = decoded?;
-        let bridge_verifying_key = self.verify_bridge_authorization_internal(&authorization)?;
+        let (bridge_verifying_key, control_signer) =
+            self.verify_bridge_authorization_internal(&authorization)?;
         Ok(VerifiedBridgeAuthorization {
             envelope: AuthorizationEnvelope {
                 envelope_id: bridge::exact_object_id(sealed),
                 authorization,
             },
             bridge_verifying_key,
+            control_signer,
         })
     }
 
@@ -3846,6 +3835,7 @@ impl EnvelopeSealer for ReferenceEnvelopeSealer {
     fn inspect_control(&mut self, sealed: &[u8]) -> Result<VerifiedControl, EnvelopeError> {
         match self.inspect_control_internal(sealed)? {
             DecodedControl::Revocation {
+                signer,
                 sequence,
                 previous,
                 subject,
@@ -3853,6 +3843,7 @@ impl EnvelopeSealer for ReferenceEnvelopeSealer {
             } => Ok(VerifiedControl::Revocation(Revocation {
                 subject,
                 authority: self.authority_id,
+                signer,
                 generation,
                 control_sequence: sequence,
                 previous_control: previous,
@@ -3860,6 +3851,7 @@ impl EnvelopeSealer for ReferenceEnvelopeSealer {
                 observed_at_ms: None,
             })),
             DecodedControl::ScopeEpoch {
+                signer,
                 sequence,
                 previous,
                 scope,
@@ -3875,6 +3867,7 @@ impl EnvelopeSealer for ReferenceEnvelopeSealer {
                 }
                 Ok(VerifiedControl::ScopeEpoch(ScopeEpoch {
                     authority: self.authority_id,
+                    signer,
                     scope,
                     epoch,
                     control_sequence: sequence,
@@ -3930,9 +3923,11 @@ impl EnvelopeSealer for ReferenceEnvelopeSealer {
             .is_some_and(|commitment| peer_route_commitments.binary_search(&commitment).is_ok())
     }
 
-    fn control_authority(&self) -> Option<NodeId> {
-        (self.credential.roles & ROLE_CONTROL_AUTHORITY != 0 && self.control_signing_key.is_some())
-            .then_some(self.authority_id)
+    fn control_principal(&self) -> Option<ControlPrincipal> {
+        (self.credential.roles & ROLE_CONTROL_AUTHORITY != 0).then_some(ControlPrincipal {
+            authority: self.authority_id,
+            signer: self.credential.identity,
+        })
     }
 
     fn seal_revocation_control(
@@ -4147,34 +4142,69 @@ impl ReferenceSessionInitiator {
 
     /// Verifies `ServerHello+ServerAuth` and returns `(pending state, ClientAuth bytes)`.
     pub fn receive_server(
-        mut self,
+        self,
         flight: &[u8],
     ) -> Result<(ReferenceSessionAwaitingFinished, Vec<u8>), EnvelopeError> {
-        let hello = decode_server_flight(flight)?;
-        let handshake = self.handshake.take().ok_or_else(authentication_failed)?;
-        let (pending, opened) = handshake
-            .open_server_auth(&self.endpoint.provider, &hello)
-            .map_err(handshake_error)?;
+        self.receive_server_retryable(flight)
+            .map_err(|(_, error)| error)
+    }
+
+    // Returning the owned state inline avoids an attacker-triggered heap
+    // allocation on every rejected flight while preserving exact secrets.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn receive_server_retryable(
+        mut self,
+        flight: &[u8],
+    ) -> Result<(ReferenceSessionAwaitingFinished, Vec<u8>), (Self, EnvelopeError)> {
+        let hello = match decode_server_flight(flight) {
+            Ok(hello) => hello,
+            Err(error) => return Err((self, error)),
+        };
+        let Some(handshake) = self.handshake.as_ref() else {
+            return Err((self, authentication_failed()));
+        };
+        let (pending, opened) =
+            match handshake.open_server_auth_borrowed(&self.endpoint.provider, &hello) {
+                Ok(opened) => opened,
+                Err(error) => return Err((self, handshake_error(error))),
+            };
         let (proof_commitment, credential_body, credential_signature) =
-            decode_server_auth_context(opened.credential_context())?;
+            match decode_server_auth_context(opened.credential_context()) {
+                Ok(context) => context,
+                Err(error) => return Err((self, error)),
+            };
         if proof_commitment != self.mission_proof_commitment {
-            return Err(authentication_failed());
+            return Err((self, authentication_failed()));
         }
-        let peer = self
+        let peer = match self
             .endpoint
-            .decode_peer_credential(credential_body, credential_signature)?;
-        let authenticated = pending
-            .authenticate_server(&self.endpoint.provider, opened, &peer.verifying_key)
-            .map_err(handshake_error)?;
-        let credential_context = encode_client_auth_context(&self.endpoint.credential)?;
-        let (handshake, finish) = authenticated
-            .seal_client_auth(
-                &mut self.endpoint.provider,
-                &self.endpoint.signing_key,
-                &credential_context,
-            )
-            .map_err(handshake_error)?;
-        let client_flight = encode_client_auth_flight(&finish)?;
+            .decode_peer_credential(credential_body, credential_signature)
+        {
+            Ok(peer) => peer,
+            Err(error) => return Err((self, error)),
+        };
+        let authenticated =
+            match pending.authenticate_server(&self.endpoint.provider, opened, &peer.verifying_key)
+            {
+                Ok(authenticated) => authenticated,
+                Err(error) => return Err((self, handshake_error(error))),
+            };
+        let credential_context = match encode_client_auth_context(&self.endpoint.credential) {
+            Ok(context) => context,
+            Err(error) => return Err((self, error)),
+        };
+        let (handshake, finish) = match authenticated.seal_client_auth(
+            &mut self.endpoint.provider,
+            &self.endpoint.signing_key,
+            &credential_context,
+        ) {
+            Ok(result) => result,
+            Err(error) => return Err((self, handshake_error(error))),
+        };
+        let client_flight = match encode_client_auth_flight(&finish) {
+            Ok(flight) => flight,
+            Err(error) => return Err((self, error)),
+        };
         let endpoint = self.endpoint;
         Ok((
             ReferenceSessionAwaitingFinished {
@@ -4200,14 +4230,33 @@ pub struct ReferenceSessionAwaitingFinished {
 impl ReferenceSessionAwaitingFinished {
     /// Authenticates `ServerFinished`; only success yields an application-capable session.
     pub fn receive_finished(
-        mut self,
+        self,
         flight: &[u8],
     ) -> Result<ReferenceAuthenticatedSession, EnvelopeError> {
-        let finished = decode_server_finished_flight(flight)?;
-        let handshake = self.handshake.take().ok_or_else(authentication_failed)?;
-        let keys = handshake
-            .finish(&self.provider, &finished)
-            .map_err(handshake_error)?;
+        self.receive_finished_retryable(flight)
+            .map_err(|(_, error)| error)
+    }
+
+    // See `receive_server_retryable`; this is a bounded cold error path.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn receive_finished_retryable(
+        mut self,
+        flight: &[u8],
+    ) -> Result<ReferenceAuthenticatedSession, (Self, EnvelopeError)> {
+        let finished = match decode_server_finished_flight(flight) {
+            Ok(finished) => finished,
+            Err(error) => return Err((self, error)),
+        };
+        let Some(handshake) = self.handshake.as_ref() else {
+            return Err((self, authentication_failed()));
+        };
+        if let Err(error) = handshake.verify_finished(&self.provider, &finished) {
+            return Err((self, handshake_error(error)));
+        }
+        let Some(handshake) = self.handshake.take() else {
+            return Err((self, authentication_failed()));
+        };
+        let keys = handshake.into_session_keys();
         let protocol_version = keys.selected_version();
         Ok(ReferenceAuthenticatedSession {
             provider: self.provider,
@@ -4244,27 +4293,57 @@ impl ReferenceSessionResponder {
 
     /// Verifies `ClientHello` and returns `(pending state, ServerHello+ServerAuth bytes)`.
     pub fn receive_client(
-        mut self,
+        self,
         flight: &[u8],
     ) -> Result<(ReferenceSessionResponderPending, Vec<u8>), EnvelopeError> {
-        let (hello, mission_proof) = decode_client_flight(flight)?;
-        verify_mission_proof(&self.endpoint, &hello, &mission_proof)?;
-        validate_kem_public_key(&hello.ml_kem_768_encapsulation_key)?;
-        let proof_commitment = mission_proof_commitment(&mission_proof)?;
+        self.receive_client_retryable(flight)
+            .map_err(|(_, error)| error)
+    }
+
+    // See `receive_server_retryable`; this is a bounded cold error path.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn receive_client_retryable(
+        mut self,
+        flight: &[u8],
+    ) -> Result<(ReferenceSessionResponderPending, Vec<u8>), (Self, EnvelopeError)> {
+        let (hello, mission_proof) = match decode_client_flight(flight) {
+            Ok(decoded) => decoded,
+            Err(error) => return Err((self, error)),
+        };
+        if let Err(error) = verify_mission_proof(&self.endpoint, &hello, &mission_proof) {
+            return Err((self, error));
+        }
+        if let Err(error) = validate_kem_public_key(&hello.ml_kem_768_encapsulation_key) {
+            return Err((self, error));
+        }
+        let proof_commitment = match mission_proof_commitment(&mission_proof) {
+            Ok(commitment) => commitment,
+            Err(error) => return Err((self, error)),
+        };
+        let credential_context =
+            match encode_server_auth_context(proof_commitment, &self.endpoint.credential) {
+                Ok(context) => context,
+                Err(error) => return Err((self, error)),
+            };
         // Mission proof verification deliberately precedes P-256 agreement and ML-KEM
         // encapsulation so unauthenticated probes cannot trigger the expensive response.
-        let prepared = ResponderHandshakePrepared::respond(&mut self.endpoint.provider, &hello)
-            .map_err(handshake_error)?;
-        let credential_context =
-            encode_server_auth_context(proof_commitment, &self.endpoint.credential)?;
-        let (handshake, server_hello) = prepared
-            .seal_server_auth(
-                &mut self.endpoint.provider,
-                &self.endpoint.signing_key,
-                &credential_context,
-            )
-            .map_err(handshake_error)?;
-        let server_flight = encode_server_flight(&server_hello)?;
+        let prepared =
+            match ResponderHandshakePrepared::respond(&mut self.endpoint.provider, &hello) {
+                Ok(prepared) => prepared,
+                Err(error) => return Err((self, handshake_error(error))),
+            };
+        let (handshake, server_hello) = match prepared.seal_server_auth(
+            &mut self.endpoint.provider,
+            &self.endpoint.signing_key,
+            &credential_context,
+        ) {
+            Ok(result) => result,
+            Err(error) => return Err((self, handshake_error(error))),
+        };
+        let server_flight = match encode_server_flight(&server_hello) {
+            Ok(flight) => flight,
+            Err(error) => return Err((self, error)),
+        };
         Ok((
             ReferenceSessionResponderPending {
                 endpoint: self.endpoint,
@@ -4284,23 +4363,62 @@ pub struct ReferenceSessionResponderPending {
 impl ReferenceSessionResponderPending {
     /// Verifies `ClientAuth` and returns `(authenticated session, ServerFinished bytes)`.
     pub fn receive_client_auth(
-        mut self,
+        self,
         flight: &[u8],
     ) -> Result<(ReferenceAuthenticatedSession, Vec<u8>), EnvelopeError> {
-        let finish = decode_client_auth_flight(flight)?;
-        let handshake = self.handshake.take().ok_or_else(authentication_failed)?;
-        let (pending, opened) = handshake
-            .open_client_auth(&self.endpoint.provider, &finish)
-            .map_err(handshake_error)?;
+        self.receive_client_auth_retryable(flight)
+            .map_err(|(_, error)| error)
+    }
+
+    // See `receive_server_retryable`; this is a bounded cold error path.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn receive_client_auth_retryable(
+        mut self,
+        flight: &[u8],
+    ) -> Result<(ReferenceAuthenticatedSession, Vec<u8>), (Self, EnvelopeError)> {
+        let finish = match decode_client_auth_flight(flight) {
+            Ok(finish) => finish,
+            Err(error) => return Err((self, error)),
+        };
+        let Some(handshake) = self.handshake.as_ref() else {
+            return Err((self, authentication_failed()));
+        };
+        let (final_transcript_hash, opened) =
+            match handshake.inspect_client_auth(&self.endpoint.provider, &finish) {
+                Ok(inspected) => inspected,
+                Err(error) => return Err((self, handshake_error(error))),
+            };
         let (credential_body, credential_signature) =
-            decode_client_auth_context(opened.credential_context())?;
-        let peer = self
+            match decode_client_auth_context(opened.credential_context()) {
+                Ok(context) => context,
+                Err(error) => return Err((self, error)),
+            };
+        let peer = match self
             .endpoint
-            .decode_peer_credential(credential_body, credential_signature)?;
-        let (finished, keys) = pending
-            .authenticate_client(&mut self.endpoint.provider, opened, &peer.verifying_key)
-            .map_err(handshake_error)?;
-        let finished_flight = encode_server_finished_flight(&finished)?;
+            .decode_peer_credential(credential_body, credential_signature)
+        {
+            Ok(peer) => peer,
+            Err(error) => return Err((self, error)),
+        };
+        if let Err(error) =
+            handshake.verify_client_auth(&self.endpoint.provider, &opened, &peer.verifying_key)
+        {
+            return Err((self, handshake_error(error)));
+        }
+        let finished = match handshake
+            .seal_server_finished(&mut self.endpoint.provider, &final_transcript_hash)
+        {
+            Ok(finished) => finished,
+            Err(error) => return Err((self, handshake_error(error))),
+        };
+        let finished_flight = match encode_server_finished_flight(&finished) {
+            Ok(flight) => flight,
+            Err(error) => return Err((self, error)),
+        };
+        let Some(handshake) = self.handshake.take() else {
+            return Err((self, authentication_failed()));
+        };
+        let keys = handshake.into_session_keys(final_transcript_hash);
         let protocol_version = keys.selected_version();
         let peer_identity = peer.identity;
         let peer_route_grant_commitments = peer.route_grant_commitments;
@@ -4873,12 +4991,14 @@ struct PreparedBatchItem {
 
 enum DecodedControl {
     Revocation {
+        signer: NodeId,
         sequence: u64,
         previous: Option<crate::store::EnvelopeId>,
         subject: NodeId,
         generation: u64,
     },
     ScopeEpoch {
+        signer: NodeId,
         sequence: u64,
         previous: Option<crate::store::EnvelopeId>,
         scope: Scope,
@@ -6002,8 +6122,24 @@ fn decode_control(
 ) -> Result<DecodedControl, EnvelopeError> {
     let mut reader = Reader::new(bytes);
     if EnvelopeKind::decode(reader.u8()?)? != expected_kind
+        || reader.take(CONTROL_AUTHENTICATION_MAGIC.len())? != CONTROL_AUTHENTICATION_MAGIC
+        || reader.u16()? != CONTROL_AUTHENTICATION_FORMAT
         || reader.array::<32>()? != *mission
         || reader.array::<32>()? != authority_id
+    {
+        return Err(authentication_failed());
+    }
+    let credential_body = reader.u32_bytes(16 * 1024)?.to_vec();
+    let credential_signature = decode_signature(&mut reader)?;
+    let credential = decode_credential(
+        credential_body,
+        credential_signature,
+        mission,
+        authority_key,
+        provider,
+    )?;
+    if credential.roles & ROLE_CONTROL_AUTHORITY == 0
+        || derive_authority_id(mission, authority_key) != authority_id
     {
         return Err(authentication_failed());
     }
@@ -6024,6 +6160,7 @@ fn decode_control(
                 return Err(invalid_envelope());
             }
             DecodedControl::Revocation {
+                signer: credential.identity,
                 sequence,
                 previous,
                 subject,
@@ -6081,6 +6218,7 @@ fn decode_control(
                 _ => return Err(invalid_envelope()),
             };
             DecodedControl::ScopeEpoch {
+                signer: credential.identity,
                 sequence,
                 previous,
                 scope,
@@ -6095,7 +6233,7 @@ fn decode_control(
     reader.finish()?;
     let digest = hash_domain(CONTROL_SIGNATURE_DOMAIN, &bytes[..signed_end]);
     provider
-        .verify(authority_key, &digest, &signature)
+        .verify(&credential.verifying_key, &digest, &signature)
         .map_err(envelope_crypto_error)?;
     Ok(body)
 }
@@ -6637,6 +6775,57 @@ mod tests {
                 .any(|window| window == needle)
     }
 
+    fn open_test_control_plaintext(
+        service: &ReferenceEnvelopeSealer,
+        sealed: &[u8],
+    ) -> (EnvelopeKind, [u8; SELECTOR_LEN], Vec<u8>) {
+        let parsed = parse_envelope(sealed)
+            .unwrap_or_else(|error| panic!("control test parse failed: {error}"));
+        let root = service
+            .control_route_key
+            .as_ref()
+            .unwrap_or_else(|| panic!("control test route key missing"));
+        let key = derive_item_secret(root.expose(), ROUTE_KEY_LABEL, &parsed.selector)
+            .unwrap_or_else(|error| panic!("control test key failed: {error}"));
+        let plaintext = service
+            .provider
+            .open_parts(
+                &key,
+                selector_nonce(&parsed.selector),
+                parsed.route_ciphertext,
+                parsed.public_header,
+            )
+            .unwrap_or_else(|error| panic!("control test open failed: {error}"));
+        (parsed.kind, parsed.selector, plaintext)
+    }
+
+    fn seal_test_control_plaintext(
+        service: &ReferenceEnvelopeSealer,
+        kind: EnvelopeKind,
+        selector: [u8; SELECTOR_LEN],
+        mut plaintext: Vec<u8>,
+    ) -> Vec<u8> {
+        let root = service
+            .control_route_key
+            .as_ref()
+            .unwrap_or_else(|| panic!("control test route key missing"));
+        let key = derive_item_secret(root.expose(), ROUTE_KEY_LABEL, &selector)
+            .unwrap_or_else(|error| panic!("control test key failed: {error}"));
+        let header = encode_public_header(
+            kind,
+            selector,
+            plaintext.len().saturating_add(GCM_TAG_LEN),
+            0,
+        )
+        .unwrap_or_else(|error| panic!("control test header failed: {error}"));
+        let ciphertext = service
+            .provider
+            .seal_with_nonce(&key, selector_nonce(&selector), &plaintext, &header)
+            .unwrap_or_else(|error| panic!("control test seal failed: {error}"));
+        plaintext.zeroize();
+        [header, ciphertext].concat()
+    }
+
     fn registry_node_offsets(encoded: &[u8]) -> Vec<usize> {
         let mut reader = Reader::new(encoded);
         reader
@@ -6716,6 +6905,7 @@ mod tests {
 
     struct BridgeProviderServices {
         authority: ReferenceEnvelopeSealer,
+        second_authority: ReferenceEnvelopeSealer,
         bridge_node: ReferenceEnvelopeSealer,
         publisher: ReferenceEnvelopeSealer,
         target: ReferenceEnvelopeSealer,
@@ -6776,6 +6966,9 @@ mod tests {
                 ],
             )
             .unwrap_or_else(|error| panic!("bridge limited target issue failed: {error}"));
+        let second_authority_bundle = provisioner
+            .issue_control_authority(6, &bridge_accesses)
+            .unwrap_or_else(|error| panic!("second bridge authority issue failed: {error}"));
         let authority_bytes = authority_bundle
             .to_bytes()
             .unwrap_or_else(|error| panic!("bridge authority persist failed: {error}"));
@@ -6787,6 +6980,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("bridge target persist failed: {error}"));
         BridgeProviderServices {
             authority: service(authority_bundle),
+            second_authority: service(second_authority_bundle),
             bridge_node: service(bridge_bundle),
             publisher: service(publisher_bundle),
             target: service(target_bundle),
@@ -7120,19 +7314,24 @@ mod tests {
         authority: &ReferenceEnvelopeSealer,
         authorization: &mut BridgeAuthorization,
     ) {
+        let credential_signature = encode_exact_hybrid_signature(&authority.credential.signature)
+            .unwrap_or_else(|error| panic!("bridge test credential signature failed: {error}"));
         let digest = authorization
-            .control_signature_digest()
+            .control_signature_digest(&authority.credential.body, &credential_signature)
             .unwrap_or_else(|error| panic!("bridge test control digest failed: {error}"));
-        let signing_key = authority
-            .control_signing_key
-            .as_ref()
-            .unwrap_or_else(|| panic!("bridge test authority signing key missing"));
         let signature = authority
             .provider
-            .sign(signing_key, &digest)
+            .sign(&authority.signing_key, &digest)
             .unwrap_or_else(|error| panic!("bridge test control signing failed: {error}"));
-        authorization.authority_control_signature = encode_exact_hybrid_signature(&signature)
+        let signature = encode_exact_hybrid_signature(&signature)
             .unwrap_or_else(|error| panic!("bridge test signature encoding failed: {error}"));
+        authorization.authority_control_signature =
+            bridge::encode_delegated_control_authentication(
+                &authority.credential.body,
+                &credential_signature,
+                &signature,
+            )
+            .unwrap_or_else(|error| panic!("bridge test authentication failed: {error}"));
     }
 
     #[test]
@@ -7671,6 +7870,161 @@ mod tests {
         let index = PUBLIC_HEADER_LEN;
         tampered[index] ^= 1;
         assert!(member.inspect_control(&tampered).is_err());
+    }
+
+    #[test]
+    fn delegated_controls_bind_distinct_authority_credentials_and_reject_legacy_or_substitution() {
+        let provisioning_seed = [0x2a; 32];
+        let mut provisioner = ReferenceProvisioner::from_seed(provisioning_seed)
+            .unwrap_or_else(|error| panic!("provisioner failed: {error}"));
+        let first_bundle = provisioner
+            .issue_control_authority(1, &[member_access(vec![0, 1])])
+            .unwrap_or_else(|error| panic!("first authority issue failed: {error}"));
+        let first_bundle_bytes = first_bundle
+            .to_bytes()
+            .unwrap_or_else(|error| panic!("first authority serialization failed: {error}"));
+        let second_bundle = provisioner
+            .issue_control_authority(2, &[member_access(vec![0, 1])])
+            .unwrap_or_else(|error| panic!("second authority issue failed: {error}"));
+        let ordinary_bundle = provisioner
+            .issue_node(3, &[member_access(vec![0, 1])])
+            .unwrap_or_else(|error| panic!("ordinary issue failed: {error}"));
+        let member_bundle = provisioner
+            .issue_node(4, &[member_access(vec![0, 1])])
+            .unwrap_or_else(|error| panic!("member issue failed: {error}"));
+
+        let mut authority_seed =
+            derive_material::<32>(&provisioning_seed, b"authority-signing-seed", &[])
+                .unwrap_or_else(|error| panic!("authority seed derivation failed: {error}"));
+        assert!(!contains_bytes(&first_bundle_bytes, &authority_seed));
+        authority_seed.zeroize();
+
+        let mut first = service(
+            ProvisioningBundle::from_bytes(&first_bundle_bytes)
+                .unwrap_or_else(|error| panic!("first authority restore failed: {error}")),
+        );
+        let mut second = service(second_bundle);
+        let ordinary = service(ordinary_bundle);
+        let mut member = service(member_bundle);
+        let first_public = first
+            .provider
+            .verifying_key(&first.signing_key)
+            .unwrap_or_else(|error| panic!("first identity public key failed: {error}"));
+        let second_public = second
+            .provider
+            .verifying_key(&second.signing_key)
+            .unwrap_or_else(|error| panic!("second identity public key failed: {error}"));
+        assert_ne!(first_public, first.authority_verifying_key);
+        assert_ne!(second_public, second.authority_verifying_key);
+        assert_ne!(first_public, second_public);
+
+        let first_control = first
+            .seal_revocation([0x41; 32], 1)
+            .unwrap_or_else(|error| panic!("first delegated control failed: {error}"));
+        let second_control = second
+            .seal_revocation([0x42; 32], 1)
+            .unwrap_or_else(|error| panic!("second delegated control failed: {error}"));
+        assert!(matches!(
+            first
+                .inspect_control_internal(&first_control)
+                .unwrap_or_else(|error| panic!("first delegated inspect failed: {error}")),
+            DecodedControl::Revocation { signer, .. } if signer == first.identity()
+        ));
+        assert!(matches!(
+            second
+                .inspect_control_internal(&second_control)
+                .unwrap_or_else(|error| panic!("second delegated inspect failed: {error}")),
+            DecodedControl::Revocation { signer, .. } if signer == second.identity()
+        ));
+        member
+            .inspect_control(&first_control)
+            .unwrap_or_else(|error| panic!("member rejected first authority: {error}"));
+        member
+            .inspect_control(&second_control)
+            .unwrap_or_else(|error| panic!("member rejected second authority: {error}"));
+
+        let (kind, selector, first_plaintext) = open_test_control_plaintext(&first, &first_control);
+        let mut reader = Reader::new(&first_plaintext);
+        reader
+            .u8()
+            .unwrap_or_else(|error| panic!("kind failed: {error}"));
+        reader
+            .take(CONTROL_AUTHENTICATION_MAGIC.len())
+            .unwrap_or_else(|error| panic!("control magic failed: {error}"));
+        reader
+            .u16()
+            .unwrap_or_else(|error| panic!("control format failed: {error}"));
+        reader
+            .array::<32>()
+            .unwrap_or_else(|error| panic!("mission failed: {error}"));
+        reader
+            .array::<32>()
+            .unwrap_or_else(|error| panic!("authority failed: {error}"));
+        let credential_start = reader.position();
+        reader
+            .u32_bytes(16 * 1024)
+            .unwrap_or_else(|error| panic!("credential failed: {error}"));
+        decode_signature(&mut reader)
+            .unwrap_or_else(|error| panic!("credential signature failed: {error}"));
+        let credential_end = reader.position();
+
+        let mut credential_substitution = first_plaintext[..credential_start].to_vec();
+        push_u32_bytes(&mut credential_substitution, &second.credential.body)
+            .unwrap_or_else(|error| panic!("replacement credential failed: {error}"));
+        encode_signature(&mut credential_substitution, &second.credential.signature)
+            .unwrap_or_else(|error| panic!("replacement credential signature failed: {error}"));
+        credential_substitution.extend_from_slice(&first_plaintext[credential_end..]);
+        let credential_substitution =
+            seal_test_control_plaintext(&first, kind, selector, credential_substitution);
+        assert!(member.inspect_control(&credential_substitution).is_err());
+
+        let signature_len = 2 + P256_SIGNATURE_LEN + 4 + ML_DSA_SIGNATURE_LEN;
+        let (_, _, second_plaintext) = open_test_control_plaintext(&second, &second_control);
+        let mut signature_substitution = first_plaintext.clone();
+        let first_signature_start = signature_substitution.len() - signature_len;
+        let second_signature_start = second_plaintext.len() - signature_len;
+        signature_substitution[first_signature_start..]
+            .copy_from_slice(&second_plaintext[second_signature_start..]);
+        let signature_substitution =
+            seal_test_control_plaintext(&first, kind, selector, signature_substitution);
+        assert!(member.inspect_control(&signature_substitution).is_err());
+
+        let mut ordinary_forgery = first_plaintext[..credential_start].to_vec();
+        push_u32_bytes(&mut ordinary_forgery, &ordinary.credential.body)
+            .unwrap_or_else(|error| panic!("ordinary credential failed: {error}"));
+        encode_signature(&mut ordinary_forgery, &ordinary.credential.signature)
+            .unwrap_or_else(|error| panic!("ordinary credential signature failed: {error}"));
+        ordinary_forgery.extend_from_slice(
+            &first_plaintext[credential_end..first_plaintext.len() - signature_len],
+        );
+        let digest = hash_domain(CONTROL_SIGNATURE_DOMAIN, &ordinary_forgery);
+        let forged_signature = ordinary
+            .provider
+            .sign(&ordinary.signing_key, &digest)
+            .unwrap_or_else(|error| panic!("ordinary control signing failed: {error}"));
+        encode_signature(&mut ordinary_forgery, &forged_signature)
+            .unwrap_or_else(|error| panic!("ordinary signature encoding failed: {error}"));
+        let ordinary_forgery =
+            seal_test_control_plaintext(&first, kind, selector, ordinary_forgery);
+        assert!(member.inspect_control(&ordinary_forgery).is_err());
+
+        let mut legacy = Vec::new();
+        legacy.push(EnvelopeKind::Revocation as u8);
+        legacy.extend_from_slice(&first.mission);
+        legacy.extend_from_slice(&first.authority_id);
+        legacy.extend_from_slice(&1u64.to_be_bytes());
+        legacy.push(0);
+        legacy.extend_from_slice(&[0x43; 32]);
+        legacy.extend_from_slice(&1u64.to_be_bytes());
+        let legacy_digest = hash_domain(b"aster/authority-control/v1", &legacy);
+        let legacy_signature = provisioner
+            .provider
+            .sign(&provisioner.authority_signing_key, &legacy_digest)
+            .unwrap_or_else(|error| panic!("legacy root signing failed: {error}"));
+        encode_signature(&mut legacy, &legacy_signature)
+            .unwrap_or_else(|error| panic!("legacy signature encoding failed: {error}"));
+        let legacy = seal_test_control_plaintext(&first, kind, selector, legacy);
+        assert!(member.inspect_control(&legacy).is_err());
     }
 
     #[test]
@@ -10071,12 +10425,100 @@ mod tests {
             .target
             .open_bridge_authorization(&sealed)
             .unwrap_or_else(|error| panic!("valid authorization open failed: {error}"));
+        assert_eq!(verified.control_signer(), services.authority.identity());
         let mut control_root = *services
             .authority
             .control_route_key
             .as_ref()
             .unwrap_or_else(|| panic!("control route key missing"))
             .expose();
+
+        let second_sealed = services
+            .second_authority
+            .seal_bridge_authorization(verified.envelope().authorization.clone())
+            .unwrap_or_else(|error| panic!("second authority seal failed: {error}"));
+        let second_verified = services
+            .target
+            .open_bridge_authorization(&second_sealed)
+            .unwrap_or_else(|error| panic!("second authority open failed: {error}"));
+        assert_eq!(
+            second_verified.control_signer(),
+            services.second_authority.identity()
+        );
+
+        let first_authentication = bridge::decode_delegated_control_authentication(
+            &verified
+                .envelope()
+                .authorization
+                .authority_control_signature,
+        )
+        .unwrap_or_else(|error| panic!("first control authentication failed: {error}"));
+        let second_authentication = bridge::decode_delegated_control_authentication(
+            &second_verified
+                .envelope()
+                .authorization
+                .authority_control_signature,
+        )
+        .unwrap_or_else(|error| panic!("second control authentication failed: {error}"));
+        let mut substituted_control_credential = verified.envelope().authorization.clone();
+        substituted_control_credential.authority_control_signature =
+            bridge::encode_delegated_control_authentication(
+                &second_authentication.credential_body,
+                &second_authentication.authority_credential_signature,
+                &first_authentication.control_signature,
+            )
+            .unwrap_or_else(|error| panic!("substituted authentication failed: {error}"));
+        let substituted_control_credential = seal_test_bridge_object(
+            &mut services.authority,
+            bridge::AUTHORIZATION_MAGIC,
+            BRIDGE_AUTHORIZATION_ROUTE_KEY_LABEL,
+            control_root,
+            substituted_control_credential
+                .encode()
+                .unwrap_or_else(|error| panic!("substituted authorization encode failed: {error}")),
+        );
+        assert!(
+            services
+                .target
+                .open_bridge_authorization(&substituted_control_credential)
+                .is_err()
+        );
+
+        let mut ordinary_control = verified.envelope().authorization.clone();
+        resign_bridge_authorization_for_test(&services.bridge_node, &mut ordinary_control);
+        let ordinary_control = seal_test_bridge_object(
+            &mut services.authority,
+            bridge::AUTHORIZATION_MAGIC,
+            BRIDGE_AUTHORIZATION_ROUTE_KEY_LABEL,
+            control_root,
+            ordinary_control
+                .encode()
+                .unwrap_or_else(|error| panic!("ordinary authorization encode failed: {error}")),
+        );
+        assert!(
+            services
+                .target
+                .open_bridge_authorization(&ordinary_control)
+                .is_err()
+        );
+
+        let mut legacy_control = verified.envelope().authorization.clone();
+        legacy_control.authority_control_signature = first_authentication.control_signature;
+        let legacy_control = seal_test_bridge_object(
+            &mut services.authority,
+            bridge::AUTHORIZATION_MAGIC,
+            BRIDGE_AUTHORIZATION_ROUTE_KEY_LABEL,
+            control_root,
+            legacy_control
+                .encode()
+                .unwrap_or_else(|error| panic!("legacy authorization encode failed: {error}")),
+        );
+        assert!(
+            services
+                .target
+                .open_bridge_authorization(&legacy_control)
+                .is_err()
+        );
 
         let mut bad_control_signature = verified.envelope().authorization.clone();
         *bad_control_signature
@@ -10521,6 +10963,7 @@ mod tests {
             .seal_scope_rekey_chained(&plan, 1, None)
             .unwrap_or_else(|error| panic!("fresh rekey seal failed: {error}"));
         let DecodedControl::ScopeEpoch {
+            signer: _,
             sequence,
             previous,
             scope: rekey_scope,

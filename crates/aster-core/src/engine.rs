@@ -13,11 +13,13 @@ use crate::model::{
 };
 use crate::store::{
     AppDelivery, ApplyOutcome, BatchStoragePolicy, BridgeFilter, BridgeProjectionCursor,
-    BridgeProjectionQuery, ChunkRange, ControlKind, ControlOutcome, CustodySample, EnvelopeId,
-    EventGap, LocalBatchCommit, LocalBatchItemCommit, PeerSnapshot, ProviderOpenedBridgeProjection,
-    QuotaUsage, RecordStore, Revocation, ScopeEpoch, ScopeQuota, SqliteStore, StoreConfig,
-    StoreError, StoreQuery, StoredBridgeProjection, StoredItem, SubscriptionCursor, SubscriptionId,
-    SubscriptionSpec, TransferProgress, VerifiedStoredControl, VersionStatus,
+    BridgeProjectionQuery, ChunkRange, ControlKind, ControlOutcome, ControlPrincipal,
+    CustodySample, EnvelopeId, EventGap, INVENTORY_OBJECT_LIMIT_ERROR, LocalBatchCommit,
+    LocalBatchItemCommit, MAX_COMPOSITE_INVENTORY_OBJECTS, PeerSnapshot,
+    ProviderOpenedBridgeProjection, QuotaUsage, RecordStore, Revocation, ScopeEpoch, ScopeQuota,
+    SqliteStore, StoreConfig, StoreError, StoreQuery, StoredBridgeProjection, StoredItem,
+    SubscriptionCursor, SubscriptionId, SubscriptionSpec, TransferProgress, VerifiedStoredControl,
+    VersionStatus,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -177,9 +179,18 @@ pub trait EnvelopeSealer {
     ) -> bool {
         false
     }
-    /// Identity of the mission control authority, only for an authority-capable provider.
-    fn control_authority(&self) -> Option<NodeId> {
+    /// Stable chain namespace and delegated signing identity for an
+    /// authority-capable provider.
+    fn control_principal(&self) -> Option<ControlPrincipal> {
         None
+    }
+    /// Identity of the stable mission control-chain namespace.
+    ///
+    /// This compatibility accessor must never be used when the delegated
+    /// signer is also needed for authorization or reservation binding.
+    fn control_authority(&self) -> Option<NodeId> {
+        self.control_principal()
+            .map(|principal| principal.authority)
     }
     fn seal_revocation_control(
         &mut self,
@@ -434,6 +445,16 @@ pub struct EnvelopeDescriptor {
     pub total_len: u64,
     pub priority: Priority,
     pub control: bool,
+}
+
+fn enforce_inventory_object_limit<T>(
+    objects: Vec<T>,
+    max_objects: usize,
+) -> Result<Vec<T>, EngineError> {
+    if objects.len() > max_objects {
+        return Err(EngineError::Invalid(INVENTORY_OBJECT_LIMIT_ERROR.into()));
+    }
+    Ok(objects)
 }
 
 /// Explicit record conflict resolution guarded by the observed sibling set.
@@ -816,6 +837,7 @@ impl<S: RecordStore, E: EnvelopeSealer> Node<S, E> {
         let stored = verified_stored_control(verified, sealed, self.clock.now_ms())?;
         let outcome = self.store.ingest_control(&stored)?;
         self.activate_control_outcome(&outcome)?;
+        self.reject_uncommitted_control_input(&stored, &outcome)?;
         Ok(outcome)
     }
 
@@ -825,12 +847,18 @@ impl<S: RecordStore, E: EnvelopeSealer> Node<S, E> {
         subject: NodeId,
         generation: u64,
     ) -> Result<ControlPublishReceipt, EngineError> {
-        let authority = self
+        let principal = self
             .envelopes
-            .control_authority()
+            .control_principal()
             .ok_or_else(|| EngineError::Invalid("node is not a control authority".into()))?;
+        if self.store.is_revoked(&principal.signer)? {
+            return Err(EngineError::Revoked(principal.signer));
+        }
+        if self.store.is_revoked(&principal.authority)? {
+            return Err(EngineError::Revoked(principal.authority));
+        }
         for _ in 0..self.publish_retry_limit {
-            let reservation = self.store.reserve_control(authority)?;
+            let reservation = self.store.reserve_control(principal)?;
             let sealed = self.envelopes.seal_revocation_control(
                 subject,
                 generation,
@@ -861,12 +889,18 @@ impl<S: RecordStore, E: EnvelopeSealer> Node<S, E> {
         scope: &Scope,
         epoch: u64,
     ) -> Result<ControlPublishReceipt, EngineError> {
-        let authority = self
+        let principal = self
             .envelopes
-            .control_authority()
+            .control_principal()
             .ok_or_else(|| EngineError::Invalid("node is not a control authority".into()))?;
+        if self.store.is_revoked(&principal.signer)? {
+            return Err(EngineError::Revoked(principal.signer));
+        }
+        if self.store.is_revoked(&principal.authority)? {
+            return Err(EngineError::Revoked(principal.authority));
+        }
         for _ in 0..self.publish_retry_limit {
-            let reservation = self.store.reserve_control(authority)?;
+            let reservation = self.store.reserve_control(principal)?;
             let sealed = self.envelopes.seal_scope_epoch_control(
                 scope,
                 epoch,
@@ -1260,6 +1294,8 @@ impl<S: RecordStore, E: EnvelopeSealer> Node<S, E> {
         filter: &crate::sync::InterestFilter,
         purpose: crate::sync::InventoryPurpose,
     ) -> Result<Vec<EnvelopeDescriptor>, EngineError> {
+        crate::wire::validate_interest_work(filter.topics.len(), filter.scopes.len())
+            .map_err(|error| EngineError::Invalid(error.to_string()))?;
         if self.store.is_zeroized()? || self.store.is_revoked(&peer)? {
             return Ok(Vec::new());
         }
@@ -1286,60 +1322,64 @@ impl<S: RecordStore, E: EnvelopeSealer> Node<S, E> {
             .collect::<Result<Vec<_>, _>>()?;
         let custody = self.clock.custody_sample();
         let mut selected = BTreeMap::new();
-        for topic in &topics {
-            for scope in &scopes {
-                let items = self.store.query(&StoreQuery {
-                    topic: Some(topic.clone()),
-                    scope: Some(scope.clone()),
-                    include_descendant_scopes: false,
-                    include_recoverable_versions: true,
-                    include_tombstones: true,
-                    custody_sample: custody,
-                    ..StoreQuery::default()
-                })?;
-                for item in items {
-                    if item.priority < minimum
-                        || !item.is_forwardable_at(custody)
-                        || (purpose == crate::sync::InventoryPurpose::ServePeer
-                            && !self.emission.allows(item.priority))
-                    {
-                        continue;
-                    }
-                    if purpose == crate::sync::InventoryPurpose::ServePeer
-                        && !self.envelopes.peer_can_route(
-                            peer,
-                            peer_route_commitments,
-                            &item.scope,
-                            item.key_epoch,
-                        )
-                    {
-                        continue;
-                    }
-                    let envelope_id = crate::wire::EnvelopeId::from(item.envelope_id);
-                    selected.entry(envelope_id).or_insert(EnvelopeDescriptor {
-                        envelope_id,
-                        total_len: item.sealed.len() as u64,
-                        priority: item.priority,
-                        control: false,
-                    });
+        let mut selected_controls = BTreeMap::new();
+        let topics = topics.into_iter().collect::<BTreeSet<_>>();
+        let scopes = scopes.into_iter().collect::<BTreeSet<_>>();
+        let metadata = enforce_inventory_object_limit(
+            self.store.select_inventory_metadata(&topics, &scopes)?,
+            MAX_COMPOSITE_INVENTORY_OBJECTS,
+        )?;
+        for metadata in metadata {
+            let priority = metadata.priority();
+            if metadata.is_control() {
+                // Controls are mission-wide and carry no topic/scope route.
+                // The revoked peer was rejected above; every remaining peer
+                // proved mission membership before reaching this boundary.
+                if purpose == crate::sync::InventoryPurpose::ServePeer
+                    && !self.emission.allows(Priority::Flash)
+                {
+                    continue;
                 }
+                let envelope_id = crate::wire::EnvelopeId::from(metadata.envelope_id());
+                selected_controls
+                    .entry(envelope_id)
+                    .or_insert(EnvelopeDescriptor {
+                        envelope_id,
+                        total_len: metadata.total_len(),
+                        priority: Priority::Flash,
+                        control: true,
+                    });
+                continue;
             }
-        }
-        // Controls are mission-wide and do not carry topic/scope routing metadata.
-        // A revoked peer was rejected above; every remaining peer proved mission membership.
-        for control in self.store.applied_controls()? {
-            if purpose == crate::sync::InventoryPurpose::ServePeer
-                && !self.emission.allows(Priority::Flash)
+            if priority < minimum
+                || !metadata.is_forwardable_at(custody)
+                || (purpose == crate::sync::InventoryPurpose::ServePeer
+                    && !self.emission.allows(priority))
             {
                 continue;
             }
-            let envelope_id = crate::wire::EnvelopeId::from(control.envelope_id);
+            let (scope, key_epoch) = metadata.route().ok_or_else(|| {
+                EngineError::Invalid("data inventory metadata has no route".into())
+            })?;
+            if purpose == crate::sync::InventoryPurpose::ServePeer
+                && !self
+                    .envelopes
+                    .peer_can_route(peer, peer_route_commitments, scope, key_epoch)
+            {
+                continue;
+            }
+            let envelope_id = crate::wire::EnvelopeId::from(metadata.envelope_id());
             selected.entry(envelope_id).or_insert(EnvelopeDescriptor {
                 envelope_id,
-                total_len: control.sealed.len() as u64,
-                priority: Priority::Flash,
-                control: true,
+                total_len: metadata.total_len(),
+                priority,
+                control: false,
             });
+        }
+        // Preserve the historical collision rule: an admitted data envelope
+        // wins over a control with the same digest, independent of SQL row order.
+        for (envelope_id, control) in selected_controls {
+            selected.entry(envelope_id).or_insert(control);
         }
         Ok(selected.into_values().collect())
     }
@@ -1614,6 +1654,7 @@ impl<S: RecordStore, E: EnvelopeSealer> Node<S, E> {
                 let stored = verified_stored_control(verified, sealed, self.clock.now_ms())?;
                 let outcome = self.store.ingest_control(&stored)?;
                 self.activate_control_outcome(&outcome)?;
+                self.reject_uncommitted_control_input(&stored, &outcome)?;
                 Ok(ForwardedIngest::Control(outcome))
             }
             VerifiedObject::Data(verified) => {
@@ -1677,12 +1718,32 @@ impl<S: RecordStore, E: EnvelopeSealer> Node<S, E> {
         Ok(())
     }
 
+    fn reject_uncommitted_control_input(
+        &mut self,
+        stored: &VerifiedStoredControl,
+        outcome: &ControlOutcome,
+    ) -> Result<(), EngineError> {
+        if outcome.rejected_input().is_none() {
+            return Ok(());
+        }
+        if self.store.is_revoked(&stored.authority)? {
+            return Err(EngineError::Revoked(stored.authority));
+        }
+        if self.store.is_revoked(&stored.signer)? {
+            return Err(EngineError::Revoked(stored.signer));
+        }
+        Err(EngineError::Invalid(
+            "control input was discarded with an invalid pending suffix".into(),
+        ))
+    }
+
     fn replay_active_controls(&mut self) -> Result<(), EngineError> {
         for persisted in self.store.applied_controls()? {
             let verified = self.envelopes.inspect_control(&persisted.sealed)?;
             let replay = verified_stored_control(verified, &persisted.sealed, None)?;
             if replay.envelope_id != persisted.envelope_id
                 || replay.authority != persisted.authority
+                || replay.signer != persisted.signer
                 || replay.sequence != persisted.sequence
                 || replay.previous_control != persisted.previous_control
                 || replay.kind != persisted.kind
@@ -1740,10 +1801,16 @@ impl<S: RecordStore> Node<S, crate::crypto::ReferenceEnvelopeSealer> {
         &mut self,
         plan: &crate::crypto::ScopeRekeyPlan,
     ) -> Result<ControlPublishReceipt, EngineError> {
-        let authority = self
+        let principal = self
             .envelopes
-            .control_authority()
+            .control_principal()
             .ok_or_else(|| EngineError::Invalid("node is not a control authority".into()))?;
+        if self.store.is_revoked(&principal.signer)? {
+            return Err(EngineError::Revoked(principal.signer));
+        }
+        if self.store.is_revoked(&principal.authority)? {
+            return Err(EngineError::Revoked(principal.authority));
+        }
         if plan.epoch() <= self.store.scope_epoch(plan.scope())? {
             return Err(EngineError::Invalid(
                 "fresh scope rekey epoch must strictly increase".into(),
@@ -1755,7 +1822,7 @@ impl<S: RecordStore> Node<S, crate::crypto::ReferenceEnvelopeSealer> {
             }
         }
         for _ in 0..self.publish_retry_limit {
-            let reservation = self.store.reserve_control(authority)?;
+            let reservation = self.store.reserve_control(principal)?;
             let sealed = self.envelopes.seal_scope_rekey_chained(
                 plan,
                 reservation.sequence,
@@ -2919,6 +2986,7 @@ fn verified_stored_control(
             VerifiedStoredControl {
                 envelope_id,
                 authority: revocation.authority,
+                signer: revocation.signer,
                 sequence: revocation.control_sequence,
                 previous_control: revocation.previous_control,
                 kind: ControlKind::Revocation,
@@ -2930,6 +2998,7 @@ fn verified_stored_control(
         VerifiedControl::ScopeEpoch(epoch) => VerifiedStoredControl {
             envelope_id,
             authority: epoch.authority,
+            signer: epoch.signer,
             sequence: epoch.control_sequence,
             previous_control: epoch.previous_control,
             kind: ControlKind::ScopeEpoch,
@@ -2999,6 +3068,18 @@ mod tests {
 
     type Registry = BTreeMap<Vec<u8>, (VerifiedEnvelope, Vec<u8>)>;
 
+    #[test]
+    fn inventory_object_limit_rejects_cap_plus_one_from_custom_stores() {
+        assert_eq!(
+            enforce_inventory_object_limit(vec![1, 2], 2).unwrap(),
+            vec![1, 2]
+        );
+        assert!(matches!(
+            enforce_inventory_object_limit(vec![1, 2, 3], 2),
+            Err(EngineError::Invalid(message)) if message == INVENTORY_OBJECT_LIMIT_ERROR
+        ));
+    }
+
     #[derive(Clone, Default)]
     struct TestSealer {
         records: Arc<Mutex<Registry>>,
@@ -3025,6 +3106,15 @@ mod tests {
                     .rotate_left((slot % 7) as u32);
             }
             id
+        }
+
+        fn route_commitment(peer: NodeId, scope: &Scope, epoch: u64) -> [u8; 32] {
+            let mut digest = Sha256::new();
+            digest.update(b"aster/test/route-commitment/v1");
+            digest.update(peer);
+            digest.update(scope.as_str().as_bytes());
+            digest.update(epoch.to_be_bytes());
+            digest.finalize().into()
         }
     }
 
@@ -3077,6 +3167,17 @@ mod tests {
             Err(EnvelopeError("no test control object".into()))
         }
 
+        fn peer_can_route(
+            &self,
+            peer: NodeId,
+            peer_route_commitments: &[[u8; 32]],
+            scope: &Scope,
+            epoch: u64,
+        ) -> bool {
+            let expected = Self::route_commitment(peer, scope, epoch);
+            peer_route_commitments.contains(&expected)
+        }
+
         fn zeroize(&mut self) -> Result<(), EnvelopeError> {
             self.zeroized.store(true, Ordering::SeqCst);
             Ok(())
@@ -3101,6 +3202,7 @@ mod tests {
                 sealed.clone(),
                 VerifiedControl::ScopeEpoch(ScopeEpoch {
                     authority,
+                    signer: authority,
                     scope: scope(),
                     epoch,
                     control_sequence: 1,
@@ -3225,6 +3327,194 @@ mod tests {
     ) -> Node<InMemoryStore, TestSealer> {
         let store = InMemoryStore::new(config.store.clone()).unwrap();
         Node::with_store([identity_byte; 32], store, sealer, config)
+    }
+
+    fn selectors(prefix: &str, count: usize) -> Vec<String> {
+        (0..count)
+            .map(|index| format!("{prefix}-{index:04}"))
+            .collect()
+    }
+
+    #[test]
+    fn oversized_interest_is_rejected_before_inventory_backend_calls() {
+        let mut node = memory_node(1, TestSealer::default(), NodeConfig::default());
+        let oversized = crate::sync::InterestFilter {
+            topics: selectors("topic", 65),
+            scopes: selectors("scope", 64),
+            min_priority: Priority::Routine as u8,
+        };
+
+        let error = node
+            .authorized_envelopes(
+                [2; 32],
+                &[],
+                &oversized,
+                crate::sync::InventoryPurpose::ReceiveBaseline,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            EngineError::Invalid(message)
+                if message.contains("InterestWorkLimit")
+                    && message.contains("actual: 4160")
+                    && message.contains("maximum: 4096")
+        ));
+        assert_eq!(node.store().inventory_selection_call_count(), 0);
+
+        let maximal_peer_input = crate::sync::InterestFilter {
+            topics: selectors("topic", crate::wire::Limits::default().max_collection_items),
+            scopes: selectors("scope", crate::wire::Limits::default().max_collection_items),
+            min_priority: Priority::Routine as u8,
+        };
+        let error = node
+            .authorized_envelopes(
+                [2; 32],
+                &[],
+                &maximal_peer_input,
+                crate::sync::InventoryPurpose::ReceiveBaseline,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            EngineError::Invalid(message)
+                if message.contains("InterestDimensionLimit")
+                    && message.contains("actual: 4096")
+                    && message.contains("maximum: 256")
+        ));
+        assert_eq!(node.store().inventory_selection_call_count(), 0);
+
+        let maximal_valid = crate::sync::InterestFilter {
+            topics: selectors("topic", 64),
+            scopes: selectors("scope", 64),
+            min_priority: Priority::Routine as u8,
+        };
+        assert!(
+            node.authorized_envelopes(
+                [2; 32],
+                &[],
+                &maximal_valid,
+                crate::sync::InventoryPurpose::ReceiveBaseline,
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(node.store().inventory_selection_call_count(), 1);
+    }
+
+    #[test]
+    fn inventory_metadata_preserves_expiry_tombstone_and_peer_route_authorization() {
+        let clock = Arc::new(ManualClock::default());
+        clock.set(100);
+        let sealer = TestSealer::default();
+        let mut node = memory_node(
+            1,
+            sealer,
+            NodeConfig {
+                clock: clock.clone(),
+                ..NodeConfig::default()
+            },
+        );
+        let durable = node
+            .publish(request(DataClass::State, b"durable", b"keep"))
+            .unwrap();
+        let mut perishable = request(DataClass::State, b"perishable", b"fresh");
+        perishable.ttl_ms = Some(50);
+        let perishable = node.publish(perishable).unwrap();
+        let mut tombstone = request(DataClass::State, b"deleted", b"");
+        tombstone.ttl_ms = Some(1);
+        tombstone.tombstone = true;
+        let tombstone = node.publish(tombstone).unwrap();
+
+        let other_scope = Scope::new("mission/team/bravo").unwrap();
+        let mut outside_grant = request(DataClass::State, b"outside", b"private");
+        outside_grant.scope = other_scope.clone();
+        let outside_grant = node.publish(outside_grant).unwrap();
+
+        let durable_envelope = crate::wire::EnvelopeId::from(
+            node.store_mut()
+                .get(&durable.id)
+                .unwrap()
+                .unwrap()
+                .envelope_id,
+        );
+        let perishable_envelope = crate::wire::EnvelopeId::from(
+            node.store_mut()
+                .get(&perishable.id)
+                .unwrap()
+                .unwrap()
+                .envelope_id,
+        );
+        let tombstone_envelope = crate::wire::EnvelopeId::from(
+            node.store_mut()
+                .get(&tombstone.id)
+                .unwrap()
+                .unwrap()
+                .envelope_id,
+        );
+        let outside_envelope = crate::wire::EnvelopeId::from(
+            node.store_mut()
+                .get(&outside_grant.id)
+                .unwrap()
+                .unwrap()
+                .envelope_id,
+        );
+
+        let peer = [0x77; 32];
+        let grant = TestSealer::route_commitment(peer, &scope(), 0);
+        let filter = crate::sync::InterestFilter {
+            topics: vec![topic().as_str().to_owned()],
+            scopes: vec![scope().as_str().to_owned(), other_scope.as_str().to_owned()],
+            min_priority: Priority::Routine as u8,
+        };
+        let initial = node
+            .authorized_envelopes(
+                peer,
+                &[grant],
+                &filter,
+                crate::sync::InventoryPurpose::ServePeer,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|descriptor| descriptor.envelope_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            initial,
+            BTreeSet::from([durable_envelope, perishable_envelope, tombstone_envelope])
+        );
+        assert!(!initial.contains(&outside_envelope));
+
+        clock.set(151);
+        let served_after_expiry = node
+            .authorized_envelopes(
+                peer,
+                &[grant],
+                &filter,
+                crate::sync::InventoryPurpose::ServePeer,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|descriptor| descriptor.envelope_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            served_after_expiry,
+            BTreeSet::from([durable_envelope, tombstone_envelope])
+        );
+
+        let receive_baseline = node
+            .authorized_envelopes(
+                peer,
+                &[],
+                &filter,
+                crate::sync::InventoryPurpose::ReceiveBaseline,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|descriptor| descriptor.envelope_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            receive_baseline,
+            BTreeSet::from([durable_envelope, tombstone_envelope, outside_envelope])
+        );
     }
 
     #[test]
