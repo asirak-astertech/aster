@@ -1,0 +1,320 @@
+# Application recipes
+
+These recipes show the framework's main application mechanisms with commented
+Python because it is the most compact binding. Rust, C, Go, and Python share
+the core local-data operations shown here. Rust additionally exposes explicit
+Event-gap inspection, merge-policy registration, and garbage collection; the
+[capability table](#operation-names-across-bindings) marks those boundaries.
+
+Start with a working node from the [Python quickstart](quickstart/python.md):
+
+```python
+from aster_mesh import (
+    BatchPublishItem,
+    DataClass,
+    EmissionThreshold,
+    Node,
+    Priority,
+)
+
+node = Node(database_path, provisioning_bundle)
+```
+
+The snippets use the disposable fixture's authorized scope and topic names. In
+a real application, those names and the payload schema are part of your
+deployment contract.
+
+## Publish each data class
+
+### State: replaceable current value
+
+```python
+position_result = node.publish(
+    DataClass.STATE,
+    "position.current",
+    "mission/team/alpha",
+    b'{"lat":38.9,"lon":-77.0}',
+    # Every update for this entity reuses the same logical key.
+    logical_key=b"unit-7",
+    # Urgency and expiry are independent policy choices.
+    priority=Priority.IMMEDIATE,
+    ttl_ms=60_000,
+)
+```
+
+Use State when consumers want one projected current value. Concurrent heads
+converge on the value with the greatest full ItemID, while losing heads remain
+queryable with `include_recoverable=True`. The current `conflicts()` and
+resolution workflow is Record-only; use Record when an application requires an
+explicit concurrent-writer signal. A short-lived position should usually
+expire; a device's long-lived configuration may have no TTL. `position_result`
+is a publish result: it confirms the local durable commit, not delivery to a
+peer.
+
+### Event: immutable history
+
+```python
+message_result = node.publish(
+    DataClass.EVENT,
+    "chat.events",
+    "mission/team/alpha",
+    b'{"from":"unit-7","text":"checkpoint clear"}',
+    # The logical key may name an application stream. Aster assigns the
+    # publisher's durable Event sequence; the app does not invent it.
+    logical_key=b"operations-chat",
+    priority=Priority.PRIORITY,
+)
+
+print(message_result.event_sequence)  # Nonzero sequence assigned by Aster.
+```
+
+Use Event when every entry matters. A receiver can inspect event-gap reporting
+to distinguish “nothing happened” from “an event has not arrived yet.” Explicit
+`ApplicationNode::event_gaps` inspection is Rust-only today; C, Go, and Python
+do not expose it.
+
+### Record: mutable data with explicit conflicts
+
+```python
+plan_result = node.publish(
+    DataClass.RECORD,
+    "record.plan",
+    "mission/team/alpha",
+    b'{"objective":"north","status":"draft"}',
+    # Concurrent edits to this logical record remain visible as siblings.
+    logical_key=b"plan-red",
+    priority=Priority.PRIORITY,
+)
+```
+
+Use Record when disconnected editors can legitimately change the same object and
+losing either version would be wrong.
+
+### Blob: streamed large immutable content
+
+```python
+# Generic node.publish(DataClass.BLOB, ...) is intentionally rejected. The
+# streaming API keeps large content out of one Python/native allocation.
+with node.blob_writer(
+    "imagery.blob",
+    "mission/team/alpha",
+    media_type="image/tiff",
+    chunk_size=64 * 1024,
+    priority=Priority.ROUTINE,
+) as writer:
+    with open("map.tiff", "rb") as source:
+        while block := source.read(64 * 1024):
+            writer.write(block)
+    finished = writer.finish()
+
+print(finished.blob_id.hex())
+```
+
+`finish()` is idempotent and safe to retry. The Blob ID commits to manifest
+identity fields—including total length, chunk size, media type, and schema
+ID—as well as the ordered plaintext chunk digests and whole-plaintext digest.
+The same plaintext published with a different chunk size therefore has a
+different Blob ID. Deduplication and reads also require the exact authenticated
+route commitment and manifest bytes; an ID match alone is insufficient. Partial
+authenticated transfer progress survives contact changes; the current profile
+rejects an empty Blob.
+
+Read a locally available Blob incrementally:
+
+```python
+import os
+
+temporary_path = "map-copy.tiff.part"
+with node.blob_reader(
+    "imagery.blob", "mission/team/alpha", finished.blob_id,
+) as reader:
+    with open(temporary_path, "wb") as output:
+        while block := reader.read(64 * 1024):
+            output.write(block)
+os.replace(temporary_path, "map-copy.tiff")
+```
+
+Each chunk is authenticated before its plaintext is returned, but the
+whole-content digest is checked only when the reader reaches end-of-file. Do not
+act on the output as a complete verified Blob before the final read returns
+end-of-file; the staging-and-rename pattern above prevents a partial result from
+being mistaken for a completed file.
+
+## Query current local data
+
+```python
+items = node.query(
+    topic="position.current",
+    scope="mission/team/alpha",
+    logical_key=b"unit-7",
+    data_class=DataClass.STATE,
+    limit=100,  # Every query is bounded.
+)
+
+for item in items:
+    print(item.item_id.hex(), item.payload)
+```
+
+A query is a bounded snapshot of the local store. It does not contact peers. Use
+`include_descendants=True` only when the caller is intentionally reading a scope
+subtree. Recoverable superseded versions and tombstones are excluded unless
+explicitly requested.
+
+## Process a durable subscription
+
+```python
+subscription = node.subscribe(
+    "chat.events",
+    "mission/team/alpha",
+    data_class=DataClass.EVENT,
+)
+
+for delivery in subscription.poll(limit=64):
+    # Make application processing idempotent using delivery.item.item_id.
+    application_store.commit(delivery.item.item_id, delivery.item.payload)
+
+    # Acknowledge after the application's commit, not before it.
+    subscription.acknowledge(delivery)
+```
+
+Stopping before acknowledgment can cause redelivery. That is the intended
+at-least-once contract.
+
+## Publish an atomic batch
+
+```python
+batch_result = node.publish_batch([
+    BatchPublishItem(
+        DataClass.EVENT,
+        "chat.events",
+        "mission/team/alpha",
+        b'{"text":"first"}',
+        logical_key=b"operations-chat",
+        priority=Priority.PRIORITY,
+    ),
+    BatchPublishItem(
+        DataClass.EVENT,
+        "chat.events",
+        "mission/team/alpha",
+        b'{"text":"second"}',
+        logical_key=b"operations-chat",
+        priority=Priority.PRIORITY,
+    ),
+])
+```
+
+An explicit batch has 2–64 ordered members with the same publisher, class,
+topic, scope, and active epoch. Either every item commits or none does. The
+default retained-dual policy keeps unchanged format-2 singleton envelopes
+alongside the semantic-v2 compact batch representation, preserving delivery to
+semantic-v1 contacts. At the maximum 64 items with 128-byte scope and topic and
+256 group entries, the compact representation is 39,414 serialized bytes versus
+1,207,414 bytes for retained-dual publication (about 30.6×). Those figures are
+object serialization, not measured transport throughput. Opt into batch-only
+retention only after evaluating mixed-version contacts, not merely to reduce
+local storage.
+
+## Delete data with a tombstone
+
+```python
+node.publish(
+    DataClass.STATE,
+    "position.current",
+    "mission/team/alpha",
+    b"",
+    logical_key=b"unit-7",
+    tombstone=True,
+    priority=Priority.IMMEDIATE,
+)
+```
+
+A tombstone is a replicated update, not an immediate physical deletion. It
+prevents a returning node from resurrecting an older value only within the
+configured tombstone-retention window. The deployment baseline is 30 days of
+offline tolerance plus a 15-day margin; after that bound, resurrection is
+possible. [`ApplicationNodeOptions`](../crates/aster-core/src/api.rs#L938)
+configures `tombstone_retention_ms` and `superseded_retention_ms`. Rust also
+exposes explicit `ApplicationNode::collect_garbage`; C, Go, and Python do not.
+
+## Inspect and resolve Record conflicts
+
+```python
+conflicts = node.conflicts(
+    topic="record.plan",
+    scope="mission/team/alpha",
+    logical_key=b"plan-red",
+    data_class=DataClass.RECORD,
+)
+
+for conflict in conflicts:
+    # Fetch recoverable sibling payloads for display or domain-specific merge.
+    siblings = node.query(
+        topic="record.plan",
+        scope="mission/team/alpha",
+        logical_key=conflict.logical_key,
+        data_class=DataClass.RECORD,
+        include_recoverable=True,
+    )
+    merged_payload = merge_plan_versions(siblings)
+
+    # The expected sibling set prevents resolving a stale view after another
+    # concurrent update has arrived.
+    node.resolve(
+        "record.plan",
+        "mission/team/alpha",
+        conflict.logical_key,
+        conflict,
+        merged_payload,
+        priority=Priority.PRIORITY,
+    )
+```
+
+A registered merge policy can automate this only when it is deterministic for
+the same ordered inputs. Registration through
+`ApplicationNode::register_merge_policy` is Rust-only today. Otherwise keep the
+decision in application code.
+
+## Enter a constrained-emission mode
+
+```python
+# Emit only Immediate and Flash data. Inbound sync remains allowed, and active
+# discovery is suppressed at every threshold above Routine.
+node.emission_threshold = EmissionThreshold.IMMEDIATE
+
+# Suppress discovery, inventory, and item transmission while continuing to
+# receive. A connection-oriented contact may still send mandatory
+# authentication or link acknowledgements needed for ingestion.
+node.emission_threshold = EmissionThreshold.RECEIVE_ONLY
+
+# Restore ordinary emission later.
+node.emission_threshold = EmissionThreshold.ROUTINE
+```
+
+Emission policy affects what the node may send. It does not change item
+priority, delete queued data, or broaden provisioning and bridge policy.
+`RECEIVE_ONLY` is not a guarantee of RF silence, and the high-level application
+APIs do not expose the separate `PassiveOnly` scheduler mode.
+
+## Operation names across bindings
+
+An em dash means that the operation is not exposed by that language binding.
+
+| Purpose | Rust | Python | Go | C ABI |
+|---|---|---|---|---|
+| Open node | `ApplicationNode::open` | `Node(...)` | `Open` | `aster_node_open` |
+| Publish | `publish` | `publish` | `Publish` | `aster_node_publish` |
+| Query | `query` | `query` | `Query` | `aster_node_query` |
+| Subscribe | `subscribe` | `subscribe` | `Subscribe` | `aster_node_subscribe` |
+| Poll / acknowledge | `poll` / `acknowledge` | `poll` / `acknowledge` | `Poll` / `Acknowledge` | `aster_node_poll` / `aster_node_acknowledge` |
+| Atomic batch | `publish_batch` | `publish_batch` | `PublishBatch` | `aster_node_publish_batch` |
+| Stream Blob | `open_blob_service` | `blob_writer` | `NewBlobWriter` | `aster_node_blob_writer_open` |
+| Inspect conflicts | `conflicts` | `conflicts` | `Conflicts` | `aster_node_conflicts` |
+| Resolve a conflict | `resolve` | `resolve` | `Resolve` | `aster_node_resolve` |
+| Inspect Event gaps | `event_gaps` | — (Rust-only) | — (Rust-only) | — (Rust-only) |
+| Register merge policy | `register_merge_policy` | — (Rust-only) | — (Rust-only) | — (Rust-only) |
+| Run garbage collection explicitly | `collect_garbage` | — (Rust-only) | — (Rust-only) | — (Rust-only) |
+| Emission policy | `set_emission_policy` | `emission_threshold` | `SetEmissionThreshold` | `aster_node_set_emission` |
+| Zeroize | `zeroize` | `zeroize` | `Zeroize` | `aster_node_zeroize` |
+
+See the [language quickstarts](quickstart/README.md) for setup and resource
+ownership details, and [Carriers and contacts](transports.md) for live sync.

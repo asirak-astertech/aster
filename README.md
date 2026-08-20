@@ -1,97 +1,144 @@
 # Aster Mesh
 
-Aster is an implementation-independent synchronization protocol and
-embeddable Rust reference framework for intermittent, untrusted, constrained
-networks. It moves four classes of data—State, Event, Record, and Blob—directly
-or through store-and-forward relays without making a server part of correctness.
+**Move important application data when the network is unreliable, untrusted, or
+missing altogether.**
 
-> **Security status:** version 0.1 is a reference candidate, not a completed MVP
-> or production build. Its
-> portable cryptographic provider uses NIST-standard algorithms but is **not a
-> claim of FIPS 140-3 validation**. Production authorization is blocked by the
-> explicit gates in `docs/security.md` and `docs/conformance.md`.
+Aster is an offline-first data synchronization protocol and embeddable reference
+framework. An application publishes to its local Aster node; Aster stores the
+item durably, protects it at the source, and exchanges it whenever an
+authenticated contact becomes available. A direct connection, relay, or central
+server may help delivery, but none is required for correctness.
 
-## What is here
+That makes Aster useful for field teams, vehicles, sensors, and edge systems that
+move between IP, Bluetooth Low Energy, tactical radio, SATCOM, and disconnected
+operation.
 
-- `docs/protocol.md` — versioned wire and replication authority
-- `docs/wire.cddl` — language-neutral data grammar
-- `docs/envelope.md` — deterministic security-object profile
-- `crates/aster-core` — model, causal reducers, security, persistence, and sync
-- `crates/aster-ip` and `crates/aster-ble` — link adapters
-- `crates/aster-ffi` — C-compatible library boundary
-- `bindings/go` and `bindings/python` — first-class application bindings
-- `crates/aster-conformance` — black-box scenarios and wire vectors
-- `docs/security.md` — threat model, controls, and production security gates
-- `docs/conformance.md` — validation plan and acceptance criteria
-- `docs/deprecation-policy.md` — mixed-version and retirement guarantees
+> **Project status:** Aster 0.1 is a reference candidate. It is not a completed
+> MVP, production-authorized build, or claim of FIPS 140-3 validation.
+> Production use is **blocked** by explicit gates in
+> [security](docs/security.md) and
+> [conformance and acceptance](docs/conformance.md); read both before planning
+> an operational deployment.
 
-## Reproducible verification
+## Why Aster exists
 
-Install the pinned toolchain and run the complete local gate:
+Most synchronization systems assume that a client can reach a service. Aster
+assumes the opposite: contacts are brief, links are slow, nodes disappear for
+days, and every carrier may be observed or manipulated.
+
+```mermaid
+flowchart LR
+    A["Producer app"] -->|"publish locally"| B["Aster node"]
+    B -->|"when contact exists"| C["Authenticated peer or relay"]
+    C -->|"later, over any carrier"| D["Consumer's Aster node"]
+    D --> E["Consumer app"]
+```
+
+Aster is unusual in combining these properties in one application-facing model:
+
+- **Offline publication:** success means the item is durably committed locally,
+  not that a remote service happened to be reachable.
+- **Store-and-forward delivery:** a relay can carry protected data between nodes
+  that never meet directly.
+- **Transport-neutral progress:** verified objects and partial large-file ranges
+  can resume through a different peer or carrier.
+- **Data-aware convergence:** State, Event, Record, and Blob each have explicit
+  synchronization and conflict behavior.
+- **Constrained-operation controls:** priority, expiry, quotas, and receive-only
+  mode make bandwidth, storage, and power deliberate choices.
+- **Protected routing:** relays can make authorized forwarding decisions without
+  receiving content access; source authentication survives every hop.
+- **Scoped sharing:** topics select what data means, scopes bound where it may
+  travel, and signed bridge policy controls movement between scopes.
+
+## Choose the right data class
+
+The data class tells every conforming node how an item should converge. It is not
+just a label.
+
+| Class | Use it for | What Aster guarantees |
+|---|---|---|
+| **State** | Current position, device status, latest setting | One current value per logical key, with deterministic handling of concurrent updates |
+| **Event** | Chat messages, observations, audit entries | Immutable, ordered events per publisher, with detectable sequence gaps |
+| **Record** | Plans, forms, annotations, mutable documents | Concurrent versions are preserved and surfaced unless a deterministic merge policy resolves them |
+| **Blob** | Imagery, maps, attachments, large binary objects | Immutable, chunked transfer whose ID commits to the plaintext digest and manifest fields, with authenticated streaming and resume |
+
+See [Core concepts](docs/concepts.md) for worked examples and selection guidance.
+The [Application recipes](docs/application-recipes.md) show commented code for
+all four classes, queries, subscriptions, batches, deletion, conflicts, and
+emission policy.
+
+## Get a local publish/subscribe working
+
+The fastest first success uses the checked-in disposable provisioning fixture.
+It exercises durable, offline application behavior without pretending to be an
+operational deployment.
+
+| Your application | Start here |
+|---|---|
+| Rust | [Rust quickstart](docs/quickstart/rust.md) |
+| Python | [Python quickstart](docs/quickstart/python.md) |
+| Go | [Go quickstart](docs/quickstart/go.md) |
+| C or another native language | [C ABI quickstart](docs/quickstart/c.md) |
+
+Then read [Connect nodes and choose a carrier](docs/transports.md). The
+[current capability boundary](docs/README.md#current-capability-boundary) states
+which application and live-synchronization paths are available today.
+
+## Know when to use it
+
+Aster is a good fit when:
+
+- publishing must keep working with no peer or infrastructure online;
+- data may cross several intermittent contacts before reaching a consumer;
+- links are too constrained to resend an entire dataset;
+- conflicts must be explicit and reproducible without trusting wall clocks;
+- relays should forward data without being able to read it; or
+- the same application model must survive a change from IP to a narrow carrier.
+
+Aster is not a message broker, general-purpose database, VPN, radio manager, or
+real-time voice/video transport. If every client has reliable access to a
+service, a conventional database or broker will usually be simpler.
+
+## How the repository is organized
+
+| Area | Purpose |
+|---|---|
+| [`crates/aster-core`](crates/aster-core) | Data model, durable store, reducers, security, and synchronization |
+| [`crates/aster-host`](crates/aster-host) | High-level node plus authenticated contact and carrier composition |
+| [`crates/aster-ip`](crates/aster-ip) | Nonblocking UDP/IP link, discovery, rendezvous, and opaque relay support |
+| [`crates/aster-ble`](crates/aster-ble) | BTLE link over a small platform-radio interface |
+| [`crates/aster-ffi`](crates/aster-ffi) | Stable C-compatible application boundary |
+| [`bindings`](bindings) | C header plus first-class Go and Python bindings |
+| [`crates/aster-conformance`](crates/aster-conformance) | Black-box scenarios and interoperability vectors |
+| [`lab`](lab) | Controlled network and impairment experiments |
+| [`docs`](docs) | Tutorials, concepts, operations, specifications, and evidence |
+| [`site`](site) | Self-contained static project landing page |
+
+## Documentation map
+
+- **New to Aster:** [Documentation home](docs/README.md) →
+  [Core concepts](docs/concepts.md) → a [language quickstart](docs/quickstart/README.md) →
+  [Application recipes](docs/application-recipes.md)
+- **Integrating a deployment:** [Carriers and contacts](docs/transports.md) →
+  [Security model and production gates](docs/security.md)
+- **Implementing the protocol:** [Protocol specification](docs/protocol.md) →
+  [wire grammar](docs/wire.cddl) → [fixed security objects](docs/envelope.md)
+- **Evaluating readiness:** [Conformance and acceptance](docs/conformance.md) →
+  [CI evidence](docs/ci.md) → [security gates](docs/security.md)
+- **Contributing:** [CONTRIBUTING.md](CONTRIBUTING.md)
+
+## Verify the repository
+
+Install the pinned tools and run the complete local gate:
 
 ```sh
 mise install
 mise run check
 ```
 
-Basic publish/subscribe examples are in `examples/`. Publishing commits locally
-before it reports success, so the same API works without a current peer.
-
-Rust applications use `ApplicationNode`, whose default surface contains bounded
-query, publish, streamed Blob staging/read, subscribe/acknowledge, conflict,
-policy, status, quota, lifecycle, and high-level authority operations. Protocol,
-sealed-object, provider, key, and adapter contracts require the explicit
-non-default `adapter-sdk` feature or remain internal; Go and Python expose the
-same application boundary through the C ABI.
-
-The reference also implements semantic-version-2 cross-scope bridge
-authorization, immutable route rewrapping, bounded status/paging, and unified
-query/subscription semantics. C, Go, and Python expose the same high-level
-capability workflow without exposing sealed controls, route descriptors, keys,
-provider handles, or transport internals. The Rust application host can own and
-pump configured `Link` instances; current automated tests use controlled
-in-memory links and do not establish behavior on a physical IP or BTLE path.
-
-Rust, C, Go, and Python callers can explicitly publish 2–64 same-publisher/
-class/topic/scope/epoch items as one atomic semantic-version-2 batch. The
-default retains both compact batch and format-2 singleton representations;
-callers may explicitly choose batch-only publication. Each binding also
-atomically finalizes 2–64 distinct Blob writers without exposing manifests or
-route commitments. Proof, compact items, any required singletons, publisher/
-Event ranges, ledgers, and outbox metadata commit together or not at all. This
-source/store/application/binding path and local peer runtime are green. Local
-tests cover exact v1/v2 representation inventory, proof-first transfer,
-compact-first private restart/promotion, and a finalized two-Blob batch through
-proof, compact manifests, carriers, and plaintext verification. This is not an
-independent-SUT, 3 kbps, or physical live-carrier claim.
-
-The core fixed profile now creates fresh recipient-filtered hybrid rekey packages
-and excludes an omitted captured node from the new epoch. A complete high-level
-and language-binding **rekey-registry** administration workflow is still absent,
-and authority restart requires an independently retained registry-generation
-high-water mark.
-The core also inventories, ranges, relays, and resumes encrypted Blob chunk
-carriers; a reference test reopens partial state and completes it from a different
-authenticated peer. Adversarial tests also prove terminal first-peer poisoning
-is cleared before a full retry through a different relay, unauthenticated staging
-cannot evict committed data, and the high-level/FFI path rejects route-root or
-chunk-count substitution. A separate generated 101 MiB local streaming test
-passes with bounded component buffers; the different-peer runtime case is
-smaller, so a combined 100+ MiB different-peer run with measured process RSS and
-a live IP/BTLE carrier remains an open acceptance gap. Zero-byte Blob
-publication is unsupported.
-The implemented four-flight handshake keeps mission, NodeID, credentials, roles,
-and route-grant commitments
-out of clear carrier bytes, and a reassembled-flight runtime canary test passes;
-captures on every enabled physical carrier remain an external acceptance gate.
-Encryption does not hide endpoints, timing, sizes, RF characteristics, or other
-traffic-analysis signals. See `docs/security.md`, `docs/protocol.md`, and
-`docs/conformance.md` for the complete technical disposition.
-
-## Contributing and CI
-
-See `CONTRIBUTING.md` for contribution requirements and `docs/ci.md` for the
-automated validation lanes and local equivalents.
+The narrower commands in each quickstart are better for a first run. The full
+gate is intentionally comprehensive.
 
 ## License
 

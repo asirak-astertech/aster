@@ -1,5 +1,10 @@
 # C ABI
 
+Use the ABI when embedding Aster in C, C++, or another language with a
+C-compatible foreign-function interface. Start with the
+[commented C quickstart](../../docs/quickstart/c.md); this page is the complete
+ownership, versioning, and capability reference.
+
 `aster_mesh.h` is the authoritative ABI v1 declaration. Link the matching
 `aster-ffi` shared or static library and initialize every versioned structure
 with `ASTER_STRUCT_INIT(type)` before use.
@@ -14,8 +19,9 @@ particular authenticated session.
 
 Explicit atomic publication uses `aster_node_publish_batch` with 2-64 ordered,
 same-class, same-topic, same-scope items. `ASTER_BATCH_RETAINED_DUAL` is the
-offline-safe default; `ASTER_BATCH_ONLY` opts out of semantic-v1 singleton
-retention. The opaque result preserves receipt order and exposes aggregate
+offline-safe default; `ASTER_BATCH_ONLY` opts out of retaining unchanged
+format-2 singleton representations for semantic-v1 peers. The opaque result
+preserves publish-result order and exposes aggregate
 post-insert eviction IDs; close it with `aster_batch_result_close`. Rejection
 commits no member and consumes no publisher counter or event sequence.
 
@@ -24,7 +30,9 @@ Blob payloads use `aster_blob_writer_t` and `aster_blob_reader_t`; generic
 `aster_blob_publish_options_init`, stream bounded caller slices with
 `aster_blob_writer_write`, then call the idempotent `finish`. The returned full
 Blob ID is the manifest item's logical key. Readers fill caller-owned buffers
-incrementally and report zero bytes only after whole-content verification.
+incrementally, authenticating each chunk before returning it. Whole-content
+digest verification completes only when a read reports zero bytes; do not act
+on accumulated plaintext before that EOF result.
 `aster_node_publish_blob_batch` finalizes and atomically publishes 2-64
 distinct, unpublished writers without exposing manifests or route commitments.
 Writers remain open and retryable; after success their ordinary `finish`
