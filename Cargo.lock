@@ -93,6 +93,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hkdf",
  "sha2",
+ "subtle",
  "tokio",
 ]
 
