@@ -105,6 +105,10 @@ Each publisher has a durable event sequence. Receivers preserve events and can
 ask Aster for gaps in that publisher's sequence. Different publishers do not
 pretend to share a single global clock or ordering authority.
 
+Entries may share a logical key to name their application stream. Event query
+and subscription results preserve every matching entry; unlike State and
+Record, Event entries are never collapsed by logical key.
+
 Do not repeatedly overwrite one Event logical key to model a mutable object. Use
 State or Record.
 

@@ -2019,6 +2019,72 @@ mod tests {
     }
 
     #[test]
+    fn same_key_events_remain_queryable_and_deliverable() {
+        let topic = Topic::new("events.stream").unwrap();
+        let scope = Scope::new("mission/events").unwrap();
+        let (path, _bundle, mut node) = batch_test_node(
+            "same-key-events",
+            0x95,
+            &topic,
+            &scope,
+            ApplicationNodeOptions::default(),
+        );
+        let subscription = node
+            .subscribe(topic.clone(), scope.clone(), Some(DataClass::Event), false)
+            .unwrap();
+        let mut published = Vec::new();
+        for payload in [b"first".as_slice(), b"second", b"third"] {
+            published.push(
+                node.publish(batch_publish_request(
+                    DataClass::Event,
+                    &topic,
+                    &scope,
+                    b"operations-chat",
+                    payload,
+                ))
+                .unwrap()
+                .id,
+            );
+        }
+
+        let queried = node
+            .query(Query {
+                topic: Some(topic),
+                scope: Some(scope),
+                class: Some(DataClass::Event),
+                logical_key: Some(b"operations-chat".to_vec()),
+                ..Query::default()
+            })
+            .unwrap();
+        assert_eq!(
+            queried
+                .iter()
+                .map(|item| item.payload.as_slice())
+                .collect::<Vec<_>>(),
+            [b"first".as_slice(), b"second", b"third"]
+        );
+
+        let deliveries = node.poll(subscription, 8).unwrap();
+        assert_eq!(
+            deliveries
+                .iter()
+                .map(|delivery| delivery.item.payload.as_slice())
+                .collect::<Vec<_>>(),
+            [b"first".as_slice(), b"second", b"third"]
+        );
+        assert_eq!(
+            deliveries
+                .iter()
+                .map(|delivery| delivery.item.id)
+                .collect::<Vec<_>>(),
+            published
+        );
+
+        drop(node);
+        remove_store(&path);
+    }
+
+    #[test]
     fn batch_only_items_reauthenticate_for_reads_and_restart() {
         let topic = Topic::new("batch.state").unwrap();
         let scope = Scope::new("mission/batch-only").unwrap();

@@ -95,6 +95,27 @@ class BindingTests(unittest.TestCase):
                     DataClass.EVENT, "position.current", "mission/team/alpha", b"only",
                 ),))
 
+    def test_same_key_event_stream_preserves_every_entry(self):
+        with Node(":memory:", BUNDLE) as node:
+            subscription = node.subscribe(
+                "position.current", "mission/team/alpha", data_class=DataClass.EVENT,
+            )
+            for payload in (b"first", b"second", b"third"):
+                node.publish(
+                    DataClass.EVENT, "position.current", "mission/team/alpha", payload,
+                    logical_key=b"operations-chat",
+                )
+
+            queried = node.query(
+                topic="position.current", scope="mission/team/alpha",
+                logical_key=b"operations-chat", data_class=DataClass.EVENT,
+            )
+            self.assertEqual([item.payload for item in queried],
+                             [b"first", b"second", b"third"])
+            deliveries = subscription.poll()
+            self.assertEqual([delivery.item.payload for delivery in deliveries],
+                             [b"first", b"second", b"third"])
+
     def test_error_and_repeated_lifecycle(self):
         with self.assertRaises(AsterError):
             Node(":memory:", b"not a provisioning bundle")
