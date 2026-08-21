@@ -179,7 +179,9 @@ for delivery in subscription.poll(limit=64):
 ```
 
 Stopping before acknowledgment can cause redelivery. That is the intended
-at-least-once contract.
+at-least-once contract. Acknowledging a projected current State or Record head
+does not promote a causally superseded ancestor into new work; concurrent Record
+siblings are acknowledged independently.
 
 ## Publish an atomic batch
 

@@ -1987,6 +1987,7 @@ mod tests {
         for delivery in deliveries {
             node.acknowledge(subscription, delivery.item.id).unwrap();
         }
+        assert!(node.poll(subscription, 8).unwrap().is_empty());
         drop(node);
 
         let mut restarted =
@@ -2082,6 +2083,225 @@ mod tests {
 
         drop(node);
         remove_store(&path);
+    }
+
+    #[test]
+    fn acknowledging_current_state_and_record_does_not_reveal_ancestors() {
+        let topic = Topic::new("projection.ack").unwrap();
+        let scope = Scope::new("mission/projection").unwrap();
+        let (path, _bundle, mut node) = batch_test_node(
+            "projection-ack",
+            0x96,
+            &topic,
+            &scope,
+            ApplicationNodeOptions::default(),
+        );
+        let subscription = node
+            .subscribe(topic.clone(), scope.clone(), None, false)
+            .unwrap();
+        for (class, key) in [
+            (DataClass::State, b"state-key".as_slice()),
+            (DataClass::Record, b"record-key".as_slice()),
+        ] {
+            node.publish(batch_publish_request(class, &topic, &scope, key, b"old"))
+                .unwrap();
+            node.publish(batch_publish_request(class, &topic, &scope, key, b"new"))
+                .unwrap();
+        }
+
+        let deliveries = node.poll(subscription, 8).unwrap();
+        assert_eq!(deliveries.len(), 2);
+        assert_eq!(
+            deliveries
+                .iter()
+                .map(|delivery| delivery.item.class)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([DataClass::State, DataClass::Record])
+        );
+        assert!(
+            deliveries
+                .iter()
+                .all(|delivery| delivery.item.payload == b"new")
+        );
+        for delivery in deliveries {
+            node.acknowledge(subscription, delivery.item.id).unwrap();
+        }
+        assert!(node.poll(subscription, 8).unwrap().is_empty());
+
+        let recoverable = node
+            .query(Query {
+                topic: Some(topic),
+                scope: Some(scope),
+                include_recoverable_versions: true,
+                ..Query::default()
+            })
+            .unwrap();
+        assert_eq!(recoverable.len(), 4);
+        assert_eq!(
+            recoverable
+                .iter()
+                .map(|item| item.payload.as_slice())
+                .collect::<Vec<_>>()
+                .iter()
+                .filter(|payload| **payload == b"old")
+                .count(),
+            2
+        );
+
+        drop(node);
+        remove_store(&path);
+    }
+
+    #[test]
+    fn acknowledged_causal_intermediates_preserve_subscription_projection() {
+        let scope = Scope::new("mission/projection-chain").unwrap();
+        let state_topic = Topic::new("projection.chain.state").unwrap();
+        let record_topic = Topic::new("projection.chain.record").unwrap();
+        let concurrent_topic = Topic::new("projection.concurrent.record").unwrap();
+        let access = ProvisioningAccess::member(
+            scope.clone(),
+            vec![0],
+            vec![
+                state_topic.clone(),
+                record_topic.clone(),
+                concurrent_topic.clone(),
+            ],
+        )
+        .unwrap();
+        let mut provisioner = ReferenceProvisioner::from_seed([0x97; 32]).unwrap();
+        let first_bytes = provisioner
+            .issue_node(1, std::slice::from_ref(&access))
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        let second_bytes = provisioner
+            .issue_node(2, std::slice::from_ref(&access))
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        let third_bytes = provisioner
+            .issue_node(3, std::slice::from_ref(&access))
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        let receiver_bytes = provisioner
+            .issue_node(4, &[access])
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        let first_path = api_test_path("projection-chain-first");
+        let second_path = api_test_path("projection-chain-second");
+        let third_path = api_test_path("projection-chain-third");
+        let receiver_path = api_test_path("projection-chain-receiver");
+        let mut first =
+            ApplicationNode::open(&first_path, &first_bytes, ApplicationNodeOptions::default())
+                .unwrap();
+        let mut second = ApplicationNode::open(
+            &second_path,
+            &second_bytes,
+            ApplicationNodeOptions::default(),
+        )
+        .unwrap();
+        let mut third =
+            ApplicationNode::open(&third_path, &third_bytes, ApplicationNodeOptions::default())
+                .unwrap();
+        let mut receiver = ApplicationNode::open(
+            &receiver_path,
+            &receiver_bytes,
+            ApplicationNodeOptions::default(),
+        )
+        .unwrap();
+
+        for (class, topic) in [
+            (DataClass::State, state_topic),
+            (DataClass::Record, record_topic),
+        ] {
+            let subscription = receiver
+                .subscribe(topic.clone(), scope.clone(), Some(class), false)
+                .unwrap();
+            let a = first
+                .publish(batch_publish_request(class, &topic, &scope, b"chain", b"a"))
+                .unwrap();
+            copy_ordinary_item(&mut first, &mut second, a.id);
+            copy_ordinary_item(&mut first, &mut receiver, a.id);
+            let b = second
+                .publish(batch_publish_request(class, &topic, &scope, b"chain", b"b"))
+                .unwrap();
+            copy_ordinary_item(&mut second, &mut receiver, b.id);
+            let delivered_b = receiver.poll(subscription, 8).unwrap();
+            assert_eq!(delivered_b.len(), 1);
+            assert_eq!(delivered_b[0].item.id, b.id);
+            receiver.acknowledge(subscription, b.id).unwrap();
+
+            // Third observes B directly but never receives A. Its context names
+            // B only, so acknowledged B is required as a transitive projection
+            // witness after C supersedes it.
+            copy_ordinary_item(&mut second, &mut third, b.id);
+            let c = third
+                .publish(batch_publish_request(class, &topic, &scope, b"chain", b"c"))
+                .unwrap();
+            copy_ordinary_item(&mut third, &mut receiver, c.id);
+            let delivered_c = receiver.poll(subscription, 8).unwrap();
+            assert_eq!(delivered_c.len(), 1);
+            assert_eq!(delivered_c[0].item.id, c.id);
+            assert_eq!(delivered_c[0].item.payload, b"c");
+            receiver.acknowledge(subscription, c.id).unwrap();
+            assert!(receiver.poll(subscription, 8).unwrap().is_empty());
+        }
+
+        let concurrent_subscription = receiver
+            .subscribe(
+                concurrent_topic.clone(),
+                scope.clone(),
+                Some(DataClass::Record),
+                false,
+            )
+            .unwrap();
+        let left = first
+            .publish(batch_publish_request(
+                DataClass::Record,
+                &concurrent_topic,
+                &scope,
+                b"siblings",
+                b"left",
+            ))
+            .unwrap();
+        let right = second
+            .publish(batch_publish_request(
+                DataClass::Record,
+                &concurrent_topic,
+                &scope,
+                b"siblings",
+                b"right",
+            ))
+            .unwrap();
+        copy_ordinary_item(&mut first, &mut receiver, left.id);
+        copy_ordinary_item(&mut second, &mut receiver, right.id);
+        let siblings = receiver.poll(concurrent_subscription, 8).unwrap();
+        assert_eq!(siblings.len(), 2);
+        receiver
+            .acknowledge(concurrent_subscription, left.id)
+            .unwrap();
+        let remaining = receiver.poll(concurrent_subscription, 8).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].item.id, right.id);
+        receiver
+            .acknowledge(concurrent_subscription, right.id)
+            .unwrap();
+        assert!(
+            receiver
+                .poll(concurrent_subscription, 8)
+                .unwrap()
+                .is_empty()
+        );
+
+        drop(first);
+        drop(second);
+        drop(third);
+        drop(receiver);
+        for path in [first_path, second_path, third_path, receiver_path] {
+            remove_store(&path);
+        }
     }
 
     #[test]

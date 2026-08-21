@@ -1001,6 +1001,11 @@ pub(crate) struct BridgeProjectionQuery {
     pub(crate) target_route_epoch: Option<u64>,
     pub(crate) topic: Option<Topic>,
     pub(crate) class: Option<DataClass>,
+    /// Restricts a wildcard class query to mutable State/Record entries before
+    /// any matching bridge route or source material is loaded.
+    pub(crate) mutable_classes_only: bool,
+    /// Restricts results to entries acknowledged by one durable subscription.
+    pub(crate) acknowledged_subscription: Option<SubscriptionId>,
     pub(crate) logical_key: Option<Vec<u8>>,
     pub(crate) version_status: Option<VersionStatus>,
     pub(crate) include_tombstones: bool,
@@ -8446,6 +8451,10 @@ impl SqliteStore {
         if let Some(class) = query.class {
             sql.push_str(" AND s.data_class=?");
             values.push(class_to_i64(class).into());
+        } else if query.mutable_classes_only {
+            sql.push_str(" AND s.data_class IN (?,?)");
+            values.push(class_to_i64(DataClass::State).into());
+            values.push(class_to_i64(DataClass::Record).into());
         }
         if let Some(key) = &query.logical_key {
             sql.push_str(" AND s.logical_key=?");
@@ -8454,6 +8463,14 @@ impl SqliteStore {
         if let Some(status) = query.version_status {
             sql.push_str(" AND p.version_status=?");
             values.push((status as u8 as i64).into());
+        }
+        if let Some(subscription) = query.acknowledged_subscription {
+            sql.push_str(
+                " AND EXISTS(SELECT 1 FROM semantic_app_deliveries d\n\
+                   WHERE d.subscription_id=? AND d.item_id=p.source_item_id\n\
+                     AND d.acked_at_ms IS NOT NULL)",
+            );
+            values.push(sql_u64(subscription.0, "subscription id")?.into());
         }
         if !query.include_tombstones {
             sql.push_str(" AND s.tombstone=0");
@@ -8537,6 +8554,28 @@ impl SqliteStore {
         after: Option<BridgeProjectionCursor>,
         custody_sample: Option<CustodySample>,
     ) -> Result<BridgeProjectionPage, StoreError> {
+        self.bridge_projection_subscription_page(id, after, custody_sample, false)
+    }
+
+    /// Returns acknowledged State/Record bridge candidates. Application
+    /// projection combines these with the ordinary unacknowledged page before
+    /// reduction so an acknowledged current head still suppresses its ancestors.
+    pub(crate) fn peek_acknowledged_bridge_projection_subscription_page(
+        &self,
+        id: SubscriptionId,
+        after: Option<BridgeProjectionCursor>,
+        custody_sample: Option<CustodySample>,
+    ) -> Result<BridgeProjectionPage, StoreError> {
+        self.bridge_projection_subscription_page(id, after, custody_sample, true)
+    }
+
+    fn bridge_projection_subscription_page(
+        &self,
+        id: SubscriptionId,
+        after: Option<BridgeProjectionCursor>,
+        custody_sample: Option<CustodySample>,
+        include_acknowledged: bool,
+    ) -> Result<BridgeProjectionPage, StoreError> {
         let subscription: Option<(String, String, Option<i64>)> = self
             .connection
             .query_row(
@@ -8548,12 +8587,23 @@ impl SqliteStore {
         let Some((topic, scope, class)) = subscription else {
             return Err(StoreError::NotFound("subscription"));
         };
+        let class = class.map(class_from_i64).transpose()?;
+        if include_acknowledged
+            && class.is_some_and(|class| !matches!(class, DataClass::State | DataClass::Record))
+        {
+            return Ok(BridgeProjectionPage {
+                entries: Vec::new(),
+                next_cursor: None,
+            });
+        }
         let query = BridgeProjectionQuery {
             target_scope: Some(
                 Scope::new(scope).map_err(|error| StoreError::Corrupt(error.to_string()))?,
             ),
             topic: Some(Topic::new(topic).map_err(|error| StoreError::Corrupt(error.to_string()))?),
-            class: class.map(class_from_i64).transpose()?,
+            class,
+            mutable_classes_only: include_acknowledged,
+            acknowledged_subscription: include_acknowledged.then_some(id),
             // Subscription reduction is performed over the combined ordinary
             // and bridge candidate set; a representation-local Current bit
             // must not hide the live fallback after another path expires.
@@ -8564,6 +8614,9 @@ impl SqliteStore {
             ..BridgeProjectionQuery::default()
         };
         let mut page = self.query_active_bridge_projection_page(&query, after)?;
+        if include_acknowledged {
+            return Ok(page);
+        }
         let mut retained = Vec::with_capacity(page.entries.len());
         for projection in page.entries {
             let acknowledged: i64 = self.connection.query_row(
@@ -8581,6 +8634,57 @@ impl SqliteStore {
         }
         page.entries = retained;
         Ok(page)
+    }
+
+    /// Returns acknowledged ordinary State/Record candidates that still match
+    /// one durable subscription. Immutable Event/Blob history remains on the
+    /// existing unacknowledged-only scan and is not rematerialized on every poll.
+    pub(crate) fn acknowledged_subscription_projection_items(
+        &self,
+        id: SubscriptionId,
+        custody_sample: Option<CustodySample>,
+    ) -> Result<Vec<StoredItem>, StoreError> {
+        let columns = ITEM_COLUMNS
+            .split(',')
+            .map(|column| format!("i.{column}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT {columns} FROM semantic_app_deliveries d\n\
+             JOIN subscriptions s ON s.subscription_id=d.subscription_id\n\
+             JOIN items i ON i.item_id=d.item_id\n\
+             WHERE d.subscription_id=?1 AND d.acked_at_ms IS NOT NULL\n\
+               AND i.data_class IN (?2,?3)\n\
+               AND i.topic=s.topic\n\
+               AND (i.scope=s.scope OR (s.descendants<>0 AND i.scope LIKE s.scope || '/%'))\n\
+               AND (s.data_class IS NULL OR i.data_class=s.data_class)\n\
+             ORDER BY i.priority DESC,i.inserted_order ASC"
+        );
+        let mut statement = self.connection.prepare(&sql)?;
+        let rows = statement.query_map(
+            params![
+                sql_u64(id.0, "subscription id")?,
+                class_to_i64(DataClass::State),
+                class_to_i64(DataClass::Record)
+            ],
+            decode_item_row,
+        )?;
+        let max_items =
+            usize::try_from(self.config.max_items).map_err(|_| StoreError::QuotaExceeded)?;
+        let scan_limit = max_items.checked_add(1).ok_or(StoreError::QuotaExceeded)?;
+        let items = rows
+            .take(scan_limit)
+            .filter(|row| {
+                row.as_ref()
+                    .map_or(true, |item| !item.is_expired_at(custody_sample))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if items.len() > max_items {
+            return Err(StoreError::Corrupt(
+                "acknowledged subscription projection exceeds configured object bound".into(),
+            ));
+        }
+        Ok(items)
     }
 
     /// Crash-atomically records attempts only for candidates whose content was
@@ -19968,6 +20072,8 @@ mod sqlite_integration_tests {
             target_route_epoch: Some(first.route.current_route_epoch),
             topic: Some(first.source.metadata.topic.clone()),
             class: Some(DataClass::State),
+            mutable_classes_only: false,
+            acknowledged_subscription: None,
             logical_key: Some(first.source.metadata.logical_key.clone()),
             version_status: None,
             include_tombstones: false,
@@ -20073,6 +20179,8 @@ mod sqlite_integration_tests {
                 target_route_epoch: Some(route.route.current_route_epoch),
                 topic: Some(route.source.metadata.topic.clone()),
                 class: Some(route.source.metadata.class),
+                mutable_classes_only: false,
+                acknowledged_subscription: None,
                 logical_key: Some(route.source.metadata.logical_key.clone()),
                 version_status: Some(VersionStatus::Current),
                 include_tombstones: false,
@@ -20885,6 +20993,14 @@ mod sqlite_integration_tests {
                 .entries
                 .is_empty()
         );
+        let acknowledged = store
+            .peek_acknowledged_bridge_projection_subscription_page(subscription, None, Some(sample))
+            .unwrap();
+        assert_eq!(acknowledged.entries.len(), 1);
+        assert_eq!(
+            acknowledged.entries[0].source.metadata.source_item_id,
+            first.source.metadata.source_item_id
+        );
 
         let target_item = ordinary_item_from_bridge_source(
             &replacement,
@@ -20902,6 +21018,101 @@ mod sqlite_integration_tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn acknowledged_bridge_projection_skips_immutable_classes_before_materialization() {
+        let authorization = verified_bridge_authorization();
+        let sample = bridge_sample(10);
+        let base = verified_bridge_route(&[&authorization], 0xd7, b"immutable-bridge-event");
+        let mut metadata = base.source.metadata.clone();
+        metadata.class = DataClass::Event;
+        metadata.event_sequence = Some(1);
+        let source = VerifiedBridgeSource::from_provider(
+            base.route.origin_envelope_id,
+            metadata,
+            base.source.exact_bytes.clone(),
+            base.source.authenticated_forwarding_age_ms,
+        )
+        .unwrap();
+        let route = VerifiedBridgeRoute::from_provider(
+            base.wrapper_envelope_id,
+            base.route.clone(),
+            base.exact_wrapper_bytes.clone(),
+            base.authenticated_forwarding_age_ms,
+            source,
+        )
+        .unwrap();
+        let mut store = SqliteStore::open_in_memory(StoreConfig::default()).unwrap();
+        configure_bridge_epoch(&mut store, "mission/source", 3);
+        configure_bridge_epoch(&mut store, "mission/target", 5);
+        store.ingest_bridge_authorization(&authorization).unwrap();
+        store
+            .promote_verified_bridge_route_at(&route, Some(sample))
+            .unwrap();
+        let event_subscription = store
+            .create_subscription(&SubscriptionSpec {
+                topic: route.source.metadata.topic.clone(),
+                scope: route.route.current_scope.clone(),
+                include_descendant_scopes: false,
+                class: Some(DataClass::Event),
+            })
+            .unwrap();
+        let any_subscription = store
+            .create_subscription(&SubscriptionSpec {
+                topic: route.source.metadata.topic.clone(),
+                scope: route.route.current_scope.clone(),
+                include_descendant_scopes: false,
+                class: None,
+            })
+            .unwrap();
+        for subscription in [event_subscription, any_subscription] {
+            let projection = store
+                .peek_bridge_projection_subscription_page(subscription, None, Some(sample))
+                .unwrap()
+                .entries
+                .remove(0);
+            store
+                .record_bridge_projection_deliveries(
+                    subscription,
+                    &[ProviderOpenedBridgeProjection::from_provider(projection)],
+                    Some(20),
+                    Some(sample),
+                )
+                .unwrap();
+            store
+                .acknowledge_bridge_projection_delivery(
+                    subscription,
+                    route.source.metadata.source_item_id,
+                    Some(21),
+                )
+                .unwrap();
+        }
+
+        // A mutable-witness scan must filter the Event row in SQL. Corrupting
+        // the otherwise valid wrapper makes any accidental materialization
+        // observable as an error.
+        store
+            .connection
+            .execute(
+                "UPDATE bridge_route_wrappers SET exact_bytes=x'00'\n\
+                 WHERE wrapper_envelope_id=?1",
+                params![route.wrapper_envelope_id.as_slice()],
+            )
+            .unwrap();
+        for subscription in [event_subscription, any_subscription] {
+            assert!(
+                store
+                    .peek_acknowledged_bridge_projection_subscription_page(
+                        subscription,
+                        None,
+                        Some(sample),
+                    )
+                    .unwrap()
+                    .entries
+                    .is_empty()
+            );
+        }
     }
 
     #[test]

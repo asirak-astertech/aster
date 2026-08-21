@@ -1902,6 +1902,7 @@ struct OpenedSubscriptionCandidate {
     item: ApplicationItem,
     inserted_order: u64,
     representation_order: u8,
+    acknowledged: bool,
     representation: SubscriptionRepresentation,
 }
 
@@ -2426,7 +2427,9 @@ impl Node<SqliteStore, crate::crypto::ReferenceEnvelopeSealer> {
             }
             ordinary_cursor = Some(next);
         }
-        let ordinary_ids = ordinary.iter().map(|item| item.id).collect::<BTreeSet<_>>();
+        let acknowledged_ordinary = self
+            .store
+            .acknowledged_subscription_projection_items(subscription, custody)?;
         let mut opened = Vec::new();
         for stored in ordinary {
             let retained = stored.clone();
@@ -2435,9 +2438,28 @@ impl Node<SqliteStore, crate::crypto::ReferenceEnvelopeSealer> {
                 item: self.open_application_item(stored)?,
                 inserted_order,
                 representation_order: 0,
+                acknowledged: false,
                 representation: SubscriptionRepresentation::Ordinary(Box::new(retained)),
             });
         }
+        for stored in acknowledged_ordinary {
+            let retained = stored.clone();
+            let inserted_order = stored.inserted_order;
+            opened.push(OpenedSubscriptionCandidate {
+                item: self.open_application_item(stored)?,
+                inserted_order,
+                representation_order: 0,
+                acknowledged: true,
+                representation: SubscriptionRepresentation::Ordinary(Box::new(retained)),
+            });
+        }
+        let ordinary_ids = opened
+            .iter()
+            .filter_map(|candidate| match &candidate.representation {
+                SubscriptionRepresentation::Ordinary(_) => Some(candidate.item.id),
+                SubscriptionRepresentation::Bridged(_) => None,
+            })
+            .collect::<BTreeSet<_>>();
 
         let mut bridge_cursor: Option<BridgeProjectionCursor> = None;
         let mut bridge_seen = BTreeSet::new();
@@ -2460,6 +2482,7 @@ impl Node<SqliteStore, crate::crypto::ReferenceEnvelopeSealer> {
                         item,
                         inserted_order,
                         representation_order: 1,
+                        acknowledged: false,
                         representation: SubscriptionRepresentation::Bridged(Box::new(retained)),
                     });
                 }
@@ -2472,7 +2495,43 @@ impl Node<SqliteStore, crate::crypto::ReferenceEnvelopeSealer> {
             }
             bridge_cursor = Some(next);
         }
+        let mut acknowledged_bridge_cursor: Option<BridgeProjectionCursor> = None;
+        loop {
+            let page = self
+                .store
+                .peek_acknowledged_bridge_projection_subscription_page(
+                    subscription,
+                    acknowledged_bridge_cursor,
+                    custody,
+                )?;
+            for projection in page.entries {
+                let id = projection.source.metadata.source_item_id;
+                if ordinary_ids.contains(&id) || bridge_seen.contains(&id) {
+                    continue;
+                }
+                let retained = projection.clone();
+                let inserted_order = projection.route.inserted_order;
+                if let Some(item) = self.open_bridge_application_item(projection)? {
+                    bridge_seen.insert(id);
+                    opened.push(OpenedSubscriptionCandidate {
+                        item,
+                        inserted_order,
+                        representation_order: 1,
+                        acknowledged: true,
+                        representation: SubscriptionRepresentation::Bridged(Box::new(retained)),
+                    });
+                }
+            }
+            let Some(next) = page.next_cursor else { break };
+            if Some(next) == acknowledged_bridge_cursor {
+                return Err(EngineError::Invalid(
+                    "acknowledged bridge subscription cursor did not advance".into(),
+                ));
+            }
+            acknowledged_bridge_cursor = Some(next);
+        }
         opened = reduce_subscription_projection(opened);
+        opened.retain(|candidate| !candidate.acknowledged);
         opened.sort_by(subscription_candidate_order);
         let mut seen = BTreeSet::new();
         opened.retain(|candidate| seen.insert(candidate.item.id));
@@ -2564,6 +2623,8 @@ impl Node<SqliteStore, crate::crypto::ReferenceEnvelopeSealer> {
             target_route_epoch: None,
             topic: query.topic.clone(),
             class: query.class,
+            mutable_classes_only: false,
+            acknowledged_subscription: None,
             logical_key: query.logical_key.clone(),
             // Representation-local status cannot decide dominance across an
             // ordinary target item and a bridged source. Fetch every retained
