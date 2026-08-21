@@ -558,6 +558,10 @@ pub enum SyncEvent {
     /// selected views and request fresh authenticated selections without
     /// inventing an object identity.
     LocalInventoryChanged,
+    /// A durable peer acknowledgement changed only the representation-specific
+    /// inventory that this contact may serve. Preserve the independently
+    /// authorized receive baseline and its live Merkle traversal.
+    ServeInventoryChanged,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -865,6 +869,7 @@ impl SyncState {
             SyncEvent::LocalObjectAdded { object_id } => self.local_added(object_id),
             SyncEvent::LocalObjectRemoved { object_id } => self.local_removed(object_id),
             SyncEvent::LocalInventoryChanged => self.inventory_changed(),
+            SyncEvent::ServeInventoryChanged => self.serve_inventory_changed(),
         }
     }
 
@@ -1365,12 +1370,20 @@ impl SyncState {
             }
         }
 
-        let newly_requested = offer
-            .object_ids
-            .iter()
-            .copied()
-            .filter(|id| !self.inventory.contains(id) && !self.wants.contains(id))
-            .collect::<Vec<_>>();
+        let newly_requested = {
+            let receive_inventory =
+                self.receive_inventory
+                    .as_ref()
+                    .ok_or(SyncError::InventoryNotSelected(
+                        InventoryPurpose::ReceiveBaseline,
+                    ))?;
+            offer
+                .object_ids
+                .iter()
+                .copied()
+                .filter(|id| !receive_inventory.contains(id) && !self.wants.contains(id))
+                .collect::<Vec<_>>()
+        };
         let wants_after = self
             .wants
             .len()
@@ -1390,17 +1403,25 @@ impl SyncState {
             debug_assert!(inserted);
             self.bump_revision()?;
         }
-        let requested = offer
-            .object_ids
-            .into_iter()
-            .filter(|id| {
-                !self.inventory.contains(id)
-                    && self
-                        .wants
-                        .get(id)
-                        .is_some_and(|progress| !progress.is_complete())
-            })
-            .collect::<Vec<_>>();
+        let requested = {
+            let receive_inventory =
+                self.receive_inventory
+                    .as_ref()
+                    .ok_or(SyncError::InventoryNotSelected(
+                        InventoryPurpose::ReceiveBaseline,
+                    ))?;
+            offer
+                .object_ids
+                .into_iter()
+                .filter(|id| {
+                    !receive_inventory.contains(id)
+                        && self
+                            .wants
+                            .get(id)
+                            .is_some_and(|progress| !progress.is_complete())
+                })
+                .collect::<Vec<_>>()
+        };
         self.push_want_ids(&requested, actions);
         let exchange = self.active.as_mut().ok_or(SyncError::NoActiveExchange)?;
         if exchange.pending_root_probe == Some(commitment) {
@@ -1621,22 +1642,7 @@ impl SyncState {
         // reconciliation does not discard sibling leaves after the first
         // commit. Only the independently authorized serve direction needs a
         // fresh backend selection because the new object may now be relayable.
-        self.serve_inventory = None;
-        let peer_filter = self
-            .active
-            .as_ref()
-            .and_then(|exchange| exchange.peer_interest.clone());
-        if let Some(exchange) = self.active.as_mut() {
-            exchange.summary_sent = None;
-            exchange
-                .selection_requested
-                .remove(&InventoryPurpose::ServePeer);
-        }
-        let mut actions = Vec::new();
-        if let Some(filter) = peer_filter {
-            self.push_selection(InventoryPurpose::ServePeer, filter, &mut actions)?;
-        }
-        Ok(actions)
+        self.serve_inventory_changed()
     }
 
     fn object_deferred(
@@ -1797,6 +1803,25 @@ impl SyncState {
             validate_outbound(&interest, self.semantic_version)?;
             actions.push(SyncAction::Send(interest));
         }
+        if let Some(filter) = peer_filter {
+            self.push_selection(InventoryPurpose::ServePeer, filter, &mut actions)?;
+        }
+        Ok(actions)
+    }
+
+    fn serve_inventory_changed(&mut self) -> Result<Vec<SyncAction>, SyncError> {
+        self.serve_inventory = None;
+        let peer_filter = self
+            .active
+            .as_ref()
+            .and_then(|exchange| exchange.peer_interest.clone());
+        if let Some(exchange) = self.active.as_mut() {
+            exchange.summary_sent = None;
+            exchange
+                .selection_requested
+                .remove(&InventoryPurpose::ServePeer);
+        }
+        let mut actions = Vec::new();
         if let Some(filter) = peer_filter {
             self.push_selection(InventoryPurpose::ServePeer, filter, &mut actions)?;
         }
@@ -2153,7 +2178,9 @@ fn validate_event_for_semantic_version(
             }
             Ok(())
         }
-        SyncEvent::Start { .. } | SyncEvent::LocalInventoryChanged => Ok(()),
+        SyncEvent::Start { .. }
+        | SyncEvent::LocalInventoryChanged
+        | SyncEvent::ServeInventoryChanged => Ok(()),
     }
 }
 
@@ -2669,6 +2696,76 @@ mod tests {
     }
 
     #[test]
+    fn serve_inventory_change_preserves_live_receive_traversal() {
+        let mut state = SyncState::new(SyncConfig::default(), SparseInventory::new()).unwrap();
+        start_with_baseline(&mut state, 131, SparseInventory::from_ids([id(1)]));
+        let remote = SparseInventory::from_ids([id(2), id(3)]);
+        state
+            .apply(SyncEvent::Receive(Message::Summary(Summary {
+                exchange_id: 131,
+                root_hash: remote.root_hash(),
+                item_count: remote.item_count(),
+                snapshot_id: remote.snapshot_id(),
+            })))
+            .unwrap();
+
+        let peer_actions = state
+            .apply(SyncEvent::Receive(Message::Interest(Interest {
+                exchange_id: 131,
+                topics: vec!["mission".into()],
+                scopes: vec!["team".into()],
+                min_priority: 0,
+                max_offers: 8,
+            })))
+            .unwrap();
+        let (serve_request, serve_filter) = selection(&peer_actions, InventoryPurpose::ServePeer);
+        state
+            .apply(SyncEvent::InventorySelected {
+                exchange_id: 131,
+                request_id: serve_request,
+                purpose: InventoryPurpose::ServePeer,
+                filter: serve_filter,
+                inventory: SparseInventory::from_ids([id(1)]),
+            })
+            .unwrap();
+
+        let receive_inventory = state.receive_inventory.clone();
+        let exchange = state.active.as_ref().expect("active exchange");
+        let pending_summary = exchange.pending_summary.clone();
+        let remote_snapshot = exchange.remote_snapshot;
+        let pending_root_probe = exchange.pending_root_probe;
+        let root_offer_history = exchange.root_offer_history.clone();
+        let probes_sent = exchange.probes_sent.clone();
+        let expected_nodes = exchange.expected_nodes.clone();
+
+        let actions = state.apply(SyncEvent::ServeInventoryChanged).unwrap();
+
+        assert_eq!(state.receive_inventory, receive_inventory);
+        let exchange = state.active.as_ref().expect("active exchange");
+        assert_eq!(exchange.pending_summary, pending_summary);
+        assert_eq!(exchange.remote_snapshot, remote_snapshot);
+        assert_eq!(exchange.pending_root_probe, pending_root_probe);
+        assert_eq!(exchange.root_offer_history, root_offer_history);
+        assert_eq!(exchange.probes_sent, probes_sent);
+        assert_eq!(exchange.expected_nodes, expected_nodes);
+        assert!(state.serve_inventory.is_none());
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            SyncAction::SelectInventory {
+                purpose: InventoryPurpose::ServePeer,
+                ..
+            }
+        )));
+        assert!(!actions.iter().any(|action| matches!(
+            action,
+            SyncAction::SelectInventory {
+                purpose: InventoryPurpose::ReceiveBaseline,
+                ..
+            } | SyncAction::Send(Message::Interest(_))
+        )));
+    }
+
+    #[test]
     fn delayed_probe_waits_for_pending_serve_inventory_reselection() {
         let mut state = SyncState::new(SyncConfig::default(), SparseInventory::new()).unwrap();
         let peer_actions = state
@@ -2876,6 +2973,36 @@ mod tests {
                 .expected_nodes
                 .keys()
                 .any(|(snapshot_id, _)| *snapshot_id == remote.snapshot_id())
+        );
+    }
+
+    #[test]
+    fn complete_root_offer_uses_authorized_receive_baseline_for_held_objects() {
+        let held = id(1);
+        let durable_baseline = SparseInventory::from_ids([held]);
+        let mut state = SyncState::new(SyncConfig::default(), SparseInventory::new()).unwrap();
+        start_with_baseline(&mut state, 61, durable_baseline.clone());
+        let offer = pending_root_offer(&mut state, 61, &durable_baseline);
+
+        assert!(state.inventory.is_empty());
+        assert!(
+            state
+                .receive_inventory
+                .as_ref()
+                .is_some_and(|inventory| inventory.contains(&held))
+        );
+
+        let actions = state
+            .apply(SyncEvent::Receive(Message::Offer(offer)))
+            .unwrap();
+
+        assert!(state.wants().is_empty());
+        assert!(
+            !actions.iter().any(|action| matches!(
+                action,
+                SyncAction::Send(Message::Want(Want { items, .. })) if !items.is_empty()
+            )),
+            "a durable baseline object must not be requested again"
         );
     }
 
