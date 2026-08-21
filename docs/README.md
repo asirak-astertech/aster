@@ -55,7 +55,7 @@ the authority for what application code is expected to touch.
 | Surface | Available now | Important boundary |
 |---|---|---|
 | Rust application API | Publish, query, durable subscriptions, conflicts, batches, streamed Blobs, emission policy, status, bridges, and recipient-filtered rekey | Event-gap inspection, process-local merge-policy ID registration, and retention-driven garbage collection are Rust-only. Policy registration only annotates high-level conflict results; replicated ingestion never executes application policy. Automatic Record merge under requirements §5.3 is partial. The complete authority-side rekey-registry administration workflow is not shipped. |
-| Protected provisioning | Replaceable, bounded, zeroizing Rust protection boundary for application and live-service open | No operational provider or persistent secret store is shipped; raw fixture/compatibility paths remain in Rust and all language bindings. |
+| Protected provisioning | Replaceable, bounded Rust protection boundary with a redacted, zeroizing Aster-owned plaintext container, plus an isolated age-v1 X25519 provider pilot | The pilot is Rust-only, non-production, classical rather than post-quantum, and not FIPS validated or a persistent secret store; upstream age encryption and identity-decoding intermediates are not comprehensively zeroized, and raw fixture/compatibility paths remain in Rust and all language bindings. |
 | Rust composition host | Owns the durable node, authenticated session, Blob transfer store, and configured `Link` carriers | One active authenticated contact at a time in the current bounded profile |
 | Live synchronization | Currently requires application logic to run inside a Rust process using `MeshService` | C, Go, and Python do not have an in-process networking API. The out-of-process local agent is post-MVP; see [ADR 0008](decisions/0008-local-agent-phasing.md). |
 | C ABI | High-level offline application operations | No event-gap inspection, merge-policy registration, retention-driven garbage collection, sealed objects, cryptographic provider, or carrier configuration |
@@ -84,6 +84,7 @@ decision records explain why the current design chose its major boundaries:
 - [0011 — Recipient-filtered rekey](decisions/0011-recipient-filtered-rekey.md)
 - [0012 — Content-committing post-quantum batches](decisions/0012-content-committing-pq-batches.md)
 - [0013 — Protected provisioning boundary](decisions/0013-protected-provisioning-boundary.md)
+- [0018 — age X25519 provisioning-provider pilot](decisions/0018-age-provisioning-provider.md)
 
 ## All documents
 

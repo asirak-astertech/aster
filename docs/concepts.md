@@ -317,10 +317,12 @@ provisioning workflow.
 There are three distinct custody layers. A protected artifact is a provider-
 owned encrypted or hardware-bound outer object. `ASTRPB03` is the bounded
 plaintext inner bundle exposed only during ingestion. A persistent secret store
-protects the long-lived keys a running node must reload. Aster now defines a
-replaceable protection boundary for the first transition, but ships no
-operational provider or persistent secret-store backend yet. The checked-in
-fixture exercises only the raw compatibility/test path.
+protects the long-lived keys a running node must reload. Aster defines a
+replaceable protection boundary for the first transition and ships an isolated
+Rust age-v1 X25519 provider pilot. The pilot is classical, non-FIPS, and not an
+operational default or persistent secret-store backend. The checked-in fixture
+and current language bindings still exercise only the raw compatibility/test
+path.
 
 Routing keys and content keys are separate. A routing-only node may forward
 protected metadata and ciphertext without obtaining the topic content key. A
@@ -344,9 +346,11 @@ independently retain and enforce its registry-generation high-water mark.
 - Relays may have routing access without content access.
 - Encryption does not hide endpoints, timing, packet sizes, RF energy, or the
   fact that Aster traffic exists.
-- The portable cryptographic provider uses the fixed NIST-algorithm profile, but
-  the project does not claim FIPS 140-3 module validation or production
-  authorization.
+- The portable mesh cryptographic provider uses the fixed NIST-algorithm
+  profile, but the project does not claim FIPS 140-3 module validation or
+  production authorization.
+- The separate age provisioning-artifact pilot uses classic X25519, is not
+  post-quantum or FIPS validated, and does not replace persistent key custody.
 
 Read [Security](security.md) for the actual threat model, controls, and open
 deployment gates.

@@ -75,9 +75,10 @@ It exercises durable, offline application behavior without pretending to be an
 operational deployment.
 
 Operational provisioning is still gated. Rust exposes a replaceable protected-
-artifact boundary, but this repository does not yet ship an admitted provider
-or persistent secret store; the fixture and current language-binding entry
-points ingest the unprotected inner format for tests and compatibility only.
+artifact boundary and an isolated age-v1 X25519 provider pilot. That pilot is
+not a production default, post-quantum or FIPS claim, persistent secret store,
+or protected language-binding workflow; the fixture and current binding entry
+points still ingest the unprotected inner format for tests and compatibility.
 
 | Your application | Start here |
 |---|---|
@@ -113,6 +114,7 @@ service, a conventional database or broker will usually be simpler.
 | [`crates/aster-host`](crates/aster-host) | High-level node plus authenticated contact and carrier composition |
 | [`crates/aster-ip`](crates/aster-ip) | Nonblocking UDP/IP link, discovery, rendezvous, and opaque relay support |
 | [`crates/aster-ble`](crates/aster-ble) | BTLE link over a small platform-radio interface |
+| [`crates/aster-provisioning-age`](crates/aster-provisioning-age) | Experimental Rust-only age-v1 X25519 provisioning-artifact provider |
 | [`crates/aster-ffi`](crates/aster-ffi) | Stable C-compatible application boundary |
 | [`bindings`](bindings) | C header plus first-class Go and Python bindings |
 | [`crates/aster-conformance`](crates/aster-conformance) | Black-box scenarios and interoperability vectors |
@@ -140,10 +142,16 @@ Install the pinned tools and run the complete local gate:
 ```sh
 mise install
 mise run check
+GOBIN=/tmp/aster-go-tools go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+GOVULNCHECK=/tmp/aster-go-tools/govulncheck mise run age-reference-audit
+mise run age-reference-interop
 ```
 
-The narrower commands in each quickstart are better for a first run. The full
-gate is intentionally comprehensive.
+The narrower commands in each quickstart are better for a first run. The
+two age-oracle commands keep the separately maintained Go implementation, its
+reachable-vulnerability and compiled-module license checks, and the
+experimental artifact-provider interoperability evidence explicit. See
+[CI evidence](docs/ci.md) for their narrow claim boundary.
 
 ## License
 

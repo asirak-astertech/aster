@@ -184,13 +184,19 @@ implementation version and conformance-vector digest under test.
 
 | ID | Group | Required evidence |
 |---|---|---|
-| V-PROVISION | local protected provisioning boundary | zero provider calls when local, size, or magic prechecks fail and exactly one protector/unprotector attempt after all prechecks pass; no internal retry or fallback; separate protect/unprotect capabilities; outer/inner size bounds; redacted and zeroizing plaintext ownership; typed provider rejection without plaintext fallback; inner checksum revalidation; failure before node, database, or Blob-store creation |
+| V-PROVISION | local protected provisioning boundary | zero provider calls when local, size, or magic prechecks fail and exactly one protector/unprotector attempt after all prechecks pass; no internal retry or fallback; separate protect/unprotect capabilities; outer/inner size bounds; redacted plaintext ownership and zeroization of its Aster-owned allocation; typed provider rejection without plaintext fallback; inner checksum revalidation; failure before node, database, or Blob-store creation |
+| V-PROVISION-AGE | experimental classic-X25519 age provider | exact patched Rust `age` 0.11.5/default-features-off identity plus exact `age-core` 0.11.0 extension-point dependency; 1–16 typed classic X25519 recipients/identities, multi-recipient recovery, and empty/over-cap/duplicate configuration rejection; pre-unwrap requirement for 1–16 X25519 stanzas, no scrypt, and at most one non-scrypt extension stanza so standard GREASE remains accepted; sanitized configuration errors and redacted secret debugging; ordinary, binary, exact plaintext-limit, and real-bundle round trips; reusable randomized encryption; empty artifact, wrong identity, malformed header, stanza/header-MAC/body/final-byte tamper, truncation, trailing data, outer cap, and caller/global recovered-plaintext cap rejection without partial plaintext release; authenticated EOF and Aster-owned partial-buffer clearing, without a claim that upstream age internals or identity-decode intermediates are comprehensively zeroized; protected-node failure before store creation; and bidirectional maximum-size binary outer-file interoperability with exact reference Go age v1.3.1 |
 
 `V-PROVISION` is not a mesh wire or independent-interoperability vector. The
-no-new-dependency boundary and behavioral test provider cover its interface
-rules. Operational acceptance remains open until a real admitted provider,
-protected-by-default application/binding paths, persistent secret custody, and
-recovery workflow pass the same gates.
+behavioral test providers cover its interface rules. `V-PROVISION-AGE` adds an
+isolated, dependency-backed implementation and a separately authored format
+oracle; it must pass before the provider-pilot batch can be accepted. That
+interoperability is evidence only for the outer classic-X25519 age file, not for
+Aster mesh messages or a complete independently authored Aster node. Even a
+passing pilot does not establish production admission. Protected-by-default
+application and binding paths, persistent secret custody, recipient issuance
+and recovery, independent review, comprehensive sensitive-intermediate handling,
+and deployment cryptographic requirements remain open gates.
 
 ## Acceptance scenarios
 
