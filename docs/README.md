@@ -32,7 +32,7 @@ peer. Networking is a deployment concern layered onto that durable local API.
 | Assess security assumptions and deployment blockers | [Security](security.md) and [Conformance](conformance.md) |
 | Build or embed a language binding | [Binding pattern](bindings/pattern.md), [C ABI](../bindings/c/README.md), [Go](../bindings/go/README.md), and [Python](../bindings/python/README.md) |
 | Implement an independent compatible node | [Protocol](protocol.md), [wire grammar](wire.cddl), and [security objects](envelope.md) |
-| Run validation or interpret evidence | [CI](ci.md), [Conformance](conformance.md), and [Lab](../lab/README.md) |
+| Run validation or interpret evidence | [CI](ci.md), [Conformance](conformance.md), [Lab](../lab/README.md), and the test-only [reconciliation bake-off](reconciliation-bakeoff.md) |
 
 ## Documentation types
 
@@ -112,6 +112,7 @@ decision records explain why the current design chose its major boundaries:
 - [CI and local validation](ci.md)
 - [Fuzzing guide](../fuzz/README.md)
 - [Lab guide](../lab/README.md)
+- [Reconciliation FOSS bake-off](reconciliation-bakeoff.md)
 
 The design-decision index above covers every ADR included in the public
 repository.
