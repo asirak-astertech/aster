@@ -43,6 +43,8 @@ implementation-independent protocol.
 - **Concept guides** explain the mental model and tradeoffs.
 - **Integration guides** describe platform and carrier seams.
 - **Reference specifications** define interoperable bytes and normative behavior.
+- **Proposals** define bounded, non-normative experiments that may produce a
+  later architecture decision.
 - **Evidence documents** state what has actually been tested and what remains a
   release or deployment gate.
 
@@ -65,6 +67,15 @@ the authority for what application code is expected to touch.
 
 See [Conformance](conformance.md) and [CI](ci.md) for the precise evidence behind
 these statements.
+
+## Proposals and experiments
+
+Proposals describe work the project may run to answer an unresolved design
+question. They do not change the protocol, admit dependencies, or establish a
+capability claim until a later decision and implementation evidence say so.
+
+- [Proposal index and lifecycle](proposals/README.md)
+- [0001 — Operational IP mesh vertical-slice experiment](proposals/0001-ip-mesh-vertical-slice.md)
 
 ## Architecture and design decisions
 
