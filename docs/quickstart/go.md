@@ -105,9 +105,13 @@ sealed objects, or sync frames.
 
 ## Replace the test fixture
 
-The example bundle is public and disposable. Real deployments issue a unique
-opaque bundle per node, protect it outside source control, and retain the node's
-database so its publisher counter cannot roll backward.
+The example bundle is public and disposable. `aster.Open` currently ingests the
+unprotected inner bundle for compatibility and tests, and the Go binding has no
+protected-provider entry point. It therefore does not yet satisfy operational
+provisioning custody. A real deployment needs a unique artifact per node, an
+admitted protection provider, persistent secret custody/recovery, and durable
+counter state; do not represent the raw path as protected. See the
+[protected-provisioning decision](../decisions/0013-protected-provisioning-boundary.md).
 
 The fixture's grants and regeneration procedure are documented in
 [Non-production binding test material](../../bindings/testdata/README.md).

@@ -8,9 +8,12 @@ binding-specific build and lifecycle reference.
 Build or install the native library first. The binding links with
 `-laster_ffi` and does not embed a repository-relative library path. Use the
 platform linker configuration, or set `CGO_LDFLAGS` to add the directory that
-contains the matching shared/static library. `Open` accepts opaque
-authority-issued provisioning bytes; it does not derive identity or scope
-access from an application password or seed.
+contains the matching shared/static library. `Open` currently accepts the
+canonical unprotected inner provisioning bytes for compatibility and tests; it
+does not derive identity or scope access from an application password or seed,
+and no protected-provider binding is shipped. Raw open is not an operational
+custody solution. See the
+[protected-provisioning gate](../../docs/decisions/0013-protected-provisioning-boundary.md).
 
 The core application flow is `Open` → `Subscribe`/`Query` → `Publish` → `Poll`
 → `Acknowledge` → `Close`. Publish returns after a durable local commit and does

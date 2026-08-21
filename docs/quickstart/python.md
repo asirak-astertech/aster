@@ -94,9 +94,13 @@ transport controls.
 ## Replace the test fixture
 
 `bindings/testdata/non-production-provisioning.bundle` is public test material,
-not an operational trust anchor. Obtain a unique opaque bundle for every real
-node, protect it as secret local configuration, and keep the node database on
-durable protected storage.
+not an operational trust anchor. `Node` currently ingests the unprotected inner
+bundle for compatibility and tests, and the Python binding has no protected-
+provider entry point. It therefore does not yet satisfy operational
+provisioning custody. A real integration needs a unique protected artifact,
+persistent secret custody/recovery, and durable database storage; do not
+represent the raw path as protected. See the
+[protected-provisioning decision](../decisions/0013-protected-provisioning-boundary.md).
 
 The fixture's grants and regeneration procedure are documented in
 [Non-production binding test material](../../bindings/testdata/README.md).

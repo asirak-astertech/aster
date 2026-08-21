@@ -116,6 +116,7 @@ impl From<EngineError> for FfiError {
             EngineError::Store(StoreError::Zeroized) => STATUS_ZEROIZED,
             EngineError::Store(_) => STATUS_STORAGE_ERROR,
             EngineError::Envelope(_)
+            | EngineError::Provisioning(_)
             | EngineError::Revoked(_)
             | EngineError::StaleKeyEpoch { .. }
             | EngineError::Expired

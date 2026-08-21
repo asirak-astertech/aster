@@ -11,6 +11,7 @@ use crate::model::{
     CausalStamp, ConflictAnnotation, DataClass, ItemId, NodeId, PeerStatus, Priority, Scope,
     SyncStatus, Topic, VersionVector,
 };
+use crate::provisioning::ProtectedProvisioningError;
 use crate::store::{
     AppDelivery, ApplyOutcome, BatchStoragePolicy, BridgeFilter, BridgeProjectionCursor,
     BridgeProjectionQuery, ChunkRange, ControlKind, ControlOutcome, ControlPrincipal,
@@ -502,6 +503,7 @@ pub trait RecordMergePolicy: Send + Sync {
 pub enum EngineError {
     Store(StoreError),
     Envelope(EnvelopeError),
+    Provisioning(ProtectedProvisioningError),
     Invalid(String),
     StaleConflict,
     Revoked(NodeId),
@@ -516,6 +518,7 @@ impl Display for EngineError {
         match self {
             Self::Store(error) => Display::fmt(error, formatter),
             Self::Envelope(error) => Display::fmt(error, formatter),
+            Self::Provisioning(error) => Display::fmt(error, formatter),
             Self::Invalid(message) => write!(formatter, "invalid engine input: {message}"),
             Self::StaleConflict => formatter.write_str("record conflict changed before resolution"),
             Self::Revoked(_) => formatter.write_str("publisher is revoked"),
@@ -530,7 +533,22 @@ impl Display for EngineError {
     }
 }
 
-impl Error for EngineError {}
+impl Error for EngineError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Store(error) => Some(error),
+            Self::Envelope(error) => Some(error),
+            Self::Provisioning(error) => Some(error),
+            Self::Invalid(_)
+            | Self::StaleConflict
+            | Self::Revoked(_)
+            | Self::StaleKeyEpoch { .. }
+            | Self::Expired
+            | Self::Unauthorized(_)
+            | Self::Merge(_) => None,
+        }
+    }
+}
 
 impl From<StoreError> for EngineError {
     fn from(value: StoreError) -> Self {
@@ -541,6 +559,12 @@ impl From<StoreError> for EngineError {
 impl From<EnvelopeError> for EngineError {
     fn from(value: EnvelopeError) -> Self {
         Self::Envelope(value)
+    }
+}
+
+impl From<ProtectedProvisioningError> for EngineError {
+    fn from(value: ProtectedProvisioningError) -> Self {
+        Self::Provisioning(value)
     }
 }
 

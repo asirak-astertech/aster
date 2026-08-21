@@ -100,6 +100,9 @@ Every exported entry point contains Rust unwinding and returns `ASTER_PANIC`.
 The release profile therefore uses unwind semantics; changing it to `panic =
 "abort"` would bypass the ABI boundary and terminate the embedding process.
 
-`aster_node_open` accepts an opaque, authority-issued provisioning bundle. Its
-format and contained credentials are intentionally outside the ABI. Never place
-operational provisioning material in source control.
+`aster_node_open` currently accepts the canonical unprotected inner
+provisioning bundle for compatibility and tests. Its format and contained
+credentials remain outside the ABI, and the C surface has no protected-provider
+entry point yet. Do not treat raw bundle ingestion as an operational custody
+solution or place provisioning material in source control. See the
+[protected-provisioning gate](../../docs/decisions/0013-protected-provisioning-boundary.md).

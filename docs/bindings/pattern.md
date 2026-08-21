@@ -23,13 +23,22 @@ crypto, storage, or sync semantics.
 
 ## Required operations
 
-`node_open/close` (where `node_open` installs the opaque provisioning bundle),
+`node_open/close` (where the current `node_open` installs the unprotected inner
+provisioning bundle for compatibility and tests),
 `publish`, atomic `publish_batch`, streaming `blob_writer_open/write/finish`,
 atomic `publish_blob_batch`, `blob_reader_open/read`, `subscribe`,
 `query`, `next_event`, `delivery_ack`, `conflicts`, `resolve`, `peer_status`,
 `sync_status` (included in each peer snapshot), `set_emission`,
 `configure_bridge`, bridge enrollment enable/disable, first/nested bridge-hop
 creation, exact bridge status and bounded status pagination, and `zeroize`.
+
+A future operational binding that accepts a protected artifact MUST connect it
+to an opaque, node-side `ProvisioningUnprotector` (or an equivalent platform
+callback/handle). It MUST NOT silently decrypt outside the zeroizing boundary
+or retry a failed unprotect operation by passing the same bytes to the raw open
+path. Persistent `SecretStore` load/destroy/recovery is a separate custody
+boundary and does not substitute for artifact unprotection. The current C, Go,
+and Python surfaces satisfy neither operational gate.
 
 ## Required binding surface
 

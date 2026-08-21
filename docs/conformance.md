@@ -180,6 +180,18 @@ implementation version and conformance-vector digest under test.
 | V-EXT | evolution | optional skip/preserve and critical rejection |
 | V-FFI | ABI | layouts, ownership, panic containment, repeated lifecycle, invalid pointers/lengths, atomic batch result ordering/rollback, and finalized-Blob writer batches |
 
+## Reference implementation security gates
+
+| ID | Group | Required evidence |
+|---|---|---|
+| V-PROVISION | local protected provisioning boundary | zero provider calls when local, size, or magic prechecks fail and exactly one protector/unprotector attempt after all prechecks pass; no internal retry or fallback; separate protect/unprotect capabilities; outer/inner size bounds; redacted and zeroizing plaintext ownership; typed provider rejection without plaintext fallback; inner checksum revalidation; failure before node, database, or Blob-store creation |
+
+`V-PROVISION` is not a mesh wire or independent-interoperability vector. The
+no-new-dependency boundary and behavioral test provider cover its interface
+rules. Operational acceptance remains open until a real admitted provider,
+protected-by-default application/binding paths, persistent secret custody, and
+recovery workflow pass the same gates.
+
 ## Acceptance scenarios
 
 | ID | Scenario | Pass condition |

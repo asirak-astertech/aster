@@ -156,7 +156,8 @@ typedef struct {
     uint32_t abi_version;
     uint32_t struct_size;
     aster_bytes_t store_path;          /* UTF-8 path; ":memory:" is supported. */
-    /* Opaque authority-issued bundle. Its internal format is not part of the ABI. */
+    /* Canonical unprotected inner bundle containing secrets; compatibility/test only.
+     * Its internal format is not part of the ABI. */
     aster_bytes_t provisioning_bundle;
     uint64_t max_items;
     uint64_t max_bytes;

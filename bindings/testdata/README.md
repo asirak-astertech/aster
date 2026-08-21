@@ -10,6 +10,10 @@ owned by the Rust provisioning provider and is deliberately not part of the C
 ABI or either language binding. Regenerate it whenever that provider's format
 version changes; never replace it with operational credential material.
 
+This fixture exercises the unprotected plaintext-ingestion compatibility path;
+its presence and successful use are not evidence for the protected-provisioning
+boundary, encryption at rest, or persistent secret custody.
+
 It was generated on 2026-08-19 by the checked-in
 `aster-ffi/generate_test_fixture` helper, using the reference provisioner and a
 public constant authority seed. The node has only epoch 0/1 member grants for

@@ -27,6 +27,13 @@ use crate::model::{
     CausalStamp, DataClass, Dot, MAX_CAUSAL_CONTEXT_ENTRIES, NodeId, Priority, Scope, Topic,
     VersionVector,
 };
+#[cfg(test)]
+use crate::provisioning::{MAX_PROTECTED_PROVISIONING_BYTES, ProvisioningProtectionError};
+use crate::provisioning::{
+    MAX_UNPROTECTED_PROVISIONING_BYTES, ProtectedProvisioningError, ProvisioningProtector,
+    ProvisioningUnprotector, UnprotectedProvisioning, protect_provisioning_artifact,
+    unprotect_provisioning_artifact,
+};
 use crate::store::{ControlPrincipal, Revocation, ScopeEpoch, SqliteStore};
 use aes_gcm::{
     Aes256Gcm,
@@ -438,11 +445,12 @@ struct ContentGrant {
     key: Secret32,
 }
 
-/// Opaque, persistable credential and grant package.
+/// Credential and grant package with a canonical unprotected inner representation.
 ///
-/// Serialized bytes contain identity and mission secrets. They must be stored in a protected
-/// keystore and must never be logged. [`Self::from_bytes`] is the production ingestion boundary;
-/// bundle issuance is intentionally separated into [`ReferenceProvisioner`].
+/// Serialized `ASTRPB03` bytes contain identity and mission secrets. They must never be logged or
+/// treated as protected storage. [`Self::from_bytes`] is retained for compatibility, tests, and
+/// provisioning tooling; operational ingestion uses [`Self::from_protected_bytes`] with an
+/// admitted provider. Bundle issuance remains separated into [`ReferenceProvisioner`].
 pub struct ProvisioningBundle {
     mission: [u8; 32],
     authority_id: NodeId,
@@ -473,10 +481,12 @@ impl fmt::Debug for ProvisioningBundle {
 }
 
 impl ProvisioningBundle {
-    /// Parses the canonical opaque bundle format and rejects truncation, trailing data, duplicate
-    /// grants, invalid bounds, and checksum damage before any service is constructed.
+    /// Parses the canonical unprotected inner bundle format and rejects truncation, trailing data,
+    /// duplicate grants, invalid bounds, and checksum damage before any service is constructed.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, EnvelopeError> {
-        if bytes.len() < BUNDLE_MAGIC.len() + 2 + 32 {
+        if bytes.len() < BUNDLE_MAGIC.len() + 2 + 32
+            || bytes.len() > MAX_UNPROTECTED_PROVISIONING_BYTES
+        {
             return Err(invalid_bundle());
         }
         let checksum_start = bytes.len().checked_sub(32).ok_or_else(invalid_bundle)?;
@@ -565,45 +575,162 @@ impl ProvisioningBundle {
         })
     }
 
-    /// Returns the canonical opaque representation for protected credential storage.
+    /// Returns the canonical unprotected inner representation.
+    ///
+    /// Operational callers must immediately pass these secret bytes to an admitted
+    /// [`ProvisioningProtector`] provider. Prefer [`Self::to_protected_bytes`] when possible.
     pub fn to_bytes(&self) -> Result<Vec<u8>, EnvelopeError> {
         let identity_seed = self.identity_seed.as_ref().ok_or_else(zeroized_service)?;
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(BUNDLE_MAGIC);
-        bytes.extend_from_slice(&BUNDLE_VERSION.to_be_bytes());
-        bytes.extend_from_slice(&self.mission);
-        bytes.extend_from_slice(&self.authority_id);
-        encode_verifying_key(&mut bytes, &self.authority_verifying_key)?;
-        bytes.extend_from_slice(identity_seed.expose());
-        bytes.extend_from_slice(&self.serial.to_be_bytes());
-        bytes.extend_from_slice(&self.roles.to_be_bytes());
-        encode_signature(&mut bytes, &self.credential_signature)?;
-        match &self.control_route_key {
-            Some(key) => {
-                bytes.push(1);
-                bytes.extend_from_slice(key.expose());
+        let expected_len = self.encoded_len()?;
+        let mut bytes = Vec::with_capacity(expected_len);
+        let encoded = (|| -> Result<(), EnvelopeError> {
+            bytes.extend_from_slice(BUNDLE_MAGIC);
+            bytes.extend_from_slice(&BUNDLE_VERSION.to_be_bytes());
+            bytes.extend_from_slice(&self.mission);
+            bytes.extend_from_slice(&self.authority_id);
+            encode_verifying_key(&mut bytes, &self.authority_verifying_key)?;
+            bytes.extend_from_slice(identity_seed.expose());
+            bytes.extend_from_slice(&self.serial.to_be_bytes());
+            bytes.extend_from_slice(&self.roles.to_be_bytes());
+            encode_signature(&mut bytes, &self.credential_signature)?;
+            match &self.control_route_key {
+                Some(key) => {
+                    bytes.push(1);
+                    bytes.extend_from_slice(key.expose());
+                }
+                None => bytes.push(0),
             }
-            None => bytes.push(0),
+            let route_count =
+                u16::try_from(self.route_grants.len()).map_err(|_| invalid_bundle())?;
+            bytes.extend_from_slice(&route_count.to_be_bytes());
+            for grant in &self.route_grants {
+                push_u16_bytes(&mut bytes, grant.scope.as_str().as_bytes())?;
+                bytes.extend_from_slice(&grant.epoch.to_be_bytes());
+                bytes.extend_from_slice(grant.key.expose());
+            }
+            let content_count =
+                u16::try_from(self.content_grants.len()).map_err(|_| invalid_bundle())?;
+            bytes.extend_from_slice(&content_count.to_be_bytes());
+            for grant in &self.content_grants {
+                push_u16_bytes(&mut bytes, grant.scope.as_str().as_bytes())?;
+                push_u16_bytes(&mut bytes, grant.topic.as_str().as_bytes())?;
+                bytes.extend_from_slice(&grant.epoch.to_be_bytes());
+                bytes.extend_from_slice(grant.key.expose());
+            }
+            let checksum = hash_domain(BUNDLE_CHECKSUM_DOMAIN, &bytes);
+            bytes.extend_from_slice(&checksum);
+            if bytes.len() != expected_len {
+                return Err(invalid_bundle());
+            }
+            Ok(())
+        })();
+        if let Err(error) = encoded {
+            bytes.zeroize();
+            return Err(error);
         }
-        let route_count = u16::try_from(self.route_grants.len()).map_err(|_| invalid_bundle())?;
-        bytes.extend_from_slice(&route_count.to_be_bytes());
-        for grant in &self.route_grants {
-            push_u16_bytes(&mut bytes, grant.scope.as_str().as_bytes())?;
-            bytes.extend_from_slice(&grant.epoch.to_be_bytes());
-            bytes.extend_from_slice(grant.key.expose());
-        }
-        let content_count =
-            u16::try_from(self.content_grants.len()).map_err(|_| invalid_bundle())?;
-        bytes.extend_from_slice(&content_count.to_be_bytes());
-        for grant in &self.content_grants {
-            push_u16_bytes(&mut bytes, grant.scope.as_str().as_bytes())?;
-            push_u16_bytes(&mut bytes, grant.topic.as_str().as_bytes())?;
-            bytes.extend_from_slice(&grant.epoch.to_be_bytes());
-            bytes.extend_from_slice(grant.key.expose());
-        }
-        let checksum = hash_domain(BUNDLE_CHECKSUM_DOMAIN, &bytes);
-        bytes.extend_from_slice(&checksum);
         Ok(bytes)
+    }
+
+    fn encoded_len(&self) -> Result<usize, EnvelopeError> {
+        fn add(total: &mut usize, amount: usize) -> Result<(), EnvelopeError> {
+            *total = total.checked_add(amount).ok_or_else(invalid_bundle)?;
+            Ok(())
+        }
+
+        self.identity_seed.as_ref().ok_or_else(zeroized_service)?;
+        let classical = self
+            .credential_signature
+            .ecdsa_p256
+            .as_deref()
+            .ok_or_else(authentication_failed)?;
+        let post_quantum = self
+            .credential_signature
+            .ml_dsa_65
+            .as_deref()
+            .ok_or_else(authentication_failed)?;
+        if self.authority_verifying_key.p256_sec1.len() != P256_PUBLIC_LEN
+            || self.authority_verifying_key.ml_dsa_65.len() != ML_DSA_PUBLIC_LEN
+            || classical.len() != P256_SIGNATURE_LEN
+            || post_quantum.len() != ML_DSA_SIGNATURE_LEN
+            || self.serial == 0
+            || self.roles == 0
+            || self.roles & !(ROLE_RELAY | ROLE_READER | ROLE_CONTROL_AUTHORITY) != 0
+            || self.route_grants.len() > MAX_GRANTS
+            || self.content_grants.len() > MAX_GRANTS
+            || (self.roles & ROLE_RELAY != 0) != !self.route_grants.is_empty()
+            || (self.roles & ROLE_READER != 0) != !self.content_grants.is_empty()
+        {
+            return Err(invalid_bundle());
+        }
+
+        let mut total = BUNDLE_MAGIC.len();
+        for fixed in [
+            2,
+            32,
+            32,
+            2 + P256_PUBLIC_LEN,
+            4 + ML_DSA_PUBLIC_LEN,
+            32,
+            8,
+            4,
+            2 + P256_SIGNATURE_LEN,
+            4 + ML_DSA_SIGNATURE_LEN,
+            1,
+            self.control_route_key.as_ref().map_or(0, |_| 32),
+            2,
+        ] {
+            add(&mut total, fixed)?;
+        }
+        for grant in &self.route_grants {
+            let scope_len = grant.scope.as_str().len();
+            if scope_len > 128 {
+                return Err(invalid_bundle());
+            }
+            add(&mut total, 2 + scope_len + 8 + 32)?;
+        }
+        add(&mut total, 2)?;
+        for grant in &self.content_grants {
+            let scope_len = grant.scope.as_str().len();
+            let topic_len = grant.topic.as_str().len();
+            if scope_len > 128 || topic_len > 128 {
+                return Err(invalid_bundle());
+            }
+            add(&mut total, 2 + scope_len + 2 + topic_len + 8 + 32)?;
+        }
+        add(&mut total, 32)?;
+        if total > MAX_UNPROTECTED_PROVISIONING_BYTES {
+            return Err(invalid_bundle());
+        }
+        Ok(total)
+    }
+
+    /// Protects the canonical inner representation with a deployment-owned provider.
+    pub fn to_protected_bytes<P>(
+        &self,
+        protector: &mut P,
+    ) -> Result<Vec<u8>, ProtectedProvisioningError>
+    where
+        P: ProvisioningProtector + ?Sized,
+    {
+        let plaintext = UnprotectedProvisioning::new(
+            self.to_bytes()
+                .map_err(|_| ProtectedProvisioningError::InvalidBundle)?,
+        )?;
+        protect_provisioning_artifact(&plaintext, protector).map_err(Into::into)
+    }
+
+    /// Authenticates a provider-owned artifact and parses its canonical inner bundle.
+    ///
+    /// Provider rejection never falls back to interpreting `protected` as plaintext.
+    pub fn from_protected_bytes<P>(
+        protected: &[u8],
+        unprotector: &mut P,
+    ) -> Result<Self, ProtectedProvisioningError>
+    where
+        P: ProvisioningUnprotector + ?Sized,
+    {
+        let plaintext = unprotect_provisioning_artifact(protected, unprotector)?;
+        Self::from_bytes(plaintext.expose()).map_err(|_| ProtectedProvisioningError::InvalidBundle)
     }
 
     /// Rapidly erases all secret fields held by this object.
@@ -6716,6 +6843,52 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    const TEST_PROTECTION_PREFIX: &[u8] = b"test-protected-provisioning:";
+
+    #[derive(Default)]
+    struct TestProvisioningProtection {
+        protect_calls: usize,
+        unprotect_calls: usize,
+        failure: Option<ProvisioningProtectionError>,
+    }
+
+    impl ProvisioningProtector for TestProvisioningProtection {
+        fn protect(
+            &mut self,
+            plaintext: &UnprotectedProvisioning,
+        ) -> Result<Vec<u8>, ProvisioningProtectionError> {
+            self.protect_calls += 1;
+            if let Some(error) = self.failure {
+                return Err(error);
+            }
+            let mut protected =
+                Vec::with_capacity(TEST_PROTECTION_PREFIX.len().saturating_add(plaintext.len()));
+            protected.extend_from_slice(TEST_PROTECTION_PREFIX);
+            protected.extend_from_slice(plaintext.expose());
+            Ok(protected)
+        }
+    }
+
+    impl ProvisioningUnprotector for TestProvisioningProtection {
+        fn unprotect(
+            &mut self,
+            protected: &[u8],
+            max_plaintext_len: usize,
+        ) -> Result<UnprotectedProvisioning, ProvisioningProtectionError> {
+            self.unprotect_calls += 1;
+            if let Some(error) = self.failure {
+                return Err(error);
+            }
+            let plaintext = protected
+                .strip_prefix(TEST_PROTECTION_PREFIX)
+                .ok_or(ProvisioningProtectionError::Rejected)?;
+            if plaintext.len() > max_plaintext_len {
+                return Err(ProvisioningProtectionError::TooLarge);
+            }
+            UnprotectedProvisioning::new(plaintext.to_vec())
+        }
+    }
+
     fn scope(value: &str) -> Scope {
         Scope::new(value).unwrap_or_else(|error| panic!("test scope failed: {error}"))
     }
@@ -9016,6 +9189,121 @@ mod tests {
                 })
                 .is_err()
         );
+    }
+
+    #[test]
+    fn protected_bundle_boundary_round_trips_and_never_falls_back_to_plaintext() {
+        let mut provisioner = ReferenceProvisioner::from_seed([0x91; 32])
+            .unwrap_or_else(|error| panic!("provisioner failed: {error}"));
+        let bundle = provisioner
+            .issue_node(1, &[member_access(vec![0])])
+            .unwrap_or_else(|error| panic!("bundle issue failed: {error}"));
+        let expected_identity = bundle_identity(&bundle);
+        let raw = bundle
+            .to_bytes()
+            .unwrap_or_else(|error| panic!("bundle serialize failed: {error}"));
+
+        let mut protection = TestProvisioningProtection::default();
+        let mut protected = bundle
+            .to_protected_bytes(&mut protection)
+            .unwrap_or_else(|error| panic!("bundle protect failed: {error}"));
+        assert_eq!(protection.protect_calls, 1);
+        assert!(ProvisioningBundle::from_bytes(&protected).is_err());
+
+        let restored = ProvisioningBundle::from_protected_bytes(&protected, &mut protection)
+            .unwrap_or_else(|error| panic!("bundle unprotect failed: {error}"));
+        assert_eq!(bundle_identity(&restored), expected_identity);
+        assert_eq!(protection.unprotect_calls, 1);
+
+        let mut rejecting = TestProvisioningProtection {
+            failure: Some(ProvisioningProtectionError::Rejected),
+            ..TestProvisioningProtection::default()
+        };
+        let error = ProvisioningBundle::from_protected_bytes(&raw, &mut rejecting)
+            .expect_err("provider rejection must not fall back to plaintext");
+        assert_eq!(
+            error,
+            ProtectedProvisioningError::Protection(ProvisioningProtectionError::Rejected)
+        );
+        assert_eq!(rejecting.unprotect_calls, 0);
+        protected.zeroize();
+    }
+
+    #[test]
+    fn protected_bundle_boundary_checks_outer_bounds_and_inner_canonical_integrity() {
+        let mut provisioner = ReferenceProvisioner::from_seed([0x92; 32])
+            .unwrap_or_else(|error| panic!("provisioner failed: {error}"));
+        let bundle = provisioner
+            .issue_node(1, &[member_access(vec![0])])
+            .unwrap_or_else(|error| panic!("bundle issue failed: {error}"));
+        let mut protection = TestProvisioningProtection::default();
+        let mut protected = bundle
+            .to_protected_bytes(&mut protection)
+            .unwrap_or_else(|error| panic!("bundle protect failed: {error}"));
+
+        protected[TEST_PROTECTION_PREFIX.len() + 10] ^= 1;
+        let error = ProvisioningBundle::from_protected_bytes(&protected, &mut protection)
+            .expect_err("tampered inner bundle must fail checksum validation");
+        assert_eq!(error, ProtectedProvisioningError::InvalidBundle);
+
+        let calls = protection.unprotect_calls;
+        let oversized = vec![0; MAX_PROTECTED_PROVISIONING_BYTES + 1];
+        let error = ProvisioningBundle::from_protected_bytes(&oversized, &mut protection)
+            .expect_err("oversized outer artifact must fail before provider use");
+        assert_eq!(
+            error,
+            ProtectedProvisioningError::Protection(ProvisioningProtectionError::TooLarge)
+        );
+        assert_eq!(protection.unprotect_calls, calls);
+
+        let mut zeroized = bundle;
+        zeroized.zeroize();
+        let calls = protection.protect_calls;
+        assert!(zeroized.to_protected_bytes(&mut protection).is_err());
+        assert_eq!(protection.protect_calls, calls);
+        protected.zeroize();
+    }
+
+    #[test]
+    fn maximum_v3_bundle_matches_the_public_plaintext_bound() {
+        fn maximum_name(prefix: char, index: usize) -> String {
+            let value = format!("{prefix}{index:03}{}", "x".repeat(124));
+            assert_eq!(value.len(), 128);
+            value
+        }
+
+        let mut provisioner = ReferenceProvisioner::from_seed([0x95; 32])
+            .unwrap_or_else(|error| panic!("provisioner failed: {error}"));
+        let mut bundle = provisioner
+            .issue_node(1, &[member_access(vec![0])])
+            .unwrap_or_else(|error| panic!("bundle issue failed: {error}"));
+        bundle.control_route_key = Some(Secret32::new([0x41; 32]));
+        bundle.route_grants = (0..MAX_GRANTS)
+            .map(|index| RouteGrant {
+                scope: scope(&maximum_name('s', index)),
+                epoch: 1,
+                key: Secret32::new([0x42; 32]),
+            })
+            .collect();
+        let maximum_scope = scope(&maximum_name('c', 0));
+        bundle.content_grants = (0..MAX_GRANTS)
+            .map(|index| ContentGrant {
+                scope: maximum_scope.clone(),
+                topic: topic(&maximum_name('t', index)),
+                epoch: 1,
+                key: Secret32::new([0x43; 32]),
+            })
+            .collect();
+
+        let encoded = UnprotectedProvisioning::new(
+            bundle
+                .to_bytes()
+                .unwrap_or_else(|error| panic!("maximum bundle encode failed: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("maximum bundle ownership failed: {error}"));
+        assert_eq!(encoded.len(), MAX_UNPROTECTED_PROVISIONING_BYTES);
+        ProvisioningBundle::from_bytes(encoded.expose())
+            .unwrap_or_else(|error| panic!("maximum bundle parse failed: {error}"));
     }
 
     #[test]

@@ -19,6 +19,10 @@ Every quickstart performs the same flow:
 
 That is intentionally an offline exercise. After it works, continue with
 [Carriers and contacts](../transports.md) to understand live synchronization.
+The fixture path is unprotected compatibility/test ingestion. Rust now exposes
+a provider-owned protection boundary, but no operational provider or protected
+C, Go, or Python entry point is shipped; see
+[ADR 0013](../decisions/0013-protected-provisioning-boundary.md).
 
 ## Shared toolchain prerequisite
 

@@ -1,15 +1,18 @@
 # Security Architecture and Threat Model
 
 - Version: 0.1.0
-- Status: reference design; production crypto gate unsatisfied
+- Status: reference design; production security and integration gates unsatisfied
 
 ## Assets and adversary
 
 Protected assets are item plaintext, protected routing metadata, publisher
-authenticity, causal history, authorization state, key epochs, and availability
-within declared quotas. The adversary may observe, drop, delay, duplicate,
-reorder, replay, modify, and inject traffic on every carrier; run an untrusted
-rendezvous/relay; capture old packets; and later possess a revoked device.
+authenticity, causal history, authorization state, key epochs, provisioning
+artifacts, identity/routing/content seeds, backups containing those values, and
+availability within declared quotas. The adversary may observe, drop, delay,
+duplicate, reorder, replay, modify, and inject traffic on every carrier; run an
+untrusted rendezvous/relay; capture old packets; later possess a revoked device;
+or obtain a copied local artifact, backup, crash dump, or accidentally committed
+file.
 
 The design does not hide protocol presence, timing, packet size, direction, or RF
 energy. It cannot stop an authorized reader from disclosing plaintext, a routing
@@ -50,6 +53,38 @@ it. The remaining cross-implementation and physical acceptance gates are in
 
 The exact protected bytes, signature messages, KDF inputs, and bounds are
 normative in [envelope.md](envelope.md).
+
+## Provisioning artifact and persistent-key custody
+
+`ASTRPB03` is a checksum-protected plaintext inner representation containing
+secret material. Separate `ProvisioningProtector` and
+`ProvisioningUnprotector` interfaces keep authority-side recipient encryption
+apart from node-side identity/private-key decryption. Each top-level protect or
+open operation completes local, size, and magic prechecks first: failure makes
+zero provider calls, while passing all prechecks makes exactly one protector or
+unprotector attempt. Aster neither retries nor falls back internally; a caller
+may explicitly start a new operation. The recovered plaintext is bounded to
+125,877 bytes, held in a redacted non-cloneable container, and zeroized on
+explicit erase and drop.
+Protected artifacts are bounded to one MiB. Provider errors retain only safe
+typed categories, and failure cannot fall back to interpreting the artifact as
+plaintext.
+
+This interface does not itself encrypt anything. The repository currently
+ships only behavioral test providers; an admitted operational provider remains
+a release gate. The raw `ApplicationNode::open`, `MeshService::open`, FFI, Go,
+and Python paths remain unprotected compatibility/test ingestion. The current
+host also retains a zeroizing plaintext bundle copy in process so it can rebuild
+its backend after a paused contact.
+
+Persistent custody after ingestion is a separate `SecretStore` problem. A
+production backend needs opaque seal/load/destroy handles, platform or hardware
+key policy, unattended-start decisions, recovery and backup procedures,
+rollback handling, and verified failure behavior. Neither successful provider
+destruction nor software zeroization proves physical flash erasure. This model
+does not defend secrets against a fully compromised running process or root,
+unlocked-memory inspection, swap, DMA, backups, or crash dumps unless the
+selected platform and deployment add those controls.
 
 ## Mandatory controls
 
@@ -106,13 +141,15 @@ normative in [envelope.md](envelope.md).
   handles at most 64 such failures before yielding. Authorization and peer state
   derive only from the cryptographically authenticated session identity.
 - The runtime handshake receive path validates against the current
-  cryptographic state without consuming that state until the flight succeeds. A forged or
-  malformed ServerHello, ClientAuth, or ServerFinished is discarded while the
-  exact prior state and its bounded retained outbound flight remain available
-  for retransmission; no second serialized provisioning bundle is retained for
-  recovery. Failures after record authentication--including wire,
-  synchronization, backend, and internal contract errors--remain fatal to the
-  containing contact rather than being hidden as carrier noise.
+  cryptographic state without consuming that state until the flight succeeds. A
+  forged or malformed ServerHello, ClientAuth, or ServerFinished is discarded
+  while the exact prior state and its bounded retained outbound flight remain
+  available for retransmission. `MeshService` retains one zeroizing in-process
+  canonical bundle copy for backend rebuilds; the runtime creates no additional
+  serialized or persistent recovery copy. Failures after record
+  authentication--including wire, synchronization, backend, and internal
+  contract errors--remain fatal to the containing contact rather than being
+  hidden as carrier noise.
 - A Blob source signature binds BlobID, chunk count, and route Merkle root.
   Route-only relays accept `ASTRBT01` carriers only after ciphertext hash,
   source-envelope association, and bounded Merkle-proof verification; readers

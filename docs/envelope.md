@@ -114,7 +114,7 @@ that 32-byte value itself is the input to both signature algorithms.
 
 | Object | Discriminator | Status and outer bound |
 |---|---|---|
-| Provisioning bundle | `"ASTRPB03"` | local secret-store format; not a network object |
+| Provisioning bundle | `"ASTRPB03"` | unprotected local provisioning-inner format; not a network object |
 | Rekey recipient registry | `"ASTRRKR1"` | signed administrative artifact; at most 16 MiB; not a mesh replication object |
 | Authority credential body | none; embedded with `b32` | network security object; embedded bound 16 KiB |
 | Singleton source envelope | `"ASTRENV2"` | network/stable-store format-2 object; semantic versions 1 and 2 |
@@ -205,7 +205,7 @@ RouteCommitment =
   HD("aster/route-grant-commitment/v1", route_commitment_material)
 ```
 
-### 3.2 Reference provisioning bundle — local only
+### 3.2 Reference provisioning bundle — unprotected inner format, local only
 
 `ASTRPB03` is a local persistence/ingestion format containing secret material.
 It MUST NOT be sent on the mesh, logged, included in captures, or treated as a
@@ -251,7 +251,21 @@ HD("aster/provisioning-check/v3", every preceding bundle byte)
 ```
 
 The checksum detects accidental damage; it does not make this secret bundle
-safe for an untrusted store.
+safe for an untrusted store. The exact maximum v3 bundle is 125,877 bytes under
+the fixed key/signature sizes, 256 route grants, 256 content grants, and
+128-byte scope/topic limits. The reference rejects larger input before checksum
+work.
+
+An operational deployment MUST protect these bytes at rest with an admitted
+local provider and expose plaintext only for bounded ingestion. The provider-
+owned outer artifact is local and implementation-specific: it is not sent on
+the mesh and cannot alter `ASTRPB03`, NodeID, credentials, grants, or any
+interoperable protocol byte. The reference's separate protection and
+unprotection boundaries supply least-privilege, fail-closed, zeroizing
+ingestion/export contracts, but no operational provider is shipped by the
+boundary itself. Empty, oversized, and raw `ASTRPB03` outer inputs are rejected
+before provider invocation. Checksum validity is never evidence of protected
+custody.
 
 The reference provisioner derives values with `PKDF` as follows:
 
