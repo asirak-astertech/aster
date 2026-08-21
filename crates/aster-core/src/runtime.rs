@@ -490,7 +490,31 @@ struct HandshakeRetry {
     mtu: Option<u16>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InventoryRefreshScope {
+    ServeOnly,
+    Both,
+}
+
+impl InventoryRefreshScope {
+    fn merged(self, other: Self) -> Self {
+        if self == Self::Both || other == Self::Both {
+            Self::Both
+        } else {
+            Self::ServeOnly
+        }
+    }
+
+    fn event(self) -> SyncEvent {
+        match self {
+            Self::ServeOnly => SyncEvent::ServeInventoryChanged,
+            Self::Both => SyncEvent::LocalInventoryChanged,
+        }
+    }
+}
+
 struct InventoryRefreshRetry {
+    scope: InventoryRefreshScope,
     attempts: u16,
     due: Instant,
 }
@@ -1221,14 +1245,14 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
                     .map_err(|error| RuntimeError::Backend(error.to_string()))?;
                 // Representation-specific receipts can unlock a different
                 // exact inventory (for example BatchProof -> compact item ->
-                // Blob carriers). Re-select both authenticated directions
-                // after a complete receipt rather than leaving the session at
-                // the root which preceded that durable acknowledgement.
+                // Blob carriers). This changes only what this peer may be
+                // served; resetting the independent receive-side traversal
+                // here can invalidate honest NODE responses still in flight.
                 if receipt.complete {
                     self.irreversible_generation = self.irreversible_generation.wrapping_add(1);
-                    self.schedule_inventory_refresh();
+                    self.schedule_inventory_refresh(InventoryRefreshScope::ServeOnly);
                     let refresh_actions = match self.sync.apply_for_semantic_version(
-                        SyncEvent::LocalInventoryChanged,
+                        SyncEvent::ServeInventoryChanged,
                         semantic_version,
                     ) {
                         Ok(actions) => actions,
@@ -1246,7 +1270,12 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
                 // A successful commit, defer, quarantine, or terminal abort
                 // cannot be rolled back in the backend. Preserve the matching
                 // reducer state and retry only the derived inventory controls.
-                self.schedule_inventory_refresh();
+                let scope = if complete_receipt {
+                    InventoryRefreshScope::ServeOnly
+                } else {
+                    InventoryRefreshScope::Both
+                };
+                self.schedule_inventory_refresh(scope);
             } else if handled.is_err()
                 && !matches!(
                     handled,
@@ -1273,7 +1302,13 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
                     return Ok(());
                 }
             }
-            if handled.is_ok() && complete_receipt {
+            if handled.is_ok()
+                && complete_receipt
+                && self
+                    .inventory_refresh_retry
+                    .as_ref()
+                    .is_some_and(|retry| retry.scope == InventoryRefreshScope::ServeOnly)
+            {
                 self.inventory_refresh_retry = None;
             }
             if self.irreversible_generation != irreversible_checkpoint
@@ -1403,11 +1438,13 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
         self.inventory_refresh_retry = None;
     }
 
-    fn schedule_inventory_refresh(&mut self) {
+    fn schedule_inventory_refresh(&mut self, scope: InventoryRefreshScope) {
         if let Some(retry) = self.inventory_refresh_retry.as_mut() {
+            retry.scope = retry.scope.merged(scope);
             retry.due = retry.due.min(self.clock);
         } else {
             self.inventory_refresh_retry = Some(InventoryRefreshRetry {
+                scope,
                 attempts: 0,
                 due: self.clock,
             });
@@ -1421,6 +1458,7 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
         if retry.due > self.clock || !self.is_authenticated() {
             return;
         }
+        let scope = retry.scope;
         let attempt = retry.attempts;
         let semantic_version = match self.authenticated_semantic_version() {
             Some(version) => version,
@@ -1433,7 +1471,7 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
         let retry_sequence_checkpoint = self.next_retry_sequence;
         let refreshed = self
             .sync
-            .apply_for_semantic_version(SyncEvent::LocalInventoryChanged, semantic_version)
+            .apply_for_semantic_version(scope.event(), semantic_version)
             .map_err(RuntimeError::from)
             .and_then(|actions| self.handle_actions(actions));
         if refreshed.is_ok() {
@@ -1445,6 +1483,7 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
             self.deferred_wants = deferred_checkpoint;
             self.next_retry_sequence = retry_sequence_checkpoint;
             self.inventory_refresh_retry = Some(InventoryRefreshRetry {
+                scope,
                 attempts: attempt.saturating_add(1),
                 due: Self::next_retry_deadline(
                     self.clock,
@@ -5567,6 +5606,255 @@ mod tests {
     }
 
     #[test]
+    fn nonempty_converged_recontact_does_not_request_retained_data() {
+        let (left_bundle, right_bundle) = bundles();
+        let sealed = b"already-retained-source-envelope".to_vec();
+        let object_id = ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(&sealed));
+
+        let mut left_backend = FakeBackend::default();
+        left_backend.available.insert(object_id, sealed.clone());
+        let mut right_backend = FakeBackend::default();
+        right_backend.available.insert(object_id, sealed);
+
+        let filter = StartRequest {
+            exchange_id: 32,
+            topics: vec!["alpha".into()],
+            scopes: vec!["mission/team".into()],
+            min_priority: Priority::Priority as u8,
+        };
+        let mut left_driver = RuntimeDriver::initiator(
+            left_bundle,
+            SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
+            left_backend,
+            filter.clone(),
+            None,
+        )
+        .unwrap();
+        let mut right_driver = RuntimeDriver::responder_with_start(
+            right_bundle,
+            SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
+            right_backend,
+            StartRequest {
+                exchange_id: 999,
+                ..filter
+            },
+            None,
+        )
+        .unwrap();
+        let (left, right) = MemoryLink::pair(256);
+
+        for _ in 0..300 {
+            left_driver.pump(&left).unwrap();
+            right_driver.pump(&right).unwrap();
+        }
+
+        assert!(left_driver.is_authenticated());
+        assert!(right_driver.is_authenticated());
+        assert_eq!(left_driver.sync().active_exchange_id(), Some(32));
+        assert_eq!(right_driver.sync().active_exchange_id(), Some(32));
+        assert!(left_driver.sync().wants().is_empty());
+        assert!(right_driver.sync().wants().is_empty());
+        assert_eq!(left_driver.backend().data_requests, 0);
+        assert_eq!(right_driver.backend().data_requests, 0);
+        assert!(left_driver.backend().ingested.is_empty());
+        assert!(right_driver.backend().ingested.is_empty());
+        assert!(
+            left_driver
+                .backend()
+                .selections
+                .iter()
+                .any(|(_, _, purpose)| { *purpose == InventoryPurpose::ReceiveBaseline })
+        );
+        assert!(
+            right_driver
+                .backend()
+                .selections
+                .iter()
+                .any(|(_, _, purpose)| { *purpose == InventoryPurpose::ReceiveBaseline })
+        );
+    }
+
+    #[test]
+    fn active_two_way_sync_converges_across_root_offer_boundary() {
+        const UNIQUE_DELTA: usize = 4;
+        for item_count in [255_usize, 256, 257] {
+            let (left_bundle, right_bundle) = bundles();
+            let object = |domain: u8, index: usize| {
+                let mut sealed = vec![domain];
+                sealed.extend_from_slice(
+                    &u64::try_from(index)
+                        .expect("bounded test index")
+                        .to_be_bytes(),
+                );
+                let object_id = ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(&sealed));
+                (object_id, sealed)
+            };
+            let mut common = BTreeMap::new();
+            for index in 0..item_count - UNIQUE_DELTA {
+                let (object_id, sealed) = object(0x43, index);
+                assert!(common.insert(object_id, sealed).is_none());
+            }
+            let mut left_backend = FakeBackend {
+                available: common.clone(),
+                ..FakeBackend::default()
+            };
+            let mut right_backend = FakeBackend {
+                available: common,
+                ..FakeBackend::default()
+            };
+            let mut left_unique = BTreeSet::new();
+            let mut right_unique = BTreeSet::new();
+            for index in 0..UNIQUE_DELTA {
+                let (left_id, left_sealed) = object(0x4c, index);
+                let (right_id, right_sealed) = object(0x52, index);
+                assert!(
+                    left_backend
+                        .available
+                        .insert(left_id, left_sealed)
+                        .is_none()
+                );
+                assert!(
+                    right_backend
+                        .available
+                        .insert(right_id, right_sealed)
+                        .is_none()
+                );
+                assert!(left_unique.insert(left_id));
+                assert!(right_unique.insert(right_id));
+            }
+            let left_initial = left_backend
+                .available
+                .keys()
+                .copied()
+                .collect::<BTreeSet<_>>();
+            let right_initial = right_backend
+                .available
+                .keys()
+                .copied()
+                .collect::<BTreeSet<_>>();
+            assert_eq!(left_initial.len(), item_count);
+            assert_eq!(right_initial.len(), item_count);
+            assert_eq!(
+                left_initial.difference(&right_initial).count(),
+                UNIQUE_DELTA
+            );
+            assert_eq!(
+                right_initial.difference(&left_initial).count(),
+                UNIQUE_DELTA
+            );
+            let expected = left_initial
+                .union(&right_initial)
+                .copied()
+                .collect::<BTreeSet<_>>();
+
+            let request = StartRequest {
+                exchange_id: 132,
+                topics: vec!["alpha".into()],
+                scopes: vec!["mission/team".into()],
+                min_priority: Priority::Routine as u8,
+            };
+            let mut left_driver = RuntimeDriver::initiator(
+                left_bundle,
+                SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
+                left_backend,
+                request.clone(),
+                None,
+            )
+            .unwrap();
+            let mut right_driver = RuntimeDriver::responder_with_start(
+                right_bundle,
+                SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
+                right_backend,
+                StartRequest {
+                    exchange_id: 9_999,
+                    ..request
+                },
+                None,
+            )
+            .unwrap();
+            assert!(left_driver.sync().inventory().is_empty());
+            assert!(right_driver.sync().inventory().is_empty());
+            let (left, right) = MemoryLink::pair(u16::MAX);
+            let now = Instant::now();
+            let mut converged = false;
+
+            for step in 0..5_000 {
+                left_driver.pump_at(&left, now).unwrap_or_else(|error| {
+                    panic!("{item_count}-item left pump failed at step {step}: {error}")
+                });
+                right_driver.pump_at(&right, now).unwrap_or_else(|error| {
+                    panic!("{item_count}-item right pump failed at step {step}: {error}")
+                });
+
+                let left_ids = left_driver
+                    .backend()
+                    .available
+                    .keys()
+                    .copied()
+                    .collect::<BTreeSet<_>>();
+                let right_ids = right_driver
+                    .backend()
+                    .available
+                    .keys()
+                    .copied()
+                    .collect::<BTreeSet<_>>();
+                let data_or_want_pending = |driver: &RuntimeDriver<FakeBackend>| {
+                    driver
+                        .retries
+                        .keys()
+                        .any(|key| matches!(key, RetryKey::Want(..) | RetryKey::Data(..)))
+                        || !driver.deferred_wants.is_empty()
+                };
+                if left_ids == expected
+                    && right_ids == expected
+                    && left_driver.sync().wants().is_empty()
+                    && right_driver.sync().wants().is_empty()
+                    && !data_or_want_pending(&left_driver)
+                    && !data_or_want_pending(&right_driver)
+                    && left.inbound.lock().unwrap().is_empty()
+                    && right.inbound.lock().unwrap().is_empty()
+                {
+                    converged = true;
+                    break;
+                }
+            }
+
+            assert!(
+                converged,
+                "{item_count}-item active two-way exchange did not converge"
+            );
+            assert!(left_driver.is_authenticated());
+            assert!(right_driver.is_authenticated());
+            assert_eq!(
+                left_driver
+                    .backend()
+                    .ingested
+                    .iter()
+                    .map(|(object_id, _)| *object_id)
+                    .collect::<BTreeSet<_>>(),
+                right_unique
+            );
+            assert_eq!(
+                right_driver
+                    .backend()
+                    .ingested
+                    .iter()
+                    .map(|(object_id, _)| *object_id)
+                    .collect::<BTreeSet<_>>(),
+                left_unique
+            );
+            assert_eq!(left_driver.backend().ingested.len(), UNIQUE_DELTA);
+            assert_eq!(right_driver.backend().ingested.len(), UNIQUE_DELTA);
+            assert!(
+                (UNIQUE_DELTA..=UNIQUE_DELTA * 2).contains(&left_driver.backend().data_requests)
+            );
+            assert!(
+                (UNIQUE_DELTA..=UNIQUE_DELTA * 2).contains(&right_driver.backend().data_requests)
+            );
+        }
+    }
+
+    #[test]
     fn authenticated_sync_converges_through_seeded_half_loss_and_a_dropped_response() {
         let (left_bundle, right_bundle) = bundles();
         let sealed = vec![0x5a; 4_096];
@@ -8338,6 +8626,21 @@ mod tests {
         receiver.deferred_wants.clear();
         receiver.outbox.clear();
         receiver.backend_mut().receipts.clear();
+        let serve_actions = receiver
+            .sync
+            .apply(SyncEvent::Receive(Message::Interest(
+                crate::wire::Interest {
+                    exchange_id: 912,
+                    topics: vec!["alpha".into()],
+                    scopes: vec!["mission/team".into()],
+                    min_priority: Priority::Routine as u8,
+                    max_offers: 256,
+                },
+            )))
+            .unwrap();
+        receiver.handle_actions(serve_actions).unwrap();
+        receiver.retries.clear();
+        receiver.outbox.clear();
         for index in 0..MAX_PENDING_RETRIES {
             let object_id = ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(
                 &u64::try_from(index).unwrap().to_be_bytes(),
@@ -8383,6 +8686,14 @@ mod tests {
             .as_ref()
             .expect("durable acknowledgement retains its blocked refresh")
             .due;
+        assert_eq!(
+            receiver
+                .inventory_refresh_retry
+                .as_ref()
+                .expect("durable acknowledgement retains its blocked refresh")
+                .scope,
+            InventoryRefreshScope::ServeOnly
+        );
 
         // Model the peer acknowledgements that release the retained send
         // capacity, then prove the scheduled refresh completes without
@@ -8397,6 +8708,20 @@ mod tests {
     fn complete_receipt_refresh_is_durable_and_wakes_after_transient_failure() {
         let (mut receiver, mut sender, left, right, now) =
             authenticated_runtime_pair(89, Priority::Routine);
+        let serve_actions = receiver
+            .sync
+            .apply(SyncEvent::Receive(Message::Interest(
+                crate::wire::Interest {
+                    exchange_id: 89,
+                    topics: vec!["alpha".into()],
+                    scopes: vec!["mission/team".into()],
+                    min_priority: Priority::Routine as u8,
+                    max_offers: 256,
+                },
+            )))
+            .unwrap();
+        receiver.handle_actions(serve_actions).unwrap();
+        let selections_before = receiver.backend().selections.len();
         receiver.backend_mut().fail_inventory_selection_attempts = 1;
         let object_id = ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(b"receipt-refresh"));
         sender
@@ -8420,11 +8745,24 @@ mod tests {
             .as_ref()
             .expect("acknowledged receipt refresh remains represented")
             .due;
+        assert_eq!(
+            receiver
+                .inventory_refresh_retry
+                .as_ref()
+                .expect("acknowledged receipt refresh remains represented")
+                .scope,
+            InventoryRefreshScope::ServeOnly
+        );
         assert_eq!(receiver.next_wakeup(&left), Some(retry_due));
 
         receiver.pump_at(&left, retry_due).unwrap();
         assert!(receiver.inventory_refresh_retry.is_none());
         assert_eq!(receiver.backend().receipts.len(), 1);
+        let refreshed_purposes = receiver.backend().selections[selections_before..]
+            .iter()
+            .map(|(_, _, purpose)| *purpose)
+            .collect::<Vec<_>>();
+        assert_eq!(refreshed_purposes, vec![InventoryPurpose::ServePeer]);
     }
 
     #[test]
