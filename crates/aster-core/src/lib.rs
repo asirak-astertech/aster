@@ -48,6 +48,7 @@ mod link;
 pub mod model;
 #[cfg(not(feature = "adapter-sdk"))]
 mod model;
+pub mod provisioning;
 #[cfg(feature = "adapter-sdk")]
 pub mod runtime;
 #[cfg(not(feature = "adapter-sdk"))]
@@ -97,6 +98,12 @@ pub use engine::{
 pub use engine::{EmissionPolicy, EngineError, PublishRequest, ResolveRequest};
 pub use model::{
     ConflictAnnotation, DataClass, ItemId, NodeId, PeerStatus, Priority, Scope, SyncStatus, Topic,
+};
+pub use provisioning::{
+    MAX_PROTECTED_PROVISIONING_BYTES, MAX_UNPROTECTED_PROVISIONING_BYTES,
+    ProtectedProvisioningError, ProvisioningProtectionError, ProvisioningProtector,
+    ProvisioningUnprotector, UnprotectedProvisioning, protect_provisioning_artifact,
+    unprotect_provisioning_artifact,
 };
 pub use store::{BridgeFilter, EventGap, PeerSnapshot, QuotaUsage, SubscriptionId};
 

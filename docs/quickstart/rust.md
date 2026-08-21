@@ -98,9 +98,18 @@ The checked-in bundle is public, disposable material authorized only for the
 example scope and topics. In an operational integration:
 
 1. obtain a unique bundle from the deployment's authority workflow;
-2. keep it out of source control, logs, and captures;
-3. store the database and Blob directory on durable protected storage; and
-4. never use the same bundle for two independent nodes.
+2. wrap it with an admitted `ProvisioningProtector`, then call
+   `ApplicationNode::open_protected` with the corresponding least-privilege
+   `ProvisioningUnprotector` rather than the raw example path;
+3. keep inner plaintext out of source control, logs, and captures;
+4. provide persistent secret custody and recovery separately from artifact
+   protection;
+5. store the database and Blob directory on durable protected storage; and
+6. never use the same bundle for two independent nodes.
+
+The repository defines that provider contract but does not yet ship an admitted
+operational implementation. See the
+[protected-provisioning decision](../decisions/0013-protected-provisioning-boundary.md).
 
 Complete bundle contents are deliberately opaque to the application API.
 The fixture's grants and regeneration procedure are documented in

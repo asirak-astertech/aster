@@ -315,7 +315,11 @@ compatibility is not downgrade-resistance evidence.
 
 ## Before a real deployment
 
-- Issue distinct operational bundles through an approved provisioning process.
+- Issue distinct operational bundles through an approved provisioning process,
+  wrap them with an admitted protected-artifact provider, and do not fall back
+  to the raw fixture/compatibility path.
+- Define persistent secret custody, unattended startup, backup/recovery, and
+  destroy behavior separately from artifact encryption.
 - Set quotas, retention, priority caps, and sync interests for the device tier.
 - Decide how the host obtains peer identities and endpoints.
 - Integrate nonblocking carrier readiness and wakeups without polling.

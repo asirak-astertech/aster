@@ -91,9 +91,13 @@ different: those fixed 32-byte values are designed for durable application use.
 
 ## Replace the test fixture
 
-The checked-in bundle is public test material. A real node needs a unique bundle
-from an approved authority workflow and durable storage that protects both the
-bundle and publisher counter state.
+The checked-in bundle is public test material. `aster_node_open` currently
+ingests the unprotected inner bundle for compatibility and tests, and the C ABI
+has no protected-provider entry point. It therefore does not yet satisfy
+operational provisioning custody. A real integration needs a unique protected
+artifact, persistent secret custody/recovery, and durable counter state; do not
+represent the raw path as protected. See the
+[protected-provisioning decision](../decisions/0013-protected-provisioning-boundary.md).
 
 The fixture's grants and regeneration procedure are documented in
 [Non-production binding test material](../../bindings/testdata/README.md).

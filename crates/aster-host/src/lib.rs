@@ -32,9 +32,10 @@ use aster_mesh::{
     BridgeFilter, BridgeNarrowingPolicy, BridgeRouteHandle, BridgeRouteResult, BridgeRouteStatus,
     ConflictAnnotation, DataClass, Delivery, EmissionPolicy, EngineError, EventGap, FinishedBlob,
     FinishedBlobBatchRequest, Item, ItemId, NodeId, PeerSnapshot, PeerStatus, Priority,
-    ProvisioningBundle, PublishRequest, PublishResult, Query, QuotaUsage, ReferenceBlobReader,
-    ReferenceBlobService, RekeyRecipient, Scope, ScopeRekeyResult, SubscriptionId, SyncStatus,
-    Topic, open_reference_node,
+    ProtectedProvisioningError, ProvisioningBundle, ProvisioningUnprotector, PublishRequest,
+    PublishResult, Query, QuotaUsage, ReferenceBlobReader, ReferenceBlobService, RekeyRecipient,
+    Scope, ScopeRekeyResult, SubscriptionId, SyncStatus, Topic, UnprotectedProvisioning,
+    open_reference_node, unprotect_provisioning_artifact,
 };
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -43,7 +44,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
-use zeroize::{Zeroize, Zeroizing};
 
 const MAX_FILTER_NAMES: usize = 256;
 const MAX_CONFIGURED_CARRIERS: usize = 256;
@@ -162,6 +162,7 @@ pub enum ContactFailure {
 pub enum ServiceError {
     Engine(EngineError),
     Blob(BlobError),
+    Provisioning(ProtectedProvisioningError),
     Contact(ContactFailure),
     /// The named operation is durably committed, but the live contact could
     /// not refresh its authenticated inventory view. Callers must not retry as
@@ -181,6 +182,7 @@ impl fmt::Display for ServiceError {
         match self {
             Self::Engine(error) => write!(formatter, "node operation failed: {error}"),
             Self::Blob(error) => write!(formatter, "Blob operation failed: {error}"),
+            Self::Provisioning(error) => write!(formatter, "provisioning failed: {error}"),
             Self::Contact(reason) => write!(formatter, "contact failed: {reason:?}"),
             Self::CommittedContactRefresh { operation, reason } => write!(
                 formatter,
@@ -199,6 +201,7 @@ impl Error for ServiceError {
         match self {
             Self::Engine(error) => Some(error),
             Self::Blob(error) => Some(error),
+            Self::Provisioning(error) => Some(error),
             Self::Io(error) => Some(error),
             Self::Contact(_)
             | Self::CommittedContactRefresh { .. }
@@ -218,6 +221,12 @@ impl From<EngineError> for ServiceError {
 impl From<BlobError> for ServiceError {
     fn from(error: BlobError) -> Self {
         Self::Blob(error)
+    }
+}
+
+impl From<ProtectedProvisioningError> for ServiceError {
+    fn from(error: ProtectedProvisioningError) -> Self {
+        Self::Provisioning(error)
     }
 }
 
@@ -536,7 +545,7 @@ impl RuntimeBackend for PeerBoundBackend {
 pub struct MeshService {
     database_path: PathBuf,
     blob_path: PathBuf,
-    credentials: Zeroizing<Vec<u8>>,
+    credentials: UnprotectedProvisioning,
     options: ServiceOptions,
     identity: NodeId,
     state: ServiceState,
@@ -547,8 +556,11 @@ pub struct MeshService {
 }
 
 impl MeshService {
-    /// Opens durable local state. No carrier is required, so offline publication
-    /// is available immediately.
+    /// Opens durable local state from a canonical unprotected inner bundle.
+    ///
+    /// This raw-byte entry point exists for compatibility, tests, and controlled migration. It
+    /// does not protect provisioning material at rest. Operational Rust callers should use
+    /// [`Self::open_protected`] with an admitted provider.
     pub fn open(
         database_path: impl AsRef<Path>,
         blob_path: impl AsRef<Path>,
@@ -557,9 +569,61 @@ impl MeshService {
     ) -> Result<Self, ServiceError> {
         let database_path = database_path.as_ref().to_path_buf();
         let blob_path = blob_path.as_ref().to_path_buf();
-        let config = node_config(&options.node)?;
-        let credentials = Zeroizing::new(provisioning_bundle.to_vec());
-        let bundle = parse_bundle(&credentials)?;
+        let config = validate_service_options(&options)?;
+        let credentials = UnprotectedProvisioning::new(provisioning_bundle.to_vec())
+            .map_err(|_| ServiceError::Credential("invalid provisioning bundle".into()))?;
+        let bundle = parse_bundle(credentials.expose())?;
+        Self::open_bundle(
+            database_path,
+            blob_path,
+            credentials,
+            bundle,
+            options,
+            config,
+        )
+    }
+
+    /// Opens durable local state from a provider-protected provisioning artifact.
+    ///
+    /// Provider failure occurs before either the SQLite database or Blob store is opened. There is
+    /// no fallback to the raw bundle path. The current host retains a zeroizing in-process copy of
+    /// the canonical credentials for backend restarts; this boundary is not a persistent secret
+    /// store or hardware-custody claim.
+    pub fn open_protected<P>(
+        database_path: impl AsRef<Path>,
+        blob_path: impl AsRef<Path>,
+        protected_bundle: &[u8],
+        unprotector: &mut P,
+        options: ServiceOptions,
+    ) -> Result<Self, ServiceError>
+    where
+        P: ProvisioningUnprotector + ?Sized,
+    {
+        let database_path = database_path.as_ref().to_path_buf();
+        let blob_path = blob_path.as_ref().to_path_buf();
+        let config = validate_service_options(&options)?;
+        let credentials = unprotect_provisioning_artifact(protected_bundle, unprotector)
+            .map_err(ProtectedProvisioningError::from)?;
+        let bundle = ProvisioningBundle::from_bytes(credentials.expose())
+            .map_err(|_| ProtectedProvisioningError::InvalidBundle)?;
+        Self::open_bundle(
+            database_path,
+            blob_path,
+            credentials,
+            bundle,
+            options,
+            config,
+        )
+    }
+
+    fn open_bundle(
+        database_path: PathBuf,
+        blob_path: PathBuf,
+        credentials: UnprotectedProvisioning,
+        bundle: ProvisioningBundle,
+        options: ServiceOptions,
+        config: NodeConfig,
+    ) -> Result<Self, ServiceError> {
         let node = open_reference_node(&database_path, bundle, config)?;
         let identity = node.identity();
         let blobs = BlobTransferStore::open_with_config(&blob_path, options.blobs)?;
@@ -651,7 +715,7 @@ impl MeshService {
             ));
         }
         let carrier = self.select_carrier(peer)?;
-        let bundle = parse_bundle(&self.credentials)?;
+        let bundle = parse_bundle(self.credentials.expose())?;
         let sync = SyncState::new(Default::default(), SparseInventory::new())
             .map_err(|error| ServiceError::Invalid(error.to_string()))?;
         let exchange_id = self.next_exchange_id;
@@ -1320,11 +1384,11 @@ impl MeshService {
     }
 
     fn reopen_backend(&self) -> Result<DurableBackend, ServiceError> {
-        let bundle = parse_bundle(&self.credentials)?;
+        let bundle = parse_bundle(self.credentials.expose())?;
         let node = open_reference_node(
             &self.database_path,
             bundle,
-            node_config(&self.options.node)?,
+            validate_service_options(&self.options)?,
         )?;
         let blobs = BlobTransferStore::open_with_config(&self.blob_path, self.options.blobs)?;
         Ok(ReferenceSemanticRuntimeBackend::new(node, blobs)?)
@@ -1419,17 +1483,56 @@ fn node_config(options: &ApplicationNodeOptions) -> Result<NodeConfig, ServiceEr
     })
 }
 
+fn validate_service_options(options: &ServiceOptions) -> Result<NodeConfig, ServiceError> {
+    if options.blobs.max_bytes == 0 || options.blobs.max_chunks == 0 {
+        return Err(ServiceError::Invalid(
+            "Blob storage limits must be nonzero".into(),
+        ));
+    }
+    node_config(&options.node)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use aster_mesh::fragment::Fragment;
     use aster_mesh::link::{LinkCharacteristics, ReceivedFrame};
-    use aster_mesh::{ProvisioningAccess, ReferenceProvisioner};
+    use aster_mesh::{
+        ProvisioningAccess, ProvisioningProtectionError, ReferenceProvisioner,
+        UnprotectedProvisioning,
+    };
     use std::collections::{BTreeSet, VecDeque};
     use std::fs;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    struct TestProtectedSource {
+        plaintext: Option<Vec<u8>>,
+        calls: usize,
+        failure: Option<ProvisioningProtectionError>,
+    }
+
+    impl ProvisioningUnprotector for TestProtectedSource {
+        fn unprotect(
+            &mut self,
+            _protected: &[u8],
+            max_plaintext_len: usize,
+        ) -> Result<UnprotectedProvisioning, ProvisioningProtectionError> {
+            self.calls += 1;
+            if let Some(error) = self.failure {
+                return Err(error);
+            }
+            let plaintext = self
+                .plaintext
+                .take()
+                .ok_or(ProvisioningProtectionError::Unavailable)?;
+            if plaintext.len() > max_plaintext_len {
+                return Err(ProvisioningProtectionError::TooLarge);
+            }
+            UnprotectedProvisioning::new(plaintext)
+        }
+    }
 
     #[derive(Clone)]
     struct AutomaticMergeMustNotRun {
@@ -1838,6 +1941,122 @@ mod tests {
             .node_mut()
             .publish_scope_epoch(scope, epoch)
             .unwrap();
+    }
+
+    #[test]
+    fn protected_service_open_retains_one_shot_credentials_and_rejects_before_paths() {
+        let root = test_directory();
+        let database = root.join("protected.sqlite");
+        let blobs = root.join("protected-blobs");
+        let topic = Topic::new("protected.host").unwrap();
+        let scope = Scope::new("mission/protected-host").unwrap();
+        let access =
+            ProvisioningAccess::member(scope.clone(), vec![0], vec![topic.clone()]).unwrap();
+        let mut provisioner = ReferenceProvisioner::from_seed([0x94; 32]).unwrap();
+        let raw = provisioner
+            .issue_node(1, &[access])
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        let options = ServiceOptions {
+            node: ApplicationNodeOptions::default(),
+            blobs: BlobStoreConfig::default(),
+            sync: SyncProfile::new(vec![topic], vec![scope], Priority::Routine).unwrap(),
+        };
+
+        let mut success = TestProtectedSource {
+            plaintext: Some(raw.clone()),
+            calls: 0,
+            failure: None,
+        };
+        let service = MeshService::open_protected(
+            &database,
+            &blobs,
+            b"provider-owned-artifact",
+            &mut success,
+            options.clone(),
+        )
+        .unwrap();
+        assert_eq!(success.calls, 1);
+        let reopened = service.reopen_backend().unwrap();
+        drop(reopened);
+        assert_eq!(success.calls, 1);
+        drop(service);
+
+        let invalid_options_database = root.join("invalid-options.sqlite");
+        let invalid_options_blobs = root.join("invalid-options-blobs");
+        let mut invalid_options_source = TestProtectedSource {
+            plaintext: Some(raw.clone()),
+            calls: 0,
+            failure: None,
+        };
+        let mut invalid_options = options.clone();
+        invalid_options.blobs.max_bytes = 0;
+        assert!(
+            MeshService::open_protected(
+                &invalid_options_database,
+                &invalid_options_blobs,
+                b"provider-owned-artifact",
+                &mut invalid_options_source,
+                invalid_options,
+            )
+            .is_err()
+        );
+        assert_eq!(invalid_options_source.calls, 0);
+        assert!(!invalid_options_database.exists());
+        assert!(!invalid_options_blobs.exists());
+
+        let failed_database = root.join("rejected.sqlite");
+        let failed_blobs = root.join("rejected-blobs");
+        let mut failure = TestProtectedSource {
+            plaintext: None,
+            calls: 0,
+            failure: Some(ProvisioningProtectionError::Rejected),
+        };
+        let error = MeshService::open_protected(
+            &failed_database,
+            &failed_blobs,
+            b"provider-owned-rejected-artifact",
+            &mut failure,
+            options.clone(),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("provider rejection must not fall back to valid plaintext"));
+        assert!(matches!(
+            error,
+            ServiceError::Provisioning(ProtectedProvisioningError::Protection(
+                ProvisioningProtectionError::Rejected
+            ))
+        ));
+        assert_eq!(failure.calls, 1);
+        assert!(!failed_database.exists());
+        assert!(!failed_blobs.exists());
+
+        let malformed_database = root.join("malformed.sqlite");
+        let malformed_blobs = root.join("malformed-blobs");
+        let mut malformed = TestProtectedSource {
+            plaintext: Some(b"not-a-provisioning-bundle".to_vec()),
+            calls: 0,
+            failure: None,
+        };
+        let error = MeshService::open_protected(
+            &malformed_database,
+            &malformed_blobs,
+            b"provider-owned-artifact",
+            &mut malformed,
+            options,
+        )
+        .err()
+        .unwrap_or_else(|| panic!("malformed recovered plaintext must fail closed"));
+        assert!(matches!(
+            error,
+            ServiceError::Provisioning(ProtectedProvisioningError::InvalidBundle)
+        ));
+        assert_eq!(malformed.calls, 1);
+        assert!(!malformed_database.exists());
+        assert!(!malformed_blobs.exists());
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

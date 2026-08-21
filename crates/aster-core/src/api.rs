@@ -24,6 +24,7 @@ use crate::engine::{
     RecordMergePolicy, RecordVersion, ResolveRequest,
 };
 use crate::model::{ConflictAnnotation, DataClass, ItemId, NodeId, Priority, Scope, Topic};
+use crate::provisioning::ProvisioningUnprotector;
 use crate::store::{
     BatchStoragePolicy, BridgeAuthorizationCursor, BridgeFilter, EventGap, PeerSnapshot,
     QuotaUsage, RecordStore, StoreConfig, StoreQuery, StoredBridgeAuthorization, StoredBridgeRoute,
@@ -1050,14 +1051,47 @@ pub struct ApplicationNode {
 }
 
 impl ApplicationNode {
-    /// Opens and authenticates an opaque authority-issued bundle.
+    /// Opens and authenticates a canonical unprotected inner bundle.
+    ///
+    /// This raw-byte entry point exists for compatibility, tests, and controlled migration. It
+    /// does not protect provisioning material at rest. Operational Rust callers should use
+    /// [`Self::open_protected`] with an admitted provider.
     pub fn open(
         path: impl AsRef<Path>,
         provisioning_bundle: &[u8],
         options: ApplicationNodeOptions,
     ) -> Result<Self, EngineError> {
+        let config = options.into_engine()?;
         let bundle = ProvisioningBundle::from_bytes(provisioning_bundle)?;
-        let mut inner = open_reference_node(path, bundle, options.into_engine()?)?;
+        Self::open_bundle(path, bundle, config)
+    }
+
+    /// Authenticates and opens a provider-protected provisioning artifact.
+    ///
+    /// Local options are validated first. A nonempty bounded outer artifact invokes the
+    /// unprotector exactly once; empty, oversized, or raw-inner input invokes it zero times.
+    /// Failure is returned before the node store is opened, and the method never retries by
+    /// treating the artifact as plaintext.
+    pub fn open_protected<P>(
+        path: impl AsRef<Path>,
+        protected_bundle: &[u8],
+        unprotector: &mut P,
+        options: ApplicationNodeOptions,
+    ) -> Result<Self, EngineError>
+    where
+        P: ProvisioningUnprotector + ?Sized,
+    {
+        let config = options.into_engine()?;
+        let bundle = ProvisioningBundle::from_protected_bytes(protected_bundle, unprotector)?;
+        Self::open_bundle(path, bundle, config)
+    }
+
+    fn open_bundle(
+        path: impl AsRef<Path>,
+        bundle: ProvisioningBundle,
+        config: NodeConfig,
+    ) -> Result<Self, EngineError> {
+        let mut inner = open_reference_node(path, bundle, config)?;
         inner.reauthenticate_application_bridge_state()?;
         Ok(Self { inner })
     }
@@ -1809,6 +1843,9 @@ mod tests {
     use crate::blob::{BlobMetadata, MIN_BLOB_CHUNK_SIZE};
     use crate::crypto::{BridgeCryptoProvider, ProvisioningAccess, ReferenceProvisioner};
     use crate::engine::EnvelopeSealer;
+    use crate::provisioning::{
+        ProtectedProvisioningError, ProvisioningProtectionError, UnprotectedProvisioning,
+    };
     use crate::store::{
         RecordStore, ScopeEpoch, VerifiedBridgeAuthorization as StoreVerifiedBridgeAuthorization,
     };
@@ -1816,6 +1853,33 @@ mod tests {
     use std::io::Cursor;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TestProtectedSource {
+        plaintext: Option<Vec<u8>>,
+        calls: usize,
+        failure: Option<ProvisioningProtectionError>,
+    }
+
+    impl ProvisioningUnprotector for TestProtectedSource {
+        fn unprotect(
+            &mut self,
+            _protected: &[u8],
+            max_plaintext_len: usize,
+        ) -> Result<UnprotectedProvisioning, ProvisioningProtectionError> {
+            self.calls += 1;
+            if let Some(error) = self.failure {
+                return Err(error);
+            }
+            let plaintext = self
+                .plaintext
+                .take()
+                .ok_or(ProvisioningProtectionError::Unavailable)?;
+            if plaintext.len() > max_plaintext_len {
+                return Err(ProvisioningProtectionError::TooLarge);
+            }
+            UnprotectedProvisioning::new(plaintext)
+        }
+    }
 
     fn api_test_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -1961,6 +2025,101 @@ mod tests {
             .into_store()
             .is_err()
         );
+    }
+
+    #[test]
+    fn protected_application_open_is_one_shot_and_fails_before_store_creation() {
+        let scope = Scope::new("mission/protected-api").unwrap();
+        let topic = Topic::new("protected.api").unwrap();
+        let access = ProvisioningAccess::member(scope, vec![0], vec![topic]).unwrap();
+        let mut provisioner = ReferenceProvisioner::from_seed([0x93; 32]).unwrap();
+        let raw = provisioner
+            .issue_node(1, &[access])
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+
+        let success_path = api_test_path("protected-open-success");
+        let mut success = TestProtectedSource {
+            plaintext: Some(raw.clone()),
+            calls: 0,
+            failure: None,
+        };
+        let node = ApplicationNode::open_protected(
+            &success_path,
+            b"provider-owned-artifact",
+            &mut success,
+            ApplicationNodeOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(success.calls, 1);
+        drop(node);
+        remove_store(&success_path);
+
+        let failure_path = api_test_path("protected-open-failure");
+        let mut failure = TestProtectedSource {
+            plaintext: None,
+            calls: 0,
+            failure: Some(ProvisioningProtectionError::Unavailable),
+        };
+        let error = ApplicationNode::open_protected(
+            &failure_path,
+            b"provider-owned-rejected-artifact",
+            &mut failure,
+            ApplicationNodeOptions::default(),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("provider failure must not fall back to valid plaintext"));
+        assert!(matches!(
+            error,
+            EngineError::Provisioning(ProtectedProvisioningError::Protection(
+                ProvisioningProtectionError::Unavailable
+            ))
+        ));
+        assert_eq!(failure.calls, 1);
+        assert!(!failure_path.exists());
+
+        let invalid_options_path = api_test_path("protected-open-invalid-options");
+        let mut invalid_options = TestProtectedSource {
+            plaintext: Some(raw.clone()),
+            calls: 0,
+            failure: None,
+        };
+        assert!(
+            ApplicationNode::open_protected(
+                &invalid_options_path,
+                b"provider-owned-artifact",
+                &mut invalid_options,
+                ApplicationNodeOptions {
+                    max_items: 0,
+                    ..ApplicationNodeOptions::default()
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(invalid_options.calls, 0);
+        assert!(!invalid_options_path.exists());
+
+        let malformed_path = api_test_path("protected-open-malformed-inner");
+        let mut malformed = TestProtectedSource {
+            plaintext: Some(b"not-a-provisioning-bundle".to_vec()),
+            calls: 0,
+            failure: None,
+        };
+        let error = ApplicationNode::open_protected(
+            &malformed_path,
+            b"provider-owned-artifact",
+            &mut malformed,
+            ApplicationNodeOptions::default(),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("malformed recovered plaintext must fail closed"));
+        assert!(matches!(
+            error,
+            EngineError::Provisioning(ProtectedProvisioningError::InvalidBundle)
+        ));
+        assert_eq!(malformed.calls, 1);
+        assert!(!malformed_path.exists());
     }
 
     #[test]

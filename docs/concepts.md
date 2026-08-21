@@ -314,6 +314,14 @@ and permitted scope/topic access. The checked-in quickstart bundle is public,
 disposable test material and must never be confused with an operational
 provisioning workflow.
 
+There are three distinct custody layers. A protected artifact is a provider-
+owned encrypted or hardware-bound outer object. `ASTRPB03` is the bounded
+plaintext inner bundle exposed only during ingestion. A persistent secret store
+protects the long-lived keys a running node must reload. Aster now defines a
+replaceable protection boundary for the first transition, but ships no
+operational provider or persistent secret-store backend yet. The checked-in
+fixture exercises only the raw compatibility/test path.
+
 Routing keys and content keys are separate. A routing-only node may forward
 protected metadata and ciphertext without obtaining the topic content key. A
 scope rekey creates a fresh epoch and explicit recipient set so a captured or

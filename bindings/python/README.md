@@ -16,11 +16,13 @@ library.
 both `2` in this build. These process-wide constants do not report a particular
 session's negotiated result.
 
-`Node` accepts opaque authority-issued provisioning bytes. Use it as a context
-manager, or call `close()`/`zeroize()` explicitly. Native result handles and
-owned buffers are copied into Python values and released deterministically.
-Transport-owned sealed envelopes are intentionally not exposed by this
-application binding.
+`Node` currently accepts the canonical unprotected inner provisioning bytes for
+compatibility and tests; no protected-provider binding is shipped. Raw open is
+not an operational custody solution. Use the node as a context manager, or call
+`close()`/`zeroize()` explicitly. Native result handles and owned buffers are
+copied into Python values and released deterministically. Transport-owned sealed
+envelopes are intentionally not exposed by this application binding. See the
+[protected-provisioning gate](../../docs/decisions/0013-protected-provisioning-boundary.md).
 
 The simplest application flow is:
 

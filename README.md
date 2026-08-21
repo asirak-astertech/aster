@@ -74,6 +74,11 @@ The fastest first success uses the checked-in disposable provisioning fixture.
 It exercises durable, offline application behavior without pretending to be an
 operational deployment.
 
+Operational provisioning is still gated. Rust exposes a replaceable protected-
+artifact boundary, but this repository does not yet ship an admitted provider
+or persistent secret store; the fixture and current language-binding entry
+points ingest the unprotected inner format for tests and compatibility only.
+
 | Your application | Start here |
 |---|---|
 | Rust | [Rust quickstart](docs/quickstart/rust.md) |

@@ -8,7 +8,6 @@ license.workspace = true
 
 [dependencies]
 aster-core = { version = "=0.1.0", path = "../aster-core", features = ["adapter-sdk"] }
-zeroize.workspace = true
 
 [lints]
 workspace = true

@@ -890,6 +890,13 @@ control-route key can see the encrypted control's package metadata, recipient
 identifiers, and sizes, but an omitted holder cannot recover hidden grant salts,
 topic lists, or fresh epoch keys.
 
+Provisioning artifact protection is local and out of band. `ASTRPB03` is the
+reference's bounded plaintext inner representation; its checksum is not
+authentication or at-rest protection. A provider-owned outer artifact MUST NOT
+change identity, credential, grant, suite, or replication bytes. The reference
+exposes a replaceable, fail-closed protection boundary, but the boundary alone
+does not admit a provider or establish a persistent secret store.
+
 Zeroization destroys in-memory identity, package, scope, content, session, DRBG,
 and cached-plaintext material, then calls platform keystore/destruction hooks.
 Destroying a hardware-backed wrapping key is the preferred persistent mechanism.
