@@ -13,5 +13,8 @@ aster-ip = { version = "=0.1.0", path = "../aster-ip" }
 getrandom.workspace = true
 zeroize.workspace = true
 
+[dev-dependencies]
+negentropy = "=0.5.1"
+
 [lints]
 workspace = true

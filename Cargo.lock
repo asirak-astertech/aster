@@ -105,6 +105,7 @@ dependencies = [
  "aster-host",
  "aster-ip",
  "getrandom 0.4.3",
+ "negentropy",
  "zeroize",
 ]
 
@@ -514,6 +515,12 @@ dependencies = [
  "num-traits",
  "zeroize",
 ]
+
+[[package]]
+name = "negentropy"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81c353b400a5503efdcf398f11a83fb7aa84f59f5d76fc4bf5bbc1e4f5366caa"
 
 [[package]]
 name = "num-traits"
