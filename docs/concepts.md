@@ -118,10 +118,16 @@ Use Record for mutable structured data that may be edited on disconnected nodes:
 plans, forms, annotations, or workflows.
 
 If two nodes make concurrent changes, Aster keeps the sibling versions and
-surfaces a conflict annotation. The framework does not silently discard one. An
-application may resolve the conflict explicitly or register a deterministic
-topic merge policy. “Deterministic” means every node produces identical output
-from the same ordered inputs.
+surfaces a conflict annotation. Direct and forwarded replicated ingestion never
+execute application merge code. Applications inspect the current sibling set
+and call `resolve()` explicitly; the sibling-set guard rejects a stale
+resolution.
+
+Rust can register a process-local, application-supplied policy ID for a topic.
+While that registration is live, the high-level conflict API includes the ID in
+matching annotations. Registration does not execute the policy and is not
+durable across restart. Automatic registered-policy merge required by §5.3 is
+therefore partial.
 
 Use Record instead of State when concurrent versions must remain inspectable.
 
@@ -188,7 +194,9 @@ update happened after another.
   concurrent heads remain recoverable when requested.
 - Event is append-only and detects per-publisher gaps.
 - Record preserves concurrent siblings, exposed through `conflicts()`, until a
-  deterministic merge or explicit resolution.
+  causally dominating revision supersedes them. Explicit resolution publishes
+  such a revision for the exact observed sibling set; automatic
+  registered-policy resolution is not implemented.
 - Blob is immutable and therefore does not merge.
 
 ### Deletion with tombstones
@@ -199,7 +207,7 @@ within the tombstone-retention window. The deployment baseline is 30 days of
 offline tolerance plus a 15-day margin; the current default is therefore 45
 days. Returning after the configured bound can resurrect data. Configure the
 tombstone and superseded-version windows through
-[`ApplicationNodeOptions`](../crates/aster-core/src/api.rs#L938), and align them
+[`ApplicationNodeOptions`](../crates/aster-core/src/api.rs), and align them
 with the deployment's offline tolerance.
 
 ### Priority and TTL

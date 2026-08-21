@@ -32,11 +32,22 @@ The implemented Rust boundary is `ApplicationNode`. It owns the generic engine,
 accepts only opaque provisioning bytes, requires bounded query/delivery pages,
 rejects generic whole-buffer Blob publication, selects Blob epochs internally,
 and maps items/publication receipts to application records that omit causal
-vectors and sealed bytes. Application merge policies receive only sorted IDs,
-publisher IDs, payloads, and tombstone flags. All underlying modules are private
-unless `adapter-sdk` is selected; every workspace adapter/tool that needs them
-opts in explicitly.
+vectors and sealed bytes. The explicit application merge-helper input contains
+only IDs, publisher IDs, payloads, and tombstone flags; callers must supply it in
+ascending full-ItemID order. All underlying modules are private unless
+`adapter-sdk` is selected; every workspace adapter/tool that needs them opts in
+explicitly.
 
 This separation follows the supplied requirement that application developers
 need no knowledge of cryptography, fragmentation, transport selection, or sync
 internals while preserving a documented path for future transport packages.
+
+## Implementation correction (2026-08-20)
+
+`register_merge_policy` is retained for API compatibility, but registration is
+process-local and its only automatic effect is to associate the policy ID with
+high-level Record conflict annotations. Direct and forwarded replicated
+ingestion never invoke application policy. Applications inspect siblings and
+publish reviewed output through explicit `resolve()`. This prevents
+peer-triggered ingestion from creating recursive merge publications and leaves
+requirements §5.3 automatic merge partial pending a convergent design.

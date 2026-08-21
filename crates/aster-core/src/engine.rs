@@ -419,7 +419,9 @@ pub struct Emission {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IngestReceipt {
     pub outcome: ApplyOutcome,
-    /// Deterministic automatic record merge, when a registered policy applied.
+    /// Reserved compatibility field. Replicated ingestion does not execute
+    /// application merge code, so the current protocol profile always returns
+    /// `None` here.
     pub merged: Option<ItemId>,
 }
 
@@ -469,7 +471,9 @@ pub struct ResolveRequest {
     pub ttl_ms: Option<u64>,
 }
 
-/// Version input to an application-provided deterministic record merge.
+/// Version input to an application-provided explicit Record merge helper.
+///
+/// Callers MUST supply versions in ascending full-ItemID order.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecordVersion {
     pub id: ItemId,
@@ -479,8 +483,15 @@ pub struct RecordVersion {
     pub tombstone: bool,
 }
 
-/// Integrator merge policy. Implementations must produce identical bytes for the
-/// canonical, item-ID-sorted input on every conformant node.
+/// Integrator merge-policy descriptor and explicit-resolution helper.
+///
+/// Registration lets the process-local application projection associate
+/// [`Self::id`] with Record conflict annotations; it is not persisted.
+/// Replicated ingestion never invokes [`Self::merge`]. Applications may retain
+/// and invoke their helper over an inspected sibling set and submit the result
+/// through [`Node::resolve`]. For identical canonical inputs, [`Self::merge`]
+/// MUST return identical bytes across every supported implementation and
+/// version; Aster does not verify that application-level obligation.
 pub trait RecordMergePolicy: Send + Sync {
     fn id(&self) -> &str;
     fn merge(&self, versions: &[RecordVersion]) -> Result<Vec<u8>, String>;
@@ -543,7 +554,7 @@ pub struct Node<S, E> {
     priority_cap: Priority,
     publish_retry_limit: usize,
     clock: Arc<dyn Clock>,
-    merge_policies: BTreeMap<String, Arc<dyn RecordMergePolicy>>,
+    merge_policy_ids: BTreeMap<String, String>,
 }
 
 impl<E: EnvelopeSealer> Node<SqliteStore, E> {
@@ -570,7 +581,7 @@ impl<S: RecordStore, E: EnvelopeSealer> Node<S, E> {
             priority_cap: config.priority_cap,
             publish_retry_limit: config.publish_retry_limit.max(1),
             clock: config.clock,
-            merge_policies: BTreeMap::new(),
+            merge_policy_ids: BTreeMap::new(),
         }
     }
 
@@ -612,9 +623,16 @@ impl<S: RecordStore, E: EnvelopeSealer> Node<S, E> {
         Ok(())
     }
 
+    /// Associates a process-local policy identifier with application-projection
+    /// conflicts on `topic`. Registration is not persisted across restart.
+    ///
+    /// Only the identifier is retained; the executable policy object is not.
+    /// This does not authorize policy execution during replicated ingestion.
+    /// Callers must retain any helper they intend to invoke, review its result,
+    /// and publish that result through [`Self::resolve`].
     pub fn register_merge_policy(&mut self, topic: Topic, policy: Arc<dyn RecordMergePolicy>) {
-        self.merge_policies
-            .insert(topic.as_str().to_owned(), policy);
+        self.merge_policy_ids
+            .insert(topic.as_str().to_owned(), policy.id().to_owned());
     }
 
     pub fn publish(&mut self, request: PublishRequest) -> Result<PublishReceipt, EngineError> {
@@ -804,11 +822,6 @@ impl<S: RecordStore, E: EnvelopeSealer> Node<S, E> {
                 received: verified.header.key_epoch,
             });
         }
-        let topic = verified.header.topic.clone();
-        let scope = verified.header.scope.clone();
-        let priority = verified.header.priority;
-        let ttl_ms = verified.header.ttl_ms;
-        let logical_key = verified.header.logical_key.clone();
         let item = stored_from_verified(
             verified,
             sealed.to_vec(),
@@ -817,16 +830,10 @@ impl<S: RecordStore, E: EnvelopeSealer> Node<S, E> {
             self.clock.custody_sample(),
         );
         let outcome = self.store.ingest(item)?;
-        let conflict = match &outcome {
-            ApplyOutcome::Inserted { conflict, .. } => conflict.clone(),
-            ApplyOutcome::Duplicate { .. } => None,
-        };
-        let merged = if let Some(conflict) = conflict {
-            self.auto_merge(&topic, &scope, priority, ttl_ms, &logical_key, &conflict)?
-        } else {
-            None
-        };
-        Ok(IngestReceipt { outcome, merged })
+        Ok(IngestReceipt {
+            outcome,
+            merged: None,
+        })
     }
 
     pub fn ingest_control(&mut self, sealed: &[u8]) -> Result<ControlOutcome, EngineError> {
@@ -1011,54 +1018,6 @@ impl<S: RecordStore, E: EnvelopeSealer> Node<S, E> {
             context.join(&item.stamp.clock());
         }
         Ok(context)
-    }
-
-    fn auto_merge(
-        &mut self,
-        topic: &Topic,
-        scope: &Scope,
-        priority: Priority,
-        ttl_ms: Option<u64>,
-        logical_key: &[u8],
-        conflict: &ConflictAnnotation,
-    ) -> Result<Option<ItemId>, EngineError> {
-        let Some(policy) = self.merge_policies.get(topic.as_str()).cloned() else {
-            return Ok(None);
-        };
-        let mut versions = Vec::new();
-        for id in &conflict.siblings {
-            let item = self.store.get(id)?.ok_or(EngineError::StaleConflict)?;
-            let application = self.open_application_item(item)?;
-            versions.push(RecordVersion {
-                id: application.id,
-                publisher: application.publisher,
-                stamp: application.stamp,
-                payload: application.payload,
-                tombstone: application.tombstone,
-            });
-        }
-        versions.sort_by_key(|version| version.id);
-        let merged = policy.merge(&versions).map_err(EngineError::Merge)?;
-        // Detect an immediately nondeterministic policy before committing a value
-        // that could make peers diverge. Cross-implementation determinism remains
-        // an integrator/conformance obligation.
-        let repeated = policy.merge(&versions).map_err(EngineError::Merge)?;
-        if merged != repeated {
-            return Err(EngineError::Merge(format!(
-                "policy {} returned different bytes for identical input",
-                policy.id()
-            )));
-        }
-        let receipt = self.resolve(ResolveRequest {
-            topic: topic.clone(),
-            scope: scope.clone(),
-            logical_key: logical_key.to_vec(),
-            expected_siblings: conflict.siblings.clone(),
-            payload: merged,
-            priority,
-            ttl_ms,
-        })?;
-        Ok(Some(receipt.id))
     }
 
     fn open_delivery(&mut self, delivery: AppDelivery) -> Result<Delivery, EngineError> {
@@ -1679,11 +1638,6 @@ impl<S: RecordStore, E: EnvelopeSealer> Node<S, E> {
                 {
                     return Err(EngineError::Expired);
                 }
-                let topic = verified.header.topic.clone();
-                let scope = verified.header.scope.clone();
-                let priority = verified.header.priority;
-                let ttl_ms = verified.header.ttl_ms;
-                let logical_key = verified.header.logical_key.clone();
                 let item = stored_from_verified(
                     verified,
                     sealed.to_vec(),
@@ -1692,16 +1646,10 @@ impl<S: RecordStore, E: EnvelopeSealer> Node<S, E> {
                     self.clock.custody_sample(),
                 );
                 let outcome = self.store.ingest(item)?;
-                let conflict = match &outcome {
-                    ApplyOutcome::Inserted { conflict, .. } => conflict.clone(),
-                    ApplyOutcome::Duplicate { .. } => None,
-                };
-                let merged = if let Some(conflict) = conflict {
-                    self.auto_merge(&topic, &scope, priority, ttl_ms, &logical_key, &conflict)?
-                } else {
-                    None
-                };
-                Ok(ForwardedIngest::Data(IngestReceipt { outcome, merged }))
+                Ok(ForwardedIngest::Data(IngestReceipt {
+                    outcome,
+                    merged: None,
+                }))
             }
         }
     }
@@ -2708,10 +2656,7 @@ impl Node<SqliteStore, crate::crypto::ReferenceEnvelopeSealer> {
                 conflicts.push(ConflictAnnotation {
                     logical_key,
                     siblings,
-                    merge_policy: self
-                        .merge_policies
-                        .get(topic.as_str())
-                        .map(|policy| policy.id().to_owned()),
+                    merge_policy: self.merge_policy_ids.get(topic.as_str()).cloned(),
                 });
             }
         }
@@ -3240,6 +3185,21 @@ mod tests {
             Err(EnvelopeError("no test control object".into()))
         }
 
+        fn inspect_forwarding(
+            &mut self,
+            _authenticated_sender: NodeId,
+            _recipient: NodeId,
+            _exchange_id: u64,
+            _envelope_id: EnvelopeId,
+            forwarding: &[u8],
+        ) -> Result<u64, EnvelopeError> {
+            if forwarding == b"authenticated-hop" {
+                Ok(0)
+            } else {
+                Err(EnvelopeError("invalid test forwarding metadata".into()))
+            }
+        }
+
         fn peer_can_route(
             &self,
             peer: NodeId,
@@ -3400,6 +3360,22 @@ mod tests {
     ) -> Node<InMemoryStore, TestSealer> {
         let store = InMemoryStore::new(config.store.clone()).unwrap();
         Node::with_store([identity_byte; 32], store, sealer, config)
+    }
+
+    #[derive(Clone)]
+    struct AutomaticMergeMustNotRun {
+        calls: Arc<AtomicU64>,
+    }
+
+    impl RecordMergePolicy for AutomaticMergeMustNotRun {
+        fn id(&self) -> &str {
+            "test.manual-resolution-only/v1"
+        }
+
+        fn merge(&self, _versions: &[RecordVersion]) -> Result<Vec<u8>, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err("registered policy must not execute during replicated ingestion".into())
+        }
     }
 
     fn selectors(prefix: &str, count: usize) -> Vec<String> {
@@ -3685,20 +3661,29 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_ingest_is_idempotent_and_records_remain_siblings() {
+    fn replicated_ingest_preserves_record_siblings_for_explicit_resolution() {
         let sealer = TestSealer::default();
         let mut left = memory_node(1, sealer.clone(), NodeConfig::default());
         let mut right = memory_node(2, sealer.clone(), NodeConfig::default());
         let mut receiver = memory_node(3, sealer, NodeConfig::default());
-        left.publish(request(DataClass::Record, b"plan", b"left"))
+        let calls = Arc::new(AtomicU64::new(0));
+        let policy = Arc::new(AutomaticMergeMustNotRun {
+            calls: calls.clone(),
+        });
+        receiver.register_merge_policy(topic(), policy.clone());
+        assert_eq!(Arc::strong_count(&policy), 1);
+        let left_receipt = left
+            .publish(request(DataClass::Record, b"plan", b"left"))
             .unwrap();
-        right
+        let right_receipt = right
             .publish(request(DataClass::Record, b"plan", b"right"))
             .unwrap();
         let left_wire = left.next_emissions([3; 32], 8, u64::MAX).unwrap();
         let right_wire = right.next_emissions([3; 32], 8, u64::MAX).unwrap();
-        receiver.ingest(&left_wire[0].sealed).unwrap();
+        let first = receiver.ingest(&left_wire[0].sealed).unwrap();
         let second = receiver.ingest(&right_wire[0].sealed).unwrap();
+        assert_eq!(first.merged, None);
+        assert_eq!(second.merged, None);
         assert!(matches!(
             second.outcome,
             ApplyOutcome::Inserted {
@@ -3707,7 +3692,12 @@ mod tests {
             }
         ));
         let replay = receiver.ingest(&left_wire[0].sealed).unwrap();
+        assert_eq!(replay.merged, None);
         assert!(matches!(replay.outcome, ApplyOutcome::Duplicate { .. }));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let mut expected_siblings = vec![left_receipt.id, right_receipt.id];
+        expected_siblings.sort_unstable();
 
         let conflicts = receiver
             .conflicts(StoreQuery {
@@ -3719,19 +3709,42 @@ mod tests {
             })
             .unwrap();
         assert_eq!(conflicts.len(), 1);
-        assert_eq!(conflicts[0].siblings.len(), 2);
+        assert_eq!(conflicts[0].logical_key, b"plan");
+        assert_eq!(conflicts[0].siblings, expected_siblings);
+        assert_eq!(conflicts[0].merge_policy, None);
+
+        let recoverable_before = receiver
+            .query(StoreQuery {
+                topic: Some(topic()),
+                scope: Some(scope()),
+                class: Some(DataClass::Record),
+                logical_key: Some(b"plan".to_vec()),
+                include_recoverable_versions: true,
+                ..StoreQuery::default()
+            })
+            .unwrap();
+        let mut recoverable_ids = recoverable_before
+            .iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+        recoverable_ids.sort_unstable();
+        assert_eq!(recoverable_ids, expected_siblings);
+
         let receipt = receiver
             .resolve(ResolveRequest {
                 topic: topic(),
                 scope: scope(),
                 logical_key: b"plan".to_vec(),
-                expected_siblings: conflicts[0].siblings.clone(),
+                expected_siblings: expected_siblings.clone(),
                 payload: b"resolved".to_vec(),
                 priority: Priority::Priority,
                 ttl_ms: None,
             })
             .unwrap();
-        assert_ne!(receipt.id, [0; 32]);
+        assert!(!expected_siblings.contains(&receipt.id));
+        assert!(receipt.stamp.context.observes(left_receipt.stamp.dot));
+        assert!(receipt.stamp.context.observes(right_receipt.stamp.dot));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert!(
             receiver
                 .conflicts(StoreQuery {
@@ -3744,6 +3757,124 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+
+        let current = receiver
+            .query(StoreQuery {
+                topic: Some(topic()),
+                scope: Some(scope()),
+                class: Some(DataClass::Record),
+                logical_key: Some(b"plan".to_vec()),
+                ..StoreQuery::default()
+            })
+            .unwrap();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].id, receipt.id);
+        assert_eq!(current[0].payload, b"resolved");
+
+        let recoverable_after = receiver
+            .query(StoreQuery {
+                topic: Some(topic()),
+                scope: Some(scope()),
+                class: Some(DataClass::Record),
+                logical_key: Some(b"plan".to_vec()),
+                include_recoverable_versions: true,
+                ..StoreQuery::default()
+            })
+            .unwrap();
+        let mut all_ids = recoverable_after
+            .iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+        all_ids.sort_unstable();
+        let mut expected_all = vec![left_receipt.id, right_receipt.id, receipt.id];
+        expected_all.sort_unstable();
+        assert_eq!(all_ids, expected_all);
+
+        let stale = receiver
+            .resolve(ResolveRequest {
+                topic: topic(),
+                scope: scope(),
+                logical_key: b"plan".to_vec(),
+                expected_siblings,
+                payload: b"stale".to_vec(),
+                priority: Priority::Priority,
+                ttl_ms: None,
+            })
+            .unwrap_err();
+        assert!(matches!(stale, EngineError::StaleConflict));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn forwarded_ingest_never_executes_registered_record_policy() {
+        let sealer = TestSealer::default();
+        let mut left = memory_node(1, sealer.clone(), NodeConfig::default());
+        let mut right = memory_node(2, sealer.clone(), NodeConfig::default());
+        let mut receiver = memory_node(3, sealer, NodeConfig::default());
+        let calls = Arc::new(AtomicU64::new(0));
+        let policy = Arc::new(AutomaticMergeMustNotRun {
+            calls: calls.clone(),
+        });
+        receiver.register_merge_policy(topic(), policy.clone());
+        assert_eq!(Arc::strong_count(&policy), 1);
+        let left_receipt = left
+            .publish(request(DataClass::Record, b"plan", b"left"))
+            .unwrap();
+        let right_receipt = right
+            .publish(request(DataClass::Record, b"plan", b"right"))
+            .unwrap();
+        let left_wire = left.next_emissions([3; 32], 8, u64::MAX).unwrap();
+        let right_wire = right.next_emissions([3; 32], 8, u64::MAX).unwrap();
+
+        for (exchange_id, emission) in [(7_u64, &left_wire[0]), (8_u64, &right_wire[0])] {
+            let forwarded = receiver
+                .ingest_forwarded(
+                    [9; 32],
+                    exchange_id,
+                    crate::wire::EnvelopeId::from_sealed_bytes(&emission.sealed),
+                    &emission.sealed,
+                    b"authenticated-hop",
+                )
+                .unwrap();
+            let ForwardedIngest::Data(receipt) = forwarded else {
+                panic!("test data envelope was classified as control");
+            };
+            assert_eq!(receipt.merged, None);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let mut expected_siblings = vec![left_receipt.id, right_receipt.id];
+        expected_siblings.sort_unstable();
+        let conflicts = receiver
+            .conflicts(StoreQuery {
+                topic: Some(topic()),
+                scope: Some(scope()),
+                class: Some(DataClass::Record),
+                logical_key: Some(b"plan".to_vec()),
+                ..StoreQuery::default()
+            })
+            .unwrap();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].siblings, expected_siblings);
+        assert_eq!(conflicts[0].merge_policy, None);
+
+        let duplicate = receiver
+            .ingest_forwarded(
+                [9; 32],
+                9,
+                crate::wire::EnvelopeId::from_sealed_bytes(&left_wire[0].sealed),
+                &left_wire[0].sealed,
+                b"authenticated-hop",
+            )
+            .unwrap();
+        assert!(matches!(
+            duplicate,
+            ForwardedIngest::Data(IngestReceipt {
+                outcome: ApplyOutcome::Duplicate { .. },
+                merged: None,
+            })
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

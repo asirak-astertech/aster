@@ -897,7 +897,9 @@ impl From<EngineDelivery> for Delivery {
     }
 }
 
-/// Input to an application merge policy, sorted by full ItemID.
+/// Input to an explicit application merge helper.
+///
+/// Callers MUST supply versions in ascending full-ItemID order.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MergeVersion {
     pub id: ItemId,
@@ -906,7 +908,17 @@ pub struct MergeVersion {
     pub tombstone: bool,
 }
 
-/// Deterministic application merge policy without access to sync internals.
+/// Process-local Record policy descriptor and explicit-resolution helper.
+///
+/// Registration lets high-level conflict results report [`Self::id`]; it is not
+/// durable, and the node retains only that identifier rather than this
+/// executable object. Replicated ingestion never invokes [`Self::merge`].
+/// Applications may retain and invoke their helper over inspected siblings
+/// before submitting [`ResolveRequest`].
+///
+/// For identical canonical inputs, [`Self::merge`] MUST return identical bytes
+/// across every supported implementation and version. Aster does not verify
+/// that application-level conformance obligation.
 pub trait ApplicationMergePolicy: Send + Sync {
     fn id(&self) -> &str;
     fn merge(&self, versions: &[MergeVersion]) -> Result<Vec<u8>, String>;
@@ -1219,6 +1231,11 @@ impl ApplicationNode {
             .event_gaps_application_projection(query.into_store()?)
     }
 
+    /// Registers process-local policy metadata for Record conflict annotations.
+    ///
+    /// Only [`ApplicationMergePolicy::id`] is retained. Replicated ingestion
+    /// never invokes the executable policy object; callers must retain any
+    /// helper they intend to use before submitting an explicit resolution.
     pub fn register_merge_policy(&mut self, topic: Topic, policy: Arc<dyn ApplicationMergePolicy>) {
         self.inner
             .register_merge_policy(topic, Arc::new(MergePolicyAdapter(policy)));
@@ -1603,6 +1620,11 @@ impl<'a> ApplicationNodeRef<'a> {
             .event_gaps_application_projection(query.into_store()?)
     }
 
+    /// Registers process-local policy metadata for Record conflict annotations.
+    ///
+    /// Only [`ApplicationMergePolicy::id`] is retained. Replicated ingestion
+    /// never invokes the executable policy object; callers must retain any
+    /// helper they intend to use before submitting an explicit resolution.
     pub fn register_merge_policy(&mut self, topic: Topic, policy: Arc<dyn ApplicationMergePolicy>) {
         self.inner
             .register_merge_policy(topic, Arc::new(MergePolicyAdapter(policy)));

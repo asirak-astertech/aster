@@ -461,12 +461,26 @@ are immutable.
 
 ### 8.3 Record
 
-A Record is a revision DAG. Without a registered policy, every concurrent maximal
-revision remains a sibling and the application receives a conflict annotation.
-A merge policy is identified by name, semantic version, and conformance-vector
-digest. It receives heads sorted by ItemID and MUST produce deterministic bytes.
-A merged view never deletes input versions. Explicit resolution publishes a new
-revision naming all resolved heads.
+A Record is a revision DAG. Every concurrent maximal revision is retained and
+surfaced as a sibling in a conflict annotation. A later causally dominating
+revision may remove a sibling from the current projection, but the input remains
+recoverable until retention-driven garbage collection. Explicit resolution
+publishes a revision whose context covers the exact observed sibling set.
+
+Application policy is process-local and is not a replicated protocol object.
+The current reference can associate an application-supplied policy ID with a
+topic; `ApplicationNode::conflicts()` reports that ID while the registration
+remains live. Direct and forwarded replicated ingestion never execute the
+registered policy or publish an automatic resolution. Registration is not
+durable across restart. Applications may compute deterministic bytes from
+ascending full-ItemID-sorted sibling inputs and submit them through explicit
+resolution. Any such helper MUST return identical bytes for identical canonical
+inputs across every supported implementation and version; this is an
+application conformance obligation, not something replicated ingestion verifies.
+
+Consequently, sibling preservation, annotations, and explicit resolution are
+implemented, but automatic registered-policy merge required by requirements
+§5.3 is partial.
 
 Code received over the mesh is never executed.
 
