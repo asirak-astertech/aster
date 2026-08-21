@@ -119,14 +119,15 @@ publisher/Event reservation, retained-dual default, explicit batch-only policy,
 Blob batches, all-or-nothing proof/compact/singleton/ledger/outbox commit, and
 proof reauthentication before reads after reopen. These are local construction
 and durability subgates. C, Go, and Python expose the same retained-dual/
-batch-only transaction plus atomic batches of finalized Blob writers; FFI 12/12,
-Go 8/8, Python 9/9, and linked C/C++ smoke pass. The reference peer runtime also
+batch-only transaction plus atomic batches of finalized Blob writers; the FFI,
+Go, Python, and linked C/C++ smoke gates pass. The reference peer runtime also
 passes exact retained-dual/batch-only inventory shaping, batch-only proof-first
 replication and receiver restart, compact-first private persistence followed by
 exact-proof promotion, selected-v1 compact rejection, and a finalized two-Blob
-proof/compact/carrier transfer with plaintext verification. Core 196/196, host
-9/9, and strict core/host lint pass. This remains same-team reference evidence,
-not independent interoperability, a 3 kbps result, or a physical-carrier claim.
+proof/compact/carrier transfer with plaintext verification. The complete core
+and host suites plus strict core/host lint pass. This remains same-team reference
+evidence, not independent interoperability, a 3 kbps result, or a
+physical-carrier claim.
 
 The self-test additionally checks exact Merkle differences, tiny-MTU
 out-of-order reassembly, resource bounds, and causal concurrency using the same
@@ -172,7 +173,7 @@ implementation version and conformance-vector digest under test.
 | V-CRYPTO | algorithms | NIST KAT provenance plus exact envelope, root-credentialed delegated-control, custody, Blob, and session vectors from `envelope.md` |
 | V-HANDSHAKE | peer authentication | all four exact flights and transcript intermediates; tamper, replay, downgrade, proof, key-confirmation, and either-signature failure |
 | V-CAUSAL | dots and clocks | before/after/equal/concurrent/equivocation traces; schema-12 exact-domain isolation, schema-11 sentinel migration/reopen and pointwise maximum, 4,095/4,096/4,097 publisher boundaries with atomic ordinary/bridge rejection, and the explicit A-to-B-to-C non-transitivity trace |
-| V-CLASS | reducers | State projection, Event gaps, Record siblings/merge, canonical Blob manifest/chunks and local streaming |
+| V-CLASS | reducers | State projection, Event gaps, Record sibling retention, annotations, stale-guarded explicit resolution, an in-process regression proving replicated ingest does not execute policy code, canonical Blob manifest/chunks, and local streaming |
 | V-MERKLE | exact anti-entropy | typed 33-byte ObjectIDs, 66-nibble tree roots, probe traces, equal-root wire-descent short circuit with local snapshot accounting, adversarial prefixes, and 100,000/cap-plus-one snapshot behavior for SQLite and custom stores |
 | V-FRAG | carrier segments | every supported MTU, order, duplicate, truncation, overlap, bounds |
 | V-IP | IP control bytes | discovery proof vectors and nonce freshness; rendezvous token echo/address forms, TTL, source, and capacity rejection; local endpoint-handle collision and non-authorization tests |
@@ -185,7 +186,7 @@ implementation version and conformance-vector digest under test.
 |---|---|---|
 | A-01 | BTLE then IP | publish over simulated/physical BTLE, disconnect, consume remaining transfer over IP; one ItemID delivered |
 | A-02 | 30-day partition | durable items converge after virtual 30 days; expired items do not transmit |
-| A-03 | concurrent Record | all heads retained and annotated, or exact registered merge view; no input disappears |
+| A-03 | concurrent Record | after resynchronization, all concurrent heads remain retained and annotated; replicated ingestion invokes no registered policy and publishes no merge revision; explicit resolution of the exact current sibling set publishes one dominating revision without deleting its inputs |
 | A-04 | relay path | producer and consumer lack direct path; ciphertext relay delivers; relay key cannot decrypt content |
 | A-05 | constrained link | at 3 kbps and seeded 50% loss, higher priority begins first; no expired frame reaches link |
 | A-06 | emission | threshold suppresses lower lanes without discarding them; ReceiveOnly/PassiveOnly behavior matches declared physical mode |
@@ -337,6 +338,9 @@ an accepted signed predecessor claim does not become local direct observation
 an inventory snapshot has at most 100000 objects or selection fails without truncation
 equal Merkle roots imply no wire descent, not no local snapshot construction
 no concurrent head disappears without a dominating explicit revision
+direct and forwarded replicated ingestion never invoke application merge policy
+direct and forwarded replicated ingestion never publish a local merge revision
+explicit resolution succeeds only for the exact current sibling set
 eventually connected replicas with the same retention policy converge
 fragment/reassembly is invariant to MTU, duplicate, and arrival order
 compact batch bytes remain private and semantically unapplied until their exact proof authenticates

@@ -60,7 +60,7 @@ just a label.
 |---|---|---|
 | **State** | Current position, device status, latest setting | One current value per logical key, with deterministic handling of concurrent updates |
 | **Event** | Chat messages, observations, audit entries | Immutable, ordered events per publisher, with detectable sequence gaps |
-| **Record** | Plans, forms, annotations, mutable documents | Concurrent versions are preserved and surfaced unless a deterministic merge policy resolves them |
+| **Record** | Plans, forms, annotations, mutable documents | Concurrent versions are preserved and annotated for explicit application resolution. Registered-policy auto-merge is not currently executed during replication. |
 | **Blob** | Imagery, maps, attachments, large binary objects | Immutable, chunked transfer whose ID commits to the plaintext digest and manifest fields, with authenticated streaming and resume |
 
 See [Core concepts](docs/concepts.md) for worked examples and selection guidance.

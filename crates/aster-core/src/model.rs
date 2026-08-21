@@ -217,7 +217,8 @@ pub struct ConflictAnnotation {
     pub logical_key: Vec<u8>,
     /// All retained concurrent item identifiers in canonical order.
     pub siblings: Vec<ItemId>,
-    /// Identifier of an applied deterministic merge policy, if any.
+    /// Process-local registered policy identifier exposed by this projection,
+    /// if any. Presence does not mean the policy was executed.
     pub merge_policy: Option<String>,
 }
 

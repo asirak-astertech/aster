@@ -967,6 +967,10 @@ impl MeshService {
         Ok(self.application()?.event_gaps(query)?)
     }
 
+    /// Registers a process-local policy ID for Record conflict annotations.
+    ///
+    /// The service retains no executable policy object and never invokes it
+    /// during replicated ingestion. Callers own explicit merge and resolution.
     pub fn register_merge_policy(
         &mut self,
         topic: Topic,
@@ -1428,6 +1432,22 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     #[derive(Clone)]
+    struct AutomaticMergeMustNotRun {
+        calls: Arc<AtomicU64>,
+    }
+
+    impl ApplicationMergePolicy for AutomaticMergeMustNotRun {
+        fn id(&self) -> &str {
+            "test.manual-resolution-only/v1"
+        }
+
+        fn merge(&self, _versions: &[aster_mesh::MergeVersion]) -> Result<Vec<u8>, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err("registered policy must not execute during replicated ingestion".into())
+        }
+    }
+
+    #[derive(Clone)]
     struct MemoryEndpoint {
         name: &'static str,
         mtu: u16,
@@ -1662,6 +1682,152 @@ mod tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn registered_merge_policy_does_not_publish_during_sync_or_recontact() {
+        let root = test_directory();
+        let topic = Topic::new("record.plan").unwrap();
+        let scope = Scope::new("mission/team").unwrap();
+        let access =
+            ProvisioningAccess::member(scope.clone(), vec![0], vec![topic.clone()]).unwrap();
+        let mut provisioner = ReferenceProvisioner::from_seed([0x7a; 32]).unwrap();
+        let left_bundle = provisioner
+            .issue_node(1, std::slice::from_ref(&access))
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        let right_bundle = provisioner
+            .issue_node(2, &[access])
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        let options = ServiceOptions {
+            node: ApplicationNodeOptions::default(),
+            blobs: BlobStoreConfig::default(),
+            sync: SyncProfile::new(vec![topic.clone()], vec![scope.clone()], Priority::Routine)
+                .unwrap(),
+        };
+        let mut left = MeshService::open(
+            root.join("left-record.sqlite"),
+            root.join("left-record-blobs"),
+            &left_bundle,
+            options.clone(),
+        )
+        .unwrap();
+        let mut right = MeshService::open(
+            root.join("right-record.sqlite"),
+            root.join("right-record-blobs"),
+            &right_bundle,
+            options,
+        )
+        .unwrap();
+        let calls = Arc::new(AtomicU64::new(0));
+        let policy = AutomaticMergeMustNotRun {
+            calls: calls.clone(),
+        };
+        left.register_merge_policy(topic.clone(), Arc::new(policy.clone()))
+            .unwrap();
+        right
+            .register_merge_policy(topic.clone(), Arc::new(policy))
+            .unwrap();
+
+        let record = |payload: &[u8]| PublishRequest {
+            class: DataClass::Record,
+            topic: topic.clone(),
+            scope: scope.clone(),
+            priority: Priority::Priority,
+            ttl_ms: None,
+            logical_key: b"plan-red".to_vec(),
+            payload: payload.to_vec(),
+            tombstone: false,
+        };
+        let left_revision = left.publish(record(b"left revision")).unwrap();
+        let right_revision = right.publish(record(b"right revision")).unwrap();
+        assert_eq!(left.quota_usage(Some(&scope)).unwrap().items, 1);
+        assert_eq!(right.quota_usage(Some(&scope)).unwrap().items, 1);
+        let mut expected_siblings = vec![left_revision.id, right_revision.id];
+        expected_siblings.sort_unstable();
+
+        let left_id = left.identity();
+        let right_id = right.identity();
+        for _ in 0..2 {
+            let (left_link, right_link) = OpenCarrier::pair(768, left_id, right_id);
+            left.configure_peer_carrier(right_id, left_link).unwrap();
+            right.configure_peer_carrier(left_id, right_link).unwrap();
+        }
+        left.begin_sync(right_id).unwrap();
+        right.begin_sync(left_id).unwrap();
+
+        let conflict_query = || Query {
+            topic: Some(topic.clone()),
+            scope: Some(scope.clone()),
+            class: Some(DataClass::Record),
+            logical_key: Some(b"plan-red".to_vec()),
+            ..Query::default()
+        };
+        let expected_for_right = expected_siblings.clone();
+        drive_pair_until(&mut left, &mut right, Duration::from_secs(5), |right| {
+            right.conflicts(conflict_query()).is_ok_and(|conflicts| {
+                conflicts.len() == 1 && conflicts[0].siblings == expected_for_right
+            })
+        });
+        let expected_for_left = expected_siblings.clone();
+        drive_pair_until(&mut right, &mut left, Duration::from_secs(5), |left| {
+            left.conflicts(conflict_query()).is_ok_and(|conflicts| {
+                conflicts.len() == 1 && conflicts[0].siblings == expected_for_left
+            })
+        });
+
+        for service in [&mut left, &mut right] {
+            let conflicts = service.conflicts(conflict_query()).unwrap();
+            assert_eq!(conflicts.len(), 1);
+            assert_eq!(conflicts[0].siblings, expected_siblings);
+            assert_eq!(
+                conflicts[0].merge_policy.as_deref(),
+                Some("test.manual-resolution-only/v1")
+            );
+            assert_eq!(service.quota_usage(Some(&scope)).unwrap().items, 2);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        left.pause_sync().unwrap();
+        right.pause_sync().unwrap();
+        let left_recontact_revision = left.publish(record(b"left recontact revision")).unwrap();
+        let right_recontact_revision = right.publish(record(b"right recontact revision")).unwrap();
+        let mut expected_recontact_siblings =
+            vec![left_recontact_revision.id, right_recontact_revision.id];
+        expected_recontact_siblings.sort_unstable();
+
+        left.begin_sync(right_id).unwrap();
+        right.begin_sync(left_id).unwrap();
+        let expected_for_right = expected_recontact_siblings.clone();
+        drive_pair_until(&mut left, &mut right, Duration::from_secs(5), |right| {
+            right.conflicts(conflict_query()).is_ok_and(|conflicts| {
+                conflicts.len() == 1 && conflicts[0].siblings == expected_for_right
+            })
+        });
+        let expected_for_left = expected_recontact_siblings.clone();
+        drive_pair_until(&mut right, &mut left, Duration::from_secs(5), |left| {
+            left.conflicts(conflict_query()).is_ok_and(|conflicts| {
+                conflicts.len() == 1 && conflicts[0].siblings == expected_for_left
+            })
+        });
+        for service in [&mut left, &mut right] {
+            let conflicts = service.conflicts(conflict_query()).unwrap();
+            assert_eq!(conflicts.len(), 1);
+            assert_eq!(conflicts[0].siblings, expected_recontact_siblings);
+            assert_eq!(
+                conflicts[0].merge_policy.as_deref(),
+                Some("test.manual-resolution-only/v1")
+            );
+            assert_eq!(service.quota_usage(Some(&scope)).unwrap().items, 4);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        left.pause_sync().unwrap();
+        right.pause_sync().unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn activate_service_epoch(service: &mut MeshService, scope: &Scope, epoch: u64) {

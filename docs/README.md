@@ -54,7 +54,7 @@ the authority for what application code is expected to touch.
 
 | Surface | Available now | Important boundary |
 |---|---|---|
-| Rust application API | Publish, query, durable subscriptions, conflicts, batches, streamed Blobs, emission policy, status, bridges, and recipient-filtered rekey | Event-gap inspection, merge-policy registration, and retention-driven garbage collection are Rust-only today. The complete authority-side rekey-registry administration workflow is not shipped. |
+| Rust application API | Publish, query, durable subscriptions, conflicts, batches, streamed Blobs, emission policy, status, bridges, and recipient-filtered rekey | Event-gap inspection, process-local merge-policy ID registration, and retention-driven garbage collection are Rust-only. Policy registration only annotates high-level conflict results; replicated ingestion never executes application policy. Automatic Record merge under requirements §5.3 is partial. The complete authority-side rekey-registry administration workflow is not shipped. |
 | Rust composition host | Owns the durable node, authenticated session, Blob transfer store, and configured `Link` carriers | One active authenticated contact at a time in the current bounded profile |
 | Live synchronization | Currently requires application logic to run inside a Rust process using `MeshService` | C, Go, and Python do not have an in-process networking API. The out-of-process local agent is post-MVP; see [ADR 0008](decisions/0008-local-agent-phasing.md). |
 | C ABI | High-level offline application operations | No event-gap inspection, merge-policy registration, retention-driven garbage collection, sealed objects, cryptographic provider, or carrier configuration |

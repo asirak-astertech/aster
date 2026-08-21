@@ -3,7 +3,9 @@
 These recipes show the framework's main application mechanisms with commented
 Python because it is the most compact binding. Rust, C, Go, and Python share
 the core local-data operations shown here. Rust additionally exposes explicit
-Event-gap inspection, merge-policy registration, and garbage collection; the
+Event-gap inspection, process-local merge-policy ID registration (which
+annotates Rust conflict results but does not execute policy code during
+replication), and garbage collection; the
 [capability table](#operation-names-across-bindings) marks those boundaries.
 
 Start with a working node from the [Python quickstart](quickstart/python.md):
@@ -235,7 +237,7 @@ A tombstone is a replicated update, not an immediate physical deletion. It
 prevents a returning node from resurrecting an older value only within the
 configured tombstone-retention window. The deployment baseline is 30 days of
 offline tolerance plus a 15-day margin; after that bound, resurrection is
-possible. [`ApplicationNodeOptions`](../crates/aster-core/src/api.rs#L938)
+possible. [`ApplicationNodeOptions`](../crates/aster-core/src/api.rs)
 configures `tombstone_retention_ms` and `superseded_retention_ms`. Rust also
 exposes explicit `ApplicationNode::collect_garbage`; C, Go, and Python do not.
 
@@ -250,14 +252,21 @@ conflicts = node.conflicts(
 )
 
 for conflict in conflicts:
-    # Fetch recoverable sibling payloads for display or domain-specific merge.
-    siblings = node.query(
+    # Recoverable history includes Concurrent heads and may also include older
+    # superseded revisions. Select only the exact annotated sibling IDs.
+    recoverable = node.query(
         topic="record.plan",
         scope="mission/team/alpha",
         logical_key=conflict.logical_key,
         data_class=DataClass.RECORD,
         include_recoverable=True,
+        limit=4096,
     )
+    by_id = {item.item_id: item for item in recoverable}
+    missing = set(conflict.siblings) - set(by_id)
+    if missing:
+        raise RuntimeError("a current Record sibling is not recoverable; retry")
+    siblings = [by_id[item_id] for item_id in sorted(conflict.siblings)]
     merged_payload = merge_plan_versions(siblings)
 
     # The expected sibling set prevents resolving a stale view after another
@@ -272,10 +281,18 @@ for conflict in conflicts:
     )
 ```
 
-A registered merge policy can automate this only when it is deterministic for
-the same ordered inputs. Registration through
-`ApplicationNode::register_merge_policy` is Rust-only today. Otherwise keep the
-decision in application code.
+`resolve()` is the implemented merge path. Direct and forwarded replicated
+ingestion never invoke registered application policy code. Rust's process-local
+`register_merge_policy` retains an application-supplied policy ID for high-level
+conflict annotations only; the node does not retain the executable policy
+object. Applications must inspect the siblings, compute and review any merged
+payload themselves, and submit it through `resolve()`.
+Any helper used for this purpose must receive siblings in ascending full-ItemID
+order and return identical bytes for identical inputs across every supported
+implementation and version; Aster does not verify that application-level
+obligation.
+Registration is lost when the node process restarts. Automatic registered-policy
+merge in requirements §5.3 remains partial.
 
 ## Enter a constrained-emission mode
 
@@ -314,7 +331,7 @@ An em dash means that the operation is not exposed by that language binding.
 | Inspect conflicts | `conflicts` | `conflicts` | `Conflicts` | `aster_node_conflicts` |
 | Resolve a conflict | `resolve` | `resolve` | `Resolve` | `aster_node_resolve` |
 | Inspect Event gaps | `event_gaps` | — (Rust-only) | — (Rust-only) | — (Rust-only) |
-| Register merge policy | `register_merge_policy` | — (Rust-only) | — (Rust-only) | — (Rust-only) |
+| Register process-local policy ID (no automatic execution) | `register_merge_policy` | — (Rust-only) | — (Rust-only) | — (Rust-only) |
 | Run garbage collection explicitly | `collect_garbage` | — (Rust-only) | — (Rust-only) | — (Rust-only) |
 | Emission policy | `set_emission_policy` | `emission_threshold` | `SetEmissionThreshold` | `aster_node_set_emission` |
 | Zeroize | `zeroize` | `zeroize` | `Zeroize` | `aster_node_zeroize` |
