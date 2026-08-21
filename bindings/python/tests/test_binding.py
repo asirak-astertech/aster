@@ -116,6 +116,46 @@ class BindingTests(unittest.TestCase):
             self.assertEqual([delivery.item.payload for delivery in deliveries],
                              [b"first", b"second", b"third"])
 
+    def test_acknowledging_projected_heads_does_not_reveal_ancestors(self):
+        with Node(":memory:", BUNDLE) as node:
+            subscription = node.subscribe(
+                "position.current", "mission/team/alpha",
+            )
+            for data_class, logical_key in (
+                (DataClass.STATE, b"state-key"),
+                (DataClass.RECORD, b"record-key"),
+            ):
+                node.publish(
+                    data_class, "position.current", "mission/team/alpha",
+                    b"old", logical_key=logical_key,
+                )
+                node.publish(
+                    data_class, "position.current", "mission/team/alpha",
+                    b"new", logical_key=logical_key,
+                )
+
+            deliveries = subscription.poll()
+            self.assertEqual(
+                {delivery.item.data_class for delivery in deliveries},
+                {DataClass.STATE, DataClass.RECORD},
+            )
+            self.assertEqual(
+                [delivery.item.payload for delivery in deliveries],
+                [b"new", b"new"],
+            )
+            for delivery in deliveries:
+                subscription.acknowledge(delivery)
+            self.assertEqual(subscription.poll(), [])
+
+            recoverable = node.query(
+                topic="position.current", scope="mission/team/alpha",
+                include_recoverable=True,
+            )
+            self.assertEqual(len(recoverable), 4)
+            self.assertEqual(
+                [item.payload for item in recoverable].count(b"old"), 2,
+            )
+
     def test_error_and_repeated_lifecycle(self):
         with self.assertRaises(AsterError):
             Node(":memory:", b"not a provisioning bundle")

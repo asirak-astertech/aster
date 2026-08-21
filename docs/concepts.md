@@ -174,7 +174,9 @@ new identity instead of starting again from counter one.
   application has committed its own result.
 
 If a process stops before acknowledgment, delivery may be repeated. The stable
-ItemID is the application deduplication key.
+ItemID is the application deduplication key. Acknowledging the projected current
+State or Record head does not make one of its causally superseded ancestors
+current again; independent concurrent Record siblings remain separate work.
 
 ### Causality and conflicts
 
