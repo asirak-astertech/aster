@@ -71,7 +71,8 @@ print(message_result.event_sequence)  # Nonzero sequence assigned by Aster.
 Use Event when every entry matters. A receiver can inspect event-gap reporting
 to distinguish “nothing happened” from “an event has not arrived yet.” Explicit
 `ApplicationNode::event_gaps` inspection is Rust-only today; C, Go, and Python
-do not expose it.
+do not expose it. Reusing a logical key to name a stream does not collapse its
+entries: matching `query()` and `poll()` calls return every retained Event.
 
 ### Record: mutable data with explicit conflicts
 

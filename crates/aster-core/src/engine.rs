@@ -1968,6 +1968,12 @@ fn reduce_application_projection(
     }
     let mut reduced = Vec::new();
     for (_, group) in groups {
+        if group.first().is_some_and(|candidate| {
+            !matches!(candidate.item.class, DataClass::State | DataClass::Record)
+        }) {
+            reduced.extend(group);
+            continue;
+        }
         let keep = (0..group.len())
             .map(|index| {
                 !(0..group.len()).any(|other| {
@@ -2015,6 +2021,12 @@ fn reduce_subscription_projection(
     }
     let mut reduced = Vec::new();
     for (_, group) in groups {
+        if group.first().is_some_and(|candidate| {
+            !matches!(candidate.item.class, DataClass::State | DataClass::Record)
+        }) {
+            reduced.extend(group);
+            continue;
+        }
         let keep = (0..group.len())
             .map(|index| {
                 !(0..group.len()).any(|other| {
