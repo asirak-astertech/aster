@@ -71,6 +71,10 @@ automatically fail over to the next carrier. Pausing destroys session keys but
 retains verified objects and partial Blob ranges. A later `begin_sync(peer)`
 selects the next configured carrier for that peer.
 
+The non-normative [operational IP mesh experiment](proposals/0001-ip-mesh-vertical-slice.md)
+defines a controlled comparison for discovery, multi-peer host scheduling, NAT,
+and failover. It is a proposal, not a current capability claim.
+
 `pump()` is nonblocking. Do not drive it in a busy loop. Integrate it with the
 platform's I/O readiness and timer mechanism.
 
