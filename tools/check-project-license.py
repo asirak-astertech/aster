@@ -16,10 +16,11 @@ EXPECTED_LICENSE_SHA256 = (
 )
 ROOT = Path(__file__).resolve().parents[1]
 LICENSE = ROOT / "LICENSE"
-BINDING_ROOTS = (
+DISTRIBUTION_ROOTS = (
     ROOT / "bindings" / "c",
     ROOT / "bindings" / "go",
     ROOT / "bindings" / "python",
+    ROOT / "tools" / "age-reference",
 )
 
 
@@ -121,13 +122,13 @@ def main() -> None:
         metadata("fuzz/Cargo.toml"), "fuzz/Cargo.toml"
     )
 
-    for binding_root in BINDING_ROOTS:
-        binding_license = binding_root / "LICENSE"
-        if not binding_license.is_file():
-            fail(f"{binding_root.relative_to(ROOT)} omits LICENSE")
-        binding_hash = hashlib.sha256(binding_license.read_bytes()).hexdigest()
-        if binding_hash != EXPECTED_LICENSE_SHA256:
-            fail(f"{binding_root.relative_to(ROOT)} has a noncanonical LICENSE")
+    for distribution_root in DISTRIBUTION_ROOTS:
+        distribution_license = distribution_root / "LICENSE"
+        if not distribution_license.is_file():
+            fail(f"{distribution_root.relative_to(ROOT)} omits LICENSE")
+        distribution_hash = hashlib.sha256(distribution_license.read_bytes()).hexdigest()
+        if distribution_hash != EXPECTED_LICENSE_SHA256:
+            fail(f"{distribution_root.relative_to(ROOT)} has a noncanonical LICENSE")
 
     dockerfile = (ROOT / "lab" / "Dockerfile").read_text(encoding="utf-8")
     if "COPY LICENSE /usr/share/licenses/aster/LICENSE" not in dockerfile:

@@ -13,6 +13,7 @@ single stable check name **`CI / required`**.
 | `macOS tests` | `macos-14` | Runs all Rust workspace tests on the supported Apple runner with Rust 1.97.1. |
 | `Rust 1.90 MSRV` | `ubuntu-24.04` | Checks every workspace target and feature with the declared minimum supported Rust version. |
 | `dependency policy` | `ubuntu-24.04` | Applies `deny.toml` to the root and fuzz dependency graphs and audits both lockfiles against a freshly downloaded RustSec database. |
+| `age reference interoperability` | `ubuntu-24.04` | Installs exact `govulncheck` v1.6.0, runs `mise run age-reference-audit`, then runs `mise run age-reference-interop`: the Go oracle's reachable vulnerability and compiled-module license gates must pass before exact reference Go `filippo.io/age` v1.3.1 and the Rust provider exchange classic-X25519 artifacts in both directions, compare recovered plaintext, and agree on the recipient. |
 | `bounded fuzz smoke` | `ubuntu-24.04` | Runs the three fixed 10,000-iteration decoder campaigns with the pinned nightly toolchain and `cargo-fuzz`. |
 | `required` | `ubuntu-24.04` | Fails unless every validation lane completed successfully; this is the branch-protection check. |
 
@@ -22,6 +23,43 @@ current advisory data once, audits the root lockfile during that refresh, and
 reuses the same database without another fetch for the fuzz lockfile. Its
 vulnerability result therefore reflects the RustSec database available when
 the workflow ran, rather than a permanently reproducible snapshot.
+
+`deny.toml` has one explicit advisory ignore:
+`RUSTSEC-2026-0173` for unmaintained build-time `proc-macro-error2` 2.0.1 in the
+non-production age-provider pilot. RustSec reports no vulnerability and no
+patched release; current Rust separately emits future-incompatibility `E0365`.
+The ignore permits that exact informational finding only. It does not suppress
+other advisories, change exact package checksums, permit online execution after
+the acquisition step, or authorize the provider for production. The companion
+scope gate also fails if `proc-macro-error2` appears anywhere in the separately
+excluded fuzz graph, so the workspace-level ignore cannot silently cover that
+lockfile. Any change to the package chain or advisory disposition requires a
+recorded pilot review.
+
+The age interoperability lane keeps its independent Go module in
+`tools/age-reference/go.mod` and `go.sum`. Its acquisition step canonicalizes
+the module with `go mod tidy`, downloads the complete locked graph, and fails if
+the final module files differ from the committed files. Exact `govulncheck`
+v1.6.0 then performs canonical non-CGO Linux/amd64 source-mode analysis.
+Reachable vulnerabilities fail; imported-but-unreachable findings remain
+visible as upstream informational output and do not fail, and there is no local
+Go suppression list. Offline interoperability execution resolves with
+`-mod=readonly`, runs `go mod verify`, and fails unless the selected module is
+exactly `filippo.io/age@v1.3.1`. It also enumerates the external modules
+compiled for canonical non-CGO Linux/amd64, requires their coordinates to match
+the committed receipt set, permits only Apache/BSD/MIT-compatible expressions,
+and verifies each reviewed license file's SHA-256. Every resolved module
+replacement is rejected before this comparison, so a local or alternate source
+cannot inherit an admitted coordinate. It does not install or discover an
+ambient age CLI.
+
+Because `deny.toml` expresses advisory exceptions at workspace scope, both the
+primary and dependency-policy gates also run
+`tools/check-dependency-exception-scope.sh`. Its exact reverse-graph assertion
+fails unless `proc-macro-error2` 2.0.1 remains reachable only through the
+isolated age-provider pilot and is absent from the fuzz graph. An adversarial
+wrapper also forces the fuzz graph command to fail and proves that failure is
+propagated instead of being masked by output processing.
 
 ## Security posture
 
@@ -40,21 +78,24 @@ The action and tool pins are:
 
 | Component | Pin |
 | --- | --- |
-| `actions/checkout` | `de0fac2e4500dabe0009e67214ff5f5447ce83dd` (`v6.0.2`) |
+| `actions/checkout` | `3d3c42e5aac5ba805825da76410c181273ba90b1` (`v7.0.1`) |
 | `jdx/mise-action` | `3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518` (`v4.2.5`) |
 | mise | `2026.4.28` |
 | Rust | `1.97.1` |
 | Minimum supported Rust | `1.90.0` |
-| Go | `1.26.5` |
+| Go | `1.26.7` |
 | Python | `3.13.7` |
+| Reference Go age oracle | `filippo.io/age v1.3.1` |
+| `govulncheck` | `golang.org/x/vuln v1.6.0` |
 | Fuzz nightly | `nightly-2026-08-18` |
 | `cargo-fuzz` | `0.13.2` |
 | `cargo-deny` | `0.20.2` |
 | `cargo-audit` | `0.22.2` |
 
-Dependabot is configured separately to propose updates to action and Cargo
-pins. An update remains untrusted until these checks pass and a maintainer
-reviews the upstream release and the resulting dependency changes.
+Dependabot is configured separately to propose updates to action, Cargo, and
+the isolated Go oracle module pins. The exact govulncheck workflow pin remains a
+manual reviewed update. An update remains untrusted until these checks pass and
+a maintainer reviews the upstream release and the resulting dependency changes.
 
 ## Running checks locally
 
@@ -71,6 +112,23 @@ copy of the canonical `LICENSE`, and include that text in its package archive.
 The C, Go, and Python binding roots and the lab runtime image must carry the same
 text. The gate also rejects alternate root license files or changed license
 text.
+
+Run the independent Go-oracle audit and classic-X25519
+provisioning-artifact interoperability gates separately:
+
+```sh
+GOBIN=/tmp/aster-go-tools go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+GOVULNCHECK=/tmp/aster-go-tools/govulncheck mise run age-reference-audit
+mise run age-reference-interop
+```
+
+Keeping these commands outside `mise run check` makes the separately maintained
+Go implementation, live vulnerability database, and network-fetched Go
+dependency graph explicit. The required CI aggregator still fails unless the
+combined lane succeeds. A pass covers the oracle's currently reachable known
+vulnerabilities, reviewed compiled-module license receipts, and the outer age
+file profile only; it is not independent Aster mesh interoperability,
+persistent-custody evidence, or production authorization.
 
 Run the bounded fuzz campaigns separately:
 

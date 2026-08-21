@@ -3,6 +3,37 @@
 - Status: accepted with recorded gates
 - Date: 2026-08-18
 
+## Admission rule
+
+Dependencies are evaluated by total assurance cost rather than by dependency
+count. The review includes the custom security-sensitive code displaced, public
+format or API stability, maintenance and adoption, vulnerability handling,
+independent review and interoperability, exact feature and transitive surface,
+target support, operational recovery, and the cost of replacing the component.
+Wide adoption is useful evidence, but is neither an automatic approval nor a
+substitute for reviewing the exact version and enabled surface.
+
+A discoverable private vulnerability-reporting channel is required before a
+dependency can support a production-security claim. A missing `SECURITY.md`
+does not automatically prohibit a **time-boxed, non-production pilot** when all
+of these conditions are recorded:
+
+- the experiment is isolated behind a replaceable boundary and cannot silently
+  become the default operational path;
+- package, version, registry checksum, features, license, source, known
+  advisories, and the complete locked dependency graph are reviewed;
+- unused execution-capable or ambient-discovery features are disabled;
+- a published behavior contract is identified and, where interoperability is
+  claimed, a separately maintained implementation can check it;
+- automated advisory and license checks cover the admitted graph; and
+- the decision records a removal or patch/fork path, an explicit review point,
+  and the production claims that remain prohibited.
+
+If neither a formal policy nor an equivalent verified reporting channel can be
+found, that remains a production blocker. The limited pilot exception does not
+transfer a security process from a different implementation of the same format
+to the selected library.
+
 ## Adopted
 
 - RustCrypto `aes-gcm`, `hkdf`, `sha2`, `p256`, `ml-kem`, `ml-dsa`, and
@@ -21,6 +52,45 @@ The IP adapter directly reuses the already admitted `getrandom`, `hkdf`, and
 adapter and binding code uses the standard library and `aster-core`; this adds
 no component or version beyond the admitted workspace graph.
 
+## Adopted for a bounded pilot only
+
+- Rust `age` 0.11.5, exactly pinned with `default-features = false`, is admitted
+  only in the isolated `aster-provisioning-age` crate for the classic X25519
+  age-v1 provisioning-artifact profile. Its exact crates.io archive checksum is
+  recorded in [Decision 0018](0018-age-provisioning-provider.md); upstream
+  declares `MIT OR Apache-2.0`. The plugin, SSH, armor, asynchronous, CLI-common,
+  and unstable features are not enabled. This is not admission for a production
+  default, persistent key custody, a post-quantum profile, or a FIPS-validated
+  path. Decision 0018 records the full exception and exit gates.
+- `age-core` 0.11.0, already required transitively by `age`, is also an exact
+  direct dependency of that isolated crate. It is used only through age's
+  documented custom-identity extension point to require 1–16 X25519 stanzas,
+  reject scrypt and more than one extension stanza, and bound work before
+  identity unwrap. One unknown stanza remains necessary for age's mandatory
+  GREASE behavior. Direct use adds no lockfile package and does not admit a
+  separate file format.
+- This pilot carries one exact dependency-policy exception:
+  `RUSTSEC-2026-0173` for transitive build-time `proc-macro-error2` 2.0.1 via
+  `age` 0.11.5 → `i18n-embed-fl` 0.9.4. RustSec classifies the advisory as
+  informational/unmaintained, reports no vulnerability and no patched release,
+  and current Rust also emits future-incompatibility diagnostic `E0365`. The
+  exception applies only to this non-production pilot; exact registry checksums,
+  locked/offline builds, and every other dependency-policy rule remain enforced.
+  It expires with the pilot and is itself a production blocker.
+- Memory-clearing claims stop at Aster-owned containers and provider buffers.
+  Rust `age` 0.11.5 does not comprehensively clear its internal plaintext
+  encryption buffer or all X25519 identity-decoding intermediates; complete
+  process-memory erasure is not an admitted pilot property.
+- The test-only Go interoperability oracle exact-pins `filippo.io/age` 1.3.1
+  and runs on Go 1.26.7. Its canonical non-CGO Linux/amd64 compiled external
+  graph is limited to `filippo.io/age`, `filippo.io/hpke`,
+  `golang.org/x/crypto`, and
+  `golang.org/x/sys`; a committed coordinate/SPDX/path/SHA-256 receipt fails
+  closed on graph or license-file changes. Exact `govulncheck` 1.6.0 fails on
+  reachable vulnerabilities while leaving imported-but-unreachable findings
+  visible as upstream informational output. This admits only test tooling, not
+  a production runtime dependency.
+
 ## Evaluated but not adopted
 
 - `redb` 4.2.0 was considered as a pure-Rust ACID store. It was not adopted
@@ -35,14 +105,30 @@ no component or version beyond the admitted workspace graph.
   deterministic decoder needed strict non-minimal, ordering, duplicate, depth,
   and critical-extension behavior. The protocol-owned bounded subset is used
   and tested byte-for-byte instead.
+- Rust `age` 0.12.1 was reevaluated but not admitted. The attempted workspace
+  lock selected an `ml-kem`/`kem` combination that failed to compile alongside
+  Aster's current cryptographic graph. The result applies only to that attempted
+  lock state; a coordinated dependency update could yield a compatible graph
+  and would require a separate assurance review. Those changes were outside
+  this bounded pilot. More importantly, 0.12.1 makes ML-KEM, P-256/HPKE, and
+  later recipient profiles non-optional even though this provider admits only
+  classic X25519.
+  Patched 0.11.5 is the current 0.11-line maintenance release and has the
+  smaller classical surface that matches the pilot. This is a scoped
+  assurance/surface decision, not a security finding or a claim that 0.11.5 is
+  the latest Rust `age` series.
 
 ## Rejected
 
 Iroh 1.0.3 was evaluated because it is explicitly permitted as a public example
-in the requirements. It is not admitted: the audited public project page did not
-provide the required vulnerability-reporting policy, and its default presets use
-hosted discovery/relay services. Reconsideration requires security-process
-evidence and a locally controlled configuration.
+in the requirements. It is not admitted: the evaluated project surface had no
+discoverable vulnerability-reporting policy or equivalent verified channel,
+its default presets use hosted discovery/relay services, and there was no
+bounded transport pilot whose benefit justified that combined assurance cost.
+Reconsideration requires a locally controlled configuration and either
+security-process evidence or a separately recorded, time-boxed pilot exception
+that satisfies the rule above.
 
 No dependency owns data semantics, causality, key hierarchy, or synchronization
-correctness. All versions and transitive sources are locked and audited.
+correctness. All versions and transitive sources are locked and audited subject
+only to the explicit pilot exception above.

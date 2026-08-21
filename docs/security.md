@@ -64,18 +64,66 @@ open operation completes local, size, and magic prechecks first: failure makes
 zero provider calls, while passing all prechecks makes exactly one protector or
 unprotector attempt. Aster neither retries nor falls back internally; a caller
 may explicitly start a new operation. The recovered plaintext is bounded to
-125,877 bytes, held in a redacted non-cloneable container, and zeroized on
-explicit erase and drop.
+125,877 bytes and held in a redacted non-cloneable container whose owned
+allocation is zeroized on explicit erase and drop.
 Protected artifacts are bounded to one MiB. Provider errors retain only safe
 typed categories, and failure cannot fall back to interpreting the artifact as
 plaintext.
 
-This interface does not itself encrypt anything. The repository currently
-ships only behavioral test providers; an admitted operational provider remains
-a release gate. The raw `ApplicationNode::open`, `MeshService::open`, FFI, Go,
-and Python paths remain unprotected compatibility/test ingestion. The current
-host also retains a zeroizing plaintext bundle copy in process so it can rebuild
-its backend after a paused contact.
+The interface does not itself guarantee encryption. In addition to behavioral
+test providers, the repository ships an isolated `aster-provisioning-age` pilot
+using exactly pinned Rust `age` 0.11.5 with `default-features = false`. The
+configuration accepts only 1–16 classic X25519 recipients or identities; it
+does not expose passphrases, SSH identities, plugins, tagged hardware
+recipients, or any post-quantum recipient profile. Its
+streaming path remains inside Aster's outer and recovered-plaintext bounds and
+must authenticate through EOF before plaintext can be returned. A narrow
+`age-core` custom-identity wrapper examines age's parsed stanza metadata and
+requires 1–16 X25519 stanzas, rejects scrypt and more than one extension stanza,
+and does so before attempting any identity unwrap. This bounds peer-controlled
+work without implementing a second file parser.
+
+Standard age adds one mandatory GREASE/unknown stanza to non-scrypt files. The
+parser does not label it separately, so the wrapper permits one non-scrypt
+unknown stanza and cannot prove that it is GREASE rather than another meaningful
+extension recipient. The provider never executes or loads such an extension,
+and decryption still requires a matching X25519 stanza, but strict byte-level
+X25519/GREASE-only classification remains an upstream-API residual.
+
+Memory clearing is best-effort and specifically bounded. The provider clears
+the plaintext/ciphertext buffers owned by its Aster wrapper and returns no
+partial plaintext after authentication failure. Rust `age` 0.11.5 does not
+comprehensively zeroize its internal plaintext encryption buffer or every
+intermediate created while decoding an X25519 identity. No claim extends to
+those upstream temporaries, allocator/compiler copies, crash dumps, swap, or
+complete process-memory erasure. This residual is separate from successful
+ciphertext authentication and is another production-review gate.
+
+This is an experimental Rust-only provider, not an operational default. Rust
+`age` describes pre-1.0 releases as beta software for testing and its repository
+has no detected security-policy file. The plugin feature is disabled, and
+0.11.5 includes the plugin-execution fix first released in 0.11.1 for
+`GHSA-4fg7-vxc8-qx5w`. Bidirectional interoperability with exact
+reference Go age v1.3.1 is a required batch gate, not a mesh-interoperability or
+security-audit claim. [Decision 0018](decisions/0018-age-provisioning-provider.md)
+records the dependency graph, sources, exception, and exit gates.
+
+The pilot graph also contains build-time `proc-macro-error2` 2.0.1 through
+`i18n-embed-fl` 0.9.4. RustSec `RUSTSEC-2026-0173` marks it unmaintained and
+lists no patched release; the advisory is informational and reports no
+vulnerability. Current Rust separately reports future-incompatibility `E0365`.
+The exact advisory is ignored by dependency policy only for this bounded pilot,
+with locked checksums and offline validation after dependency acquisition. It
+is not a reported runtime vulnerability, but build-time code can influence the
+produced binary. It therefore remains an unresolved supply-chain and
+compiler-lifecycle risk and independently prohibits production admission.
+
+The profile is X25519 and ChaCha20-Poly1305 based. It provides no post-quantum
+artifact-confidentiality or FIPS 140-3 validation claim. The raw
+`ApplicationNode::open`, `MeshService::open`, FFI, Go, and Python paths remain
+unprotected compatibility/test ingestion. The current host also retains a
+zeroizing plaintext bundle copy in process so it can rebuild its backend after
+a paused contact.
 
 Persistent custody after ingestion is a separate `SecretStore` problem. A
 production backend needs opaque seal/load/destroy handles, platform or hardware
@@ -434,7 +482,7 @@ per-credential protected flight-1 identifier/proof or rotation of the shared
 mission proof key. This residual authorized-member exposure is distinct from the
 solved passive-observer credential leak.
 
-## Provider status
+## Mesh cryptographic provider status
 
 The reference provider uses `aes-gcm`, `hkdf`, `sha2`, `p256`, `ml-kem`, and
 `ml-dsa` at the exact registered versions. This proves neither independent audit
@@ -464,7 +512,23 @@ protocol conformance vectors do not satisfy that gate.
 - The repository ships `wire_decode`, `fragment_decode`, and
   `envelope_inspect` fuzz targets plus allocation-limit tests; an FFI fuzz target
   remains a production gate.
-- zeroization hook invocation and post-zeroize handle rejection.
+- Aster-owned zeroization hook invocation and post-zeroize handle rejection;
+  this does not assert clearing of upstream age internals.
+- age-provider ordinary/binary/maximum-size and real-bundle round trips;
+  one-to-sixteen recipient/identity bounds, duplicate rejection, sanitized
+  configuration errors, redacted secret debug output, and multi-recipient
+  recovery; incoming no-X25519, over-16-X25519, scrypt, and multiple-extension
+  stanza-set rejection before identity unwrap while accepting standard GREASE;
+  wrong-identity, malformed-header,
+  stanza/header-MAC/body/final-byte, truncation, and trailing-data rejection;
+  bounded output and recovered
+  plaintext; randomized ciphertext; and failure without partial plaintext
+  release.
+- bidirectional outer-file interoperability with exact reference Go age v1.3.1;
+  this checks only the classic X25519 age file profile.
+- dependency-policy confirmation that the sole ignored advisory is the
+  pilot-scoped informational `RUSTSEC-2026-0173`, with no additional advisory
+  or vulnerability exception.
 
 The semantic-version tamper gate proves only on-path transcript downgrade
 resistance. Client offers are mission-proof bound; honest responder selections
