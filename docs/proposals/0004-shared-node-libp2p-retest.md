@@ -2,8 +2,10 @@
 
 > ****
 
-- Status: Gate H passed for the provider-free shared-node baseline; the
-  corrected libp2p experiment is authorized, but no provider is selected
+- Status: superseded — stopped before formal Phase 0; no arm selected and
+  the rust-libp2p pilot rejected from the continuing stack
+- Outcome date: 2026-08-23
+- Result: [Proposal 0004 result](0004-shared-node-libp2p-retest-results.md)
 - Date: 2026-08-21
 - Owner: Aster Clean Team — execution authorized in the designated project
   task
@@ -19,6 +21,8 @@
   [Proposal 0003 result](0003-idiomatic-ip-mesh-provider-results.md)
 - Governing decision:
   [Decision 0024](../decisions/0024-refactor-durable-node-ownership-before-ip-provider-selection.md)
+- Closure decision:
+  [Decision 0029](../decisions/0029-close-proposal-0004-libp2p-pilot.md)
 - Preserves: Decisions
   [0002](../decisions/0002-dependency-admission.md),
   [0014](../decisions/0014-total-assurance-build-vs-buy.md),
@@ -68,7 +72,11 @@ DCUtR, and it did not complete the 64 KiB application-delivery probe. This
 proposal preserves those failures and reruns the complete Phase-1-through-5
 matrix only after removing the common architecture confound.
 
-### Current execution state
+### Historical execution state before closure
+
+This section preserves the state and open gates as they stood while the
+proposal was active. The dated outcome at the end of this document is the
+current disposition.
 
 The signed provider-free implementation contains the common shared durable
 authority, non-clone contact sessions, transactional admission, authorization-
@@ -491,7 +499,7 @@ and zero failed trials. Gate H is therefore complete for this exact baseline.
 That result authorizes the corrected libp2p experiment only; it does not select
 libp2p, change the requirements baseline, or grant production status.
 
-### Post-Gate-H libp2p development checkpoint
+### Historical post-Gate-H libp2p development checkpoint
 
 The current post-gate tree adds a default-disabled
 `aster-libp2p-provider` crate and an opt-in
@@ -521,20 +529,33 @@ for each direction, Link acceptance, provider submission, physical
 `FrameSent`, remote provider receipt, and remote RuntimeDriver consumption were
 exactly equal. Both 1,024-frame bounded Link queues reached their exact high
 water and returned real full-queue `WouldBlock` 104 and 111 times. The provider
-suite passed 18/18 tests, including repeated simultaneous dials, address-only
-unknown-`PeerId` dialing, slow-writer recovery, truncated mid-frame close, and
-predecessor-state cancellation. The complete opt-in lab library suite passed
-15/15, and strict clippy passed for the provider and combined candidate graph.
+suite passed 20/20 tests, including repeated simultaneous dials, address-only
+unknown-`PeerId` dialing, slow-writer recovery, truncated mid-frame close,
+predecessor-state cancellation, live Identify exchange, and a controlled
+AutoNAT-v1 `Unknown`-to-`Public` dial-back. A separately bounded localhost
+relay test retained the exact reservation, relayed-carrier, circuit, DCUtR,
+and fresh direct-carrier events at both clients. The complete opt-in lab
+library suite passed 17/17. A SharedNode-owned direct replacement test kept the
+predecessor physical connection live while dialing its successor, performed
+the two-phase provider replacement, retired the old contact, reopened the
+exact Host candidate as a new contact, and required fresh Aster authentication
+before an interrupted 1 MiB item could finish. The same path passed the
+Proposal 0002 trial-14 64 KiB payload size without the archived frame stall.
+Strict clippy passed for the provider and combined candidate graph.
 
 This is development evidence, not a Phase-0 receipt or complete Phase-1 pass.
 Still required are a frozen source/SBOM/advisory receipt; Linux disposition of
 unmaintained `paste 1.0.15`, reached only through
-`libp2p-tcp -> if-watch -> netlink-packet-core`; controlled runtime evidence
-for Identify, AutoNAT, relay, and DCUtR; packet proof that AutoNAT's transitive
-request/response behavior never carries Aster data; fresh Aster authentication
-through replacement stream/path/address/process transitions; the archived
-Proposal 0002 trial-14 regression; and the remaining Phase-2-through-5
-experiments. No selection credit is awarded until those rows pass.
+`libp2p-tcp -> if-watch -> netlink-packet-core`; packet proof that AutoNAT's
+transitive request/response behavior never carries Aster data;
+one combined supervisor-bound relayed-to-direct replacement proving that the
+new path creates a new contact session and completes fresh Aster
+authentication; replacement through address/process transitions; the complete
+archived Proposal 0002 trial-14 process topology; and the remaining
+Phase-2-through-5 experiments. The provider-only relay/DCUtR proof and the
+full-node direct-replacement proof are deliberately separate development
+witnesses and do not substitute for that combined row. No selection credit is
+awarded until those rows pass.
 
 ## Eligible arms and provider boundary
 
@@ -925,3 +946,37 @@ failures and signed evidence, and removes every rejected experimental
 integration. Until then Decision 0024 remains authoritative and no IP provider,
 dependency, requirement, conformance scenario, MVP status, or deployment
 profile is selected.
+
+## Outcome — 2026-08-23
+
+Proposal 0004 is closed as superseded before its formal Phase-0 freeze and
+Phase-1 comparison. Gate H passed only for the provider-free shared-node
+baseline. The corrected-native arm and the default-disabled rust-libp2p arm did
+not produce the frozen comparative Phase-0 receipt or complete Phase-1 result;
+Phases 2–5, the deletion comparison, and rollback fixture were not reached.
+Consequently no arm passed or failed the full proposal, and no arm is selected
+from it.
+
+The final rust-libp2p development checkpoint passed its bounded localhost test
+suite and remains preserved in this closure's version-controlled tree. Its
+exact source files are:
+
+- `crates/aster-lab/src/mesh_experiment/libp2p_candidate.rs` — SHA-256
+  `ab6a866c5e02bdacaa490135c0d5ad7a89de6e866655d79ed0cab7f6b8ec2e33`;
+- `crates/aster-libp2p-provider/src/adapter.rs` — SHA-256
+  `eb9ab9ef50cf248042872f993d114c37c0af4399792945426b9504061503ec22`.
+
+It is retained only as a
+publish-disabled, opt-in test oracle under
+[Decision 0027](../decisions/0027-libp2p-pilot-dependency-policy.md). It grants
+no requirement, conformance, compatibility, dependency-admission, capability,
+or production credit and must be removed or explicitly reauthorized by that
+decision's deadline.
+
+Proposal 0005 and Proposal 0006 independently moved the program to a
+requirements-first engineering baseline. Rust-libp2p is therefore rejected
+from the continuing selected-stack implementation, default, deployment, and
+production lanes. This is a portfolio disposition, not a claim that
+rust-libp2p failed gates that were never run. See the
+[separate result](0004-shared-node-libp2p-retest-results.md) and
+[Decision 0029](../decisions/0029-close-proposal-0004-libp2p-pilot.md).

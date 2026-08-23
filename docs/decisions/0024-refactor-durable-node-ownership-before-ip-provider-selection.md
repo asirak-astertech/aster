@@ -164,3 +164,13 @@ cheap authenticated contacts, transactional admission, coherent node-global
 budgets and state fanout, and one exact provider profile that passes every
 Proposal 0003 mandatory gate. Performance or dependency advantages cannot
 compensate for a functional, authorization, boundedness, or rollback failure.
+
+## Later disposition — 2026-08-23
+
+The provider-free shared-node architecture subsequently passed Gate H, but
+Proposal 0004 did not complete its formal corrected-native versus rust-libp2p
+comparison. [Decision 0029](0029-close-proposal-0004-libp2p-pilot.md) closes
+that proposal with no provider selected. It supersedes this decision's
+forward-looking libp2p-first revisit, while preserving the durable-owner,
+transactional-admission, aggregate-resource, and provider-neutral architecture
+findings above.

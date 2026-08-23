@@ -184,6 +184,8 @@ jobs:
 
       - name: Enforce dependency policy offline
         run: |
+          CARGO="cargo +1.97.1" python3 tools/check-retained-libp2p-oracle-boundary.py
+          python3 tools/test-retained-libp2p-oracle-boundary.py
           CARGO_NET_OFFLINE=true sh ./tools/check-dependency-exception-scope.sh
           CARGO_NET_OFFLINE=true sh ./tools/test-dependency-exception-scope.sh
           cargo +1.97.1 deny --locked --offline check

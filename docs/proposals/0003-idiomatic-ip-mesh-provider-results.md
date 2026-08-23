@@ -1,6 +1,5 @@
 # Proposal 0003 result: no provider selected; refactor node ownership first
 
-> ****
 
 - Status: completed by the proposal's mandatory Phase-1 stop rule — **none
   selected**
@@ -410,3 +409,14 @@ admitted to the candidate graph, and neither libp2p nor Iroh is selected.
 
 No requirement, conformance scenario, MVP status, or production mesh capability
 is closed by this result.
+
+### Follow-on disposition — 2026-08-23
+
+The provider-free shared-node candidate later passed formal Gate H and its
+10/10 live cohort. That corrected-host result did not select a provider.
+Proposal [0004](0004-shared-node-libp2p-retest.md) then accumulated bounded,
+default-disabled rust-libp2p development evidence but stopped before its formal
+Phase-0/Phase-1 comparison; Phases 2–5 did not run. Its
+[result](0004-shared-node-libp2p-retest-results.md) records no arm selected and
+rejects rust-libp2p from the continuing selected-stack lane without relabeling
+unrun gates as candidate failures.

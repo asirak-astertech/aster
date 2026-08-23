@@ -1,11 +1,13 @@
 # Decision 0027: Bound the active libp2p pilot dependency exceptions
 
-- Status: accepted for a non-production pilot only
+- Status: accepted for a retained non-production test oracle only; provider
+  selection lane closed
 - Date: 2026-08-23
 - Review deadline: 2026-11-23, or before any production selection or release,
   whichever comes first
 - Related: [Decision 0002](0002-dependency-admission.md),
   [Decision 0023](0023-mesh-host-contract-no-libp2p-selection.md),
+  [Decision 0029](0029-close-proposal-0004-libp2p-pilot.md),
   [Proposal 0003](../proposals/0003-idiomatic-ip-mesh-provider-activation.md),
   and [CI policy](../ci.md)
 
@@ -81,3 +83,22 @@ and the age-pilot exception from Decision 0018.
   beyond RustSec's current classification.
 - First-party license enforcement remains byte-for-byte Apache-2.0 and is
   unaffected by the external dependency allowlist.
+
+## Post-closure scope — 2026-08-23
+
+[Decision 0029](0029-close-proposal-0004-libp2p-pilot.md) closes Proposal 0004
+with no provider selected. This decision now governs retained test evidence
+only. The provider must remain `publish = false`, absent from default features,
+and have no workspace consumer other than the optional dependency activated by
+the opt-in `aster-lab/libp2p-candidate` feature.
+No new Proposal 0004 experimental cohort or selection-phase execution is
+authorized; routine retained-oracle CI validation remains permitted.
+The provider remains an independently buildable workspace test package, so
+explicit and workspace-wide validation may compile it without activating it in
+any default or shipping consumer.
+
+The 2026-11-23 review/removal deadline and the earlier-use expiry remain
+unchanged. Closure does not convert the temporary license allowlist or
+`RUSTSEC-2024-0436` disposition into general or permanent policy. If the pilot
+is removed before the deadline, its lock reachability, advisory ignore, and
+scope assertions must be removed in the same change.

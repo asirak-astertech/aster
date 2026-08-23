@@ -32,6 +32,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const CONTACT: ContactId = ContactId(1);
+const REPLACEMENT_CONTACT: ContactId = ContactId(2);
 const LINK_FRAME_CAPACITY: usize = 1_024;
 const VOLUME_PAYLOAD_BYTES: usize = 1_048_576;
 const REQUIRED_FRAMES_PER_DIRECTION: u64 = 10_000;
@@ -389,17 +390,19 @@ fn role_for(direction: StreamDirection, remote: NodeId) -> ContactSessionRole {
 #[allow(clippy::too_many_arguments)]
 fn open_supervised_contact(
     supervisor: &mut SharedNodeContactSupervisor,
+    contact: ContactId,
     candidate: CandidateId,
     locator: CandidateLocator,
     remote_aster_peer: NodeId,
     remote_carrier_identity: Vec<u8>,
     carrier: EstablishedCarrier,
+    path: ContactPath,
     stream_direction: StreamDirection,
     link: ChannelLink,
 ) -> LabResult<()> {
     let report = supervisor.open_contact_with_factory(
         ContactOpening {
-            contact: CONTACT,
+            contact,
             candidate,
             locator,
             carrier_identity: Some(CarrierIdentity::new(remote_carrier_identity)?),
@@ -408,7 +411,7 @@ fn open_supervised_contact(
             } else {
                 ContactDirection::Inbound
             },
-            path: ContactPath::Direct,
+            path,
             role: role_for(stream_direction, remote_aster_peer),
         },
         Instant::now(),
@@ -730,21 +733,25 @@ async fn real_two_node_bridge() -> LabResult<()> {
     // claim before either provider is allowed to activate `/aster/sync/2`.
     open_supervised_contact(
         &mut a_supervisor,
+        CONTACT,
         a_candidate,
         a_locator,
         b_identity,
         b_carrier_peer.to_bytes(),
         a_carrier,
+        ContactPath::Direct,
         a_stream_direction,
         a_link,
     )?;
     open_supervised_contact(
         &mut b_supervisor,
+        CONTACT,
         b_candidate,
         b_locator,
         a_identity,
         a_carrier_peer.to_bytes(),
         b_carrier,
+        ContactPath::Direct,
         b_stream_direction,
         b_link,
     )?;
@@ -919,10 +926,408 @@ async fn real_two_node_bridge() -> LabResult<()> {
     Ok(())
 }
 
+async fn direct_replacement_fresh_authentication(payload_bytes: usize) -> LabResult<()> {
+    let scratch = ScratchRoot::fresh();
+    let prepared = prepare_ip_mesh(&MeshPrepareConfig {
+        root: scratch.path().to_path_buf(),
+        seed: 0x1b2f_0014,
+        payload_bytes,
+    })?;
+    let a_config = node_config(
+        scratch.path(),
+        "a",
+        prepared.topic.clone(),
+        prepared.scope.clone(),
+        prepared.consumer,
+    );
+    let b_config = node_config(
+        scratch.path(),
+        "c",
+        prepared.topic.clone(),
+        prepared.scope.clone(),
+        prepared.publisher,
+    );
+    let (a_identity, mut a_supervisor, _) = open_native_shared_supervisor_with_limits(
+        &a_config,
+        EmissionPolicy::default(),
+        fs::read(&a_config.credential_path)?,
+        libp2p_node_resource_limits(&a_config)?,
+    )?;
+    let (b_identity, mut b_supervisor, _) = open_native_shared_supervisor_with_limits(
+        &b_config,
+        EmissionPolicy::default(),
+        fs::read(&b_config.credential_path)?,
+        libp2p_node_resource_limits(&b_config)?,
+    )?;
+
+    let base_claim = provider_base_claim();
+    let a_provider_base = a_supervisor.reserve_provider_resources(base_claim)?;
+    let b_provider_base = b_supervisor.reserve_provider_resources(base_claim)?;
+    let adapter_config = AdapterConfig {
+        max_pending_connections: PROVIDER_MAX_PENDING_CONNECTIONS,
+        max_established_connections: PROVIDER_MAX_ESTABLISHED_CONNECTIONS,
+        max_connections_per_peer: PROVIDER_MAX_ESTABLISHED_CONNECTIONS,
+        max_frame_bytes: 1_400,
+        max_queued_frames_per_session: LINK_FRAME_CAPACITY,
+        max_queued_bytes_per_session: LINK_FRAME_CAPACITY * 1_400,
+        ..AdapterConfig::default()
+    };
+    let mut a_adapter = Libp2pAdapter::new(Keypair::generate_ed25519(), adapter_config.clone())?;
+    let mut b_adapter = Libp2pAdapter::new(Keypair::generate_ed25519(), adapter_config)?;
+    let a_carrier_peer = a_adapter.local_peer_id();
+    let b_carrier_peer = b_adapter.local_peer_id();
+
+    a_adapter.listen("/ip4/127.0.0.1/tcp/0".parse()?)?;
+    b_adapter.listen("/ip4/127.0.0.1/tcp/0".parse()?)?;
+    let a_address = listen_address(&mut a_adapter).await?;
+    let b_address = listen_address(&mut b_adapter).await?;
+    let a_candidate = CandidateId::new("libp2p-replacement-b")?;
+    let b_candidate = CandidateId::new("libp2p-replacement-a")?;
+    let a_locator = CandidateLocator::new(b_address.to_string())?;
+    let b_locator = CandidateLocator::new(a_address.to_string())?;
+    let observed = Instant::now();
+    a_supervisor.observe_candidate(
+        a_candidate.clone(),
+        a_locator.clone(),
+        CandidateProvenance::Manual,
+        ContactPath::Direct,
+        Some(b_identity),
+        observed,
+    )?;
+    b_supervisor.observe_candidate(
+        b_candidate.clone(),
+        b_locator.clone(),
+        CandidateProvenance::Manual,
+        ContactPath::Direct,
+        Some(a_identity),
+        observed,
+    )?;
+    let _ = a_supervisor.plan(observed)?;
+    a_adapter.dial(DialCandidate {
+        expected_peer_id: Some(b_carrier_peer),
+        address: b_address.clone(),
+    })?;
+
+    let mut a_old = None;
+    let mut b_old = None;
+    while a_old.is_none() || b_old.is_none() {
+        tokio::select! {
+            event = a_adapter.next_event(), if a_old.is_none() => {
+                a_old = observe_established(event, b_carrier_peer)?;
+            }
+            event = b_adapter.next_event(), if b_old.is_none() => {
+                b_old = observe_established(event, a_carrier_peer)?;
+            }
+        }
+    }
+    let a_old = a_old.expect("A predecessor carrier");
+    let b_old = b_old.expect("B predecessor carrier");
+    let a_direction = expected_stream_direction(a_carrier_peer, b_carrier_peer)?;
+    let b_direction = expected_stream_direction(b_carrier_peer, a_carrier_peer)?;
+    let (a_old_link, a_old_bridge) = ChannelLink::bounded(b_identity);
+    let (b_old_link, b_old_bridge) = ChannelLink::bounded(a_identity);
+    open_supervised_contact(
+        &mut a_supervisor,
+        CONTACT,
+        a_candidate.clone(),
+        a_locator.clone(),
+        b_identity,
+        b_carrier_peer.to_bytes(),
+        a_old,
+        ContactPath::Direct,
+        a_direction,
+        a_old_link,
+    )?;
+    open_supervised_contact(
+        &mut b_supervisor,
+        CONTACT,
+        b_candidate.clone(),
+        b_locator.clone(),
+        a_identity,
+        a_carrier_peer.to_bytes(),
+        b_old,
+        ContactPath::Direct,
+        b_direction,
+        b_old_link,
+    )?;
+    a_adapter.activate_session(a_old.session)?;
+    b_adapter.activate_session(b_old.session)?;
+    let mut a_old_observations = ProviderObservations {
+        expected_session: a_old.session,
+        expected_direction: a_direction,
+        remote_aster_peer: b_identity,
+        stream_opened: 0,
+        frames_received: 0,
+        frames_submitted: 0,
+        frames_sent: 0,
+    };
+    let mut b_old_observations = ProviderObservations {
+        expected_session: b_old.session,
+        expected_direction: b_direction,
+        remote_aster_peer: a_identity,
+        stream_opened: 0,
+        frames_received: 0,
+        frames_submitted: 0,
+        frames_sent: 0,
+    };
+    loop {
+        let now = Instant::now();
+        a_supervisor.drive_contact(CONTACT, now)?;
+        b_supervisor.drive_contact(CONTACT, now)?;
+        let a_admitted = a_supervisor
+            .contact_status()
+            .iter()
+            .any(|status| status.contact == CONTACT && status.admitted);
+        let b_admitted = b_supervisor
+            .contact_status()
+            .iter()
+            .any(|status| status.contact == CONTACT && status.admitted);
+        if a_admitted && b_admitted {
+            break;
+        }
+        flush_runtime_frames(&mut a_adapter, &a_old_bridge, &mut a_old_observations)?;
+        flush_runtime_frames(&mut b_adapter, &b_old_bridge, &mut b_old_observations)?;
+        tokio::select! {
+            event = a_adapter.next_event() => {
+                handle_provider_event(event, &a_old_bridge, &mut a_old_observations)?;
+            }
+            event = b_adapter.next_event() => {
+                handle_provider_event(event, &b_old_bridge, &mut b_old_observations)?;
+            }
+            () = tokio::time::sleep(Duration::from_millis(1)) => {}
+        }
+    }
+    if b_supervisor.durable_item_present(prepared.item_id)? {
+        return Err(invalid(
+            "predecessor contact completed the item before replacement",
+        ));
+    }
+
+    a_adapter.dial_replacement(DialCandidate {
+        expected_peer_id: Some(b_carrier_peer),
+        address: b_address,
+    })?;
+    let mut a_new = None;
+    let mut b_new = None;
+    while a_new.is_none() || b_new.is_none() {
+        tokio::select! {
+            event = a_adapter.next_event() => match event {
+                ProviderEvent::CarrierEstablished {
+                    session,
+                    path: ProviderCarrierPath::Direct,
+                    outbound,
+                    ..
+                } if session.peer_id == b_carrier_peer && session != a_old.session => {
+                    a_new = Some(EstablishedCarrier { session, outbound });
+                }
+                ProviderEvent::TransportFailure { error, .. } => {
+                    return Err(invalid(format!("replacement dial failed at A: {error}")));
+                }
+                _ => {}
+            },
+            event = b_adapter.next_event() => match event {
+                ProviderEvent::CarrierEstablished {
+                    session,
+                    path: ProviderCarrierPath::Direct,
+                    outbound,
+                    ..
+                } if session.peer_id == a_carrier_peer && session != b_old.session => {
+                    b_new = Some(EstablishedCarrier { session, outbound });
+                }
+                ProviderEvent::TransportFailure { error, .. } => {
+                    return Err(invalid(format!("replacement dial failed at B: {error}")));
+                }
+                _ => {}
+            },
+        }
+    }
+    let a_new = a_new.expect("A replacement carrier");
+    let b_new = b_new.expect("B replacement carrier");
+    a_adapter.begin_replacement(a_old.session, a_new.session)?;
+    b_adapter.begin_replacement(b_old.session, b_new.session)?;
+    let _ = a_supervisor.close_contact(CONTACT, false, Instant::now())?;
+    let _ = b_supervisor.close_contact(CONTACT, false, Instant::now())?;
+    drop(a_old_bridge);
+    drop(b_old_bridge);
+
+    let mut a_ready = false;
+    let mut b_ready = false;
+    while !a_ready || !b_ready {
+        tokio::select! {
+            event = a_adapter.next_event(), if !a_ready => match event {
+                ProviderEvent::ReplacementReady { retired, replacement }
+                    if retired == a_old.session && replacement == a_new.session => {
+                    a_ready = true;
+                }
+                ProviderEvent::TransportFailure { error, .. } => {
+                    return Err(invalid(format!("A replacement failed: {error}")));
+                }
+                _ => {}
+            },
+            event = b_adapter.next_event(), if !b_ready => match event {
+                ProviderEvent::ReplacementReady { retired, replacement }
+                    if retired == b_old.session && replacement == b_new.session => {
+                    b_ready = true;
+                }
+                ProviderEvent::TransportFailure { error, .. } => {
+                    return Err(invalid(format!("B replacement failed: {error}")));
+                }
+                _ => {}
+            },
+        }
+    }
+
+    let replacement_observed = Instant::now();
+    let replacement_plan_at = a_supervisor
+        .next_wakeup(replacement_observed)
+        .unwrap_or(replacement_observed);
+    let replacement_plan = a_supervisor.plan(replacement_plan_at)?;
+    if !replacement_plan.actions.iter().any(|action| {
+        matches!(
+            action,
+            HostAction::Dial { candidate, locator }
+                if candidate == &a_candidate && locator == &a_locator
+        )
+    }) {
+        return Err(invalid(
+            "shared supervisor did not authorize the replacement carrier",
+        ));
+    }
+    let (a_new_link, a_new_bridge) = ChannelLink::bounded(b_identity);
+    let (b_new_link, b_new_bridge) = ChannelLink::bounded(a_identity);
+    open_supervised_contact(
+        &mut a_supervisor,
+        REPLACEMENT_CONTACT,
+        a_candidate,
+        a_locator,
+        b_identity,
+        b_carrier_peer.to_bytes(),
+        a_new,
+        ContactPath::Direct,
+        a_direction,
+        a_new_link,
+    )?;
+    open_supervised_contact(
+        &mut b_supervisor,
+        REPLACEMENT_CONTACT,
+        b_candidate,
+        b_locator,
+        a_identity,
+        a_carrier_peer.to_bytes(),
+        b_new,
+        ContactPath::Direct,
+        b_direction,
+        b_new_link,
+    )?;
+    a_adapter.complete_replacement(a_old.session, a_new.session)?;
+    b_adapter.complete_replacement(b_old.session, b_new.session)?;
+    let mut a_new_observations = ProviderObservations {
+        expected_session: a_new.session,
+        expected_direction: a_direction,
+        remote_aster_peer: b_identity,
+        stream_opened: 0,
+        frames_received: 0,
+        frames_submitted: 0,
+        frames_sent: 0,
+    };
+    let mut b_new_observations = ProviderObservations {
+        expected_session: b_new.session,
+        expected_direction: b_direction,
+        remote_aster_peer: a_identity,
+        stream_opened: 0,
+        frames_received: 0,
+        frames_submitted: 0,
+        frames_sent: 0,
+    };
+    loop {
+        let now = Instant::now();
+        a_supervisor.drive_contact(REPLACEMENT_CONTACT, now)?;
+        b_supervisor.drive_contact(REPLACEMENT_CONTACT, now)?;
+        flush_runtime_frames(&mut a_adapter, &a_new_bridge, &mut a_new_observations)?;
+        flush_runtime_frames(&mut b_adapter, &b_new_bridge, &mut b_new_observations)?;
+        let a_admitted = a_supervisor.contact_status().iter().any(|status| {
+            status.contact == REPLACEMENT_CONTACT
+                && status.admitted
+                && status.authenticated_peer == Some(b_identity)
+        });
+        let b_admitted = b_supervisor.contact_status().iter().any(|status| {
+            status.contact == REPLACEMENT_CONTACT
+                && status.admitted
+                && status.authenticated_peer == Some(a_identity)
+        });
+        if a_admitted
+            && b_admitted
+            && b_supervisor.durable_item_present(prepared.item_id)?
+            && a_new_observations.stream_opened == 1
+            && b_new_observations.stream_opened == 1
+        {
+            break;
+        }
+        tokio::select! {
+            event = a_adapter.next_event() => {
+                handle_provider_event(event, &a_new_bridge, &mut a_new_observations)?;
+            }
+            event = b_adapter.next_event() => {
+                handle_provider_event(event, &b_new_bridge, &mut b_new_observations)?;
+            }
+            () = tokio::time::sleep(Duration::from_millis(1)) => {}
+        }
+    }
+
+    if a_old.session == a_new.session
+        || b_old.session == b_new.session
+        || a_new_observations.frames_sent == 0
+        || b_new_observations.frames_sent == 0
+    {
+        return Err(invalid(
+            "replacement did not use a fresh connection and Aster exchange",
+        ));
+    }
+    for supervisor in [&a_supervisor, &b_supervisor] {
+        let statuses = supervisor.contact_status();
+        if statuses.len() != 1
+            || statuses[0].contact != REPLACEMENT_CONTACT
+            || !statuses[0].admitted
+        {
+            return Err(invalid(
+                "predecessor contact survived fresh replacement admission",
+            ));
+        }
+    }
+
+    drop(a_adapter);
+    drop(b_adapter);
+    a_provider_base.release()?;
+    b_provider_base.release()?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn two_persistent_swarms_drive_ten_thousand_runtime_frames_each_way() -> LabResult<()> {
     tokio::time::timeout(Duration::from_secs(120), real_two_node_bridge())
         .await
         .map_err(|_| invalid("real libp2p volume bridge timed out after 120 seconds"))??;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn replacement_connection_requires_fresh_aster_authentication() -> LabResult<()> {
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        direct_replacement_fresh_authentication(VOLUME_PAYLOAD_BYTES),
+    )
+    .await
+    .map_err(|_| invalid("real libp2p replacement timed out after 60 seconds"))??;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn trial_14_seed_delivers_64_kib_after_connection_replacement() -> LabResult<()> {
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        direct_replacement_fresh_authentication(65_536),
+    )
+    .await
+    .map_err(|_| invalid("64 KiB replacement regression timed out after 30 seconds"))??;
     Ok(())
 }

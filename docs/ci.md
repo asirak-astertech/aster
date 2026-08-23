@@ -9,10 +9,10 @@ single stable check name **`CI / required`**.
 
 | Check | Runner | Purpose |
 | --- | --- | --- |
-| `quality` | `ubuntu-24.04` | Runs `mise run check`: Rust and Go formatting, Apache-2.0-only project-license and package checks, Clippy with warnings denied, the full Rust workspace test suite, C ABI build and C/C++ header checks, Rust/Python conformance, Python/Go binding tests, and the lab-controller tests. |
+| `quality` | `ubuntu-24.04` | Runs `mise run check`: Rust and Go formatting, Apache-2.0-only project-license and package checks, the retained-libp2p-oracle boundary, Clippy with warnings denied, the full Rust workspace test suite, C ABI build and C/C++ header checks, Rust/Python conformance, Python/Go binding tests, and the lab-controller tests. |
 | `macOS tests` | `macos-14` | Runs all Rust workspace tests on the supported Apple runner with Rust 1.97.1. |
 | `Rust 1.90 MSRV` | `ubuntu-24.04` | Checks every workspace target and feature with the declared minimum supported Rust version. |
-| `dependency policy` | `ubuntu-24.04` | Applies `deny.toml` to the root and fuzz dependency graphs and audits both lockfiles against a freshly downloaded RustSec database. |
+| `dependency policy` | `ubuntu-24.04` | Enforces the retained-libp2p-oracle boundary, applies `deny.toml` to the root and fuzz dependency graphs, and audits both lockfiles against a freshly downloaded RustSec database. |
 | `age reference interoperability` | `ubuntu-24.04` | Installs exact `govulncheck` v1.6.0, runs `mise run age-reference-audit`, then runs `mise run age-reference-interop`: the Go oracle's reachable vulnerability and compiled-module license gates must pass before exact reference Go `filippo.io/age` v1.3.1 and the Rust provider exchange classic-X25519 artifacts in both directions, compare recovered plaintext, and agree on the recipient. |
 | `bounded fuzz smoke` | `ubuntu-24.04` | Runs the three fixed 10,000-iteration decoder campaigns with the pinned nightly toolchain and `cargo-fuzz`. |
 | `required` | `ubuntu-24.04` | Fails unless every validation lane completed successfully; this is the branch-protection check. |
@@ -43,6 +43,17 @@ project files remain subject to the separate byte-identical Apache-2.0 gate.
 The companion scope gate fails if either ignored package's reverse graph drifts
 or if either package appears in the separately excluded fuzz graph. Any change
 to a package chain or advisory disposition requires a recorded pilot review.
+
+An advisory-independent retained-oracle gate separately parses locked,
+offline, all-feature Cargo metadata. It requires
+`aster-libp2p-provider` to remain unpublished and allows no dependency consumer
+other than `aster-lab`'s optional `libp2p-candidate` feature. It also rejects
+default or aliased activation, renamed or remote provider dependencies, and
+local intermediary consumers outside the workspace. The provider remains
+directly buildable as a workspace test package so explicit and workspace-wide
+validation can exercise the retained oracle without activating it in a default
+or shipping consumer. Mutation tests cover each escape route in both the
+primary and dependency-policy lanes.
 
 The root lockfile also contains `hickory-proto` and `hickory-resolver` 0.25.2
 because the `libp2p` 0.56.0 aggregate manifest exposes DNS and mDNS as optional
