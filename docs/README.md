@@ -111,6 +111,7 @@ decision records explain why the current design chose its major boundaries:
 - [0025 — Requirements-first FOSS architecture evaluation](decisions/0025-requirements-first-foss-architecture-evaluation.md)
 - [0026 — Scope lock-only Hickory advisories](decisions/0026-lock-only-hickory-advisories.md)
 - [0027 — Bound the active libp2p pilot dependency exceptions](decisions/0027-libp2p-pilot-dependency-policy.md)
+- [0028 — Start the selected-stack implementation behind an isolated profile](decisions/0028-selected-stack-implementation-boundary.md)
 - [0029 — Close Proposal 0004 without selecting rust-libp2p](decisions/0029-close-proposal-0004-libp2p-pilot.md)
 
 ## All documents

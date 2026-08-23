@@ -24,10 +24,20 @@ run = [
   "c++ -std=c++17 -Wall -Wextra -Werror -pedantic -Ibindings/c -fsyntax-only bindings/c/header_smoke.cpp",
   "cargo run --locked -p aster-conformance -- --self-test",
   "python3 conformance/python_wire_oracle.py conformance/vectors/wire-v1.tsv",
+  "mise run conformance-profile-v0-r2",
   "python3 -m unittest discover -s bindings/python/tests",
   "python3 -m unittest discover -s lab/tests",
   "test -z \"$(gofmt -l bindings/go)\"",
   "GOCACHE=/tmp/aster-mesh-go-cache go -C bindings/go test -tags aster_workspace ./...",
+]
+
+[tasks.conformance-profile-v0-r2]
+description = "Verify the standalone candidate-neutral v0-r2 conformance corpus"
+run = [
+  "cargo fmt --manifest-path conformance/evaluation-v0/runner/Cargo.toml -- --check",
+  "cargo test --locked --offline --manifest-path conformance/evaluation-v0/runner/Cargo.toml",
+  "cargo clippy --locked --offline --manifest-path conformance/evaluation-v0/runner/Cargo.toml --all-targets -- -D warnings",
+  "python3 conformance/evaluation-v0/check_v0_r2.py",
 ]
 
 [tasks.fuzz-smoke]

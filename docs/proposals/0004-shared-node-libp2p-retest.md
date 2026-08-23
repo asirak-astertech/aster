@@ -962,9 +962,15 @@ suite and remains preserved in this closure's version-controlled tree. Its
 exact source files are:
 
 - `crates/aster-lab/src/mesh_experiment/libp2p_candidate.rs` — SHA-256
-  `ab6a866c5e02bdacaa490135c0d5ad7a89de6e866655d79ed0cab7f6b8ec2e33`;
+  `7b12a8f028593729a36a1bc524cff09939c803bc168b36959e6fb576d6dfa1fe`;
 - `crates/aster-libp2p-provider/src/adapter.rs` — SHA-256
   `eb9ab9ef50cf248042872f993d114c37c0af4399792945426b9504061503ec22`.
+
+The lab source hash includes a watchdog-only stabilization made after a slow
+shared CI runner exhausted the original 120-second bound while continuing far
+beyond the required frame count. The bound is now 300 seconds; the workload
+and every delivery, durability, backpressure, stream, identity, and resource
+assertion are unchanged. This is a deadlock bound, not throughput credit.
 
 It is retained only as a
 publish-disabled, opt-in test oracle under

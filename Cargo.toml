@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+  "crates/aster-profile",
   "crates/aster-core",
   "crates/aster-host",
   "crates/aster-ip",

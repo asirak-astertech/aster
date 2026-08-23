@@ -87,3 +87,43 @@ error codes, resource limits per tier, and a deprecation policy. The release
 gate remains an implementation built independently from that specification and
 interoperating with the reference framework across both positive and hostile
 negative cases.
+
+## Append-only correction: profile v0-r2
+
+The initial execution above is historical. Phase 5's independently written
+Python parser later agreed on only 13 of 18 outcomes because the Rust generator
+privately treated critical extension ID 1 as known and injected it into every
+positive vector. Neither this prose nor the frozen CDDL defined ID 1 or any
+known-extension registry. That also masked the intended reasons for the empty
+protected-object, truncated, and trailing-byte negatives and made the ID 99
+critical-extension attribution ambiguous.
+
+The v0-r2 correction preserves the old corpus and creates revisioned artifacts:
+
+- the known-extension registry is explicitly empty;
+- base positives contain no extension;
+- ID 99 noncritical is accepted and ID 99 critical is rejected;
+- three Rust tests verify all outcomes and the reason-specific structural
+  failures; and
+- the unchanged independent Python parser agrees on **18/18** revised vectors.
+
+The corrected runner passed locked/offline tests (3/3), warning-denied Clippy,
+and locked/offline release build. The independent parser reports the intended
+`byte_string_bound`, `truncated`, `trailing_data`, and
+`unknown_critical_extension` reasons. Exact artifact identities:
+
+| Artifact | SHA-256 |
+|---|---|
+| Historical v0-r1 preservation manifest | `c8a1ab948bfd719f099d2c588a99ab6c21a780524ce919ac7d73c2fb30e3e6e0` |
+| Revised runner source | `a7ac74d7a06204bae7baab4d428f596169923de8d459825d6456f577f3217c24` |
+| Revised profile CDDL | `349d6be07bdf710c42c28f93d4d7f88254c3009fad0607ecb28eab75eda337d9` |
+| Release runner | `97fa31820d65923370a6feb36a78ed02d8230e557f1465e4afb0c79301d88d27` |
+| Rust summary | `d440ff3c32275e586264f26c9a3f6fc389dfb10e7e9c51f514e606da39533c88` |
+| Independent result | `c0081c730e3d71302a8af0a4b24fa9b1240ea2bfd1b71f3dc77a0e13568e85f2` |
+| Unchanged independent parser | `c482e60218eae7de42c6823f0aeca15c5c669470e8307501b1dc5f9652eafe63` |
+| 25-entry v0-r2 manifest | `dfb4c5584123f52178ae19becf55b288a68c3c75bcd2c49967a5d1f151afaa96` |
+
+This repair closes the evaluator's hidden-extension discrepancy only. The
+profile is still explicitly non-product, its CDDL is not a complete normative
+specification, and the Python oracle is not a second full implementation.
+DM-8-18 and DM-12-11 therefore remain open release gates.

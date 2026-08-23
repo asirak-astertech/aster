@@ -52,6 +52,7 @@ jobs:
         run: |
           cargo fetch --locked
           cargo fetch --locked --manifest-path fuzz/Cargo.toml
+          cargo fetch --locked --manifest-path conformance/evaluation-v0/runner/Cargo.toml
 
       - name: Run formatting, lint, tests, bindings, and conformance
         env:
