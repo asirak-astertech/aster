@@ -176,7 +176,11 @@ jobs:
           cargo +1.97.1 fetch --locked
           cargo +1.97.1 fetch --locked --manifest-path fuzz/Cargo.toml
           cargo +1.97.1 deny fetch all
-          cargo +1.97.1 audit --file Cargo.lock
+          CARGO_NET_OFFLINE=true sh ./tools/check-dependency-exception-scope.sh
+          cargo +1.97.1 audit \
+            --ignore RUSTSEC-2026-0118 \
+            --ignore RUSTSEC-2026-0119 \
+            --file Cargo.lock
 
       - name: Enforce dependency policy offline
         run: |

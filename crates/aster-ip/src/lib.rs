@@ -15,6 +15,7 @@ use aster_mesh::link::{Link, LinkCharacteristics, ReceivedFrame};
 use aster_mesh::model::NodeId;
 use hkdf::Hkdf;
 use sha2::Sha256;
+use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
@@ -147,14 +148,89 @@ impl IpLink {
             ));
         }
         let socket = UdpSocket::bind(address)?;
+        let interface = match address {
+            SocketAddr::V4(address) => Some(*address.ip()),
+            SocketAddr::V6(_) => None,
+        };
+        Self::from_socket(name, socket, discovery_token, discovery_target, interface)
+    }
+
+    /// Binds a nonblocking UDP link whose local multicast port may be shared by
+    /// several independent node processes on one host.
+    ///
+    /// This is a deployment-level local-discovery facility, not a relaxation of
+    /// the discovery proof or Aster authentication. The caller must bind an
+    /// local address using the same multicast port as `discovery_target`; every
+    /// DATA endpoint remains separately registered and authenticated by the
+    /// core runtime. A concrete local address is useful in a network namespace
+    /// without a default route because it selects the multicast interface.
+    pub fn bind_shared_multicast(
+        name: impl Into<String>,
+        address: SocketAddr,
+        discovery_token: [u8; 16],
+        discovery_target: SocketAddr,
+    ) -> io::Result<Self> {
+        if address.port() != discovery_target.port()
+            || !discovery_target.ip().is_multicast()
+            || !matches!(
+                (address, discovery_target),
+                (SocketAddr::V4(_), SocketAddr::V4(_))
+            )
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "shared multicast requires matching IPv4 ports and a multicast target",
+            ));
+        }
+        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        socket.set_reuse_address(true)?;
+        #[cfg(unix)]
+        socket.set_reuse_port(true)?;
+        socket.set_nonblocking(true)?;
+        socket.bind(&address.into())?;
+        let interface = match address {
+            SocketAddr::V4(address) => Some(*address.ip()),
+            SocketAddr::V6(_) => None,
+        };
+        Self::from_socket(
+            name,
+            socket.into(),
+            discovery_token,
+            Some(discovery_target),
+            interface,
+        )
+    }
+
+    fn from_socket(
+        name: impl Into<String>,
+        socket: UdpSocket,
+        discovery_token: [u8; 16],
+        discovery_target: Option<SocketAddr>,
+        multicast_interface: Option<Ipv4Addr>,
+    ) -> io::Result<Self> {
+        if discovery_token == [0; 16] {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "discovery token must be provisioned",
+            ));
+        }
         socket.set_nonblocking(true)?;
         let mut endpoint_handle_seed = [0u8; 32];
         getrandom::fill(&mut endpoint_handle_seed).map_err(io::Error::other)?;
         if let Some(SocketAddr::V4(target)) = discovery_target
             && target.ip().is_multicast()
         {
-            socket.join_multicast_v4(target.ip(), &Ipv4Addr::UNSPECIFIED)?;
+            socket.join_multicast_v4(
+                target.ip(),
+                &multicast_interface.unwrap_or(Ipv4Addr::UNSPECIFIED),
+            )?;
             socket.set_multicast_loop_v4(true)?;
+        } else if matches!(discovery_target, Some(SocketAddr::V4(_))) {
+            // A directed or limited LAN broadcast is an equivalent local
+            // discovery medium on container/embedded networks that do not
+            // forward multicast. The same provisioned proof and confirmation
+            // exchange still gates candidate admission.
+            socket.set_broadcast(true)?;
         }
         Ok(Self {
             name: name.into(),
@@ -326,6 +402,39 @@ impl IpLink {
         result
     }
 
+    /// Waits for socket readiness up to `timeout`, then drains one admissible
+    /// DATA frame while still processing bounded discovery/rendezvous control
+    /// traffic internally.
+    ///
+    /// The adapter is expected to have one receive owner. Sending may occur
+    /// concurrently, but callers must not mix this method with another receive
+    /// loop for the same link. A timeout returns `Ok(None)`.
+    pub fn wait_receive(&self, timeout: Duration) -> io::Result<Option<ReceivedFrame>> {
+        if timeout.is_zero() {
+            return self.try_receive();
+        }
+        self.socket.set_nonblocking(false)?;
+        self.socket.set_read_timeout(Some(timeout))?;
+        let mut byte = [0_u8; 1];
+        let readiness = self.socket.peek_from(&mut byte);
+        let timeout_reset = self.socket.set_read_timeout(None);
+        let nonblocking_reset = self.socket.set_nonblocking(true);
+        timeout_reset?;
+        nonblocking_reset?;
+        match readiness {
+            Ok(_) => self.try_receive(),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Registers a high-entropy token accepted for an incoming NAT punch.
     pub fn accept_punch(&self, token: RendezvousToken) -> io::Result<()> {
         if token == [0; 32] {
@@ -415,6 +524,17 @@ impl IpLink {
                 }
                 let mut nonce = [0_u8; 16];
                 nonce.copy_from_slice(&packet[1..17]);
+                {
+                    let now = Instant::now();
+                    let mut announcements = self.recent_announcements.lock().map_err(lock_error)?;
+                    retain_fresh(&mut announcements, now);
+                    if announcements.contains_key(&nonce) {
+                        // Multicast and broadcast sockets commonly receive
+                        // their own announcement. It is not a peer candidate
+                        // and must not consume a challenge/contact slot.
+                        return Ok(true);
+                    }
+                }
                 if bool::from(
                     discovery_proof(&self.discovery_token, &nonce)?
                         .as_slice()
@@ -2071,6 +2191,42 @@ mod tests {
             thread::sleep(Duration::from_millis(2));
         }
         panic!("registered discovered endpoint did not deliver DATA");
+    }
+
+    #[test]
+    fn reflected_own_discovery_announcement_is_not_a_candidate() {
+        let token = [0x44; 16];
+        let link = IpLink::bind("self", loopback(), token, None).unwrap();
+        let nonce = [0x55; 16];
+        link.recent_announcements
+            .lock()
+            .unwrap()
+            .insert(nonce, Instant::now());
+        let mut packet = [0_u8; DISCOVERY_PACKET_LEN];
+        packet[0] = DISCOVERY;
+        packet[1..17].copy_from_slice(&nonce);
+        packet[17..DISCOVERY_ANNOUNCEMENT_BODY_LEN]
+            .copy_from_slice(&discovery_proof(&token, &nonce).unwrap());
+        assert!(
+            link.process_control("127.0.0.1:49999".parse().unwrap(), &packet)
+                .unwrap()
+        );
+        assert!(link.pending_discovery.lock().unwrap().is_empty());
+        assert!(link.take_discovered().is_empty());
+    }
+
+    #[test]
+    fn independent_process_style_links_can_share_one_multicast_port() {
+        let token = [0x5a; 16];
+        let probe = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let bind = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
+        let group = SocketAddr::from((Ipv4Addr::new(239, 255, 71, 1), port));
+        let first = IpLink::bind_shared_multicast("first", bind, token, group).unwrap();
+        let second = IpLink::bind_shared_multicast("second", bind, token, group).unwrap();
+        assert_eq!(first.local_addr().unwrap().port(), port);
+        assert_eq!(second.local_addr().unwrap().port(), port);
     }
 
     #[test]

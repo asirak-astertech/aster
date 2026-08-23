@@ -564,6 +564,16 @@ The message flow is:
    forwarding field.
 7. `RECEIPT`: durably stored ranges for the typed object.
 
+Durable partial progress is peer-neutral, so a resumed `WANT` MAY reach a fresh
+authenticated peer which never advertised that typed ObjectID. A receiver MUST
+emit a serve action or `DATA` only when the ObjectID is present in that
+contact's current authenticated, policy-filtered served inventory. A `WANT`
+absent from that view is silently ignored before any object lookup; the
+requester retains its bounded durable progress and MAY retry this or another
+peer. Once a `WANT` is eligible for serving, backend, authorization, integrity,
+and storage failures remain fatal to the contact rather than being converted
+to absence.
+
 One INTEREST admits at most 256 canonical topic selectors, 256 canonical scope
 selectors, and 4,096 topic-by-scope combinations. Both locally constructed and
 peer-supplied messages are checked with overflow-safe arithmetic before an

@@ -9,5 +9,10 @@ license.workspace = true
 [dependencies]
 aster-core = { version = "=0.1.0", path = "../aster-core", features = ["adapter-sdk"] }
 
+[features]
+default = ["legacy-single-contact-service"]
+legacy-single-contact-service = []
+gate-h-formal = []
+
 [lints]
 workspace = true

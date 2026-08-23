@@ -1,14 +1,16 @@
 use super::*;
+use std::sync::{Arc, Mutex, Weak};
+
 use crate::crypto::{
     BatchCryptoProvider, BridgeCryptoProvider, ReferenceEnvelopeSealer, VerifiedBatchItem,
     VerifiedBatchProof, VerifiedBridgeSourceRoute, VerifiedBridgeWrapper,
 };
-use crate::engine::{EnvelopeError, EnvelopeSealer, stored_from_verified};
+use crate::engine::{EnvelopeError, EnvelopeSealer, ObservedForwardedIngest, stored_from_verified};
 use crate::store::{
     BridgeAuthorizationCursor, BridgeControlOutcome, BridgeRouteOutcome, BridgeRouteReadiness,
-    SqliteStore, StoreError, StoredBatchMaterial, StoredBridgeRoute, StoredBridgeSource,
-    StoredItem, StoredItemRepresentation, StoredPendingBatchItem, StoredPendingBridgeBlobCarrier,
-    StoredPendingBridgeWrapper, VerifiedBlobRouteMetadata,
+    ControlOutcome, SqliteStore, StoreError, StoredBatchMaterial, StoredBridgeRoute,
+    StoredBridgeSource, StoredItem, StoredItemRepresentation, StoredPendingBatchItem,
+    StoredPendingBridgeBlobCarrier, StoredPendingBridgeWrapper, VerifiedBlobRouteMetadata,
     VerifiedBridgeAuthorization as StoreVerifiedBridgeAuthorization,
     VerifiedBridgeBlobCarrierCommit, VerifiedBridgeRoute as StoreVerifiedBridgeRoute,
     VerifiedBridgeSource as StoreVerifiedBridgeSource, VerifiedBridgeSourceMetadata,
@@ -18,6 +20,22 @@ use crate::store::{
 
 const RESTART_PAGE: usize = 1_024;
 const MAX_SEMANTIC_INVENTORY_OBJECTS: usize = 100_000;
+
+fn ordinary_control_activated(outcome: &ControlOutcome) -> bool {
+    matches!(
+        outcome,
+        ControlOutcome::Applied { activated, .. }
+            if activated.iter().any(|control| control.applied)
+    )
+}
+
+fn bridge_control_activated(outcome: &BridgeControlOutcome) -> bool {
+    matches!(
+        outcome,
+        BridgeControlOutcome::Applied { activated, .. }
+            if activated.iter().any(|control| control.applied)
+    )
+}
 
 /// Reference runtime composition which adds semantic-v2 bridge and batch
 /// dependency handling around the stable singleton/Blob backend.
@@ -31,6 +49,8 @@ pub struct ReferenceSemanticRuntimeBackend {
     batch_served: BTreeMap<(NodeId, u64, ObjectId), ServedBatchObject>,
     bridge_inventory_grants: BTreeMap<ObjectId, BridgeInventoryGrant>,
     bridge_served: BTreeMap<(NodeId, u64, ObjectId), ServedBridgeObject>,
+    authorization_generation: u64,
+    authorization_generation_exhausted: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -100,6 +120,284 @@ struct ServedBridgeObject {
     total_len: u64,
 }
 
+#[derive(Default)]
+struct ReferenceSemanticContactState {
+    serve_routes: BTreeMap<ObjectId, AuthenticatedBlobRoute>,
+    batch_inventory_grants: BTreeMap<ObjectId, BatchInventoryGrant>,
+    batch_served: BTreeMap<(NodeId, u64, ObjectId), ServedBatchObject>,
+    bridge_inventory_grants: BTreeMap<ObjectId, BridgeInventoryGrant>,
+    bridge_served: BTreeMap<(NodeId, u64, ObjectId), ServedBridgeObject>,
+    expected_peer: Option<NodeId>,
+}
+
+impl ReferenceSemanticContactState {
+    fn swap_caches(&mut self, backend: &mut ReferenceSemanticRuntimeBackend) {
+        std::mem::swap(&mut self.serve_routes, &mut backend.inner.serve_routes);
+        std::mem::swap(
+            &mut self.batch_inventory_grants,
+            &mut backend.batch_inventory_grants,
+        );
+        std::mem::swap(&mut self.batch_served, &mut backend.batch_served);
+        std::mem::swap(
+            &mut self.bridge_inventory_grants,
+            &mut backend.bridge_inventory_grants,
+        );
+        std::mem::swap(&mut self.bridge_served, &mut backend.bridge_served);
+    }
+}
+
+/// Process owner of exactly one reference semantic runtime backend.
+///
+/// Contact sessions borrow the backend through non-owning handles. The public
+/// authority surface is deliberately typed: caller code is never invoked while
+/// the authority mutex is held.
+#[must_use = "dropping the authority invalidates every semantic runtime session"]
+pub struct ReferenceSemanticRuntimeAuthority {
+    backend: Arc<Mutex<ReferenceSemanticRuntimeBackend>>,
+}
+
+/// One bounded, opaque mission-authority control awaiting authenticated,
+/// crash-atomic application by the process-owned semantic authority.
+///
+/// Construction proves only the transport bound and stable object identity.
+/// [`ReferenceSemanticRuntimeAuthority::apply_authorization_control`] performs
+/// the cryptographic authentication and durable chain validation while holding
+/// the one authority lock.
+#[derive(Debug, Eq, PartialEq)]
+pub struct SignedAuthorizationControl {
+    sealed: Vec<u8>,
+    envelope_id: EnvelopeId,
+}
+
+impl SignedAuthorizationControl {
+    pub fn from_sealed(sealed: Vec<u8>) -> Result<Self, BlobRuntimeError> {
+        if sealed.is_empty() || sealed.len() > crate::fragment::MAX_MESSAGE_LEN {
+            return Err(missing(
+                "signed authorization control must be nonempty and no larger than 1 MiB",
+            ));
+        }
+        let envelope_id = EnvelopeId::from_sealed_bytes(&sealed);
+        Ok(Self {
+            sealed,
+            envelope_id,
+        })
+    }
+
+    pub const fn envelope_id(&self) -> EnvelopeId {
+        self.envelope_id
+    }
+
+    fn sealed(&self) -> &[u8] {
+        &self.sealed
+    }
+}
+
+/// Exact durable result of applying one signed authorization control.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AppliedAuthorizationControl {
+    pub envelope_id: EnvelopeId,
+    pub generation_before: u64,
+    pub generation_after: u64,
+}
+
+/// Read-only aggregate Blob quota state owned by one semantic authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReferenceSemanticBlobQuotaSnapshot {
+    pub config: crate::blob::BlobStoreConfig,
+    pub used_bytes: u64,
+    pub used_chunks: u64,
+}
+
+/// Non-clone contact handle over one process-owned semantic runtime authority.
+///
+/// Durable state is serialized through the authority. Ordinary Blob, batch,
+/// and bridge serve grants remain local to this handle and are swapped into the
+/// backend only for the duration of one [`RuntimeBackend`] call.
+#[must_use = "a semantic runtime session has no effect until driven"]
+pub struct ReferenceSemanticRuntimeSession {
+    backend: Weak<Mutex<ReferenceSemanticRuntimeBackend>>,
+    contact: ReferenceSemanticContactState,
+}
+
+impl ReferenceSemanticRuntimeAuthority {
+    /// Consumes the single durable backend owned by this process authority.
+    pub fn new(mut backend: ReferenceSemanticRuntimeBackend) -> Self {
+        backend.clear_all_contact_state();
+        Self {
+            backend: Arc::new(Mutex::new(backend)),
+        }
+    }
+
+    /// Creates one non-clone handle with independent contact authorization state.
+    pub fn session(&self) -> ReferenceSemanticRuntimeSession {
+        ReferenceSemanticRuntimeSession {
+            backend: Arc::downgrade(&self.backend),
+            contact: ReferenceSemanticContactState::default(),
+        }
+    }
+
+    /// Authenticates and durably commits one exact mission control, then
+    /// invalidates every contact-scoped authorization view before returning.
+    ///
+    /// Duplicate, pending, rejected, or identity-mismatched controls are not
+    /// accepted as an authorization change. A successful return therefore
+    /// witnesses both the exact durable control and one monotonic generation
+    /// transition; no caller callback or generation-only substitute is used.
+    pub fn apply_authorization_control(
+        &self,
+        control: &SignedAuthorizationControl,
+    ) -> Result<AppliedAuthorizationControl, BlobRuntimeError> {
+        let mut backend = self
+            .backend
+            .lock()
+            .map_err(|_| BlobRuntimeError::AuthorityPoisoned)?;
+        let generation_before = backend.current_authorization_generation()?;
+        let observed = backend
+            .node_mut()
+            .ingest_control_observed(control.sealed())?;
+        // The store commit is already authoritative, including the mixed case
+        // where an unrelated pending prefix activated while this submitted
+        // input must be rejected. Invalidate before propagating that error.
+        let _ = backend.reconcile_ordinary_control_outcome(&observed.outcome)?;
+        observed.input_result?;
+        let outcome = observed.outcome;
+        let expected_id = control.envelope_id().into_bytes();
+        match outcome {
+            ControlOutcome::Applied {
+                envelope_id,
+                activated,
+                rejected,
+            } if envelope_id == expected_id
+                && rejected
+                    .iter()
+                    .all(|entry| entry.envelope_id != expected_id)
+                && activated
+                    .iter()
+                    .any(|entry| entry.envelope_id == expected_id && entry.applied) => {}
+            ControlOutcome::Applied { .. } => {
+                return Err(missing(
+                    "signed authorization control did not durably activate its exact identity",
+                ));
+            }
+            ControlOutcome::Duplicate { .. } => {
+                return Err(missing("signed authorization control is already committed"));
+            }
+            ControlOutcome::Pending { .. } => {
+                return Err(missing(
+                    "signed authorization control is missing a durable predecessor",
+                ));
+            }
+            ControlOutcome::Rejected { .. } => {
+                return Err(missing("signed authorization control was rejected"));
+            }
+        }
+
+        let generation_after = backend.current_authorization_generation()?;
+        if generation_after == generation_before {
+            return Err(missing(
+                "signed authorization control did not change durable authorization state",
+            ));
+        }
+        Ok(AppliedAuthorizationControl {
+            envelope_id: control.envelope_id(),
+            generation_before,
+            generation_after,
+        })
+    }
+
+    /// Invalidates authorization admitted under the current generation.
+    ///
+    /// This is the narrow supervisor seam for a process-owned authorization
+    /// mutation performed through another typed authority API. Active runtime
+    /// sessions observe the returned generation mismatch before their next
+    /// outbound flush and fail closed.
+    pub fn invalidate_authorization_generation(&self) -> Result<u64, BlobRuntimeError> {
+        let mut backend = self
+            .backend
+            .lock()
+            .map_err(|_| BlobRuntimeError::AuthorityPoisoned)?;
+        backend.clear_all_contact_state();
+        backend.advance_authorization_generation();
+        backend.current_authorization_generation()
+    }
+
+    /// Returns the current process-owned authorization generation without
+    /// creating a contact session or exposing an authority-lock callback.
+    pub fn authorization_generation(&self) -> Result<u64, BlobRuntimeError> {
+        let backend = self
+            .backend
+            .lock()
+            .map_err(|_| BlobRuntimeError::AuthorityPoisoned)?;
+        backend.current_authorization_generation()
+    }
+
+    /// Checks one exact durable ItemID through the process-owned SQLite
+    /// authority without opening or projecting its application payload.
+    pub fn durable_item_present(&self, item_id: ItemId) -> Result<bool, BlobRuntimeError> {
+        let backend = self
+            .backend
+            .lock()
+            .map_err(|_| BlobRuntimeError::AuthorityPoisoned)?;
+        backend
+            .node()
+            .store()
+            .contains_item(&item_id)
+            .map_err(store_error)
+    }
+
+    /// Returns the shared Blob store's configured and current quota counters.
+    pub fn blob_quota_snapshot(
+        &self,
+    ) -> Result<ReferenceSemanticBlobQuotaSnapshot, BlobRuntimeError> {
+        let backend = self
+            .backend
+            .lock()
+            .map_err(|_| BlobRuntimeError::AuthorityPoisoned)?;
+        let config = backend.blobs().config();
+        let (used_bytes, used_chunks) = backend.blobs().quota_usage();
+        Ok(ReferenceSemanticBlobQuotaSnapshot {
+            config,
+            used_bytes,
+            used_chunks,
+        })
+    }
+}
+
+impl ReferenceSemanticRuntimeSession {
+    fn with_backend<R>(
+        &mut self,
+        operation: impl FnOnce(&mut ReferenceSemanticRuntimeBackend) -> Result<R, BlobRuntimeError>,
+    ) -> Result<R, BlobRuntimeError> {
+        let backend = self
+            .backend
+            .upgrade()
+            .ok_or(BlobRuntimeError::AuthorityUnavailable)?;
+        let mut backend = backend
+            .lock()
+            .map_err(|_| BlobRuntimeError::AuthorityPoisoned)?;
+        self.contact.swap_caches(&mut backend);
+        let result = operation(&mut backend);
+        self.contact.swap_caches(&mut backend);
+        result
+    }
+
+    fn require_expected_peer(&self, peer: NodeId) -> Result<(), BlobRuntimeError> {
+        match self.contact.expected_peer {
+            Some(expected) if expected == peer => Ok(()),
+            Some(_) => Err(missing("semantic runtime session peer changed")),
+            None => Err(missing("semantic runtime session peer is not authorized")),
+        }
+    }
+
+    fn require_authorized(&self) -> Result<(), BlobRuntimeError> {
+        if self.contact.expected_peer.is_some() {
+            Ok(())
+        } else {
+            Err(missing("semantic runtime session peer is not authorized"))
+        }
+    }
+}
+
 struct IncomingSemanticObject {
     authenticated_peer: NodeId,
     exchange_id: u64,
@@ -120,6 +418,8 @@ impl ReferenceSemanticRuntimeBackend {
             batch_served: BTreeMap::new(),
             bridge_inventory_grants: BTreeMap::new(),
             bridge_served: BTreeMap::new(),
+            authorization_generation: 0,
+            authorization_generation_exhausted: false,
         };
         let _ = backend.reauthenticate_batch_state()?;
         let _ = backend.reauthenticate_bridge_state()?;
@@ -160,11 +460,63 @@ impl ReferenceSemanticRuntimeBackend {
         self.reauthenticate_bridge_state()
     }
 
+    fn current_authorization_generation(&self) -> Result<u64, BlobRuntimeError> {
+        if self.authorization_generation_exhausted {
+            Err(missing(
+                "semantic runtime authorization generation exhausted",
+            ))
+        } else {
+            Ok(self.authorization_generation)
+        }
+    }
+
+    fn advance_authorization_generation(&mut self) {
+        match self.authorization_generation.checked_add(1) {
+            Some(generation) => self.authorization_generation = generation,
+            None => self.authorization_generation_exhausted = true,
+        }
+    }
+
+    fn clear_all_contact_state(&mut self) {
+        self.inner.serve_routes.clear();
+        self.clear_bridge_contact_state();
+    }
+
     fn clear_bridge_contact_state(&mut self) {
         self.batch_inventory_grants.clear();
         self.batch_served.clear();
         self.bridge_inventory_grants.clear();
         self.bridge_served.clear();
+    }
+
+    fn reconcile_authorization_change(
+        &mut self,
+        changed: bool,
+    ) -> Result<Vec<ObjectId>, BlobRuntimeError> {
+        if !changed {
+            return Ok(Vec::new());
+        }
+        self.advance_authorization_generation();
+        self.clear_all_contact_state();
+        let mut promoted = self.reauthenticate_batch_state()?;
+        promoted.extend(self.reauthenticate_bridge_state()?);
+        promoted.sort_unstable();
+        promoted.dedup();
+        Ok(promoted)
+    }
+
+    fn reconcile_ordinary_control_outcome(
+        &mut self,
+        outcome: &ControlOutcome,
+    ) -> Result<Vec<ObjectId>, BlobRuntimeError> {
+        self.reconcile_authorization_change(ordinary_control_activated(outcome))
+    }
+
+    fn reconcile_bridge_control_outcome(
+        &mut self,
+        outcome: &BridgeControlOutcome,
+    ) -> Result<Vec<ObjectId>, BlobRuntimeError> {
+        self.reconcile_authorization_change(bridge_control_activated(outcome))
     }
 
     fn ensure_bridge_contact_authorized(
@@ -1140,6 +1492,19 @@ impl ReferenceSemanticRuntimeBackend {
             .store_mut()
             .ingest_bridge_authorization(&stored)
             .map_err(store_error)?;
+        let authorization_changed = bridge_control_activated(&outcome);
+        let mut promoted = Vec::new();
+        if let BridgeControlOutcome::Applied { activated, .. } = &outcome {
+            promoted.extend(activated.iter().filter_map(|value| {
+                (value.envelope_id != *object_id.digest()).then_some(ObjectId::new(
+                    ObjectKind::BridgeAuthorization,
+                    value.envelope_id,
+                ))
+            }));
+        }
+        // A rejected submitted suffix may still have activated an unrelated
+        // durable prefix. Invalidate before returning its input error.
+        promoted.extend(self.reconcile_bridge_control_outcome(&outcome)?);
         if let Some(rejected) = outcome.rejected_input() {
             if self
                 .node_mut()
@@ -1167,22 +1532,11 @@ impl ReferenceSemanticRuntimeBackend {
         }
         self.node_mut().finish_transfer(object_id)?;
 
-        let mut promoted = Vec::new();
-        let mut refresh_bridge_state = false;
         let disposition = match outcome {
-            BridgeControlOutcome::Applied { activated, .. } => {
-                refresh_bridge_state = true;
-                promoted.extend(activated.into_iter().filter_map(|value| {
-                    (value.envelope_id != *object_id.digest()).then_some(ObjectId::new(
-                        ObjectKind::BridgeAuthorization,
-                        value.envelope_id,
-                    ))
-                }));
-                RuntimeCommit::Committed {
-                    item_id: None,
-                    promoted: Vec::new(),
-                }
-            }
+            BridgeControlOutcome::Applied { .. } => RuntimeCommit::Committed {
+                item_id: None,
+                promoted: Vec::new(),
+            },
             BridgeControlOutcome::Duplicate { .. } => {
                 let stored = self
                     .node()
@@ -1228,10 +1582,7 @@ impl ReferenceSemanticRuntimeBackend {
         };
         match disposition {
             RuntimeCommit::Committed { item_id, .. } => {
-                if refresh_bridge_state {
-                    self.clear_bridge_contact_state();
-                    promoted.extend(self.reauthenticate_bridge_state()?);
-                } else {
+                if !authorization_changed {
                     promoted.extend(self.promote_ready_bridge_routes()?);
                 }
                 promoted.sort_unstable();
@@ -1479,7 +1830,15 @@ impl ReferenceSemanticRuntimeBackend {
         } = incoming;
         let ordinary = self.node_mut().envelopes_mut().inspect_object(&bytes).ok();
         if let Some(ordinary) = ordinary {
-            let control = matches!(ordinary, crate::engine::VerifiedObject::Control(_));
+            if matches!(ordinary, crate::engine::VerifiedObject::Control(_)) {
+                return self.commit_ordinary_control(
+                    authenticated_peer,
+                    exchange_id,
+                    object_id,
+                    bytes,
+                    forwarding,
+                );
+            }
             let mut commit = self.inner.commit_authenticated_object_with_dependencies(
                 authenticated_peer,
                 exchange_id,
@@ -1488,17 +1847,7 @@ impl ReferenceSemanticRuntimeBackend {
                 bytes,
                 forwarding,
             )?;
-            if control && matches!(commit, RuntimeCommit::Committed { .. }) {
-                self.clear_bridge_contact_state();
-                let batch_promoted = self.reauthenticate_batch_state()?;
-                let bridge_promoted = self.reauthenticate_bridge_state()?;
-                if let RuntimeCommit::Committed { promoted, .. } = &mut commit {
-                    promoted.extend(batch_promoted);
-                    promoted.extend(bridge_promoted);
-                    promoted.sort_unstable();
-                    promoted.dedup();
-                }
-            } else if matches!(commit, RuntimeCommit::Committed { .. }) {
+            if matches!(commit, RuntimeCommit::Committed { .. }) {
                 let blob_promoted = self.promote_ready_bridge_blob_carriers()?;
                 if let RuntimeCommit::Committed { promoted, .. } = &mut commit {
                     promoted.extend(blob_promoted);
@@ -1547,6 +1896,46 @@ impl ReferenceSemanticRuntimeBackend {
             .defer_verified_unresolved_bridge_source_transfer(&unresolved, sample)
             .map_err(store_error)?;
         Ok(RuntimeCommit::Quarantined)
+    }
+
+    fn commit_ordinary_control(
+        &mut self,
+        authenticated_peer: NodeId,
+        exchange_id: u64,
+        object_id: ObjectId,
+        bytes: Vec<u8>,
+        forwarding: Vec<u8>,
+    ) -> Result<RuntimeCommit, BlobRuntimeError> {
+        let envelope_id = object_id
+            .envelope_id()
+            .ok_or_else(|| missing("ordinary control object kind mismatch"))?;
+        let observed = self.node_mut().ingest_forwarded_observed(
+            authenticated_peer,
+            exchange_id,
+            envelope_id,
+            &bytes,
+            &forwarding,
+        )?;
+        let ObservedForwardedIngest::Control(observed) = observed else {
+            return Err(missing(
+                "provider inspection changed an ordinary control into application data",
+            ));
+        };
+        let authorization_changed = ordinary_control_activated(&observed.outcome);
+        // Drive invalidation from the durable activated prefix, not from
+        // whether the submitted object itself can be acknowledged.
+        let mut promoted = self.reconcile_ordinary_control_outcome(&observed.outcome)?;
+        observed.input_result?;
+        self.node_mut().finish_transfer(object_id)?;
+        if !authorization_changed {
+            promoted.extend(self.promote_ready_bridge_blob_carriers()?);
+        }
+        promoted.sort_unstable();
+        promoted.dedup();
+        Ok(RuntimeCommit::Committed {
+            item_id: None,
+            promoted,
+        })
     }
 
     fn commit_batch_proof(
@@ -3651,6 +4040,10 @@ enum BridgeReadKind {
 impl RuntimeBackend for ReferenceSemanticRuntimeBackend {
     type Error = BlobRuntimeError;
 
+    fn authorization_generation(&mut self) -> Result<u64, Self::Error> {
+        self.current_authorization_generation()
+    }
+
     fn authorize_adjacency(&mut self, authenticated_peer: NodeId) -> Result<(), Self::Error> {
         self.inner.authorize_adjacency(authenticated_peer)
     }
@@ -3794,13 +4187,33 @@ impl RuntimeBackend for ReferenceSemanticRuntimeBackend {
         bytes: Vec<u8>,
         forwarding: Vec<u8>,
     ) -> Result<Option<ItemId>, Self::Error> {
-        self.inner.commit_authenticated_object(
+        let source_control = object_id.kind() == ObjectKind::SourceEnvelope
+            && matches!(
+                self.node_mut().envelopes_mut().inspect_object(&bytes),
+                Ok(crate::engine::VerifiedObject::Control(_))
+            );
+        if source_control {
+            return match self.commit_ordinary_control(
+                authenticated_peer,
+                exchange_id,
+                object_id,
+                bytes,
+                forwarding,
+            )? {
+                RuntimeCommit::Committed { item_id, .. } => Ok(item_id),
+                RuntimeCommit::Deferred { .. } | RuntimeCommit::Quarantined => Err(missing(
+                    "ordinary control did not reach a terminal durable disposition",
+                )),
+            };
+        }
+        let committed = self.inner.commit_authenticated_object(
             authenticated_peer,
             exchange_id,
             object_id,
             bytes,
             forwarding,
-        )
+        )?;
+        Ok(committed)
     }
 
     fn commit_authenticated_object_with_dependencies(
@@ -4123,6 +4536,255 @@ impl RuntimeBackend for ReferenceSemanticRuntimeBackend {
     }
 }
 
+impl RuntimeBackend for ReferenceSemanticRuntimeSession {
+    type Error = BlobRuntimeError;
+
+    fn authorization_generation(&mut self) -> Result<u64, Self::Error> {
+        self.with_backend(|backend| backend.authorization_generation())
+    }
+
+    fn authorize_adjacency(&mut self, authenticated_peer: NodeId) -> Result<(), Self::Error> {
+        if let Some(expected) = self.contact.expected_peer
+            && expected != authenticated_peer
+        {
+            return Err(missing("semantic runtime session peer changed"));
+        }
+        self.with_backend(|backend| backend.authorize_adjacency(authenticated_peer))?;
+        self.contact.expected_peer = Some(authenticated_peer);
+        Ok(())
+    }
+
+    fn durable_progress(
+        &mut self,
+        limit: usize,
+    ) -> Result<Vec<RuntimeTransferProgress>, Self::Error> {
+        self.require_authorized()?;
+        self.with_backend(|backend| backend.durable_progress(limit))
+    }
+
+    fn durable_progress_for_semantic_version(
+        &mut self,
+        limit: usize,
+        semantic_version: u16,
+    ) -> Result<Vec<RuntimeTransferProgress>, Self::Error> {
+        self.require_authorized()?;
+        self.with_backend(|backend| {
+            backend.durable_progress_for_semantic_version(limit, semantic_version)
+        })
+    }
+
+    fn durable_dependencies(&mut self, limit: usize) -> Result<Vec<ObjectId>, Self::Error> {
+        self.require_authorized()?;
+        self.with_backend(|backend| backend.durable_dependencies(limit))
+    }
+
+    fn durable_dependencies_for_semantic_version(
+        &mut self,
+        limit: usize,
+        semantic_version: u16,
+    ) -> Result<Vec<ObjectId>, Self::Error> {
+        self.require_authorized()?;
+        self.with_backend(|backend| {
+            backend.durable_dependencies_for_semantic_version(limit, semantic_version)
+        })
+    }
+
+    fn durably_disposed_object_len(
+        &mut self,
+        object_id: ObjectId,
+        semantic_version: u16,
+    ) -> Result<Option<u64>, Self::Error> {
+        self.require_authorized()?;
+        self.with_backend(|backend| {
+            backend.durably_disposed_object_len(object_id, semantic_version)
+        })
+    }
+
+    fn select_authorized_inventory(
+        &mut self,
+        authenticated_peer: NodeId,
+        peer_route_commitments: &[[u8; 32]],
+        filter: &InterestFilter,
+        purpose: InventoryPurpose,
+    ) -> Result<SparseInventory, Self::Error> {
+        self.require_expected_peer(authenticated_peer)?;
+        self.with_backend(|backend| {
+            backend.select_authorized_inventory(
+                authenticated_peer,
+                peer_route_commitments,
+                filter,
+                purpose,
+            )
+        })
+    }
+
+    fn select_authorized_inventory_for_semantic_version(
+        &mut self,
+        authenticated_peer: NodeId,
+        peer_route_commitments: &[[u8; 32]],
+        filter: &InterestFilter,
+        purpose: InventoryPurpose,
+        semantic_version: u16,
+    ) -> Result<SparseInventory, Self::Error> {
+        self.require_expected_peer(authenticated_peer)?;
+        self.with_backend(|backend| {
+            backend.select_authorized_inventory_for_semantic_version(
+                authenticated_peer,
+                peer_route_commitments,
+                filter,
+                purpose,
+                semantic_version,
+            )
+        })
+    }
+
+    fn store_object_chunk(
+        &mut self,
+        object_id: ObjectId,
+        total_len: u64,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<(), Self::Error> {
+        self.require_authorized()?;
+        self.with_backend(|backend| backend.store_object_chunk(object_id, total_len, offset, bytes))
+    }
+
+    fn store_object_chunk_for_semantic_version(
+        &mut self,
+        object_id: ObjectId,
+        total_len: u64,
+        offset: u64,
+        bytes: &[u8],
+        semantic_version: u16,
+    ) -> Result<(), Self::Error> {
+        self.require_authorized()?;
+        self.with_backend(|backend| {
+            backend.store_object_chunk_for_semantic_version(
+                object_id,
+                total_len,
+                offset,
+                bytes,
+                semantic_version,
+            )
+        })
+    }
+
+    fn complete_object_bytes(
+        &mut self,
+        object_id: ObjectId,
+        total_len: u64,
+    ) -> Result<Vec<u8>, Self::Error> {
+        self.require_authorized()?;
+        self.with_backend(|backend| backend.complete_object_bytes(object_id, total_len))
+    }
+
+    fn abort_object(&mut self, object_id: ObjectId) -> Result<(), Self::Error> {
+        self.require_authorized()?;
+        self.with_backend(|backend| backend.abort_object(object_id))
+    }
+
+    fn commit_authenticated_object(
+        &mut self,
+        authenticated_peer: NodeId,
+        exchange_id: u64,
+        object_id: ObjectId,
+        bytes: Vec<u8>,
+        forwarding: Vec<u8>,
+    ) -> Result<Option<ItemId>, Self::Error> {
+        self.require_expected_peer(authenticated_peer)?;
+        self.with_backend(|backend| {
+            backend.commit_authenticated_object(
+                authenticated_peer,
+                exchange_id,
+                object_id,
+                bytes,
+                forwarding,
+            )
+        })
+    }
+
+    fn commit_authenticated_object_with_dependencies(
+        &mut self,
+        authenticated_peer: NodeId,
+        exchange_id: u64,
+        semantic_version: u16,
+        object_id: ObjectId,
+        bytes: Vec<u8>,
+        forwarding: Vec<u8>,
+    ) -> Result<RuntimeCommit, Self::Error> {
+        self.require_expected_peer(authenticated_peer)?;
+        self.with_backend(|backend| {
+            backend.commit_authenticated_object_with_dependencies(
+                authenticated_peer,
+                exchange_id,
+                semantic_version,
+                object_id,
+                bytes,
+                forwarding,
+            )
+        })
+    }
+
+    fn is_terminal_commit_error(&self, error: &Self::Error) -> bool {
+        semantic_terminal_commit_error(error)
+    }
+
+    fn object_priority(&mut self, object_id: ObjectId) -> Result<Priority, Self::Error> {
+        self.require_authorized()?;
+        self.with_backend(|backend| backend.object_priority(object_id))
+    }
+
+    fn data_for_want(
+        &mut self,
+        authenticated_peer: NodeId,
+        peer_route_commitments: &[[u8; 32]],
+        exchange_id: u64,
+        want: &WantItem,
+    ) -> Result<Vec<Data>, Self::Error> {
+        self.require_expected_peer(authenticated_peer)?;
+        self.with_backend(|backend| {
+            backend.data_for_want(
+                authenticated_peer,
+                peer_route_commitments,
+                exchange_id,
+                want,
+            )
+        })
+    }
+
+    fn data_for_want_for_semantic_version(
+        &mut self,
+        authenticated_peer: NodeId,
+        peer_route_commitments: &[[u8; 32]],
+        exchange_id: u64,
+        semantic_version: u16,
+        want: &WantItem,
+    ) -> Result<Vec<Data>, Self::Error> {
+        self.require_expected_peer(authenticated_peer)?;
+        self.with_backend(|backend| {
+            backend.data_for_want_for_semantic_version(
+                authenticated_peer,
+                peer_route_commitments,
+                exchange_id,
+                semantic_version,
+                want,
+            )
+        })
+    }
+
+    fn acknowledge_receipt(
+        &mut self,
+        authenticated_peer: NodeId,
+        semantic_version: u16,
+        receipt: &wire::Receipt,
+    ) -> Result<(), Self::Error> {
+        self.require_expected_peer(authenticated_peer)?;
+        self.with_backend(|backend| {
+            backend.acknowledge_receipt(authenticated_peer, semantic_version, receipt)
+        })
+    }
+}
+
 fn store_error(error: StoreError) -> BlobRuntimeError {
     BlobRuntimeError::Engine(EngineError::Store(error))
 }
@@ -4137,6 +4799,7 @@ fn missing(message: &'static str) -> BlobRuntimeError {
 
 fn semantic_terminal_commit_error(error: &BlobRuntimeError) -> bool {
     match error {
+        BlobRuntimeError::AuthorityUnavailable | BlobRuntimeError::AuthorityPoisoned => false,
         BlobRuntimeError::Invalid(_) => true,
         BlobRuntimeError::Engine(EngineError::Store(error)) => match error {
             StoreError::Sqlite(_)
@@ -4323,15 +4986,863 @@ fn authenticated_blob_route(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blob::BlobStoreConfig;
+    use crate::blob::{
+        BlobId, BlobMetadata, BlobRouteCommitment, BlobStoreConfig, MIN_BLOB_CHUNK_SIZE,
+        ReferenceBlobService,
+    };
+    use crate::bridge::{BridgeAuthorization, bridge_authorization_key};
     use crate::crypto::{
-        ProvisioningAccess, ProvisioningBundle, ReferenceProvisioner, open_reference_node,
+        ProvisioningAccess, ProvisioningBundle, ReferenceEnvelopeSealer, ReferenceProvisioner,
+        open_reference_node,
     };
     use crate::engine::{BatchPublishItem, NodeConfig, PublishRequest};
     use crate::model::{DataClass, Scope, Topic};
-    use crate::store::BatchStoragePolicy;
+    use crate::store::{
+        BatchStoragePolicy, ControlKind, RejectedControl, StoredBridgeAuthorization, StoredControl,
+    };
     use std::fs;
+    use std::io::Cursor;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_root(label: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "aster-semantic-authority-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn test_authority_with_blob_config(
+        label: &str,
+        blob_config: BlobStoreConfig,
+    ) -> (std::path::PathBuf, ReferenceSemanticRuntimeAuthority) {
+        let root = test_root(label);
+        let topic = Topic::new("authority.test").unwrap();
+        let scope = Scope::new("mission/authority").unwrap();
+        let access = ProvisioningAccess::member(scope, vec![0], vec![topic]).unwrap();
+        let mut provisioner = ReferenceProvisioner::from_seed([0xd1; 32]).unwrap();
+        let bundle = provisioner.issue_node(1, &[access]).unwrap();
+        let node =
+            open_reference_node(root.join("node.sqlite"), bundle, NodeConfig::default()).unwrap();
+        let blobs = BlobTransferStore::open_with_config(root.join("blobs"), blob_config).unwrap();
+        let backend = ReferenceSemanticRuntimeBackend::new(node, blobs).unwrap();
+        (root, ReferenceSemanticRuntimeAuthority::new(backend))
+    }
+
+    fn test_authority(label: &str) -> (std::path::PathBuf, ReferenceSemanticRuntimeAuthority) {
+        test_authority_with_blob_config(label, BlobStoreConfig::default())
+    }
+
+    fn test_authority_with_signed_control(
+        label: &str,
+    ) -> (
+        std::path::PathBuf,
+        ReferenceSemanticRuntimeAuthority,
+        SignedAuthorizationControl,
+    ) {
+        let root = test_root(label);
+        let topic = Topic::new("authority.control").unwrap();
+        let scope = Scope::new("mission/authority-control").unwrap();
+        let access = ProvisioningAccess::member(scope, vec![0], vec![topic]).unwrap();
+        let mut provisioner = ReferenceProvisioner::from_seed([0xd2; 32]).unwrap();
+        let node_bundle = provisioner
+            .issue_node(1, std::slice::from_ref(&access))
+            .unwrap();
+        let subject_bundle = provisioner
+            .issue_node(2, std::slice::from_ref(&access))
+            .unwrap();
+        let subject = ReferenceEnvelopeSealer::open(subject_bundle)
+            .unwrap()
+            .identity();
+        let authority_bundle = provisioner
+            .issue_control_authority(3, std::slice::from_ref(&access))
+            .unwrap();
+        let mut control_authority = ReferenceEnvelopeSealer::open(authority_bundle).unwrap();
+        let signed = control_authority.seal_revocation(subject, 1).unwrap();
+        let control = SignedAuthorizationControl::from_sealed(signed).unwrap();
+        let node =
+            open_reference_node(root.join("node.sqlite"), node_bundle, NodeConfig::default())
+                .unwrap();
+        let blobs =
+            BlobTransferStore::open_with_config(root.join("blobs"), BlobStoreConfig::default())
+                .unwrap();
+        let backend = ReferenceSemanticRuntimeBackend::new(node, blobs).unwrap();
+        (
+            root,
+            ReferenceSemanticRuntimeAuthority::new(backend),
+            control,
+        )
+    }
+
+    fn two_blob_carriers(
+        root: &std::path::Path,
+    ) -> (AuthenticatedBlobRoute, Vec<(ObjectId, Vec<u8>)>) {
+        let producer_root = root.join("producer-blobs");
+        let producer_config = BlobStoreConfig {
+            max_bytes: 4 * 1024 * 1024,
+            max_chunks: 16,
+        };
+        let scope = Scope::new("mission/quota").unwrap();
+        let topic = Topic::new("authority.quota").unwrap();
+        let mut service = ReferenceBlobService::open_with_config(
+            &producer_root,
+            [0xa7; 32],
+            &scope,
+            &topic,
+            1,
+            producer_config,
+        )
+        .unwrap();
+        let chunk_size = usize::try_from(MIN_BLOB_CHUNK_SIZE).unwrap();
+        let mut source = Cursor::new(
+            (0..chunk_size * 2)
+                .map(|index| ((index * 29 + 11) % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        let mut scratch = Cursor::new(Vec::new());
+        let manifest = service
+            .prepare(
+                &mut source,
+                &mut scratch,
+                MIN_BLOB_CHUNK_SIZE,
+                BlobMetadata::new(None, b"authority-quota-v1".to_vec()).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(manifest.chunk_count(), 2);
+        service
+            .encrypt_some(&mut source, &manifest, u64::MAX)
+            .unwrap();
+        let finished = service.finish(manifest.id()).unwrap();
+        drop(service);
+
+        let route = AuthenticatedBlobRoute::new(
+            EnvelopeId::from_sealed_bytes(b"authority quota source envelope"),
+            finished.route_commitment(),
+        );
+        let mut transfers =
+            BlobTransferStore::open_with_config(&producer_root, producer_config).unwrap();
+        let object_ids = transfers.object_ids_for_route(route, 4).unwrap();
+        assert_eq!(object_ids.len(), 2);
+        let carriers = object_ids
+            .into_iter()
+            .map(|object_id| {
+                let (total_len, carrier) = transfers
+                    .read_object_range(route, object_id, 0, usize::MAX)
+                    .unwrap();
+                assert_eq!(u64::try_from(carrier.len()).unwrap(), total_len);
+                (object_id, carrier)
+            })
+            .collect();
+        (route, carriers)
+    }
+
+    fn contact_object(kind: ObjectKind, tag: u8, offset: u8) -> ObjectId {
+        ObjectId::new(kind, [tag.wrapping_add(offset); 32])
+    }
+
+    fn seed_contact_caches(session: &mut ReferenceSemanticRuntimeSession, tag: u8, peer: NodeId) {
+        session
+            .with_backend(|backend| {
+                let blob_id = contact_object(ObjectKind::BlobChunk, tag, 0);
+                let blob_route = AuthenticatedBlobRoute::new(
+                    EnvelopeId::from_bytes([tag; 32]),
+                    BlobRouteCommitment::from_authenticated_header(
+                        BlobId::from_bytes([tag; 32]),
+                        1,
+                        [tag; 32],
+                    ),
+                );
+                backend.inner.serve_routes.insert(blob_id, blob_route);
+
+                let batch_id = contact_object(ObjectKind::SourceBatchProof, tag, 1);
+                let batch_grant = BatchInventoryGrant {
+                    peer,
+                    peer_route_commitments: vec![[tag; 32]],
+                    filter: InterestFilter {
+                        topics: vec![format!("topic-{tag}")],
+                        scopes: vec![format!("mission/{tag}")],
+                        min_priority: Priority::Routine as u8,
+                    },
+                    effective_priority: Priority::Priority,
+                    role: BatchInventoryRole::Proof {
+                        proof_envelope_id: [tag.wrapping_add(2); 32],
+                        anchor_item_id: [tag.wrapping_add(3); 32],
+                    },
+                };
+                backend
+                    .batch_inventory_grants
+                    .insert(batch_id, batch_grant.clone());
+                backend.batch_served.insert(
+                    (peer, u64::from(tag), batch_id),
+                    ServedBatchObject {
+                        grant: batch_grant,
+                        total_len: u64::from(tag),
+                    },
+                );
+
+                let bridge_id = contact_object(ObjectKind::BridgeRouteWrapper, tag, 4);
+                let bridge_grant = BridgeInventoryGrant {
+                    wrapper_envelope_id: [tag.wrapping_add(5); 32],
+                    current_scope: Scope::new(format!("mission/{tag}")).unwrap(),
+                    current_route_epoch: u64::from(tag),
+                    peer,
+                    filter: InterestFilter {
+                        topics: vec![format!("bridge-{tag}")],
+                        scopes: vec![format!("mission/{tag}")],
+                        min_priority: Priority::Routine as u8,
+                    },
+                };
+                backend
+                    .bridge_inventory_grants
+                    .insert(bridge_id, bridge_grant.clone());
+                backend.bridge_served.insert(
+                    (peer, u64::from(tag), bridge_id),
+                    ServedBridgeObject {
+                        grant: bridge_grant,
+                        total_len: u64::from(tag),
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn assert_contact_caches(
+        session: &mut ReferenceSemanticRuntimeSession,
+        own_tag: u8,
+        other_tag: u8,
+        peer: NodeId,
+    ) {
+        session
+            .with_backend(|backend| {
+                let own_blob = contact_object(ObjectKind::BlobChunk, own_tag, 0);
+                let other_blob = contact_object(ObjectKind::BlobChunk, other_tag, 0);
+                let own_batch = contact_object(ObjectKind::SourceBatchProof, own_tag, 1);
+                let other_batch = contact_object(ObjectKind::SourceBatchProof, other_tag, 1);
+                let own_bridge = contact_object(ObjectKind::BridgeRouteWrapper, own_tag, 4);
+                let other_bridge = contact_object(ObjectKind::BridgeRouteWrapper, other_tag, 4);
+                assert_eq!(backend.inner.serve_routes.len(), 1);
+                assert!(backend.inner.serve_routes.contains_key(&own_blob));
+                assert!(!backend.inner.serve_routes.contains_key(&other_blob));
+                assert_eq!(backend.batch_inventory_grants.len(), 1);
+                assert!(backend.batch_inventory_grants.contains_key(&own_batch));
+                assert!(!backend.batch_inventory_grants.contains_key(&other_batch));
+                assert_eq!(backend.batch_served.len(), 1);
+                assert!(
+                    backend
+                        .batch_served
+                        .contains_key(&(peer, u64::from(own_tag), own_batch))
+                );
+                assert_eq!(backend.bridge_inventory_grants.len(), 1);
+                assert!(backend.bridge_inventory_grants.contains_key(&own_bridge));
+                assert!(!backend.bridge_inventory_grants.contains_key(&other_bridge));
+                assert_eq!(backend.bridge_served.len(), 1);
+                assert!(backend.bridge_served.contains_key(&(
+                    peer,
+                    u64::from(own_tag),
+                    own_bridge,
+                )));
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn authority_sessions_do_not_clobber_contact_scoped_serve_grants() {
+        let (root, authority) = test_authority("contact-caches");
+        let mut left = authority.session();
+        let mut right = authority.session();
+        let left_peer = [0x31; 32];
+        let right_peer = [0x42; 32];
+        left.authorize_adjacency(left_peer).unwrap();
+        right.authorize_adjacency(right_peer).unwrap();
+
+        seed_contact_caches(&mut left, 0x31, left_peer);
+        seed_contact_caches(&mut right, 0x42, right_peer);
+        assert_contact_caches(&mut left, 0x31, 0x42, left_peer);
+        assert_contact_caches(&mut right, 0x42, 0x31, right_peer);
+        assert_contact_caches(&mut left, 0x31, 0x42, left_peer);
+
+        let backend = authority.backend.lock().unwrap();
+        let authority_cache_lengths = [
+            backend.inner.serve_routes.len(),
+            backend.batch_inventory_grants.len(),
+            backend.batch_served.len(),
+            backend.bridge_inventory_grants.len(),
+            backend.bridge_served.len(),
+        ];
+        assert_eq!(authority_cache_lengths, [0; 5]);
+        drop(backend);
+
+        drop(left);
+        drop(right);
+        drop(authority);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explicit_authority_invalidation_advances_generation() {
+        let (root, authority) = test_authority("generation");
+        let mut session = authority.session();
+        assert_eq!(authority.authorization_generation().unwrap(), 0);
+        assert_eq!(session.authorization_generation().unwrap(), 0);
+        assert_eq!(authority.invalidate_authorization_generation().unwrap(), 1);
+        assert_eq!(authority.authorization_generation().unwrap(), 1);
+        assert_eq!(session.authorization_generation().unwrap(), 1);
+
+        drop(session);
+        drop(authority);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn authority_checks_exact_durable_item_without_opening_payload() {
+        let (root, authority) = test_authority("durable-item-present");
+        let missing = [0x91; 32];
+        assert!(!authority.durable_item_present(missing).unwrap());
+
+        let committed = {
+            let mut backend = authority.backend.lock().unwrap();
+            backend
+                .node_mut()
+                .publish(PublishRequest {
+                    class: DataClass::State,
+                    topic: Topic::new("authority.test").unwrap(),
+                    scope: Scope::new("mission/authority").unwrap(),
+                    priority: Priority::Priority,
+                    ttl_ms: None,
+                    logical_key: b"durable-item-present".to_vec(),
+                    payload: b"payload-must-not-be-opened".to_vec(),
+                    tombstone: false,
+                })
+                .unwrap()
+                .id
+        };
+
+        assert!(authority.durable_item_present(committed).unwrap());
+        assert!(!authority.durable_item_present(missing).unwrap());
+
+        drop(authority);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn signed_control_is_exactly_committed_before_generation_advances() {
+        let (root, authority, control) = test_authority_with_signed_control("signed-control");
+        let mut admitted_session = authority.session();
+        admitted_session.authorize_adjacency([0x51; 32]).unwrap();
+        assert_eq!(authority.authorization_generation().unwrap(), 0);
+
+        let applied = authority.apply_authorization_control(&control).unwrap();
+        assert_eq!(applied.envelope_id, control.envelope_id());
+        assert_eq!(applied.generation_before, 0);
+        assert_eq!(applied.generation_after, 1);
+        assert_eq!(authority.authorization_generation().unwrap(), 1);
+        assert_eq!(admitted_session.authorization_generation().unwrap(), 1);
+
+        let duplicate = authority.apply_authorization_control(&control).unwrap_err();
+        assert_eq!(
+            duplicate.to_string(),
+            "signed authorization control is already committed"
+        );
+        assert_eq!(authority.authorization_generation().unwrap(), 1);
+
+        drop(admitted_session);
+        drop(authority);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn mixed_signed_control_activation_invalidates_before_rejected_input_error() {
+        let root = test_root("mixed-signed-control");
+        let topic = Topic::new("authority.mixed-control").unwrap();
+        let scope = Scope::new("mission/mixed-control").unwrap();
+        let access = ProvisioningAccess::member(scope, vec![0], vec![topic]).unwrap();
+        let mut provisioner = ReferenceProvisioner::from_seed([0xd3; 32]).unwrap();
+        let node_bundle = provisioner
+            .issue_node(1, std::slice::from_ref(&access))
+            .unwrap();
+        let mut live_signer = ReferenceEnvelopeSealer::open(
+            provisioner
+                .issue_control_authority(2, std::slice::from_ref(&access))
+                .unwrap(),
+        )
+        .unwrap();
+        let mut revoked_signer = ReferenceEnvelopeSealer::open(
+            provisioner
+                .issue_control_authority(3, std::slice::from_ref(&access))
+                .unwrap(),
+        )
+        .unwrap();
+        let principal = live_signer.control_principal().unwrap();
+        let revoked_principal = revoked_signer.control_principal().unwrap();
+        assert_eq!(principal.authority, revoked_principal.authority);
+
+        let first_bytes = live_signer
+            .seal_revocation_control([0xa1; 32], 1, 1, None)
+            .unwrap();
+        let first_id: [u8; 32] = Sha256::digest(&first_bytes).into();
+        let rejected_bytes = revoked_signer
+            .seal_revocation_control([0xa2; 32], 1, 2, Some(first_id))
+            .unwrap();
+        let first = SignedAuthorizationControl::from_sealed(first_bytes.clone()).unwrap();
+        let rejected = SignedAuthorizationControl::from_sealed(rejected_bytes).unwrap();
+
+        let node =
+            open_reference_node(root.join("node.sqlite"), node_bundle, NodeConfig::default())
+                .unwrap();
+        let blobs =
+            BlobTransferStore::open_with_config(root.join("blobs"), BlobStoreConfig::default())
+                .unwrap();
+        let authority = ReferenceSemanticRuntimeAuthority::new(
+            ReferenceSemanticRuntimeBackend::new(node, blobs).unwrap(),
+        );
+        {
+            let mut backend = authority.backend.lock().unwrap();
+            backend
+                .node_mut()
+                .stage_control_without_activation_for_test(&first_bytes)
+                .unwrap();
+            backend
+                .node_mut()
+                .store_mut()
+                .apply_revocation(&crate::store::Revocation {
+                    subject: revoked_principal.signer,
+                    authority: principal.authority,
+                    signer: principal.signer,
+                    generation: 1,
+                    control_sequence: 1,
+                    previous_control: None,
+                    sealed_notice: b"test-authenticated-delegated-signer-revocation".to_vec(),
+                    observed_at_ms: None,
+                })
+                .unwrap();
+        }
+
+        assert_eq!(authority.authorization_generation().unwrap(), 0);
+        assert!(authority.apply_authorization_control(&rejected).is_err());
+        assert_eq!(authority.authorization_generation().unwrap(), 1);
+        {
+            let mut backend = authority.backend.lock().unwrap();
+            let applied = backend.node_mut().store_mut().applied_controls().unwrap();
+            assert!(
+                applied
+                    .iter()
+                    .any(|control| control.envelope_id == first_id)
+            );
+            assert!(
+                !applied
+                    .iter()
+                    .any(|control| { control.envelope_id == rejected.envelope_id().into_bytes() })
+            );
+        }
+        assert!(authority.apply_authorization_control(&first).is_err());
+        assert_eq!(authority.authorization_generation().unwrap(), 1);
+
+        drop(authority);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn mixed_bridge_control_activation_invalidates_before_rejected_input_error() {
+        let root = test_root("mixed-bridge-control");
+        let topic = Topic::new("authority.mixed-bridge").unwrap();
+        let source_scope = Scope::new("mission/bridge-source").unwrap();
+        let target_scope = Scope::new("mission/bridge-target").unwrap();
+        let source_access =
+            ProvisioningAccess::member(source_scope.clone(), vec![0], vec![topic.clone()]).unwrap();
+        let target_access =
+            ProvisioningAccess::member(target_scope.clone(), vec![0], vec![topic]).unwrap();
+        let accesses = [source_access, target_access];
+        let mut provisioner = ReferenceProvisioner::from_seed([0xd4; 32]).unwrap();
+        let node_bundle = provisioner.issue_node(1, &accesses).unwrap();
+        let mut live_signer = ReferenceEnvelopeSealer::open(
+            provisioner.issue_control_authority(2, &accesses).unwrap(),
+        )
+        .unwrap();
+        let mut revoked_signer = ReferenceEnvelopeSealer::open(
+            provisioner.issue_control_authority(3, &accesses).unwrap(),
+        )
+        .unwrap();
+        let principal = live_signer.control_principal().unwrap();
+        let revoked_principal = revoked_signer.control_principal().unwrap();
+        assert_eq!(principal.authority, revoked_principal.authority);
+        let bridge_node_id = [0xb1; 32];
+        let authorization_key = bridge_authorization_key(
+            &live_signer.bridge_mission_id(),
+            &bridge_node_id,
+            &source_scope,
+            &target_scope,
+        )
+        .unwrap();
+        let first_bytes = live_signer
+            .seal_bridge_authorization(BridgeAuthorization {
+                mission_id: live_signer.bridge_mission_id(),
+                authority_id: principal.authority,
+                control_sequence: 1,
+                previous_control_id: None,
+                authorization_key,
+                generation: 1,
+                bridge_node_id,
+                source_scope: source_scope.clone(),
+                target_scope: target_scope.clone(),
+                enabled: None,
+                authority_control_signature: Vec::new(),
+            })
+            .unwrap();
+        let first_id: [u8; 32] = Sha256::digest(&first_bytes).into();
+        let rejected_bytes = revoked_signer
+            .seal_bridge_authorization(BridgeAuthorization {
+                mission_id: revoked_signer.bridge_mission_id(),
+                authority_id: revoked_principal.authority,
+                control_sequence: 2,
+                previous_control_id: Some(first_id),
+                authorization_key,
+                generation: 2,
+                bridge_node_id,
+                source_scope,
+                target_scope,
+                enabled: None,
+                authority_control_signature: Vec::new(),
+            })
+            .unwrap();
+        let rejected_id: [u8; 32] = Sha256::digest(&rejected_bytes).into();
+
+        let node =
+            open_reference_node(root.join("node.sqlite"), node_bundle, NodeConfig::default())
+                .unwrap();
+        let blobs =
+            BlobTransferStore::open_with_config(root.join("blobs"), BlobStoreConfig::default())
+                .unwrap();
+        let mut backend = ReferenceSemanticRuntimeBackend::new(node, blobs).unwrap();
+        let first_verified = backend
+            .node()
+            .envelopes()
+            .open_bridge_authorization(&first_bytes)
+            .unwrap();
+        let first_envelope = first_verified.envelope();
+        let first_stored = StoreVerifiedBridgeAuthorization::from_provider(
+            first_envelope.envelope_id,
+            first_envelope.authorization.clone(),
+            first_verified.control_signer(),
+            first_bytes.clone(),
+        )
+        .unwrap();
+        backend
+            .node_mut()
+            .store_mut()
+            .stage_bridge_authorization_without_activation_for_test(&first_stored)
+            .unwrap();
+        backend
+            .node_mut()
+            .store_mut()
+            .apply_revocation(&crate::store::Revocation {
+                subject: revoked_principal.signer,
+                authority: principal.authority,
+                signer: principal.signer,
+                generation: 1,
+                control_sequence: 1,
+                previous_control: None,
+                sealed_notice: b"test-authenticated-bridge-signer-revocation".to_vec(),
+                observed_at_ms: None,
+            })
+            .unwrap();
+        // Revocation correctly clears process-local bridge capabilities. The
+        // provider re-verifies the still-pending live-signer prefix without
+        // activating it, recreating the exact crash/restart window.
+        backend
+            .node_mut()
+            .store_mut()
+            .stage_bridge_authorization_without_activation_for_test(&first_stored)
+            .unwrap();
+        backend.inner.serve_routes.insert(
+            ObjectId::new(ObjectKind::BlobChunk, [0xb2; 32]),
+            AuthenticatedBlobRoute::new(
+                EnvelopeId::from_bytes([0xb3; 32]),
+                BlobRouteCommitment::from_authenticated_header(
+                    BlobId::from_bytes([0xb4; 32]),
+                    1,
+                    [0xb5; 32],
+                ),
+            ),
+        );
+
+        assert_eq!(backend.current_authorization_generation().unwrap(), 0);
+        assert!(
+            backend
+                .commit_bridge_authorization(
+                    ObjectId::new(ObjectKind::BridgeAuthorization, rejected_id),
+                    rejected_bytes,
+                    Vec::new(),
+                )
+                .is_err()
+        );
+        assert_eq!(backend.current_authorization_generation().unwrap(), 1);
+        assert!(backend.inner.serve_routes.is_empty());
+        assert!(
+            backend
+                .node()
+                .store()
+                .stored_bridge_authorization(&first_id)
+                .unwrap()
+                .is_some_and(|stored| stored.applied)
+        );
+
+        assert!(matches!(
+            backend
+                .commit_bridge_authorization(
+                    ObjectId::new(ObjectKind::BridgeAuthorization, first_id),
+                    first_bytes,
+                    Vec::new(),
+                )
+                .unwrap(),
+            RuntimeCommit::Committed { .. }
+        ));
+        assert_eq!(backend.current_authorization_generation().unwrap(), 1);
+
+        drop(backend);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn synthetic_stored_control(envelope_id: [u8; 32]) -> StoredControl {
+        StoredControl {
+            envelope_id,
+            authority: [0x61; 32],
+            signer: [0x62; 32],
+            sequence: 1,
+            previous_control: None,
+            kind: ControlKind::Revocation,
+            sealed: vec![0x63],
+            applied: true,
+            inserted_order: 1,
+        }
+    }
+
+    fn synthetic_stored_bridge_control(envelope_id: [u8; 32]) -> StoredBridgeAuthorization {
+        StoredBridgeAuthorization {
+            envelope_id,
+            authorization: BridgeAuthorization {
+                mission_id: [0x71; 32],
+                authority_id: [0x72; 32],
+                control_sequence: 1,
+                previous_control_id: None,
+                authorization_key: [0x73; 32],
+                generation: 1,
+                bridge_node_id: [0x74; 32],
+                source_scope: Scope::new("mission/source").unwrap(),
+                target_scope: Scope::new("mission/target").unwrap(),
+                enabled: None,
+                authority_control_signature: vec![0x75],
+            },
+            control_signer: [0x76; 32],
+            exact_bytes: vec![0x77],
+            applied: true,
+            inserted_order: 1,
+        }
+    }
+
+    #[test]
+    fn ordinary_mixed_activation_invalidates_once_and_duplicate_does_not_bump() {
+        let (root, authority) = test_authority("ordinary-mixed-generation");
+        let activated_id = [0x81; 32];
+        let rejected_id = [0x82; 32];
+        let mixed = ControlOutcome::Applied {
+            envelope_id: rejected_id,
+            activated: vec![synthetic_stored_control(activated_id)],
+            rejected: vec![RejectedControl {
+                envelope_id: rejected_id,
+                signer: [0x83; 32],
+            }],
+        };
+        assert_eq!(mixed.rejected_input().unwrap().envelope_id, rejected_id);
+
+        let mut backend = authority.backend.lock().unwrap();
+        assert_eq!(backend.current_authorization_generation().unwrap(), 0);
+        backend.inner.serve_routes.insert(
+            ObjectId::new(ObjectKind::BlobChunk, [0x84; 32]),
+            AuthenticatedBlobRoute::new(
+                EnvelopeId::from_bytes([0x85; 32]),
+                BlobRouteCommitment::from_authenticated_header(
+                    BlobId::from_bytes([0x86; 32]),
+                    1,
+                    [0x87; 32],
+                ),
+            ),
+        );
+        backend.reconcile_ordinary_control_outcome(&mixed).unwrap();
+        assert_eq!(backend.current_authorization_generation().unwrap(), 1);
+        assert!(backend.inner.serve_routes.is_empty());
+
+        let duplicate = ControlOutcome::Duplicate {
+            envelope_id: activated_id,
+        };
+        assert!(
+            backend
+                .reconcile_ordinary_control_outcome(&duplicate)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(backend.current_authorization_generation().unwrap(), 1);
+        drop(backend);
+        drop(authority);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bridge_mixed_activation_invalidates_once_and_duplicate_does_not_bump() {
+        let (root, authority) = test_authority("bridge-mixed-generation");
+        let activated_id = [0x91; 32];
+        let rejected_id = [0x92; 32];
+        let mixed = BridgeControlOutcome::Applied {
+            envelope_id: rejected_id,
+            activated: vec![synthetic_stored_bridge_control(activated_id)],
+            rejected: vec![RejectedControl {
+                envelope_id: rejected_id,
+                signer: [0x93; 32],
+            }],
+        };
+        assert_eq!(mixed.rejected_input().unwrap().envelope_id, rejected_id);
+
+        let mut backend = authority.backend.lock().unwrap();
+        assert_eq!(backend.current_authorization_generation().unwrap(), 0);
+        backend.reconcile_bridge_control_outcome(&mixed).unwrap();
+        assert_eq!(backend.current_authorization_generation().unwrap(), 1);
+
+        let duplicate = BridgeControlOutcome::Duplicate {
+            envelope_id: activated_id,
+        };
+        assert!(
+            backend
+                .reconcile_bridge_control_outcome(&duplicate)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(backend.current_authorization_generation().unwrap(), 1);
+        drop(backend);
+        drop(authority);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn concurrent_sessions_share_one_blob_quota_without_orphan_allocation() {
+        let producer_root = test_root("quota-producer");
+        let (route, mut carriers) = two_blob_carriers(&producer_root);
+        let max_carrier_bytes = carriers
+            .iter()
+            .map(|(_, carrier)| u64::try_from(carrier.len()).unwrap())
+            .max()
+            .unwrap();
+        let quota = BlobStoreConfig {
+            max_bytes: max_carrier_bytes,
+            max_chunks: 1,
+        };
+        let (root, authority) = test_authority_with_blob_config("quota-shared", quota);
+        let mut left = authority.session();
+        let mut right = authority.session();
+        left.authorize_adjacency([0x51; 32]).unwrap();
+        right.authorize_adjacency([0x52; 32]).unwrap();
+
+        let right_carrier = carriers.pop().unwrap();
+        let left_carrier = carriers.pop().unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let left_barrier = Arc::clone(&barrier);
+        let left_thread = thread::spawn(move || {
+            left_barrier.wait();
+            let (object_id, carrier) = left_carrier;
+            let carrier_len = u64::try_from(carrier.len()).unwrap();
+            let result = left.with_backend(|backend| {
+                backend
+                    .blobs_mut()
+                    .commit_carrier(object_id, &carrier, route)
+                    .map_err(BlobRuntimeError::from)
+            });
+            (object_id, carrier_len, result)
+        });
+        let right_barrier = Arc::clone(&barrier);
+        let right_thread = thread::spawn(move || {
+            right_barrier.wait();
+            let (object_id, carrier) = right_carrier;
+            let carrier_len = u64::try_from(carrier.len()).unwrap();
+            let result = right.with_backend(|backend| {
+                backend
+                    .blobs_mut()
+                    .commit_carrier(object_id, &carrier, route)
+                    .map_err(BlobRuntimeError::from)
+            });
+            (object_id, carrier_len, result)
+        });
+
+        barrier.wait();
+        let outcomes = [left_thread.join().unwrap(), right_thread.join().unwrap()];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|(_, _, result)| result.is_ok())
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|(_, _, result)| {
+                    matches!(
+                        result,
+                        Err(BlobRuntimeError::Blob(BlobError::Io(error)))
+                            if error.kind() == std::io::ErrorKind::StorageFull
+                    )
+                })
+                .count(),
+            1
+        );
+        let (committed_id, committed_len, _) = outcomes
+            .iter()
+            .find(|(_, _, result)| result.is_ok())
+            .unwrap();
+
+        let snapshot = authority.blob_quota_snapshot().unwrap();
+        assert_eq!(snapshot.config, quota);
+        assert_eq!(snapshot.used_bytes, *committed_len);
+        assert_eq!(snapshot.used_chunks, 1);
+        assert!(snapshot.used_bytes <= snapshot.config.max_bytes);
+        assert!(snapshot.used_chunks <= snapshot.config.max_chunks);
+
+        let transfer_directory = root.join("blobs").join("transfer-objects");
+        let entries = fs::read_dir(&transfer_directory)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].metadata().unwrap().len(), *committed_len);
+        assert!(
+            !entries[0]
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".tmp-")
+        );
+        let mut inspection = authority.session();
+        inspection.authorize_adjacency([0x53; 32]).unwrap();
+        assert!(inspection.durable_progress(8).unwrap().is_empty());
+        drop(inspection);
+        drop(authority);
+
+        let mut reopened = BlobTransferStore::open_with_config(root.join("blobs"), quota).unwrap();
+        assert_eq!(reopened.quota_usage(), (snapshot.used_bytes, 1));
+        assert_eq!(
+            reopened.object_ids_for_route(route, 4).unwrap(),
+            vec![*committed_id]
+        );
+        drop(reopened);
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(producer_root).unwrap();
+    }
 
     #[test]
     fn semantic_commit_failure_classification_retires_poison_but_keeps_retryable_state() {
@@ -4354,6 +5865,12 @@ mod tests {
         assert!(!semantic_terminal_commit_error(&BlobRuntimeError::Blob(
             BlobError::MissingChunk
         )));
+        assert!(!semantic_terminal_commit_error(
+            &BlobRuntimeError::AuthorityUnavailable
+        ));
+        assert!(!semantic_terminal_commit_error(
+            &BlobRuntimeError::AuthorityPoisoned
+        ));
     }
 
     #[test]

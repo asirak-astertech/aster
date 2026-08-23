@@ -1,19 +1,45 @@
-//! High-level, offline-first composition host for Aster Mesh.
+//! Process-owned, offline-first composition host for Aster Mesh.
 //!
-//! [`MeshService`] owns the durable node, encrypted Blob carrier store,
-//! mutually authenticated runtime adjacency, and configured carriers. Normal
-//! application operations never accept cryptographic values, wire messages,
-//! fragments, or a carrier choice. Carrier registration is a deployment-time
-//! integration operation; contact selection is automatic and never per item.
-//!
-//! The current bounded profile deliberately supports one active authenticated
-//! adjacency per service. Any number of peers and carriers may be configured,
-//! but contacts are serviced sequentially. Pausing a contact destroys its
-//! session keys while retaining peer-neutral durable object ranges, so a later
-//! contact can resume over a different carrier or peer.
+//! [`SharedNodeContactSupervisor`] is the candidate multi-contact ownership
+//! boundary evaluated by Gate H. The former single-contact service remains
+//! available only behind the explicit `legacy-single-contact-service`
+//! compatibility feature and is
+//! absent from the `gate-h-formal` profile.
 
 #![forbid(unsafe_code)]
 
+mod mesh_host;
+mod node_admission;
+mod node_budget;
+mod shared_node;
+
+pub use mesh_host::{
+    CandidateId, CandidateLocator, CandidateProvenance, CandidateStatus, CarrierIdentity,
+    ContactCloseReason, ContactDirection, ContactId, ContactPath, HostAction, HostConfig,
+    HostEvent, HostSnapshot, MeshHost, MeshHostError,
+};
+pub use node_admission::AdmissionTransactionError;
+pub use node_budget::{
+    NodeResourceBudget, NodeResourceClaim, NodeResourceLease, NodeResourceLimits,
+    NodeResourceSnapshot, ResourceBudgetError,
+};
+pub use shared_node::{
+    AdmissionAbortReason, ContactDriveReport, ContactOpenReport, ContactOpening, ContactPlan,
+    ContactResourceClaims, ContactSessionRole, ContactSupervisorConfig, ContactSupervisorError,
+    NodeProviderResourceLease, SharedContactStatus, SharedNodeAuthorizationMutation,
+    SharedNodeContactSupervisor, SharedNodeEvidenceCounters, SharedNodeEvidenceTransition,
+    SharedNodeMutation,
+};
+
+#[cfg(feature = "legacy-single-contact-service")]
+pub use legacy_single_contact_service::{
+    ContactFailure, ContactStatus, MeshService, PumpReport, ServiceError, ServiceOptions,
+    SyncProfile,
+};
+
+#[cfg(feature = "legacy-single-contact-service")]
+#[rustfmt::skip]
+mod legacy_single_contact_service {
 use aster_mesh::blob::{BlobStoreConfig, BlobTransferStore};
 use aster_mesh::engine::{NodeConfig, ResolveRequest};
 use aster_mesh::inventory::SparseInventory;
@@ -235,6 +261,12 @@ impl From<BlobRuntimeError> for ServiceError {
         match error {
             BlobRuntimeError::Engine(error) => Self::Engine(error),
             BlobRuntimeError::Blob(error) => Self::Blob(error),
+            BlobRuntimeError::AuthorityUnavailable => {
+                Self::Unavailable("shared durable runtime authority is unavailable".into())
+            }
+            BlobRuntimeError::AuthorityPoisoned => {
+                Self::Unavailable("shared durable runtime authority is poisoned".into())
+            }
             BlobRuntimeError::Invalid(message) => Self::Invalid(message.into()),
         }
     }
@@ -1429,15 +1461,15 @@ fn parse_bundle(bytes: &[u8]) -> Result<ProvisioningBundle, ServiceError> {
 fn contact_failure(error: &RuntimeError) -> ContactFailure {
     match error {
         RuntimeError::Io(_) => ContactFailure::Carrier,
-        RuntimeError::Session(_) | RuntimeError::TransportPeerChanged => {
-            ContactFailure::Authentication
-        }
+        RuntimeError::Session(_)
+        | RuntimeError::TransportPeerChanged
+        | RuntimeError::AuthorizationGenerationChanged => ContactFailure::Authentication,
         RuntimeError::Backend(message)
             if message == "authenticated identity does not match configured peer" =>
         {
             ContactFailure::Authentication
         }
-        RuntimeError::Backend(_) => ContactFailure::LocalState,
+        RuntimeError::Backend(_) | RuntimeError::InvalidLimits(_) => ContactFailure::LocalState,
         RuntimeError::Fragment(_)
         | RuntimeError::Wire(_)
         | RuntimeError::Sync(_)
@@ -3242,4 +3274,6 @@ mod tests {
         drop(captured);
         fs::remove_dir_all(root).unwrap();
     }
+}
+
 }

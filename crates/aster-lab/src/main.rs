@@ -5,13 +5,18 @@ use aster_lab::live::{
     RendezvousInfraConfig, parse_node_id, provision_private_nodes, read_private_hex, run_live_node,
     write_private_hex,
 };
+use aster_lab::mesh_experiment::{
+    MeshPrepareConfig, NativeMeshNodeConfig, consume_and_ack_ip_mesh, prepare_ip_mesh,
+    run_native_mesh_node, verify_ip_mesh_duplicate_suppression, verify_ip_mesh_relay_custody,
+};
 use aster_lab::{
     BlobRecoveryScenario, FaultProfile, LabMetrics, LabResult, LiveEvidenceInvocation,
-    SCENARIO_OWNERSHIP_FILE, ShardScenario, TransferScenario, run_blob_recovery, run_shard,
-    run_transfer, write_metrics,
+    RouteOnlyEventScenario, SCENARIO_OWNERSHIP_FILE, ShardScenario, TransferScenario,
+    run_blob_recovery, run_route_only_event, run_shard, run_transfer, write_metrics,
+    write_route_only_event_receipt,
 };
 use aster_mesh::{Scope, Topic};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsString;
 use std::fs;
@@ -57,10 +62,16 @@ fn real_main() -> LabResult<()> {
         "node-udp" => run_live_node_command(&options, LiveMode::FixedUdp)?,
         "node-rendezvous" => run_live_node_command(&options, LiveMode::RendezvousUdp)?,
         "node-discovery" => run_live_node_command(&options, LiveMode::DiscoveryUdp)?,
+        "mesh-native-node" => run_native_mesh_node_command(&options)?,
+        "mesh-prepare" => run_mesh_prepare_command(&options)?,
+        "mesh-verify-relay" => run_mesh_verify_relay_command(&options)?,
+        "mesh-consume" => run_mesh_consume_command(&options)?,
+        "mesh-verify-duplicate" => run_mesh_verify_duplicate_command(&options)?,
         "node-relay" => run_live_node_command(&options, LiveMode::Relay)?,
         "rendezvous" => run_infrastructure(&options, true)?,
         "infra" => run_infrastructure(&options, false)?,
         "transfer" => run_transfer_command(&options)?,
+        "route-only-event" => run_route_only_event_command(&options)?,
         "blob-recovery" => run_blob_command(&options)?,
         "scale" => run_scale_command(&options)?,
         "shard-worker" => run_shard_command(&options)?,
@@ -78,9 +89,15 @@ fn print_help() {
            aster-lab node-rendezvous --root NODE_PATH --bundle FILE --bind ADDRESS \\\n             --peer-id HEX --rendezvous-address ADDRESS --pairing-token FILE [OPTIONS]\n\
            aster-lab node-discovery --root NODE_PATH --bundle FILE --bind ADDRESS \\\n             --peer-id HEX --discovery-target ADDRESS --discovery-token FILE [OPTIONS]\n\
            aster-lab node-relay --root NODE_PATH --bundle FILE --peer-id HEX \\\n             --relay-address ADDRESS --relay-channel FILE [OPTIONS]\n\
+           aster-lab mesh-native-node --root NODE_PATH --bundle FILE --discovery-target ADDRESS --discovery-token FILE [OPTIONS]\n\
+           aster-lab mesh-prepare --root PATH [--seed N --payload-bytes N]\n\
+           aster-lab mesh-verify-relay --root PATH --invocation NAME\n\
+           aster-lab mesh-consume --root PATH --invocation NAME\n\
+           aster-lab mesh-verify-duplicate --root PATH --invocation NAME\n\
            aster-lab infra --rendezvous-bind ADDRESS [--relay-bind ADDRESS --relay-pairs N]\n\
            aster-lab rendezvous --bind ADDRESS [--duration-ms N]\n\
            aster-lab transfer --root PATH [OPTIONS]\n\
+           aster-lab route-only-event --root PATH [OPTIONS]\n\
            aster-lab blob-recovery --root PATH [OPTIONS]\n\
            aster-lab scale --root PATH --nodes N --shards N [OPTIONS]\n\n\
          Common fault options:\n\
@@ -95,6 +112,12 @@ fn print_help() {
            --payload-bytes N        bytes per item (default 65536)\n\
            --restart-after-frames N receiver reopen checkpoint (default 24; 0 disables)\n\
            --max-pumps N            total pump budget (default 200000)\n\n\
+         Route-only Event options:\n\
+           --payload-bytes N        command payload bytes (default 1024)\n\
+           --max-pumps N            budget per A-B or B-C contact (default 50000)\n\
+           --source-revision HEX    exact 40-hex repository revision\n\
+           --source-diff-sha256 HEX SHA-256 of the exact uncommitted diff\n\
+           --binary-sha256 HEX      SHA-256 of this experiment binary\n\n\
          Blob recovery options:\n\
            --blob-bytes N           streamed bytes (default 105906176)\n\
            --chunk-bytes N          Blob chunk bytes (default 65536)\n\
@@ -213,10 +236,16 @@ fn known_command(command: &str) -> bool {
             | "node-udp"
             | "node-rendezvous"
             | "node-discovery"
+            | "mesh-native-node"
+            | "mesh-prepare"
+            | "mesh-verify-relay"
+            | "mesh-consume"
+            | "mesh-verify-duplicate"
             | "node-relay"
             | "rendezvous"
             | "infra"
             | "transfer"
+            | "route-only-event"
             | "blob-recovery"
             | "scale"
             | "shard-worker"
@@ -272,6 +301,31 @@ fn option_is_allowed(command: &str, name: &str) -> bool {
             ]
             .contains(&name)
         }
+        "mesh-native-node" => [
+            "root",
+            "bundle",
+            "invocation",
+            "topic",
+            "scope",
+            "duration-ms",
+            "bind",
+            "discovery-target",
+            "discovery-token",
+            "max-candidates",
+            "max-active-contacts",
+            "expected-peers",
+            "discovery-enabled",
+            "manual-peers",
+            "emission-mode",
+            "gate-h-control",
+            "gate-h-stale-target-peer",
+            "durable-item-probe",
+        ]
+        .contains(&name),
+        "mesh-prepare" => ["root", "seed", "payload-bytes"].contains(&name),
+        "mesh-verify-relay" | "mesh-consume" | "mesh-verify-duplicate" => {
+            ["root", "invocation"].contains(&name)
+        }
         "node-relay" => {
             live || ["relay-address", "relay-channel", "connect-timeout-ms"].contains(&name)
         }
@@ -299,6 +353,18 @@ fn option_is_allowed(command: &str, name: &str) -> bool {
                     "payload-bytes",
                     "restart-after-frames",
                     "max-pumps",
+                ]
+                .contains(&name)
+        }
+        "route-only-event" => {
+            fault
+                || [
+                    "root",
+                    "payload-bytes",
+                    "max-pumps",
+                    "source-revision",
+                    "source-diff-sha256",
+                    "binary-sha256",
                 ]
                 .contains(&name)
         }
@@ -481,6 +547,104 @@ fn run_live_node_command(options: &Options, mode: LiveMode) -> LabResult<()> {
     Ok(())
 }
 
+fn run_native_mesh_node_command(options: &Options) -> LabResult<()> {
+    let expected_peers = options
+        .text("expected-peers", "")
+        .split(',')
+        .filter(|value| !value.is_empty())
+        .map(parse_node_id)
+        .collect::<LabResult<BTreeSet<_>>>()?;
+    let discovery_enabled_value = options.text("discovery-enabled", "true");
+    let discovery_enabled = match discovery_enabled_value.as_str() {
+        "true" => true,
+        "false" => false,
+        _ => return Err(invalid("--discovery-enabled must be true or false")),
+    };
+    let config = NativeMeshNodeConfig {
+        invocation: options
+            .0
+            .get("invocation")
+            .cloned()
+            .ok_or_else(|| invalid("--invocation is required"))?,
+        root: options.required_path("root")?,
+        credential_path: options.required_path("bundle")?,
+        topic: Topic::new(options.text("topic", "lab.ip-mesh.commands"))?,
+        scope: Scope::new(options.text("scope", "lab/ip-mesh"))?,
+        discovery_token: read_private_hex::<16>(&options.required_path("discovery-token")?)?,
+        bind: options
+            .text("bind", "0.0.0.0:47101")
+            .parse()
+            .map_err(|error| invalid(format!("invalid --bind: {error}")))?,
+        discovery_target: required_socket(options, "discovery-target")?,
+        max_candidates: options.number("max-candidates", 128_usize)?,
+        max_active_contacts: options.number("max-active-contacts", 8_usize)?,
+        run_for: Duration::from_millis(options.number("duration-ms", 60_000_u64)?),
+        discovery_enabled,
+        expected_peers,
+        manual_peers: options.text("manual-peers", ""),
+        emission_mode: options.text("emission-mode", "normal"),
+        gate_h_control_path: options.0.get("gate-h-control").map(PathBuf::from),
+        gate_h_stale_target_peer: options
+            .0
+            .get("gate-h-stale-target-peer")
+            .map(|value| parse_node_id(value))
+            .transpose()?,
+        durable_item_probe: options
+            .0
+            .get("durable-item-probe")
+            .map(|value| parse_node_id(value))
+            .transpose()?,
+    };
+    let receipt = run_native_mesh_node(&config)?;
+    println!("{}", receipt.to_json());
+    Ok(())
+}
+
+fn run_mesh_prepare_command(options: &Options) -> LabResult<()> {
+    let receipt = prepare_ip_mesh(&MeshPrepareConfig {
+        root: options.required_path("root")?,
+        seed: options.number("seed", 1_u64)?,
+        payload_bytes: options.number("payload-bytes", 1_024_usize)?,
+    })?;
+    println!("{}", receipt.to_json());
+    Ok(())
+}
+
+fn run_mesh_verify_relay_command(options: &Options) -> LabResult<()> {
+    let receipt = verify_ip_mesh_relay_custody(
+        &options.required_path("root")?,
+        required_invocation(options)?,
+    )?;
+    println!("{}", receipt.to_json());
+    Ok(())
+}
+
+fn run_mesh_consume_command(options: &Options) -> LabResult<()> {
+    let receipt = consume_and_ack_ip_mesh(
+        &options.required_path("root")?,
+        required_invocation(options)?,
+    )?;
+    println!("{}", receipt.to_json());
+    Ok(())
+}
+
+fn run_mesh_verify_duplicate_command(options: &Options) -> LabResult<()> {
+    verify_ip_mesh_duplicate_suppression(
+        &options.required_path("root")?,
+        required_invocation(options)?,
+    )?;
+    println!("{{\"duplicate_suppression\":true}}");
+    Ok(())
+}
+
+fn required_invocation(options: &Options) -> LabResult<&str> {
+    options
+        .0
+        .get("invocation")
+        .map(String::as_str)
+        .ok_or_else(|| invalid("--invocation is required"))
+}
+
 fn live_carrier(options: &Options, mode: LiveMode) -> LabResult<LiveCarrier> {
     match mode {
         LiveMode::FixedUdp => {
@@ -651,6 +815,36 @@ fn run_transfer_command(options: &Options) -> LabResult<()> {
     finish_scenario(&claim, failure, started, result)
 }
 
+fn run_route_only_event_command(options: &Options) -> LabResult<()> {
+    let claim = ScenarioRootClaim::reserve(options.required_path("root")?)?;
+    let started = Instant::now();
+    let mut failure = LabMetrics {
+        scenario: "phase0-route-only-event".into(),
+        shards: 1,
+        nodes: 3,
+        published_items: 1,
+        ..LabMetrics::default()
+    };
+    let result = match route_only_event_scenario(options) {
+        Ok(scenario) => {
+            failure.seed = scenario.seed;
+            failure.configured_bits_per_second = scenario.fault.bits_per_second;
+            failure.configured_loss_per_mille = scenario.fault.loss_per_mille;
+            failure.loss_window_frames = 1_000;
+            run_route_only_event(&scenario)
+        }
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok(result) => {
+            write_route_only_event_receipt(&claim.root, &result.receipt)?;
+            println!("{}", result.receipt.to_json());
+            emit(&claim.root, &result.metrics)
+        }
+        Err(error) => preserve_failure(&claim, failure, started, error),
+    }
+}
+
 fn run_blob_command(options: &Options) -> LabResult<()> {
     let claim = ScenarioRootClaim::reserve(options.required_path("root")?)?;
     let started = Instant::now();
@@ -723,6 +917,20 @@ fn transfer_scenario(options: &Options) -> LabResult<TransferScenario> {
         restart_after_delivered_frames: (checkpoint != 0).then_some(checkpoint),
         max_pumps: options.number("max-pumps", 200_000)?,
         fault,
+    })
+}
+
+fn route_only_event_scenario(options: &Options) -> LabResult<RouteOnlyEventScenario> {
+    let fault = fault(options)?;
+    Ok(RouteOnlyEventScenario {
+        root: options.required_path("root")?,
+        seed: fault.seed,
+        payload_bytes: options.number("payload-bytes", 1_024)?,
+        max_pumps_per_contact: options.number("max-pumps", 50_000)?,
+        fault,
+        source_revision: required_text(options, "source-revision")?,
+        source_diff_sha256: required_text(options, "source-diff-sha256")?,
+        binary_sha256: required_text(options, "binary-sha256")?,
     })
 }
 
@@ -1041,6 +1249,14 @@ fn emit_live(
 
 fn invalid(message: impl Into<String>) -> Box<dyn std::error::Error + Send + Sync> {
     Box::new(io::Error::new(io::ErrorKind::InvalidInput, message.into()))
+}
+
+fn required_text(options: &Options, name: &str) -> LabResult<String> {
+    options
+        .0
+        .get(name)
+        .cloned()
+        .ok_or_else(|| invalid(format!("--{name} is required")))
 }
 
 #[cfg(test)]

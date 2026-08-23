@@ -58,11 +58,11 @@ the authority for what application code is expected to touch.
 |---|---|---|
 | Rust application API | Publish, query, durable subscriptions, conflicts, batches, streamed Blobs, emission policy, status, bridges, and recipient-filtered rekey | Event-gap inspection, process-local merge-policy ID registration, and retention-driven garbage collection are Rust-only. Policy registration only annotates high-level conflict results; replicated ingestion never executes application policy. Automatic Record merge under requirements §5.3 is partial. The complete authority-side rekey-registry administration workflow is not shipped. |
 | Protected provisioning | Replaceable, bounded Rust protection boundary with a redacted, zeroizing Aster-owned plaintext container, plus an isolated age-v1 X25519 provider pilot | The pilot is Rust-only, non-production, classical rather than post-quantum, and not FIPS validated or a persistent secret store; upstream age encryption and identity-decoding intermediates are not comprehensively zeroized, and raw fixture/compatibility paths remain in Rust and all language bindings. |
-| Rust composition host | Owns the durable node, authenticated session, Blob transfer store, and configured `Link` carriers | One active authenticated contact at a time in the current bounded profile |
-| Live synchronization | Currently requires application logic to run inside a Rust process using `MeshService` | C, Go, and Python do not have an in-process networking API. The out-of-process local agent is post-MVP; see [ADR 0008](decisions/0008-local-agent-phasing.md). |
+| Rust composition host | Provider-neutral `MeshHost`, the default-gated legacy `MeshService`, and a Proposal-0004 shared-node supervisor that owns one durable authority across contact sessions | The shared-node experiment baseline passed formal Gate H. The formal `aster-gate-h` build compile-excludes `MeshService` and the legacy CLI; no provider is selected. |
+| Live synchronization | The default compatibility build can run application logic in-process through `MeshService`; a separate native three-process Gate-H CLI exists for the shared-node experiment | The shared-node Gate-H cohort passed 10/10, but C, Go, and Python still do not have an in-process networking API. The out-of-process local agent is post-MVP; see [ADR 0008](decisions/0008-local-agent-phasing.md). |
 | C ABI | High-level offline application operations | No event-gap inspection, merge-policy registration, retention-driven garbage collection, sealed objects, cryptographic provider, or carrier configuration |
 | Go and Python | First-class wrappers over the C ABI | The same C ABI boundaries apply; build and load the matching native library first |
-| IP adapter | UDP link with manual peer mapping, protected discovery support, rendezvous helpers, and opaque relay components | End-to-end host testing currently uses controlled links; physical/network acceptance remains separate |
+| IP adapter | UDP link with manual peer mapping, protected discovery support, rendezvous helpers, opaque relay components, and the provider-free native Gate-H harness | The formal provider-free Gate-H evidence passed; corrected provider comparison is authorized, but no IP provider is selected. Production NAT, relay/path recovery, and physical-network acceptance remain separate. |
 | BTLE adapter | MTU-aware `Link` over the `BleRadio` platform seam | A platform-specific OS radio implementation is not shipped |
 
 See [Conformance](conformance.md) and [CI](ci.md) for the precise evidence behind
@@ -76,6 +76,14 @@ capability claim until a later decision and implementation evidence say so.
 
 - [Proposal index and lifecycle](proposals/README.md)
 - [0001 — Operational IP mesh vertical-slice experiment](proposals/0001-ip-mesh-vertical-slice.md)
+- [0001 result — LAN mesh proven; operational IP profile not selected](proposals/0001-ip-mesh-vertical-slice-results.md)
+- [0002 — Provider-neutral mesh host and focused rust-libp2p profile](proposals/0002-provider-neutral-mesh-host.md)
+- [0002 result — Host contract retained; rust-libp2p profile not selected](proposals/0002-provider-neutral-mesh-host-results.md)
+- [0003 — Idiomatic IP mesh provider comparison](proposals/0003-idiomatic-ip-mesh-provider-comparison.md)
+- [0003 result — No provider selected; refactor durable node ownership first](proposals/0003-idiomatic-ip-mesh-provider-results.md)
+- [0004 — Shared-node rust-libp2p retest](proposals/0004-shared-node-libp2p-retest.md)
+- [0005 — Requirements-first FOSS architecture evaluation](proposals/0005-requirements-first-foss-architecture-evaluation.md)
+- [0006 — Selected FOSS reference stack build and validation](proposals/0006-selected-foss-reference-stack.md)
 
 ## Architecture and design decisions
 
@@ -96,6 +104,12 @@ decision records explain why the current design chose its major boundaries:
 - [0012 — Content-committing post-quantum batches](decisions/0012-content-committing-pq-batches.md)
 - [0013 — Protected provisioning boundary](decisions/0013-protected-provisioning-boundary.md)
 - [0018 — age X25519 provisioning-provider pilot](decisions/0018-age-provisioning-provider.md)
+- [0022 — No IP mesh substrate selected from Proposal 0001](decisions/0022-ip-mesh-experiment-no-selection.md)
+- [0023 — Retain the mesh-host contract without selecting rust-libp2p](decisions/0023-mesh-host-contract-no-libp2p-selection.md)
+- [0024 — Refactor durable node ownership before selecting an IP provider](decisions/0024-refactor-durable-node-ownership-before-ip-provider-selection.md)
+- [0025 — Requirements-first FOSS architecture evaluation](decisions/0025-requirements-first-foss-architecture-evaluation.md)
+- [0026 — Scope lock-only Hickory advisories](decisions/0026-lock-only-hickory-advisories.md)
+- [0027 — Bound the active libp2p pilot dependency exceptions](decisions/0027-libp2p-pilot-dependency-policy.md)
 
 ## All documents
 
@@ -127,6 +141,7 @@ decision records explain why the current design chose its major boundaries:
 - [Fuzzing guide](../fuzz/README.md)
 - [Lab guide](../lab/README.md)
 - [Reconciliation FOSS bake-off](reconciliation-bakeoff.md)
+- [Selected FOSS reference-stack validation](evaluations/0006/README.md)
 
 The design-decision index above covers every ADR included in the public
 repository.

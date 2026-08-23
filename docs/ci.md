@@ -24,17 +24,45 @@ reuses the same database without another fetch for the fuzz lockfile. Its
 vulnerability result therefore reflects the RustSec database available when
 the workflow ran, rather than a permanently reproducible snapshot.
 
-`deny.toml` has one explicit advisory ignore:
-`RUSTSEC-2026-0173` for unmaintained build-time `proc-macro-error2` 2.0.1 in the
-non-production age-provider pilot. RustSec reports no vulnerability and no
+Two explicit `cargo deny` advisory ignores cover bounded active pilot graphs.
+`RUSTSEC-2026-0173` covers unmaintained build-time `proc-macro-error2` 2.0.1 in
+the non-production age-provider pilot. RustSec reports no vulnerability and no
 patched release; current Rust separately emits future-incompatibility `E0365`.
 The ignore permits that exact informational finding only. It does not suppress
 other advisories, change exact package checksums, permit online execution after
-the acquisition step, or authorize the provider for production. The companion
-scope gate also fails if `proc-macro-error2` appears anywhere in the separately
-excluded fuzz graph, so the workspace-level ignore cannot silently cover that
-lockfile. Any change to the package chain or advisory disposition requires a
-recorded pilot review.
+the acquisition step, or authorize the provider for production.
+
+`RUSTSEC-2024-0436` covers unmaintained `paste` 1.0.15 only through the exact
+`netlink-packet-core` → `if-watch` → `libp2p-tcp` path in the non-production
+libp2p-provider pilot. [Decision 0027](decisions/0027-libp2p-pilot-dependency-policy.md)
+records the 2026-11-23 review deadline, upstream-removal gate, and production
+prohibition. The same decision admits `BSD-2-Clause`, `ISC`, and `Zlib` for the
+reviewed external dependency graph; first-party packages and distributed
+project files remain subject to the separate byte-identical Apache-2.0 gate.
+
+The companion scope gate fails if either ignored package's reverse graph drifts
+or if either package appears in the separately excluded fuzz graph. Any change
+to a package chain or advisory disposition requires a recorded pilot review.
+
+The root lockfile also contains `hickory-proto` and `hickory-resolver` 0.25.2
+because the `libp2p` 0.56.0 aggregate manifest exposes DNS and mDNS as optional
+features. Aster disables libp2p default features and enables neither optional
+feature, so neither Hickory package is present in the resolved workspace graph,
+including with every Aster workspace feature and target enabled. They are also
+absent from the independent fuzz graph. The raw-lock tools cannot represent
+that reachability distinction, so only the root raw-lock `cargo audit` command
+narrowly ignores `RUSTSEC-2026-0118` and `RUSTSEC-2026-0119`. Feature-aware
+`cargo deny` sees neither inactive package and carries no Hickory ignore.
+
+This is a lock-only tooling disposition, not a runtime vulnerability waiver or
+admission of DNS, mDNS, or Hickory. Before either ignore can be used,
+`tools/check-dependency-exception-scope.sh` requires the lock-only package set
+to remain exactly `hickory-proto`/`hickory-resolver` 0.25.2 and proves that both
+names are absent from the full workspace and fuzz dependency graphs. Its
+adversarial regression injects an active Hickory package and requires the gate
+to fail. Package/version drift or future feature activation therefore blocks
+CI before the audit suppression is applied. Remove both ignores when the
+aggregate libp2p lock no longer contains the affected optional versions.
 
 The age interoperability lane keeps its independent Go module in
 `tools/age-reference/go.mod` and `go.sum`. Its acquisition step canonicalizes
@@ -53,13 +81,15 @@ replacement is rejected before this comparison, so a local or alternate source
 cannot inherit an admitted coordinate. It does not install or discover an
 ambient age CLI.
 
-Because `deny.toml` expresses advisory exceptions at workspace scope, both the
-primary and dependency-policy gates also run
-`tools/check-dependency-exception-scope.sh`. Its exact reverse-graph assertion
-fails unless `proc-macro-error2` 2.0.1 remains reachable only through the
-isolated age-provider pilot and is absent from the fuzz graph. An adversarial
-wrapper also forces the fuzz graph command to fail and proves that failure is
-propagated instead of being masked by output processing.
+Because `deny.toml` expresses active advisory exceptions at workspace scope,
+both the primary and dependency-policy gates also run
+`tools/check-dependency-exception-scope.sh`. Its exact reverse-graph assertions
+fail unless `proc-macro-error2` 2.0.1 remains reachable only through the
+isolated age-provider pilot and `paste` 1.0.15 remains limited to the reviewed
+libp2p-provider path. Both must be absent from the fuzz graph. The same gate
+proves the raw-lock Hickory pair remains inactive. Adversarial wrappers force a
+fuzz graph command failure, an active Hickory package, an expanded `paste`
+graph, and a second active `paste` version; each must fail closed.
 
 ## Security posture
 
@@ -85,6 +115,7 @@ The action and tool pins are:
 | Minimum supported Rust | `1.90.0` |
 | Go | `1.26.7` |
 | Python | `3.13.7` |
+| ripgrep | `15.2.0` |
 | Reference Go age oracle | `filippo.io/age v1.3.1` |
 | `govulncheck` | `golang.org/x/vuln v1.6.0` |
 | Fuzz nightly | `nightly-2026-08-18` |
@@ -153,7 +184,8 @@ to both lockfiles:
 cargo install --locked cargo-deny --version 0.20.2
 cargo install --locked cargo-audit --version 0.22.2
 cargo deny fetch all
-cargo audit --file Cargo.lock
+CARGO_NET_OFFLINE=true sh ./tools/check-dependency-exception-scope.sh
+cargo audit --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119 --file Cargo.lock
 cargo deny --locked --offline check
 cargo deny --manifest-path fuzz/Cargo.toml --config deny.toml --locked --offline check
 cargo audit --no-fetch --file fuzz/Cargo.lock

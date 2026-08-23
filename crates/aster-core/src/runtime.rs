@@ -35,7 +35,11 @@ use crate::wire::{
 };
 
 mod reference_semantic;
-pub use reference_semantic::ReferenceSemanticRuntimeBackend;
+pub use reference_semantic::{
+    AppliedAuthorizationControl, ReferenceSemanticBlobQuotaSnapshot,
+    ReferenceSemanticRuntimeAuthority, ReferenceSemanticRuntimeBackend,
+    ReferenceSemanticRuntimeSession, SignedAuthorizationControl,
+};
 
 /// Engine/storage boundary used only after session authentication.
 ///
@@ -45,6 +49,15 @@ pub use reference_semantic::ReferenceSemanticRuntimeBackend;
 /// separate and is authenticated again by `ingest_authenticated`.
 pub trait RuntimeBackend {
     type Error: fmt::Display;
+
+    /// Monotonic process-wide authorization epoch.
+    ///
+    /// Backends without mutable authorization state retain generation zero.
+    /// Shared authorities override this so a driver can fail closed when
+    /// revocation, rekey, or other control state changes after admission.
+    fn authorization_generation(&mut self) -> Result<u64, Self::Error> {
+        Ok(0)
+    }
 
     fn authorize_adjacency(&mut self, _authenticated_peer: NodeId) -> Result<(), Self::Error> {
         Ok(())
@@ -185,8 +198,12 @@ pub trait RuntimeBackend {
         Ok(())
     }
 
-    /// Verifies and atomically commits one complete typed object. An error has
-    /// no commit effect; a successful disposition is durable and irreversible.
+    /// Verifies and atomically commits one complete typed object. An error does
+    /// not commit the submitted object. A backend may nevertheless durably
+    /// activate an independently staged authorization prefix while rejecting
+    /// that input; such a side effect must be exposed by a changed
+    /// [`Self::authorization_generation`]. A successful disposition is durable
+    /// and irreversible.
     /// Source
     /// envelopes must authenticate the hop wrapper against
     /// `authenticated_peer`; Blob chunks must verify their source-authenticated
@@ -200,7 +217,9 @@ pub trait RuntimeBackend {
         forwarding: Vec<u8>,
     ) -> Result<Option<ItemId>, Self::Error>;
 
-    /// Dependency-aware completion seam. A deferred result means the backend
+    /// Dependency-aware completion seam. The submitted-object error contract
+    /// and authorization-generation exception are identical to
+    /// [`Self::commit_authenticated_object`]. A deferred result means the backend
     /// has crash-atomically moved exact bytes out of transfer staging and has
     /// not inserted the object into semantic state or authorized inventory.
     fn commit_authenticated_object_with_dependencies(
@@ -326,9 +345,200 @@ const MAX_PENDING_LOGICAL_BYTES: usize = 16 * 1024 * 1024;
 const DEFERRED_WANT_EPOCH_RESERVE: usize = 2 * 1024 * 1024;
 const MAX_RETRY_SENDS_PER_PUMP: usize = 128;
 const MAX_COMPLETED_TRANSFERS: usize = 1_024;
+const MAX_WIRE_MESSAGE_BYTES: usize = 1_048_576;
+const MAX_WIRE_DEPTH: usize = 16;
+const MAX_WIRE_COLLECTION_ITEMS: usize = 4_096;
+const MAX_WIRE_BYTE_STRING: usize = 1_048_576;
+const MAX_WIRE_TEXT_STRING: usize = 4_096;
 const MIN_RECORD_REPAIR_ROUNDS: u16 = 8;
 const MAX_SUCCESSFUL_RECORD_REPAIR_ROUNDS: u16 = 8;
 const SECURE_REPLAY_WINDOW_RECORDS: u64 = u128::BITS as u64;
+
+/// Per-contact runtime bounds.
+///
+/// Defaults preserve the limits that predated this configuration surface. The
+/// same values are hard maxima: callers may tighten a contact reservation but
+/// cannot silently expand the audited resource envelope. `max_reassembly_bytes`
+/// and `max_pending_logical_bytes` are the retained inbound and outbound
+/// payload-byte reservations respectively; the count fields separately bound
+/// retained metadata and work performed by one pump.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RuntimeLimits {
+    pub max_in_flight_logical_frames: usize,
+    pub max_reassembly_bytes: usize,
+    pub partial_transfer_idle_ttl: Duration,
+    pub max_received_frames_per_pump: usize,
+    pub max_unauthenticated_failures_per_pump: usize,
+    pub max_pending_retries: usize,
+    pub max_pending_outbox: usize,
+    pub max_pending_logical_bytes: usize,
+    pub deferred_want_epoch_reserve: usize,
+    pub max_retry_sends_per_pump: usize,
+    pub max_completed_transfers: usize,
+    pub wire: Limits,
+}
+
+impl Default for RuntimeLimits {
+    fn default() -> Self {
+        Self {
+            max_in_flight_logical_frames: MAX_IN_FLIGHT_LOGICAL_FRAMES,
+            max_reassembly_bytes: MAX_REASSEMBLY_BYTES,
+            partial_transfer_idle_ttl: PARTIAL_TRANSFER_IDLE_TTL,
+            max_received_frames_per_pump: MAX_RECEIVED_FRAMES_PER_PUMP,
+            max_unauthenticated_failures_per_pump: MAX_UNAUTHENTICATED_FAILURES_PER_PUMP,
+            max_pending_retries: MAX_PENDING_RETRIES,
+            max_pending_outbox: MAX_PENDING_OUTBOX,
+            max_pending_logical_bytes: MAX_PENDING_LOGICAL_BYTES,
+            deferred_want_epoch_reserve: DEFERRED_WANT_EPOCH_RESERVE,
+            max_retry_sends_per_pump: MAX_RETRY_SENDS_PER_PUMP,
+            max_completed_transfers: MAX_COMPLETED_TRANSFERS,
+            wire: Limits::default(),
+        }
+    }
+}
+
+impl RuntimeLimits {
+    /// Validates non-zero operational bounds, cross-field relationships, and
+    /// the audited hard maxima.
+    pub fn validate(&self) -> Result<(), RuntimeLimitsError> {
+        for (field, value, maximum) in [
+            (
+                "max_in_flight_logical_frames",
+                self.max_in_flight_logical_frames,
+                MAX_IN_FLIGHT_LOGICAL_FRAMES,
+            ),
+            (
+                "max_reassembly_bytes",
+                self.max_reassembly_bytes,
+                MAX_REASSEMBLY_BYTES,
+            ),
+            (
+                "max_received_frames_per_pump",
+                self.max_received_frames_per_pump,
+                MAX_RECEIVED_FRAMES_PER_PUMP,
+            ),
+            (
+                "max_unauthenticated_failures_per_pump",
+                self.max_unauthenticated_failures_per_pump,
+                MAX_UNAUTHENTICATED_FAILURES_PER_PUMP,
+            ),
+            (
+                "max_pending_retries",
+                self.max_pending_retries,
+                MAX_PENDING_RETRIES,
+            ),
+            (
+                "max_pending_outbox",
+                self.max_pending_outbox,
+                MAX_PENDING_OUTBOX,
+            ),
+            (
+                "max_pending_logical_bytes",
+                self.max_pending_logical_bytes,
+                MAX_PENDING_LOGICAL_BYTES,
+            ),
+            (
+                "max_retry_sends_per_pump",
+                self.max_retry_sends_per_pump,
+                MAX_RETRY_SENDS_PER_PUMP,
+            ),
+            (
+                "max_completed_transfers",
+                self.max_completed_transfers,
+                MAX_COMPLETED_TRANSFERS,
+            ),
+            (
+                "wire.max_message_bytes",
+                self.wire.max_message_bytes,
+                MAX_WIRE_MESSAGE_BYTES,
+            ),
+            ("wire.max_depth", self.wire.max_depth, MAX_WIRE_DEPTH),
+            (
+                "wire.max_collection_items",
+                self.wire.max_collection_items,
+                MAX_WIRE_COLLECTION_ITEMS,
+            ),
+            (
+                "wire.max_byte_string",
+                self.wire.max_byte_string,
+                MAX_WIRE_BYTE_STRING,
+            ),
+            (
+                "wire.max_text_string",
+                self.wire.max_text_string,
+                MAX_WIRE_TEXT_STRING,
+            ),
+        ] {
+            if value == 0 {
+                return Err(RuntimeLimitsError::Zero(field));
+            }
+            if value > maximum {
+                return Err(RuntimeLimitsError::ExceedsHardMaximum(field));
+            }
+        }
+        if self.partial_transfer_idle_ttl.is_zero() {
+            return Err(RuntimeLimitsError::Zero("partial_transfer_idle_ttl"));
+        }
+        if self.partial_transfer_idle_ttl > PARTIAL_TRANSFER_IDLE_TTL {
+            return Err(RuntimeLimitsError::ExceedsHardMaximum(
+                "partial_transfer_idle_ttl",
+            ));
+        }
+        if self.deferred_want_epoch_reserve > DEFERRED_WANT_EPOCH_RESERVE {
+            return Err(RuntimeLimitsError::ExceedsHardMaximum(
+                "deferred_want_epoch_reserve",
+            ));
+        }
+        if self.deferred_want_epoch_reserve > self.max_pending_logical_bytes {
+            return Err(RuntimeLimitsError::InvalidRelationship(
+                "deferred_want_epoch_reserve exceeds max_pending_logical_bytes",
+            ));
+        }
+        if self.wire.max_byte_string > self.wire.max_message_bytes {
+            return Err(RuntimeLimitsError::InvalidRelationship(
+                "wire.max_byte_string exceeds wire.max_message_bytes",
+            ));
+        }
+        if self.wire.max_text_string > self.wire.max_message_bytes {
+            return Err(RuntimeLimitsError::InvalidRelationship(
+                "wire.max_text_string exceeds wire.max_message_bytes",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Maximum retained partial inbound payload bytes for one contact.
+    pub const fn retained_inbound_payload_bytes(&self) -> usize {
+        self.max_reassembly_bytes
+    }
+
+    /// Maximum retained queued outbound payload bytes for one contact.
+    pub const fn retained_outbound_payload_bytes(&self) -> usize {
+        self.max_pending_logical_bytes
+    }
+}
+
+/// Invalid per-contact resource configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeLimitsError {
+    Zero(&'static str),
+    ExceedsHardMaximum(&'static str),
+    InvalidRelationship(&'static str),
+}
+
+impl fmt::Display for RuntimeLimitsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Zero(field) => write!(formatter, "runtime limit {field} must be non-zero"),
+            Self::ExceedsHardMaximum(field) => {
+                write!(formatter, "runtime limit {field} exceeds its hard maximum")
+            }
+            Self::InvalidRelationship(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for RuntimeLimitsError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StartRequest {
@@ -347,6 +557,8 @@ pub enum RuntimeError {
     Session(String),
     Backend(String),
     BackendContract(&'static str),
+    InvalidLimits(RuntimeLimitsError),
+    AuthorizationGenerationChanged,
     EnvelopeLengthMismatch,
     EnvelopeHashMismatch,
     TransportPeerChanged,
@@ -354,6 +566,33 @@ pub enum RuntimeError {
     Backpressure,
     TransferIdExhausted,
     FailedState,
+}
+
+/// The authorization-generation comparison performed by a runtime before it
+/// admits authenticated state or flushes authenticated Aster bytes.
+///
+/// Embeddings may drain this observation for structured lifecycle evidence;
+/// it does not replace the fail-closed check itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeAuthorizationGenerationCheck {
+    Current {
+        generation: u64,
+    },
+    Changed {
+        expected_generation: u64,
+        observed_generation: u64,
+    },
+    Unavailable {
+        expected_generation: Option<u64>,
+    },
+}
+
+/// Cumulative authorization-generation comparisons performed by one runtime.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeAuthorizationGenerationCounters {
+    pub checks: u64,
+    pub mismatches: u64,
+    pub unavailable: u64,
 }
 
 impl fmt::Display for RuntimeError {
@@ -366,6 +605,10 @@ impl fmt::Display for RuntimeError {
             Self::Session(error) => write!(formatter, "session authentication failed: {error}"),
             Self::Backend(error) => write!(formatter, "runtime backend failed: {error}"),
             Self::BackendContract(error) => write!(formatter, "backend contract failed: {error}"),
+            Self::InvalidLimits(error) => write!(formatter, "invalid runtime limits: {error}"),
+            Self::AuthorizationGenerationChanged => {
+                formatter.write_str("runtime authorization changed after adjacency admission")
+            }
             Self::EnvelopeLengthMismatch => formatter.write_str("sealed envelope length mismatch"),
             Self::EnvelopeHashMismatch => formatter.write_str("sealed envelope hash mismatch"),
             Self::TransportPeerChanged => {
@@ -578,6 +821,7 @@ pub struct RuntimeDriver<B: RuntimeBackend> {
     committed_route: Option<CarrierRoute>,
     candidate_route: Option<CarrierRoute>,
     fragment_routes: BTreeMap<u64, PartialTransferRoute>,
+    limits: RuntimeLimits,
     wire_limits: Limits,
     reassembler: Reassembler,
     outbox: VecDeque<Outbound>,
@@ -593,6 +837,13 @@ pub struct RuntimeDriver<B: RuntimeBackend> {
     secure_records_sealed: u64,
     irreversible_generation: u64,
     inventory_refresh_retry: Option<InventoryRefreshRetry>,
+    initiates_sync: bool,
+    external_admission_required: bool,
+    authenticated_initialized: bool,
+    admitted_authorization_generation: Option<u64>,
+    authorization_generation_check: Option<RuntimeAuthorizationGenerationCheck>,
+    authorization_generation_counters: RuntimeAuthorizationGenerationCounters,
+    local_inventory_changed: bool,
 }
 
 impl<B: RuntimeBackend> RuntimeDriver<B> {
@@ -603,6 +854,25 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
         start_request: StartRequest,
         peer_hint: Option<NodeId>,
     ) -> Result<Self, RuntimeError> {
+        Self::initiator_with_limits(
+            bundle,
+            sync,
+            backend,
+            start_request,
+            peer_hint,
+            RuntimeLimits::default(),
+        )
+    }
+
+    pub fn initiator_with_limits(
+        bundle: ProvisioningBundle,
+        sync: SyncState,
+        backend: B,
+        start_request: StartRequest,
+        peer_hint: Option<NodeId>,
+        limits: RuntimeLimits,
+    ) -> Result<Self, RuntimeError> {
+        limits.validate().map_err(RuntimeError::InvalidLimits)?;
         let (initiator, first_flight) = ReferenceSessionInitiator::start(bundle)
             .map_err(|error| RuntimeError::Session(error.to_string()))?;
         Self::initiator_from_started(
@@ -612,6 +882,7 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
             backend,
             start_request,
             peer_hint,
+            limits,
         )
     }
 
@@ -634,6 +905,7 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
             backend,
             start_request,
             peer_hint,
+            RuntimeLimits::default(),
         )
     }
 
@@ -644,6 +916,7 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
         backend: B,
         start_request: StartRequest,
         peer_hint: Option<NodeId>,
+        limits: RuntimeLimits,
     ) -> Result<Self, RuntimeError> {
         let clock = Instant::now();
         let mut driver = Self {
@@ -654,10 +927,11 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
             committed_route: peer_hint.map(CarrierRoute::Routed),
             candidate_route: None,
             fragment_routes: BTreeMap::new(),
-            wire_limits: Limits::default(),
+            limits,
+            wire_limits: limits.wire,
             reassembler: Reassembler::with_budget(
-                MAX_IN_FLIGHT_LOGICAL_FRAMES,
-                MAX_REASSEMBLY_BYTES,
+                limits.max_in_flight_logical_frames,
+                limits.max_reassembly_bytes,
             ),
             outbox: VecDeque::new(),
             retries: BTreeMap::new(),
@@ -672,6 +946,13 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
             secure_records_sealed: 0,
             irreversible_generation: 0,
             inventory_refresh_retry: None,
+            initiates_sync: true,
+            external_admission_required: false,
+            authenticated_initialized: false,
+            admitted_authorization_generation: None,
+            authorization_generation_check: None,
+            authorization_generation_counters: RuntimeAuthorizationGenerationCounters::default(),
+            local_inventory_changed: false,
         };
         driver.queue_handshake(first_flight)?;
         Ok(driver)
@@ -683,7 +964,17 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
         backend: B,
         peer_hint: Option<NodeId>,
     ) -> Result<Self, RuntimeError> {
-        Self::responder_inner(bundle, sync, backend, None, peer_hint)
+        Self::responder_with_limits(bundle, sync, backend, peer_hint, RuntimeLimits::default())
+    }
+
+    pub fn responder_with_limits(
+        bundle: ProvisioningBundle,
+        sync: SyncState,
+        backend: B,
+        peer_hint: Option<NodeId>,
+        limits: RuntimeLimits,
+    ) -> Result<Self, RuntimeError> {
+        Self::responder_inner(bundle, sync, backend, None, peer_hint, limits)
     }
 
     /// Opens a responder that also advertises a local interest after receiving
@@ -697,7 +988,32 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
         start_request: StartRequest,
         peer_hint: Option<NodeId>,
     ) -> Result<Self, RuntimeError> {
-        Self::responder_inner(bundle, sync, backend, Some(start_request), peer_hint)
+        Self::responder_with_start_and_limits(
+            bundle,
+            sync,
+            backend,
+            start_request,
+            peer_hint,
+            RuntimeLimits::default(),
+        )
+    }
+
+    pub fn responder_with_start_and_limits(
+        bundle: ProvisioningBundle,
+        sync: SyncState,
+        backend: B,
+        start_request: StartRequest,
+        peer_hint: Option<NodeId>,
+        limits: RuntimeLimits,
+    ) -> Result<Self, RuntimeError> {
+        Self::responder_inner(
+            bundle,
+            sync,
+            backend,
+            Some(start_request),
+            peer_hint,
+            limits,
+        )
     }
 
     fn responder_inner(
@@ -706,7 +1022,9 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
         backend: B,
         start_request: Option<StartRequest>,
         peer_hint: Option<NodeId>,
+        limits: RuntimeLimits,
     ) -> Result<Self, RuntimeError> {
+        limits.validate().map_err(RuntimeError::InvalidLimits)?;
         let responder = ReferenceSessionResponder::open(bundle)
             .map_err(|error| RuntimeError::Session(error.to_string()))?;
         let clock = Instant::now();
@@ -718,10 +1036,11 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
             committed_route: peer_hint.map(CarrierRoute::Routed),
             candidate_route: None,
             fragment_routes: BTreeMap::new(),
-            wire_limits: Limits::default(),
+            limits,
+            wire_limits: limits.wire,
             reassembler: Reassembler::with_budget(
-                MAX_IN_FLIGHT_LOGICAL_FRAMES,
-                MAX_REASSEMBLY_BYTES,
+                limits.max_in_flight_logical_frames,
+                limits.max_reassembly_bytes,
             ),
             outbox: VecDeque::new(),
             retries: BTreeMap::new(),
@@ -736,7 +1055,55 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
             secure_records_sealed: 0,
             irreversible_generation: 0,
             inventory_refresh_retry: None,
+            initiates_sync: false,
+            external_admission_required: false,
+            authenticated_initialized: false,
+            admitted_authorization_generation: None,
+            authorization_generation_check: None,
+            authorization_generation_counters: RuntimeAuthorizationGenerationCounters::default(),
+            local_inventory_changed: false,
         })
+    }
+
+    /// Defers all authenticated synchronization work until the embedding host
+    /// admits the cryptographic peer on this carrier. The authenticated
+    /// handshake may finish, but the backend is not consulted, durable
+    /// progress is not hydrated, and no sync frame is accepted or emitted
+    /// before [`Self::admit_authenticated`] succeeds.
+    ///
+    /// This must be enabled before the first pump. It exists for contact
+    /// managers whose carrier-to-node binding policy is intentionally outside
+    /// the wire/runtime layer.
+    pub fn require_external_admission(&mut self) -> Result<(), RuntimeError> {
+        if self.is_authenticated()
+            || self.authenticated_initialized
+            || self.external_admission_required
+        {
+            return Err(RuntimeError::FailedState);
+        }
+        self.external_admission_required = true;
+        Ok(())
+    }
+
+    /// Completes backend authorization/hydration and, for an initiator,
+    /// schedules its initial interest after the embedding host has accepted
+    /// the authenticated carrier binding.
+    pub fn admit_authenticated(&mut self) -> Result<(), RuntimeError> {
+        if !self.external_admission_required
+            || !self.is_authenticated()
+            || self.authenticated_initialized
+        {
+            return Err(RuntimeError::FailedState);
+        }
+        self.initialize_authenticated()
+    }
+
+    /// True only at the host-policy barrier between a completed cryptographic
+    /// handshake and authenticated synchronization.
+    pub fn awaiting_external_admission(&self) -> bool {
+        self.external_admission_required
+            && self.is_authenticated()
+            && !self.authenticated_initialized
     }
 
     pub fn is_authenticated(&self) -> bool {
@@ -750,6 +1117,67 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
         }
     }
 
+    /// Returns and clears the latest exact generation comparison performed by
+    /// durable admission or an authenticated outbound flush.
+    ///
+    /// Repeated successful comparisons in one pump are coalesced. A changed
+    /// or unavailable result is always the terminal comparison for that pump.
+    pub fn take_authorization_generation_check(
+        &mut self,
+    ) -> Option<RuntimeAuthorizationGenerationCheck> {
+        self.authorization_generation_check.take()
+    }
+
+    /// Cumulative exact checks performed by this contact runtime.
+    pub const fn authorization_generation_counters(
+        &self,
+    ) -> RuntimeAuthorizationGenerationCounters {
+        self.authorization_generation_counters
+    }
+
+    /// Revalidates an admitted session's captured authorization generation
+    /// without reading or writing its carrier. Shared coordinators use this to
+    /// retire an explicitly invalidated contact before invoking a link pump.
+    pub fn revalidate_authorization_generation(&mut self) -> Result<(), RuntimeError> {
+        self.ensure_authorization_generation_current()
+    }
+
+    fn record_authorization_generation_check(
+        &mut self,
+        check: RuntimeAuthorizationGenerationCheck,
+    ) {
+        self.authorization_generation_counters.checks = self
+            .authorization_generation_counters
+            .checks
+            .saturating_add(1);
+        match check {
+            RuntimeAuthorizationGenerationCheck::Changed { .. } => {
+                self.authorization_generation_counters.mismatches = self
+                    .authorization_generation_counters
+                    .mismatches
+                    .saturating_add(1);
+            }
+            RuntimeAuthorizationGenerationCheck::Unavailable { .. } => {
+                self.authorization_generation_counters.unavailable = self
+                    .authorization_generation_counters
+                    .unavailable
+                    .saturating_add(1);
+            }
+            RuntimeAuthorizationGenerationCheck::Current { .. } => {}
+        }
+        self.authorization_generation_check = Some(check);
+    }
+
+    /// Number of already-allocated carrier frames awaiting an outbound flush.
+    /// This read-only diagnostic proves a generation race exercised queued
+    /// bytes rather than an idle contact.
+    pub fn pending_outbound_frame_count(&self) -> usize {
+        self.outbox
+            .len()
+            .saturating_add(self.retries.len())
+            .saturating_add(usize::from(self.handshake_retry.is_some()))
+    }
+
     fn outbound_route(&self) -> Option<NodeId> {
         self.committed_route
             .or(self.candidate_route)
@@ -757,8 +1185,10 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
     }
 
     fn reset_reassembly(&mut self) {
-        self.reassembler =
-            Reassembler::with_budget(MAX_IN_FLIGHT_LOGICAL_FRAMES, MAX_REASSEMBLY_BYTES);
+        self.reassembler = Reassembler::with_budget(
+            self.limits.max_in_flight_logical_frames,
+            self.limits.max_reassembly_bytes,
+        );
         self.fragment_routes.clear();
     }
 
@@ -767,7 +1197,8 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
             .fragment_routes
             .iter()
             .filter_map(|(transfer_id, partial)| {
-                (now.saturating_duration_since(partial.last_seen) > PARTIAL_TRANSFER_IDLE_TTL)
+                (now.saturating_duration_since(partial.last_seen)
+                    > self.limits.partial_transfer_idle_ttl)
                     .then_some(*transfer_id)
             })
             .collect::<Vec<_>>();
@@ -815,7 +1246,7 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
             partial.last_seen = now;
             return true;
         }
-        if self.fragment_routes.len() >= MAX_IN_FLIGHT_LOGICAL_FRAMES
+        if self.fragment_routes.len() >= self.limits.max_in_flight_logical_frames
             && let Some(oldest) = self
                 .fragment_routes
                 .iter()
@@ -847,6 +1278,11 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
 
     pub fn sync(&self) -> &SyncState {
         &self.sync
+    }
+
+    /// Validated bounds reserved by this contact.
+    pub const fn limits(&self) -> &RuntimeLimits {
+        &self.limits
     }
 
     pub fn backend(&self) -> &B {
@@ -887,6 +1323,13 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
         handled
     }
 
+    /// Returns and clears the coalesced signal that this contact durably
+    /// committed at least one inventory-visible object. Embeddings use this to
+    /// notify other live contacts that share the same durable store.
+    pub fn take_local_inventory_changed(&mut self) -> bool {
+        std::mem::take(&mut self.local_inventory_changed)
+    }
+
     pub fn into_backend(self) -> B {
         self.backend
     }
@@ -919,10 +1362,19 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
 
     fn pump_at(&mut self, link: &dyn Link, now: Instant) -> Result<usize, RuntimeError> {
         self.clock = now;
+        if self.awaiting_external_admission() {
+            // A responder must be able to finish its fourth handshake flight
+            // so the initiator can learn the authenticated peer, but neither
+            // side may consume or emit synchronization traffic until the host
+            // accepts the carrier binding.
+            let mut send_budget = self.limits.max_retry_sends_per_pump;
+            self.flush(link, &mut send_budget)?;
+            return Ok(0);
+        }
         self.retry_pending_inventory_refresh();
         self.expire_partial_transfers(now);
         let mut completed = 0_usize;
-        let mut send_budget = MAX_RETRY_SENDS_PER_PUMP;
+        let mut send_budget = self.limits.max_retry_sends_per_pump;
         let mut received_frames = 0_usize;
         let mut unauthenticated_failures = 0_usize;
         let mut deferred_send_error = None;
@@ -932,7 +1384,7 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
                 _ => return Err(error),
             }
         }
-        while received_frames < MAX_RECEIVED_FRAMES_PER_PUMP {
+        while received_frames < self.limits.max_received_frames_per_pump {
             if send_budget == 0 && !self.outbox.is_empty() {
                 // Do not keep accepting authenticated work after this pass
                 // has exhausted its send budget while a one-shot response is
@@ -958,7 +1410,7 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
                 // distinction between anonymous and routed delivery. Compare
                 // before parsing attacker-controlled fragment bytes.
                 unauthenticated_failures = unauthenticated_failures.saturating_add(1);
-                if unauthenticated_failures >= MAX_UNAUTHENTICATED_FAILURES_PER_PUMP {
+                if unauthenticated_failures >= self.limits.max_unauthenticated_failures_per_pump {
                     break;
                 }
                 continue;
@@ -967,7 +1419,8 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
                 Ok(fragment) => fragment,
                 Err(FragmentError::Malformed) => {
                     unauthenticated_failures = unauthenticated_failures.saturating_add(1);
-                    if unauthenticated_failures >= MAX_UNAUTHENTICATED_FAILURES_PER_PUMP {
+                    if unauthenticated_failures >= self.limits.max_unauthenticated_failures_per_pump
+                    {
                         break;
                     }
                     continue;
@@ -980,7 +1433,7 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
                 // parallel exact-route key and never combine fragments
                 // received anonymously and/or through different routes.
                 unauthenticated_failures = unauthenticated_failures.saturating_add(1);
-                if unauthenticated_failures >= MAX_UNAUTHENTICATED_FAILURES_PER_PUMP {
+                if unauthenticated_failures >= self.limits.max_unauthenticated_failures_per_pump {
                     break;
                 }
                 continue;
@@ -1000,7 +1453,8 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
                     self.fragment_routes.remove(&transfer_id);
                     self.reassembler.remove(transfer_id);
                     unauthenticated_failures = unauthenticated_failures.saturating_add(1);
-                    if unauthenticated_failures >= MAX_UNAUTHENTICATED_FAILURES_PER_PUMP {
+                    if unauthenticated_failures >= self.limits.max_unauthenticated_failures_per_pump
+                    {
                         break;
                     }
                     continue;
@@ -1027,7 +1481,9 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
                         || previous.logical_digest != logical_digest
                     {
                         unauthenticated_failures = unauthenticated_failures.saturating_add(1);
-                        if unauthenticated_failures >= MAX_UNAUTHENTICATED_FAILURES_PER_PUMP {
+                        if unauthenticated_failures
+                            >= self.limits.max_unauthenticated_failures_per_pump
+                        {
                             break;
                         }
                     }
@@ -1039,7 +1495,8 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
                 self.retain_authenticated_route(completed_route);
                 if matches!(result, Err(RuntimeError::Session(_))) && !self.logical_authenticated {
                     unauthenticated_failures = unauthenticated_failures.saturating_add(1);
-                    if unauthenticated_failures >= MAX_UNAUTHENTICATED_FAILURES_PER_PUMP {
+                    if unauthenticated_failures >= self.limits.max_unauthenticated_failures_per_pump
+                    {
                         break;
                     }
                     continue;
@@ -1068,6 +1525,9 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
                         _ => return Err(error),
                     }
                 }
+                if self.awaiting_external_admission() {
+                    break;
+                }
             }
         }
         if let Some(error) = deferred_send_error {
@@ -1078,14 +1538,14 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
     }
 
     fn remember_completed_transfer(&mut self, completed: CompletedTransfer) {
-        if self.completed_transfers.len() == MAX_COMPLETED_TRANSFERS {
+        if self.completed_transfers.len() == self.limits.max_completed_transfers {
             self.completed_transfers.pop_front();
         }
         self.completed_transfers.push_back(completed);
     }
 
     fn remember_failed_transfer(&mut self, failed: CompletedTransfer) {
-        if self.failed_transfers.len() == MAX_COMPLETED_TRANSFERS {
+        if self.failed_transfers.len() == self.limits.max_completed_transfers {
             self.failed_transfers.pop_front();
         }
         self.failed_transfers.push_back(failed);
@@ -1351,32 +1811,11 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
                 self.logical_authenticated = true;
                 self.handshake_retry = None;
                 self.phase = SessionPhase::Authenticated(session);
-                self.authorize_and_hydrate_authenticated()?;
-                let Some(request) = self.start_request.clone() else {
-                    self.fail_authenticated_initialization();
-                    return Err(RuntimeError::FailedState);
-                };
-                let finalized = (|| {
-                    let semantic_version = self
-                        .authenticated_semantic_version()
-                        .ok_or(RuntimeError::FailedState)?;
-                    let actions = self.sync.apply_for_semantic_version(
-                        SyncEvent::Start {
-                            exchange_id: request.exchange_id,
-                            topics: request.topics,
-                            scopes: request.scopes,
-                            min_priority: request.min_priority,
-                        },
-                        semantic_version,
-                    )?;
-                    self.handle_actions(actions)
-                })();
-                if finalized.is_ok() {
-                    self.start_request = None;
+                if self.external_admission_required {
+                    Ok(())
                 } else {
-                    self.fail_authenticated_initialization();
+                    self.initialize_authenticated()
                 }
-                finalized
             }
             SessionPhase::Responder(responder) => {
                 let (pending, second_flight) = match responder.receive_client_retryable(bytes) {
@@ -1402,7 +1841,9 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
                 self.logical_authenticated = true;
                 self.handshake_retry = None;
                 self.phase = SessionPhase::Authenticated(session);
-                self.authorize_and_hydrate_authenticated()?;
+                if !self.external_admission_required {
+                    self.initialize_authenticated()?;
+                }
                 let finalized = self.queue_handshake(fourth_flight);
                 if finalized.is_err() {
                     self.fail_authenticated_initialization();
@@ -1417,15 +1858,84 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
     fn authorize_and_hydrate_authenticated(&mut self) -> Result<(), RuntimeError> {
         let result = (|| {
             let peer = self.authenticated_peer().ok_or(RuntimeError::FailedState)?;
+            let generation_before = match self.backend.authorization_generation() {
+                Ok(generation) => generation,
+                Err(error) => {
+                    self.record_authorization_generation_check(
+                        RuntimeAuthorizationGenerationCheck::Unavailable {
+                            expected_generation: None,
+                        },
+                    );
+                    return Err(RuntimeError::Backend(error.to_string()));
+                }
+            };
             self.backend
                 .authorize_adjacency(peer)
                 .map_err(|error| RuntimeError::Backend(error.to_string()))?;
+            let generation_after = match self.backend.authorization_generation() {
+                Ok(generation) => generation,
+                Err(error) => {
+                    self.record_authorization_generation_check(
+                        RuntimeAuthorizationGenerationCheck::Unavailable {
+                            expected_generation: Some(generation_before),
+                        },
+                    );
+                    return Err(RuntimeError::Backend(error.to_string()));
+                }
+            };
+            if generation_before != generation_after {
+                self.record_authorization_generation_check(
+                    RuntimeAuthorizationGenerationCheck::Changed {
+                        expected_generation: generation_before,
+                        observed_generation: generation_after,
+                    },
+                );
+                return Err(RuntimeError::AuthorizationGenerationChanged);
+            }
+            self.record_authorization_generation_check(
+                RuntimeAuthorizationGenerationCheck::Current {
+                    generation: generation_after,
+                },
+            );
+            self.admitted_authorization_generation = Some(generation_after);
             self.hydrate_durable_progress()
         })();
         if result.is_err() {
             self.fail_authenticated_initialization();
         }
         result
+    }
+
+    fn initialize_authenticated(&mut self) -> Result<(), RuntimeError> {
+        let initialized = (|| {
+            self.authorize_and_hydrate_authenticated()?;
+            if self.initiates_sync {
+                let request = self
+                    .start_request
+                    .clone()
+                    .ok_or(RuntimeError::FailedState)?;
+                let semantic_version = self
+                    .authenticated_semantic_version()
+                    .ok_or(RuntimeError::FailedState)?;
+                let actions = self.sync.apply_for_semantic_version(
+                    SyncEvent::Start {
+                        exchange_id: request.exchange_id,
+                        topics: request.topics,
+                        scopes: request.scopes,
+                        min_priority: request.min_priority,
+                    },
+                    semantic_version,
+                )?;
+                self.handle_actions(actions)?;
+                self.start_request = None;
+            }
+            self.authenticated_initialized = true;
+            Ok(())
+        })();
+        if initialized.is_err() {
+            self.fail_authenticated_initialization();
+        }
+        initialized
     }
 
     fn fail_authenticated_initialization(&mut self) {
@@ -1436,6 +1946,40 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
         self.retries.clear();
         self.deferred_wants.clear();
         self.inventory_refresh_retry = None;
+        self.authenticated_initialized = false;
+        self.admitted_authorization_generation = None;
+    }
+
+    fn ensure_authorization_generation_current(&mut self) -> Result<(), RuntimeError> {
+        let Some(admitted) = self.admitted_authorization_generation else {
+            return Ok(());
+        };
+        let current = match self.backend.authorization_generation() {
+            Ok(generation) => generation,
+            Err(error) => {
+                self.record_authorization_generation_check(
+                    RuntimeAuthorizationGenerationCheck::Unavailable {
+                        expected_generation: Some(admitted),
+                    },
+                );
+                self.fail_authenticated_initialization();
+                return Err(RuntimeError::Backend(error.to_string()));
+            }
+        };
+        if current != admitted {
+            self.record_authorization_generation_check(
+                RuntimeAuthorizationGenerationCheck::Changed {
+                    expected_generation: admitted,
+                    observed_generation: current,
+                },
+            );
+            self.fail_authenticated_initialization();
+            return Err(RuntimeError::AuthorizationGenerationChanged);
+        }
+        self.record_authorization_generation_check(RuntimeAuthorizationGenerationCheck::Current {
+            generation: current,
+        });
+        Ok(())
     }
 
     fn schedule_inventory_refresh(&mut self, scope: InventoryRefreshScope) {
@@ -1730,9 +2274,15 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
                         Err(error) => {
                             let terminal = self.backend.is_terminal_commit_error(&error);
                             let message = error.to_string();
-                            if terminal {
-                                self.abort_terminal_object(object_id)?;
+                            let abort_result = if terminal {
+                                self.abort_terminal_object(object_id)
+                            } else {
+                                Ok(())
+                            };
+                            if self.authorization_changed_after_commit_error()? {
+                                return Err(RuntimeError::AuthorizationGenerationChanged);
                             }
+                            abort_result?;
                             return Err(RuntimeError::Backend(message));
                         }
                     };
@@ -1741,6 +2291,7 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
                     self.irreversible_generation = self.irreversible_generation.wrapping_add(1);
                     match disposition {
                         RuntimeCommit::Committed { item_id, promoted } => {
+                            self.local_inventory_changed = true;
                             let was_new_wanted = !self.sync.inventory().contains(&object_id)
                                 && self.sync.wants().contains(&object_id);
                             let mut committed_actions = match self.sync.apply_for_semantic_version(
@@ -1853,6 +2404,55 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
             }
         }
         Ok(())
+    }
+
+    fn authorization_changed_after_commit_error(&mut self) -> Result<bool, RuntimeError> {
+        let Some(expected_generation) = self.admitted_authorization_generation else {
+            return Ok(false);
+        };
+        let observed_generation = match self.backend.authorization_generation() {
+            Ok(generation) => generation,
+            Err(_) => {
+                self.record_authorization_generation_check(
+                    RuntimeAuthorizationGenerationCheck::Unavailable {
+                        expected_generation: Some(expected_generation),
+                    },
+                );
+                self.irreversible_generation = self.irreversible_generation.wrapping_add(1);
+                self.local_inventory_changed = true;
+                self.schedule_inventory_refresh(InventoryRefreshScope::Both);
+                self.fail_after_authorization_generation_change();
+                return Ok(true);
+            }
+        };
+        if observed_generation == expected_generation {
+            return Ok(false);
+        }
+        self.record_authorization_generation_check(RuntimeAuthorizationGenerationCheck::Changed {
+            expected_generation,
+            observed_generation,
+        });
+        // The authorization prefix is already durable and cannot be rolled
+        // back with the reducer checkpoint even though this object receives
+        // no completion receipt.
+        self.irreversible_generation = self.irreversible_generation.wrapping_add(1);
+        self.local_inventory_changed = true;
+        self.schedule_inventory_refresh(InventoryRefreshScope::Both);
+        self.fail_after_authorization_generation_change();
+        Ok(true)
+    }
+
+    fn fail_after_authorization_generation_change(&mut self) {
+        self.phase = SessionPhase::Failed;
+        self.logical_authenticated = false;
+        self.handshake_retry = None;
+        self.outbox.clear();
+        self.retries.clear();
+        self.deferred_wants.clear();
+        self.authenticated_initialized = false;
+        self.admitted_authorization_generation = None;
+        // Preserve the reducer and its Both-scope refresh witness. The host
+        // retires this stale session; a fresh session hydrates durable state.
     }
 
     fn validate_served_data(
@@ -1989,13 +2589,16 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
         let retained_bytes = plaintext
             .capacity()
             .saturating_add(transport_record_reservation(&plaintext));
-        while self.outbox.len() >= MAX_PENDING_OUTBOX
+        while self.outbox.len() >= self.limits.max_pending_outbox
             || self
                 .non_deferred_pending_bytes()
                 .saturating_add(retained_bytes)
-                > MAX_PENDING_LOGICAL_BYTES.saturating_sub(DEFERRED_WANT_EPOCH_RESERVE)
+                > self
+                    .limits
+                    .max_pending_logical_bytes
+                    .saturating_sub(self.limits.deferred_want_epoch_reserve)
             || self.pending_logical_bytes().saturating_add(retained_bytes)
-                > MAX_PENDING_LOGICAL_BYTES
+                > self.limits.max_pending_logical_bytes
         {
             let deferred_candidate = self
                 .deferred_wants
@@ -2069,7 +2672,7 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
             .pending_logical_bytes()
             .saturating_sub(prior)
             .saturating_add(bytes.capacity())
-            > MAX_PENDING_LOGICAL_BYTES
+            > self.limits.max_pending_logical_bytes
         {
             return Err(RuntimeError::Backpressure);
         }
@@ -2248,8 +2851,10 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
         priority: Priority,
         replacing: Option<&RetryKey>,
     ) -> bool {
-        let normal_byte_limit =
-            MAX_PENDING_LOGICAL_BYTES.saturating_sub(DEFERRED_WANT_EPOCH_RESERVE);
+        let normal_byte_limit = self
+            .limits
+            .max_pending_logical_bytes
+            .saturating_sub(self.limits.deferred_want_epoch_reserve);
         if required_bytes > normal_byte_limit {
             return false;
         }
@@ -2266,10 +2871,10 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
             let total_bytes_without_replaced =
                 self.pending_logical_bytes().saturating_sub(replaced_bytes);
             let count_without_replaced = self.retries.len().saturating_sub(replaced_count);
-            if count_without_replaced < MAX_PENDING_RETRIES
+            if count_without_replaced < self.limits.max_pending_retries
                 && bytes_without_replaced.saturating_add(required_bytes) <= normal_byte_limit
                 && total_bytes_without_replaced.saturating_add(required_bytes)
-                    <= MAX_PENDING_LOGICAL_BYTES
+                    <= self.limits.max_pending_logical_bytes
             {
                 return true;
             }
@@ -2806,7 +3411,7 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
                 .pending_logical_bytes()
                 .saturating_sub(old_capacity)
                 .saturating_add(reserved_record_bytes)
-                > MAX_PENDING_LOGICAL_BYTES
+                > self.limits.max_pending_logical_bytes
             {
                 let candidate = self
                     .deferred_wants
@@ -2904,6 +3509,7 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
             Deferred(ObjectId),
         }
 
+        self.ensure_authorization_generation_current()?;
         let link_floor = link.retry_floor();
 
         if self
@@ -3496,6 +4102,8 @@ impl<S: RecordStore, E: EnvelopeSealer> BlobRuntimeBackend<S, E> {
 pub enum BlobRuntimeError {
     Engine(EngineError),
     Blob(BlobError),
+    AuthorityUnavailable,
+    AuthorityPoisoned,
     Invalid(&'static str),
 }
 
@@ -3504,6 +4112,12 @@ impl fmt::Display for BlobRuntimeError {
         match self {
             Self::Engine(error) => write!(formatter, "engine: {error}"),
             Self::Blob(error) => write!(formatter, "Blob: {error}"),
+            Self::AuthorityUnavailable => {
+                formatter.write_str("semantic runtime authority is unavailable")
+            }
+            Self::AuthorityPoisoned => {
+                formatter.write_str("semantic runtime authority lock is poisoned")
+            }
             Self::Invalid(message) => formatter.write_str(message),
         }
     }
@@ -3539,6 +4153,7 @@ impl BlobRuntimeError {
         match self {
             Self::Engine(error) => terminal_engine_commit_error(error),
             Self::Blob(error) => terminal_blob_commit_error(error),
+            Self::AuthorityUnavailable | Self::AuthorityPoisoned => false,
             Self::Invalid(_) => true,
         }
     }
@@ -4160,7 +4775,10 @@ mod tests {
     use std::fs;
     use std::io::Cursor;
     use std::path::PathBuf;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    };
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     #[derive(Clone, Copy, Debug)]
@@ -4454,12 +5072,17 @@ mod tests {
         available: BTreeMap<ObjectId, Vec<u8>>,
         priorities: BTreeMap<ObjectId, Priority>,
         partial: BTreeMap<ObjectId, Vec<u8>>,
+        durable_progress: Vec<RuntimeTransferProgress>,
         disposed: BTreeMap<(ObjectId, u16), u64>,
         selections: Vec<(NodeId, InterestFilter, InventoryPurpose)>,
         ingested: Vec<(ObjectId, ItemId)>,
         fail_store_attempts: usize,
         fail_complete_attempts: usize,
         fail_commit_attempts: usize,
+        advance_generation_on_commit_error: bool,
+        make_generation_unavailable_on_commit_error: bool,
+        terminal_commit_errors: bool,
+        aborted: Vec<ObjectId>,
         fanout_messages: usize,
         data_requests: usize,
         receipts: Vec<(NodeId, u16, wire::Receipt)>,
@@ -4467,10 +5090,23 @@ mod tests {
         fail_durable_progress: bool,
         fail_inventory_selection: bool,
         fail_inventory_selection_attempts: usize,
+        authorization_generation: Arc<AtomicU64>,
+        authorization_generation_unavailable: Arc<AtomicBool>,
     }
 
     impl RuntimeBackend for FakeBackend {
         type Error = &'static str;
+
+        fn authorization_generation(&mut self) -> Result<u64, Self::Error> {
+            if self
+                .authorization_generation_unavailable
+                .load(Ordering::SeqCst)
+            {
+                Err("authorization generation unavailable")
+            } else {
+                Ok(self.authorization_generation.load(Ordering::SeqCst))
+            }
+        }
 
         fn authorize_adjacency(&mut self, _peer: NodeId) -> Result<(), Self::Error> {
             if self.fail_authorize {
@@ -4482,12 +5118,12 @@ mod tests {
 
         fn durable_progress(
             &mut self,
-            _limit: usize,
+            limit: usize,
         ) -> Result<Vec<RuntimeTransferProgress>, Self::Error> {
             if self.fail_durable_progress {
                 Err("durable progress")
             } else {
-                Ok(Vec::new())
+                Ok(self.durable_progress.iter().take(limit).cloned().collect())
             }
         }
 
@@ -4561,6 +5197,12 @@ mod tests {
             self.partial.get(&object_id).cloned().ok_or("missing")
         }
 
+        fn abort_object(&mut self, object_id: ObjectId) -> Result<(), Self::Error> {
+            self.partial.remove(&object_id);
+            self.aborted.push(object_id);
+            Ok(())
+        }
+
         fn commit_authenticated_object(
             &mut self,
             _peer: NodeId,
@@ -4571,6 +5213,13 @@ mod tests {
         ) -> Result<Option<ItemId>, Self::Error> {
             if self.fail_commit_attempts > 0 {
                 self.fail_commit_attempts -= 1;
+                if self.advance_generation_on_commit_error {
+                    self.authorization_generation.fetch_add(1, Ordering::SeqCst);
+                }
+                if self.make_generation_unavailable_on_commit_error {
+                    self.authorization_generation_unavailable
+                        .store(true, Ordering::SeqCst);
+                }
                 return Err("transient commit");
             }
             if forwarding.is_empty() {
@@ -4580,6 +5229,10 @@ mod tests {
             self.available.insert(object_id, sealed);
             self.ingested.push((object_id, item_id));
             Ok(Some(item_id))
+        }
+
+        fn is_terminal_commit_error(&self, _error: &Self::Error) -> bool {
+            self.terminal_commit_errors
         }
 
         fn object_priority(&mut self, object_id: ObjectId) -> Result<Priority, Self::Error> {
@@ -4704,6 +5357,10 @@ mod tests {
 
     impl<B: RuntimeBackend> RuntimeBackend for RecordingBackend<B> {
         type Error = B::Error;
+
+        fn authorization_generation(&mut self) -> Result<u64, Self::Error> {
+            self.inner.authorization_generation()
+        }
 
         fn authorize_adjacency(&mut self, peer: NodeId) -> Result<(), Self::Error> {
             self.inner.authorize_adjacency(peer)
@@ -4965,8 +5622,28 @@ mod tests {
         MemoryLink,
         Instant,
     ) {
+        authenticated_runtime_pair_with_limits(
+            exchange_id,
+            min_priority,
+            RuntimeLimits::default(),
+            RuntimeLimits::default(),
+        )
+    }
+
+    fn authenticated_runtime_pair_with_limits(
+        exchange_id: u64,
+        min_priority: Priority,
+        left_limits: RuntimeLimits,
+        right_limits: RuntimeLimits,
+    ) -> (
+        RuntimeDriver<FakeBackend>,
+        RuntimeDriver<FakeBackend>,
+        MemoryLink,
+        MemoryLink,
+        Instant,
+    ) {
         let (left_bundle, right_bundle) = bundles();
-        let mut left_driver = RuntimeDriver::initiator(
+        let mut left_driver = RuntimeDriver::initiator_with_limits(
             left_bundle,
             SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
             FakeBackend::default(),
@@ -4977,13 +5654,15 @@ mod tests {
                 min_priority: min_priority as u8,
             },
             None,
+            left_limits,
         )
         .unwrap();
-        let mut right_driver = RuntimeDriver::responder(
+        let mut right_driver = RuntimeDriver::responder_with_limits(
             right_bundle,
             SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
             FakeBackend::default(),
             None,
+            right_limits,
         )
         .unwrap();
         let (left, right) = MemoryLink::pair(256);
@@ -5007,6 +5686,503 @@ mod tests {
         right_driver.outbox.clear();
         right.capture.lock().unwrap().clear();
         (left_driver, right_driver, left, right, now)
+    }
+
+    #[test]
+    fn runtime_limits_validate_hard_maxima_and_relationships() {
+        let defaults = RuntimeLimits::default();
+        assert_eq!(defaults.validate(), Ok(()));
+        assert_eq!(
+            defaults.retained_inbound_payload_bytes(),
+            MAX_REASSEMBLY_BYTES
+        );
+        assert_eq!(
+            defaults.retained_outbound_payload_bytes(),
+            MAX_PENDING_LOGICAL_BYTES
+        );
+
+        let zero = RuntimeLimits {
+            max_pending_outbox: 0,
+            ..defaults
+        };
+        assert_eq!(
+            zero.validate(),
+            Err(RuntimeLimitsError::Zero("max_pending_outbox"))
+        );
+
+        let above_hard_maximum = RuntimeLimits {
+            max_reassembly_bytes: MAX_REASSEMBLY_BYTES + 1,
+            ..defaults
+        };
+        assert_eq!(
+            above_hard_maximum.validate(),
+            Err(RuntimeLimitsError::ExceedsHardMaximum(
+                "max_reassembly_bytes"
+            ))
+        );
+
+        let invalid_reserve = RuntimeLimits {
+            max_pending_logical_bytes: DEFERRED_WANT_EPOCH_RESERVE - 1,
+            ..defaults
+        };
+        assert_eq!(
+            invalid_reserve.validate(),
+            Err(RuntimeLimitsError::InvalidRelationship(
+                "deferred_want_epoch_reserve exceeds max_pending_logical_bytes"
+            ))
+        );
+
+        let (left_bundle, _) = bundles();
+        assert!(matches!(
+            RuntimeDriver::responder_with_limits(
+                left_bundle,
+                SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
+                FakeBackend::default(),
+                None,
+                zero,
+            ),
+            Err(RuntimeError::InvalidLimits(RuntimeLimitsError::Zero(
+                "max_pending_outbox"
+            )))
+        ));
+    }
+
+    #[test]
+    fn lowered_runtime_queue_limits_apply_backpressure() {
+        let limits = RuntimeLimits {
+            max_pending_outbox: 1,
+            max_pending_logical_bytes: 64 * 1024,
+            deferred_want_epoch_reserve: 0,
+            ..RuntimeLimits::default()
+        };
+        let (_left_driver, mut right_driver, _left, _right, _) =
+            authenticated_runtime_pair_with_limits(
+                41,
+                Priority::Routine,
+                RuntimeLimits::default(),
+                limits,
+            );
+        assert_eq!(right_driver.limits(), &limits);
+
+        let receipt = Message::Receipt(wire::Receipt {
+            exchange_id: 41,
+            object_id: ObjectId::new(ObjectKind::SourceEnvelope, [0x92; 32]),
+            total_len: 1,
+            received: vec![ByteRange { start: 0, end: 1 }],
+            complete: true,
+        });
+        right_driver.queue_sync_message(&receipt).unwrap();
+        assert!(matches!(
+            right_driver.queue_sync_message(&receipt),
+            Err(RuntimeError::Backpressure)
+        ));
+        assert_eq!(right_driver.outbox.len(), 1);
+
+        right_driver.outbox.clear();
+        assert!(matches!(
+            right_driver.queue_logical_once(
+                vec![0; 48 * 1024],
+                Priority::Routine,
+                wire::SEMANTIC_PROTOCOL_V1,
+            ),
+            Err(RuntimeError::Backpressure)
+        ));
+        assert!(right_driver.pending_logical_bytes() <= limits.max_pending_logical_bytes);
+    }
+
+    #[test]
+    fn lowered_reassembly_frame_limit_evicts_oldest_partial_route() {
+        let limits = RuntimeLimits {
+            max_in_flight_logical_frames: 1,
+            ..RuntimeLimits::default()
+        };
+        let (bundle, _) = bundles();
+        let mut driver = RuntimeDriver::responder_with_limits(
+            bundle,
+            SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
+            FakeBackend::default(),
+            None,
+            limits,
+        )
+        .unwrap();
+        let now = Instant::now();
+
+        assert!(driver.admit_fragment_route(10, CarrierRoute::Anonymous, now));
+        assert!(driver.admit_fragment_route(11, CarrierRoute::Anonymous, now));
+        assert_eq!(driver.fragment_routes.len(), 1);
+        assert!(!driver.fragment_routes.contains_key(&10));
+        assert!(driver.fragment_routes.contains_key(&11));
+    }
+
+    #[test]
+    fn authorization_generation_change_blocks_stale_outbound_flush() {
+        let (_current, mut stale, _current_link, stale_link, now) =
+            authenticated_runtime_pair(40, Priority::Routine);
+        assert_eq!(stale.admitted_authorization_generation, Some(0));
+        let object_id = ObjectId::new(ObjectKind::SourceEnvelope, [0x91; 32]);
+        stale
+            .queue_sync_message(&Message::Receipt(wire::Receipt {
+                exchange_id: 40,
+                object_id,
+                total_len: 1,
+                received: vec![ByteRange { start: 0, end: 1 }],
+                complete: true,
+            }))
+            .unwrap();
+        assert!(!stale.outbox.is_empty());
+        let captured_before = stale_link.capture.lock().unwrap().len();
+        let counters_before = stale.authorization_generation_counters();
+
+        stale
+            .backend
+            .authorization_generation
+            .store(1, Ordering::SeqCst);
+        assert!(matches!(
+            stale.pump_at(&stale_link, now),
+            Err(RuntimeError::AuthorizationGenerationChanged)
+        ));
+        assert_eq!(
+            stale.take_authorization_generation_check(),
+            Some(RuntimeAuthorizationGenerationCheck::Changed {
+                expected_generation: 0,
+                observed_generation: 1,
+            })
+        );
+        assert_eq!(
+            stale.authorization_generation_counters(),
+            RuntimeAuthorizationGenerationCounters {
+                checks: counters_before.checks + 1,
+                mismatches: counters_before.mismatches + 1,
+                unavailable: counters_before.unavailable,
+            }
+        );
+        assert_eq!(
+            stale_link.capture.lock().unwrap().len(),
+            captured_before,
+            "stale authorization must be rejected before the first link send"
+        );
+        assert!(stale.outbox.is_empty());
+        assert!(!stale.is_authenticated());
+    }
+
+    #[test]
+    fn commit_error_with_durable_authorization_change_preserves_checkpoint_and_reauthenticates() {
+        let (mut sender, mut receiver, left, right, now) =
+            authenticated_runtime_pair(401, Priority::Routine);
+        sender.retries.clear();
+        sender.deferred_wants.clear();
+        sender.outbox.clear();
+        receiver.retries.clear();
+        receiver.deferred_wants.clear();
+        receiver.outbox.clear();
+
+        let payload = b"mixed-authorization-activation".to_vec();
+        let object_id = ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(&payload));
+        prepare_expected_object(&mut receiver, 401, object_id);
+        receiver.backend_mut().fail_commit_attempts = 1;
+        receiver.backend_mut().advance_generation_on_commit_error = true;
+        receiver.backend_mut().terminal_commit_errors = true;
+        sender
+            .backend_mut()
+            .priorities
+            .insert(object_id, Priority::Flash);
+        sender
+            .queue_sync_message(&Message::Data(Data {
+                exchange_id: 401,
+                object_id,
+                total_len: payload.len() as u64,
+                offset: 0,
+                payload,
+                forwarding: b"authenticated-forwarding".to_vec(),
+            }))
+            .unwrap();
+        sender.pump_at(&left, now).unwrap();
+
+        let irreversible_before = receiver.irreversible_generation;
+        assert!(matches!(
+            receiver.pump_at(&right, now),
+            Err(RuntimeError::AuthorizationGenerationChanged)
+        ));
+        assert_eq!(
+            receiver.take_authorization_generation_check(),
+            Some(RuntimeAuthorizationGenerationCheck::Changed {
+                expected_generation: 0,
+                observed_generation: 1,
+            })
+        );
+        assert!(receiver.irreversible_generation > irreversible_before);
+        assert!(receiver.local_inventory_changed);
+        assert_eq!(
+            receiver
+                .inventory_refresh_retry
+                .as_ref()
+                .map(|retry| retry.scope),
+            Some(InventoryRefreshScope::Both)
+        );
+        assert!(!receiver.sync.inventory().contains(&object_id));
+        assert!(receiver.sync.wants().contains(&object_id));
+        assert!(receiver.backend().ingested.is_empty());
+        assert_eq!(receiver.backend().aborted, vec![object_id]);
+        assert!(
+            receiver.outbox.is_empty(),
+            "no completion receipt is emitted"
+        );
+        assert!(!receiver.is_authenticated());
+    }
+
+    #[test]
+    fn commit_error_with_unavailable_authorization_generation_fails_closed_without_receipt() {
+        let (mut sender, mut receiver, left, right, now) =
+            authenticated_runtime_pair(402, Priority::Routine);
+        sender.retries.clear();
+        sender.deferred_wants.clear();
+        sender.outbox.clear();
+        receiver.retries.clear();
+        receiver.deferred_wants.clear();
+        receiver.outbox.clear();
+
+        let payload = b"authorization-generation-unavailable".to_vec();
+        let object_id = ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(&payload));
+        prepare_expected_object(&mut receiver, 402, object_id);
+        receiver.backend_mut().fail_commit_attempts = 1;
+        receiver
+            .backend_mut()
+            .make_generation_unavailable_on_commit_error = true;
+        sender
+            .queue_sync_message(&Message::Data(Data {
+                exchange_id: 402,
+                object_id,
+                total_len: payload.len() as u64,
+                offset: 0,
+                payload,
+                forwarding: b"authenticated-forwarding".to_vec(),
+            }))
+            .unwrap();
+        sender.pump_at(&left, now).unwrap();
+
+        assert!(matches!(
+            receiver.pump_at(&right, now),
+            Err(RuntimeError::AuthorizationGenerationChanged)
+        ));
+        assert_eq!(
+            receiver.take_authorization_generation_check(),
+            Some(RuntimeAuthorizationGenerationCheck::Unavailable {
+                expected_generation: Some(0),
+            })
+        );
+        assert!(receiver.backend().ingested.is_empty());
+        assert!(receiver.outbox.is_empty());
+        assert!(!receiver.is_authenticated());
+    }
+
+    #[test]
+    fn external_admission_blocks_backend_and_sync_until_host_accepts() {
+        let (left_bundle, right_bundle) = bundles();
+        let left_backend = FakeBackend {
+            fail_authorize: true,
+            ..FakeBackend::default()
+        };
+        let mut initiator = RuntimeDriver::initiator(
+            left_bundle,
+            SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
+            left_backend,
+            StartRequest {
+                exchange_id: 41,
+                topics: vec!["alpha".into()],
+                scopes: vec!["mission/team".into()],
+                min_priority: Priority::Routine as u8,
+            },
+            None,
+        )
+        .unwrap();
+        let mut responder = RuntimeDriver::responder_with_start(
+            right_bundle,
+            SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
+            FakeBackend::default(),
+            StartRequest {
+                exchange_id: 1,
+                topics: vec!["alpha".into()],
+                scopes: vec!["mission/team".into()],
+                min_priority: Priority::Routine as u8,
+            },
+            None,
+        )
+        .unwrap();
+        initiator.require_external_admission().unwrap();
+        responder.require_external_admission().unwrap();
+        let (left, right) = MemoryLink::pair(256);
+        let now = Instant::now();
+
+        for _ in 0..64 {
+            initiator.pump_at(&left, now).unwrap();
+            responder.pump_at(&right, now).unwrap();
+            if initiator.awaiting_external_admission() && responder.awaiting_external_admission() {
+                break;
+            }
+        }
+
+        assert!(initiator.awaiting_external_admission());
+        assert!(responder.awaiting_external_admission());
+        assert_eq!(initiator.sync.active_exchange_id(), None);
+        assert_eq!(responder.sync.active_exchange_id(), None);
+        assert!(initiator.backend.selections.is_empty());
+        assert!(responder.backend.selections.is_empty());
+        let captured_before = (
+            left.capture.lock().unwrap().len(),
+            right.capture.lock().unwrap().len(),
+        );
+
+        for _ in 0..4 {
+            initiator.pump_at(&left, now).unwrap();
+            responder.pump_at(&right, now).unwrap();
+        }
+        assert_eq!(
+            captured_before,
+            (
+                left.capture.lock().unwrap().len(),
+                right.capture.lock().unwrap().len(),
+            )
+        );
+        assert!(matches!(
+            initiator.admit_authenticated(),
+            Err(RuntimeError::Backend(_))
+        ));
+    }
+
+    #[test]
+    fn accepted_external_admission_starts_normal_sync() {
+        let (left_bundle, right_bundle) = bundles();
+        let mut initiator = RuntimeDriver::initiator(
+            left_bundle,
+            SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
+            FakeBackend::default(),
+            StartRequest {
+                exchange_id: 42,
+                topics: vec!["alpha".into()],
+                scopes: vec!["mission/team".into()],
+                min_priority: Priority::Routine as u8,
+            },
+            None,
+        )
+        .unwrap();
+        let mut responder = RuntimeDriver::responder_with_start(
+            right_bundle,
+            SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
+            FakeBackend::default(),
+            StartRequest {
+                exchange_id: 1,
+                topics: vec!["alpha".into()],
+                scopes: vec!["mission/team".into()],
+                min_priority: Priority::Routine as u8,
+            },
+            None,
+        )
+        .unwrap();
+        initiator.require_external_admission().unwrap();
+        responder.require_external_admission().unwrap();
+        let (left, right) = MemoryLink::pair(256);
+        let now = Instant::now();
+
+        for _ in 0..64 {
+            initiator.pump_at(&left, now).unwrap();
+            responder.pump_at(&right, now).unwrap();
+            if initiator.awaiting_external_admission() && responder.awaiting_external_admission() {
+                break;
+            }
+        }
+        responder.admit_authenticated().unwrap();
+        initiator.admit_authenticated().unwrap();
+
+        for _ in 0..64 {
+            initiator.pump_at(&left, now).unwrap();
+            responder.pump_at(&right, now).unwrap();
+            if responder.sync.active_exchange_id() == Some(42) {
+                break;
+            }
+        }
+        assert_eq!(initiator.sync.active_exchange_id(), Some(42));
+        assert_eq!(responder.sync.active_exchange_id(), Some(42));
+        assert!(!initiator.awaiting_external_admission());
+        assert!(!responder.awaiting_external_admission());
+        assert!(matches!(
+            initiator.admit_authenticated(),
+            Err(RuntimeError::FailedState)
+        ));
+    }
+
+    #[test]
+    fn unadmitted_responder_does_not_consume_authenticated_sync_frames() {
+        let (left_bundle, right_bundle) = bundles();
+        let mut initiator = RuntimeDriver::initiator(
+            left_bundle,
+            SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
+            FakeBackend::default(),
+            StartRequest {
+                exchange_id: 43,
+                topics: vec!["alpha".into()],
+                scopes: vec!["mission/team".into()],
+                min_priority: Priority::Routine as u8,
+            },
+            None,
+        )
+        .unwrap();
+        let mut responder = RuntimeDriver::responder_with_start(
+            right_bundle,
+            SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
+            FakeBackend::default(),
+            StartRequest {
+                exchange_id: 1,
+                topics: vec!["alpha".into()],
+                scopes: vec!["mission/team".into()],
+                min_priority: Priority::Routine as u8,
+            },
+            None,
+        )
+        .unwrap();
+        initiator.require_external_admission().unwrap();
+        responder.require_external_admission().unwrap();
+        let (left, right) = MemoryLink::pair(256);
+        let now = Instant::now();
+
+        for _ in 0..64 {
+            initiator.pump_at(&left, now).unwrap();
+            responder.pump_at(&right, now).unwrap();
+            if initiator.awaiting_external_admission() && responder.awaiting_external_admission() {
+                break;
+            }
+        }
+        assert!(initiator.awaiting_external_admission());
+        assert!(responder.awaiting_external_admission());
+
+        initiator.admit_authenticated().unwrap();
+        for _ in 0..8 {
+            initiator.pump_at(&left, now).unwrap();
+            if !right.inbound.lock().unwrap().is_empty() {
+                break;
+            }
+        }
+        let queued = right.inbound.lock().unwrap().len();
+        assert!(
+            queued > 0,
+            "initiator should queue authenticated sync traffic"
+        );
+
+        for _ in 0..4 {
+            responder.pump_at(&right, now).unwrap();
+        }
+        assert_eq!(right.inbound.lock().unwrap().len(), queued);
+        assert_eq!(responder.sync.active_exchange_id(), None);
+        assert!(responder.backend.selections.is_empty());
+
+        responder.admit_authenticated().unwrap();
+        for _ in 0..64 {
+            responder.pump_at(&right, now).unwrap();
+            initiator.pump_at(&left, now).unwrap();
+            if responder.sync.active_exchange_id() == Some(43) {
+                break;
+            }
+        }
+        assert_eq!(responder.sync.active_exchange_id(), Some(43));
     }
 
     fn restored_bundle(bytes: &[u8]) -> ProvisioningBundle {
@@ -6131,6 +7307,9 @@ mod tests {
         }
         assert!(receiver.sync.inventory().contains(&object_id));
         assert_eq!(receiver.backend().ingested, vec![(object_id, [0xa5; 32])]);
+        assert!(receiver.take_local_inventory_changed());
+        assert!(!receiver.take_local_inventory_changed());
+        assert!(!provider.take_local_inventory_changed());
     }
 
     #[test]
@@ -6149,6 +7328,16 @@ mod tests {
         let sealed = vec![0x5c; 16 * 1_024];
         let object_id = ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(&sealed));
         provider.backend_mut().available.insert(object_id, sealed);
+        provider.local_inventory_changed().unwrap();
+        assert!(
+            provider
+                .sync()
+                .selected_serve_inventory()
+                .is_some_and(|inventory| inventory.contains(&object_id))
+        );
+        provider.retries.clear();
+        provider.deferred_wants.clear();
+        provider.outbox.clear();
         let offer = pending_offer_for(&mut receiver, 97, [object_id]);
         let snapshot_id = offer.snapshot_id;
         receiver
@@ -7476,6 +8665,10 @@ mod tests {
             });
         }
         items.sort_by_key(|item| item.object_id);
+        driver.local_inventory_changed().unwrap();
+        driver.retries.clear();
+        driver.deferred_wants.clear();
+        driver.outbox.clear();
         let replay = items.last().cloned().unwrap();
         let actions = driver
             .sync
@@ -7509,6 +8702,158 @@ mod tests {
             0,
             u64::try_from(MAX_DATA_PAYLOAD_BYTES).unwrap(),
         )));
+    }
+
+    #[test]
+    fn peer_neutral_durable_want_skips_unavailable_peer_and_resumes_with_another() {
+        let mut provisioner = ReferenceProvisioner::from_seed([0x71; 32]).unwrap();
+        let access = ProvisioningAccess::member(
+            Scope::new("mission/team").unwrap(),
+            vec![0],
+            vec![Topic::new("alpha").unwrap()],
+        )
+        .unwrap();
+        let requester_bytes = provisioner
+            .issue_node(1, std::slice::from_ref(&access))
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        let empty_peer_bytes = provisioner
+            .issue_node(2, std::slice::from_ref(&access))
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        let provider_bytes = provisioner
+            .issue_node(3, std::slice::from_ref(&access))
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        let payload = b"peer-neutral-resume".to_vec();
+        let object_id = ObjectId::for_envelope(EnvelopeId::from_sealed_bytes(&payload));
+        let split = payload.len() / 2;
+        let mut partial = vec![0; payload.len()];
+        partial[split..].copy_from_slice(&payload[split..]);
+        let progress = RuntimeTransferProgress {
+            object_id,
+            origin_semantic_version: Some(wire::SEMANTIC_PROTOCOL_V1),
+            total_len: payload.len() as u64,
+            received: vec![ByteRange {
+                start: split as u64,
+                end: payload.len() as u64,
+            }],
+        };
+        let mut requester_backend = FakeBackend {
+            durable_progress: vec![progress],
+            ..FakeBackend::default()
+        };
+        requester_backend.partial.insert(object_id, partial);
+        let request = |exchange_id| StartRequest {
+            exchange_id,
+            topics: vec!["alpha".into()],
+            scopes: vec!["mission/team".into()],
+            min_priority: Priority::Routine as u8,
+        };
+
+        let mut requester = RuntimeDriver::initiator(
+            ProvisioningBundle::from_bytes(&requester_bytes).unwrap(),
+            SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
+            requester_backend,
+            request(784),
+            None,
+        )
+        .unwrap();
+        let mut empty_peer = RuntimeDriver::responder(
+            ProvisioningBundle::from_bytes(&empty_peer_bytes).unwrap(),
+            SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
+            FakeBackend::default(),
+            None,
+        )
+        .unwrap();
+        let (requester_link, empty_link) = MemoryLink::pair(256);
+        let mut now = Instant::now();
+        for _ in 0..128 {
+            requester.pump_at(&requester_link, now).unwrap();
+            empty_peer.pump_at(&empty_link, now).unwrap();
+            now += Duration::from_secs(70);
+        }
+        let first_peer = requester.authenticated_peer().unwrap();
+        assert!(requester.is_authenticated());
+        assert!(empty_peer.is_authenticated());
+        assert_eq!(empty_peer.backend().data_requests, 0);
+        assert!(requester.sync().wants().contains(&object_id));
+        assert!(
+            requester
+                .retries
+                .keys()
+                .any(|key| matches!(key, RetryKey::Want(784, id) if *id == object_id))
+        );
+
+        let requester_backend = requester.into_backend();
+        let mut requester = RuntimeDriver::initiator(
+            ProvisioningBundle::from_bytes(&requester_bytes).unwrap(),
+            SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
+            requester_backend,
+            request(785),
+            None,
+        )
+        .unwrap();
+        let mut provider_backend = FakeBackend::default();
+        provider_backend.available.insert(object_id, payload);
+        let mut provider = RuntimeDriver::responder(
+            ProvisioningBundle::from_bytes(&provider_bytes).unwrap(),
+            SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
+            provider_backend,
+            None,
+        )
+        .unwrap();
+        let (requester_link, provider_link) = MemoryLink::pair(256);
+        for _ in 0..256 {
+            requester.pump_at(&requester_link, now).unwrap();
+            provider.pump_at(&provider_link, now).unwrap();
+            if requester
+                .backend()
+                .ingested
+                .iter()
+                .any(|(id, _)| *id == object_id)
+            {
+                break;
+            }
+            now += Duration::from_secs(70);
+        }
+        assert_ne!(requester.authenticated_peer(), Some(first_peer));
+        assert!(provider.backend().data_requests > 0);
+        assert_eq!(requester.backend().ingested, vec![(object_id, [0xa5; 32])]);
+        assert!(!requester.sync().wants().contains(&object_id));
+        assert!(
+            !requester
+                .retries
+                .keys()
+                .any(|key| matches!(key, RetryKey::Want(_, id) if *id == object_id))
+        );
+
+        // Silence is permitted only before a serve action, while the typed ID
+        // is absent from this contact's selected served view. If a previously
+        // selected object disappears and the backend is reached, its error
+        // remains contact-fatal rather than being reclassified as absence.
+        provider.backend_mut().available.remove(&object_id);
+        let stale = WantItem {
+            object_id,
+            total_len: None,
+            missing: Vec::new(),
+            need_forwarding: true,
+        };
+        let actions = provider
+            .sync
+            .apply(SyncEvent::Receive(Message::Want(crate::wire::Want {
+                exchange_id: 785,
+                items: vec![stale.clone()],
+            })))
+            .unwrap();
+        assert_eq!(actions, vec![SyncAction::Serve(stale)]);
+        assert!(matches!(
+            provider.handle_actions(actions),
+            Err(RuntimeError::Backend(message)) if message == "unknown"
+        ));
     }
 
     #[test]
