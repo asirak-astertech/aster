@@ -2042,6 +2042,31 @@ impl SqliteStore {
         })
     }
 
+    /// Test-only crash-window fixture: persist one already-provider-verified
+    /// control without running contiguous-prefix activation.
+    #[cfg(test)]
+    pub(crate) fn stage_verified_control_without_activation_for_test(
+        &mut self,
+        control: &VerifiedStoredControl,
+    ) -> Result<(), StoreError> {
+        let transaction = self.connection.transaction()?;
+        match insert_control_tx(&transaction, control)? {
+            ControlInsert::Inserted => {}
+            ControlInsert::Duplicate => {
+                return Err(StoreError::Invalid(
+                    "test fixture control was already staged".into(),
+                ));
+            }
+            ControlInsert::Rejected(_) => {
+                return Err(StoreError::Invalid(
+                    "test fixture control signer was already revoked".into(),
+                ));
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Opens an isolated SQLite database for tests and ephemeral nodes.
     pub fn open_in_memory(config: StoreConfig) -> Result<Self, StoreError> {
         validate_config(&config)?;
@@ -3399,6 +3424,15 @@ impl SqliteStore {
             .optional()?)
     }
 
+    /// Checks one exact durable ItemID without materializing its sealed bytes.
+    pub(crate) fn contains_item(&self, item_id: &ItemId) -> Result<bool, StoreError> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM items WHERE item_id=?1)",
+            params![item_id.as_slice()],
+            |row| row.get(0),
+        )?)
+    }
+
     pub(crate) fn stored_batch_materials_after(
         &self,
         after_order: Option<u64>,
@@ -4642,6 +4676,19 @@ impl SqliteStore {
         self.verified_bridge_authorizations
             .insert(verified.envelope_id);
         Ok(BridgeControlStage::Inserted)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stage_bridge_authorization_without_activation_for_test(
+        &mut self,
+        verified: &VerifiedBridgeAuthorization,
+    ) -> Result<(), StoreError> {
+        match self.stage_bridge_authorization(verified)? {
+            BridgeControlStage::Inserted | BridgeControlStage::Duplicate => Ok(()),
+            BridgeControlStage::Rejected(_) => Err(StoreError::Invalid(
+                "test fixture bridge control signer was already revoked".into(),
+            )),
+        }
     }
 
     /// Stores a provider-verified bridge control and advances only the

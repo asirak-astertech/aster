@@ -1,28 +1,40 @@
-//! Deterministic, process-shardable simulation laboratory for Aster Mesh.
+//! Deterministic and real-process laboratories for Aster Mesh.
 //!
-//! The laboratory is deliberately an application of the shipped public APIs:
-//! it provisions nodes, opens [`aster_host::MeshService`] instances, and joins
-//! them with an implementation of [`aster_mesh::link::Link`]. It does not call
-//! the reconciliation reducer, cryptographic provider, or store directly. The
-//! fault adapter parses only the public fragment header when a Blob test asks
-//! it to pause between complete logical messages. Fault choices, generated
-//! application bytes, and in-process simulation-only identities are
-//! deterministic for a configuration seed.
-//! Process-oriented live provisioning is separate and obtains credentials and
-//! carrier capabilities from operating-system entropy.
+//! The Gate-H profile exposes only the shared-node native mesh experiment.
+//! Historical single-contact simulations and live commands require the
+//! explicit `legacy-lab` compatibility feature.
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "legacy-lab")]
 pub mod live;
+pub mod mesh_experiment;
 
+use std::error::Error;
+
+/// Error result returned by a laboratory scenario.
+pub type LabResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
+
+#[cfg(feature = "legacy-lab")]
+pub use legacy_lab::*;
+
+#[cfg(feature = "legacy-lab")]
+#[rustfmt::skip]
+mod legacy_lab {
+use super::LabResult;
+use crate::live;
 use aster_host::{MeshService, ServiceOptions, SyncProfile};
 use aster_mesh::blob::{BlobMetadata, BlobStoreConfig, MAX_BLOB_CHUNK_SIZE, MIN_BLOB_CHUNK_SIZE};
+use aster_mesh::engine::NodeConfig;
 use aster_mesh::fragment::Fragment;
 use aster_mesh::link::{Link, LinkCharacteristics, ReceivedFrame};
+use aster_mesh::sync::{InterestFilter, InventoryPurpose};
+use aster_mesh::wire::EnvelopeId;
 use aster_mesh::{
-    ApplicationNodeOptions, DataClass, NodeId, Priority, ProvisioningAccess, PublishRequest, Query,
-    ReferenceProvisioner, Scope, Topic,
+    ApplicationNodeOptions, DataClass, NodeId, Priority, ProvisioningAccess, ProvisioningBundle,
+    PublishRequest, Query, ReferenceProvisioner, Scope, Topic, open_reference_node,
 };
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, VecDeque};
 use std::error::Error;
 use std::fs::{self, OpenOptions};
@@ -41,9 +53,6 @@ const MAX_LIVE_INVOCATIONS: u32 = 10_000;
 /// Marker placed in a simulation directory once the CLI has claimed that
 /// otherwise-empty directory for exactly one invocation.
 pub const SCENARIO_OWNERSHIP_FILE: &str = ".aster-lab-invocation";
-
-/// Error result returned by a laboratory scenario.
-pub type LabResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 /// Deterministic frame-fault and virtual-rate profile.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -123,6 +132,110 @@ pub struct BlobRecoveryScenario {
     pub restart_after_delivered_frames: u64,
     pub max_pumps_per_contact: u64,
     pub fault: FaultProfile,
+}
+
+/// Three-node Event custody control with a route-only durable intermediate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouteOnlyEventScenario {
+    pub root: PathBuf,
+    pub seed: u64,
+    pub payload_bytes: usize,
+    pub max_pumps_per_contact: u64,
+    pub fault: FaultProfile,
+    pub source_revision: String,
+    pub source_diff_sha256: String,
+    pub binary_sha256: String,
+}
+
+/// Exact semantic receipt for one route-only Event custody control.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouteOnlyEventReceipt {
+    pub seed: u64,
+    pub source_revision: String,
+    pub source_diff_sha256: String,
+    pub binary_sha256: String,
+    pub publisher: NodeId,
+    pub relay: NodeId,
+    pub consumer: NodeId,
+    pub item_id: [u8; 32],
+    pub envelope_id: [u8; 32],
+    pub payload_sha256: [u8; 32],
+    pub a_to_b_authenticated: bool,
+    pub relay_application_unreadable: bool,
+    pub relay_payload_absent_at_rest: bool,
+    pub relay_payload_digest_absent_at_rest: bool,
+    pub relay_logical_key_present_in_trusted_store: bool,
+    pub relay_reopened_with_source_envelope: bool,
+    pub b_to_c_authenticated: bool,
+    pub consumer_received_same_item: bool,
+    pub consumer_received_same_envelope: bool,
+    pub application_acknowledged: bool,
+    pub post_ack_deliveries: usize,
+    pub a_c_contact_count: u64,
+}
+
+impl RouteOnlyEventReceipt {
+    /// Canonical human- and machine-readable evidence record.
+    pub fn to_json(&self) -> String {
+        format!(
+            concat!(
+                "{{\n",
+                "  \"schema\": \"aster.phase0.route-only-event.v1\",\n",
+                "  \"seed\": {},\n",
+                "  \"source_revision\": \"{}\",\n",
+                "  \"source_diff_sha256\": \"{}\",\n",
+                "  \"binary_sha256\": \"{}\",\n",
+                "  \"publisher\": \"{}\",\n",
+                "  \"relay\": \"{}\",\n",
+                "  \"consumer\": \"{}\",\n",
+                "  \"item_id\": \"{}\",\n",
+                "  \"envelope_id\": \"{}\",\n",
+                "  \"payload_sha256\": \"{}\",\n",
+                "  \"a_to_b_authenticated\": {},\n",
+                "  \"relay_application_unreadable\": {},\n",
+                "  \"relay_payload_absent_at_rest\": {},\n",
+                "  \"relay_payload_digest_absent_at_rest\": {},\n",
+                "  \"relay_logical_key_present_in_trusted_store\": {},\n",
+                "  \"relay_reopened_with_source_envelope\": {},\n",
+                "  \"b_to_c_authenticated\": {},\n",
+                "  \"consumer_received_same_item\": {},\n",
+                "  \"consumer_received_same_envelope\": {},\n",
+                "  \"application_acknowledged\": {},\n",
+                "  \"post_ack_deliveries\": {},\n",
+                "  \"a_c_contact_count\": {}\n",
+                "}}"
+            ),
+            self.seed,
+            self.source_revision,
+            self.source_diff_sha256,
+            self.binary_sha256,
+            hex_bytes(&self.publisher),
+            hex_bytes(&self.relay),
+            hex_bytes(&self.consumer),
+            hex_bytes(&self.item_id),
+            hex_bytes(&self.envelope_id),
+            hex_bytes(&self.payload_sha256),
+            self.a_to_b_authenticated,
+            self.relay_application_unreadable,
+            self.relay_payload_absent_at_rest,
+            self.relay_payload_digest_absent_at_rest,
+            self.relay_logical_key_present_in_trusted_store,
+            self.relay_reopened_with_source_envelope,
+            self.b_to_c_authenticated,
+            self.consumer_received_same_item,
+            self.consumer_received_same_envelope,
+            self.application_acknowledged,
+            self.post_ack_deliveries,
+            self.a_c_contact_count,
+        )
+    }
+}
+
+/// Metrics plus the exact semantic receipt for one Phase-0 control trial.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouteOnlyEventResult {
+    pub metrics: LabMetrics,
+    pub receipt: RouteOnlyEventReceipt,
 }
 
 /// One scale-worker shard. Nodes form a store-and-forward chain inside the
@@ -469,6 +582,12 @@ impl NetworkProbe {
 
     fn allow_next_right_to_left_logical(&self) -> LabResult<()> {
         allow_next_logical(&self.right_to_left)
+    }
+
+    fn pending_frames(&self) -> LabResult<usize> {
+        let left_to_right = self.left_to_right.lock().map_err(lock_error)?.pending.len();
+        let right_to_left = self.right_to_left.lock().map_err(lock_error)?.pending.len();
+        Ok(left_to_right.saturating_add(right_to_left))
     }
 }
 
@@ -822,6 +941,313 @@ pub fn run_transfer(config: &TransferScenario) -> LabResult<LabMetrics> {
         )));
     }
     Ok(metrics)
+}
+
+/// Runs the Phase-0 Event control through a durable route-only intermediate.
+///
+/// The publisher and consumer never share a carrier. The relay first receives
+/// the stable source envelope, closes, is inspected and reopened from its
+/// durable store, and only then contacts the consumer. The returned receipt
+/// distinguishes opaque custody from application delivery and acknowledgement.
+pub fn run_route_only_event(config: &RouteOnlyEventScenario) -> LabResult<RouteOnlyEventResult> {
+    validate_route_only_event(config)?;
+    prepare_fresh_directory(&config.root)?;
+    let started = Instant::now();
+    let topic = Topic::new("lab.phase0.command")?;
+    let scope = Scope::new("lab/phase0")?;
+    let member = ProvisioningAccess::member(scope.clone(), vec![0], vec![topic.clone()])?;
+    let relay_access = ProvisioningAccess::relay(scope.clone(), vec![0])?;
+    let mut provisioner = ReferenceProvisioner::from_seed(seed_bytes(config.seed))?;
+    let publisher_bundle = Zeroizing::new(
+        provisioner
+            .issue_node(1, std::slice::from_ref(&member))?
+            .to_bytes()?,
+    );
+    let relay_bundle = Zeroizing::new(
+        provisioner
+            .issue_node(2, std::slice::from_ref(&relay_access))?
+            .to_bytes()?,
+    );
+    let consumer_bundle = Zeroizing::new(
+        provisioner
+            .issue_node(3, std::slice::from_ref(&member))?
+            .to_bytes()?,
+    );
+    let service_options = options(&topic, &scope, u64::try_from(config.payload_bytes)?, 1);
+    let publisher_root = config.root.join("publisher");
+    let relay_root = config.root.join("relay");
+    let consumer_root = config.root.join("consumer");
+    for node_root in [&publisher_root, &relay_root, &consumer_root] {
+        fs::create_dir_all(node_root)?;
+    }
+    let publisher_database = publisher_root.join("state.sqlite");
+    let relay_database = relay_root.join("state.sqlite");
+    let consumer_database = consumer_root.join("state.sqlite");
+    let publisher_blobs = publisher_root.join("blobs");
+    let relay_blobs = relay_root.join("blobs");
+    let consumer_blobs = consumer_root.join("blobs");
+
+    let mut publisher = MeshService::open(
+        &publisher_database,
+        &publisher_blobs,
+        publisher_bundle.as_slice(),
+        service_options.clone(),
+    )?;
+    let mut relay = MeshService::open(
+        &relay_database,
+        &relay_blobs,
+        relay_bundle.as_slice(),
+        service_options.clone(),
+    )?;
+    let mut consumer = MeshService::open(
+        &consumer_database,
+        &consumer_blobs,
+        consumer_bundle.as_slice(),
+        service_options.clone(),
+    )?;
+    let publisher_id = publisher.identity();
+    let relay_id = relay.identity();
+    let consumer_id = consumer.identity();
+    if publisher_id == relay_id || publisher_id == consumer_id || relay_id == consumer_id {
+        return Err(invalid(
+            "Phase-0 provisioning produced duplicate identities",
+        ));
+    }
+
+    let subscription =
+        consumer.subscribe(topic.clone(), scope.clone(), Some(DataClass::Event), false)?;
+    let logical_key = pattern_bytes(32, config.seed, 0x004b_4559);
+    let payload = pattern_bytes(config.payload_bytes, config.seed, 0x0043_4d44);
+    let payload_sha256: [u8; 32] = Sha256::digest(&payload).into();
+    let published = publisher.publish(PublishRequest {
+        class: DataClass::Event,
+        topic: topic.clone(),
+        scope: scope.clone(),
+        priority: Priority::Immediate,
+        ttl_ms: None,
+        logical_key: logical_key.clone(),
+        payload: payload.clone(),
+        tombstone: false,
+    })?;
+    if published.publisher != publisher_id {
+        return Err(invalid("Phase-0 publication changed publisher identity"));
+    }
+
+    let (publisher_link, relay_link, first_probe) = FaultLink::pair(
+        "phase0-a-b",
+        publisher_id,
+        relay_id,
+        config.fault.with_stream(0),
+    )?;
+    publisher.configure_peer_carrier(relay_id, publisher_link)?;
+    relay.configure_peer_carrier(publisher_id, relay_link)?;
+    publisher.begin_sync(relay_id)?;
+    relay.begin_sync(publisher_id)?;
+    let mut pump_calls = 0_u64;
+    let a_to_b_authenticated = drive_until_authenticated_quiet(
+        &mut publisher,
+        &mut relay,
+        &first_probe,
+        config.max_pumps_per_contact,
+        &mut pump_calls,
+    )?;
+    if !a_to_b_authenticated {
+        return Err(invalid("Phase-0 A-to-B contact did not authenticate"));
+    }
+    let relay_application_unreadable = match relay.query(Query {
+        topic: Some(topic.clone()),
+        scope: Some(scope.clone()),
+        class: Some(DataClass::Event),
+        logical_key: Some(logical_key.clone()),
+        limit: 2,
+        ..Query::default()
+    }) {
+        Ok(items) => items.is_empty(),
+        Err(_) => true,
+    };
+    if !relay_application_unreadable {
+        return Err(invalid(
+            "route-only relay exposed the Event through the application API",
+        ));
+    }
+    publisher.pause_sync()?;
+    relay.pause_sync()?;
+    drop(publisher);
+    drop(relay);
+
+    let source_envelope = single_data_envelope(
+        &publisher_database,
+        publisher_bundle.as_slice(),
+        &topic,
+        &scope,
+    )?;
+    let relay_envelope =
+        single_data_envelope(&relay_database, relay_bundle.as_slice(), &topic, &scope)?;
+    if source_envelope != relay_envelope {
+        return Err(invalid(
+            "route-only relay did not retain the exact source envelope",
+        ));
+    }
+    let payload_absent = !tree_contains_any(&relay_root, &[payload.as_slice()])?;
+    let payload_digest_absent = !tree_contains_any(&relay_root, &[payload_sha256.as_slice()])?;
+    let logical_key_absent = !tree_contains_any(&relay_root, &[logical_key.as_slice()])?;
+    if !payload_absent || !payload_digest_absent {
+        return Err(invalid(format!(
+            "route-only relay durable state canary scan failed: payload_absent={payload_absent}, payload_digest_absent={payload_digest_absent}, logical_key_absent={logical_key_absent}"
+        )));
+    }
+
+    let mut relay = MeshService::open(
+        &relay_database,
+        &relay_blobs,
+        relay_bundle.as_slice(),
+        service_options,
+    )?;
+    let relay_reopened_with_source_envelope = relay.identity() == relay_id;
+    if !relay_reopened_with_source_envelope {
+        return Err(invalid("route-only relay identity changed after reopen"));
+    }
+    let (relay_link, consumer_link, second_probe) = FaultLink::pair(
+        "phase0-b-c",
+        relay_id,
+        consumer_id,
+        config.fault.with_stream(1),
+    )?;
+    relay.configure_peer_carrier(consumer_id, relay_link)?;
+    consumer.configure_peer_carrier(relay_id, consumer_link)?;
+    relay.begin_sync(consumer_id)?;
+    consumer.begin_sync(relay_id)?;
+
+    let contact_start = pump_calls;
+    let mut delivered_item = None;
+    while pump_calls.saturating_sub(contact_start) < config.max_pumps_per_contact {
+        pump_pair(&mut relay, &mut consumer, &mut pump_calls)?;
+        if pump_calls.is_multiple_of(8) {
+            let deliveries = consumer.poll(subscription, 2)?;
+            if deliveries.len() > 1 {
+                return Err(invalid("Phase-0 consumer received duplicate deliveries"));
+            }
+            if let Some(delivery) = deliveries.into_iter().next() {
+                delivered_item = Some(delivery.item);
+                break;
+            }
+        }
+        wait_for_pair(&relay, &consumer, pump_calls);
+    }
+    let delivered = delivered_item.ok_or_else(|| {
+        invalid(format!(
+            "Phase-0 B-to-C contact produced no delivery within {} pump calls",
+            config.max_pumps_per_contact
+        ))
+    })?;
+    let b_to_c_authenticated = relay
+        .active_contact()
+        .is_some_and(|status| status.authenticated)
+        && consumer
+            .active_contact()
+            .is_some_and(|status| status.authenticated);
+    if !b_to_c_authenticated {
+        return Err(invalid("Phase-0 B-to-C delivery preceded authentication"));
+    }
+    let consumer_received_same_item = delivered.id == published.id
+        && delivered.publisher == publisher_id
+        && delivered.publisher_counter == published.publisher_counter
+        && delivered.class == DataClass::Event
+        && delivered.topic == topic
+        && delivered.scope == scope
+        && delivered.logical_key == logical_key
+        && delivered.payload == payload;
+    if !consumer_received_same_item {
+        return Err(invalid(
+            "Phase-0 consumer did not receive the exact A-authored Event",
+        ));
+    }
+    consumer.acknowledge(subscription, delivered.id)?;
+    for _ in 0..32 {
+        pump_pair(&mut relay, &mut consumer, &mut pump_calls)?;
+    }
+    let post_ack_deliveries = consumer.poll(subscription, 2)?.len();
+    if post_ack_deliveries != 0 {
+        return Err(invalid(
+            "Phase-0 consumer redelivered an acknowledged Event",
+        ));
+    }
+    let queried = consumer.query(Query {
+        topic: Some(topic.clone()),
+        scope: Some(scope.clone()),
+        class: Some(DataClass::Event),
+        logical_key: Some(logical_key),
+        limit: 2,
+        ..Query::default()
+    })?;
+    if queried.len() != 1 || queried[0].id != published.id {
+        return Err(invalid(
+            "Phase-0 consumer query did not retain the acknowledged Event",
+        ));
+    }
+    relay.pause_sync()?;
+    consumer.pause_sync()?;
+    drop(relay);
+    drop(consumer);
+
+    let consumer_envelope = single_data_envelope(
+        &consumer_database,
+        consumer_bundle.as_slice(),
+        &topic,
+        &scope,
+    )?;
+    let consumer_received_same_envelope = consumer_envelope == source_envelope;
+    if !consumer_received_same_envelope {
+        return Err(invalid(
+            "Phase-0 consumer did not retain the exact source envelope",
+        ));
+    }
+
+    let mut metrics = LabMetrics {
+        scenario: "phase0-route-only-event".into(),
+        seed: config.seed,
+        shards: 1,
+        nodes: 3,
+        published_items: 1,
+        delivered_items: 1,
+        pump_calls,
+        restarts: 1,
+        configured_bits_per_second: config.fault.bits_per_second,
+        configured_loss_per_mille: config.fault.loss_per_mille,
+        loss_window_frames: LOSS_WINDOW_FRAMES,
+        elapsed_ms: elapsed_ms(started),
+        converged: true,
+        ..LabMetrics::default()
+    };
+    first_probe.add_to(&mut metrics)?;
+    second_probe.add_to(&mut metrics)?;
+    Ok(RouteOnlyEventResult {
+        metrics,
+        receipt: RouteOnlyEventReceipt {
+            seed: config.seed,
+            source_revision: config.source_revision.clone(),
+            source_diff_sha256: config.source_diff_sha256.clone(),
+            binary_sha256: config.binary_sha256.clone(),
+            publisher: publisher_id,
+            relay: relay_id,
+            consumer: consumer_id,
+            item_id: published.id,
+            envelope_id: source_envelope.into_bytes(),
+            payload_sha256,
+            a_to_b_authenticated,
+            relay_application_unreadable,
+            relay_payload_absent_at_rest: payload_absent,
+            relay_payload_digest_absent_at_rest: payload_digest_absent,
+            relay_logical_key_present_in_trusted_store: !logical_key_absent,
+            relay_reopened_with_source_envelope,
+            b_to_c_authenticated,
+            consumer_received_same_item,
+            consumer_received_same_envelope,
+            application_acknowledged: true,
+            post_ack_deliveries,
+            a_c_contact_count: 0,
+        },
+    })
 }
 
 /// Runs a three-node Blob scenario: source first fills an alternate peer,
@@ -1233,6 +1659,22 @@ pub fn write_metrics(root: &Path, metrics: &LabMetrics) -> LabResult<PathBuf> {
     Ok(path)
 }
 
+/// Writes a Phase-0 semantic receipt exactly once.
+pub fn write_route_only_event_receipt(
+    root: &Path,
+    receipt: &RouteOnlyEventReceipt,
+) -> LabResult<PathBuf> {
+    let path = root.join("receipt.json");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    file.write_all(receipt.to_json().as_bytes())?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    Ok(path)
+}
+
 /// One atomically reserved evidence slot for a durable live-node invocation.
 ///
 /// The reservation marker is retained even when an invocation fails or the
@@ -1330,6 +1772,114 @@ fn write_metrics_at(path: &Path, metrics: &LabMetrics) -> LabResult<()> {
     file.write_all(b"\n")?;
     file.sync_all()?;
     Ok(())
+}
+
+fn drive_until_authenticated_quiet(
+    left: &mut MeshService,
+    right: &mut MeshService,
+    probe: &NetworkProbe,
+    limit: u64,
+    pump_calls: &mut u64,
+) -> LabResult<bool> {
+    let before = *pump_calls;
+    let mut previous_frames = probe.snapshot()?.frames_delivered;
+    let mut quiet_pumps = 0_u16;
+    while pump_calls.saturating_sub(before) < limit {
+        pump_pair(left, right, pump_calls)?;
+        let frames = probe.snapshot()?.frames_delivered;
+        let left_status = left.active_contact();
+        let right_status = right.active_contact();
+        let authenticated = left_status
+            .as_ref()
+            .is_some_and(|status| status.authenticated)
+            && right_status
+                .as_ref()
+                .is_some_and(|status| status.authenticated);
+        let no_pending_objects = left_status
+            .as_ref()
+            .is_some_and(|status| status.pending_objects == 0)
+            && right_status
+                .as_ref()
+                .is_some_and(|status| status.pending_objects == 0);
+        if authenticated && no_pending_objects && frames == previous_frames {
+            quiet_pumps = quiet_pumps.saturating_add(1);
+        } else {
+            quiet_pumps = 0;
+        }
+        previous_frames = frames;
+        if quiet_pumps >= 256 && probe.pending_frames()? == 0 {
+            return Ok(true);
+        }
+        wait_for_pair(left, right, *pump_calls);
+    }
+    Ok(false)
+}
+
+fn single_data_envelope(
+    database: &Path,
+    bundle: &[u8],
+    topic: &Topic,
+    scope: &Scope,
+) -> LabResult<EnvelopeId> {
+    let bundle = ProvisioningBundle::from_bytes(bundle)?;
+    let mut node = open_reference_node(database, bundle, NodeConfig::default())?;
+    let filter = InterestFilter {
+        topics: vec![topic.as_str().to_owned()],
+        scopes: vec![scope.as_str().to_owned()],
+        min_priority: Priority::Routine as u8,
+    };
+    let descriptors = node
+        .authorized_envelopes([0xff; 32], &[], &filter, InventoryPurpose::ReceiveBaseline)?
+        .into_iter()
+        .filter(|descriptor| !descriptor.control)
+        .collect::<Vec<_>>();
+    if descriptors.len() != 1 {
+        return Err(invalid(format!(
+            "expected one data envelope in {}, found {}",
+            database.display(),
+            descriptors.len()
+        )));
+    }
+    Ok(descriptors[0].envelope_id)
+}
+
+fn tree_contains_any(root: &Path, needles: &[&[u8]]) -> LabResult<bool> {
+    if !root.exists() {
+        return Ok(false);
+    }
+    let metadata = fs::symlink_metadata(root)?;
+    if metadata.file_type().is_symlink() {
+        return Err(invalid(format!(
+            "refusing to scan symbolic link {}",
+            root.display()
+        )));
+    }
+    if metadata.is_file() {
+        let bytes = fs::read(root)?;
+        return Ok(needles
+            .iter()
+            .filter(|needle| !needle.is_empty())
+            .any(|needle| bytes.windows(needle.len()).any(|window| window == *needle)));
+    }
+    if !metadata.is_dir() {
+        return Ok(false);
+    }
+    for entry in fs::read_dir(root)? {
+        if tree_contains_any(&entry?.path(), needles)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
 }
 
 fn drive_until_blob(
@@ -1496,6 +2046,35 @@ fn validate_transfer(config: &TransferScenario) -> LabResult<()> {
     }
     if config.max_pumps == 0 {
         return Err(invalid("transfer pump budget must be nonzero"));
+    }
+    Ok(())
+}
+
+fn validate_route_only_event(config: &RouteOnlyEventScenario) -> LabResult<()> {
+    config.fault.validate()?;
+    if config.payload_bytes < 32 || config.payload_bytes > 1024 * 1024 {
+        return Err(invalid(
+            "Phase-0 Event payload must be between 32 bytes and 1 MiB",
+        ));
+    }
+    if config.max_pumps_per_contact < 512 {
+        return Err(invalid("Phase-0 contact pump budget must be at least 512"));
+    }
+    validate_lower_hex("source revision", &config.source_revision, 40)?;
+    validate_lower_hex("source diff SHA-256", &config.source_diff_sha256, 64)?;
+    validate_lower_hex("binary SHA-256", &config.binary_sha256, 64)?;
+    Ok(())
+}
+
+fn validate_lower_hex(name: &str, value: &str, length: usize) -> LabResult<()> {
+    if value.len() != length
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(invalid(format!(
+            "{name} must contain exactly {length} lowercase hexadecimal characters"
+        )));
     }
     Ok(())
 }
@@ -1911,6 +2490,37 @@ mod tests {
     }
 
     #[test]
+    fn route_only_event_survives_reopen_and_is_acknowledged_by_consumer() {
+        let _guard = SCENARIO_TEST_LOCK.lock().unwrap();
+        let root = test_path("phase0-route-only-event");
+        let result = run_route_only_event(&RouteOnlyEventScenario {
+            root: root.clone(),
+            seed: 59,
+            payload_bytes: 1_024,
+            max_pumps_per_contact: 50_000,
+            fault: FaultProfile::default(),
+            source_revision: "11".repeat(20),
+            source_diff_sha256: "22".repeat(32),
+            binary_sha256: "33".repeat(32),
+        })
+        .unwrap();
+        assert!(result.metrics.converged);
+        assert_eq!(result.metrics.restarts, 1);
+        assert!(result.receipt.a_to_b_authenticated);
+        assert!(result.receipt.relay_application_unreadable);
+        assert!(result.receipt.relay_payload_absent_at_rest);
+        assert!(result.receipt.relay_payload_digest_absent_at_rest);
+        assert!(result.receipt.relay_reopened_with_source_envelope);
+        assert!(result.receipt.b_to_c_authenticated);
+        assert!(result.receipt.consumer_received_same_item);
+        assert!(result.receipt.consumer_received_same_envelope);
+        assert!(result.receipt.application_acknowledged);
+        assert_eq!(result.receipt.post_ack_deliveries, 0);
+        assert_eq!(result.receipt.a_c_contact_count, 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn shard_chain_republishes_received_objects() {
         let _guard = SCENARIO_TEST_LOCK.lock().unwrap();
         let root = test_path("shard");
@@ -2008,4 +2618,6 @@ mod tests {
         assert!(evidence.contains("\"converged\": false"));
         fs::remove_dir_all(root).unwrap();
     }
+}
+
 }

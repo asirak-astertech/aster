@@ -11,6 +11,7 @@ aster-core = { version = "=0.1.0", path = "../aster-core", features = ["adapter-
 getrandom.workspace = true
 hkdf.workspace = true
 sha2.workspace = true
+socket2.workspace = true
 subtle.workspace = true
 tokio.workspace = true
 

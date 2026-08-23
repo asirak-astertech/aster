@@ -973,8 +973,17 @@ impl SyncState {
             Message::Node(node) => self.receive_node(node, &mut actions)?,
             Message::Offer(offer) => self.receive_offer(offer, &mut actions)?,
             Message::Want(want) => {
-                for item in want.items {
-                    actions.push(SyncAction::Serve(item));
+                // Durable progress is intentionally peer-neutral, so a fresh
+                // contact may optimistically ask this node for an object it
+                // never advertised. Serve only from the current authenticated,
+                // policy-filtered view. Silence leaves the requester's bounded
+                // WANT retryable here or through a different peer.
+                if let Some(inventory) = &self.serve_inventory {
+                    for item in want.items {
+                        if inventory.contains(&item.object_id) {
+                            actions.push(SyncAction::Serve(item));
+                        }
+                    }
                 }
             }
             Message::Data(data) => self.receive_data(data, &mut actions)?,
@@ -2926,6 +2935,89 @@ mod tests {
                 ..
             }))]
         ));
+    }
+
+    #[test]
+    fn want_serving_requires_current_policy_filtered_inventory() {
+        let mut state = SyncState::new(SyncConfig::default(), SparseInventory::new()).unwrap();
+        let actions = state
+            .apply(SyncEvent::Receive(Message::Interest(Interest {
+                exchange_id: 43,
+                topics: vec!["mission".into()],
+                scopes: vec!["team".into()],
+                min_priority: 0,
+                max_offers: 2,
+            })))
+            .unwrap();
+        let (request_id, filter) = selection(&actions, InventoryPurpose::ServePeer);
+        let selected = id(1);
+        let unadvertised = id(2);
+        let want = |object_id| WantItem {
+            object_id,
+            total_len: None,
+            missing: Vec::new(),
+            need_forwarding: true,
+        };
+
+        assert!(
+            state
+                .apply(SyncEvent::Receive(Message::Want(Want {
+                    exchange_id: 43,
+                    items: vec![want(selected)],
+                })))
+                .unwrap()
+                .is_empty(),
+            "a WANT cannot bypass the pending policy selection"
+        );
+        state
+            .apply(SyncEvent::InventorySelected {
+                exchange_id: 43,
+                request_id,
+                purpose: InventoryPurpose::ServePeer,
+                filter,
+                inventory: SparseInventory::from_ids([selected]),
+            })
+            .unwrap();
+        assert_eq!(
+            state
+                .apply(SyncEvent::Receive(Message::Want(Want {
+                    exchange_id: 43,
+                    items: vec![want(selected), want(unadvertised)],
+                })))
+                .unwrap(),
+            vec![SyncAction::Serve(want(selected))]
+        );
+
+        let refresh = state.apply(SyncEvent::ServeInventoryChanged).unwrap();
+        let (request_id, filter) = selection(&refresh, InventoryPurpose::ServePeer);
+        assert!(
+            state
+                .apply(SyncEvent::Receive(Message::Want(Want {
+                    exchange_id: 43,
+                    items: vec![want(selected)],
+                })))
+                .unwrap()
+                .is_empty(),
+            "an invalidated served snapshot cannot authorize an in-flight WANT"
+        );
+        state
+            .apply(SyncEvent::InventorySelected {
+                exchange_id: 43,
+                request_id,
+                purpose: InventoryPurpose::ServePeer,
+                filter,
+                inventory: SparseInventory::new(),
+            })
+            .unwrap();
+        assert!(
+            state
+                .apply(SyncEvent::Receive(Message::Want(Want {
+                    exchange_id: 43,
+                    items: vec![want(selected)],
+                })))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

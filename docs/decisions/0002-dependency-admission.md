@@ -54,6 +54,13 @@ no component or version beyond the admitted workspace graph.
 
 ## Adopted for a bounded pilot only
 
+- The focused `aster-libp2p-provider` graph remains a non-production experiment,
+  not a selected carrier. [Decision 0027](0027-libp2p-pilot-dependency-policy.md)
+  records its exact active `paste` 1.0.15 path, dated removal/review gate, fuzz
+  exclusion, and the reviewed `BSD-2-Clause`, `ISC`, and `Zlib` external
+  dependency license expressions. The exception expires before any default,
+  release, deployment, or production use and grants no provider-selection or
+  production-security claim.
 - Rust `age` 0.11.5, exactly pinned with `default-features = false`, is admitted
   only in the isolated `aster-provisioning-age` crate for the classic X25519
   age-v1 provisioning-artifact profile. Its exact crates.io archive checksum is
@@ -131,4 +138,6 @@ that satisfies the rule above.
 
 No dependency owns data semantics, causality, key hierarchy, or synchronization
 correctness. All versions and transitive sources are locked and audited subject
-only to the explicit pilot exception above.
+only to the explicit active pilot exceptions above and the disabled, lock-only
+scanner disposition in
+[Decision 0026](0026-lock-only-hickory-advisories.md).

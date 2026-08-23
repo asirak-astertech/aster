@@ -4,6 +4,11 @@ exclude-dev = false
 
 [advisories]
 ignore = [
+  # Non-production libp2p-provider pilot only. paste is an unmaintained proc
+  # macro reached through libp2p-tcp -> if-watch -> netlink-packet-core, not a
+  # reported vulnerability. ADR 0027 records the exact graph, expiry, removal
+  # gate, and prohibition on treating this exception as production admission.
+  "RUSTSEC-2024-0436",
   # Non-production age-provider pilot only. This is an unmaintained build-time
   # localization proc macro, not a reported vulnerability. ADR 0018 records
   # the exact graph, future-compiler warning, removal gate, and prohibition on
@@ -15,12 +20,15 @@ ignore = [
 confidence-threshold = 0.93
 allow = [
   "Apache-2.0",
+  "BSD-2-Clause",
   "BSD-3-Clause",
   "BlueOak-1.0.0",
+  "ISC",
   "MIT",
   "MPL-2.0",
   "NCSA",
   "Unicode-3.0",
+  "Zlib",
 ]
 
 [bans]

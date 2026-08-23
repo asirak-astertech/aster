@@ -5,13 +5,33 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+autobins = false
 
 [dependencies]
 aster-core = { version = "=0.1.0", path = "../aster-core", features = ["adapter-sdk"] }
-aster-host = { version = "=0.1.0", path = "../aster-host" }
+aster-host = { version = "=0.1.0", path = "../aster-host", default-features = false }
 aster-ip = { version = "=0.1.0", path = "../aster-ip" }
+aster-libp2p-provider = { version = "=0.1.0", path = "../aster-libp2p-provider", optional = true }
 getrandom.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["macros"], optional = true }
 zeroize.workspace = true
+
+[features]
+default = ["legacy-lab"]
+legacy-lab = ["aster-host/legacy-single-contact-service"]
+gate-h = ["aster-host/gate-h-formal"]
+libp2p-candidate = ["dep:aster-libp2p-provider", "dep:tokio"]
+
+[[bin]]
+name = "aster-lab"
+path = "src/main.rs"
+required-features = ["legacy-lab"]
+
+[[bin]]
+name = "aster-gate-h"
+path = "src/gate_h_main.rs"
+required-features = ["gate-h"]
 
 [dev-dependencies]
 negentropy = "=0.5.1"

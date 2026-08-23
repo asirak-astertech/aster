@@ -433,6 +433,22 @@ pub enum ForwardedIngest {
     Control(ControlOutcome),
 }
 
+/// Internal control-ingest result which preserves the durable store outcome
+/// even when provider activation or rejection of the submitted input must be
+/// reported to the caller as an error.
+pub(crate) struct ObservedControlIngest {
+    pub(crate) outcome: ControlOutcome,
+    pub(crate) input_result: Result<(), EngineError>,
+}
+
+/// Internal forwarded-ingest result used by the process-owned semantic
+/// authority to observe every durable authorization activation before it
+/// propagates the submitted-input result.
+pub(crate) enum ObservedForwardedIngest {
+    Data(IngestReceipt),
+    Control(ObservedControlIngest),
+}
+
 /// One locally published, durably chained control object.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ControlPublishReceipt {
@@ -861,15 +877,28 @@ impl<S: RecordStore, E: EnvelopeSealer> Node<S, E> {
     }
 
     pub fn ingest_control(&mut self, sealed: &[u8]) -> Result<ControlOutcome, EngineError> {
+        let observed = self.ingest_control_observed(sealed)?;
+        observed.input_result?;
+        Ok(observed.outcome)
+    }
+
+    pub(crate) fn ingest_control_observed(
+        &mut self,
+        sealed: &[u8],
+    ) -> Result<ObservedControlIngest, EngineError> {
         if self.store.is_zeroized()? {
             return Err(StoreError::Zeroized.into());
         }
         let verified = self.envelopes.inspect_control(sealed)?;
         let stored = verified_stored_control(verified, sealed, self.clock.now_ms())?;
         let outcome = self.store.ingest_control(&stored)?;
-        self.activate_control_outcome(&outcome)?;
-        self.reject_uncommitted_control_input(&stored, &outcome)?;
-        Ok(outcome)
+        let input_result = self
+            .activate_control_outcome(&outcome)
+            .and_then(|()| self.reject_uncommitted_control_input(&stored, &outcome));
+        Ok(ObservedControlIngest {
+            outcome,
+            input_result,
+        })
     }
 
     /// Publishes a revocation as the next crash-atomic authority-chain link.
@@ -1613,6 +1642,29 @@ impl<S: RecordStore, E: EnvelopeSealer> Node<S, E> {
         sealed: &[u8],
         forwarding: &[u8],
     ) -> Result<ForwardedIngest, EngineError> {
+        match self.ingest_forwarded_observed(
+            authenticated_sender,
+            exchange_id,
+            envelope_id,
+            sealed,
+            forwarding,
+        )? {
+            ObservedForwardedIngest::Data(receipt) => Ok(ForwardedIngest::Data(receipt)),
+            ObservedForwardedIngest::Control(observed) => {
+                observed.input_result?;
+                Ok(ForwardedIngest::Control(observed.outcome))
+            }
+        }
+    }
+
+    pub(crate) fn ingest_forwarded_observed(
+        &mut self,
+        authenticated_sender: NodeId,
+        exchange_id: u64,
+        envelope_id: crate::wire::EnvelopeId,
+        sealed: &[u8],
+        forwarding: &[u8],
+    ) -> Result<ObservedForwardedIngest, EngineError> {
         if self.store.is_zeroized()? {
             return Err(StoreError::Zeroized.into());
         }
@@ -1636,9 +1688,13 @@ impl<S: RecordStore, E: EnvelopeSealer> Node<S, E> {
             VerifiedObject::Control(verified) => {
                 let stored = verified_stored_control(verified, sealed, self.clock.now_ms())?;
                 let outcome = self.store.ingest_control(&stored)?;
-                self.activate_control_outcome(&outcome)?;
-                self.reject_uncommitted_control_input(&stored, &outcome)?;
-                Ok(ForwardedIngest::Control(outcome))
+                let input_result = self
+                    .activate_control_outcome(&outcome)
+                    .and_then(|()| self.reject_uncommitted_control_input(&stored, &outcome));
+                Ok(ObservedForwardedIngest::Control(ObservedControlIngest {
+                    outcome,
+                    input_result,
+                }))
             }
             VerifiedObject::Data(verified) => {
                 if self
@@ -1670,7 +1726,7 @@ impl<S: RecordStore, E: EnvelopeSealer> Node<S, E> {
                     self.clock.custody_sample(),
                 );
                 let outcome = self.store.ingest(item)?;
-                Ok(ForwardedIngest::Data(IngestReceipt {
+                Ok(ObservedForwardedIngest::Data(IngestReceipt {
                     outcome,
                     merged: None,
                 }))
@@ -2031,6 +2087,18 @@ fn reduce_subscription_projection(
 }
 
 impl Node<SqliteStore, crate::crypto::ReferenceEnvelopeSealer> {
+    #[cfg(test)]
+    pub(crate) fn stage_control_without_activation_for_test(
+        &mut self,
+        sealed: &[u8],
+    ) -> Result<(), EngineError> {
+        let verified = self.envelopes.inspect_control(sealed)?;
+        let stored = verified_stored_control(verified, sealed, self.clock.now_ms())?;
+        self.store
+            .stage_verified_control_without_activation_for_test(&stored)?;
+        Ok(())
+    }
+
     /// Rebuilds process-local batch proof authority and reauthenticates every
     /// accepted compact representation after the durable store is reopened.
     /// Pending proof/item promotion remains a semantic-runtime responsibility
@@ -3243,6 +3311,7 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct ControlTrackingSealer {
+        data: TestSealer,
         controls: Arc<Mutex<BTreeMap<Vec<u8>, VerifiedControl>>>,
         activated: Arc<Mutex<Vec<Vec<u8>>>>,
     }
@@ -3276,24 +3345,20 @@ mod tests {
     }
 
     impl EnvelopeSealer for ControlTrackingSealer {
-        fn seal(&mut self, _request: SealRequest<'_>) -> Result<SealedEnvelope, EnvelopeError> {
-            Err(EnvelopeError(
-                "data sealing is not used by this test".into(),
-            ))
+        fn seal(&mut self, request: SealRequest<'_>) -> Result<SealedEnvelope, EnvelopeError> {
+            self.data.seal(request)
         }
 
-        fn inspect(&mut self, _sealed: &[u8]) -> Result<VerifiedEnvelope, EnvelopeError> {
-            Err(EnvelopeError("not a test data envelope".into()))
+        fn inspect(&mut self, sealed: &[u8]) -> Result<VerifiedEnvelope, EnvelopeError> {
+            self.data.inspect(sealed)
         }
 
         fn open_payload(
             &mut self,
-            _envelope: &VerifiedEnvelope,
-            _sealed: &[u8],
+            envelope: &VerifiedEnvelope,
+            sealed: &[u8],
         ) -> Result<Vec<u8>, EnvelopeError> {
-            Err(EnvelopeError(
-                "data opening is not used by this test".into(),
-            ))
+            self.data.open_payload(envelope, sealed)
         }
 
         fn inspect_control(&mut self, sealed: &[u8]) -> Result<VerifiedControl, EnvelopeError> {
@@ -3327,6 +3392,17 @@ mod tests {
             } else {
                 Err(EnvelopeError("invalid test forwarding metadata".into()))
             }
+        }
+
+        fn peer_can_route(
+            &self,
+            peer: NodeId,
+            peer_route_commitments: &[[u8; 32]],
+            scope: &Scope,
+            epoch: u64,
+        ) -> bool {
+            self.data
+                .peer_can_route(peer, peer_route_commitments, scope, epoch)
         }
 
         fn zeroize(&mut self) -> Result<(), EnvelopeError> {
@@ -3642,6 +3718,75 @@ mod tests {
         ));
         assert_eq!(node.store.scope_epoch(&scope()).unwrap(), 1);
         assert_eq!(sealer.activated(), vec![accepted]);
+    }
+
+    #[test]
+    fn flash_only_serves_controls_but_custodies_immediate_application_data() {
+        let sealer = ControlTrackingSealer::default();
+        let authority = [0x61; 32];
+        let sealed = b"flash-only signed control".to_vec();
+        let control_id = sealer.register_scope_epoch(sealed.clone(), authority, 1);
+        let store = InMemoryStore::new(StoreConfig::default()).unwrap();
+        let mut node = Node::with_store([0x62; 32], store, sealer, NodeConfig::default());
+        let mut immediate = request(DataClass::Event, b"custody", b"held immediate event");
+        immediate.priority = Priority::Immediate;
+        let published = node.publish(immediate).unwrap();
+        let data_id = crate::wire::EnvelopeId::from(
+            node.store_mut()
+                .get(&published.id)
+                .unwrap()
+                .unwrap()
+                .envelope_id,
+        );
+        assert!(matches!(
+            node.ingest_control(&sealed).unwrap(),
+            ControlOutcome::Applied { .. }
+        ));
+        node.set_emission_policy(EmissionPolicy {
+            minimum_priority: Some(Priority::Flash),
+        });
+        let peer = [0x63; 32];
+        let grant = TestSealer::route_commitment(peer, &scope(), 0);
+        let filter = crate::sync::InterestFilter {
+            topics: vec![topic().as_str().to_owned()],
+            scopes: vec![scope().as_str().to_owned()],
+            min_priority: Priority::Routine as u8,
+        };
+        let inventory = node
+            .authorized_envelopes(
+                peer,
+                &[grant],
+                &filter,
+                crate::sync::InventoryPurpose::ServePeer,
+            )
+            .unwrap();
+        assert_eq!(inventory.len(), 1);
+        assert_eq!(inventory[0].envelope_id, control_id);
+        assert!(inventory[0].control);
+        assert!(!inventory.iter().any(|entry| entry.envelope_id == data_id));
+        assert_eq!(node.query(StoreQuery::default()).unwrap().len(), 1);
+        let (total_len, priority, read) = node
+            .read_authorized_envelope_range(
+                peer,
+                &[],
+                control_id,
+                ChunkRange::new(0, sealed.len() as u64).unwrap(),
+                usize::MAX,
+            )
+            .unwrap();
+        assert_eq!(total_len, sealed.len() as u64);
+        assert_eq!(priority, Priority::Flash);
+        assert_eq!(read, sealed);
+        assert!(matches!(
+            node.read_authorized_envelope_range(
+                peer,
+                &[grant],
+                data_id,
+                ChunkRange::new(0, 1).unwrap(),
+                1,
+            ),
+            Err(EngineError::Unauthorized(node)) if node == peer
+        ));
     }
 
     #[test]

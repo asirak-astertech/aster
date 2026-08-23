@@ -5,7 +5,15 @@ ENV PATH="/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 WORKDIR /work
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN cargo build --locked --release -p aster-lab -p aster-ip --bins
+ARG LAB_ASTER_FEATURES=aster-lab/default
+ARG LAB_ASTER_BINARY=aster-lab
+RUN cargo build --locked --release -p aster-lab \
+    --bin "${LAB_ASTER_BINARY}" \
+    --no-default-features \
+    --features "${LAB_ASTER_FEATURES}"
+RUN cargo build --locked --release -p aster-ip --bins
+RUN cp "/work/target/release/${LAB_ASTER_BINARY}" \
+    /work/target/release/candidate-aster-lab
 
 FROM ${LAB_BASE_IMAGE} AS runtime
 ENV PATH="/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -22,7 +30,7 @@ RUN apt-get update \
         iproute2 iputils-ping nftables procps tcpdump \
         > /usr/share/aster-lab/runtime-package-inventory.tsv \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=build /work/target/release/aster-lab /usr/local/bin/aster-lab
+COPY --from=build /work/target/release/candidate-aster-lab /usr/local/bin/aster-lab
 COPY --from=build /work/target/release/aster-relay /usr/local/bin/aster-relay
 COPY LICENSE /usr/share/licenses/aster/LICENSE
 ENTRYPOINT ["/usr/local/bin/aster-lab"]

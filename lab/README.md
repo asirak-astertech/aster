@@ -192,6 +192,71 @@ still reference-to-reference simulation evidence; it is not adversarial
 credential-secrecy, cryptographic-strength, or independent-implementation
 interoperability evidence.
 
+## Route-only Event custody control
+
+`route-only-event` is Proposal 0001's Phase-0 prerequisite. It provisions an
+A publisher, a route-only durable B intermediate, and a C consumer. A and C
+never receive a carrier path. B receives the stable source envelope, closes,
+is inspected and reopened from the same durable store, and then forwards the
+unchanged A-authored Event to C. C application-acknowledges it and a second poll
+must be empty.
+
+Each run requires exact provenance for the uncommitted experiment build:
+
+```sh
+target/release/aster-lab route-only-event \
+  --root lab/runs/phase0-route-only-event-01 \
+  --seed 1001 --payload-bytes 1024 --max-pumps 50000 \
+  --source-revision 9a8a87e11785c98fd1069cb2338c4076f4c728cb \
+  --source-diff-sha256 796fac56ef87b1b16062ebfb1514bc0a15135fd72b01c51582a29dcbe2256ad8 \
+  --binary-sha256 ebb712065ce2006bdf6c112c989977b854ed51dfae445c02cc602d4d35294bad
+```
+
+Those exact values identify the retained 2026-08-21 Phase-0 run; a new build
+must supply its own revision, `git diff --binary` digest, and binary digest.
+The command creates `metrics.json`, `receipt.json`, and three independent node
+stores without overwriting an existing root. The receipt separates durable
+custody, application readability, exact ItemID/EnvelopeID continuity, and
+application acknowledgement. A raw-store scan requires payload and payload
+SHA-256 canaries to be absent at B. It separately reports whether the logical
+key is retained as protected mesh forwarding metadata.
+
+This control uses the deterministic in-memory fault carrier. It proves the
+data-plane prerequisite, not IP discovery, NAT traversal, concurrent contacts,
+or an operational mesh.
+
+## Automatic three-process LAN mesh demo
+
+Proposal 0001's shared controller runs the complete local A→B→C demonstration
+with three independent processes and stores. It is a dry run unless
+`--execute` is present. Given a Linux release binary, one command provisions
+the nodes, publishes a random command Event, discovers A↔B without peer
+locators, stops A, restarts route-only B, discovers B↔C, delivers and
+application-acknowledges the exact source item, reconnects A to check duplicate
+suppression, writes the receipt, and removes only its temporary networks and
+containers:
+
+```sh
+python3 lab/ip_mesh_experiment.py \
+  --arm native --scenario primary \
+  --binary target-linux/release/aster-lab \
+  --root lab/runs/manual-native-ip-mesh \
+  --trials 1 --execute
+```
+
+The final human-checkable result is
+`lab/runs/manual-native-ip-mesh/trial-01/result.json`. A passing receipt must
+show `passed=true`, the same ItemID and EnvelopeID through custody and delivery,
+application acknowledgement, no post-ack redelivery, duplicate suppression,
+internal-only networks, and `a_c_contact_count=0`.
+
+This is the retained native LAN oracle from [Proposal 0001's result](../docs/proposals/0001-ip-mesh-vertical-slice-results.md).
+It deliberately does not claim manual peering, NAT traversal, connectivity
+relay fallback, or fair large-peer scheduling. The historical Iroh and
+rust-libp2p comparison binaries and exact commands are bound to experiment
+checkpoint `117770259680d89e5fbd1ff1f6c3df9f3e646e6c`; they are not continuing
+production dependencies.
+
 ## Cgroup-v2 resource capture
 
 The default workload creates one logical node with a 10,000-item metadata set

@@ -17,3 +17,6 @@
 
 # Fuzz inputs are byte-oriented, even when a particular seed looks textual.
 fuzz/corpus/** -text
+
+# Preserve this hash-frozen comparison receipt byte-for-byte (registered CRLF).
+docs/evaluations/0005/results/stack-comparison.csv -text

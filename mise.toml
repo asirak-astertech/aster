@@ -2,6 +2,7 @@
 rust = "1.97.1"
 go = "1.26.7"
 python = "3.13.7"
+ripgrep = "15.2.0"
 
 [env]
 RUST_BACKTRACE = "1"
@@ -52,7 +53,7 @@ description = "Run the algorithm-error-tolerant 100,000-item diagnostic"
 run = "ASTER_BAKEOFF_MAX_ITEMS=100000 ASTER_BAKEOFF_ALLOW_ALGORITHM_ERRORS=1 cargo test --release --locked -p aster-lab --test reconciliation_bakeoff emit_reconciliation_bakeoff_matrix -- --ignored --nocapture"
 
 [tasks.dependency-exception-scope]
-description = "Verify the age pilot advisory exception cannot escape its admitted graph"
+description = "Verify active pilot and lock-only advisory dispositions cannot escape their reviewed graphs"
 run = [
   "sh ./tools/check-dependency-exception-scope.sh",
   "sh ./tools/test-dependency-exception-scope.sh",

@@ -1,4 +1,6 @@
 /target/
+/target-linux/
+/target-linux-*/
 /fuzz/target/
 /fuzz/artifacts/
 **/__pycache__/

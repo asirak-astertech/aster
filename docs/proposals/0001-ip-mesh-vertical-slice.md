@@ -2,9 +2,10 @@
 
 > ****
 
-- Status: proposed — research experiment; no dependency admitted
+- Status: completed — no production winner; no dependency admitted
 - Date: 2026-08-21
-- Owner: unassigned — required before acceptance for experiment
+- Owner: Aster Clean Team — execution authorized in the designated project
+  task on 2026-08-21
 - Decision target: a new architecture decision after the experiment
 - Proposed execution cap: 30 engineer-days after acceptance; this is a stop
   limit, not an effort estimate
@@ -16,6 +17,39 @@
   [0014](../decisions/0014-total-assurance-build-vs-buy.md),
   [0015](../decisions/0015-library-backed-mechanism-reduction.md), and
   [0016](../decisions/0016-tokio-relay-host-boundary.md)
+
+## Activation record — 2026-08-21
+
+Execution is authorized from starting baseline
+`9a8a87e11785c98fd1069cb2338c4076f4c728cb`, with requirements SHA-256
+`e88bcc6c717a5175a460205fdc084aaa2e1f020a142a84087f9881677da02987`.
+Every run must additionally record the exact experiment commit and worktree
+state used to produce it.
+
+The following provisional choices close the proposal's execution questions
+without deciding the eventual production profile:
+
+- stable carrier identities may be exposed inside the isolated experiment and
+  must be measured; production acceptability remains a result-ADR decision;
+- the clean LAN handoff timeout is 60 seconds per A→B or B→C contact, while
+  the impaired 3 kbps/50%-loss bound remains ten minutes;
+- settled automatic-discovery traffic must average no more than 4 KiB per node
+  per minute after a two-minute settling interval, measured including UDP/IP
+  headers but excluding link-layer framing;
+- the provisional binary, RAM, and idle-CPU screening thresholds stated below
+  are accepted for this experiment, not ratified as product requirements;
+- the first host must support at least two simultaneous authenticated Aster
+  contacts at B, with a configurable bound; the staged offline custody path is
+  still tested separately;
+- the NAT profile uses two independently translated node networks and one
+  separately isolated, locally controlled rendezvous/connectivity-relay
+  network; it must test direct traversal first and forced relay fallback;
+- the first integration is an embedded Rust host plus the `aster-lab`
+  demonstration; non-Rust bindings remain a measured follow-on gap; and
+- a production-eligible dependency must have an exact transitive SBOM and
+  license/advisory review, a usable private vulnerability-reporting route,
+  published support expectations, and a named Aster update owner. Missing
+  evidence may block production selection but does not abort technical trials.
 
 ## Summary
 
@@ -720,5 +754,56 @@ upstream references for the hypotheses are:
 
 ## Dated outcome
 
-No outcome yet. Append the completed result here; do not replace the proposal's
-original hypotheses, gates, or recorded failures.
+### 2026-08-21 — Completed with no production winner
+
+Native UDP, Iroh, and rust-libp2p each passed 30/30 clean three-process LAN
+vertical-slice trials, including automatic locator-free discovery, Aster mutual
+authentication, route-only B custody across restart, exact A-authored ItemID
+delivery at C, application acknowledgement, and duplicate suppression. All
+three also passed the exercised discovery-disabled, two-simultaneous-contact,
+and capture-canary lanes.
+
+No arm satisfied the complete mandatory gate set. The shared implementations
+lacked manual peering, emission-policy linkage, fair 100-peer scheduling, NAT
+direct/fallback composition, and relay-loss reconnect. Iroh failed the
+provisional idle discovery-traffic threshold. Quinn had no runnable host. The
+required deterministic netem seed was unsupported by the pinned environment,
+so the live impaired-IP cell was blocked rather than replaced by an unseeded
+pass. No arm was eligible for Phase C and no dependency was selected.
+
+The complete measurements, failed-run ledger, evidence identities, gate matrix,
+supply-chain results, and next boundary are in the
+[result report](0001-ip-mesh-vertical-slice-results.md). Decision
+[0022](../decisions/0022-ip-mesh-experiment-no-selection.md) records the
+no-selection disposition.
+
+## Progress log
+
+### 2026-08-21 — Phase 0 passed
+
+The sequential route-only Event prerequisite passed 10/10 clean trials using
+seeds 1001 through 1010. Every trial retained the exact source ItemID and
+EnvelopeID through A→B, restarted B from its durable store, delivered the same
+A-authored object through B→C, application-acknowledged it once at C, observed
+zero post-ack redeliveries, and configured no A↔C contact.
+
+B's route-only application API exposed no Event. Raw durable-state canary scans
+found neither payload plaintext nor the payload SHA-256. They did find the
+logical key inside the trusted Aster store; the receipt records that fact
+explicitly because the current profile treats it as protected forwarding
+metadata visible at the authenticated mesh-membership layer. Candidate-owned
+carrier caches and logs remain subject to the stricter Phase-A privacy gate.
+
+This checkpoint proves only the data-plane prerequisite over the deterministic
+in-memory fault carrier. It is not IP, discovery, concurrent-contact, NAT, or
+operational mesh evidence. Exact provenance, commands, failures, receipt hashes,
+and the aggregate manifest digest are retained in
+`evidence/IP_MESH_EXPERIMENT_20260821.md` and the referenced `lab/runs`
+directories.
+
+The current fixed-address UDP control was then rebuilt from the experiment
+worktree and run in two independent containers. Both nodes mutually
+authenticated, each published one Event, and each observed both Events. This
+confirms the current real-UDP carrier still works, but the run explicitly used
+configured peer IP addresses and ports and therefore does not satisfy Phase A
+discovery or mesh-host gates.
