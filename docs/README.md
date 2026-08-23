@@ -62,7 +62,7 @@ the authority for what application code is expected to touch.
 | Live synchronization | The default compatibility build can run application logic in-process through `MeshService`; a separate native three-process Gate-H CLI exists for the shared-node experiment | The shared-node Gate-H cohort passed 10/10, but C, Go, and Python still do not have an in-process networking API. The out-of-process local agent is post-MVP; see [ADR 0008](decisions/0008-local-agent-phasing.md). |
 | C ABI | High-level offline application operations | No event-gap inspection, merge-policy registration, retention-driven garbage collection, sealed objects, cryptographic provider, or carrier configuration |
 | Go and Python | First-class wrappers over the C ABI | The same C ABI boundaries apply; build and load the matching native library first |
-| IP adapter | UDP link with manual peer mapping, protected discovery support, rendezvous helpers, opaque relay components, and the provider-free native Gate-H harness | The formal provider-free Gate-H evidence passed; corrected provider comparison is authorized, but no IP provider is selected. Production NAT, relay/path recovery, and physical-network acceptance remain separate. |
+| IP adapter | UDP link with manual peer mapping, protected discovery support, rendezvous helpers, opaque relay components, and the provider-free native Gate-H harness | The formal provider-free Gate-H evidence passed. Proposal 0004's provider comparison is closed with no arm selected; the rust-libp2p code is only a publish-disabled, opt-in test oracle. Production NAT, relay/path recovery, and physical-network acceptance remain separate. |
 | BTLE adapter | MTU-aware `Link` over the `BleRadio` platform seam | A platform-specific OS radio implementation is not shipped |
 
 See [Conformance](conformance.md) and [CI](ci.md) for the precise evidence behind
@@ -82,6 +82,7 @@ capability claim until a later decision and implementation evidence say so.
 - [0003 — Idiomatic IP mesh provider comparison](proposals/0003-idiomatic-ip-mesh-provider-comparison.md)
 - [0003 result — No provider selected; refactor durable node ownership first](proposals/0003-idiomatic-ip-mesh-provider-results.md)
 - [0004 — Shared-node rust-libp2p retest](proposals/0004-shared-node-libp2p-retest.md)
+- [0004 result — Provider-free Gate H retained; no provider selected](proposals/0004-shared-node-libp2p-retest-results.md)
 - [0005 — Requirements-first FOSS architecture evaluation](proposals/0005-requirements-first-foss-architecture-evaluation.md)
 - [0006 — Selected FOSS reference stack build and validation](proposals/0006-selected-foss-reference-stack.md)
 
@@ -110,6 +111,7 @@ decision records explain why the current design chose its major boundaries:
 - [0025 — Requirements-first FOSS architecture evaluation](decisions/0025-requirements-first-foss-architecture-evaluation.md)
 - [0026 — Scope lock-only Hickory advisories](decisions/0026-lock-only-hickory-advisories.md)
 - [0027 — Bound the active libp2p pilot dependency exceptions](decisions/0027-libp2p-pilot-dependency-policy.md)
+- [0029 — Close Proposal 0004 without selecting rust-libp2p](decisions/0029-close-proposal-0004-libp2p-pilot.md)
 
 ## All documents
 

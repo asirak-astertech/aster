@@ -1,6 +1,5 @@
 # Decision 0025: Run a requirements-first FOSS architecture evaluation
 
-> ****
 
 - Status: accepted — evaluation governance only; no implementation selected
 - Date: 2026-08-22
@@ -106,3 +105,12 @@ selection gates here.
 - Any selected architecture requires a later decision with exact composition,
   measured evidence, residual bespoke work, migration/deletion plan, and
   production admission disposition.
+
+## Proposal 0004 disposition — 2026-08-23
+
+The permission for Proposal 0004 to continue independently is now exhausted.
+Its provider-free Gate-H prerequisite passed, but neither eligible arm reached
+a formal comparative Phase-0/Phase-1 result and later phases did not run.
+[Decision 0029](0029-close-proposal-0004-libp2p-pilot.md) closes it with no
+provider selected. Historical component characterization remains bounded
+evidence and supplies no selection or production credit.

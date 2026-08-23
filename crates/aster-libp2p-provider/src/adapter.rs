@@ -14,7 +14,10 @@ use libp2p::{
     dcutr, identify,
     identity::Keypair,
     memory_connection_limits, noise, relay,
-    swarm::{ConnectionId, NetworkBehaviour, SwarmEvent, dial_opts::DialOpts},
+    swarm::{
+        ConnectionId, NetworkBehaviour, SwarmEvent,
+        dial_opts::{DialOpts, PeerCondition},
+    },
     tcp, yamux,
 };
 use libp2p_autonat as autonat;
@@ -329,9 +332,6 @@ impl Libp2pAdapter {
     }
 
     pub fn dial(&mut self, candidate: DialCandidate) -> Result<ConnectionId, AdapterError> {
-        if self.pending_dials.len() >= self.config.max_pending_connections as usize {
-            return Err(AdapterError::Capacity("pending dial candidates"));
-        }
         // A discovery dial is an ordinary carrier attempt, not a hole punch.
         // A fresh source port prevents simultaneous dials from collapsing into
         // one TCP simultaneous-open where both Noise sides assume dialer role.
@@ -345,6 +345,35 @@ impl Libp2pAdapter {
                 .allocate_new_port()
                 .build(),
         };
+        self.submit_dial(opts)
+    }
+
+    /// Dials a known peer even while its predecessor connection remains live.
+    ///
+    /// The caller must still use the two-phase replacement API before the new
+    /// connection can carry Aster traffic. This method changes only libp2p's
+    /// dial condition; it does not select or activate the new session.
+    pub fn dial_replacement(
+        &mut self,
+        candidate: DialCandidate,
+    ) -> Result<ConnectionId, AdapterError> {
+        let peer_id = candidate
+            .expected_peer_id
+            .ok_or(AdapterError::InvalidConfig(
+                "replacement dial requires an expected PeerId",
+            ))?;
+        let opts = DialOpts::peer_id(peer_id)
+            .condition(PeerCondition::Always)
+            .addresses(vec![candidate.address])
+            .allocate_new_port()
+            .build();
+        self.submit_dial(opts)
+    }
+
+    fn submit_dial(&mut self, opts: DialOpts) -> Result<ConnectionId, AdapterError> {
+        if self.pending_dials.len() >= self.config.max_pending_connections as usize {
+            return Err(AdapterError::Capacity("pending dial candidates"));
+        }
         let connection_id = opts.connection_id();
         self.swarm
             .dial(opts)
@@ -677,11 +706,303 @@ fn map_nat_status(status: autonat::NatStatus) -> NatReachability {
 mod tests {
     use super::*;
 
+    #[derive(NetworkBehaviour)]
+    struct ControlledRelayBehaviour {
+        relay: relay::Behaviour,
+        identify: identify::Behaviour,
+    }
+
+    fn controlled_relay_server() -> Swarm<ControlledRelayBehaviour> {
+        SwarmBuilder::with_new_identity()
+            .with_tokio()
+            .with_tcp(
+                tcp::Config::default().nodelay(true),
+                noise::Config::new,
+                || bounded_yamux(8),
+            )
+            .expect("controlled relay transport must build")
+            .with_behaviour(|key| {
+                let local_peer_id = key.public().to_peer_id();
+                ControlledRelayBehaviour {
+                    relay: relay::Behaviour::new(
+                        local_peer_id,
+                        relay::Config {
+                            max_reservations: 2,
+                            max_reservations_per_peer: 1,
+                            reservation_duration: Duration::from_secs(30),
+                            reservation_rate_limiters: Vec::new(),
+                            max_circuits: 2,
+                            max_circuits_per_peer: 1,
+                            max_circuit_duration: Duration::from_secs(30),
+                            max_circuit_bytes: 1_048_576,
+                            circuit_src_rate_limiters: Vec::new(),
+                        },
+                    ),
+                    identify: identify::Behaviour::new(identify::Config::new(
+                        "/aster/controlled-relay/1".to_owned(),
+                        key.public(),
+                    )),
+                }
+            })
+            .expect("controlled relay behaviour must build")
+            .with_swarm_config(|config| {
+                config.with_idle_connection_timeout(Duration::from_secs(30))
+            })
+            .build()
+    }
+
     #[test]
     fn stable_composite_swarm_builds_without_mdns_or_stream_alpha() {
         let adapter =
             Libp2pAdapter::new(Keypair::generate_ed25519(), AdapterConfig::default()).unwrap();
         assert_ne!(adapter.local_peer_id(), PeerId::random());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn identify_and_controlled_autonat_v1_are_live_behaviours() {
+        tokio::time::timeout(Duration::from_secs(35), async {
+            let mut client =
+                Libp2pAdapter::new(Keypair::generate_ed25519(), AdapterConfig::default()).unwrap();
+            let mut server =
+                Libp2pAdapter::new(Keypair::generate_ed25519(), AdapterConfig::default()).unwrap();
+            let client_peer = client.local_peer_id();
+            let server_peer = server.local_peer_id();
+
+            client
+                .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+                .unwrap();
+            server
+                .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+                .unwrap();
+            let client_address = loop {
+                if let ProviderEvent::Listening { address } = client.next_event().await {
+                    break address;
+                }
+            };
+            let server_address = loop {
+                if let ProviderEvent::Listening { address } = server.next_event().await {
+                    break address;
+                }
+            };
+
+            client
+                .add_autonat_server(server_peer, Some(server_address.clone()))
+                .unwrap();
+            client
+                .dial(DialCandidate {
+                    expected_peer_id: Some(server_peer),
+                    address: server_address,
+                })
+                .unwrap();
+
+            let mut client_identified_server = false;
+            let mut server_identified_client = false;
+            let mut client_observed_public = false;
+            while !client_identified_server || !server_identified_client || !client_observed_public
+            {
+                tokio::select! {
+                    event = client.next_event() => match event {
+                        ProviderEvent::IdentifyObserved {
+                            session,
+                            observed_address,
+                            supports_aster,
+                        } if session.peer_id == server_peer => {
+                            assert!(supports_aster);
+                            assert!(!observed_address.is_empty());
+                            client_identified_server = true;
+                        }
+                        ProviderEvent::NatStatusChanged {
+                            old: NatReachability::Unknown,
+                            new: NatReachability::Public(address),
+                        } => {
+                            let mut expected_address = client_address.clone();
+                            expected_address
+                                .push(libp2p::multiaddr::Protocol::P2p(client_peer));
+                            assert_eq!(address, expected_address);
+                            client_observed_public = true;
+                        }
+                        _ => {}
+                    },
+                    event = server.next_event() => match event {
+                        ProviderEvent::IdentifyObserved {
+                            session,
+                            observed_address,
+                            supports_aster,
+                        } if session.peer_id == client_peer => {
+                            assert!(supports_aster);
+                            assert!(!observed_address.is_empty());
+                            server_identified_client = true;
+                        }
+                        _ => {}
+                    },
+                }
+            }
+        })
+        .await
+        .expect("Identify and controlled AutoNAT v1 must finish before the hard deadline");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn controlled_relay_and_dcutr_upgrade_emit_exact_path_events() {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let mut relay = controlled_relay_server();
+            let relay_peer = *relay.local_peer_id();
+            relay
+                .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+                .unwrap();
+            let relay_address = loop {
+                if let SwarmEvent::NewListenAddr { address, .. } = relay.select_next_some().await {
+                    break address;
+                }
+            };
+            relay.add_external_address(relay_address.clone());
+            let mut relay_dial_address = relay_address.clone();
+            relay_dial_address.push(libp2p::multiaddr::Protocol::P2p(relay_peer));
+
+            let mut source =
+                Libp2pAdapter::new(Keypair::generate_ed25519(), AdapterConfig::default()).unwrap();
+            let mut destination =
+                Libp2pAdapter::new(Keypair::generate_ed25519(), AdapterConfig::default()).unwrap();
+            let source_peer = source.local_peer_id();
+            let destination_peer = destination.local_peer_id();
+            source
+                .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+                .unwrap();
+            destination
+                .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+                .unwrap();
+            while !matches!(source.next_event().await, ProviderEvent::Listening { .. }) {}
+            while !matches!(
+                destination.next_event().await,
+                ProviderEvent::Listening { .. }
+            ) {}
+
+            destination
+                .reserve_relay(relay_dial_address.clone())
+                .unwrap();
+            let mut reservation_accepted = false;
+            let mut destination_relay_address = None;
+            while !reservation_accepted || destination_relay_address.is_none() {
+                tokio::select! {
+                    event = destination.next_event() => match event {
+                        ProviderEvent::RelayReservationAccepted {
+                            relay_peer_id,
+                            renewal: false,
+                        } if relay_peer_id == relay_peer => {
+                            reservation_accepted = true;
+                        }
+                        ProviderEvent::Listening { address }
+                            if address.iter().any(|protocol| {
+                                protocol == libp2p::multiaddr::Protocol::P2pCircuit
+                            }) => {
+                            destination_relay_address = Some(address);
+                        }
+                        _ => {}
+                    },
+                    _ = relay.select_next_some() => {}
+                }
+            }
+
+            source
+                .dial(DialCandidate {
+                    expected_peer_id: Some(destination_peer),
+                    address: destination_relay_address.expect("relay listener was observed"),
+                })
+                .unwrap();
+
+            let mut source_relayed = None;
+            let mut destination_relayed = None;
+            let mut source_direct = None;
+            let mut destination_direct = None;
+            let mut source_circuit = false;
+            let mut destination_circuit = false;
+            let mut successful_hole_punches = 0_u8;
+            // DCUtR reports completion for locally initiated direct attempts.
+            // TCP simultaneous-open may resolve the other peer's attempt as an
+            // inbound connection, so require one successful completion plus a
+            // direct carrier on both peers instead of a completion per peer.
+            while source_relayed.is_none()
+                || destination_relayed.is_none()
+                || source_direct.is_none()
+                || destination_direct.is_none()
+                || !source_circuit
+                || !destination_circuit
+                || successful_hole_punches == 0
+            {
+                tokio::select! {
+                    event = source.next_event() => match event {
+                        ProviderEvent::CarrierEstablished {
+                            session,
+                            path: CarrierPath::Relayed,
+                            ..
+                        } if session.peer_id == destination_peer => source_relayed = Some(session),
+                        ProviderEvent::CarrierEstablished {
+                            session,
+                            path: CarrierPath::Direct,
+                            ..
+                        } if session.peer_id == destination_peer => source_direct = Some(session),
+                        ProviderEvent::RelayCircuitEstablished {
+                            peer_id,
+                            inbound: false,
+                        } if peer_id == relay_peer => source_circuit = true,
+                        ProviderEvent::HolePunchFinished {
+                            peer_id,
+                            direct_connection,
+                            error,
+                        } if peer_id == destination_peer => {
+                            assert_eq!(direct_connection.is_some(), error.is_none());
+                            successful_hole_punches += u8::from(direct_connection.is_some());
+                        }
+                        _ => {}
+                    },
+                    event = destination.next_event() => match event {
+                        ProviderEvent::CarrierEstablished {
+                            session,
+                            path: CarrierPath::Relayed,
+                            ..
+                        } if session.peer_id == source_peer => destination_relayed = Some(session),
+                        ProviderEvent::CarrierEstablished {
+                            session,
+                            path: CarrierPath::Direct,
+                            ..
+                        } if session.peer_id == source_peer => destination_direct = Some(session),
+                        ProviderEvent::RelayCircuitEstablished {
+                            peer_id,
+                            inbound: true,
+                        } if peer_id == source_peer => destination_circuit = true,
+                        ProviderEvent::HolePunchFinished {
+                            peer_id,
+                            direct_connection,
+                            error,
+                        } if peer_id == source_peer => {
+                            assert_eq!(direct_connection.is_some(), error.is_none());
+                            successful_hole_punches += u8::from(direct_connection.is_some());
+                        }
+                        _ => {}
+                    },
+                    _ = relay.select_next_some() => {}
+                }
+            }
+
+            assert!(successful_hole_punches >= 1);
+
+            assert_ne!(
+                source_relayed
+                    .expect("source relayed carrier")
+                    .connection_id,
+                source_direct.expect("source direct carrier").connection_id,
+            );
+            assert_ne!(
+                destination_relayed
+                    .expect("destination relayed carrier")
+                    .connection_id,
+                destination_direct
+                    .expect("destination direct carrier")
+                    .connection_id,
+            );
+        })
+        .await
+        .expect("controlled relay and DCUtR upgrade must finish before the hard deadline");
     }
 
     #[test]
