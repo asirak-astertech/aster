@@ -110,6 +110,7 @@ service, a conventional database or broker will usually be simpler.
 
 | Area | Purpose |
 |---|---|
+| [`crates/aster-profile`](crates/aster-profile) | Requirements-owned item vocabulary and stable reconciliation ordering |
 | [`crates/aster-core`](crates/aster-core) | Data model, durable store, reducers, security, and synchronization |
 | [`crates/aster-host`](crates/aster-host) | High-level node plus authenticated contact and carrier composition |
 | [`crates/aster-ip`](crates/aster-ip) | Nonblocking UDP/IP link, discovery, rendezvous, and opaque relay support |

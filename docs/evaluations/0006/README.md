@@ -1,6 +1,5 @@
 # Proposal 0006 selected-stack result
 
-> ****
 
 ## Decision
 
@@ -116,7 +115,9 @@ qualification.
 The recommendation narrows implementation, not the requirements. The next
 stages must add and separately prove:
 
-1. a normative, independently implemented item/profile and class semantics;
+1. a normative item/profile and class semantics plus a second independently
+   implemented stack; the corrected evaluation v0-r2 corpus now has 18/18
+   parser agreement, but remains explicitly non-product seed material;
 2. durable reconciliation-session progression, fallback, any-peer resume, and
    hostile bounds;
 3. one persistent temporal scheduler and mission propagation-policy owner;

@@ -1304,9 +1304,11 @@ async fn direct_replacement_fresh_authentication(payload_bytes: usize) -> LabRes
 
 #[tokio::test(flavor = "current_thread")]
 async fn two_persistent_swarms_drive_ten_thousand_runtime_frames_each_way() -> LabResult<()> {
-    tokio::time::timeout(Duration::from_secs(120), real_two_node_bridge())
+    // This bounds deadlock; it is not a throughput gate. In the shared debug
+    // suite this current-thread oracle competes with other CPU-heavy lab tests.
+    tokio::time::timeout(Duration::from_secs(300), real_two_node_bridge())
         .await
-        .map_err(|_| invalid("real libp2p volume bridge timed out after 120 seconds"))??;
+        .map_err(|_| invalid("real libp2p volume bridge timed out after 300 seconds"))??;
     Ok(())
 }
 

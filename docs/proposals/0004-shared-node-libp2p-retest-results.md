@@ -1,6 +1,5 @@
 # Proposal 0004 result: shared-node baseline retained; no provider selected
 
-> ****
 
 - Status: superseded — stopped before formal Phase 0; no arm selected
 - Date: 2026-08-23
@@ -49,7 +48,7 @@ provider:
 - evidence-index SHA-256
   `7ac26490c89c124681c98a0c226c4592c2e03dba525802f311618454b39afee9`.
 
-The raw Gate-H evidence remains in the privileged local evidence store and is
+The raw Gate-H evidence remains in the local evidence store and is
 not committed in this public tree. A later post-hoc revalidation attempt was
 stopped because local Git configuration no longer matched the frozen receipt.
 The historical hashes and disposition are retained; this result does not call
@@ -61,9 +60,15 @@ The version-controlled closure tree preserves the final development checkpoint
 before closure. Its exact source files are:
 
 - `crates/aster-lab/src/mesh_experiment/libp2p_candidate.rs` — SHA-256
-  `ab6a866c5e02bdacaa490135c0d5ad7a89de6e866655d79ed0cab7f6b8ec2e33`;
+  `7b12a8f028593729a36a1bc524cff09939c803bc168b36959e6fb576d6dfa1fe`;
 - `crates/aster-libp2p-provider/src/adapter.rs` — SHA-256
   `eb9ab9ef50cf248042872f993d114c37c0af4399792945426b9504061503ec22`.
+
+The lab source hash includes a watchdog-only stabilization made after a slow
+shared CI runner exhausted the original 120-second bound while continuing far
+beyond the required frame count. The bound is now 300 seconds; the workload
+and every delivery, durability, backpressure, stream, identity, and resource
+assertion are unchanged. This is a deadlock bound, not throughput credit.
 
 Its locked, offline, localhost-only validation passed:
 

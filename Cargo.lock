@@ -261,6 +261,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "aster-profile"
+version = "0.1.0"
+
+[[package]]
 name = "aster-provisioning-age"
 version = "0.1.0"
 dependencies = [

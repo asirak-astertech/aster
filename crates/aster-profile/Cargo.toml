@@ -1,0 +1,10 @@
+[package]
+name = "aster-profile"
+description = "Requirements-owned data profile primitives for Aster replication"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
