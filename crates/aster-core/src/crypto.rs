@@ -20,10 +20,12 @@ pub(crate) use reference::{
 };
 pub use reference::{
     ProvisioningAccess, ProvisioningBundle, ReferenceAuthenticatedSession, ReferenceEnvelopeSealer,
-    ReferenceNode, ReferenceProvisioner, ReferenceSessionAwaitingFinished,
-    ReferenceSessionInitiator, ReferenceSessionResponder, ReferenceSessionResponderPending,
-    ScopeRekeyPlan, ScopeRekeyRecipient, open_reference_node,
+    ReferenceProvisioner, ReferenceSessionAwaitingFinished, ReferenceSessionInitiator,
+    ReferenceSessionResponder, ReferenceSessionResponderPending, ScopeRekeyPlan,
+    ScopeRekeyRecipient,
 };
+#[cfg(feature = "sqlite-store")]
+pub use reference::{ReferenceNode, open_reference_node};
 #[cfg(test)]
 pub(crate) use reference::{SessionPrivacyCanaries, session_privacy_canaries};
 

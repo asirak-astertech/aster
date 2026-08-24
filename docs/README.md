@@ -5,24 +5,34 @@ need to understand the wire format or cryptography to embed the application API.
 
 ## Start here
 
-1. Read [Core concepts](concepts.md) for the ten-minute mental model.
-2. Run one local quickstart:
-   [Rust](quickstart/rust.md), [Python](quickstart/python.md),
-   [Go](quickstart/go.md), or [C](quickstart/c.md).
-3. Read [Carriers and contacts](transports.md) when you are ready to move data
+1. Run the one-command [capability tour](quickstart/capability-tour.md) for the
+   fastest visible result.
+2. Read [Core concepts](concepts.md) for the ten-minute mental model and the
+   [selected architecture](architecture.md) for its trust boundaries.
+3. Run the full [live N-node, multi-process mesh CLI](quickstart/mesh-cli.md), or exercise the
+   current semantic application API with the [Rust](quickstart/rust.md),
+   [Python](quickstart/python.md), [Go](quickstart/go.md), or
+   [C](quickstart/c.md) quickstart.
+4. Read [Carriers and contacts](transports.md) when you are ready to move data
    between nodes.
-4. Review [Security and production gates](security.md) before designing a real
+5. Review [Security and production gates](security.md) before designing a real
    provisioning or deployment process.
 
-The local quickstarts deliberately begin offline. This is Aster's foundational
-contract: publish, query, and subscription behavior must work without a live
-peer. Networking is a deployment concern layered onto that durable local API.
+The application quickstarts deliberately begin offline. This is Aster's
+foundational contract: publish, query, and subscription behavior must work
+without a live peer. The selected carrier/storage quickstart separately proves
+real process and contact mechanics, including runtime mission authentication
+before inventory disclosure, while the remaining proven semantic behavior is
+migrated onto that composition.
 
 ## Find a guide by goal
 
 | I want to… | Read… |
 |---|---|
+| See Aster work as quickly as possible | [Capability tour](quickstart/capability-tour.md) |
 | Understand what makes Aster different | [Project overview](../README.md) and [Core concepts](concepts.md) |
+| Understand the selected components and trust boundaries | [Selected architecture](architecture.md) |
+| Run real node processes and watch Ping/Pong or captured-node control propagation cross the mesh | [Live mesh CLI](quickstart/mesh-cli.md) |
 | Choose between State, Event, Record, and Blob | [Choosing a data class](concepts.md#choosing-a-data-class) |
 | Publish and subscribe from an application | [Language quickstarts](quickstart/README.md) |
 | See commented examples for every data class and common operation | [Application recipes](application-recipes.md) |
@@ -33,6 +43,7 @@ peer. Networking is a deployment concern layered onto that durable local API.
 | Build or embed a language binding | [Binding pattern](bindings/pattern.md), [C ABI](../bindings/c/README.md), [Go](../bindings/go/README.md), and [Python](../bindings/python/README.md) |
 | Implement an independent compatible node | [Protocol](protocol.md), [wire grammar](wire.cddl), and [security objects](envelope.md) |
 | Run validation or interpret evidence | [CI](ci.md), [Conformance](conformance.md), [Lab](../lab/README.md), and the test-only [reconciliation bake-off](reconciliation-bakeoff.md) |
+| See which source requirements the selected composition has actually reached | [Production implementation requirements status](implementation/requirements-status.md) |
 
 ## Documentation types
 
@@ -56,17 +67,19 @@ the authority for what application code is expected to touch.
 
 | Surface | Available now | Important boundary |
 |---|---|---|
-| Rust application API | Publish, query, durable subscriptions, conflicts, batches, streamed Blobs, emission policy, status, bridges, and recipient-filtered rekey | Event-gap inspection, process-local merge-policy ID registration, and retention-driven garbage collection are Rust-only. Policy registration only annotates high-level conflict results; replicated ingestion never executes application policy. Automatic Record merge under requirements §5.3 is partial. The complete authority-side rekey-registry administration workflow is not shipped. |
+| Selected carrier/storage composition | Exact source-sealed control/Event transfer, a durable ordered Flash-control prefix with atomic policy activation, mission-bound semantic/causal/operation state, bounded route-only cache, a durable terminal software-zeroization intent, clock-independent Negentropy difference, direct Iroh exchange, and the `aster` composition/CLI. The runtime uses the existing `aster-core` mission-session, control-envelope, recipient-filtered-rekey, and source-envelope providers. | Carrier, mission, control/source, route, and content authority remain distinct. State/Record/Blob, generalized applications/subscriptions and control administration, finite-TTL custody, protected provisioning, NAT/hosted relay, BTLE, platform-complete zeroization assurance, and release gates remain open. The selected node's normal graph contains no SQLite. |
+| Selected live CLI | Configurable 2–32-node Ping/Pong line, explicit four-role control scenario, addressed `init`/`inspect`/mission-provisioned `node`, stopped-state authority commands, a same-UID Unix `zeroize` hook, and isolated legacy `put`; built-in relay/Ping/Pong application roles | Current-tree N=3/13-process, default N=4/18-process, and N=8/38-process Ping/Pong receipts plus the explicit N=4/23-process control receipt passed. The generic line uses `2N+1` isolated cohorts and `5N-2` children: peerless Ping and Pong publication, one exact pre-existing Event transfer per directed edge with all control counters zero, and a final no-op with all 11 reconciliation counters zero. The control receipt separately proves control convergence, no-contact Ping publication, later relay forwarding, four causal Pong barriers, and a zero-transfer no-op; its captured node deliberately retains stale signing material because exclusion is not destruction. A separate live-child receipt exercises the local hook. Retained stderr is disclosed in the [quickstart](quickstart/mesh-cli.md). The hook preserves data rows and zero-length artifact pathnames and does not prove non-Unix behavior, inode deletion, physical sanitization, database rollback resistance, physical networking, many-node scale, or production authorization. |
+| Current semantic Rust API | Publish, query, durable subscriptions, conflicts, batches, streamed Blobs, emission policy, status, bridges, recipient-filtered rekey, hybrid-PQ handshakes, protected envelopes, and source authentication in `aster-core` | This remains the proven semantic implementation and migration source. The selected node now uses its mission-session, control-envelope/rekey, and Event source-envelope seams; the broader high-level API and other data classes are not composed yet. Event-gap inspection, process-local merge-policy ID registration, and retention-driven garbage collection are Rust-only; automatic Record merge is partial. |
 | Protected provisioning | Replaceable, bounded Rust protection boundary with a redacted, zeroizing Aster-owned plaintext container, plus an isolated age-v1 X25519 provider pilot | The pilot is Rust-only, non-production, classical rather than post-quantum, and not FIPS validated or a persistent secret store; upstream age encryption and identity-decoding intermediates are not comprehensively zeroized, and raw fixture/compatibility paths remain in Rust and all language bindings. |
-| Rust composition host | Provider-neutral `MeshHost`, the default-gated legacy `MeshService`, and a Proposal-0004 shared-node supervisor that owns one durable authority across contact sessions | The shared-node experiment baseline passed formal Gate H. The formal `aster-gate-h` build compile-excludes `MeshService` and the legacy CLI; no provider is selected. |
-| Live synchronization | The default compatibility build can run application logic in-process through `MeshService`; a separate native three-process Gate-H CLI exists for the shared-node experiment | The shared-node Gate-H cohort passed 10/10, but C, Go, and Python still do not have an in-process networking API. The out-of-process local agent is post-MVP; see [ADR 0008](decisions/0008-local-agent-phasing.md). |
-| C ABI | High-level offline application operations | No event-gap inspection, merge-policy registration, retention-driven garbage collection, sealed objects, cryptographic provider, or carrier configuration |
-| Go and Python | First-class wrappers over the C ABI | The same C ABI boundaries apply; build and load the matching native library first |
-| IP adapter | UDP link with manual peer mapping, protected discovery support, rendezvous helpers, opaque relay components, and the provider-free native Gate-H harness | The formal provider-free Gate-H evidence passed. Proposal 0004's provider comparison is closed with no arm selected; the rust-libp2p code is only a publish-disabled, opt-in test oracle. Production NAT, relay/path recovery, and physical-network acceptance remain separate. |
-| BTLE adapter | MTU-aware `Link` over the `BleRadio` platform seam | A platform-specific OS radio implementation is not shipped |
+| Current semantic host | Provider-neutral `MeshHost`, `MeshService`, and the tested shared-node supervisor | This code remains a proven migration source. Its persistence/reconciliation authorities are not run beside the selected ones; behavior moves only with equivalent tests. |
+| C ABI | High-level offline operations over the current semantic implementation | Not yet connected to the selected node; no event-gap inspection, merge-policy registration, retention-driven garbage collection, sealed objects, cryptographic provider, or carrier configuration |
+| Go and Python | First-class wrappers over the current semantic C ABI | Not yet connected to the selected node; the same C ABI boundaries apply |
+| Selected Iroh carrier | Exact endpoint identity, manually supplied direct address, bounded request/response, allowlist admission | Carrier identity is not mission, control, or Event-source authorization. `aster-node` enforces mission-before-inventory and control-before-Event admission. Hosted discovery, relays, port mapping, NAT acceptance, other data classes, non-Unix and physical zeroization assurance, and remaining zero-trust lifecycle obligations are open. Dependency admission awaits exact CDLA/Unlicense and supported-target dispositions; no exception was added. |
+| Current semantic IP adapter | UDP link with manual peer mapping, protected discovery support, rendezvous helpers, and opaque relay components | A migration source, not the selected carrier. Production NAT, relay/path recovery, and physical-network acceptance remain separate. |
+| Current semantic BTLE adapter | MTU-aware `Link` over the `BleRadio` platform seam | A migration source; no platform-specific OS radio implementation ships and it is not wired to the selected node. |
 
-See [Conformance](conformance.md) and [CI](ci.md) for the precise evidence behind
-these statements.
+See the [production requirements status](implementation/requirements-status.md),
+[Conformance](conformance.md), and [CI](ci.md) for the precise claim boundaries.
 
 ## Proposals and experiments
 
@@ -118,6 +131,9 @@ decision records explain why the current design chose its major boundaries:
 
 ### Tutorials and integration
 
+- [Capability tour](quickstart/capability-tour.md)
+- [Live mesh CLI](quickstart/mesh-cli.md)
+- [Selected production-lane architecture](architecture.md)
 - [Language quickstarts](quickstart/README.md)
 - [Application recipes](application-recipes.md)
 - [Carriers and contacts](transports.md)
@@ -139,6 +155,7 @@ decision records explain why the current design chose its major boundaries:
 
 ### Validation and project evidence
 
+- [Production implementation requirements status](implementation/requirements-status.md)
 - [Conformance and acceptance](conformance.md)
 - [CI and local validation](ci.md)
 - [Fuzzing guide](../fuzz/README.md)

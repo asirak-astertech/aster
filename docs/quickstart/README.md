@@ -1,5 +1,9 @@
 # Language quickstarts
 
+To see real Aster nodes exchange protected Events before embedding an API, run
+the one-command [capability tour](capability-tour.md). This page indexes the
+offline application and language-binding quickstarts.
+
 Choose the API closest to your application:
 
 | Language | API you use | Quickstart |
@@ -27,7 +31,7 @@ C, Go, or Python entry point is shipped; see
 ## Shared toolchain prerequisite
 
 The repository pins Rust 1.97.1, installed with `mise install`. The crates'
-minimum supported Rust version (MSRV) is Rust 1.90. Each language quickstart
+minimum supported Rust version (MSRV) is Rust 1.91. Each language quickstart
 uses the pinned toolchain to build the Rust core or native library.
 
 ## Shared vocabulary

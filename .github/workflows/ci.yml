@@ -83,7 +83,7 @@ jobs:
         run: cargo +1.97.1 test --locked --workspace --all-features
 
   msrv:
-    name: Rust 1.90 MSRV
+    name: Rust 1.91 MSRV
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -94,16 +94,16 @@ jobs:
           persist-credentials: false
           submodules: false
 
-      - name: Install Rust 1.90.0
-        run: rustup toolchain install 1.90.0 --profile minimal
+      - name: Install Rust 1.91.0
+        run: rustup toolchain install 1.91.0 --profile minimal
 
       - name: Acquire Rust dependencies
-        run: cargo +1.90.0 fetch --locked
+        run: cargo +1.91.0 fetch --locked
 
       - name: Check all targets and features offline
         env:
           CARGO_NET_OFFLINE: "true"
-        run: cargo +1.90.0 check --locked --workspace --all-targets --all-features
+        run: cargo +1.91.0 check --locked --workspace --all-targets --all-features
 
   age-reference-interop:
     name: age reference interoperability
@@ -185,6 +185,7 @@ jobs:
 
       - name: Enforce dependency policy offline
         run: |
+          python3 tools/check-netlink-packet-core-patch.py
           CARGO="cargo +1.97.1" python3 tools/check-retained-libp2p-oracle-boundary.py
           python3 tools/test-retained-libp2p-oracle-boundary.py
           CARGO_NET_OFFLINE=true sh ./tools/check-dependency-exception-scope.sh

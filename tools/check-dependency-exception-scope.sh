@@ -23,11 +23,23 @@ lock_hickory_packages=$(
   ' "$repository_root/Cargo.lock"
 )
 expected_lock_hickory_packages='hickory-proto 0.25.2
-hickory-resolver 0.25.2'
+hickory-proto 0.26.1
+hickory-resolver 0.25.2
+hickory-resolver 0.26.1'
 
 if [ "$lock_hickory_packages" != "$expected_lock_hickory_packages" ]; then
   printf '%s\n' 'dependency-exception scope failed: unexpected lock-only Hickory package set' >&2
   printf '%s\n' 'expected:' "$expected_lock_hickory_packages" 'actual:' "$lock_hickory_packages" >&2
+  exit 1
+fi
+
+if awk '
+  /^\[\[package\]\]$/ { package = "" }
+  /^name = "paste"$/ { package = "paste" }
+  /^version = / && package == "paste" { found = 1 }
+  END { exit !found }
+' "$repository_root/Cargo.lock"; then
+  printf '%s\n' 'dependency-exception scope failed: unmaintained paste remains in Cargo.lock' >&2
   exit 1
 fi
 
@@ -54,41 +66,6 @@ if [ "$packages" != "$expected" ]; then
   exit 1
 fi
 
-paste_tree=$(
-  "$cargo_command" tree \
-    --locked \
-    --manifest-path "$repository_root/Cargo.toml" \
-    --workspace \
-    --all-features \
-    --invert paste@1.0.15 \
-    --edges normal,build,dev \
-    --target all \
-    --prefix depth \
-    --format '{p}'
-)
-paste_graph=$(printf '%s\n' "$paste_tree" | awk '{ print $1 " " $2 }')
-expected_paste_graph='0paste v1.0.15
-1netlink-packet-core v0.8.2
-2if-watch v3.2.2
-3libp2p-tcp v0.44.1
-4libp2p v0.56.0
-5aster-libp2p-provider v0.1.0
-6aster-lab v0.1.0
-2netlink-packet-route v0.28.0
-3if-watch v3.2.2
-3rtnetlink v0.20.0
-4if-watch v3.2.2
-2netlink-proto v0.12.2
-3if-watch v3.2.2
-3rtnetlink v0.20.0
-2rtnetlink v0.20.0'
-
-if [ "$paste_graph" != "$expected_paste_graph" ]; then
-  printf '%s\n' 'dependency-exception scope failed: unexpected paste reverse dependency graph' >&2
-  printf '%s\n' 'expected:' "$expected_paste_graph" 'actual:' "$paste_graph" >&2
-  exit 1
-fi
-
 active_tree=$(
   "$cargo_command" tree \
     --locked \
@@ -106,17 +83,17 @@ active_paste_packages=$(
     awk '$1 == "paste" { print $1 " " $2 }' |
     LC_ALL=C sort -u
 )
-if [ "$active_paste_packages" != 'paste v1.0.15' ]; then
-  printf '%s\n' 'dependency-exception scope failed: unexpected active paste package set' >&2
-  printf '%s\n' 'expected:' 'paste v1.0.15' 'actual:' "$active_paste_packages" >&2
+if [ -n "$active_paste_packages" ]; then
+  printf '%s\n' 'dependency-exception scope failed: unmaintained paste is active in the workspace graph' >&2
+  printf '%s\n' 'actual:' "$active_paste_packages" >&2
   exit 1
 fi
 
 if printf '%s\n' "$active_packages" | awk '
-  $1 == "hickory-proto" || $1 == "hickory-resolver" { found = 1 }
+  ($1 == "hickory-proto" || $1 == "hickory-resolver") && $2 == "v0.25.2" { found = 1 }
   END { exit !found }
 '; then
-  printf '%s\n' 'dependency-exception scope failed: ignored Hickory package is active in the workspace graph' >&2
+  printf '%s\n' 'dependency-exception scope failed: ignored Hickory 0.25.2 package is active in the workspace graph' >&2
   exit 1
 fi
 
@@ -142,11 +119,11 @@ if printf '%s\n' "$fuzz_packages" | awk '$1 == "paste" { found = 1 } END { exit 
 fi
 
 if printf '%s\n' "$fuzz_packages" | awk '
-  $1 == "hickory-proto" || $1 == "hickory-resolver" { found = 1 }
+  ($1 == "hickory-proto" || $1 == "hickory-resolver") && $2 == "v0.25.2" { found = 1 }
   END { exit !found }
 '; then
-  printf '%s\n' 'dependency-exception scope failed: ignored Hickory package is present in the fuzz graph' >&2
+  printf '%s\n' 'dependency-exception scope failed: ignored Hickory 0.25.2 package is present in the fuzz graph' >&2
   exit 1
 fi
 
-printf '%s\n' 'dependency-exception scope passed: RUSTSEC-2026-0173 is isolated to aster-provisioning-age; RUSTSEC-2024-0436 is isolated to the exact libp2p-provider pilot path; RUSTSEC-2026-0118 and RUSTSEC-2026-0119 are exact lock-only inactive Hickory entries; all four are absent from fuzz'
+printf '%s\n' 'dependency-exception scope passed: RUSTSEC-2026-0173 is isolated to aster-provisioning-age; unmaintained paste is absent from the lock and active graphs; Hickory 0.25.2 remains lock-only/inactive while safe 0.26.1 is permitted; ignored packages are absent from fuzz'

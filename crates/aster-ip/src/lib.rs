@@ -2884,9 +2884,7 @@ mod tests {
         let mut server = RendezvousServer::bind(loopback()).unwrap();
         let attacker = UdpSocket::bind(loopback()).unwrap();
         let legitimate = UdpSocket::bind(loopback()).unwrap();
-        legitimate
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
+        legitimate.set_nonblocking(true).unwrap();
         let server_address = server.local_addr().unwrap();
         let paired_token = rendezvous_token(0);
         for index in 0..MAX_RENDEZVOUS_DATAGRAMS_PER_POLL {
@@ -2896,18 +2894,23 @@ mod tests {
         let packet = rendezvous_registration_packet(paired_token);
         legitimate.send_to(&packet, server_address).unwrap();
 
-        assert_eq!(server.poll().unwrap(), MAX_RENDEZVOUS_DATAGRAMS_PER_POLL);
-        assert!(server.waiting.contains_key(&paired_token));
-        for _ in 0..50 {
-            assert!(server.poll().unwrap() <= MAX_RENDEZVOUS_DATAGRAMS_PER_POLL);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut processed_total = 0;
+        let mut nonempty_polls = 0;
+        let mut received_response = false;
+        while Instant::now() < deadline {
+            let processed = server.poll().unwrap();
+            assert!(processed <= MAX_RENDEZVOUS_DATAGRAMS_PER_POLL);
+            processed_total += processed;
+            nonempty_polls += usize::from(processed > 0);
+
             let mut response = [0_u8; 64];
             match legitimate.recv_from(&mut response) {
                 Ok((length, _)) => {
                     assert!(length >= 40);
                     assert_eq!(response[0], RENDEZVOUS_PEER);
                     assert_eq!(&response[1..33], &paired_token);
-                    assert!(!server.waiting.contains_key(&paired_token));
-                    return;
+                    received_response = true;
                 }
                 Err(error)
                     if matches!(
@@ -2916,7 +2919,18 @@ mod tests {
                     ) => {}
                 Err(error) => panic!("could not receive rendezvous response: {error}"),
             }
+
+            if received_response && processed_total > MAX_RENDEZVOUS_DATAGRAMS_PER_POLL {
+                assert!(nonempty_polls >= 2);
+                assert!(!server.waiting.contains_key(&paired_token));
+                return;
+            }
+            thread::yield_now();
         }
-        panic!("queued legitimate rendezvous registration did not progress");
+        panic!(
+            "queued legitimate rendezvous registration did not progress: \
+             processed={processed_total}, nonempty_polls={nonempty_polls}, \
+             received_response={received_response}"
+        );
     }
 }

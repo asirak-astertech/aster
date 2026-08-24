@@ -13,6 +13,10 @@ description = "Run format, lint, unit, binding, and conformance checks"
 run = [
   "cargo fmt --all -- --check",
   "python3 tools/check-project-license.py",
+  "python3 tools/check-implementation-requirements.py",
+  "python3 tools/check-selected-node-dependency-boundary.py",
+  "python3 tools/check-netlink-packet-core-patch.py",
+  "sh tools/test-netlink-packet-core-patch.sh",
   "python3 tools/check-retained-libp2p-oracle-boundary.py",
   "python3 tools/test-retained-libp2p-oracle-boundary.py",
   "sh ./tools/check-dependency-exception-scope.sh",
@@ -43,6 +47,18 @@ run = [
 [tasks.fuzz-smoke]
 description = "Run bounded sanitizer-instrumented decoder fuzz campaigns"
 run = "sh ./tools/run-fuzz-smoke.sh"
+
+[tasks.tour]
+description = "Run the fastest two-node causal Ping/Pong capability tour"
+run = "sh ./tools/aster-tour.sh quick"
+
+[tasks.tour-relay]
+description = "Run the three-node payload-blind relay capability tour"
+run = "sh ./tools/aster-tour.sh relay"
+
+[tasks.tour-control]
+description = "Run the four-node revocation and rekey capability tour"
+run = "sh ./tools/aster-tour.sh control"
 
 [tasks.reconcile-bakeoff]
 description = "Gate the non-production reconciliation matrix through 1,000 items"

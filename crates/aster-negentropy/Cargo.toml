@@ -1,0 +1,15 @@
+[package]
+name = "aster-negentropy"
+description = "Bounded Negentropy set reconciliation for Aster inventories"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+aster-profile = { path = "../aster-profile" }
+negentropy.workspace = true
+
+[lints]
+workspace = true

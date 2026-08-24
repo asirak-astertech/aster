@@ -19,9 +19,11 @@ use crate::blob::{BlobId, BlobRouteCommitment, BlobStoreConfig, ReferenceBlobSer
 use crate::bridge::{
     self, AuthorizationEnvelope, BridgeAuthorization, BridgeOuterKind, BridgeRoute,
 };
+#[cfg(feature = "sqlite-store")]
+use crate::engine::{EngineError, Node, NodeConfig};
 use crate::engine::{
-    EngineError, EnvelopeError, EnvelopeHeader, EnvelopeSealer, Node, NodeConfig, SealRequest,
-    SealedEnvelope, VerifiedControl, VerifiedEnvelope,
+    EnvelopeError, EnvelopeHeader, EnvelopeSealer, SealRequest, SealedEnvelope, VerifiedControl,
+    VerifiedEnvelope,
 };
 use crate::model::{
     CausalStamp, DataClass, Dot, MAX_CAUSAL_CONTEXT_ENTRIES, NodeId, Priority, Scope, Topic,
@@ -34,7 +36,9 @@ use crate::provisioning::{
     ProvisioningUnprotector, UnprotectedProvisioning, protect_provisioning_artifact,
     unprotect_provisioning_artifact,
 };
-use crate::store::{ControlPrincipal, Revocation, ScopeEpoch, SqliteStore};
+#[cfg(feature = "sqlite-store")]
+use crate::store::SqliteStore;
+use crate::store::{ControlPrincipal, Revocation, ScopeEpoch};
 use aes_gcm::{
     Aes256Gcm,
     aead::{AeadInOut, KeyInit, array::Array},
@@ -657,8 +661,8 @@ impl ProvisioningBundle {
             || self.roles & !(ROLE_RELAY | ROLE_READER | ROLE_CONTROL_AUTHORITY) != 0
             || self.route_grants.len() > MAX_GRANTS
             || self.content_grants.len() > MAX_GRANTS
-            || (self.roles & ROLE_RELAY != 0) != !self.route_grants.is_empty()
-            || (self.roles & ROLE_READER != 0) != !self.content_grants.is_empty()
+            || (self.roles & ROLE_RELAY != 0) == self.route_grants.is_empty()
+            || (self.roles & ROLE_READER != 0) == self.content_grants.is_empty()
         {
             return Err(invalid_bundle());
         }
@@ -1524,6 +1528,36 @@ impl ReferenceEnvelopeSealer {
         self.credential.identity
     }
 
+    /// Stable mission authority namespace authenticated by this provisioning bundle.
+    ///
+    /// This identifier is derived from the mission and authority verification key.
+    /// It therefore remains stable across ordinary node credential rotation and is
+    /// distinct from this node's [`Self::identity`].
+    pub const fn authority_id(&self) -> NodeId {
+        self.authority_id
+    }
+
+    /// Explicit alias for [`Self::authority_id`] at persistence boundaries.
+    pub const fn mission_authority_id(&self) -> NodeId {
+        self.authority_id()
+    }
+
+    /// Tests whether an authenticated peer credential carries the exact
+    /// authority-signed route grant for one scope and key epoch.
+    ///
+    /// The opaque commitments must come from a completed authenticated session,
+    /// never from peer application data. This wrapper exposes only the existing
+    /// provider authorization decision without revealing route-grant material.
+    pub fn peer_can_route(
+        &self,
+        peer: NodeId,
+        peer_route_commitments: &[[u8; 32]],
+        scope: &Scope,
+        epoch: u64,
+    ) -> bool {
+        <Self as EnvelopeSealer>::peer_can_route(self, peer, peer_route_commitments, scope, epoch)
+    }
+
     /// Verifies an opaque authority-signed public registry and resolves only
     /// high-level recipient identities/topic grants into a private fresh-rekey
     /// plan. No issuing seed, private recipient key, or generated scope key
@@ -1636,7 +1670,8 @@ impl ReferenceEnvelopeSealer {
     /// Creates a legacy authority-signed activation of an independently pre-provisioned epoch.
     ///
     /// This explicit format-0 operation does not exclude a captured node that already holds the
-    /// future epoch. New deployments should use [`ScopeRekeyPlan`] through the authority node.
+    /// future epoch. New deployments should use the recipient-filtered rekey control API through
+    /// the authority node.
     pub fn seal_scope_epoch(
         &mut self,
         scope: &Scope,
@@ -4602,7 +4637,12 @@ impl ReferenceAuthenticatedSession {
     }
 
     /// Opaque, authority-signed route-grant commitments from the peer credential.
-    pub(crate) fn peer_route_grant_commitments(&self) -> &[[u8; 32]] {
+    ///
+    /// These bytes were authenticated by the completed handshake. They are safe
+    /// to use only as input to provider authorization such as
+    /// [`ReferenceEnvelopeSealer::peer_can_route`]; they confer no key access and
+    /// must not be interpreted or accepted from application frames.
+    pub fn peer_route_grant_commitments(&self) -> &[[u8; 32]] {
         &self.peer_route_grant_commitments
     }
 
@@ -4639,9 +4679,11 @@ impl Drop for ReferenceAuthenticatedSession {
 }
 
 /// Ready-to-use node type backed by SQLite and the reference envelope service.
+#[cfg(feature = "sqlite-store")]
 pub type ReferenceNode = Node<SqliteStore, ReferenceEnvelopeSealer>;
 
 /// Opens a node without allowing an identity/key mismatch at the call site.
+#[cfg(feature = "sqlite-store")]
 pub fn open_reference_node(
     path: impl AsRef<Path>,
     bundle: ProvisioningBundle,
@@ -5701,7 +5743,7 @@ fn encode_credential_body(
         || roles == 0
         || p256_ecdh_public_key.len() != P256_PUBLIC_LEN
         || kem_public_key.len() != ML_KEM_PUBLIC_LEN
-        || has_route_role != !route_grant_commitments.is_empty()
+        || has_route_role == route_grant_commitments.is_empty()
         || route_grant_commitments.len() > MAX_GRANTS
         || route_grant_commitments
             .windows(2)
@@ -6835,7 +6877,7 @@ impl<'a> Reader<'a> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite-store"))]
 mod tests {
     use super::*;
     use crate::engine::EnvelopeSealer;

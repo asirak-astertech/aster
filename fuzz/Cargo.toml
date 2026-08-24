@@ -10,6 +10,10 @@ cargo-fuzz = true
 
 [dependencies]
 aster-core = { path = "../crates/aster-core", features = ["adapter-sdk"] }
+aster-negentropy = { path = "../crates/aster-negentropy" }
+aster-node = { path = "../crates/aster-node", features = ["fuzzing"] }
+aster-profile = { path = "../crates/aster-profile" }
+aster-redb-store = { path = "../crates/aster-redb-store" }
 libfuzzer-sys = "=0.4.13"
 
 [[bin]]
@@ -33,4 +37,21 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "selected_frame_decode"
+path = "fuzz_targets/selected_frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "selected_negentropy"
+path = "fuzz_targets/selected_negentropy.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
+
+[patch.crates-io]
+netlink-packet-core = { path = "../third-party/netlink-packet-core-0.8.2-aster" }
