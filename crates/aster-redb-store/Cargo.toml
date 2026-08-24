@@ -1,0 +1,18 @@
+[package]
+name = "aster-redb-store"
+description = "Crash-safe accepted-item and acceptance-marker storage for Aster"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+aster-mesh = { package = "aster-core", path = "../aster-core", default-features = false, features = ["reference-session"] }
+aster-profile = { path = "../aster-profile" }
+redb.workspace = true
+rustix.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true

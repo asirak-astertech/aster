@@ -2,7 +2,7 @@
 
 > ****
 
-- Status: accepted — implementation migration lane; no selected dependency admitted
+- Status: accepted — Iroh-first implementation migration; release admission gates open
 - Date: 2026-08-23
 - Authority: [`data-mesh-requirements.md`](../../data-mesh-requirements.md)
 - Related: [Decision 0002](0002-dependency-admission.md),
@@ -23,10 +23,27 @@ crate now would create overlapping persistence and reconciliation authorities.
 Wrapping Iroh behind the existing IP seam would also preserve a boundary that
 had zero selection weight in the requirements-first evaluation.
 
-Decision 0002 still records redb as evaluated but not adopted and Iroh as
-rejected pending a bounded exception. Iroh 1.0.3 also declares Rust 1.91 while
-the workspace minimum remains Rust 1.90. A proposal result does not supersede
-those dependency-admission and toolchain gates.
+At the time of this decision, Decision 0002 still recorded redb as evaluated
+but not adopted and Iroh as rejected pending a bounded exception. Iroh 1.0.3
+also declared Rust 1.91 while the workspace minimum was Rust 1.90. The later
+implementation update below records the stakeholder's explicit resolution;
+the earlier proposal result alone did not supersede those gates.
+
+## Implementation update — 2026-08-23
+
+The stakeholder approved Iroh-first as the production implementation direction
+and approved raising the workspace minimum to Rust 1.91. Iroh 1.0.3,
+Negentropy 0.5.1, and redb 4.2.0 may therefore enter the active implementation
+graph behind the boundaries in this decision. This is implementation authority,
+not release authorization: exact license, advisory, SBOM, security, physical
+carrier, interoperability, and operational acceptance gates remain binding.
+
+Iroh endpoint authentication is carrier evidence only. The hybrid-PQ session,
+protected envelopes, source authentication, data classes, causality,
+custody/TTL, scopes, and authorization already implemented and tested in
+`aster-core` are the semantic migration source. They are to be ported onto the
+new composition rather than independently reinvented. No old implementation
+path is removed until its replacement passes equivalent tests.
 
 ## Decision
 
@@ -48,9 +65,11 @@ Begin the selected-stack implementation as an isolated migration lane:
    Each requires its own exact-graph dependency admission and evidence.
 5. Permit only one selected durable acceptance/effect authority at a node.
    redb cutover must replace, not duplicate, the corresponding SQLite owner.
-6. Treat the current SQLite/custom-sync/IP and pilot libp2p paths as legacy
-   experimental implementations during migration. This decision neither
-   removes them nor grants them compatibility weight.
+6. Treat the current SQLite/custom-sync/IP path as the proven semantic and test
+   source during migration, without running a second selected persistence or
+   reconciliation authority beside it. The libp2p path remains only the bounded
+   retained oracle described by Decision 0029. This decision removes neither;
+   each displaced mechanism stays until its replacement passes equivalent tests.
 
 The evaluation profile-v0 wire corpus is seed material, not a product format.
 No product encoder or decoder may copy its undeclared extension behavior.

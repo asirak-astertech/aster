@@ -1,0 +1,13277 @@
+//! Crash-safe storage for mission-bound Aster semantic Events and compatibility data.
+//!
+//! One redb transaction authority owns four disjoint namespaces: content-verified
+//! semantic Events and their causal/operation ledgers; a bounded, non-semantic cache
+//! of route-verified exact transfers; and the retained caller-ID opaque API used by
+//! the legacy compatibility lane; plus source-authenticated, mission-wide Flash
+//! controls and their pending/applied chain ledgers. Opaque IDs can never collide
+//! with or promote into Event or control state. Semantic mutation requires a live
+//! strong capability from `aster-core`, while persisted decoded metadata is only
+//! structurally audited. Configured item and byte limits apply to the aggregate
+//! usage of all four namespaces.
+
+#![forbid(unsafe_code)]
+
+use std::error::Error;
+use std::fmt;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use aster_mesh::engine::EnvelopeHeader;
+use aster_mesh::{
+    CausalStamp, ContentVerifiedEventEnvelope, DataClass as SemanticDataClass, Dot,
+    MAX_CAUSAL_CONTEXT_ENTRIES, NodeId, Priority, RouteVerifiedEventEnvelope, Scope,
+    ScopeRekeyRecipient, Topic, VerifiedControlEnvelope, VerifiedControlKind,
+    VerifiedControlPrincipal, VersionVector,
+};
+use aster_profile::{InventorySnapshot, ItemId};
+use redb::{
+    Database, Durability, MultimapTableHandle, ReadableDatabase, ReadableTable,
+    ReadableTableMetadata, TableDefinition, TableHandle,
+};
+use sha2::{Digest, Sha256};
+
+const ITEMS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("aster.items.v1");
+// These identifiers are the already-persisted v1 schema. Keep their bytes stable even
+// though the public API now uses the more accurate "acceptance marker" vocabulary.
+const ACCEPTANCE_MARKERS: TableDefinition<&[u8], u64> = TableDefinition::new("aster.effects.v1");
+const METADATA: TableDefinition<&str, u64> = TableDefinition::new("aster.metadata.v1");
+const LAST_ACCEPTANCE_MARKER: &str = "last_effect_marker";
+const ITEM_COUNT: &str = "item_count";
+const TOTAL_PAYLOAD_BYTES: &str = "total_payload_bytes";
+
+// Event tables extend the same redb transaction authority without sharing a
+// caller-controlled key namespace with legacy opaque ITEMS. EVENT_BYTES and
+// EVENT_ACCEPTANCE_MARKERS use exact source-envelope SHA-256 transfer identity;
+// the distinct semantic item identifier remains unique in SEMANTIC_ITEMS.
+const EVENTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("aster.semantic-events.v1");
+const EVENT_BYTES: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("aster.semantic-event-bytes.v1");
+const EVENT_ACCEPTANCE_MARKERS: TableDefinition<&[u8], u64> =
+    TableDefinition::new("aster.semantic-event-markers.v1");
+const SEMANTIC_ITEMS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("aster.semantic-items.v1");
+const ACCEPTED_DOTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("aster.accepted-dots.v1");
+const ACCEPTED_EVENTS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("aster.accepted-events.v1");
+const CAUSAL_FRONTIER: TableDefinition<&[u8], u64> =
+    TableDefinition::new("aster.causal-frontier.v1");
+const PUBLISHER_HIGH_WATER: TableDefinition<&[u8], u64> =
+    TableDefinition::new("aster.publisher-high-water.v1");
+const EVENT_HIGH_WATER: TableDefinition<&[u8], u64> =
+    TableDefinition::new("aster.event-high-water.v1");
+const EVENT_OPERATIONS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("aster.event-operations.v1");
+const ROUTE_CACHE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("aster.route-event-cache.v1");
+const ROUTE_CACHE_CLAIMS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("aster.route-event-claims.v1");
+const SEMANTIC_DOMAIN: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("aster.semantic-domain.v1");
+const MISSION_AUTHORITY_ID: &str = "mission_authority_id";
+const SEMANTIC_ITEM_COUNT: &str = "semantic_event_item_count";
+const SEMANTIC_TOTAL_BYTES: &str = "semantic_event_total_bytes";
+const LAST_SEMANTIC_ACCEPTANCE_MARKER: &str = "last_semantic_acceptance_marker";
+const ROUTE_CACHE_ITEM_COUNT: &str = "route_event_cache_item_count";
+const ROUTE_CACHE_TOTAL_BYTES: &str = "route_event_cache_total_bytes";
+
+// Mission controls use their own exact-transfer namespace. A control becomes
+// applied only when one redb transaction moves it from CONTROL_PENDING into the
+// contiguous CONTROL_APPLIED prefix and updates every effect index and the head.
+// The returned suffix is therefore the sole selected-composition input to the
+// provider's post-commit activation seam.
+const CONTROL_RECORDS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("aster.mission-controls.v1");
+const CONTROL_BYTES: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("aster.mission-control-bytes.v1");
+const CONTROL_SEQUENCE: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("aster.mission-control-sequence.v1");
+const CONTROL_PENDING: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("aster.mission-control-pending.v1");
+const CONTROL_APPLIED: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("aster.mission-control-applied.v1");
+const CONTROL_REVOCATIONS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("aster.mission-control-revocations.v1");
+const CONTROL_SCOPE_EPOCHS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("aster.mission-control-scope-epochs.v1");
+// Local reservation receipts are inserted atomically with the exact control;
+// remote controls never acquire one. They prove the committed source control
+// matched the optimistic chain head used before randomized sealing.
+const CONTROL_RESERVATIONS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("aster.mission-control-reservations.v1");
+// Local scope-rekey publications bind the operator's canonical non-secret
+// intent to the exact applied control. Remote controls intentionally have no
+// local publication intent and therefore cannot be mistaken for an exact CLI
+// retry after a crash.
+const CONTROL_PUBLICATION_INTENTS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("aster.mission-control-publication-intents.v1");
+const CONTROL_HEAD: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("aster.mission-control-head.v1");
+const CONTROL_HEAD_KEY: &str = "head";
+const CONTROL_ITEM_COUNT: &str = "mission_control_item_count";
+const CONTROL_TOTAL_BYTES: &str = "mission_control_total_bytes";
+const CONTROL_PUBLICATION_INTENT_TOTAL_BYTES: &str =
+    "mission_control_publication_intent_total_bytes";
+
+// This table is deliberately absent from live historical stores. Once created,
+// it must contain exactly one self-checking, mission-bound record. Every valid
+// phase is terminal to normal Store opens; only ZeroizationStore may advance it.
+const ZEROIZATION: TableDefinition<&str, &[u8]> = TableDefinition::new("aster.zeroization.v1");
+const ZEROIZATION_STATE_KEY: &str = "state";
+const ZEROIZATION_MAGIC: &[u8; 8] = b"ASTRZ001";
+const ZEROIZATION_DIGEST_BYTES: usize = 32;
+const ZEROIZATION_HEADER_BYTES: usize = 50;
+/// Maximum nonsecret artifact descriptor bytes retained for one zeroization target.
+pub const MAX_ZEROIZATION_DESCRIPTOR_BYTES: usize = 8 * 1024;
+const MAX_ZEROIZATION_RECORD_BYTES: usize =
+    ZEROIZATION_HEADER_BYTES + (2 * MAX_ZEROIZATION_DESCRIPTOR_BYTES) + ZEROIZATION_DIGEST_BYTES;
+
+const EVENT_METADATA_VERSION: u8 = 1;
+const EVENT_OPERATION_VERSION: u8 = 1;
+const CONTROL_METADATA_VERSION: u8 = 1;
+const CONTROL_RESERVATION_VERSION: u8 = 1;
+const CONTROL_PUBLICATION_INTENT_VERSION: u8 = 1;
+const CONTROL_EFFECT_INDEX_VERSION: u8 = 1;
+const CONTROL_HEAD_VERSION: u8 = 1;
+/// Maximum number of semantic Events returned by one cursor page.
+pub const MAX_EVENT_PAGE: usize = 1_024;
+/// Maximum byte length of one application operation key.
+pub const MAX_EVENT_OPERATION_KEY_BYTES: usize = 256;
+const MAX_LOGICAL_KEY_BYTES: usize = 4 * 1024;
+/// Maximum route-verified, content-unopened source representations retained per store.
+pub const MAX_ROUTE_CACHE_ITEMS: u64 = 1_024;
+/// Maximum exact bytes retained in the route-only cache (8 MiB).
+pub const MAX_ROUTE_CACHE_BYTES: u64 = 8 * 1024 * 1024;
+/// Maximum randomized route-only representations retained for one semantic claim.
+pub const MAX_ROUTE_CACHE_REPRESENTATIONS_PER_SEMANTIC: u64 = 4;
+/// Maximum retained pending plus applied mission-control objects per store.
+pub const MAX_CONTROL_ITEMS: u64 = 4_096;
+/// Maximum exact controls plus canonical local publication-intent bytes retained per store.
+pub const MAX_CONTROL_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_CONTROL_INTENT_RECIPIENTS: usize = 128;
+const MAX_CONTROL_INTENT_TOPICS_PER_RECIPIENT: usize = 128;
+
+/// Default maximum number of accepted items in one store.
+pub const DEFAULT_MAX_ITEMS: u64 = 10_000;
+/// Default maximum aggregate retained bytes in one store (64 MiB).
+pub const DEFAULT_MAX_TOTAL_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Validated durable admission limits for one store.
+///
+/// Both limits count aggregate legacy opaque rows, accepted exact source-sealed
+/// Event representations, route-only cache entries, exact controls, and canonical
+/// local control-publication intents. Filesystem and redb allocation overhead
+/// remain backend-specific.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StoreLimits {
+    max_items: u64,
+    max_total_payload_bytes: u64,
+}
+
+impl StoreLimits {
+    /// Constructs nonzero store admission limits.
+    pub const fn new(
+        max_items: u64,
+        max_total_payload_bytes: u64,
+    ) -> Result<Self, StoreLimitsError> {
+        if max_items == 0 {
+            return Err(StoreLimitsError::ZeroMaxItems);
+        }
+        if max_total_payload_bytes == 0 {
+            return Err(StoreLimitsError::ZeroMaxTotalPayloadBytes);
+        }
+        Ok(Self {
+            max_items,
+            max_total_payload_bytes,
+        })
+    }
+
+    /// Returns the maximum accepted-item count.
+    pub const fn max_items(self) -> u64 {
+        self.max_items
+    }
+
+    /// Returns the maximum aggregate retained payload/source-envelope bytes.
+    pub const fn max_total_payload_bytes(self) -> u64 {
+        self.max_total_payload_bytes
+    }
+}
+
+impl Default for StoreLimits {
+    fn default() -> Self {
+        Self {
+            max_items: DEFAULT_MAX_ITEMS,
+            max_total_payload_bytes: DEFAULT_MAX_TOTAL_PAYLOAD_BYTES,
+        }
+    }
+}
+
+/// Invalid store-limit configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StoreLimitsError {
+    /// At least one item must be admissible.
+    ZeroMaxItems,
+    /// At least one opaque payload byte must be admissible.
+    ZeroMaxTotalPayloadBytes,
+}
+
+impl fmt::Display for StoreLimitsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroMaxItems => formatter.write_str("maximum item count must be nonzero"),
+            Self::ZeroMaxTotalPayloadBytes => {
+                formatter.write_str("maximum total payload bytes must be nonzero")
+            }
+        }
+    }
+}
+
+impl Error for StoreLimitsError {}
+
+/// The result of atomically accepting an item and recording its acceptance marker.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApplyOutcome {
+    /// The identifier and bytes were new and committed with this marker.
+    Inserted { acceptance_marker: u64 },
+    /// The same identifier and exact bytes were already committed.
+    Duplicate { acceptance_marker: u64 },
+}
+
+impl ApplyOutcome {
+    /// Returns the durable marker associated with the item.
+    pub const fn acceptance_marker(self) -> u64 {
+        match self {
+            Self::Inserted { acceptance_marker } | Self::Duplicate { acceptance_marker } => {
+                acceptance_marker
+            }
+        }
+    }
+
+    /// Returns whether this call inserted a new durable item.
+    pub const fn inserted(self) -> bool {
+        matches!(self, Self::Inserted { .. })
+    }
+}
+
+/// Exact SHA-256 identity of one stable source-sealed transfer representation.
+///
+/// This is deliberately distinct from both [`EventSemanticId`] and the selected
+/// profile's generic [`ItemId`]. The explicit conversion method is the only
+/// place an Event transfer key enters the current reconciliation adapter.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct EventTransferId([u8; 32]);
+
+impl EventTransferId {
+    /// Constructs an exact transfer identifier from complete digest bytes.
+    pub const fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the exact transfer identifier bytes.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Explicitly adapts this exact transfer key into the current reconciliation key type.
+    pub const fn reconciliation_item_id(self) -> ItemId {
+        ItemId::new(self.0)
+    }
+
+    /// Explicitly adapts a received reconciliation key back into an Event transfer key.
+    pub const fn from_reconciliation_item_id(id: ItemId) -> Self {
+        Self(*id.as_bytes())
+    }
+}
+
+/// Source-authenticated semantic identity of an Event independent of route sealing randomness.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct EventSemanticId([u8; 32]);
+
+impl EventSemanticId {
+    /// Constructs an authenticated semantic identifier from complete bytes.
+    pub const fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the exact semantic identifier bytes.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// Exact SHA-256 identity of one stable source-sealed mission control.
+///
+/// This type is deliberately distinct from [`EventTransferId`] even though
+/// both currently use SHA-256. Callers must retain the authenticated object
+/// class alongside the digest when composing a shared reconciliation lane.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ControlTransferId([u8; 32]);
+
+impl ControlTransferId {
+    /// Constructs an exact control transfer identifier from complete digest bytes.
+    pub const fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the exact transfer identifier bytes.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Explicitly adapts this control transfer key to the current reconciliation key.
+    pub const fn reconciliation_item_id(self) -> ItemId {
+        ItemId::new(self.0)
+    }
+
+    /// Explicitly adapts a reconciliation key back into a control transfer key.
+    pub const fn from_reconciliation_item_id(id: ItemId) -> Self {
+        Self(*id.as_bytes())
+    }
+}
+
+/// Exact durable control policy observed by a mission-bound store snapshot.
+///
+/// Fields are private so application code cannot manufacture a token. The
+/// token is reusable only while the durable head remains exact and there are
+/// no pending control-chain links. A database transaction always rechecks it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ControlPolicySnapshot {
+    authority: NodeId,
+    head: Option<(u64, ControlTransferId)>,
+}
+
+impl ControlPolicySnapshot {
+    /// Stable mission authority whose policy was captured.
+    pub const fn authority(&self) -> NodeId {
+        self.authority
+    }
+
+    /// Exact applied control head, absent only before the first control.
+    pub const fn head(&self) -> Option<(u64, ControlTransferId)> {
+        self.head
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ScopeRekeyRecipientIntent {
+    node: NodeId,
+    route_access: bool,
+    readable_topics: Vec<Topic>,
+}
+
+/// Canonical non-secret operator intent for one local scope-rekey publication.
+///
+/// This binds authority/signer, scope/epoch, the exact signed public registry
+/// artifact and provider-authenticated generation, and sorted recipient access
+/// modes. It contains no key material. The intent becomes authoritative only
+/// when atomically paired with an applied, source-authenticated control.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScopeRekeyPublicationIntent {
+    authority: NodeId,
+    signer: NodeId,
+    scope: Scope,
+    epoch: u64,
+    registry_identity: [u8; 32],
+    registry_generation: u64,
+    recipients: Vec<ScopeRekeyRecipientIntent>,
+}
+
+impl ScopeRekeyPublicationIntent {
+    /// Canonicalizes a provider-authenticated rekey request for durable retry matching.
+    ///
+    /// `registry_generation` must be the generation returned by the provider
+    /// while authenticating `signed_public_registry` for the same sealing call.
+    pub fn new(
+        principal: VerifiedControlPrincipal,
+        signed_public_registry: &[u8],
+        registry_generation: u64,
+        scope: Scope,
+        epoch: u64,
+        recipients: &[ScopeRekeyRecipient],
+    ) -> Result<Self, StoreError> {
+        if signed_public_registry.is_empty()
+            || registry_generation == 0
+            || epoch == 0
+            || recipients.is_empty()
+            || recipients.len() > MAX_CONTROL_INTENT_RECIPIENTS
+        {
+            return Err(StoreError::InvalidControlPublicationIntent);
+        }
+        let mut recipients = recipients
+            .iter()
+            .map(|recipient| ScopeRekeyRecipientIntent {
+                node: recipient.node(),
+                route_access: recipient.has_route_access(),
+                readable_topics: recipient.readable_topics().to_vec(),
+            })
+            .collect::<Vec<_>>();
+        recipients.sort_by_key(|recipient| recipient.node);
+        if recipients
+            .windows(2)
+            .any(|pair| pair[0].node == pair[1].node)
+            || recipients.iter().any(|recipient| {
+                (!recipient.route_access && recipient.readable_topics.is_empty())
+                    || recipient.readable_topics.len() > MAX_CONTROL_INTENT_TOPICS_PER_RECIPIENT
+                    || recipient
+                        .readable_topics
+                        .windows(2)
+                        .any(|pair| pair[0] >= pair[1])
+            })
+        {
+            return Err(StoreError::InvalidControlPublicationIntent);
+        }
+        Ok(Self {
+            authority: principal.authority(),
+            signer: principal.signer(),
+            scope,
+            epoch,
+            registry_identity: Sha256::digest(signed_public_registry).into(),
+            registry_generation,
+            recipients,
+        })
+    }
+
+    pub const fn authority(&self) -> NodeId {
+        self.authority
+    }
+
+    pub const fn signer(&self) -> NodeId {
+        self.signer
+    }
+
+    pub const fn scope(&self) -> &Scope {
+        &self.scope
+    }
+
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    pub const fn registry_identity(&self) -> &[u8; 32] {
+        &self.registry_identity
+    }
+
+    pub const fn registry_generation(&self) -> u64 {
+        self.registry_generation
+    }
+
+    pub fn recipient_count(&self) -> usize {
+        self.recipients.len()
+    }
+}
+
+/// Optimistic local mission-control reservation captured before randomized sealing.
+///
+/// Commit rechecks the durable head in the same transaction that stores and
+/// applies the control. A racing publisher receives [`StoreError::ControlReservationChanged`]
+/// and must reserve and seal again.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ControlReservation {
+    authority: NodeId,
+    signer: NodeId,
+    previous_sequence: u64,
+    sequence: u64,
+    previous_control: Option<ControlTransferId>,
+}
+
+impl ControlReservation {
+    /// Stable mission authority namespace.
+    pub const fn authority(&self) -> NodeId {
+        self.authority
+    }
+
+    /// Delegated control signer selected by the local provider.
+    pub const fn signer(&self) -> NodeId {
+        self.signer
+    }
+
+    /// Previously applied durable chain sequence.
+    pub const fn previous_sequence(&self) -> u64 {
+        self.previous_sequence
+    }
+
+    /// Reserved nonzero next chain sequence.
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    /// Exact currently applied predecessor, absent only for sequence one.
+    pub const fn previous_control(&self) -> Option<ControlTransferId> {
+        self.previous_control
+    }
+}
+
+/// Authenticated durable effect retained with an exact mission-control transfer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StoredControlEffect {
+    /// Revokes one principal at a strictly increasing generation.
+    Revocation { subject: NodeId, generation: u64 },
+    /// Activates a strictly increasing epoch for one scope.
+    ScopeEpoch { scope: Scope, epoch: u64 },
+}
+
+/// Durable source-authenticated mission control.
+///
+/// Reloading this value is not a live cryptographic capability. Runtime must
+/// freshly call `aster-core` verification, compare every claim and the exact
+/// bytes, and only prepare provider activation for ordered applied rows.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredControl {
+    /// Exact SHA-256 transfer identity.
+    pub transfer_id: ControlTransferId,
+    /// Stable mission authority.
+    pub authority: NodeId,
+    /// Delegated source signer authenticated by the provider.
+    pub signer: NodeId,
+    /// Nonzero stable-authority chain position.
+    pub sequence: u64,
+    /// Exact predecessor transfer identity.
+    pub previous_control: Option<ControlTransferId>,
+    /// Authenticated effect.
+    pub effect: StoredControlEffect,
+    /// Exact source-sealed bytes.
+    pub sealed: Vec<u8>,
+    /// Whether this row belongs to the durable contiguous applied prefix.
+    pub applied: bool,
+}
+
+impl StoredControl {
+    /// Mission controls are always scheduled at Flash priority.
+    pub const fn priority(&self) -> Priority {
+        Priority::Flash
+    }
+
+    /// Returns the authenticated core control kind without deriving it from bytes.
+    pub const fn kind(&self) -> VerifiedControlKind {
+        match self.effect {
+            StoredControlEffect::Revocation { .. } => VerifiedControlKind::Revocation,
+            StoredControlEffect::ScopeEpoch { .. } => VerifiedControlKind::ScopeEpoch,
+        }
+    }
+
+    /// Returns whether this exact applied control revokes `node`.
+    pub fn revokes(&self, node: NodeId) -> bool {
+        matches!(&self.effect, StoredControlEffect::Revocation { subject, .. } if *subject == node)
+    }
+}
+
+/// Exact reason an authenticated control input was rejected from durable state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ControlRejectionReason {
+    /// The stable mission authority had already been durably revoked.
+    AuthorityRevoked(NodeId),
+    /// The delegated signer had already been durably revoked.
+    SignerRevoked(NodeId),
+    /// An earlier rejected exact link invalidated this control's predecessor.
+    InvalidatedPredecessor(ControlTransferId),
+}
+
+impl ControlRejectionReason {
+    /// Returns the durably revoked principal, when revocation caused rejection directly.
+    pub const fn revoked_principal(self) -> Option<NodeId> {
+        match self {
+            Self::AuthorityRevoked(principal) | Self::SignerRevoked(principal) => Some(principal),
+            Self::InvalidatedPredecessor(_) => None,
+        }
+    }
+}
+
+/// Authenticated input removed because its authority, signer, or exact
+/// predecessor became invalid after a committed revocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RejectedControl {
+    pub transfer_id: ControlTransferId,
+    pub signer: NodeId,
+    pub reason: ControlRejectionReason,
+}
+
+/// Result of atomically storing a mission control and advancing any now-contiguous prefix.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ControlOutcome {
+    /// Exact input was already retained and no new chain link became applied.
+    Duplicate { transfer_id: ControlTransferId },
+    /// Exact input is durable but remains outside the contiguous applied prefix.
+    Pending { transfer_id: ControlTransferId },
+    /// Input was not retained because its authenticated principal was revoked.
+    Rejected {
+        transfer_id: ControlTransferId,
+        signer: NodeId,
+        reason: ControlRejectionReason,
+        rejected: Vec<RejectedControl>,
+    },
+    /// This transaction durably committed an exact ordered activation suffix.
+    ///
+    /// Only entries in `activated` may cross the core post-commit activation
+    /// boundary. `rejected` can include the input itself even while an unrelated
+    /// pending prefix becomes applied in this same transaction.
+    Applied {
+        transfer_id: ControlTransferId,
+        activated: Vec<StoredControl>,
+        rejected: Vec<RejectedControl>,
+    },
+}
+
+impl ControlOutcome {
+    /// Ordered exact durable suffix eligible for fresh verification and provider activation.
+    pub fn activated(&self) -> &[StoredControl] {
+        match self {
+            Self::Applied { activated, .. } => activated,
+            Self::Duplicate { .. } | Self::Pending { .. } | Self::Rejected { .. } => &[],
+        }
+    }
+
+    /// Returns the authenticated input rejected by this operation, including
+    /// the case where another prefix became applied in the same transaction.
+    pub fn rejected_input(&self) -> Option<RejectedControl> {
+        match self {
+            Self::Rejected {
+                transfer_id,
+                signer,
+                reason,
+                ..
+            } => Some(RejectedControl {
+                transfer_id: *transfer_id,
+                signer: *signer,
+                reason: *reason,
+            }),
+            Self::Applied {
+                transfer_id,
+                rejected,
+                ..
+            } => rejected
+                .iter()
+                .find(|control| control.transfer_id == *transfer_id)
+                .copied(),
+            Self::Duplicate { .. } | Self::Pending { .. } => None,
+        }
+    }
+}
+
+/// Canonically ordered exact mission-control identities for reconciliation.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ControlInventory(Vec<ControlTransferId>);
+
+impl ControlInventory {
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &ControlTransferId> {
+        self.0.iter()
+    }
+
+    pub fn reconciliation_snapshot(&self) -> InventorySnapshot {
+        InventorySnapshot::new(
+            self.0
+                .iter()
+                .copied()
+                .map(ControlTransferId::reconciliation_item_id),
+        )
+    }
+}
+
+/// A bounded, application-defined idempotency key for one local Event operation.
+///
+/// The key is durable and maps to exactly one accepted source Event. A caller
+/// should namespace the bytes by application and operation kind. Reactive work
+/// can append the authenticated predecessor's semantic item identifier.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct EventOperationKey(Vec<u8>);
+
+impl EventOperationKey {
+    /// Validates a nonempty bounded operation key.
+    pub fn new(bytes: impl Into<Vec<u8>>) -> Result<Self, StoreError> {
+        let bytes = bytes.into();
+        if bytes.is_empty() || bytes.len() > MAX_EVENT_OPERATION_KEY_BYTES {
+            return Err(StoreError::InvalidEventOperationKey {
+                length: bytes.len(),
+            });
+        }
+        Ok(Self(bytes))
+    }
+
+    /// Returns the exact durable key bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// Optimistic Event publication reservation derived only from durable ledgers.
+///
+/// Sealing may occur after this value is returned. Commit rechecks both high
+/// waters in the redb write transaction; a concurrent publisher receives
+/// [`StoreError::ReservationChanged`] and must reserve and seal again.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventReservation {
+    control_policy: ControlPolicySnapshot,
+    publisher: NodeId,
+    topic: Topic,
+    scope: Scope,
+    previous_counter: u64,
+    counter: u64,
+    previous_event_sequence: u64,
+    event_sequence: u64,
+    context: VersionVector,
+}
+
+impl EventReservation {
+    /// Exact settled control policy atomically observed with this reservation.
+    pub const fn control_policy(&self) -> &ControlPolicySnapshot {
+        &self.control_policy
+    }
+
+    /// Source identity for this reservation.
+    pub const fn publisher(&self) -> NodeId {
+        self.publisher
+    }
+
+    /// Reserved nonzero source causal counter.
+    pub const fn counter(&self) -> u64 {
+        self.counter
+    }
+
+    /// Reserved nonzero position in the publisher/topic/scope Event stream.
+    pub const fn event_sequence(&self) -> u64 {
+        self.event_sequence
+    }
+
+    /// Directly accepted causal frontier captured for this topic and scope.
+    pub const fn context(&self) -> &VersionVector {
+        &self.context
+    }
+
+    /// Builds the exact proven Event header for source sealing.
+    pub fn header(
+        &self,
+        priority: Priority,
+        logical_key: Vec<u8>,
+        ttl_ms: Option<u64>,
+        content_len: u64,
+        tombstone: bool,
+        key_epoch: u64,
+    ) -> Result<EnvelopeHeader, StoreError> {
+        if logical_key.len() > MAX_LOGICAL_KEY_BYTES {
+            return Err(StoreError::InvalidSemanticEvent(
+                "logical key exceeds 4096 bytes",
+            ));
+        }
+        Ok(EnvelopeHeader {
+            class: SemanticDataClass::Event,
+            topic: self.topic.clone(),
+            scope: self.scope.clone(),
+            priority,
+            stamp: CausalStamp {
+                dot: Dot {
+                    publisher: self.publisher,
+                    counter: self.counter,
+                },
+                context: self.context.clone(),
+            },
+            event_sequence: Some(self.event_sequence),
+            logical_key,
+            blob_route: None,
+            ttl_ms,
+            content_len,
+            tombstone,
+            key_epoch,
+        })
+    }
+}
+
+/// One source-authenticated Event and its exact retained transfer representation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredEvent {
+    /// SHA-256 identity used by reconciliation and fetch for the exact sealed bytes.
+    pub transfer_id: EventTransferId,
+    /// Semantic item identity authenticated inside the source envelope.
+    pub semantic_id: EventSemanticId,
+    /// Full source-authenticated Event header.
+    pub header: EnvelopeHeader,
+    /// Exact stable source-sealed representation.
+    pub sealed: Vec<u8>,
+    /// Durable marker allocated when this representation was first accepted.
+    pub acceptance_marker: u64,
+}
+
+/// Canonically ordered exact Event transfer identities for reconciliation.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct EventInventory(Vec<EventTransferId>);
+
+impl EventInventory {
+    /// Returns the number of exact source representations in this inventory.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Returns whether the semantic Event inventory is empty.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Iterates exact transfer identities in canonical byte order.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &EventTransferId> {
+        self.0.iter()
+    }
+
+    /// Explicitly adapts exact Event transfer identities to the current Negentropy profile.
+    pub fn reconciliation_snapshot(&self) -> InventorySnapshot {
+        InventorySnapshot::new(
+            self.0
+                .iter()
+                .copied()
+                .map(EventTransferId::reconciliation_item_id),
+        )
+    }
+}
+
+/// Result of retaining a route-verified Event without content acceptance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RouteCacheOutcome {
+    /// A new exact transfer representation entered the bounded route cache.
+    Inserted {
+        transfer_id: EventTransferId,
+        semantic_claim: EventSemanticId,
+    },
+    /// The same exact route-verified representation is already retained, either
+    /// in this cache or as a content-accepted semantic Event.
+    Duplicate {
+        transfer_id: EventTransferId,
+        semantic_claim: EventSemanticId,
+    },
+}
+
+/// Route-authenticated metadata and exact bytes that have not passed content AEAD.
+///
+/// This type is intentionally distinct from [`StoredEvent`]. It confers no
+/// semantic acceptance and never participates in accepted-dot, Event-position,
+/// operation, or application-reaction APIs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouteCachedEvent {
+    pub transfer_id: EventTransferId,
+    pub semantic_claim: EventSemanticId,
+    pub header_claim: EnvelopeHeader,
+    pub sealed: Vec<u8>,
+}
+
+/// One mission-bound exact transfer row, separated by content-acceptance state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StoredEventTransfer {
+    /// Content was authenticated before semantic acceptance.
+    Accepted(StoredEvent),
+    /// Only source/route metadata has been authenticated; content must be reopened.
+    RouteCached(RouteCachedEvent),
+}
+
+/// Result of an atomic idempotent local Event operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EventOnceOutcome {
+    /// This transaction committed the operation and Event together.
+    Inserted {
+        /// Exact transfer identity of the newly retained representation.
+        transfer_id: EventTransferId,
+        /// Semantic identity authenticated inside the Event.
+        semantic_id: EventSemanticId,
+        /// Durable acceptance marker paired with the transfer representation.
+        acceptance_marker: u64,
+    },
+    /// This transaction durably bound a new operation key to an exact Event
+    /// representation that was already content-accepted.
+    BoundExisting {
+        /// Exact transfer identity of the retained representation.
+        transfer_id: EventTransferId,
+        /// Semantic identity authenticated inside the Event.
+        semantic_id: EventSemanticId,
+        /// Original durable acceptance marker.
+        acceptance_marker: u64,
+    },
+    /// The operation was already durably mapped to this Event.
+    Existing {
+        /// Exact transfer identity of the retained representation.
+        transfer_id: EventTransferId,
+        /// Semantic identity authenticated inside the Event.
+        semantic_id: EventSemanticId,
+        /// Original durable acceptance marker.
+        acceptance_marker: u64,
+    },
+}
+
+/// Missing half-open range in one authenticated publisher Event stream.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventGap {
+    /// Source-authenticated publisher identity.
+    pub publisher: NodeId,
+    /// Source-authenticated topic.
+    pub topic: Topic,
+    /// Source-authenticated scope.
+    pub scope: Scope,
+    /// First absent sequence.
+    pub start_sequence: u64,
+    /// First observed sequence after the gap.
+    pub end_sequence: u64,
+}
+
+/// A consistent point-in-time summary of the store.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StoreStats {
+    /// Number of accepted items.
+    pub items: u64,
+    /// Number of acceptance markers.
+    pub acceptance_markers: u64,
+    /// Sum of exact opaque accepted-item byte lengths.
+    pub total_payload_bytes: u64,
+    /// Last allocated acceptance marker, or zero when the store is empty.
+    pub last_acceptance_marker: u64,
+}
+
+/// Consistent counts for the mission-bound semantic Event namespace.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EventStoreStats {
+    /// Number of content-verified Event representations.
+    pub events: u64,
+    /// Number of semantic Event acceptance markers.
+    pub acceptance_markers: u64,
+    /// Sum of exact source-sealed Event bytes.
+    pub total_sealed_bytes: u64,
+    /// Last semantic acceptance marker, or zero when empty.
+    pub last_acceptance_marker: u64,
+    /// Route/source-verified representations not yet content-accepted.
+    pub route_cached: u64,
+    /// Exact bytes retained in the route-only cache.
+    pub route_cached_bytes: u64,
+}
+
+/// Consistent counts for the mission-wide control namespace.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ControlStoreStats {
+    /// Total retained exact control transfers, applied plus pending.
+    pub controls: u64,
+    /// Controls in the contiguous durable applied prefix.
+    pub applied: u64,
+    /// Authenticated out-of-order controls retained without effect authority.
+    pub pending: u64,
+    /// Sum of exact retained source-sealed control bytes.
+    pub total_sealed_bytes: u64,
+    /// Sum of canonical non-secret local scope-rekey publication-intent bytes.
+    pub publication_intent_bytes: u64,
+    /// Contiguous applied mission-control sequence.
+    pub head_sequence: u64,
+    /// Active durable revocation effects.
+    pub revocations: u64,
+    /// Active durable scope-epoch effects.
+    pub scope_epochs: u64,
+    /// Locally committed controls paired with an exact reservation receipt.
+    pub reservation_receipts: u64,
+}
+
+/// Local artifact whose exact destruction is recorded during terminal cleanup.
+///
+/// The store persists only bounded, caller-encoded nonsecret descriptors. The
+/// runtime owns their path/file-identity semantics and must fsync destruction
+/// before advancing the corresponding durable receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ZeroizationArtifact {
+    /// Mission cryptographic provisioning bundle.
+    MissionBundle,
+    /// Local carrier identity key.
+    CarrierIdentity,
+}
+
+/// Exact bounded nonsecret artifact targets for crash-resumable zeroization.
+///
+/// Descriptor bytes are opaque to this crate. They are stored and compared
+/// exactly so a retry cannot silently substitute a same-path replacement.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ZeroizationIntent {
+    mission_bundle_descriptor: Vec<u8>,
+    carrier_identity_descriptor: Vec<u8>,
+}
+
+impl ZeroizationIntent {
+    /// Constructs an intent with exactly one nonempty descriptor per required artifact.
+    pub fn new(
+        mission_bundle_descriptor: impl Into<Vec<u8>>,
+        carrier_identity_descriptor: impl Into<Vec<u8>>,
+    ) -> Result<Self, StoreError> {
+        let mission_bundle_descriptor = mission_bundle_descriptor.into();
+        validate_zeroization_descriptor(
+            ZeroizationArtifact::MissionBundle,
+            &mission_bundle_descriptor,
+        )?;
+        let carrier_identity_descriptor = carrier_identity_descriptor.into();
+        validate_zeroization_descriptor(
+            ZeroizationArtifact::CarrierIdentity,
+            &carrier_identity_descriptor,
+        )?;
+        Ok(Self {
+            mission_bundle_descriptor,
+            carrier_identity_descriptor,
+        })
+    }
+
+    /// Returns the exact persisted descriptor for `artifact`.
+    pub fn descriptor(&self, artifact: ZeroizationArtifact) -> &[u8] {
+        match artifact {
+            ZeroizationArtifact::MissionBundle => &self.mission_bundle_descriptor,
+            ZeroizationArtifact::CarrierIdentity => &self.carrier_identity_descriptor,
+        }
+    }
+}
+
+/// Durable lifecycle of one mission-bound store.
+///
+/// Every state except `Live` is a terminal access lockout. Intermediate names
+/// report durable cleanup receipts, not claims about physical media erasure.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum StoreZeroizationState {
+    /// Normal mission-bound operation is authorized by this store boundary.
+    #[default]
+    Live,
+    /// Terminal lockout is durable; neither artifact has a destruction receipt.
+    CleanupPending,
+    /// Mission-bundle destruction was durably acknowledged after runtime fsync.
+    MissionDestroyed,
+    /// Both artifact destructions were durably acknowledged after runtime fsync.
+    IdentityDestroyed,
+    /// Cleanup was explicitly finalized after both destruction receipts.
+    Complete,
+}
+
+impl StoreZeroizationState {
+    /// Returns whether normal Store opens and data APIs must fail closed.
+    pub const fn is_terminal(self) -> bool {
+        !matches!(self, Self::Live)
+    }
+
+    /// Returns whether mission-bundle destruction has a durable receipt.
+    pub const fn mission_destroyed(self) -> bool {
+        matches!(
+            self,
+            Self::MissionDestroyed | Self::IdentityDestroyed | Self::Complete
+        )
+    }
+
+    /// Returns whether carrier-identity destruction has a durable receipt.
+    pub const fn identity_destroyed(self) -> bool {
+        matches!(self, Self::IdentityDestroyed | Self::Complete)
+    }
+}
+
+/// Read-only lifecycle truth for one existing store.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StoreZeroizationStatus {
+    state: StoreZeroizationState,
+    mission_authority: Option<NodeId>,
+    intent: Option<ZeroizationIntent>,
+}
+
+impl StoreZeroizationStatus {
+    /// Returns the durable lifecycle phase.
+    pub const fn state(&self) -> StoreZeroizationState {
+        self.state
+    }
+
+    /// Returns the stable mission binding, when present.
+    pub const fn mission_authority(&self) -> Option<NodeId> {
+        self.mission_authority
+    }
+
+    /// Returns exact nonsecret cleanup targets after terminal transition.
+    pub const fn intent(&self) -> Option<&ZeroizationIntent> {
+        self.intent.as_ref()
+    }
+}
+
+/// Result of an idempotent terminal-lockout transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BeginZeroizationOutcome {
+    /// This call durably entered cleanup-pending state.
+    EnteredCleanupPending,
+    /// The exact intent was already terminal at this phase or later.
+    AlreadyStarted(StoreZeroizationState),
+}
+
+/// Result of durably recording one artifact destruction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArtifactDestructionOutcome {
+    /// This call durably advanced the artifact receipt.
+    Marked,
+    /// This artifact already had a durable receipt.
+    AlreadyMarked,
+}
+
+/// Result of idempotently finalizing completed artifact cleanup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FinalizeZeroizationOutcome {
+    /// This call durably advanced the lifecycle to complete.
+    Finalized,
+    /// The lifecycle was already complete.
+    AlreadyComplete,
+}
+
+/// One strictly read-only, internally consistent view of an existing store.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StoreInspection {
+    /// Canonical complete-ID inventory from the audited read transaction.
+    pub inventory: InventorySnapshot,
+    /// Durable legacy opaque counts and byte accounting from the same read transaction.
+    pub stats: StoreStats,
+    /// Mission-bound semantic Event and route-cache counts from the same read transaction.
+    pub event_stats: EventStoreStats,
+    /// Mission-wide Flash control counts from the same audited read transaction.
+    pub control_stats: ControlStoreStats,
+    /// Stable mission authority binding, when this store has been provisioned.
+    pub mission_authority: Option<NodeId>,
+    /// Durable terminal-lockout and crash-resumable cleanup truth.
+    pub zeroization: StoreZeroizationStatus,
+}
+
+/// Startup proof that redb rejected a concurrent writable open for one live store path.
+///
+/// This only proves the filesystem/backend lock behavior observed while the
+/// current [`Store`] handle was live; it is not an async network-send lease.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcessExclusiveLockProof(());
+
+/// Immutable identity captured from the exact file handle owned by redb.
+///
+/// On Unix this is the `fstat(2)` device/inode pair from the no-follow file
+/// descriptor passed directly into redb. Other platforms report identity as
+/// unavailable rather than deriving it from a pathname and overstating proof.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct StoreBackingIdentity {
+    unix_device_inode: Option<(u64, u64)>,
+}
+
+impl StoreBackingIdentity {
+    /// Returns the exact Unix device/inode pair, or `None` where unavailable.
+    pub const fn unix_device_inode(self) -> Option<(u64, u64)> {
+        self.unix_device_inode
+    }
+}
+
+/// Failures from the durable accepted-item authority.
+#[derive(Debug)]
+pub enum StoreError {
+    /// The storage engine rejected an operation.
+    Backend(redb::Error),
+    /// The selected store path could not be resolved to a stable file identity.
+    StorePath(std::io::Error),
+    /// The exact opened backing file violates the local single-owner safety policy.
+    StoreBackingInvariant(&'static str),
+    /// A stable identifier was presented with bytes different from the committed bytes.
+    IdentityConflict { id: ItemId },
+    /// An accepted item exists without its atomically paired acceptance marker.
+    MissingAcceptanceMarker { id: ItemId },
+    /// An acceptance marker exists without its atomically paired accepted item.
+    OrphanedAcceptanceMarker { id: ItemId },
+    /// A stored table key was not a complete 32-byte item identifier.
+    InvalidStoredIdLength {
+        /// Table containing the invalid key.
+        table: &'static str,
+        /// Observed key length.
+        length: usize,
+    },
+    /// Accepting another item would exceed the configured item-count quota.
+    ItemLimitExceeded {
+        /// Currently committed item count.
+        current: u64,
+        /// Configured maximum item count.
+        limit: u64,
+    },
+    /// Accepting the opaque bytes would exceed the configured payload-byte quota.
+    PayloadByteLimitExceeded {
+        /// Currently committed opaque payload bytes.
+        current: u64,
+        /// Opaque bytes in the rejected item.
+        incoming: u64,
+        /// Configured maximum aggregate retained payload/source-envelope bytes.
+        limit: u64,
+    },
+    /// The durable item count cannot be represented by the accounting type.
+    ItemCountAccountingOverflow,
+    /// The durable opaque payload byte count cannot be represented by the accounting type.
+    PayloadByteAccountingOverflow,
+    /// Durable accounting metadata disagrees with reconstructed item-table truth.
+    AccountingMismatch {
+        /// Accounting field that differs.
+        field: &'static str,
+        /// Value stored in durable metadata.
+        durable: u64,
+        /// Value reconstructed from accepted items.
+        reconstructed: u64,
+    },
+    /// A required durable accounting field is absent.
+    MissingAccountingMetadata {
+        /// Missing metadata field.
+        field: &'static str,
+    },
+    /// The monotonically increasing acceptance-marker counter is exhausted.
+    AcceptanceMarkerExhausted,
+    /// A core Event capability did not match its exact sealed bytes or TTL boundary.
+    SemanticVerification(String),
+    /// Source-authenticated Event metadata was internally inconsistent.
+    InvalidSemanticEvent(&'static str),
+    /// A finite-TTL Event arrived before authenticated custody tracking was available.
+    AuthenticatedCustodyAgeRequired,
+    /// One semantic item was replayed with a different exact source representation.
+    SemanticRepresentationConflict {
+        /// Authenticated semantic item identifier.
+        semantic_id: EventSemanticId,
+        /// First accepted exact source-envelope identity.
+        accepted_envelope_id: EventTransferId,
+        /// Replayed exact source-envelope identity.
+        received_envelope_id: EventTransferId,
+    },
+    /// A publisher reused an already accepted causal counter for another item.
+    CausalEquivocation {
+        /// Source-authenticated publisher identity.
+        publisher: NodeId,
+        /// Reused source causal counter.
+        counter: u64,
+    },
+    /// A publisher reused one Event stream position for another item.
+    EventEquivocation {
+        /// Source-authenticated publisher identity.
+        publisher: NodeId,
+        /// Reused per-stream Event sequence.
+        sequence: u64,
+    },
+    /// An optimistic publisher or stream reservation changed before commit.
+    ReservationChanged,
+    /// An application operation key was empty or exceeded its explicit bound.
+    InvalidEventOperationKey {
+        /// Observed key length.
+        length: usize,
+    },
+    /// One Event cursor request exceeded the explicit page bound.
+    EventPageLimitExceeded {
+        /// Requested number of rows.
+        requested: usize,
+        /// Maximum rows accepted in one request.
+        maximum: usize,
+    },
+    /// A reactive predecessor was not an accepted semantic Event.
+    MissingReactionPredecessor { semantic_id: EventSemanticId },
+    /// A reaction reservation did not causally observe its accepted predecessor.
+    ReactionContextMissing { semantic_id: EventSemanticId },
+    /// A durable semantic table or index disagreed with its paired authority row.
+    SemanticInvariant(&'static str),
+    /// The bounded route-only cache reached its item-count limit.
+    RouteCacheItemLimitExceeded { current: u64, limit: u64 },
+    /// Retaining more exact route-only bytes would exceed the cache byte limit.
+    RouteCacheByteLimitExceeded {
+        current: u64,
+        incoming: u64,
+        limit: u64,
+    },
+    /// Semantic/cache state has not been bound to a stable mission authority.
+    MissionNotBound,
+    /// A token or requested reopen belongs to another stable mission authority.
+    MissionAuthorityMismatch { bound: NodeId, received: NodeId },
+    /// One semantic claim reached its route-only representation cap.
+    RouteCacheSemanticRepresentationLimit {
+        semantic_id: EventSemanticId,
+        current: u64,
+        limit: u64,
+    },
+    /// An idempotent operation key was replayed with another causal predecessor.
+    OperationPredecessorMismatch,
+    /// A control policy snapshot cannot be issued or used while controls are pending.
+    ControlPolicyUnsettled { pending: u64 },
+    /// The expected exact control policy no longer matches durable state.
+    ControlPolicyChanged,
+    /// An Event publisher was revoked by the applied mission-control prefix.
+    EventPublisherRevoked(NodeId),
+    /// An Event uses a scope key epoch older than durable control policy.
+    EventKeyEpochStale { current: u64, received: u64 },
+    /// A core control capability did not match its exact source-sealed bytes.
+    ControlVerification(String),
+    /// Authenticated control claims were internally inconsistent.
+    InvalidControl(&'static str),
+    /// Two exact controls claim one stable-authority sequence or predecessor chain.
+    ControlFork,
+    /// A revocation generation or scope epoch moved backward or failed to increase.
+    ControlRollback,
+    /// A delegated source signer was already durably revoked.
+    ControlSignerRevoked(NodeId),
+    /// The stable mission authority was already durably revoked.
+    ControlAuthorityRevoked(NodeId),
+    /// The optimistic local control reservation no longer matches the durable head.
+    ControlReservationChanged,
+    /// The stable mission-authority control sequence is exhausted.
+    ControlSequenceExhausted,
+    /// Durable control tables or indexes disagree.
+    ControlInvariant(&'static str),
+    /// A local scope-rekey publication intent was empty or non-canonical.
+    InvalidControlPublicationIntent,
+    /// Local scope-rekey commit omitted its required durable intent binding.
+    MissingControlPublicationIntent,
+    /// An applied scope-rekey has no local intent and cannot prove an exact retry.
+    ControlPublicationIntentUnknown { transfer_id: ControlTransferId },
+    /// A requested scope-rekey intent differs from the exact committed publication.
+    ControlPublicationIntentConflict { transfer_id: ControlTransferId },
+    /// The dedicated control item cap was reached.
+    ControlItemLimitExceeded { current: u64, limit: u64 },
+    /// Retaining an exact control would exceed the dedicated control byte cap.
+    ControlByteLimitExceeded {
+        current: u64,
+        incoming: u64,
+        limit: u64,
+    },
+    /// One exact digest appears in both Event and control transfer namespaces.
+    TransferNamespaceCollision { transfer_id: [u8; 32] },
+    /// redb did not enforce a second-writer exclusion lock for the selected store path.
+    ProcessExclusiveLockUnavailable,
+    /// The exact store already has another writable process/handle.
+    StoreInUse,
+    /// A normal open or data API reached a durably terminal store.
+    StoreZeroized(StoreZeroizationState),
+    /// The terminal schema is partial, corrupt, or disagrees with mission binding.
+    ZeroizationInvariant(&'static str),
+    /// A required nonsecret artifact descriptor was empty or over its bound.
+    InvalidZeroizationDescriptor {
+        /// Required artifact whose descriptor was invalid.
+        artifact: ZeroizationArtifact,
+        /// Observed descriptor byte length.
+        length: usize,
+    },
+    /// A retry supplied artifact targets different from the durable intent.
+    ZeroizationIntentConflict,
+    /// A zeroization receipt/finalization step was requested out of order.
+    ZeroizationOrderViolation(&'static str),
+}
+
+impl StoreError {
+    /// Returns whether a read-only redb open was refused solely because writer recovery is needed.
+    ///
+    /// Callers may defer inspection only for this exact condition and must then
+    /// acquire a writable store path whose first transaction enforces terminal
+    /// state before any application schema access.
+    pub const fn is_read_only_repair_required(&self) -> bool {
+        // redb intentionally refuses allocator repair from a read-only handle
+        // after an unclean exit; this was also observed after node SIGKILL.
+        matches!(self, Self::Backend(redb::Error::RepairAborted))
+    }
+}
+
+impl fmt::Display for StoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Backend(error) => write!(formatter, "redb storage error: {error}"),
+            Self::StorePath(error) => write!(formatter, "store path error: {error}"),
+            Self::StoreBackingInvariant(reason) => {
+                write!(formatter, "store backing-file invariant failed: {reason}")
+            }
+            Self::IdentityConflict { .. } => formatter
+                .write_str("the item identifier is already committed with different opaque bytes"),
+            Self::MissingAcceptanceMarker { .. } => {
+                formatter.write_str("accepted item is missing its atomic acceptance marker")
+            }
+            Self::OrphanedAcceptanceMarker { .. } => {
+                formatter.write_str("acceptance marker exists without its accepted item")
+            }
+            Self::InvalidStoredIdLength { table, length } => {
+                write!(
+                    formatter,
+                    "{table} contains a {length}-byte item identifier"
+                )
+            }
+            Self::ItemLimitExceeded { current, limit } => write!(
+                formatter,
+                "item count {current} is already at configured limit {limit}"
+            ),
+            Self::PayloadByteLimitExceeded {
+                current,
+                incoming,
+                limit,
+            } => write!(
+                formatter,
+                "accepting {incoming} retained bytes at current total {current} would exceed configured limit {limit}"
+            ),
+            Self::ItemCountAccountingOverflow => {
+                formatter.write_str("durable item-count accounting overflow")
+            }
+            Self::PayloadByteAccountingOverflow => {
+                formatter.write_str("durable payload-byte accounting overflow")
+            }
+            Self::AccountingMismatch {
+                field,
+                durable,
+                reconstructed,
+            } => write!(
+                formatter,
+                "durable {field} accounting {durable} differs from reconstructed value {reconstructed}"
+            ),
+            Self::MissingAccountingMetadata { field } => {
+                write!(
+                    formatter,
+                    "required durable accounting field {field} is absent"
+                )
+            }
+            Self::AcceptanceMarkerExhausted => {
+                formatter.write_str("the acceptance-marker counter is exhausted")
+            }
+            Self::SemanticVerification(error) => {
+                write!(formatter, "source Event verification failed: {error}")
+            }
+            Self::InvalidSemanticEvent(reason) => {
+                write!(formatter, "invalid source-authenticated Event: {reason}")
+            }
+            Self::AuthenticatedCustodyAgeRequired => formatter
+                .write_str("finite-TTL Event requires authenticated cumulative custody tracking"),
+            Self::SemanticRepresentationConflict { .. } => formatter
+                .write_str("semantic item was replayed with a different source-sealed envelope"),
+            Self::CausalEquivocation { counter, .. } => {
+                write!(
+                    formatter,
+                    "publisher reused accepted causal counter {counter}"
+                )
+            }
+            Self::EventEquivocation { sequence, .. } => {
+                write!(
+                    formatter,
+                    "publisher reused accepted Event sequence {sequence}"
+                )
+            }
+            Self::ReservationChanged => {
+                formatter.write_str("durable Event reservation changed before commit")
+            }
+            Self::InvalidEventOperationKey { length } => write!(
+                formatter,
+                "Event operation key length {length} is outside 1..={MAX_EVENT_OPERATION_KEY_BYTES}"
+            ),
+            Self::EventPageLimitExceeded { requested, maximum } => write!(
+                formatter,
+                "Event page request {requested} exceeds maximum {maximum}"
+            ),
+            Self::MissingReactionPredecessor { .. } => {
+                formatter.write_str("reactive predecessor is not an accepted semantic Event")
+            }
+            Self::ReactionContextMissing { .. } => formatter
+                .write_str("reactive Event does not causally observe its accepted predecessor"),
+            Self::SemanticInvariant(reason) => {
+                write!(
+                    formatter,
+                    "durable semantic Event invariant failed: {reason}"
+                )
+            }
+            Self::RouteCacheItemLimitExceeded { current, limit } => write!(
+                formatter,
+                "route-only Event cache count {current} is at limit {limit}"
+            ),
+            Self::RouteCacheByteLimitExceeded {
+                current,
+                incoming,
+                limit,
+            } => write!(
+                formatter,
+                "retaining {incoming} route-only bytes at current total {current} would exceed limit {limit}"
+            ),
+            Self::MissionNotBound => {
+                formatter.write_str("semantic Event store is not bound to a mission authority")
+            }
+            Self::MissionAuthorityMismatch { .. } => {
+                formatter.write_str("semantic Event token belongs to a different mission authority")
+            }
+            Self::RouteCacheSemanticRepresentationLimit { current, limit, .. } => write!(
+                formatter,
+                "route-only semantic claim has {current} representations at limit {limit}"
+            ),
+            Self::OperationPredecessorMismatch => {
+                formatter.write_str("Event operation key was replayed with a different predecessor")
+            }
+            Self::ControlPolicyUnsettled { pending } => write!(
+                formatter,
+                "control policy has {pending} pending chain links and cannot authorize Event I/O"
+            ),
+            Self::ControlPolicyChanged => {
+                formatter.write_str("exact durable control policy changed")
+            }
+            Self::EventPublisherRevoked(_) => {
+                formatter.write_str("Event publisher is durably revoked")
+            }
+            Self::EventKeyEpochStale { current, received } => write!(
+                formatter,
+                "Event key epoch {received} is older than durable scope epoch {current}"
+            ),
+            Self::ControlVerification(error) => {
+                write!(formatter, "source control verification failed: {error}")
+            }
+            Self::InvalidControl(reason) => {
+                write!(formatter, "invalid source-authenticated control: {reason}")
+            }
+            Self::ControlFork => formatter.write_str("mission control-chain fork detected"),
+            Self::ControlRollback => {
+                formatter.write_str("mission control effect generation or epoch rollback detected")
+            }
+            Self::ControlSignerRevoked(_) => {
+                formatter.write_str("delegated mission-control signer is revoked")
+            }
+            Self::ControlAuthorityRevoked(_) => {
+                formatter.write_str("stable mission-control authority is revoked")
+            }
+            Self::ControlReservationChanged => {
+                formatter.write_str("durable mission-control head changed; reserve and seal again")
+            }
+            Self::ControlSequenceExhausted => {
+                formatter.write_str("mission-control sequence is exhausted")
+            }
+            Self::ControlInvariant(reason) => {
+                write!(
+                    formatter,
+                    "durable mission-control invariant failed: {reason}"
+                )
+            }
+            Self::InvalidControlPublicationIntent => {
+                formatter.write_str("local scope-rekey publication intent is invalid")
+            }
+            Self::MissingControlPublicationIntent => formatter
+                .write_str("local scope-rekey commit is missing its durable publication intent"),
+            Self::ControlPublicationIntentUnknown { .. } => {
+                formatter.write_str("applied scope-rekey has no durable local publication intent")
+            }
+            Self::ControlPublicationIntentConflict { .. } => {
+                formatter.write_str("scope-rekey retry differs from its durable publication intent")
+            }
+            Self::ControlItemLimitExceeded { current, limit } => write!(
+                formatter,
+                "mission-control count {current} is at dedicated limit {limit}"
+            ),
+            Self::ControlByteLimitExceeded {
+                current,
+                incoming,
+                limit,
+            } => write!(
+                formatter,
+                "retaining {incoming} control bytes at current total {current} would exceed dedicated limit {limit}"
+            ),
+            Self::TransferNamespaceCollision { .. } => formatter.write_str(
+                "one exact digest appears in both Event and mission-control transfer namespaces",
+            ),
+            Self::ProcessExclusiveLockUnavailable => formatter
+                .write_str("redb did not enforce exclusive writer ownership for the store path"),
+            Self::StoreInUse => formatter.write_str("store already has a writable owner"),
+            Self::StoreZeroized(state) => {
+                write!(
+                    formatter,
+                    "store is terminally locked out in {state:?} state"
+                )
+            }
+            Self::ZeroizationInvariant(reason) => {
+                write!(formatter, "durable zeroization invariant failed: {reason}")
+            }
+            Self::InvalidZeroizationDescriptor { artifact, length } => write!(
+                formatter,
+                "{artifact:?} zeroization descriptor length {length} is outside 1..={MAX_ZEROIZATION_DESCRIPTOR_BYTES}"
+            ),
+            Self::ZeroizationIntentConflict => formatter
+                .write_str("zeroization retry targets differ from the durable artifact intent"),
+            Self::ZeroizationOrderViolation(reason) => {
+                write!(
+                    formatter,
+                    "zeroization cleanup step is out of order: {reason}"
+                )
+            }
+        }
+    }
+}
+
+impl Error for StoreError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Backend(error) => Some(error),
+            Self::StorePath(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+macro_rules! impl_backend_conversion {
+    ($($error:ty),+ $(,)?) => {
+        $(
+            impl From<$error> for StoreError {
+                fn from(error: $error) -> Self {
+                    Self::Backend(error.into())
+                }
+            }
+        )+
+    };
+}
+
+impl_backend_conversion!(
+    redb::DatabaseError,
+    redb::TransactionError,
+    redb::TableError,
+    redb::StorageError,
+    redb::CommitError,
+    redb::SetDurabilityError,
+);
+
+#[derive(Clone, Copy)]
+enum EventOrigin {
+    Local,
+    Remote,
+}
+
+struct PreparedEvent {
+    mission_authority: NodeId,
+    transfer_id: EventTransferId,
+    semantic_id: EventSemanticId,
+    header: EnvelopeHeader,
+    sealed: Vec<u8>,
+    encoded_metadata: Vec<u8>,
+}
+
+impl PreparedEvent {
+    fn from_verified(
+        event: &ContentVerifiedEventEnvelope,
+        sealed: &[u8],
+        origin: EventOrigin,
+    ) -> Result<Self, StoreError> {
+        event
+            .verify_exact_sealed(sealed)
+            .map_err(|error| StoreError::SemanticVerification(error.to_string()))?;
+        if event.ttl_ms().is_some() {
+            return Err(StoreError::AuthenticatedCustodyAgeRequired);
+        }
+        if matches!(origin, EventOrigin::Local) {
+            event
+                .ensure_live_for_local_publication()
+                .map_err(|error| StoreError::SemanticVerification(error.to_string()))?;
+        } else {
+            event
+                .ensure_remote_acceptance_without_forwarding_age()
+                .map_err(|error| StoreError::SemanticVerification(error.to_string()))?;
+        }
+        let header = event.header().clone();
+        validate_event_header(&header)?;
+        let transfer_id = EventTransferId::new(event.envelope_id());
+        let semantic_id = EventSemanticId::new(event.item_id());
+        let encoded_metadata = encode_event_metadata(transfer_id, semantic_id, &header)?;
+        Ok(Self {
+            mission_authority: event.mission_authority_id(),
+            transfer_id,
+            semantic_id,
+            header,
+            sealed: sealed.to_vec(),
+            encoded_metadata,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PendingOperation<'a> {
+    key: &'a EventOperationKey,
+    predecessor: Option<EventSemanticId>,
+}
+
+struct EventCommit {
+    transfer_id: EventTransferId,
+    semantic_id: EventSemanticId,
+    apply: ApplyOutcome,
+    operation_existing: bool,
+}
+
+fn event_once_outcome(committed: EventCommit) -> Result<EventOnceOutcome, StoreError> {
+    let transfer_id = committed.transfer_id;
+    let semantic_id = committed.semantic_id;
+    let acceptance_marker = committed.apply.acceptance_marker();
+    if committed.operation_existing {
+        Ok(EventOnceOutcome::Existing {
+            transfer_id,
+            semantic_id,
+            acceptance_marker,
+        })
+    } else if matches!(committed.apply, ApplyOutcome::Inserted { .. }) {
+        Ok(EventOnceOutcome::Inserted {
+            transfer_id,
+            semantic_id,
+            acceptance_marker,
+        })
+    } else {
+        Ok(EventOnceOutcome::BoundExisting {
+            transfer_id,
+            semantic_id,
+            acceptance_marker,
+        })
+    }
+}
+
+struct EventMetadata {
+    transfer_id: EventTransferId,
+    semantic_id: EventSemanticId,
+    header: EnvelopeHeader,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OperationRecord {
+    transfer_id: EventTransferId,
+    predecessor: Option<EventSemanticId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ControlRecord {
+    transfer_id: ControlTransferId,
+    authority: NodeId,
+    signer: NodeId,
+    sequence: u64,
+    previous_control: Option<ControlTransferId>,
+    effect: StoredControlEffect,
+}
+
+struct PreparedControl {
+    record: ControlRecord,
+    sealed: Vec<u8>,
+    encoded: Vec<u8>,
+}
+
+impl PreparedControl {
+    fn from_verified(control: &VerifiedControlEnvelope, sealed: &[u8]) -> Result<Self, StoreError> {
+        control
+            .verify_exact_sealed(sealed)
+            .map_err(|error| StoreError::ControlVerification(error.to_string()))?;
+        let transfer_id = ControlTransferId::new(control.envelope_id());
+        let previous_control = control.previous_control().map(ControlTransferId::new);
+        let effect = match control.kind() {
+            VerifiedControlKind::Revocation => StoredControlEffect::Revocation {
+                subject: control
+                    .revocation_subject()
+                    .ok_or(StoreError::InvalidControl(
+                        "revocation capability is missing its subject",
+                    ))?,
+                generation: control
+                    .revocation_generation()
+                    .ok_or(StoreError::InvalidControl(
+                        "revocation capability is missing its generation",
+                    ))?,
+            },
+            VerifiedControlKind::ScopeEpoch => StoredControlEffect::ScopeEpoch {
+                scope: control.scope().cloned().ok_or(StoreError::InvalidControl(
+                    "scope-epoch capability is missing its scope",
+                ))?,
+                epoch: control.scope_epoch().ok_or(StoreError::InvalidControl(
+                    "scope-epoch capability is missing its epoch",
+                ))?,
+            },
+        };
+        let record = ControlRecord {
+            transfer_id,
+            authority: control.authority_id(),
+            signer: control.signer(),
+            sequence: control.control_sequence(),
+            previous_control,
+            effect,
+        };
+        validate_control_record(&record)?;
+        let encoded = encode_control_record(&record)?;
+        Ok(Self {
+            record,
+            sealed: sealed.to_vec(),
+            encoded,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ControlInsert {
+    Inserted,
+    Duplicate,
+    Rejected(RejectedControl),
+}
+
+#[derive(Default)]
+struct ControlActivation {
+    activated: Vec<StoredControl>,
+    rejected: Vec<RejectedControl>,
+}
+
+/// One exact backing-file handle to the durable accepted-item and acceptance-marker domain.
+///
+/// Writable construction passes a validated file descriptor directly to redb;
+/// [`Store::backing_identity`] reports the immutable handle identity captured at
+/// open. On Unix, every writable open also synchronizes the exact retained parent
+/// directory before returning a usable handle. Other platforms make neither
+/// backing-identity nor parent-directory durability claims.
+pub struct Store {
+    database: Database,
+    path: PathBuf,
+    backing_identity: StoreBackingIdentity,
+    limits: StoreLimits,
+    mission_authority: Option<NodeId>,
+    live: AtomicBool,
+}
+
+/// Exact-writer cleanup handle for a live or terminal mission-bound store.
+///
+/// This type deliberately exposes no opaque, Event, or control data API. It
+/// can only inspect preserved rows, enter terminal lockout, and advance the
+/// one-way crash-resumable cleanup receipts.
+pub struct ZeroizationStore {
+    database: Database,
+    path: PathBuf,
+    backing_identity: StoreBackingIdentity,
+    status: StoreZeroizationStatus,
+}
+
+struct OpenedStoreBacking {
+    file: std::fs::File,
+    #[cfg(unix)]
+    parent_directory: std::fs::File,
+    #[cfg(unix)]
+    path: PathBuf,
+    identity: StoreBackingIdentity,
+    length: u64,
+    newly_created: bool,
+}
+
+#[cfg(unix)]
+fn open_store_backing_file(
+    path: &Path,
+    create_new: bool,
+) -> Result<OpenedStoreBacking, StoreError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let parent_path = path.parent().ok_or_else(|| {
+        StoreError::StorePath(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "store path has no parent directory",
+        ))
+    })?;
+    let file_name = path.file_name().ok_or_else(|| {
+        StoreError::StorePath(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "store path has no final component",
+        ))
+    })?;
+    let parent_descriptor = rustix::fs::open(
+        parent_path,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|error| StoreError::StorePath(error.into()))?;
+    let mut flags = rustix::fs::OFlags::RDWR
+        | rustix::fs::OFlags::CLOEXEC
+        | rustix::fs::OFlags::NOFOLLOW
+        | rustix::fs::OFlags::NONBLOCK;
+    let mode = if create_new {
+        flags |= rustix::fs::OFlags::CREATE | rustix::fs::OFlags::EXCL;
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR
+    } else {
+        rustix::fs::Mode::empty()
+    };
+    let descriptor = rustix::fs::openat(&parent_descriptor, file_name, flags, mode)
+        .map_err(|error| StoreError::StorePath(error.into()))?;
+    let file = std::fs::File::from(descriptor);
+    let parent_directory = std::fs::File::from(parent_descriptor);
+    let metadata = file.metadata().map_err(StoreError::StorePath)?;
+    if !metadata.is_file() {
+        return Err(StoreError::StoreBackingInvariant(
+            "backing handle is not a regular file",
+        ));
+    }
+    if metadata.uid() != rustix::process::geteuid().as_raw() {
+        return Err(StoreError::StoreBackingInvariant(
+            "backing handle is not owned by the effective user",
+        ));
+    }
+    if metadata.nlink() != 1 {
+        return Err(StoreError::StoreBackingInvariant(
+            "backing handle must have exactly one filesystem link",
+        ));
+    }
+    if metadata.mode() & 0o022 != 0 {
+        return Err(StoreError::StoreBackingInvariant(
+            "backing handle is group- or world-writable",
+        ));
+    }
+    Ok(OpenedStoreBacking {
+        parent_directory,
+        path: path.to_path_buf(),
+        identity: StoreBackingIdentity {
+            unix_device_inode: Some((metadata.dev(), metadata.ino())),
+        },
+        length: metadata.len(),
+        newly_created: create_new,
+        file,
+    })
+}
+
+#[cfg(not(unix))]
+fn open_store_backing_file(
+    path: &Path,
+    create_new: bool,
+) -> Result<OpenedStoreBacking, StoreError> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create_new(create_new);
+    let file = options.open(path).map_err(StoreError::StorePath)?;
+    let metadata = file.metadata().map_err(StoreError::StorePath)?;
+    if !metadata.is_file() {
+        return Err(StoreError::StoreBackingInvariant(
+            "backing handle is not a regular file",
+        ));
+    }
+    Ok(OpenedStoreBacking {
+        identity: StoreBackingIdentity {
+            unix_device_inode: None,
+        },
+        length: metadata.len(),
+        newly_created: create_new,
+        file,
+    })
+}
+
+fn open_existing_store_backing(path: &Path) -> Result<OpenedStoreBacking, StoreError> {
+    let backing = open_store_backing_file(path, false)?;
+    if backing.length == 0 {
+        return Err(StoreError::StoreBackingInvariant(
+            "existing backing file is empty",
+        ));
+    }
+    Ok(backing)
+}
+
+fn open_or_create_store_backing(path: &Path) -> Result<OpenedStoreBacking, StoreError> {
+    let backing = match open_store_backing_file(path, false) {
+        Ok(backing) => backing,
+        Err(StoreError::StorePath(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            match open_store_backing_file(path, true) {
+                Ok(backing) => backing,
+                Err(StoreError::StorePath(error))
+                    if error.kind() == std::io::ErrorKind::AlreadyExists =>
+                {
+                    open_store_backing_file(path, false)?
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(error) => return Err(error),
+    };
+    if !backing.newly_created && backing.length == 0 {
+        return Err(StoreError::StoreBackingInvariant(
+            "existing backing file is empty",
+        ));
+    }
+    Ok(backing)
+}
+
+#[cfg(all(test, unix))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ParentSyncTestAction {
+    Observe,
+    Fail,
+}
+
+#[cfg(all(test, unix))]
+#[derive(Debug)]
+struct ParentSyncTestHook {
+    path: PathBuf,
+    action: ParentSyncTestAction,
+    invocations: usize,
+}
+
+#[cfg(all(test, unix))]
+static PARENT_SYNC_TEST_HOOK: std::sync::Mutex<Option<ParentSyncTestHook>> =
+    std::sync::Mutex::new(None);
+
+// This is deliberately required for existing writers too. A failed creation
+// barrier can leave an initialized named database, and its retry must not bypass
+// the first successful proof that the directory entry is durable.
+#[cfg(unix)]
+fn sync_store_parent(parent: &std::fs::File, path: &Path) -> std::io::Result<()> {
+    #[cfg(not(test))]
+    let _ = path;
+    #[cfg(test)]
+    {
+        let mut hook = PARENT_SYNC_TEST_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(hook) = hook.as_mut()
+            && hook.path == path
+        {
+            hook.invocations += 1;
+            if hook.action == ParentSyncTestAction::Fail {
+                return Err(std::io::Error::other(
+                    "injected new-store parent synchronization failure",
+                ));
+            }
+        }
+    }
+    parent.sync_all()
+}
+
+fn database_from_store_backing(
+    backing: OpenedStoreBacking,
+) -> Result<(Database, StoreBackingIdentity), StoreError> {
+    let identity = backing.identity;
+    #[cfg(unix)]
+    let parent_directory = backing.parent_directory;
+    #[cfg(unix)]
+    let path = backing.path;
+    let database = match Database::builder().create_file(backing.file) {
+        Ok(database) => database,
+        Err(redb::DatabaseError::DatabaseAlreadyOpen) => return Err(StoreError::StoreInUse),
+        Err(error) => return Err(error.into()),
+    };
+    #[cfg(unix)]
+    {
+        if let Err(error) = sync_store_parent(&parent_directory, &path) {
+            drop(database);
+            return Err(StoreError::StorePath(error));
+        }
+    }
+    Ok((database, identity))
+}
+
+fn open_existing_store_database(
+    path: &Path,
+) -> Result<(Database, StoreBackingIdentity), StoreError> {
+    database_from_store_backing(open_existing_store_backing(path)?)
+}
+
+fn open_or_create_store_database(
+    path: &Path,
+) -> Result<(Database, StoreBackingIdentity), StoreError> {
+    database_from_store_backing(open_or_create_store_backing(path)?)
+}
+
+fn require_exact_writer_exclusion(
+    path: &Path,
+    expected: StoreBackingIdentity,
+) -> Result<ProcessExclusiveLockProof, StoreError> {
+    let backing = open_existing_store_backing(path)?;
+    if backing.identity != expected {
+        return Err(StoreError::ProcessExclusiveLockUnavailable);
+    }
+    match Database::builder().create_file(backing.file) {
+        Err(redb::DatabaseError::DatabaseAlreadyOpen) => Ok(ProcessExclusiveLockProof(())),
+        Err(error) => Err(error.into()),
+        Ok(second_writer) => {
+            drop(second_writer);
+            Err(StoreError::ProcessExclusiveLockUnavailable)
+        }
+    }
+}
+
+impl Store {
+    /// Opens a store with conservative default admission limits.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        Self::open_with_limits(path, StoreLimits::default())
+    }
+
+    /// Opens or creates a store bound to one stable mission authority.
+    ///
+    /// For a clean existing store, a mismatched binding is detected through a
+    /// read-only redb handle before application mutation. If read-only open
+    /// returns the exact backend-recovery-required signal, a writable open may
+    /// first recover redb; its first transaction then checks terminal state and
+    /// the existing mission binding before any other Aster schema access. Binding
+    /// is to the stable authority, never a rotatable per-node credential identity.
+    pub fn open_for_mission(
+        path: impl AsRef<Path>,
+        mission_authority: NodeId,
+    ) -> Result<Self, StoreError> {
+        Self::open_with_limits_for_mission(path, StoreLimits::default(), mission_authority)
+    }
+
+    /// Opens a mission-bound store with explicit item/byte limits.
+    pub fn open_with_limits_for_mission(
+        path: impl AsRef<Path>,
+        limits: StoreLimits,
+        mission_authority: NodeId,
+    ) -> Result<Self, StoreError> {
+        let path = path.as_ref();
+        let readable_preflight = if path.exists() {
+            match reject_terminal_normal_open(path) {
+                Ok(()) => true,
+                Err(error) if error.is_read_only_repair_required() => false,
+                Err(error) => return Err(error),
+            }
+        } else {
+            false
+        };
+        if readable_preflight {
+            match inspect_mission_binding_read_only(path) {
+                Ok(Some(bound)) if bound != mission_authority => {
+                    return Err(StoreError::MissionAuthorityMismatch {
+                        bound,
+                        received: mission_authority,
+                    });
+                }
+                Ok(_) => {}
+                Err(error) if error.is_read_only_repair_required() => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let store = Self::open_with_limits_internal(path, limits, Some(mission_authority))?;
+        debug_assert_eq!(store.mission_authority, Some(mission_authority));
+        Ok(store)
+    }
+
+    /// Opens and audits an existing store without creating, repairing, or writing it.
+    ///
+    /// All v1 tables and accounting fields must already exist and agree with the
+    /// accepted-item and acceptance-marker tables. This path deliberately uses
+    /// redb's read-only database handle, so an absent or migration-era store fails
+    /// closed instead of being created or repaired as a side effect of inspection.
+    pub fn inspect_existing(path: impl AsRef<Path>) -> Result<StoreInspection, StoreError> {
+        let database = redb::Builder::new().open_read_only(path)?;
+        inspect_readable(&database)
+    }
+
+    /// Inspects only exact terminal-schema and mission-binding truth without writing.
+    ///
+    /// This remains available after terminal lockout even if cleanup is incomplete.
+    /// Ordinary namespace counts can be paired from [`Self::inspect_existing`].
+    pub fn inspect_zeroization_state(
+        path: impl AsRef<Path>,
+    ) -> Result<StoreZeroizationStatus, StoreError> {
+        let database = match redb::Builder::new().open_read_only(path) {
+            Ok(database) => database,
+            Err(redb::DatabaseError::DatabaseAlreadyOpen) => return Err(StoreError::StoreInUse),
+            Err(error) => return Err(error.into()),
+        };
+        inspect_zeroization_readable(&database)
+    }
+
+    /// Recovers redb after an unclean shutdown and returns only terminal-schema truth.
+    ///
+    /// This acquires the existing path's exact writer so redb may perform its
+    /// backend recovery, then reads the mission binding and zeroization table.
+    /// On Unix the existing file is opened no-follow and validated before its
+    /// exact descriptor is passed to redb; an existing empty file is rejected.
+    /// On Unix, the retained exact parent directory must synchronize before status
+    /// is returned.
+    /// It performs no Aster application migration, audit, repair, or mission
+    /// binding and is valid for an unbound live store. The writer is dropped
+    /// before this method returns.
+    pub fn recover_zeroization_state(
+        path: impl AsRef<Path>,
+    ) -> Result<StoreZeroizationStatus, StoreError> {
+        let path = std::path::absolute(path).map_err(StoreError::StorePath)?;
+        let (database, _) = open_existing_store_database(&path)?;
+        inspect_zeroization_readable(&database)
+    }
+
+    /// Opens an existing mission-bound store under the exact writer lock solely for cleanup.
+    ///
+    /// Unlike normal opens, this accepts live and terminal phases and exposes no
+    /// data mutation/read API. Writable open may perform redb's required backend
+    /// recovery after an unclean shutdown, but performs no application schema
+    /// migration or repair. It opens an existing file only, and callers can
+    /// compare [`ZeroizationStore::backing_identity`] before terminal entry. On
+    /// Unix, its retained exact parent directory is synchronized before cleanup
+    /// becomes usable.
+    pub fn open_for_zeroization(path: impl AsRef<Path>) -> Result<ZeroizationStore, StoreError> {
+        let path = std::path::absolute(path).map_err(StoreError::StorePath)?;
+        let (database, backing_identity) = open_existing_store_database(&path)?;
+        let status = inspect_zeroization_readable(&database)?;
+        if status.mission_authority.is_none() {
+            return Err(StoreError::MissionNotBound);
+        }
+        Ok(ZeroizationStore {
+            database,
+            path,
+            backing_identity,
+            status,
+        })
+    }
+
+    /// Opens or creates a store and applies explicit admission limits.
+    ///
+    /// Opening scans the accepted-item table and audits every item/acceptance-marker pair.
+    /// Absent accounting fields are reconstructed for migration and committed;
+    /// present counters or marker high-water values must exactly match item-table
+    /// truth or opening fails closed. Existing data is preserved even if a newly
+    /// supplied limit is lower; subsequent new-item admission remains closed until
+    /// usage is within the configured limit.
+    pub fn open_with_limits(
+        path: impl AsRef<Path>,
+        limits: StoreLimits,
+    ) -> Result<Self, StoreError> {
+        Self::open_with_limits_internal(path.as_ref(), limits, None)
+    }
+
+    fn open_with_limits_internal(
+        path: &Path,
+        limits: StoreLimits,
+        expected_mission_authority: Option<NodeId>,
+    ) -> Result<Self, StoreError> {
+        let path = std::path::absolute(path).map_err(StoreError::StorePath)?;
+        if path.exists() {
+            match reject_terminal_normal_open(&path) {
+                Ok(()) => match inspect_control_state_read_only(&path) {
+                    Ok(()) => {}
+                    Err(error) if error.is_read_only_repair_required() => {}
+                    Err(error) => return Err(error),
+                },
+                Err(error) if error.is_read_only_repair_required() => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let (database, backing_identity) = open_or_create_store_database(&path)?;
+
+        let write = database.begin_write()?;
+        // Recheck under the exact writer transaction before opening any table.
+        // This closes the gap between the read-only startup check and migration.
+        enforce_live_write(&write)?;
+        if let Some(expected) = expected_mission_authority {
+            check_expected_mission_binding(&write, expected)?;
+        }
+        let (item_count, total_payload_bytes, max_acceptance_marker) = {
+            let items = write.open_table(ITEMS)?;
+            let acceptance_markers = write.open_table(ACCEPTANCE_MARKERS)?;
+            let mut item_count = 0u64;
+            let mut total_payload_bytes = 0u64;
+
+            for row in items.iter()? {
+                let (key, value) = row?;
+                let id = parse_id("item table", key.value())?;
+                if acceptance_markers.get(key.value())?.is_none() {
+                    return Err(StoreError::MissingAcceptanceMarker { id });
+                }
+                item_count = item_count
+                    .checked_add(1)
+                    .ok_or(StoreError::ItemCountAccountingOverflow)?;
+                let length = u64::try_from(value.value().len())
+                    .map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
+                total_payload_bytes = total_payload_bytes
+                    .checked_add(length)
+                    .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+            }
+
+            let mut max_acceptance_marker = 0u64;
+            for row in acceptance_markers.iter()? {
+                let (key, value) = row?;
+                let id = parse_id("acceptance-marker table", key.value())?;
+                if items.get(key.value())?.is_none() {
+                    return Err(StoreError::OrphanedAcceptanceMarker { id });
+                }
+                max_acceptance_marker = max_acceptance_marker.max(value.value());
+            }
+            (item_count, total_payload_bytes, max_acceptance_marker)
+        };
+        {
+            let mut metadata = write.open_table(METADATA)?;
+            let durable_marker = metadata
+                .get(LAST_ACCEPTANCE_MARKER)?
+                .map(|value| value.value());
+            match durable_marker {
+                Some(durable) if durable != max_acceptance_marker => {
+                    return Err(StoreError::AccountingMismatch {
+                        field: LAST_ACCEPTANCE_MARKER,
+                        durable,
+                        reconstructed: max_acceptance_marker,
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    metadata.insert(LAST_ACCEPTANCE_MARKER, max_acceptance_marker)?;
+                }
+            }
+
+            let durable_items = metadata.get(ITEM_COUNT)?.map(|value| value.value());
+            match durable_items {
+                Some(durable) if durable != item_count => {
+                    return Err(StoreError::AccountingMismatch {
+                        field: ITEM_COUNT,
+                        durable,
+                        reconstructed: item_count,
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    metadata.insert(ITEM_COUNT, item_count)?;
+                }
+            }
+
+            let durable_payload_bytes = metadata
+                .get(TOTAL_PAYLOAD_BYTES)?
+                .map(|value| value.value());
+            match durable_payload_bytes {
+                Some(durable) if durable != total_payload_bytes => {
+                    return Err(StoreError::AccountingMismatch {
+                        field: TOTAL_PAYLOAD_BYTES,
+                        durable,
+                        reconstructed: total_payload_bytes,
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    metadata.insert(TOTAL_PAYLOAD_BYTES, total_payload_bytes)?;
+                }
+            }
+        }
+        audit_semantic_tables(&write)?;
+        audit_control_tables(&write)?;
+        let mut mission_authority = read_mission_binding(&write)?;
+        if mission_authority.is_none()
+            && (write.open_table(EVENTS)?.len()? != 0
+                || write.open_table(ROUTE_CACHE)?.len()? != 0
+                || write.open_table(CONTROL_RECORDS)?.len()? != 0)
+        {
+            return Err(StoreError::SemanticInvariant(
+                "unbound store contains mission-scoped Event or control state",
+            ));
+        }
+        if mission_authority.is_none()
+            && let Some(expected) = expected_mission_authority
+        {
+            write
+                .open_table(SEMANTIC_DOMAIN)?
+                .insert(MISSION_AUTHORITY_ID, expected.as_slice())?;
+            mission_authority = Some(expected);
+        }
+        write.commit()?;
+
+        Ok(Self {
+            database,
+            path,
+            backing_identity,
+            limits,
+            mission_authority,
+            live: AtomicBool::new(true),
+        })
+    }
+
+    /// Returns the admission limits active on this handle.
+    pub const fn limits(&self) -> StoreLimits {
+        self.limits
+    }
+
+    /// Returns the stable mission authority binding, when provisioned.
+    pub const fn mission_authority(&self) -> Option<NodeId> {
+        self.mission_authority
+    }
+
+    /// Returns the immutable identity of the exact file handle owned by redb.
+    pub const fn backing_identity(&self) -> StoreBackingIdentity {
+        self.backing_identity
+    }
+
+    /// Consumes a terminal normal handle into cleanup without reopening its pathname.
+    ///
+    /// The durable terminal marker and mission binding are re-read through the
+    /// existing redb handle. The same database lock and backing-file identity
+    /// move into the restricted cleanup capability unchanged.
+    pub fn into_zeroization(self) -> Result<ZeroizationStore, StoreError> {
+        let status = inspect_zeroization_readable(&self.database)?;
+        if status.mission_authority.is_none() {
+            return Err(StoreError::MissionNotBound);
+        }
+        if !status.state.is_terminal() {
+            return Err(StoreError::ZeroizationOrderViolation(
+                "terminal lockout is required before converting the live store",
+            ));
+        }
+        let Self {
+            database,
+            path,
+            backing_identity,
+            limits: _,
+            mission_authority: _,
+            live: _,
+        } = self;
+        Ok(ZeroizationStore {
+            database,
+            path,
+            backing_identity,
+            status,
+        })
+    }
+
+    /// Captures an exact settled control policy for transaction-bound Event I/O.
+    pub fn control_policy_snapshot(&self) -> Result<ControlPolicySnapshot, StoreError> {
+        let authority = self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        control_policy_snapshot_read(&read, authority)
+    }
+
+    /// Proves that a second writable redb open is rejected while this handle is live.
+    ///
+    /// Selected startup must call this for the exact path used to construct
+    /// this handle. Success is an observed backend/filesystem exclusion proof,
+    /// not a substitute for policy-bound transactions or an async send lease.
+    pub fn require_process_exclusive_lock(&self) -> Result<ProcessExclusiveLockProof, StoreError> {
+        self.require_live()?;
+        require_exact_writer_exclusion(&self.path, self.backing_identity)
+    }
+
+    /// Durably enters terminal cleanup-pending state with exact artifact targets.
+    ///
+    /// The caller must first stop and drain asynchronous work. The in-memory
+    /// handle then fail-closes before waiting for the write transaction, and the
+    /// transaction serializes any mutation that already passed the API gate.
+    /// This is a software lifecycle boundary and makes no physical-erasure claim.
+    pub fn begin_zeroization(
+        &self,
+        intent: &ZeroizationIntent,
+    ) -> Result<BeginZeroizationOutcome, StoreError> {
+        let authority = self.mission_authority.ok_or(StoreError::MissionNotBound)?;
+        self.live.store(false, Ordering::SeqCst);
+        let mut write = self.database.begin_write()?;
+        write.set_durability(Durability::Immediate)?;
+        let outcome = begin_zeroization_write(&write, authority, intent)?;
+        write.commit()?;
+        Ok(outcome)
+    }
+
+    fn require_live(&self) -> Result<(), StoreError> {
+        if self.live.load(Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err(StoreError::StoreZeroized(
+                StoreZeroizationState::CleanupPending,
+            ))
+        }
+    }
+
+    fn require_bound_mission(&self) -> Result<NodeId, StoreError> {
+        self.require_live()?;
+        self.mission_authority.ok_or(StoreError::MissionNotBound)
+    }
+
+    fn require_mission_authority(&self, received: NodeId) -> Result<(), StoreError> {
+        let bound = self.require_bound_mission()?;
+        if bound != received {
+            return Err(StoreError::MissionAuthorityMismatch { bound, received });
+        }
+        Ok(())
+    }
+
+    /// Reserves the next local mission-control chain link for a provider-authenticated principal.
+    pub fn reserve_control(
+        &self,
+        principal: VerifiedControlPrincipal,
+    ) -> Result<ControlReservation, StoreError> {
+        let authority = self.require_bound_mission()?;
+        if principal.authority() != authority {
+            return Err(StoreError::MissionAuthorityMismatch {
+                bound: authority,
+                received: principal.authority(),
+            });
+        }
+        let read = self.database.begin_read()?;
+        if control_principal_revoked_read(&read, authority)? {
+            return Err(StoreError::ControlAuthorityRevoked(authority));
+        }
+        if control_principal_revoked_read(&read, principal.signer())? {
+            return Err(StoreError::ControlSignerRevoked(principal.signer()));
+        }
+        let (previous_sequence, previous_control) = read_control_head(&read)?
+            .map_or((0, None), |(sequence, transfer_id)| {
+                (sequence, Some(transfer_id))
+            });
+        let sequence = previous_sequence
+            .checked_add(1)
+            .ok_or(StoreError::ControlSequenceExhausted)?;
+        Ok(ControlReservation {
+            authority,
+            signer: principal.signer(),
+            previous_sequence,
+            sequence,
+            previous_control,
+        })
+    }
+
+    /// Atomically commits one locally sealed mission control against its durable reservation.
+    ///
+    /// Any returned `Applied` suffix was committed before this method returned.
+    /// Pending, duplicate, and rejected outcomes expose no activation suffix.
+    pub fn commit_reserved_control(
+        &self,
+        reservation: &ControlReservation,
+        control: &VerifiedControlEnvelope,
+        sealed: &[u8],
+    ) -> Result<ControlOutcome, StoreError> {
+        self.require_live()?;
+        let prepared = PreparedControl::from_verified(control, sealed)?;
+        if matches!(
+            prepared.record.effect,
+            StoredControlEffect::ScopeEpoch { .. }
+        ) {
+            return Err(StoreError::MissingControlPublicationIntent);
+        }
+        self.commit_prepared_control(&prepared, Some(reservation), None)
+    }
+
+    /// Atomically commits a locally sealed scope rekey and its canonical publication intent.
+    pub fn commit_reserved_scope_rekey_control(
+        &self,
+        reservation: &ControlReservation,
+        control: &VerifiedControlEnvelope,
+        sealed: &[u8],
+        intent: &ScopeRekeyPublicationIntent,
+    ) -> Result<ControlOutcome, StoreError> {
+        self.require_live()?;
+        let prepared = PreparedControl::from_verified(control, sealed)?;
+        if !matches!(
+            prepared.record.effect,
+            StoredControlEffect::ScopeEpoch { .. }
+        ) {
+            return Err(StoreError::InvalidControlPublicationIntent);
+        }
+        self.commit_prepared_control(&prepared, Some(reservation), Some(intent))
+    }
+
+    /// Atomically retains one remotely received provider-verified mission control.
+    ///
+    /// Out-of-order controls are retained as bounded pending transport inputs.
+    /// Their effects confer no authority until the same transaction advances a
+    /// contiguous chain prefix and returns it in `ControlOutcome::Applied`.
+    pub fn ingest_verified_control(
+        &self,
+        control: &VerifiedControlEnvelope,
+        sealed: &[u8],
+    ) -> Result<ControlOutcome, StoreError> {
+        self.require_live()?;
+        let prepared = PreparedControl::from_verified(control, sealed)?;
+        self.commit_prepared_control(&prepared, None, None)
+    }
+
+    /// Proves that an applied scope rekey is an exact retry of one local publication intent.
+    pub fn verify_scope_rekey_publication_intent(
+        &self,
+        transfer_id: ControlTransferId,
+        expected: &ScopeRekeyPublicationIntent,
+    ) -> Result<(), StoreError> {
+        self.require_mission_authority(expected.authority)?;
+        let read = self.database.begin_read()?;
+        let stored = load_control_read(&read, transfer_id)?
+            .ok_or(StoreError::ControlPublicationIntentUnknown { transfer_id })?;
+        if !stored.applied
+            || stored.authority != expected.authority
+            || stored.signer != expected.signer
+            || !matches!(
+                &stored.effect,
+                StoredControlEffect::ScopeEpoch { scope, epoch }
+                    if scope == &expected.scope && *epoch == expected.epoch
+            )
+        {
+            return Err(StoreError::ControlPublicationIntentConflict { transfer_id });
+        }
+        let encoded = read
+            .open_table(CONTROL_PUBLICATION_INTENTS)?
+            .get(transfer_id.as_bytes().as_slice())?
+            .map(|value| value.value().to_vec())
+            .ok_or(StoreError::ControlPublicationIntentUnknown { transfer_id })?;
+        if decode_scope_rekey_publication_intent(&encoded)? != *expected {
+            return Err(StoreError::ControlPublicationIntentConflict { transfer_id });
+        }
+        Ok(())
+    }
+
+    /// Returns all retained applied and pending control transfer identities in byte order.
+    pub fn control_inventory(&self) -> Result<ControlInventory, StoreError> {
+        self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        let records = read.open_table(CONTROL_RECORDS)?;
+        let mut ids = Vec::new();
+        for row in records.iter()? {
+            let (key, _) = row?;
+            ids.push(parse_control_transfer_id(
+                "mission control record table",
+                key.value(),
+            )?);
+        }
+        ids.sort_unstable();
+        Ok(ControlInventory(ids))
+    }
+
+    /// Reads one exact retained control while preserving pending/applied state.
+    pub fn get_control(
+        &self,
+        transfer_id: ControlTransferId,
+    ) -> Result<Option<StoredControl>, StoreError> {
+        self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        load_control_read(&read, transfer_id)
+    }
+
+    /// Returns the audited applied control prefix in strict sequence order.
+    ///
+    /// Runtime must freshly verify and compare every row before replaying it
+    /// into a fresh provider. Merely loading this vector confers no capability.
+    pub fn applied_controls(&self) -> Result<Vec<StoredControl>, StoreError> {
+        self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        let applied = read.open_table(CONTROL_APPLIED)?;
+        let mut controls = Vec::new();
+        for row in applied.iter()? {
+            let (sequence, value) = row?;
+            let transfer_id =
+                parse_control_transfer_id("applied mission control table", value.value())?;
+            let control = load_control_read(&read, transfer_id)?.ok_or(
+                StoreError::ControlInvariant("applied index points to a missing control"),
+            )?;
+            if !control.applied || control.sequence != sequence.value() {
+                return Err(StoreError::ControlInvariant(
+                    "applied index sequence or state differs from its control",
+                ));
+            }
+            controls.push(control);
+        }
+        Ok(controls)
+    }
+
+    /// Returns the exact durable applied chain head.
+    pub fn control_head(&self) -> Result<Option<(u64, ControlTransferId)>, StoreError> {
+        self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        read_control_head(&read)
+    }
+
+    /// Returns whether the applied mission-control prefix revokes `principal`.
+    pub fn is_control_principal_revoked(&self, principal: NodeId) -> Result<bool, StoreError> {
+        self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        control_principal_revoked_read(&read, principal)
+    }
+
+    /// Returns the active revocation generation and exact source control for one principal.
+    pub fn active_revocation(
+        &self,
+        subject: NodeId,
+    ) -> Result<Option<(u64, ControlTransferId)>, StoreError> {
+        let bound = self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        let value = read
+            .open_table(CONTROL_REVOCATIONS)?
+            .get(subject.as_slice())?
+            .map(|value| value.value().to_vec());
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        let (authority, generation, transfer_id) = decode_revocation_index(&value)?;
+        if authority != bound {
+            return Err(StoreError::ControlInvariant(
+                "revocation index belongs to another mission authority",
+            ));
+        }
+        Ok(Some((generation, transfer_id)))
+    }
+
+    /// Returns the applied key epoch and source control for one scope.
+    pub fn active_scope_epoch(
+        &self,
+        scope: &Scope,
+    ) -> Result<Option<(u64, ControlTransferId)>, StoreError> {
+        self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        read.open_table(CONTROL_SCOPE_EPOCHS)?
+            .get(scope.as_str())?
+            .map(|value| decode_scope_epoch_index(value.value()))
+            .transpose()
+    }
+
+    /// Returns structurally audited mission-control counts from one snapshot.
+    pub fn control_stats(&self) -> Result<ControlStoreStats, StoreError> {
+        self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        Ok(inspect_control_tables(&read, self.mission_authority)?.unwrap_or_default())
+    }
+
+    fn commit_prepared_control(
+        &self,
+        prepared: &PreparedControl,
+        reservation: Option<&ControlReservation>,
+        publication_intent: Option<&ScopeRekeyPublicationIntent>,
+    ) -> Result<ControlOutcome, StoreError> {
+        self.require_mission_authority(prepared.record.authority)?;
+        validate_control_publication_intent(publication_intent, reservation, &prepared.record)?;
+        let publication_intent_encoded = publication_intent
+            .map(encode_scope_rekey_publication_intent)
+            .transpose()?;
+        let write = self.database.begin_write()?;
+        enforce_live_write(&write)?;
+
+        let existing_receipt = if let Some(reservation) = reservation {
+            let existing = write
+                .open_table(CONTROL_RESERVATIONS)?
+                .get(prepared.record.transfer_id.as_bytes().as_slice())?
+                .map(|value| decode_control_reservation(value.value()))
+                .transpose()?;
+            match existing {
+                Some(existing) if existing != *reservation => {
+                    return Err(StoreError::ControlInvariant(
+                        "control reservation receipt differs from replayed reservation",
+                    ));
+                }
+                Some(_) => true,
+                None => false,
+            }
+        } else {
+            false
+        };
+        let existing_intent = write
+            .open_table(CONTROL_PUBLICATION_INTENTS)?
+            .get(prepared.record.transfer_id.as_bytes().as_slice())?
+            .map(|value| decode_scope_rekey_publication_intent(value.value()))
+            .transpose()?;
+        match (
+            publication_intent,
+            existing_intent.as_ref(),
+            existing_receipt,
+        ) {
+            (Some(expected), Some(existing), true) if expected == existing => {}
+            (Some(_), Some(_), _) => {
+                return Err(StoreError::ControlPublicationIntentConflict {
+                    transfer_id: prepared.record.transfer_id,
+                });
+            }
+            (Some(_), None, true) => {
+                return Err(StoreError::ControlPublicationIntentUnknown {
+                    transfer_id: prepared.record.transfer_id,
+                });
+            }
+            (None, Some(_), _) if reservation.is_none() => {}
+            (None, Some(_), _) => {
+                return Err(StoreError::ControlInvariant(
+                    "control has a publication intent without a matching local retry",
+                ));
+            }
+            (Some(_), None, false) | (None, None, _) => {}
+        }
+        if let Some(reservation) = reservation {
+            validate_control_reservation_claims(reservation, &prepared.record)?;
+            if !existing_receipt {
+                validate_control_reservation_head(&write, reservation)?;
+            }
+        }
+
+        let inserted = insert_control(&write, prepared, self.limits)?;
+        if matches!(inserted, ControlInsert::Inserted)
+            && let Some(encoded) = publication_intent_encoded.as_ref()
+        {
+            admit_control_publication_intent(&write, encoded.len(), self.limits)?;
+        }
+        let activation = activate_control_chain(&write, prepared.record.authority)?;
+        let outcome = control_outcome(prepared.record.transfer_id, inserted, activation);
+        if let Some(reservation) = reservation
+            && !existing_receipt
+            && outcome.rejected_input().is_none()
+        {
+            let Some(stored) = load_control_write(&write, prepared.record.transfer_id)? else {
+                return Err(StoreError::ControlInvariant(
+                    "local committed control disappeared before its receipt",
+                ));
+            };
+            if !stored.applied {
+                return Err(StoreError::ControlInvariant(
+                    "local control reservation cannot receipt a pending control",
+                ));
+            }
+            let encoded = encode_control_reservation(reservation);
+            write.open_table(CONTROL_RESERVATIONS)?.insert(
+                prepared.record.transfer_id.as_bytes().as_slice(),
+                encoded.as_slice(),
+            )?;
+            if let Some(encoded) = publication_intent_encoded.as_ref() {
+                write.open_table(CONTROL_PUBLICATION_INTENTS)?.insert(
+                    prepared.record.transfer_id.as_bytes().as_slice(),
+                    encoded.as_slice(),
+                )?;
+            }
+        }
+        write.commit()?;
+        Ok(outcome)
+    }
+
+    /// Atomically accepts `bytes` under a caller-supplied complete item identifier.
+    ///
+    /// The first acceptance stores the item and a new nonzero acceptance marker in one
+    /// redb transaction. Replaying the same identifier and exact bytes is harmless
+    /// and returns the original marker. Reusing an identifier for different bytes is
+    /// an error and changes no durable state.
+    pub fn apply(&self, id: ItemId, bytes: &[u8]) -> Result<ApplyOutcome, StoreError> {
+        self.require_live()?;
+        let write = self.database.begin_write()?;
+        enforce_live_write(&write)?;
+        let existing = {
+            let items = write.open_table(ITEMS)?;
+            items
+                .get(id.as_bytes().as_slice())?
+                .map(|value| value.value().to_vec())
+        };
+
+        if let Some(existing) = existing {
+            if existing != bytes {
+                return Err(StoreError::IdentityConflict { id });
+            }
+            let marker = {
+                let acceptance_markers = write.open_table(ACCEPTANCE_MARKERS)?;
+                acceptance_markers
+                    .get(id.as_bytes().as_slice())?
+                    .map(|value| value.value())
+            }
+            .ok_or(StoreError::MissingAcceptanceMarker { id })?;
+            return Ok(ApplyOutcome::Duplicate {
+                acceptance_marker: marker,
+            });
+        }
+
+        {
+            let acceptance_markers = write.open_table(ACCEPTANCE_MARKERS)?;
+            if acceptance_markers.get(id.as_bytes().as_slice())?.is_some() {
+                return Err(StoreError::OrphanedAcceptanceMarker { id });
+            }
+        }
+
+        let incoming =
+            u64::try_from(bytes.len()).map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
+        let marker = {
+            let mut metadata = write.open_table(METADATA)?;
+            let current_items = metadata.get(ITEM_COUNT)?.map_or(0, |value| value.value());
+            let semantic_items = metadata
+                .get(SEMANTIC_ITEM_COUNT)?
+                .map_or(0, |value| value.value());
+            let route_items = metadata
+                .get(ROUTE_CACHE_ITEM_COUNT)?
+                .map_or(0, |value| value.value());
+            let control_items = metadata
+                .get(CONTROL_ITEM_COUNT)?
+                .map_or(0, |value| value.value());
+            let aggregate_items = current_items
+                .checked_add(semantic_items)
+                .and_then(|value| value.checked_add(route_items))
+                .and_then(|value| value.checked_add(control_items))
+                .ok_or(StoreError::ItemCountAccountingOverflow)?;
+            let next_aggregate_items = aggregate_items
+                .checked_add(1)
+                .ok_or(StoreError::ItemCountAccountingOverflow)?;
+            if next_aggregate_items > self.limits.max_items {
+                return Err(StoreError::ItemLimitExceeded {
+                    current: aggregate_items,
+                    limit: self.limits.max_items,
+                });
+            }
+            let next_items = current_items
+                .checked_add(1)
+                .ok_or(StoreError::ItemCountAccountingOverflow)?;
+
+            let current_payload_bytes = metadata
+                .get(TOTAL_PAYLOAD_BYTES)?
+                .map_or(0, |value| value.value());
+            let semantic_payload_bytes = metadata
+                .get(SEMANTIC_TOTAL_BYTES)?
+                .map_or(0, |value| value.value());
+            let route_payload_bytes = metadata
+                .get(ROUTE_CACHE_TOTAL_BYTES)?
+                .map_or(0, |value| value.value());
+            let control_payload_bytes = metadata
+                .get(CONTROL_TOTAL_BYTES)?
+                .map_or(0, |value| value.value());
+            let control_intent_bytes = metadata
+                .get(CONTROL_PUBLICATION_INTENT_TOTAL_BYTES)?
+                .map_or(0, |value| value.value());
+            let aggregate_payload_bytes = current_payload_bytes
+                .checked_add(semantic_payload_bytes)
+                .and_then(|value| value.checked_add(route_payload_bytes))
+                .and_then(|value| value.checked_add(control_payload_bytes))
+                .and_then(|value| value.checked_add(control_intent_bytes))
+                .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+            let next_aggregate_payload_bytes = aggregate_payload_bytes
+                .checked_add(incoming)
+                .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+            if next_aggregate_payload_bytes > self.limits.max_total_payload_bytes {
+                return Err(StoreError::PayloadByteLimitExceeded {
+                    current: aggregate_payload_bytes,
+                    incoming,
+                    limit: self.limits.max_total_payload_bytes,
+                });
+            }
+            let next_payload_bytes = current_payload_bytes
+                .checked_add(incoming)
+                .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+
+            let previous = metadata
+                .get(LAST_ACCEPTANCE_MARKER)?
+                .map_or(0, |value| value.value());
+            let marker = previous
+                .checked_add(1)
+                .ok_or(StoreError::AcceptanceMarkerExhausted)?;
+            metadata.insert(LAST_ACCEPTANCE_MARKER, marker)?;
+            metadata.insert(ITEM_COUNT, next_items)?;
+            metadata.insert(TOTAL_PAYLOAD_BYTES, next_payload_bytes)?;
+            marker
+        };
+
+        {
+            let mut items = write.open_table(ITEMS)?;
+            items.insert(id.as_bytes().as_slice(), bytes)?;
+        }
+        {
+            let mut acceptance_markers = write.open_table(ACCEPTANCE_MARKERS)?;
+            acceptance_markers.insert(id.as_bytes().as_slice(), marker)?;
+        }
+        write.commit()?;
+
+        Ok(ApplyOutcome::Inserted {
+            acceptance_marker: marker,
+        })
+    }
+
+    /// Derives the next local Event dot, stream sequence, and causal context
+    /// from permanent redb acceptance ledgers.
+    pub fn reserve_event(
+        &self,
+        publisher: NodeId,
+        topic: &Topic,
+        scope: &Scope,
+    ) -> Result<EventReservation, StoreError> {
+        self.require_live()?;
+        self.reserve_event_internal(publisher, topic, scope, None, None)
+    }
+
+    /// Reserves a local Event only under one exact settled control policy.
+    pub fn reserve_event_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        publisher: NodeId,
+        topic: &Topic,
+        scope: &Scope,
+    ) -> Result<EventReservation, StoreError> {
+        self.require_live()?;
+        self.reserve_event_internal(publisher, topic, scope, None, Some(policy))
+    }
+
+    /// Derives a local Event reservation whose causal context explicitly
+    /// observes one already accepted semantic predecessor.
+    ///
+    /// Normal frontier construction remains topic/scope-scoped. This method is
+    /// the explicit bridge for a reaction whose predecessor belongs to another
+    /// topic; it does not widen the durable frontier globally.
+    pub fn reserve_reaction_event(
+        &self,
+        publisher: NodeId,
+        topic: &Topic,
+        scope: &Scope,
+        predecessor: EventSemanticId,
+    ) -> Result<EventReservation, StoreError> {
+        self.require_live()?;
+        self.reserve_event_internal(publisher, topic, scope, Some(predecessor), None)
+    }
+
+    /// Reserves a reaction only under one exact settled control policy.
+    pub fn reserve_reaction_event_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        publisher: NodeId,
+        topic: &Topic,
+        scope: &Scope,
+        predecessor: EventSemanticId,
+    ) -> Result<EventReservation, StoreError> {
+        self.require_live()?;
+        self.reserve_event_internal(publisher, topic, scope, Some(predecessor), Some(policy))
+    }
+
+    fn reserve_event_internal(
+        &self,
+        publisher: NodeId,
+        topic: &Topic,
+        scope: &Scope,
+        predecessor: Option<EventSemanticId>,
+        expected_policy: Option<&ControlPolicySnapshot>,
+    ) -> Result<EventReservation, StoreError> {
+        let authority = self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        let control_policy = match expected_policy {
+            Some(expected) => {
+                require_control_policy_read(&read, authority, expected)?;
+                *expected
+            }
+            None => control_policy_snapshot_read(&read, authority)?,
+        };
+        if control_principal_revoked_read(&read, publisher)? {
+            return Err(StoreError::EventPublisherRevoked(publisher));
+        }
+        let publisher_high_water = read.open_table(PUBLISHER_HIGH_WATER)?;
+        let event_high_water = read.open_table(EVENT_HIGH_WATER)?;
+        let frontier = read.open_table(CAUSAL_FRONTIER)?;
+
+        let previous_counter = publisher_high_water
+            .get(publisher.as_slice())?
+            .map_or(0, |value| value.value());
+        let counter = previous_counter
+            .checked_add(1)
+            .ok_or(StoreError::InvalidSemanticEvent(
+                "publisher causal counter is exhausted",
+            ))?;
+        let stream = event_stream_key(publisher, topic, scope)?;
+        let previous_event_sequence = event_high_water
+            .get(stream.as_slice())?
+            .map_or(0, |value| value.value());
+        let event_sequence =
+            previous_event_sequence
+                .checked_add(1)
+                .ok_or(StoreError::InvalidSemanticEvent(
+                    "publisher Event sequence is exhausted",
+                ))?;
+
+        let prefix = event_domain_prefix(topic, scope)?;
+        let mut context = VersionVector::default();
+        let mut direct_publishers = 0usize;
+        for row in frontier.iter()? {
+            let (key, value) = row?;
+            let key = key.value();
+            if !key.starts_with(&prefix) {
+                continue;
+            }
+            if key.len() != prefix.len() + 32 {
+                return Err(StoreError::SemanticInvariant(
+                    "causal frontier contains an invalid domain key",
+                ));
+            }
+            direct_publishers = direct_publishers
+                .checked_add(1)
+                .ok_or(StoreError::ItemCountAccountingOverflow)?;
+            if direct_publishers > MAX_CAUSAL_CONTEXT_ENTRIES {
+                return Err(StoreError::SemanticInvariant(
+                    "causal frontier exceeds the proven context bound",
+                ));
+            }
+            let context_publisher: NodeId = key[prefix.len()..]
+                .try_into()
+                .map_err(|_| StoreError::SemanticInvariant("invalid causal frontier key"))?;
+            let context_counter = value.value();
+            if context_counter == 0 {
+                return Err(StoreError::SemanticInvariant(
+                    "causal frontier contains a zero counter",
+                ));
+            }
+            context.observe(Dot {
+                publisher: context_publisher,
+                counter: context_counter,
+            });
+        }
+        if context.counter(&publisher) == 0 && direct_publishers == MAX_CAUSAL_CONTEXT_ENTRIES {
+            return Err(StoreError::InvalidSemanticEvent(
+                "causal frontier publisher limit reached",
+            ));
+        }
+
+        if let Some(predecessor) = predecessor {
+            let semantic_items = read.open_table(SEMANTIC_ITEMS)?;
+            let predecessor_transfer = semantic_items
+                .get(predecessor.as_bytes().as_slice())?
+                .map(|value| parse_transfer_id("semantic item table", value.value()))
+                .transpose()?
+                .ok_or(StoreError::MissingReactionPredecessor {
+                    semantic_id: predecessor,
+                })?;
+            let events = read.open_table(EVENTS)?;
+            let predecessor_metadata = events
+                .get(predecessor_transfer.as_bytes().as_slice())?
+                .map(|value| decode_event_metadata(value.value()))
+                .transpose()?
+                .ok_or(StoreError::MissingReactionPredecessor {
+                    semantic_id: predecessor,
+                })?;
+            let predecessor_dot = predecessor_metadata.header.stamp.dot;
+            if context.counter(&predecessor_dot.publisher) < predecessor_dot.counter {
+                if context.counter(&predecessor_dot.publisher) == 0
+                    && context.len() == MAX_CAUSAL_CONTEXT_ENTRIES
+                {
+                    return Err(StoreError::InvalidSemanticEvent(
+                        "reaction context exceeds the proven context bound",
+                    ));
+                }
+                context.observe(predecessor_dot);
+            }
+        }
+
+        Ok(EventReservation {
+            control_policy,
+            publisher,
+            topic: topic.clone(),
+            scope: scope.clone(),
+            previous_counter,
+            counter,
+            previous_event_sequence,
+            event_sequence,
+            context,
+        })
+    }
+
+    /// Retains one exact route/source-metadata-verified representation without
+    /// granting semantic acceptance.
+    ///
+    /// This is the only API that accepts the weaker [`RouteVerifiedEventEnvelope`]
+    /// capability. It never mutates semantic, causal, stream, operation, or
+    /// acceptance-marker state. Finite-TTL inputs remain unavailable until the
+    /// selected transport supplies authenticated cumulative custody age.
+    pub fn cache_route_verified_event(
+        &self,
+        event: &RouteVerifiedEventEnvelope,
+        sealed: &[u8],
+    ) -> Result<RouteCacheOutcome, StoreError> {
+        self.require_live()?;
+        self.cache_route_verified_event_internal(None, event, sealed)
+    }
+
+    /// Retains one route-verified Event only under an exact settled control policy.
+    pub fn cache_route_verified_event_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        event: &RouteVerifiedEventEnvelope,
+        sealed: &[u8],
+    ) -> Result<RouteCacheOutcome, StoreError> {
+        self.require_live()?;
+        self.cache_route_verified_event_internal(Some(policy), event, sealed)
+    }
+
+    fn cache_route_verified_event_internal(
+        &self,
+        policy: Option<&ControlPolicySnapshot>,
+        event: &RouteVerifiedEventEnvelope,
+        sealed: &[u8],
+    ) -> Result<RouteCacheOutcome, StoreError> {
+        self.require_mission_authority(event.mission_authority_id())?;
+        event
+            .verify_exact_sealed(sealed)
+            .map_err(|error| StoreError::SemanticVerification(error.to_string()))?;
+        if event.ttl_ms().is_some() {
+            return Err(StoreError::AuthenticatedCustodyAgeRequired);
+        }
+        validate_event_header(event.header())?;
+        let transfer_id = EventTransferId::new(event.envelope_id());
+        let semantic_claim = EventSemanticId::new(event.item_id());
+        let encoded = encode_event_metadata(transfer_id, semantic_claim, event.header())?;
+        let write = self.database.begin_write()?;
+        enforce_live_write(&write)?;
+        enforce_event_policy_write(&write, event.mission_authority_id(), policy, event.header())?;
+        if write
+            .open_table(CONTROL_RECORDS)?
+            .get(transfer_id.as_bytes().as_slice())?
+            .is_some()
+        {
+            return Err(StoreError::TransferNamespaceCollision {
+                transfer_id: *transfer_id.as_bytes(),
+            });
+        }
+        let accepted_transfer = write
+            .open_table(SEMANTIC_ITEMS)?
+            .get(semantic_claim.as_bytes().as_slice())?
+            .map(|value| parse_transfer_id("semantic item table", value.value()))
+            .transpose()?;
+        if let Some(accepted_transfer) = accepted_transfer {
+            if accepted_transfer != transfer_id {
+                return Err(StoreError::SemanticRepresentationConflict {
+                    semantic_id: semantic_claim,
+                    accepted_envelope_id: accepted_transfer,
+                    received_envelope_id: transfer_id,
+                });
+            }
+            let accepted = load_event_from_write(&write, accepted_transfer)?.ok_or(
+                StoreError::SemanticInvariant(
+                    "semantic item index points to a missing Event representation",
+                ),
+            )?;
+            if accepted.semantic_id != semantic_claim
+                || accepted.header != *event.header()
+                || accepted.sealed != sealed
+            {
+                return Err(StoreError::SemanticInvariant(
+                    "accepted Event differs from an exact route-cache replay",
+                ));
+            }
+            purge_route_cache_semantic_claim(
+                &write,
+                transfer_id,
+                semantic_claim,
+                event.header(),
+                sealed,
+            )?;
+            write.commit()?;
+            return Ok(RouteCacheOutcome::Duplicate {
+                transfer_id,
+                semantic_claim,
+            });
+        }
+        if load_event_from_write(&write, transfer_id)?.is_some() {
+            return Err(StoreError::SemanticInvariant(
+                "Event representation exists without its semantic item index",
+            ));
+        }
+        let existing = write
+            .open_table(ROUTE_CACHE)?
+            .get(transfer_id.as_bytes().as_slice())?
+            .map(|value| value.value().to_vec());
+        let existing_claim = write
+            .open_table(ROUTE_CACHE_CLAIMS)?
+            .get(transfer_id.as_bytes().as_slice())?
+            .map(|value| value.value().to_vec());
+        match (existing, existing_claim) {
+            (Some(existing), Some(existing_claim)) => {
+                if existing != sealed || existing_claim != encoded {
+                    return Err(StoreError::SemanticInvariant(
+                        "route-cache identity was reused for different exact bytes or claims",
+                    ));
+                }
+                return Ok(RouteCacheOutcome::Duplicate {
+                    transfer_id,
+                    semantic_claim,
+                });
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(StoreError::SemanticInvariant(
+                    "route-cache bytes and claim are not atomically paired",
+                ));
+            }
+            (None, None) => {}
+        }
+        let mut semantic_representation_count = 0u64;
+        for row in write.open_table(ROUTE_CACHE_CLAIMS)?.iter()? {
+            let (_, value) = row?;
+            if decode_event_metadata(value.value())?.semantic_id == semantic_claim {
+                semantic_representation_count = semantic_representation_count
+                    .checked_add(1)
+                    .ok_or(StoreError::ItemCountAccountingOverflow)?;
+            }
+        }
+        if semantic_representation_count >= MAX_ROUTE_CACHE_REPRESENTATIONS_PER_SEMANTIC {
+            return Err(StoreError::RouteCacheSemanticRepresentationLimit {
+                semantic_id: semantic_claim,
+                current: semantic_representation_count,
+                limit: MAX_ROUTE_CACHE_REPRESENTATIONS_PER_SEMANTIC,
+            });
+        }
+        let incoming =
+            u64::try_from(sealed.len()).map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
+        {
+            let mut metadata = write.open_table(METADATA)?;
+            let current_items = metadata
+                .get(ROUTE_CACHE_ITEM_COUNT)?
+                .map_or(0, |value| value.value());
+            let next_items = current_items
+                .checked_add(1)
+                .ok_or(StoreError::ItemCountAccountingOverflow)?;
+            if next_items > MAX_ROUTE_CACHE_ITEMS {
+                return Err(StoreError::RouteCacheItemLimitExceeded {
+                    current: current_items,
+                    limit: MAX_ROUTE_CACHE_ITEMS,
+                });
+            }
+            let opaque_items = metadata.get(ITEM_COUNT)?.map_or(0, |value| value.value());
+            let semantic_items = metadata
+                .get(SEMANTIC_ITEM_COUNT)?
+                .map_or(0, |value| value.value());
+            let control_items = metadata
+                .get(CONTROL_ITEM_COUNT)?
+                .map_or(0, |value| value.value());
+            let aggregate_items = opaque_items
+                .checked_add(semantic_items)
+                .and_then(|value| value.checked_add(next_items))
+                .and_then(|value| value.checked_add(control_items))
+                .ok_or(StoreError::ItemCountAccountingOverflow)?;
+            if aggregate_items > self.limits.max_items {
+                return Err(StoreError::ItemLimitExceeded {
+                    current: aggregate_items.saturating_sub(1),
+                    limit: self.limits.max_items,
+                });
+            }
+            let current_bytes = metadata
+                .get(ROUTE_CACHE_TOTAL_BYTES)?
+                .map_or(0, |value| value.value());
+            let next_bytes = current_bytes
+                .checked_add(incoming)
+                .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+            if next_bytes > MAX_ROUTE_CACHE_BYTES {
+                return Err(StoreError::RouteCacheByteLimitExceeded {
+                    current: current_bytes,
+                    incoming,
+                    limit: MAX_ROUTE_CACHE_BYTES,
+                });
+            }
+            let opaque_bytes = metadata
+                .get(TOTAL_PAYLOAD_BYTES)?
+                .map_or(0, |value| value.value());
+            let semantic_bytes = metadata
+                .get(SEMANTIC_TOTAL_BYTES)?
+                .map_or(0, |value| value.value());
+            let control_bytes = metadata
+                .get(CONTROL_TOTAL_BYTES)?
+                .map_or(0, |value| value.value());
+            let control_intent_bytes = metadata
+                .get(CONTROL_PUBLICATION_INTENT_TOTAL_BYTES)?
+                .map_or(0, |value| value.value());
+            let aggregate_bytes = opaque_bytes
+                .checked_add(semantic_bytes)
+                .and_then(|value| value.checked_add(next_bytes))
+                .and_then(|value| value.checked_add(control_bytes))
+                .and_then(|value| value.checked_add(control_intent_bytes))
+                .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+            if aggregate_bytes > self.limits.max_total_payload_bytes {
+                return Err(StoreError::PayloadByteLimitExceeded {
+                    current: aggregate_bytes.saturating_sub(incoming),
+                    incoming,
+                    limit: self.limits.max_total_payload_bytes,
+                });
+            }
+            metadata.insert(ROUTE_CACHE_ITEM_COUNT, next_items)?;
+            metadata.insert(ROUTE_CACHE_TOTAL_BYTES, next_bytes)?;
+        }
+        write
+            .open_table(ROUTE_CACHE)?
+            .insert(transfer_id.as_bytes().as_slice(), sealed)?;
+        write
+            .open_table(ROUTE_CACHE_CLAIMS)?
+            .insert(transfer_id.as_bytes().as_slice(), encoded.as_slice())?;
+        write.commit()?;
+        Ok(RouteCacheOutcome::Inserted {
+            transfer_id,
+            semantic_claim,
+        })
+    }
+
+    /// Reads a route-only cached representation without implying content acceptance.
+    pub fn get_route_cached_event(
+        &self,
+        transfer_id: EventTransferId,
+    ) -> Result<Option<RouteCachedEvent>, StoreError> {
+        self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        let cache = read.open_table(ROUTE_CACHE)?;
+        let claims = read.open_table(ROUTE_CACHE_CLAIMS)?;
+        let sealed = cache
+            .get(transfer_id.as_bytes().as_slice())?
+            .map(|value| value.value().to_vec());
+        let encoded = claims
+            .get(transfer_id.as_bytes().as_slice())?
+            .map(|value| value.value().to_vec());
+        match (sealed, encoded) {
+            (None, None) => Ok(None),
+            (Some(sealed), Some(encoded)) => {
+                let metadata = decode_event_metadata(&encoded)?;
+                if metadata.transfer_id != transfer_id
+                    || EventTransferId::new(Sha256::digest(&sealed).into()) != transfer_id
+                {
+                    return Err(StoreError::SemanticInvariant(
+                        "route-cache representation fails exact identity audit",
+                    ));
+                }
+                Ok(Some(RouteCachedEvent {
+                    transfer_id,
+                    semantic_claim: metadata.semantic_id,
+                    header_claim: metadata.header,
+                    sealed,
+                }))
+            }
+            _ => Err(StoreError::SemanticInvariant(
+                "route-cache bytes and claim are not atomically paired",
+            )),
+        }
+    }
+
+    /// Returns exact route-cache transfer keys, kept separate from semantic inventory.
+    pub fn route_cache_inventory(&self) -> Result<EventInventory, StoreError> {
+        self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        let cache = read.open_table(ROUTE_CACHE)?;
+        let claims = read.open_table(ROUTE_CACHE_CLAIMS)?;
+        let mut ids = Vec::new();
+        for row in cache.iter()? {
+            let (key, _) = row?;
+            if claims.get(key.value())?.is_none() {
+                return Err(StoreError::SemanticInvariant(
+                    "route-cache bytes are missing their route claim",
+                ));
+            }
+            ids.push(parse_transfer_id("route Event cache", key.value())?);
+        }
+        for row in claims.iter()? {
+            let (key, _) = row?;
+            if cache.get(key.value())?.is_none() {
+                return Err(StoreError::SemanticInvariant(
+                    "route-cache claim is missing exact source bytes",
+                ));
+            }
+        }
+        ids.sort_unstable();
+        Ok(EventInventory(ids))
+    }
+
+    /// Returns the disjoint union of semantic and route-only exact transfer keys.
+    pub fn transfer_inventory(&self) -> Result<EventInventory, StoreError> {
+        let accepted = self.event_inventory()?;
+        let cached = self.route_cache_inventory()?;
+        let mut ids = accepted
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        for transfer_id in cached.iter().copied() {
+            if !ids.insert(transfer_id) {
+                return Err(StoreError::SemanticInvariant(
+                    "one transfer identity exists in semantic and route-cache namespaces",
+                ));
+            }
+        }
+        Ok(EventInventory(ids.into_iter().collect()))
+    }
+
+    /// Returns one transfer inventory from the exact expected control-policy snapshot.
+    ///
+    /// The database read is snapshot-consistent. Success does not keep a lease
+    /// alive after return and therefore cannot by itself linearize a later
+    /// asynchronous network send.
+    pub fn transfer_inventory_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+    ) -> Result<EventInventory, StoreError> {
+        let authority = self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        require_control_policy_read(&read, authority, policy)?;
+        transfer_inventory_read(&read)
+    }
+
+    /// Reads one exact transfer while preserving its content-acceptance state.
+    ///
+    /// Persisted metadata is structurally audited, not a live cryptographic
+    /// capability. Runtime consumers must reverify the returned sealed bytes
+    /// through the mission-bound core provider before forwarding or acting.
+    pub fn get_transfer(
+        &self,
+        transfer_id: EventTransferId,
+    ) -> Result<Option<StoredEventTransfer>, StoreError> {
+        self.require_live()?;
+        if let Some(event) = self.get_event(transfer_id)? {
+            return Ok(Some(StoredEventTransfer::Accepted(event)));
+        }
+        Ok(self
+            .get_route_cached_event(transfer_id)?
+            .map(StoredEventTransfer::RouteCached))
+    }
+
+    /// Reads one exact transfer from the exact expected control-policy snapshot.
+    ///
+    /// Success only binds the returned bytes to this redb read transaction; it
+    /// does not claim async network-send linearization after the method returns.
+    pub fn get_transfer_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        transfer_id: EventTransferId,
+    ) -> Result<Option<StoredEventTransfer>, StoreError> {
+        let authority = self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        require_control_policy_read(&read, authority, policy)?;
+        load_transfer_read(&read, transfer_id)
+    }
+
+    /// Authenticates and accepts one remotely received durable Event.
+    ///
+    /// The selected mission session does not yet carry authenticated cumulative
+    /// custody age. Finite-TTL non-tombstone imports therefore fail closed
+    /// instead of manufacturing an age of zero.
+    pub fn apply_verified_event(
+        &self,
+        event: &ContentVerifiedEventEnvelope,
+        sealed: &[u8],
+    ) -> Result<ApplyOutcome, StoreError> {
+        self.require_live()?;
+        let prepared = PreparedEvent::from_verified(event, sealed, EventOrigin::Remote)?;
+        self.commit_prepared_event(&prepared, None, None, None)
+            .map(|outcome| outcome.apply)
+    }
+
+    /// Accepts one remotely verified Event only under an exact settled control policy.
+    pub fn apply_verified_event_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        event: &ContentVerifiedEventEnvelope,
+        sealed: &[u8],
+    ) -> Result<ApplyOutcome, StoreError> {
+        self.require_live()?;
+        let prepared = PreparedEvent::from_verified(event, sealed, EventOrigin::Remote)?;
+        self.commit_prepared_event(&prepared, None, None, Some(policy))
+            .map(|outcome| outcome.apply)
+    }
+
+    /// Commits one locally sealed Event against its optimistic durable reservation.
+    pub fn commit_reserved_event(
+        &self,
+        reservation: &EventReservation,
+        event: &ContentVerifiedEventEnvelope,
+        sealed: &[u8],
+    ) -> Result<ApplyOutcome, StoreError> {
+        self.require_live()?;
+        let prepared = PreparedEvent::from_verified(event, sealed, EventOrigin::Local)?;
+        self.commit_prepared_event(
+            &prepared,
+            Some(reservation),
+            None,
+            Some(&reservation.control_policy),
+        )
+        .map(|outcome| outcome.apply)
+    }
+
+    /// Commits a reserved local Event only if its captured policy remains exact.
+    pub fn commit_reserved_event_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        reservation: &EventReservation,
+        event: &ContentVerifiedEventEnvelope,
+        sealed: &[u8],
+    ) -> Result<ApplyOutcome, StoreError> {
+        self.require_live()?;
+        if policy != &reservation.control_policy {
+            return Err(StoreError::ControlPolicyChanged);
+        }
+        let prepared = PreparedEvent::from_verified(event, sealed, EventOrigin::Local)?;
+        self.commit_prepared_event(&prepared, Some(reservation), None, Some(policy))
+            .map(|outcome| outcome.apply)
+    }
+
+    /// Atomically commits a local Event and a durable application operation mapping.
+    ///
+    /// When `predecessor` is present, it must already be an accepted semantic
+    /// Event and the reservation context must observe its authenticated dot.
+    /// The operation row, source envelope, semantic ledgers, reconciliation
+    /// item, and acceptance marker are committed in the same redb transaction.
+    pub fn commit_reserved_event_once(
+        &self,
+        operation: &EventOperationKey,
+        predecessor: Option<EventSemanticId>,
+        reservation: &EventReservation,
+        event: &ContentVerifiedEventEnvelope,
+        sealed: &[u8],
+    ) -> Result<EventOnceOutcome, StoreError> {
+        self.require_live()?;
+        let prepared = PreparedEvent::from_verified(event, sealed, EventOrigin::Local)?;
+        let operation = PendingOperation {
+            key: operation,
+            predecessor,
+        };
+        let committed = self.commit_prepared_event(
+            &prepared,
+            Some(reservation),
+            Some(operation),
+            Some(&reservation.control_policy),
+        )?;
+        event_once_outcome(committed)
+    }
+
+    /// Commits one idempotent local Event operation under an exact settled policy.
+    pub fn commit_reserved_event_once_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        operation: &EventOperationKey,
+        predecessor: Option<EventSemanticId>,
+        reservation: &EventReservation,
+        event: &ContentVerifiedEventEnvelope,
+        sealed: &[u8],
+    ) -> Result<EventOnceOutcome, StoreError> {
+        self.require_live()?;
+        if policy != &reservation.control_policy {
+            return Err(StoreError::ControlPolicyChanged);
+        }
+        let prepared = PreparedEvent::from_verified(event, sealed, EventOrigin::Local)?;
+        let operation = PendingOperation {
+            key: operation,
+            predecessor,
+        };
+        let committed = self.commit_prepared_event(
+            &prepared,
+            Some(reservation),
+            Some(operation),
+            Some(policy),
+        )?;
+        event_once_outcome(committed)
+    }
+
+    /// Resolves an idempotent application operation to its accepted Event.
+    pub fn event_for_operation(
+        &self,
+        operation: &EventOperationKey,
+    ) -> Result<Option<StoredEvent>, StoreError> {
+        self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        let operations = read.open_table(EVENT_OPERATIONS)?;
+        let transfer = operations
+            .get(operation.as_bytes())?
+            .map(|value| decode_operation_record(value.value()).map(|record| record.transfer_id))
+            .transpose()?;
+        drop(operations);
+        drop(read);
+        transfer
+            .map(|id| self.get_event(id))
+            .transpose()?
+            .flatten()
+            .map_or(Ok(None), |event| Ok(Some(event)))
+    }
+
+    /// Reads one exact source Event by its transfer/inventory identity.
+    ///
+    /// Legacy opaque rows never cross this API because a paired semantic row is required.
+    pub fn get_event(
+        &self,
+        transfer_id: EventTransferId,
+    ) -> Result<Option<StoredEvent>, StoreError> {
+        self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        let events = read.open_table(EVENTS)?;
+        let Some(encoded) = events
+            .get(transfer_id.as_bytes().as_slice())?
+            .map(|value| value.value().to_vec())
+        else {
+            return Ok(None);
+        };
+        let event_bytes = read.open_table(EVENT_BYTES)?;
+        let markers = read.open_table(EVENT_ACCEPTANCE_MARKERS)?;
+        let sealed = event_bytes
+            .get(transfer_id.as_bytes().as_slice())?
+            .map(|value| value.value().to_vec())
+            .ok_or(StoreError::SemanticInvariant(
+                "Event metadata is missing exact source bytes",
+            ))?;
+        let marker = markers
+            .get(transfer_id.as_bytes().as_slice())?
+            .map(|value| value.value())
+            .ok_or(StoreError::SemanticInvariant(
+                "Event metadata is missing its acceptance marker",
+            ))?;
+        decode_stored_event(transfer_id, &encoded, sealed, marker).map(Some)
+    }
+
+    /// Resolves a semantic Event identity to its one retained exact representation.
+    pub fn event_by_semantic_id(
+        &self,
+        semantic_id: EventSemanticId,
+    ) -> Result<Option<StoredEvent>, StoreError> {
+        self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        let semantic_items = read.open_table(SEMANTIC_ITEMS)?;
+        let transfer = semantic_items
+            .get(semantic_id.as_bytes().as_slice())?
+            .map(|value| parse_transfer_id("semantic item table", value.value()))
+            .transpose()?;
+        drop(semantic_items);
+        drop(read);
+        transfer
+            .map(|id| self.get_event(id))
+            .transpose()?
+            .flatten()
+            .map_or(Ok(None), |event| Ok(Some(event)))
+    }
+
+    /// Returns only exact source-authenticated Event transfer identities.
+    pub fn event_inventory(&self) -> Result<EventInventory, StoreError> {
+        self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        let events = read.open_table(EVENTS)?;
+        let event_bytes = read.open_table(EVENT_BYTES)?;
+        let markers = read.open_table(EVENT_ACCEPTANCE_MARKERS)?;
+        let mut ids = Vec::new();
+        for row in events.iter()? {
+            let (key, _) = row?;
+            let transfer_id = parse_transfer_id("Event metadata table", key.value())?;
+            if event_bytes.get(key.value())?.is_none() || markers.get(key.value())?.is_none() {
+                return Err(StoreError::SemanticInvariant(
+                    "Event inventory row is not atomically paired",
+                ));
+            }
+            ids.push(transfer_id);
+        }
+        ids.sort_unstable();
+        Ok(EventInventory(ids))
+    }
+
+    /// Returns the number of accepted semantic Event representations.
+    pub fn event_count(&self) -> Result<u64, StoreError> {
+        self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        Ok(read.open_table(EVENTS)?.len()?)
+    }
+
+    /// Returns structurally audited semantic and route-cache receipt counts.
+    pub fn event_stats(&self) -> Result<EventStoreStats, StoreError> {
+        self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        let events = read.open_table(EVENTS)?;
+        let event_bytes = read.open_table(EVENT_BYTES)?;
+        let event_markers = read.open_table(EVENT_ACCEPTANCE_MARKERS)?;
+        let route_cache = read.open_table(ROUTE_CACHE)?;
+        let route_claims = read.open_table(ROUTE_CACHE_CLAIMS)?;
+        let metadata = read.open_table(METADATA)?;
+        let mut total_sealed_bytes = 0u64;
+        let mut last_acceptance_marker = 0u64;
+        for row in events.iter()? {
+            let (key, _) = row?;
+            let bytes = event_bytes
+                .get(key.value())?
+                .ok_or(StoreError::SemanticInvariant(
+                    "Event stats row is missing exact source bytes",
+                ))?;
+            total_sealed_bytes = total_sealed_bytes
+                .checked_add(
+                    u64::try_from(bytes.value().len())
+                        .map_err(|_| StoreError::PayloadByteAccountingOverflow)?,
+                )
+                .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+            let marker = event_markers
+                .get(key.value())?
+                .map(|value| value.value())
+                .ok_or(StoreError::SemanticInvariant(
+                    "Event stats row is missing its acceptance marker",
+                ))?;
+            last_acceptance_marker = last_acceptance_marker.max(marker);
+        }
+        let mut route_cached_bytes = 0u64;
+        for row in route_cache.iter()? {
+            let (key, value) = row?;
+            if route_claims.get(key.value())?.is_none() {
+                return Err(StoreError::SemanticInvariant(
+                    "route-cache stats row is missing its claim",
+                ));
+            }
+            route_cached_bytes = route_cached_bytes
+                .checked_add(
+                    u64::try_from(value.value().len())
+                        .map_err(|_| StoreError::PayloadByteAccountingOverflow)?,
+                )
+                .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        }
+        let stats = EventStoreStats {
+            events: events.len()?,
+            acceptance_markers: event_markers.len()?,
+            total_sealed_bytes,
+            last_acceptance_marker,
+            route_cached: route_cache.len()?,
+            route_cached_bytes,
+        };
+        for (field, durable, reconstructed) in [
+            (
+                SEMANTIC_ITEM_COUNT,
+                metadata
+                    .get(SEMANTIC_ITEM_COUNT)?
+                    .map_or(0, |value| value.value()),
+                stats.events,
+            ),
+            (
+                SEMANTIC_TOTAL_BYTES,
+                metadata
+                    .get(SEMANTIC_TOTAL_BYTES)?
+                    .map_or(0, |value| value.value()),
+                stats.total_sealed_bytes,
+            ),
+            (
+                LAST_SEMANTIC_ACCEPTANCE_MARKER,
+                metadata
+                    .get(LAST_SEMANTIC_ACCEPTANCE_MARKER)?
+                    .map_or(0, |value| value.value()),
+                stats.last_acceptance_marker,
+            ),
+            (
+                ROUTE_CACHE_ITEM_COUNT,
+                metadata
+                    .get(ROUTE_CACHE_ITEM_COUNT)?
+                    .map_or(0, |value| value.value()),
+                stats.route_cached,
+            ),
+            (
+                ROUTE_CACHE_TOTAL_BYTES,
+                metadata
+                    .get(ROUTE_CACHE_TOTAL_BYTES)?
+                    .map_or(0, |value| value.value()),
+                stats.route_cached_bytes,
+            ),
+        ] {
+            if durable != reconstructed {
+                return Err(StoreError::AccountingMismatch {
+                    field,
+                    durable,
+                    reconstructed,
+                });
+            }
+        }
+        Ok(stats)
+    }
+
+    /// Returns a bounded marker-ordered page of semantic Events.
+    pub fn events_after(
+        &self,
+        after_acceptance_marker: u64,
+        limit: usize,
+    ) -> Result<Vec<StoredEvent>, StoreError> {
+        self.require_bound_mission()?;
+        if limit > MAX_EVENT_PAGE {
+            return Err(StoreError::EventPageLimitExceeded {
+                requested: limit,
+                maximum: MAX_EVENT_PAGE,
+            });
+        }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let read = self.database.begin_read()?;
+        let events = read.open_table(EVENTS)?;
+        let event_bytes = read.open_table(EVENT_BYTES)?;
+        let markers = read.open_table(EVENT_ACCEPTANCE_MARKERS)?;
+        let mut page = Vec::new();
+        for row in events.iter()? {
+            let (key, value) = row?;
+            let transfer_id = parse_transfer_id("Event metadata table", key.value())?;
+            let marker = markers.get(key.value())?.map(|value| value.value()).ok_or(
+                StoreError::SemanticInvariant("Event page row is missing its acceptance marker"),
+            )?;
+            if marker <= after_acceptance_marker {
+                continue;
+            }
+            let sealed = event_bytes
+                .get(key.value())?
+                .map(|value| value.value().to_vec())
+                .ok_or(StoreError::SemanticInvariant(
+                    "Event page row is missing exact source bytes",
+                ))?;
+            page.push(decode_stored_event(
+                transfer_id,
+                value.value(),
+                sealed,
+                marker,
+            )?);
+        }
+        page.sort_by_key(|event| (event.acceptance_marker, event.transfer_id));
+        page.truncate(limit);
+        Ok(page)
+    }
+
+    /// Returns a marker-ordered page from the exact expected control-policy snapshot.
+    ///
+    /// The returned bytes are policy-bound at read time only; callers need a
+    /// process-local policy guard through any later asynchronous send.
+    pub fn events_after_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        after_acceptance_marker: u64,
+        limit: usize,
+    ) -> Result<Vec<StoredEvent>, StoreError> {
+        let authority = self.require_bound_mission()?;
+        if limit > MAX_EVENT_PAGE {
+            return Err(StoreError::EventPageLimitExceeded {
+                requested: limit,
+                maximum: MAX_EVENT_PAGE,
+            });
+        }
+        let read = self.database.begin_read()?;
+        require_control_policy_read(&read, authority, policy)?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        events_after_read(&read, after_acceptance_marker, limit)
+    }
+
+    /// Reports missing half-open ranges in all accepted Event streams.
+    ///
+    /// Out-of-order acceptance remains valid. For sequences 1 and 3 this
+    /// returns `[2, 3)`; accepting sequence 2 later closes the gap.
+    pub fn event_gaps(&self) -> Result<Vec<EventGap>, StoreError> {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        let events = read.open_table(EVENTS)?;
+        let mut streams = BTreeMap::<(NodeId, Topic, Scope), BTreeSet<u64>>::new();
+        for row in events.iter()? {
+            let (_, value) = row?;
+            let metadata = decode_event_metadata(value.value())?;
+            let sequence = event_sequence(&metadata.header)?;
+            streams
+                .entry((
+                    metadata.header.stamp.dot.publisher,
+                    metadata.header.topic,
+                    metadata.header.scope,
+                ))
+                .or_default()
+                .insert(sequence);
+        }
+        let mut gaps = Vec::new();
+        for ((publisher, topic, scope), sequences) in streams {
+            let mut expected = 1u64;
+            for sequence in sequences {
+                if sequence > expected {
+                    gaps.push(EventGap {
+                        publisher,
+                        topic: topic.clone(),
+                        scope: scope.clone(),
+                        start_sequence: expected,
+                        end_sequence: sequence,
+                    });
+                }
+                expected = expected.max(sequence.saturating_add(1));
+            }
+        }
+        Ok(gaps)
+    }
+
+    fn commit_prepared_event(
+        &self,
+        prepared: &PreparedEvent,
+        reservation: Option<&EventReservation>,
+        operation: Option<PendingOperation<'_>>,
+        policy: Option<&ControlPolicySnapshot>,
+    ) -> Result<EventCommit, StoreError> {
+        self.require_mission_authority(prepared.mission_authority)?;
+        let write = self.database.begin_write()?;
+        enforce_live_write(&write)?;
+        enforce_event_policy_write(&write, prepared.mission_authority, policy, &prepared.header)?;
+
+        if write
+            .open_table(CONTROL_RECORDS)?
+            .get(prepared.transfer_id.as_bytes().as_slice())?
+            .is_some()
+        {
+            return Err(StoreError::TransferNamespaceCollision {
+                transfer_id: *prepared.transfer_id.as_bytes(),
+            });
+        }
+
+        // A durable operation result wins before optimistic reservation checks.
+        // This is the restart/replay boundary for both initial publication and
+        // reactive publication.
+        if let Some(operation) = operation {
+            let existing = {
+                let operations = write.open_table(EVENT_OPERATIONS)?;
+                operations
+                    .get(operation.key.as_bytes())?
+                    .map(|value| decode_operation_record(value.value()))
+                    .transpose()?
+            };
+            if let Some(existing) = existing {
+                if existing.predecessor != operation.predecessor {
+                    return Err(StoreError::OperationPredecessorMismatch);
+                }
+                let transfer_id = existing.transfer_id;
+                let stored = load_event_from_write(&write, transfer_id)?.ok_or(
+                    StoreError::SemanticInvariant(
+                        "Event operation points to a missing semantic Event",
+                    ),
+                )?;
+                return Ok(EventCommit {
+                    transfer_id,
+                    semantic_id: stored.semantic_id,
+                    apply: ApplyOutcome::Duplicate {
+                        acceptance_marker: stored.acceptance_marker,
+                    },
+                    operation_existing: true,
+                });
+            }
+        }
+
+        if let Some(reservation) = reservation {
+            validate_reservation(reservation, prepared)?;
+        }
+
+        if let Some(predecessor) = operation.and_then(|operation| operation.predecessor) {
+            let predecessor_transfer = {
+                let semantic_items = write.open_table(SEMANTIC_ITEMS)?;
+                semantic_items
+                    .get(predecessor.as_bytes().as_slice())?
+                    .map(|value| parse_transfer_id("semantic item table", value.value()))
+                    .transpose()?
+                    .ok_or(StoreError::MissingReactionPredecessor {
+                        semantic_id: predecessor,
+                    })?
+            };
+            let predecessor_event = load_event_from_write(&write, predecessor_transfer)?.ok_or(
+                StoreError::MissingReactionPredecessor {
+                    semantic_id: predecessor,
+                },
+            )?;
+            if !prepared
+                .header
+                .stamp
+                .context
+                .observes(predecessor_event.header.stamp.dot)
+            {
+                return Err(StoreError::ReactionContextMissing {
+                    semantic_id: predecessor,
+                });
+            }
+        }
+
+        let accepted_representation = {
+            let semantic_items = write.open_table(SEMANTIC_ITEMS)?;
+            semantic_items
+                .get(prepared.semantic_id.as_bytes().as_slice())?
+                .map(|value| parse_transfer_id("semantic item table", value.value()))
+                .transpose()?
+        };
+        if let Some(accepted) = accepted_representation {
+            if accepted != prepared.transfer_id {
+                return Err(StoreError::SemanticRepresentationConflict {
+                    semantic_id: prepared.semantic_id,
+                    accepted_envelope_id: accepted,
+                    received_envelope_id: prepared.transfer_id,
+                });
+            }
+            let stored =
+                load_event_from_write(&write, accepted)?.ok_or(StoreError::SemanticInvariant(
+                    "semantic item index points to a missing Event representation",
+                ))?;
+            if stored.semantic_id != prepared.semantic_id
+                || stored.header != prepared.header
+                || stored.sealed != prepared.sealed
+            {
+                return Err(StoreError::SemanticInvariant(
+                    "accepted Event representation differs from exact replay",
+                ));
+            }
+            purge_route_cache_semantic_claim(
+                &write,
+                prepared.transfer_id,
+                prepared.semantic_id,
+                &prepared.header,
+                &prepared.sealed,
+            )?;
+            if let Some(operation) = operation {
+                let operation_record = encode_operation_record(OperationRecord {
+                    transfer_id: prepared.transfer_id,
+                    predecessor: operation.predecessor,
+                });
+                write
+                    .open_table(EVENT_OPERATIONS)?
+                    .insert(operation.key.as_bytes(), operation_record.as_slice())?;
+            }
+            write.commit()?;
+            return Ok(EventCommit {
+                transfer_id: accepted,
+                semantic_id: prepared.semantic_id,
+                apply: ApplyOutcome::Duplicate {
+                    acceptance_marker: stored.acceptance_marker,
+                },
+                operation_existing: false,
+            });
+        }
+
+        if let Some(reservation) = reservation {
+            let current_counter = write
+                .open_table(PUBLISHER_HIGH_WATER)?
+                .get(reservation.publisher.as_slice())?
+                .map_or(0, |value| value.value());
+            let stream = event_stream_key(
+                reservation.publisher,
+                &reservation.topic,
+                &reservation.scope,
+            )?;
+            let current_sequence = write
+                .open_table(EVENT_HIGH_WATER)?
+                .get(stream.as_slice())?
+                .map_or(0, |value| value.value());
+            if current_counter != reservation.previous_counter
+                || current_sequence != reservation.previous_event_sequence
+            {
+                return Err(StoreError::ReservationChanged);
+            }
+        }
+
+        let dot_key = accepted_dot_key(prepared.header.stamp.dot);
+        if let Some(accepted) = write
+            .open_table(ACCEPTED_DOTS)?
+            .get(dot_key.as_slice())?
+            .map(|value| parse_semantic_id("accepted dot table", value.value()))
+            .transpose()?
+        {
+            if accepted != prepared.semantic_id {
+                return Err(StoreError::CausalEquivocation {
+                    publisher: prepared.header.stamp.dot.publisher,
+                    counter: prepared.header.stamp.dot.counter,
+                });
+            }
+            return Err(StoreError::SemanticInvariant(
+                "accepted dot is missing its semantic item index",
+            ));
+        }
+
+        let sequence = event_sequence(&prepared.header)?;
+        let position_key = accepted_event_key(
+            prepared.header.stamp.dot.publisher,
+            &prepared.header.topic,
+            &prepared.header.scope,
+            sequence,
+        )?;
+        if let Some(accepted) = write
+            .open_table(ACCEPTED_EVENTS)?
+            .get(position_key.as_slice())?
+            .map(|value| parse_semantic_id("accepted Event table", value.value()))
+            .transpose()?
+        {
+            if accepted != prepared.semantic_id {
+                return Err(StoreError::EventEquivocation {
+                    publisher: prepared.header.stamp.dot.publisher,
+                    sequence,
+                });
+            }
+            return Err(StoreError::SemanticInvariant(
+                "accepted Event position is missing its semantic item index",
+            ));
+        }
+
+        ensure_frontier_capacity(
+            &write,
+            &prepared.header.topic,
+            &prepared.header.scope,
+            prepared.header.stamp.dot.publisher,
+        )?;
+
+        if write
+            .open_table(EVENTS)?
+            .get(prepared.transfer_id.as_bytes().as_slice())?
+            .is_some()
+        {
+            return Err(StoreError::SemanticInvariant(
+                "Event representation exists without its semantic item index",
+            ));
+        }
+
+        let existing_item = write
+            .open_table(EVENT_BYTES)?
+            .get(prepared.transfer_id.as_bytes().as_slice())?
+            .map(|value| value.value().to_vec());
+        let existing_marker = write
+            .open_table(EVENT_ACCEPTANCE_MARKERS)?
+            .get(prepared.transfer_id.as_bytes().as_slice())?
+            .map(|value| value.value());
+        if existing_item.is_some() || existing_marker.is_some() {
+            return Err(StoreError::SemanticInvariant(
+                "semantic Event bytes or marker exist without semantic metadata",
+            ));
+        }
+        purge_route_cache_semantic_claim(
+            &write,
+            prepared.transfer_id,
+            prepared.semantic_id,
+            &prepared.header,
+            &prepared.sealed,
+        )?;
+        let incoming = u64::try_from(prepared.sealed.len())
+            .map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
+        let marker = {
+            let mut metadata = write.open_table(METADATA)?;
+            let opaque_items = metadata.get(ITEM_COUNT)?.map_or(0, |value| value.value());
+            let semantic_items = metadata
+                .get(SEMANTIC_ITEM_COUNT)?
+                .map_or(0, |value| value.value());
+            let route_items = metadata
+                .get(ROUTE_CACHE_ITEM_COUNT)?
+                .map_or(0, |value| value.value());
+            let control_items = metadata
+                .get(CONTROL_ITEM_COUNT)?
+                .map_or(0, |value| value.value());
+            let aggregate_items = opaque_items
+                .checked_add(semantic_items)
+                .and_then(|value| value.checked_add(route_items))
+                .and_then(|value| value.checked_add(control_items))
+                .and_then(|value| value.checked_add(1))
+                .ok_or(StoreError::ItemCountAccountingOverflow)?;
+            if aggregate_items > self.limits.max_items {
+                return Err(StoreError::ItemLimitExceeded {
+                    current: aggregate_items.saturating_sub(1),
+                    limit: self.limits.max_items,
+                });
+            }
+            let opaque_bytes = metadata
+                .get(TOTAL_PAYLOAD_BYTES)?
+                .map_or(0, |value| value.value());
+            let semantic_bytes = metadata
+                .get(SEMANTIC_TOTAL_BYTES)?
+                .map_or(0, |value| value.value());
+            let route_bytes = metadata
+                .get(ROUTE_CACHE_TOTAL_BYTES)?
+                .map_or(0, |value| value.value());
+            let control_bytes = metadata
+                .get(CONTROL_TOTAL_BYTES)?
+                .map_or(0, |value| value.value());
+            let control_intent_bytes = metadata
+                .get(CONTROL_PUBLICATION_INTENT_TOTAL_BYTES)?
+                .map_or(0, |value| value.value());
+            let aggregate_bytes = opaque_bytes
+                .checked_add(semantic_bytes)
+                .and_then(|value| value.checked_add(route_bytes))
+                .and_then(|value| value.checked_add(control_bytes))
+                .and_then(|value| value.checked_add(control_intent_bytes))
+                .and_then(|value| value.checked_add(incoming))
+                .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+            if aggregate_bytes > self.limits.max_total_payload_bytes {
+                return Err(StoreError::PayloadByteLimitExceeded {
+                    current: aggregate_bytes.saturating_sub(incoming),
+                    incoming,
+                    limit: self.limits.max_total_payload_bytes,
+                });
+            }
+            let next_semantic_items = semantic_items
+                .checked_add(1)
+                .ok_or(StoreError::ItemCountAccountingOverflow)?;
+            let next_semantic_bytes = semantic_bytes
+                .checked_add(incoming)
+                .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+            let previous = metadata
+                .get(LAST_SEMANTIC_ACCEPTANCE_MARKER)?
+                .map_or(0, |value| value.value());
+            let marker = previous
+                .checked_add(1)
+                .ok_or(StoreError::AcceptanceMarkerExhausted)?;
+            metadata.insert(SEMANTIC_ITEM_COUNT, next_semantic_items)?;
+            metadata.insert(SEMANTIC_TOTAL_BYTES, next_semantic_bytes)?;
+            metadata.insert(LAST_SEMANTIC_ACCEPTANCE_MARKER, marker)?;
+            marker
+        };
+        write.open_table(EVENT_BYTES)?.insert(
+            prepared.transfer_id.as_bytes().as_slice(),
+            prepared.sealed.as_slice(),
+        )?;
+        write
+            .open_table(EVENT_ACCEPTANCE_MARKERS)?
+            .insert(prepared.transfer_id.as_bytes().as_slice(), marker)?;
+
+        write.open_table(EVENTS)?.insert(
+            prepared.transfer_id.as_bytes().as_slice(),
+            prepared.encoded_metadata.as_slice(),
+        )?;
+        write.open_table(SEMANTIC_ITEMS)?.insert(
+            prepared.semantic_id.as_bytes().as_slice(),
+            prepared.transfer_id.as_bytes().as_slice(),
+        )?;
+        write.open_table(ACCEPTED_DOTS)?.insert(
+            dot_key.as_slice(),
+            prepared.semantic_id.as_bytes().as_slice(),
+        )?;
+        write.open_table(ACCEPTED_EVENTS)?.insert(
+            position_key.as_slice(),
+            prepared.semantic_id.as_bytes().as_slice(),
+        )?;
+
+        update_high_water(
+            &write,
+            prepared.header.stamp.dot.publisher,
+            &prepared.header.topic,
+            &prepared.header.scope,
+            prepared.header.stamp.dot.counter,
+            sequence,
+        )?;
+
+        if let Some(operation) = operation {
+            let operation_record = encode_operation_record(OperationRecord {
+                transfer_id: prepared.transfer_id,
+                predecessor: operation.predecessor,
+            });
+            write
+                .open_table(EVENT_OPERATIONS)?
+                .insert(operation.key.as_bytes(), operation_record.as_slice())?;
+        }
+        write.commit()?;
+
+        Ok(EventCommit {
+            transfer_id: prepared.transfer_id,
+            semantic_id: prepared.semantic_id,
+            apply: ApplyOutcome::Inserted {
+                acceptance_marker: marker,
+            },
+            operation_existing: false,
+        })
+    }
+
+    /// Reads the exact opaque bytes for an accepted item.
+    ///
+    /// A half-present item/acceptance-marker pair is reported as an invariant failure rather
+    /// than being delivered silently.
+    pub fn get(&self, id: ItemId) -> Result<Option<Vec<u8>>, StoreError> {
+        self.require_live()?;
+        let read = self.database.begin_read()?;
+        let items = read.open_table(ITEMS)?;
+        let acceptance_markers = read.open_table(ACCEPTANCE_MARKERS)?;
+        let bytes = items
+            .get(id.as_bytes().as_slice())?
+            .map(|value| value.value().to_vec());
+        let marker = acceptance_markers
+            .get(id.as_bytes().as_slice())?
+            .map(|value| value.value());
+
+        match (bytes, marker) {
+            (Some(bytes), Some(_)) => Ok(Some(bytes)),
+            (None, None) => Ok(None),
+            (Some(_), None) => Err(StoreError::MissingAcceptanceMarker { id }),
+            (None, Some(_)) => Err(StoreError::OrphanedAcceptanceMarker { id }),
+        }
+    }
+
+    /// Returns whether an item and its paired acceptance marker are present.
+    pub fn contains(&self, id: ItemId) -> Result<bool, StoreError> {
+        self.get(id).map(|bytes| bytes.is_some())
+    }
+
+    /// Returns the durable acceptance marker paired with an item.
+    pub fn acceptance_marker(&self, id: ItemId) -> Result<Option<u64>, StoreError> {
+        self.require_live()?;
+        let read = self.database.begin_read()?;
+        let items = read.open_table(ITEMS)?;
+        let acceptance_markers = read.open_table(ACCEPTANCE_MARKERS)?;
+        let item_exists = items.get(id.as_bytes().as_slice())?.is_some();
+        let marker = acceptance_markers
+            .get(id.as_bytes().as_slice())?
+            .map(|value| value.value());
+
+        match (item_exists, marker) {
+            (true, Some(marker)) => Ok(Some(marker)),
+            (false, None) => Ok(None),
+            (true, None) => Err(StoreError::MissingAcceptanceMarker { id }),
+            (false, Some(_)) => Err(StoreError::OrphanedAcceptanceMarker { id }),
+        }
+    }
+
+    /// Returns the canonical complete-ID inventory after auditing every item/acceptance-marker pair.
+    pub fn inventory(&self) -> Result<InventorySnapshot, StoreError> {
+        self.require_live()?;
+        let read = self.database.begin_read()?;
+        let items = read.open_table(ITEMS)?;
+        let acceptance_markers = read.open_table(ACCEPTANCE_MARKERS)?;
+        let mut ids = Vec::new();
+
+        for row in items.iter()? {
+            let (key, _) = row?;
+            let id = parse_id("item table", key.value())?;
+            if acceptance_markers.get(key.value())?.is_none() {
+                return Err(StoreError::MissingAcceptanceMarker { id });
+            }
+            ids.push(id);
+        }
+
+        for row in acceptance_markers.iter()? {
+            let (key, _) = row?;
+            let id = parse_id("acceptance-marker table", key.value())?;
+            if items.get(key.value())?.is_none() {
+                return Err(StoreError::OrphanedAcceptanceMarker { id });
+            }
+        }
+
+        Ok(InventorySnapshot::new(ids))
+    }
+
+    /// Returns consistent item, acceptance-marker, byte, and last-marker counts from one read snapshot.
+    pub fn stats(&self) -> Result<StoreStats, StoreError> {
+        self.require_live()?;
+        let read = self.database.begin_read()?;
+        let items = read.open_table(ITEMS)?;
+        let acceptance_markers = read.open_table(ACCEPTANCE_MARKERS)?;
+        let metadata = read.open_table(METADATA)?;
+
+        let mut reconstructed_items = 0u64;
+        let mut reconstructed_payload_bytes = 0u64;
+        for row in items.iter()? {
+            let (key, value) = row?;
+            let id = parse_id("item table", key.value())?;
+            if acceptance_markers.get(key.value())?.is_none() {
+                return Err(StoreError::MissingAcceptanceMarker { id });
+            }
+            reconstructed_items = reconstructed_items
+                .checked_add(1)
+                .ok_or(StoreError::ItemCountAccountingOverflow)?;
+            let length = u64::try_from(value.value().len())
+                .map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
+            reconstructed_payload_bytes = reconstructed_payload_bytes
+                .checked_add(length)
+                .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        }
+        for row in acceptance_markers.iter()? {
+            let (key, _) = row?;
+            let id = parse_id("acceptance-marker table", key.value())?;
+            if items.get(key.value())?.is_none() {
+                return Err(StoreError::OrphanedAcceptanceMarker { id });
+            }
+        }
+
+        let durable_items = metadata.get(ITEM_COUNT)?.map_or(0, |value| value.value());
+        if durable_items != reconstructed_items {
+            return Err(StoreError::AccountingMismatch {
+                field: ITEM_COUNT,
+                durable: durable_items,
+                reconstructed: reconstructed_items,
+            });
+        }
+        let durable_payload_bytes = metadata
+            .get(TOTAL_PAYLOAD_BYTES)?
+            .map_or(0, |value| value.value());
+        if durable_payload_bytes != reconstructed_payload_bytes {
+            return Err(StoreError::AccountingMismatch {
+                field: TOTAL_PAYLOAD_BYTES,
+                durable: durable_payload_bytes,
+                reconstructed: reconstructed_payload_bytes,
+            });
+        }
+
+        Ok(StoreStats {
+            items: reconstructed_items,
+            acceptance_markers: acceptance_markers.len()?,
+            total_payload_bytes: reconstructed_payload_bytes,
+            last_acceptance_marker: metadata
+                .get(LAST_ACCEPTANCE_MARKER)?
+                .map_or(0, |value| value.value()),
+        })
+    }
+}
+
+impl ZeroizationStore {
+    /// Returns the immutable identity of the exact file handle owned by redb.
+    pub const fn backing_identity(&self) -> StoreBackingIdentity {
+        self.backing_identity
+    }
+
+    /// Returns the stable mission authority bound to this cleanup handle.
+    pub fn mission_authority(&self) -> NodeId {
+        self.status
+            .mission_authority
+            .expect("ZeroizationStore construction requires a mission binding")
+    }
+
+    /// Returns the current durable lifecycle phase.
+    pub const fn zeroization_state(&self) -> StoreZeroizationState {
+        self.status.state
+    }
+
+    /// Returns exact persisted nonsecret artifact targets after lockout begins.
+    pub const fn zeroization_intent(&self) -> Option<&ZeroizationIntent> {
+        self.status.intent.as_ref()
+    }
+
+    /// Returns whether mission-bundle destruction has a durable receipt.
+    pub const fn mission_destroyed(&self) -> bool {
+        self.status.state.mission_destroyed()
+    }
+
+    /// Returns whether carrier-identity destruction has a durable receipt.
+    pub const fn identity_destroyed(&self) -> bool {
+        self.status.state.identity_destroyed()
+    }
+
+    /// Returns a terminal-safe, fully audited snapshot of preserved namespaces.
+    pub fn inspect_preserved(&self) -> Result<StoreInspection, StoreError> {
+        inspect_readable(&self.database)
+    }
+
+    /// Proves exact-path backend writer exclusion while this cleanup handle is live.
+    pub fn require_process_exclusive_lock(&self) -> Result<ProcessExclusiveLockProof, StoreError> {
+        require_exact_writer_exclusion(&self.path, self.backing_identity)
+    }
+
+    /// Durably enters terminal cleanup-pending state, or validates an exact retry.
+    pub fn begin_zeroization(
+        &mut self,
+        intent: &ZeroizationIntent,
+    ) -> Result<BeginZeroizationOutcome, StoreError> {
+        let mut write = self.database.begin_write()?;
+        write.set_durability(Durability::Immediate)?;
+        let outcome = begin_zeroization_write(&write, self.mission_authority(), intent)?;
+        write.commit()?;
+        self.refresh()?;
+        Ok(outcome)
+    }
+
+    /// Durably acknowledges destruction and fsync of the original mission artifact.
+    pub fn mark_mission_destroyed(&mut self) -> Result<ArtifactDestructionOutcome, StoreError> {
+        self.mark_artifact_destroyed(ZeroizationArtifact::MissionBundle)
+    }
+
+    /// Durably acknowledges destruction and fsync of the original carrier identity.
+    pub fn mark_identity_destroyed(&mut self) -> Result<ArtifactDestructionOutcome, StoreError> {
+        self.mark_artifact_destroyed(ZeroizationArtifact::CarrierIdentity)
+    }
+
+    /// Durably finalizes cleanup after both artifact receipts exist.
+    pub fn finalize_zeroization(&mut self) -> Result<FinalizeZeroizationOutcome, StoreError> {
+        let mut write = self.database.begin_write()?;
+        write.set_durability(Durability::Immediate)?;
+        let outcome = finalize_zeroization_write(&write, self.mission_authority())?;
+        write.commit()?;
+        self.refresh()?;
+        Ok(outcome)
+    }
+
+    fn mark_artifact_destroyed(
+        &mut self,
+        artifact: ZeroizationArtifact,
+    ) -> Result<ArtifactDestructionOutcome, StoreError> {
+        let mut write = self.database.begin_write()?;
+        write.set_durability(Durability::Immediate)?;
+        let outcome = mark_artifact_destroyed_write(&write, self.mission_authority(), artifact)?;
+        write.commit()?;
+        self.refresh()?;
+        Ok(outcome)
+    }
+
+    fn refresh(&mut self) -> Result<(), StoreError> {
+        self.status = inspect_zeroization_readable(&self.database)?;
+        Ok(())
+    }
+}
+
+fn validate_control_record(record: &ControlRecord) -> Result<(), StoreError> {
+    if record.sequence == 0 {
+        return Err(StoreError::InvalidControl(
+            "control sequence must be nonzero",
+        ));
+    }
+    if (record.sequence == 1) != record.previous_control.is_none() {
+        return Err(StoreError::ControlFork);
+    }
+    match &record.effect {
+        StoredControlEffect::Revocation { generation, .. } if *generation == 0 => Err(
+            StoreError::InvalidControl("revocation generation must be nonzero"),
+        ),
+        StoredControlEffect::ScopeEpoch { epoch, .. } if *epoch == 0 => {
+            Err(StoreError::InvalidControl("scope epoch must be nonzero"))
+        }
+        StoredControlEffect::Revocation { .. } | StoredControlEffect::ScopeEpoch { .. } => Ok(()),
+    }
+}
+
+fn validate_control_reservation_claims(
+    reservation: &ControlReservation,
+    record: &ControlRecord,
+) -> Result<(), StoreError> {
+    if reservation.authority != record.authority
+        || reservation.signer != record.signer
+        || reservation.sequence != record.sequence
+        || reservation.previous_control != record.previous_control
+        || reservation.previous_sequence.checked_add(1) != Some(reservation.sequence)
+    {
+        return Err(StoreError::InvalidControl(
+            "sealed control does not match its durable reservation",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_control_publication_intent(
+    intent: Option<&ScopeRekeyPublicationIntent>,
+    reservation: Option<&ControlReservation>,
+    record: &ControlRecord,
+) -> Result<(), StoreError> {
+    match (&record.effect, reservation, intent) {
+        (StoredControlEffect::ScopeEpoch { .. }, Some(_), None) => {
+            return Err(StoreError::MissingControlPublicationIntent);
+        }
+        (StoredControlEffect::Revocation { .. }, _, Some(_))
+        | (StoredControlEffect::ScopeEpoch { .. }, None, Some(_)) => {
+            return Err(StoreError::InvalidControlPublicationIntent);
+        }
+        _ => {}
+    }
+    let Some(intent) = intent else {
+        return Ok(());
+    };
+    let StoredControlEffect::ScopeEpoch { scope, epoch } = &record.effect else {
+        return Err(StoreError::InvalidControlPublicationIntent);
+    };
+    if intent.authority != record.authority
+        || intent.signer != record.signer
+        || &intent.scope != scope
+        || intent.epoch != *epoch
+        || intent.registry_generation == 0
+        || intent.recipients.is_empty()
+    {
+        return Err(StoreError::InvalidControlPublicationIntent);
+    }
+    Ok(())
+}
+
+fn validate_control_reservation_head(
+    write: &redb::WriteTransaction,
+    reservation: &ControlReservation,
+) -> Result<(), StoreError> {
+    let current = read_control_head_write(write)?;
+    let expected = match current {
+        Some((sequence, transfer_id)) => (sequence, Some(transfer_id)),
+        None => (0, None),
+    };
+    if expected != (reservation.previous_sequence, reservation.previous_control) {
+        return Err(StoreError::ControlReservationChanged);
+    }
+    Ok(())
+}
+
+fn insert_control(
+    write: &redb::WriteTransaction,
+    prepared: &PreparedControl,
+    limits: StoreLimits,
+) -> Result<ControlInsert, StoreError> {
+    validate_control_record(&prepared.record)?;
+    let calculated = ControlTransferId::new(Sha256::digest(&prepared.sealed).into());
+    if calculated != prepared.record.transfer_id || prepared.sealed.is_empty() {
+        return Err(StoreError::InvalidControl(
+            "control exact bytes do not match their transfer identity",
+        ));
+    }
+
+    if let Some(existing) = load_control_write(write, prepared.record.transfer_id)? {
+        if existing.authority != prepared.record.authority
+            || existing.signer != prepared.record.signer
+            || existing.sequence != prepared.record.sequence
+            || existing.previous_control != prepared.record.previous_control
+            || existing.effect != prepared.record.effect
+            || existing.sealed != prepared.sealed
+        {
+            return Err(StoreError::ControlFork);
+        }
+        return Ok(ControlInsert::Duplicate);
+    }
+
+    let rejection = if control_principal_revoked_write(write, prepared.record.authority)? {
+        Some(ControlRejectionReason::AuthorityRevoked(
+            prepared.record.authority,
+        ))
+    } else if control_principal_revoked_write(write, prepared.record.signer)? {
+        Some(ControlRejectionReason::SignerRevoked(
+            prepared.record.signer,
+        ))
+    } else {
+        None
+    };
+    if let Some(reason) = rejection {
+        return Ok(ControlInsert::Rejected(RejectedControl {
+            transfer_id: prepared.record.transfer_id,
+            signer: prepared.record.signer,
+            reason,
+        }));
+    }
+
+    if let Some(occupied) = write
+        .open_table(CONTROL_SEQUENCE)?
+        .get(prepared.record.sequence)?
+        .map(|value| parse_control_transfer_id("mission control sequence table", value.value()))
+        .transpose()?
+    {
+        if occupied != prepared.record.transfer_id {
+            return Err(StoreError::ControlFork);
+        }
+        return Err(StoreError::ControlInvariant(
+            "control sequence index exists without its control record",
+        ));
+    }
+
+    if write
+        .open_table(EVENTS)?
+        .get(prepared.record.transfer_id.as_bytes().as_slice())?
+        .is_some()
+        || write
+            .open_table(ROUTE_CACHE)?
+            .get(prepared.record.transfer_id.as_bytes().as_slice())?
+            .is_some()
+    {
+        return Err(StoreError::TransferNamespaceCollision {
+            transfer_id: *prepared.record.transfer_id.as_bytes(),
+        });
+    }
+
+    let incoming = u64::try_from(prepared.sealed.len())
+        .map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
+    {
+        let mut metadata = write.open_table(METADATA)?;
+        let controls = metadata
+            .get(CONTROL_ITEM_COUNT)?
+            .map_or(0, |value| value.value());
+        let next_controls = controls
+            .checked_add(1)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        if next_controls > MAX_CONTROL_ITEMS {
+            return Err(StoreError::ControlItemLimitExceeded {
+                current: controls,
+                limit: MAX_CONTROL_ITEMS,
+            });
+        }
+        let control_bytes = metadata
+            .get(CONTROL_TOTAL_BYTES)?
+            .map_or(0, |value| value.value());
+        let next_control_bytes = control_bytes
+            .checked_add(incoming)
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        let control_intent_bytes = metadata
+            .get(CONTROL_PUBLICATION_INTENT_TOTAL_BYTES)?
+            .map_or(0, |value| value.value());
+        let next_retained_control_bytes = next_control_bytes
+            .checked_add(control_intent_bytes)
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        if next_retained_control_bytes > MAX_CONTROL_BYTES {
+            return Err(StoreError::ControlByteLimitExceeded {
+                current: control_bytes.saturating_add(control_intent_bytes),
+                incoming,
+                limit: MAX_CONTROL_BYTES,
+            });
+        }
+
+        let opaque_items = metadata.get(ITEM_COUNT)?.map_or(0, |value| value.value());
+        let event_items = metadata
+            .get(SEMANTIC_ITEM_COUNT)?
+            .map_or(0, |value| value.value());
+        let cache_items = metadata
+            .get(ROUTE_CACHE_ITEM_COUNT)?
+            .map_or(0, |value| value.value());
+        let aggregate_items = opaque_items
+            .checked_add(event_items)
+            .and_then(|value| value.checked_add(cache_items))
+            .and_then(|value| value.checked_add(next_controls))
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        if aggregate_items > limits.max_items {
+            return Err(StoreError::ItemLimitExceeded {
+                current: aggregate_items.saturating_sub(1),
+                limit: limits.max_items,
+            });
+        }
+
+        let opaque_bytes = metadata
+            .get(TOTAL_PAYLOAD_BYTES)?
+            .map_or(0, |value| value.value());
+        let event_bytes = metadata
+            .get(SEMANTIC_TOTAL_BYTES)?
+            .map_or(0, |value| value.value());
+        let cache_bytes = metadata
+            .get(ROUTE_CACHE_TOTAL_BYTES)?
+            .map_or(0, |value| value.value());
+        let aggregate_bytes = opaque_bytes
+            .checked_add(event_bytes)
+            .and_then(|value| value.checked_add(cache_bytes))
+            .and_then(|value| value.checked_add(next_retained_control_bytes))
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        if aggregate_bytes > limits.max_total_payload_bytes {
+            return Err(StoreError::PayloadByteLimitExceeded {
+                current: aggregate_bytes.saturating_sub(incoming),
+                incoming,
+                limit: limits.max_total_payload_bytes,
+            });
+        }
+        metadata.insert(CONTROL_ITEM_COUNT, next_controls)?;
+        metadata.insert(CONTROL_TOTAL_BYTES, next_control_bytes)?;
+    }
+
+    write.open_table(CONTROL_BYTES)?.insert(
+        prepared.record.transfer_id.as_bytes().as_slice(),
+        prepared.sealed.as_slice(),
+    )?;
+    write.open_table(CONTROL_RECORDS)?.insert(
+        prepared.record.transfer_id.as_bytes().as_slice(),
+        prepared.encoded.as_slice(),
+    )?;
+    write.open_table(CONTROL_SEQUENCE)?.insert(
+        prepared.record.sequence,
+        prepared.record.transfer_id.as_bytes().as_slice(),
+    )?;
+    write.open_table(CONTROL_PENDING)?.insert(
+        prepared.record.sequence,
+        prepared.record.transfer_id.as_bytes().as_slice(),
+    )?;
+    Ok(ControlInsert::Inserted)
+}
+
+fn admit_control_publication_intent(
+    write: &redb::WriteTransaction,
+    encoded_len: usize,
+    limits: StoreLimits,
+) -> Result<(), StoreError> {
+    let incoming =
+        u64::try_from(encoded_len).map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
+    let mut metadata = write.open_table(METADATA)?;
+    let sealed_bytes = metadata
+        .get(CONTROL_TOTAL_BYTES)?
+        .map_or(0, |value| value.value());
+    let intent_bytes = metadata
+        .get(CONTROL_PUBLICATION_INTENT_TOTAL_BYTES)?
+        .map_or(0, |value| value.value());
+    let current_control_bytes = sealed_bytes
+        .checked_add(intent_bytes)
+        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    let next_intent_bytes = intent_bytes
+        .checked_add(incoming)
+        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    let next_control_bytes = sealed_bytes
+        .checked_add(next_intent_bytes)
+        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    if next_control_bytes > MAX_CONTROL_BYTES {
+        return Err(StoreError::ControlByteLimitExceeded {
+            current: current_control_bytes,
+            incoming,
+            limit: MAX_CONTROL_BYTES,
+        });
+    }
+    let opaque_bytes = metadata
+        .get(TOTAL_PAYLOAD_BYTES)?
+        .map_or(0, |value| value.value());
+    let event_bytes = metadata
+        .get(SEMANTIC_TOTAL_BYTES)?
+        .map_or(0, |value| value.value());
+    let cache_bytes = metadata
+        .get(ROUTE_CACHE_TOTAL_BYTES)?
+        .map_or(0, |value| value.value());
+    let aggregate_bytes = opaque_bytes
+        .checked_add(event_bytes)
+        .and_then(|value| value.checked_add(cache_bytes))
+        .and_then(|value| value.checked_add(next_control_bytes))
+        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    if aggregate_bytes > limits.max_total_payload_bytes {
+        return Err(StoreError::PayloadByteLimitExceeded {
+            current: aggregate_bytes.saturating_sub(incoming),
+            incoming,
+            limit: limits.max_total_payload_bytes,
+        });
+    }
+    metadata.insert(CONTROL_PUBLICATION_INTENT_TOTAL_BYTES, next_intent_bytes)?;
+    Ok(())
+}
+
+fn validate_control_effect_order(
+    write: &redb::WriteTransaction,
+    record: &ControlRecord,
+) -> Result<(), StoreError> {
+    match &record.effect {
+        StoredControlEffect::Revocation {
+            subject,
+            generation,
+        } => {
+            if let Some((authority, prior_generation, _)) = write
+                .open_table(CONTROL_REVOCATIONS)?
+                .get(subject.as_slice())?
+                .map(|value| decode_revocation_index(value.value()))
+                .transpose()?
+            {
+                if authority != record.authority {
+                    return Err(StoreError::ControlFork);
+                }
+                if prior_generation >= *generation {
+                    return Err(StoreError::ControlRollback);
+                }
+            }
+        }
+        StoredControlEffect::ScopeEpoch { scope, epoch } => {
+            if let Some((prior_epoch, _)) = write
+                .open_table(CONTROL_SCOPE_EPOCHS)?
+                .get(scope.as_str())?
+                .map(|value| decode_scope_epoch_index(value.value()))
+                .transpose()?
+                && prior_epoch >= *epoch
+            {
+                return Err(StoreError::ControlRollback);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn apply_control_effect(
+    write: &redb::WriteTransaction,
+    record: &ControlRecord,
+) -> Result<Option<NodeId>, StoreError> {
+    match &record.effect {
+        StoredControlEffect::Revocation {
+            subject,
+            generation,
+        } => {
+            let encoded =
+                encode_revocation_index(record.authority, *generation, record.transfer_id);
+            write
+                .open_table(CONTROL_REVOCATIONS)?
+                .insert(subject.as_slice(), encoded.as_slice())?;
+            Ok(Some(*subject))
+        }
+        StoredControlEffect::ScopeEpoch { scope, epoch } => {
+            let encoded = encode_scope_epoch_index(*epoch, record.transfer_id);
+            write
+                .open_table(CONTROL_SCOPE_EPOCHS)?
+                .insert(scope.as_str(), encoded.as_slice())?;
+            Ok(None)
+        }
+    }
+}
+
+fn activate_control_chain(
+    write: &redb::WriteTransaction,
+    authority: NodeId,
+) -> Result<ControlActivation, StoreError> {
+    let (mut sequence, mut previous) = read_control_head_write(write)?
+        .map_or((0, None), |(sequence, transfer_id)| {
+            (sequence, Some(transfer_id))
+        });
+    let mut result = ControlActivation::default();
+    while let Some(next_sequence) = sequence.checked_add(1) {
+        let next_id = {
+            let pending = write.open_table(CONTROL_PENDING)?;
+            let value = pending
+                .get(next_sequence)?
+                .map(|value| value.value().to_vec());
+            value
+                .map(|value| parse_control_transfer_id("pending mission control table", &value))
+                .transpose()?
+        };
+        let Some(next_id) = next_id else { break };
+        let mut next = load_control_write(write, next_id)?.ok_or(StoreError::ControlInvariant(
+            "pending index points to a missing control",
+        ))?;
+        if next.authority != authority
+            || next.sequence != next_sequence
+            || next.previous_control != previous
+        {
+            return Err(StoreError::ControlFork);
+        }
+        let rejection = if control_principal_revoked_write(write, authority)? {
+            Some(ControlRejectionReason::AuthorityRevoked(authority))
+        } else if control_principal_revoked_write(write, next.signer)? {
+            Some(ControlRejectionReason::SignerRevoked(next.signer))
+        } else {
+            None
+        };
+        if let Some(reason) = rejection {
+            result
+                .rejected
+                .extend(purge_pending_control_suffix(write, next_sequence, reason)?);
+            break;
+        }
+
+        let record = ControlRecord {
+            transfer_id: next.transfer_id,
+            authority: next.authority,
+            signer: next.signer,
+            sequence: next.sequence,
+            previous_control: next.previous_control,
+            effect: next.effect.clone(),
+        };
+        validate_control_effect_order(write, &record)?;
+        let revoked = apply_control_effect(write, &record)?;
+        {
+            write.open_table(CONTROL_PENDING)?.remove(next_sequence)?;
+        }
+        write
+            .open_table(CONTROL_APPLIED)?
+            .insert(next_sequence, next_id.as_bytes().as_slice())?;
+        let encoded_head = encode_control_head(next_sequence, next_id);
+        write
+            .open_table(CONTROL_HEAD)?
+            .insert(CONTROL_HEAD_KEY, encoded_head.as_slice())?;
+        next.applied = true;
+        sequence = next_sequence;
+        previous = Some(next_id);
+        result.activated.push(next);
+
+        if let Some(principal) = revoked {
+            result
+                .rejected
+                .extend(purge_revoked_control_suffixes(write, principal)?);
+        }
+    }
+    Ok(result)
+}
+
+fn purge_revoked_control_suffixes(
+    write: &redb::WriteTransaction,
+    principal: NodeId,
+) -> Result<Vec<RejectedControl>, StoreError> {
+    let mut first = None;
+    let candidates = {
+        let pending = write.open_table(CONTROL_PENDING)?;
+        let mut candidates = Vec::new();
+        for row in pending.iter()? {
+            let (sequence, value) = row?;
+            let transfer_id =
+                parse_control_transfer_id("pending mission control table", value.value())?;
+            candidates.push((sequence.value(), transfer_id));
+        }
+        candidates
+    };
+    for (sequence, transfer_id) in candidates {
+        let record = load_control_write(write, transfer_id)?.ok_or(
+            StoreError::ControlInvariant("pending index points to a missing control"),
+        )?;
+        if record.authority == principal || record.signer == principal {
+            let reason = if record.authority == principal {
+                ControlRejectionReason::AuthorityRevoked(principal)
+            } else {
+                ControlRejectionReason::SignerRevoked(principal)
+            };
+            first = Some((sequence, reason));
+            break;
+        }
+    }
+    match first {
+        Some((first, reason)) => purge_pending_control_suffix(write, first, reason),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn purge_pending_control_suffix(
+    write: &redb::WriteTransaction,
+    first_sequence: u64,
+    first_reason: ControlRejectionReason,
+) -> Result<Vec<RejectedControl>, StoreError> {
+    let mut removals = Vec::<(u64, StoredControl)>::new();
+    let candidates = {
+        let pending = write.open_table(CONTROL_PENDING)?;
+        let mut candidates = Vec::new();
+        for row in pending.iter()? {
+            let (sequence, value) = row?;
+            if sequence.value() < first_sequence {
+                continue;
+            }
+            let transfer_id =
+                parse_control_transfer_id("pending mission control table", value.value())?;
+            candidates.push((sequence.value(), transfer_id));
+        }
+        candidates
+    };
+    for (sequence, transfer_id) in candidates {
+        let control = load_control_write(write, transfer_id)?.ok_or(
+            StoreError::ControlInvariant("pending index points to a missing control"),
+        )?;
+        if control.applied {
+            return Err(StoreError::ControlInvariant(
+                "pending suffix contains an applied control",
+            ));
+        }
+        removals.push((sequence, control));
+    }
+    if removals.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let removed_items =
+        u64::try_from(removals.len()).map_err(|_| StoreError::ItemCountAccountingOverflow)?;
+    let removed_bytes = removals.iter().try_fold(0u64, |total, (_, control)| {
+        let length = u64::try_from(control.sealed.len())
+            .map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
+        total
+            .checked_add(length)
+            .ok_or(StoreError::PayloadByteAccountingOverflow)
+    })?;
+    {
+        let mut records = write.open_table(CONTROL_RECORDS)?;
+        let mut bytes = write.open_table(CONTROL_BYTES)?;
+        let mut sequence_index = write.open_table(CONTROL_SEQUENCE)?;
+        let mut pending = write.open_table(CONTROL_PENDING)?;
+        let mut reservations = write.open_table(CONTROL_RESERVATIONS)?;
+        let publication_intents = write.open_table(CONTROL_PUBLICATION_INTENTS)?;
+        for (sequence, control) in &removals {
+            if publication_intents
+                .get(control.transfer_id.as_bytes().as_slice())?
+                .is_some()
+            {
+                return Err(StoreError::ControlInvariant(
+                    "pending control unexpectedly has a local publication intent",
+                ));
+            }
+            records.remove(control.transfer_id.as_bytes().as_slice())?;
+            bytes.remove(control.transfer_id.as_bytes().as_slice())?;
+            sequence_index.remove(*sequence)?;
+            pending.remove(*sequence)?;
+            reservations.remove(control.transfer_id.as_bytes().as_slice())?;
+        }
+    }
+    {
+        let mut metadata = write.open_table(METADATA)?;
+        let items = metadata
+            .get(CONTROL_ITEM_COUNT)?
+            .map_or(0, |value| value.value())
+            .checked_sub(removed_items)
+            .ok_or(StoreError::ControlInvariant(
+                "control item counter underflow while rejecting pending suffix",
+            ))?;
+        let bytes = metadata
+            .get(CONTROL_TOTAL_BYTES)?
+            .map_or(0, |value| value.value())
+            .checked_sub(removed_bytes)
+            .ok_or(StoreError::ControlInvariant(
+                "control byte counter underflow while rejecting pending suffix",
+            ))?;
+        metadata.insert(CONTROL_ITEM_COUNT, items)?;
+        metadata.insert(CONTROL_TOTAL_BYTES, bytes)?;
+    }
+    removals
+        .into_iter()
+        .enumerate()
+        .map(|(index, (_, control))| {
+            let reason = if index == 0 {
+                first_reason
+            } else {
+                ControlRejectionReason::InvalidatedPredecessor(control.previous_control.ok_or(
+                    StoreError::ControlInvariant("rejected control suffix lost its predecessor"),
+                )?)
+            };
+            Ok(RejectedControl {
+                transfer_id: control.transfer_id,
+                signer: control.signer,
+                reason,
+            })
+        })
+        .collect()
+}
+
+fn control_outcome(
+    transfer_id: ControlTransferId,
+    inserted: ControlInsert,
+    mut activation: ControlActivation,
+) -> ControlOutcome {
+    if let ControlInsert::Rejected(rejected) = inserted
+        && !activation.rejected.contains(&rejected)
+    {
+        activation.rejected.push(rejected);
+    }
+    if !activation.activated.is_empty() {
+        return ControlOutcome::Applied {
+            transfer_id,
+            activated: activation.activated,
+            rejected: activation.rejected,
+        };
+    }
+    if let ControlInsert::Rejected(rejected) = inserted {
+        return ControlOutcome::Rejected {
+            transfer_id: rejected.transfer_id,
+            signer: rejected.signer,
+            reason: rejected.reason,
+            rejected: activation.rejected,
+        };
+    }
+    if let Some(rejected) = activation
+        .rejected
+        .iter()
+        .find(|rejected| rejected.transfer_id == transfer_id)
+        .copied()
+    {
+        return ControlOutcome::Rejected {
+            transfer_id: rejected.transfer_id,
+            signer: rejected.signer,
+            reason: rejected.reason,
+            rejected: activation.rejected,
+        };
+    }
+    match inserted {
+        ControlInsert::Inserted => ControlOutcome::Pending { transfer_id },
+        ControlInsert::Duplicate => ControlOutcome::Duplicate { transfer_id },
+        ControlInsert::Rejected(_) => unreachable!("rejected insert handled above"),
+    }
+}
+
+fn validate_reservation(
+    reservation: &EventReservation,
+    prepared: &PreparedEvent,
+) -> Result<(), StoreError> {
+    let header = &prepared.header;
+    if header.stamp.dot.publisher != reservation.publisher
+        || header.stamp.dot.counter != reservation.counter
+        || header.topic != reservation.topic
+        || header.scope != reservation.scope
+        || header.event_sequence != Some(reservation.event_sequence)
+        || header.stamp.context != reservation.context
+    {
+        return Err(StoreError::InvalidSemanticEvent(
+            "sealed Event does not match its durable reservation",
+        ));
+    }
+    Ok(())
+}
+
+fn purge_route_cache_semantic_claim(
+    write: &redb::WriteTransaction,
+    accepted_transfer_id: EventTransferId,
+    semantic_id: EventSemanticId,
+    accepted_header: &EnvelopeHeader,
+    accepted_sealed: &[u8],
+) -> Result<(), StoreError> {
+    let mut removals = Vec::<(EventTransferId, u64)>::new();
+    {
+        let cache = write.open_table(ROUTE_CACHE)?;
+        let claims = write.open_table(ROUTE_CACHE_CLAIMS)?;
+        for row in claims.iter()? {
+            let (key, value) = row?;
+            let transfer_id = parse_transfer_id("route Event claim table", key.value())?;
+            let metadata = decode_event_metadata(value.value())?;
+            if metadata.transfer_id != transfer_id {
+                return Err(StoreError::SemanticInvariant(
+                    "route-cache claim differs from its transfer key",
+                ));
+            }
+            if metadata.semantic_id != semantic_id {
+                continue;
+            }
+            let cached = cache
+                .get(key.value())?
+                .ok_or(StoreError::SemanticInvariant(
+                    "route-cache claim is missing exact source bytes",
+                ))?;
+            if EventTransferId::new(Sha256::digest(cached.value()).into()) != transfer_id {
+                return Err(StoreError::SemanticInvariant(
+                    "route-cache bytes fail exact transfer identity audit",
+                ));
+            }
+            if transfer_id == accepted_transfer_id
+                && (cached.value() != accepted_sealed || metadata.header != *accepted_header)
+            {
+                return Err(StoreError::SemanticInvariant(
+                    "content-verified Event differs from its route-cache representation",
+                ));
+            }
+            removals.push((
+                transfer_id,
+                u64::try_from(cached.value().len())
+                    .map_err(|_| StoreError::PayloadByteAccountingOverflow)?,
+            ));
+        }
+    }
+    if removals.is_empty() {
+        return Ok(());
+    }
+    let removed_items =
+        u64::try_from(removals.len()).map_err(|_| StoreError::ItemCountAccountingOverflow)?;
+    let removed_bytes = removals.iter().try_fold(0u64, |total, (_, length)| {
+        total
+            .checked_add(*length)
+            .ok_or(StoreError::PayloadByteAccountingOverflow)
+    })?;
+    {
+        let mut cache = write.open_table(ROUTE_CACHE)?;
+        let mut claims = write.open_table(ROUTE_CACHE_CLAIMS)?;
+        for (transfer_id, _) in &removals {
+            cache.remove(transfer_id.as_bytes().as_slice())?;
+            claims.remove(transfer_id.as_bytes().as_slice())?;
+        }
+    }
+    let mut counters = write.open_table(METADATA)?;
+    let current_items = counters
+        .get(ROUTE_CACHE_ITEM_COUNT)?
+        .map_or(0, |value| value.value());
+    let current_bytes = counters
+        .get(ROUTE_CACHE_TOTAL_BYTES)?
+        .map_or(0, |value| value.value());
+    let next_items =
+        current_items
+            .checked_sub(removed_items)
+            .ok_or(StoreError::SemanticInvariant(
+                "route-cache item counter underflow",
+            ))?;
+    let next_bytes =
+        current_bytes
+            .checked_sub(removed_bytes)
+            .ok_or(StoreError::SemanticInvariant(
+                "route-cache byte counter underflow",
+            ))?;
+    counters.insert(ROUTE_CACHE_ITEM_COUNT, next_items)?;
+    counters.insert(ROUTE_CACHE_TOTAL_BYTES, next_bytes)?;
+    Ok(())
+}
+
+fn update_high_water(
+    write: &redb::WriteTransaction,
+    publisher: NodeId,
+    topic: &Topic,
+    scope: &Scope,
+    counter: u64,
+    sequence: u64,
+) -> Result<(), StoreError> {
+    {
+        let mut publishers = write.open_table(PUBLISHER_HIGH_WATER)?;
+        let current = publishers
+            .get(publisher.as_slice())?
+            .map_or(0, |value| value.value());
+        if counter > current {
+            publishers.insert(publisher.as_slice(), counter)?;
+        }
+    }
+    let stream = event_stream_key(publisher, topic, scope)?;
+    {
+        let mut events = write.open_table(EVENT_HIGH_WATER)?;
+        let current = events
+            .get(stream.as_slice())?
+            .map_or(0, |value| value.value());
+        if sequence > current {
+            events.insert(stream.as_slice(), sequence)?;
+        }
+    }
+    let frontier_key = causal_frontier_key(topic, scope, publisher)?;
+    {
+        let mut frontier = write.open_table(CAUSAL_FRONTIER)?;
+        let current = frontier
+            .get(frontier_key.as_slice())?
+            .map_or(0, |value| value.value());
+        if counter > current {
+            frontier.insert(frontier_key.as_slice(), counter)?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_frontier_capacity(
+    write: &redb::WriteTransaction,
+    topic: &Topic,
+    scope: &Scope,
+    incoming_publisher: NodeId,
+) -> Result<(), StoreError> {
+    let prefix = event_domain_prefix(topic, scope)?;
+    let frontier = write.open_table(CAUSAL_FRONTIER)?;
+    let mut direct_publishers = 0usize;
+    let mut incoming_present = false;
+    for row in frontier.iter()? {
+        let (key, value) = row?;
+        let key = key.value();
+        if !key.starts_with(&prefix) {
+            continue;
+        }
+        if key.len() != prefix.len() + 32 || value.value() == 0 {
+            return Err(StoreError::SemanticInvariant(
+                "causal frontier contains an invalid row",
+            ));
+        }
+        direct_publishers = direct_publishers
+            .checked_add(1)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        if key[prefix.len()..] == incoming_publisher {
+            incoming_present = true;
+        }
+    }
+    if direct_publishers > MAX_CAUSAL_CONTEXT_ENTRIES {
+        return Err(StoreError::SemanticInvariant(
+            "causal frontier exceeds the proven context bound",
+        ));
+    }
+    if !incoming_present && direct_publishers == MAX_CAUSAL_CONTEXT_ENTRIES {
+        return Err(StoreError::InvalidSemanticEvent(
+            "causal frontier publisher limit reached",
+        ));
+    }
+    Ok(())
+}
+
+fn load_event_from_write(
+    write: &redb::WriteTransaction,
+    transfer_id: EventTransferId,
+) -> Result<Option<StoredEvent>, StoreError> {
+    let encoded = write
+        .open_table(EVENTS)?
+        .get(transfer_id.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec());
+    let Some(encoded) = encoded else {
+        return Ok(None);
+    };
+    let sealed = write
+        .open_table(EVENT_BYTES)?
+        .get(transfer_id.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec())
+        .ok_or(StoreError::SemanticInvariant(
+            "Event metadata is missing exact source bytes",
+        ))?;
+    let marker = write
+        .open_table(EVENT_ACCEPTANCE_MARKERS)?
+        .get(transfer_id.as_bytes().as_slice())?
+        .map(|value| value.value())
+        .ok_or(StoreError::SemanticInvariant(
+            "Event metadata is missing its acceptance marker",
+        ))?;
+    decode_stored_event(transfer_id, &encoded, sealed, marker).map(Some)
+}
+
+fn decode_stored_event(
+    transfer_id: EventTransferId,
+    encoded: &[u8],
+    sealed: Vec<u8>,
+    acceptance_marker: u64,
+) -> Result<StoredEvent, StoreError> {
+    let metadata = decode_event_metadata(encoded)?;
+    if metadata.transfer_id != transfer_id {
+        return Err(StoreError::SemanticInvariant(
+            "Event metadata transfer identity differs from its table key",
+        ));
+    }
+    let calculated = EventTransferId::new(Sha256::digest(&sealed).into());
+    if calculated != transfer_id {
+        return Err(StoreError::SemanticInvariant(
+            "exact source bytes differ from their Event transfer identity",
+        ));
+    }
+    Ok(StoredEvent {
+        transfer_id,
+        semantic_id: metadata.semantic_id,
+        header: metadata.header,
+        sealed,
+        acceptance_marker,
+    })
+}
+
+fn load_event_from_read(
+    read: &redb::ReadTransaction,
+    transfer_id: EventTransferId,
+) -> Result<Option<StoredEvent>, StoreError> {
+    let encoded = read
+        .open_table(EVENTS)?
+        .get(transfer_id.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec());
+    let Some(encoded) = encoded else {
+        return Ok(None);
+    };
+    let sealed = read
+        .open_table(EVENT_BYTES)?
+        .get(transfer_id.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec())
+        .ok_or(StoreError::SemanticInvariant(
+            "Event metadata is missing exact source bytes",
+        ))?;
+    let marker = read
+        .open_table(EVENT_ACCEPTANCE_MARKERS)?
+        .get(transfer_id.as_bytes().as_slice())?
+        .map(|value| value.value())
+        .ok_or(StoreError::SemanticInvariant(
+            "Event metadata is missing its acceptance marker",
+        ))?;
+    decode_stored_event(transfer_id, &encoded, sealed, marker).map(Some)
+}
+
+fn load_route_cached_event_read(
+    read: &redb::ReadTransaction,
+    transfer_id: EventTransferId,
+) -> Result<Option<RouteCachedEvent>, StoreError> {
+    let sealed = read
+        .open_table(ROUTE_CACHE)?
+        .get(transfer_id.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec());
+    let encoded = read
+        .open_table(ROUTE_CACHE_CLAIMS)?
+        .get(transfer_id.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec());
+    match (sealed, encoded) {
+        (None, None) => Ok(None),
+        (Some(sealed), Some(encoded)) => {
+            let metadata = decode_event_metadata(&encoded)?;
+            if metadata.transfer_id != transfer_id
+                || EventTransferId::new(Sha256::digest(&sealed).into()) != transfer_id
+            {
+                return Err(StoreError::SemanticInvariant(
+                    "route-cache representation fails exact identity audit",
+                ));
+            }
+            Ok(Some(RouteCachedEvent {
+                transfer_id,
+                semantic_claim: metadata.semantic_id,
+                header_claim: metadata.header,
+                sealed,
+            }))
+        }
+        _ => Err(StoreError::SemanticInvariant(
+            "route-cache bytes and claim are not atomically paired",
+        )),
+    }
+}
+
+fn load_transfer_read(
+    read: &redb::ReadTransaction,
+    transfer_id: EventTransferId,
+) -> Result<Option<StoredEventTransfer>, StoreError> {
+    if let Some(event) = load_event_from_read(read, transfer_id)? {
+        return Ok(Some(StoredEventTransfer::Accepted(event)));
+    }
+    Ok(load_route_cached_event_read(read, transfer_id)?.map(StoredEventTransfer::RouteCached))
+}
+
+fn transfer_inventory_read(read: &redb::ReadTransaction) -> Result<EventInventory, StoreError> {
+    let events = read.open_table(EVENTS)?;
+    let event_bytes = read.open_table(EVENT_BYTES)?;
+    let event_markers = read.open_table(EVENT_ACCEPTANCE_MARKERS)?;
+    let route_cache = read.open_table(ROUTE_CACHE)?;
+    let route_claims = read.open_table(ROUTE_CACHE_CLAIMS)?;
+    let mut ids = std::collections::BTreeSet::new();
+    for row in events.iter()? {
+        let (key, _) = row?;
+        let transfer_id = parse_transfer_id("Event metadata table", key.value())?;
+        if event_bytes.get(key.value())?.is_none() || event_markers.get(key.value())?.is_none() {
+            return Err(StoreError::SemanticInvariant(
+                "Event inventory row is not atomically paired",
+            ));
+        }
+        ids.insert(transfer_id);
+    }
+    for row in event_bytes.iter()? {
+        let (key, _) = row?;
+        if events.get(key.value())?.is_none() || event_markers.get(key.value())?.is_none() {
+            return Err(StoreError::SemanticInvariant(
+                "Event exact bytes are not atomically paired",
+            ));
+        }
+    }
+    for row in event_markers.iter()? {
+        let (key, _) = row?;
+        if events.get(key.value())?.is_none() || event_bytes.get(key.value())?.is_none() {
+            return Err(StoreError::SemanticInvariant(
+                "Event acceptance marker is not atomically paired",
+            ));
+        }
+    }
+    for row in route_cache.iter()? {
+        let (key, _) = row?;
+        if route_claims.get(key.value())?.is_none() {
+            return Err(StoreError::SemanticInvariant(
+                "route-cache bytes are missing their route claim",
+            ));
+        }
+        let transfer_id = parse_transfer_id("route Event cache", key.value())?;
+        if !ids.insert(transfer_id) {
+            return Err(StoreError::SemanticInvariant(
+                "one transfer identity exists in semantic and route-cache namespaces",
+            ));
+        }
+    }
+    for row in route_claims.iter()? {
+        let (key, _) = row?;
+        if route_cache.get(key.value())?.is_none() {
+            return Err(StoreError::SemanticInvariant(
+                "route-cache claim is missing exact source bytes",
+            ));
+        }
+    }
+    Ok(EventInventory(ids.into_iter().collect()))
+}
+
+fn events_after_read(
+    read: &redb::ReadTransaction,
+    after_acceptance_marker: u64,
+    limit: usize,
+) -> Result<Vec<StoredEvent>, StoreError> {
+    let events = read.open_table(EVENTS)?;
+    let event_bytes = read.open_table(EVENT_BYTES)?;
+    let markers = read.open_table(EVENT_ACCEPTANCE_MARKERS)?;
+    let mut page = Vec::new();
+    for row in events.iter()? {
+        let (key, value) = row?;
+        let transfer_id = parse_transfer_id("Event metadata table", key.value())?;
+        let marker = markers.get(key.value())?.map(|value| value.value()).ok_or(
+            StoreError::SemanticInvariant("Event page row is missing its acceptance marker"),
+        )?;
+        if marker <= after_acceptance_marker {
+            continue;
+        }
+        let sealed = event_bytes
+            .get(key.value())?
+            .map(|value| value.value().to_vec())
+            .ok_or(StoreError::SemanticInvariant(
+                "Event page row is missing exact source bytes",
+            ))?;
+        page.push(decode_stored_event(
+            transfer_id,
+            value.value(),
+            sealed,
+            marker,
+        )?);
+    }
+    page.sort_by_key(|event| (event.acceptance_marker, event.transfer_id));
+    page.truncate(limit);
+    Ok(page)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ZeroizationRecord {
+    state: StoreZeroizationState,
+    authority: NodeId,
+    intent: ZeroizationIntent,
+}
+
+fn validate_zeroization_descriptor(
+    artifact: ZeroizationArtifact,
+    descriptor: &[u8],
+) -> Result<(), StoreError> {
+    if descriptor.is_empty() || descriptor.len() > MAX_ZEROIZATION_DESCRIPTOR_BYTES {
+        return Err(StoreError::InvalidZeroizationDescriptor {
+            artifact,
+            length: descriptor.len(),
+        });
+    }
+    Ok(())
+}
+
+fn zeroization_phase_and_flags(state: StoreZeroizationState) -> Result<(u8, u8), StoreError> {
+    match state {
+        StoreZeroizationState::Live => Err(StoreError::ZeroizationInvariant(
+            "live state must be represented by an absent terminal table",
+        )),
+        StoreZeroizationState::CleanupPending => Ok((1, 0)),
+        StoreZeroizationState::MissionDestroyed => Ok((2, 1)),
+        StoreZeroizationState::IdentityDestroyed => Ok((3, 3)),
+        StoreZeroizationState::Complete => Ok((4, 3)),
+    }
+}
+
+fn encode_zeroization_record(record: &ZeroizationRecord) -> Result<Vec<u8>, StoreError> {
+    let (phase, flags) = zeroization_phase_and_flags(record.state)?;
+    let mission = record.intent.descriptor(ZeroizationArtifact::MissionBundle);
+    let identity = record
+        .intent
+        .descriptor(ZeroizationArtifact::CarrierIdentity);
+    validate_zeroization_descriptor(ZeroizationArtifact::MissionBundle, mission)?;
+    validate_zeroization_descriptor(ZeroizationArtifact::CarrierIdentity, identity)?;
+    let mission_len =
+        u32::try_from(mission.len()).map_err(|_| StoreError::InvalidZeroizationDescriptor {
+            artifact: ZeroizationArtifact::MissionBundle,
+            length: mission.len(),
+        })?;
+    let identity_len =
+        u32::try_from(identity.len()).map_err(|_| StoreError::InvalidZeroizationDescriptor {
+            artifact: ZeroizationArtifact::CarrierIdentity,
+            length: identity.len(),
+        })?;
+    let mut encoded = Vec::with_capacity(
+        ZEROIZATION_HEADER_BYTES + mission.len() + identity.len() + ZEROIZATION_DIGEST_BYTES,
+    );
+    encoded.extend_from_slice(ZEROIZATION_MAGIC);
+    encoded.push(phase);
+    encoded.push(flags);
+    encoded.extend_from_slice(record.authority.as_slice());
+    encoded.extend_from_slice(&mission_len.to_be_bytes());
+    encoded.extend_from_slice(&identity_len.to_be_bytes());
+    encoded.extend_from_slice(mission);
+    encoded.extend_from_slice(identity);
+    let digest: [u8; ZEROIZATION_DIGEST_BYTES] = Sha256::digest(&encoded).into();
+    encoded.extend_from_slice(&digest);
+    Ok(encoded)
+}
+
+fn decode_zeroization_record(encoded: &[u8]) -> Result<ZeroizationRecord, StoreError> {
+    if encoded.len() > MAX_ZEROIZATION_RECORD_BYTES {
+        return Err(StoreError::ZeroizationInvariant(
+            "terminal record exceeds maximum encoded length",
+        ));
+    }
+    if encoded.len() < ZEROIZATION_HEADER_BYTES + ZEROIZATION_DIGEST_BYTES {
+        return Err(StoreError::ZeroizationInvariant(
+            "terminal record is shorter than its fixed header and digest",
+        ));
+    }
+    let digest_offset = encoded.len() - ZEROIZATION_DIGEST_BYTES;
+    let expected: [u8; ZEROIZATION_DIGEST_BYTES] = Sha256::digest(&encoded[..digest_offset]).into();
+    if encoded[digest_offset..] != expected {
+        return Err(StoreError::ZeroizationInvariant(
+            "terminal record digest does not match its encoded state",
+        ));
+    }
+    if &encoded[..ZEROIZATION_MAGIC.len()] != ZEROIZATION_MAGIC {
+        return Err(StoreError::ZeroizationInvariant(
+            "terminal record magic or schema version is invalid",
+        ));
+    }
+    let phase = encoded[8];
+    let flags = encoded[9];
+    let state = match (phase, flags) {
+        (1, 0) => StoreZeroizationState::CleanupPending,
+        (2, 1) => StoreZeroizationState::MissionDestroyed,
+        (3, 3) => StoreZeroizationState::IdentityDestroyed,
+        (4, 3) => StoreZeroizationState::Complete,
+        _ => {
+            return Err(StoreError::ZeroizationInvariant(
+                "terminal phase and artifact receipts disagree",
+            ));
+        }
+    };
+    let authority = parse_node_id("zeroization mission authority", &encoded[10..42])?;
+    let mission_len =
+        usize::try_from(u32::from_be_bytes(encoded[42..46].try_into().map_err(
+            |_| StoreError::ZeroizationInvariant("invalid mission descriptor length"),
+        )?))
+        .map_err(|_| StoreError::ZeroizationInvariant("invalid mission descriptor length"))?;
+    let identity_len =
+        usize::try_from(u32::from_be_bytes(encoded[46..50].try_into().map_err(
+            |_| StoreError::ZeroizationInvariant("invalid identity descriptor length"),
+        )?))
+        .map_err(|_| StoreError::ZeroizationInvariant("invalid identity descriptor length"))?;
+    if mission_len == 0 || mission_len > MAX_ZEROIZATION_DESCRIPTOR_BYTES {
+        return Err(StoreError::ZeroizationInvariant(
+            "terminal mission descriptor length is outside its bound",
+        ));
+    }
+    if identity_len == 0 || identity_len > MAX_ZEROIZATION_DESCRIPTOR_BYTES {
+        return Err(StoreError::ZeroizationInvariant(
+            "terminal identity descriptor length is outside its bound",
+        ));
+    }
+    let payload_len =
+        mission_len
+            .checked_add(identity_len)
+            .ok_or(StoreError::ZeroizationInvariant(
+                "terminal descriptor lengths overflow",
+            ))?;
+    if ZEROIZATION_HEADER_BYTES.checked_add(payload_len) != Some(digest_offset) {
+        return Err(StoreError::ZeroizationInvariant(
+            "terminal descriptor lengths do not match the record",
+        ));
+    }
+    let mission_end = ZEROIZATION_HEADER_BYTES + mission_len;
+    let intent = ZeroizationIntent::new(
+        encoded[ZEROIZATION_HEADER_BYTES..mission_end].to_vec(),
+        encoded[mission_end..digest_offset].to_vec(),
+    )
+    .map_err(|_| StoreError::ZeroizationInvariant("terminal artifact descriptor is invalid"))?;
+    Ok(ZeroizationRecord {
+        state,
+        authority,
+        intent,
+    })
+}
+
+fn inspect_zeroization_readable(
+    database: &impl ReadableDatabase,
+) -> Result<StoreZeroizationStatus, StoreError> {
+    let read = database.begin_read()?;
+    inspect_zeroization_read(&read)
+}
+
+fn inspect_zeroization_read(
+    read: &redb::ReadTransaction,
+) -> Result<StoreZeroizationStatus, StoreError> {
+    let multimap_names = read
+        .list_multimap_tables()?
+        .map(|table| table.name().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    if multimap_names.contains(ZEROIZATION.name()) {
+        return Err(StoreError::ZeroizationInvariant(
+            "reserved terminal table name has the wrong table kind",
+        ));
+    }
+    if multimap_names.contains(SEMANTIC_DOMAIN.name()) {
+        return Err(StoreError::SemanticInvariant(
+            "semantic mission domain has the wrong table kind",
+        ));
+    }
+    let table_names = read
+        .list_tables()?
+        .map(|table| table.name().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mission_authority = if table_names.contains(SEMANTIC_DOMAIN.name()) {
+        let domain = read.open_table(SEMANTIC_DOMAIN)?;
+        domain
+            .get(MISSION_AUTHORITY_ID)?
+            .map(|value| parse_node_id("semantic mission authority", value.value()))
+            .transpose()?
+    } else {
+        None
+    };
+    if !table_names.contains(ZEROIZATION.name()) {
+        return Ok(StoreZeroizationStatus {
+            state: StoreZeroizationState::Live,
+            mission_authority,
+            intent: None,
+        });
+    }
+    let terminal = read.open_table(ZEROIZATION)?;
+    if terminal.len()? != 1 {
+        return Err(StoreError::ZeroizationInvariant(
+            "terminal table must contain exactly one state record",
+        ));
+    }
+    let encoded = terminal
+        .get(ZEROIZATION_STATE_KEY)?
+        .ok_or(StoreError::ZeroizationInvariant(
+            "terminal table is missing its state record",
+        ))?;
+    let record = decode_zeroization_record(encoded.value())?;
+    if mission_authority != Some(record.authority) {
+        return Err(StoreError::ZeroizationInvariant(
+            "terminal authority differs from the stable mission binding",
+        ));
+    }
+    Ok(StoreZeroizationStatus {
+        state: record.state,
+        mission_authority,
+        intent: Some(record.intent),
+    })
+}
+
+fn zeroization_record_write(
+    write: &redb::WriteTransaction,
+) -> Result<Option<ZeroizationRecord>, StoreError> {
+    if write
+        .list_multimap_tables()?
+        .any(|table| table.name() == ZEROIZATION.name())
+    {
+        return Err(StoreError::ZeroizationInvariant(
+            "reserved terminal table name has the wrong table kind",
+        ));
+    }
+    let present = write
+        .list_tables()?
+        .any(|table| table.name() == ZEROIZATION.name());
+    if !present {
+        return Ok(None);
+    }
+    let terminal = write.open_table(ZEROIZATION)?;
+    if terminal.len()? != 1 {
+        return Err(StoreError::ZeroizationInvariant(
+            "terminal table must contain exactly one state record",
+        ));
+    }
+    let encoded = terminal
+        .get(ZEROIZATION_STATE_KEY)?
+        .ok_or(StoreError::ZeroizationInvariant(
+            "terminal table is missing its state record",
+        ))?;
+    Ok(Some(decode_zeroization_record(encoded.value())?))
+}
+
+fn enforce_live_write(write: &redb::WriteTransaction) -> Result<(), StoreError> {
+    match zeroization_record_write(write)? {
+        None => Ok(()),
+        Some(record) => Err(StoreError::StoreZeroized(record.state)),
+    }
+}
+
+fn require_zeroization_authority(
+    write: &redb::WriteTransaction,
+    authority: NodeId,
+) -> Result<(), StoreError> {
+    match read_mission_binding(write)? {
+        Some(bound) if bound == authority => Ok(()),
+        Some(bound) => Err(StoreError::MissionAuthorityMismatch {
+            bound,
+            received: authority,
+        }),
+        None => Err(StoreError::MissionNotBound),
+    }
+}
+
+fn write_zeroization_record(
+    write: &redb::WriteTransaction,
+    record: &ZeroizationRecord,
+) -> Result<(), StoreError> {
+    let encoded = encode_zeroization_record(record)?;
+    let mut terminal = write.open_table(ZEROIZATION)?;
+    terminal.insert(ZEROIZATION_STATE_KEY, encoded.as_slice())?;
+    Ok(())
+}
+
+fn begin_zeroization_write(
+    write: &redb::WriteTransaction,
+    authority: NodeId,
+    intent: &ZeroizationIntent,
+) -> Result<BeginZeroizationOutcome, StoreError> {
+    require_zeroization_authority(write, authority)?;
+    if let Some(record) = zeroization_record_write(write)? {
+        if record.authority != authority {
+            return Err(StoreError::ZeroizationInvariant(
+                "terminal authority differs from the cleanup handle",
+            ));
+        }
+        if &record.intent != intent {
+            return Err(StoreError::ZeroizationIntentConflict);
+        }
+        return Ok(BeginZeroizationOutcome::AlreadyStarted(record.state));
+    }
+    write_zeroization_record(
+        write,
+        &ZeroizationRecord {
+            state: StoreZeroizationState::CleanupPending,
+            authority,
+            intent: intent.clone(),
+        },
+    )?;
+    Ok(BeginZeroizationOutcome::EnteredCleanupPending)
+}
+
+fn mark_artifact_destroyed_write(
+    write: &redb::WriteTransaction,
+    authority: NodeId,
+    artifact: ZeroizationArtifact,
+) -> Result<ArtifactDestructionOutcome, StoreError> {
+    require_zeroization_authority(write, authority)?;
+    let mut record = zeroization_record_write(write)?.ok_or(
+        StoreError::ZeroizationOrderViolation("terminal cleanup has not begun"),
+    )?;
+    if record.authority != authority {
+        return Err(StoreError::ZeroizationInvariant(
+            "terminal authority differs from the cleanup handle",
+        ));
+    }
+    let next = match (artifact, record.state) {
+        (ZeroizationArtifact::MissionBundle, StoreZeroizationState::CleanupPending) => {
+            StoreZeroizationState::MissionDestroyed
+        }
+        (ZeroizationArtifact::MissionBundle, _) if record.state.mission_destroyed() => {
+            return Ok(ArtifactDestructionOutcome::AlreadyMarked);
+        }
+        (ZeroizationArtifact::CarrierIdentity, StoreZeroizationState::CleanupPending) => {
+            return Err(StoreError::ZeroizationOrderViolation(
+                "mission bundle must be destroyed before carrier identity",
+            ));
+        }
+        (ZeroizationArtifact::CarrierIdentity, StoreZeroizationState::MissionDestroyed) => {
+            StoreZeroizationState::IdentityDestroyed
+        }
+        (ZeroizationArtifact::CarrierIdentity, _) if record.state.identity_destroyed() => {
+            return Ok(ArtifactDestructionOutcome::AlreadyMarked);
+        }
+        _ => {
+            return Err(StoreError::ZeroizationInvariant(
+                "terminal artifact state cannot advance",
+            ));
+        }
+    };
+    record.state = next;
+    write_zeroization_record(write, &record)?;
+    Ok(ArtifactDestructionOutcome::Marked)
+}
+
+fn finalize_zeroization_write(
+    write: &redb::WriteTransaction,
+    authority: NodeId,
+) -> Result<FinalizeZeroizationOutcome, StoreError> {
+    require_zeroization_authority(write, authority)?;
+    let mut record = zeroization_record_write(write)?.ok_or(
+        StoreError::ZeroizationOrderViolation("terminal cleanup has not begun"),
+    )?;
+    if record.authority != authority {
+        return Err(StoreError::ZeroizationInvariant(
+            "terminal authority differs from the cleanup handle",
+        ));
+    }
+    match record.state {
+        StoreZeroizationState::IdentityDestroyed => {
+            record.state = StoreZeroizationState::Complete;
+            write_zeroization_record(write, &record)?;
+            Ok(FinalizeZeroizationOutcome::Finalized)
+        }
+        StoreZeroizationState::Complete => Ok(FinalizeZeroizationOutcome::AlreadyComplete),
+        _ => Err(StoreError::ZeroizationOrderViolation(
+            "both artifact destruction receipts are required before finalization",
+        )),
+    }
+}
+
+fn reject_terminal_normal_open(path: &Path) -> Result<(), StoreError> {
+    let status = Store::inspect_zeroization_state(path)?;
+    if status.state.is_terminal() {
+        Err(StoreError::StoreZeroized(status.state))
+    } else {
+        Ok(())
+    }
+}
+
+fn inspect_mission_binding_read_only(path: &Path) -> Result<Option<NodeId>, StoreError> {
+    let database = redb::Builder::new().open_read_only(path)?;
+    let read = database.begin_read()?;
+    let table_names = read
+        .list_tables()?
+        .map(|table| table.name().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    let binding = if table_names.contains(SEMANTIC_DOMAIN.name()) {
+        let domain = read.open_table(SEMANTIC_DOMAIN)?;
+        domain
+            .get(MISSION_AUTHORITY_ID)?
+            .map(|value| parse_node_id("semantic mission authority", value.value()))
+            .transpose()?
+    } else {
+        None
+    };
+    if binding.is_none() {
+        let semantic_rows = if table_names.contains(EVENTS.name()) {
+            read.open_table(EVENTS)?.len()?
+        } else {
+            0
+        };
+        let cached_rows = if table_names.contains(ROUTE_CACHE.name()) {
+            read.open_table(ROUTE_CACHE)?.len()?
+        } else {
+            0
+        };
+        let control_rows = if table_names.contains(CONTROL_RECORDS.name()) {
+            read.open_table(CONTROL_RECORDS)?.len()?
+        } else {
+            0
+        };
+        if semantic_rows != 0 || cached_rows != 0 || control_rows != 0 {
+            return Err(StoreError::SemanticInvariant(
+                "unbound store contains mission-scoped Event or control state",
+            ));
+        }
+    }
+    Ok(binding)
+}
+
+fn inspect_control_state_read_only(path: &Path) -> Result<(), StoreError> {
+    let database = redb::Builder::new().open_read_only(path)?;
+    let read = database.begin_read()?;
+    let table_names = read
+        .list_tables()?
+        .map(|table| table.name().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mission_authority = if table_names.contains(SEMANTIC_DOMAIN.name()) {
+        let domain = read.open_table(SEMANTIC_DOMAIN)?;
+        domain
+            .get(MISSION_AUTHORITY_ID)?
+            .map(|value| parse_node_id("semantic mission authority", value.value()))
+            .transpose()?
+    } else {
+        None
+    };
+    inspect_control_tables(&read, mission_authority)?;
+    Ok(())
+}
+
+fn check_expected_mission_binding(
+    write: &redb::WriteTransaction,
+    expected: NodeId,
+) -> Result<(), StoreError> {
+    if write
+        .list_multimap_tables()?
+        .any(|table| table.name() == SEMANTIC_DOMAIN.name())
+    {
+        return Err(StoreError::SemanticInvariant(
+            "semantic mission domain has the wrong table kind",
+        ));
+    }
+    let domain_exists = write
+        .list_tables()?
+        .any(|table| table.name() == SEMANTIC_DOMAIN.name());
+    let bound = if domain_exists {
+        let domain = write.open_table(SEMANTIC_DOMAIN)?;
+        domain
+            .get(MISSION_AUTHORITY_ID)?
+            .map(|value| parse_node_id("semantic mission authority", value.value()))
+            .transpose()?
+    } else {
+        None
+    };
+    match bound {
+        Some(bound) if bound != expected => Err(StoreError::MissionAuthorityMismatch {
+            bound,
+            received: expected,
+        }),
+        Some(_) | None => Ok(()),
+    }
+}
+
+fn read_mission_binding(write: &redb::WriteTransaction) -> Result<Option<NodeId>, StoreError> {
+    let domain = write.open_table(SEMANTIC_DOMAIN)?;
+    domain
+        .get(MISSION_AUTHORITY_ID)?
+        .map(|value| parse_node_id("semantic mission authority", value.value()))
+        .transpose()
+}
+
+fn audit_semantic_tables(write: &redb::WriteTransaction) -> Result<(), StoreError> {
+    // Opening every table here is the non-destructive schema extension for old
+    // stores. Existing v1 opaque item/effect bytes remain untouched and use a
+    // disjoint caller-controlled key namespace.
+    let events = write.open_table(EVENTS)?;
+    let event_bytes = write.open_table(EVENT_BYTES)?;
+    let event_markers = write.open_table(EVENT_ACCEPTANCE_MARKERS)?;
+    let semantic_items = write.open_table(SEMANTIC_ITEMS)?;
+    let accepted_dots = write.open_table(ACCEPTED_DOTS)?;
+    let accepted_events = write.open_table(ACCEPTED_EVENTS)?;
+    let frontier = write.open_table(CAUSAL_FRONTIER)?;
+    let publisher_high_water = write.open_table(PUBLISHER_HIGH_WATER)?;
+    let event_high_water = write.open_table(EVENT_HIGH_WATER)?;
+    let operations = write.open_table(EVENT_OPERATIONS)?;
+    let route_cache = write.open_table(ROUTE_CACHE)?;
+    let route_claims = write.open_table(ROUTE_CACHE_CLAIMS)?;
+    let _domain = write.open_table(SEMANTIC_DOMAIN)?;
+
+    let mut reconstructed_event_count = 0u64;
+    let mut reconstructed_event_bytes = 0u64;
+    let mut reconstructed_last_marker = 0u64;
+    let mut acceptance_marker_values = std::collections::BTreeSet::new();
+    let mut expected_dots = std::collections::BTreeMap::<Vec<u8>, EventSemanticId>::new();
+    let mut expected_positions = std::collections::BTreeMap::<Vec<u8>, EventSemanticId>::new();
+    let mut expected_publisher_high = std::collections::BTreeMap::<Vec<u8>, u64>::new();
+    let mut expected_event_high = std::collections::BTreeMap::<Vec<u8>, u64>::new();
+    let mut expected_frontier = std::collections::BTreeMap::<Vec<u8>, u64>::new();
+    let mut domain_publishers =
+        std::collections::BTreeMap::<Vec<u8>, std::collections::BTreeSet<NodeId>>::new();
+
+    for row in events.iter()? {
+        let (key, value) = row?;
+        let transfer_id = parse_transfer_id("Event metadata table", key.value())?;
+        let metadata = decode_event_metadata(value.value())?;
+        if metadata.transfer_id != transfer_id {
+            return Err(StoreError::SemanticInvariant(
+                "Event metadata transfer identity differs from its table key",
+            ));
+        }
+        let sealed = event_bytes
+            .get(key.value())?
+            .map(|value| value.value().to_vec())
+            .ok_or(StoreError::SemanticInvariant(
+                "Event metadata is missing exact source bytes",
+            ))?;
+        if EventTransferId::new(Sha256::digest(&sealed).into()) != transfer_id {
+            return Err(StoreError::SemanticInvariant(
+                "Event source bytes fail exact transfer identity audit",
+            ));
+        }
+        let marker = event_markers
+            .get(key.value())?
+            .map(|value| value.value())
+            .ok_or(StoreError::SemanticInvariant(
+                "Event metadata is missing its acceptance marker",
+            ))?;
+        if marker == 0 || !acceptance_marker_values.insert(marker) {
+            return Err(StoreError::SemanticInvariant(
+                "semantic acceptance markers must be nonzero and unique",
+            ));
+        }
+        reconstructed_event_count = reconstructed_event_count
+            .checked_add(1)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        reconstructed_event_bytes = reconstructed_event_bytes
+            .checked_add(
+                u64::try_from(sealed.len())
+                    .map_err(|_| StoreError::PayloadByteAccountingOverflow)?,
+            )
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        reconstructed_last_marker = reconstructed_last_marker.max(marker);
+        let indexed_transfer = semantic_items
+            .get(metadata.semantic_id.as_bytes().as_slice())?
+            .map(|value| parse_transfer_id("semantic item table", value.value()))
+            .transpose()?
+            .ok_or(StoreError::SemanticInvariant(
+                "Event metadata is missing its semantic item index",
+            ))?;
+        if indexed_transfer != transfer_id {
+            return Err(StoreError::SemanticInvariant(
+                "semantic item index points to another Event representation",
+            ));
+        }
+        let dot = metadata.header.stamp.dot;
+        let dot_key = accepted_dot_key(dot).to_vec();
+        if expected_dots
+            .insert(dot_key.clone(), metadata.semantic_id)
+            .is_some()
+        {
+            return Err(StoreError::SemanticInvariant(
+                "multiple Events claim one accepted causal dot",
+            ));
+        }
+        let accepted_semantic = accepted_dots
+            .get(dot_key.as_slice())?
+            .map(|value| parse_semantic_id("accepted dot table", value.value()))
+            .transpose()?
+            .ok_or(StoreError::SemanticInvariant(
+                "Event metadata is missing its accepted-dot ledger row",
+            ))?;
+        if accepted_semantic != metadata.semantic_id {
+            return Err(StoreError::SemanticInvariant(
+                "accepted-dot ledger points to another semantic item",
+            ));
+        }
+        let sequence = event_sequence(&metadata.header)?;
+        let position = accepted_event_key(
+            dot.publisher,
+            &metadata.header.topic,
+            &metadata.header.scope,
+            sequence,
+        )?;
+        if expected_positions
+            .insert(position.clone(), metadata.semantic_id)
+            .is_some()
+        {
+            return Err(StoreError::SemanticInvariant(
+                "multiple Events claim one accepted stream position",
+            ));
+        }
+        let positioned_semantic = accepted_events
+            .get(position.as_slice())?
+            .map(|value| parse_semantic_id("accepted Event table", value.value()))
+            .transpose()?
+            .ok_or(StoreError::SemanticInvariant(
+                "Event metadata is missing its accepted-position ledger row",
+            ))?;
+        if positioned_semantic != metadata.semantic_id {
+            return Err(StoreError::SemanticInvariant(
+                "accepted Event position points to another semantic item",
+            ));
+        }
+        let publisher_high = publisher_high_water
+            .get(dot.publisher.as_slice())?
+            .map_or(0, |value| value.value());
+        if publisher_high < dot.counter {
+            return Err(StoreError::SemanticInvariant(
+                "publisher high-water is behind an accepted Event dot",
+            ));
+        }
+        expected_publisher_high
+            .entry(dot.publisher.to_vec())
+            .and_modify(|current| *current = (*current).max(dot.counter))
+            .or_insert(dot.counter);
+        let stream = event_stream_key(
+            dot.publisher,
+            &metadata.header.topic,
+            &metadata.header.scope,
+        )?;
+        let event_high = event_high_water
+            .get(stream.as_slice())?
+            .map_or(0, |value| value.value());
+        if event_high < sequence {
+            return Err(StoreError::SemanticInvariant(
+                "Event stream high-water is behind an accepted position",
+            ));
+        }
+        expected_event_high
+            .entry(stream.clone())
+            .and_modify(|current| *current = (*current).max(sequence))
+            .or_insert(sequence);
+        let frontier_key = causal_frontier_key(
+            &metadata.header.topic,
+            &metadata.header.scope,
+            dot.publisher,
+        )?;
+        let direct_frontier = frontier
+            .get(frontier_key.as_slice())?
+            .map_or(0, |value| value.value());
+        if direct_frontier < dot.counter {
+            return Err(StoreError::SemanticInvariant(
+                "causal frontier is behind a directly accepted Event dot",
+            ));
+        }
+        expected_frontier
+            .entry(frontier_key)
+            .and_modify(|current| *current = (*current).max(dot.counter))
+            .or_insert(dot.counter);
+        domain_publishers
+            .entry(event_domain_prefix(
+                &metadata.header.topic,
+                &metadata.header.scope,
+            )?)
+            .or_default()
+            .insert(dot.publisher);
+    }
+
+    if reconstructed_last_marker != reconstructed_event_count
+        || acceptance_marker_values
+            .iter()
+            .copied()
+            .ne(1..=reconstructed_event_count)
+    {
+        return Err(StoreError::SemanticInvariant(
+            "semantic acceptance markers are not a contiguous allocation history",
+        ));
+    }
+    if domain_publishers
+        .values()
+        .any(|publishers| publishers.len() > MAX_CAUSAL_CONTEXT_ENTRIES)
+    {
+        return Err(StoreError::SemanticInvariant(
+            "causal frontier exceeds the proven context bound",
+        ));
+    }
+
+    for row in event_bytes.iter()? {
+        let (key, _) = row?;
+        parse_transfer_id("semantic Event byte table", key.value())?;
+        if events.get(key.value())?.is_none() {
+            return Err(StoreError::SemanticInvariant(
+                "semantic Event bytes are missing metadata",
+            ));
+        }
+    }
+    for row in event_markers.iter()? {
+        let (key, _) = row?;
+        parse_transfer_id("semantic Event marker table", key.value())?;
+        if events.get(key.value())?.is_none() {
+            return Err(StoreError::SemanticInvariant(
+                "semantic Event marker is missing metadata",
+            ));
+        }
+    }
+    {
+        let mut metadata = write.open_table(METADATA)?;
+        audit_or_initialize_counter(
+            &mut metadata,
+            SEMANTIC_ITEM_COUNT,
+            reconstructed_event_count,
+        )?;
+        audit_or_initialize_counter(
+            &mut metadata,
+            SEMANTIC_TOTAL_BYTES,
+            reconstructed_event_bytes,
+        )?;
+        audit_or_initialize_counter(
+            &mut metadata,
+            LAST_SEMANTIC_ACCEPTANCE_MARKER,
+            reconstructed_last_marker,
+        )?;
+    }
+
+    for row in semantic_items.iter()? {
+        let (key, value) = row?;
+        let semantic_id = parse_semantic_id("semantic item table", key.value())?;
+        let transfer_id = parse_transfer_id("semantic item table", value.value())?;
+        let encoded = events
+            .get(transfer_id.as_bytes().as_slice())?
+            .map(|value| value.value().to_vec())
+            .ok_or(StoreError::SemanticInvariant(
+                "semantic item index points to a missing Event",
+            ))?;
+        if decode_event_metadata(&encoded)?.semantic_id != semantic_id {
+            return Err(StoreError::SemanticInvariant(
+                "semantic item index key differs from Event metadata",
+            ));
+        }
+    }
+
+    if accepted_dots.len()?
+        != u64::try_from(expected_dots.len())
+            .map_err(|_| StoreError::ItemCountAccountingOverflow)?
+    {
+        return Err(StoreError::SemanticInvariant(
+            "accepted-dot ledger has missing or orphan rows",
+        ));
+    }
+    for row in accepted_dots.iter()? {
+        let (key, value) = row?;
+        let semantic_id = parse_semantic_id("accepted dot table", value.value())?;
+        if expected_dots.get(key.value()) != Some(&semantic_id) {
+            return Err(StoreError::SemanticInvariant(
+                "accepted-dot ledger contains an orphan or mismatched row",
+            ));
+        }
+    }
+    if accepted_events.len()?
+        != u64::try_from(expected_positions.len())
+            .map_err(|_| StoreError::ItemCountAccountingOverflow)?
+    {
+        return Err(StoreError::SemanticInvariant(
+            "accepted Event-position ledger has missing or orphan rows",
+        ));
+    }
+    for row in accepted_events.iter()? {
+        let (key, value) = row?;
+        let semantic_id = parse_semantic_id("accepted Event table", value.value())?;
+        if expected_positions.get(key.value()) != Some(&semantic_id) {
+            return Err(StoreError::SemanticInvariant(
+                "accepted Event-position ledger contains an orphan or mismatched row",
+            ));
+        }
+    }
+
+    audit_exact_u64_index(
+        &publisher_high_water,
+        &expected_publisher_high,
+        "publisher high-water contains an orphan, missing, or inflated row",
+    )?;
+    audit_exact_u64_index(
+        &event_high_water,
+        &expected_event_high,
+        "Event stream high-water contains an orphan, missing, or inflated row",
+    )?;
+    audit_exact_u64_index(
+        &frontier,
+        &expected_frontier,
+        "causal frontier contains an orphan, missing, or inflated row",
+    )?;
+
+    for row in operations.iter()? {
+        let (key, value) = row?;
+        EventOperationKey::new(key.value().to_vec())?;
+        let record = decode_operation_record(value.value())?;
+        let transfer_id = record.transfer_id;
+        if events.get(transfer_id.as_bytes().as_slice())?.is_none() {
+            return Err(StoreError::SemanticInvariant(
+                "Event operation points to a missing Event",
+            ));
+        }
+        if let Some(predecessor) = record.predecessor {
+            let predecessor_transfer = semantic_items
+                .get(predecessor.as_bytes().as_slice())?
+                .map(|value| parse_transfer_id("semantic item table", value.value()))
+                .transpose()?
+                .ok_or(StoreError::SemanticInvariant(
+                    "Event operation predecessor is missing",
+                ))?;
+            let predecessor_metadata = events
+                .get(predecessor_transfer.as_bytes().as_slice())?
+                .map(|value| decode_event_metadata(value.value()))
+                .transpose()?
+                .ok_or(StoreError::SemanticInvariant(
+                    "Event operation predecessor metadata is missing",
+                ))?;
+            let reaction_metadata = events
+                .get(transfer_id.as_bytes().as_slice())?
+                .map(|value| decode_event_metadata(value.value()))
+                .transpose()?
+                .ok_or(StoreError::SemanticInvariant(
+                    "Event operation result metadata is missing",
+                ))?;
+            if !reaction_metadata
+                .header
+                .stamp
+                .context
+                .observes(predecessor_metadata.header.stamp.dot)
+            {
+                return Err(StoreError::SemanticInvariant(
+                    "Event operation result does not observe its predecessor",
+                ));
+            }
+        }
+    }
+
+    let mut reconstructed_route_count = 0u64;
+    let mut reconstructed_route_bytes = 0u64;
+    let mut route_semantic_counts = std::collections::BTreeMap::<EventSemanticId, u64>::new();
+    for row in route_cache.iter()? {
+        let (key, value) = row?;
+        let transfer_id = parse_transfer_id("route Event cache", key.value())?;
+        if events.get(key.value())?.is_some() {
+            return Err(StoreError::SemanticInvariant(
+                "one transfer identity exists in semantic and route-cache namespaces",
+            ));
+        }
+        if EventTransferId::new(Sha256::digest(value.value()).into()) != transfer_id {
+            return Err(StoreError::SemanticInvariant(
+                "route-cache bytes fail exact transfer identity audit",
+            ));
+        }
+        let claim = route_claims
+            .get(key.value())?
+            .map(|value| value.value().to_vec())
+            .ok_or(StoreError::SemanticInvariant(
+                "route-cache bytes are missing their route claim",
+            ))?;
+        let claim = decode_event_metadata(&claim)?;
+        if claim.transfer_id != transfer_id {
+            return Err(StoreError::SemanticInvariant(
+                "route-cache claim differs from its transfer key",
+            ));
+        }
+        if let Some(accepted) = semantic_items
+            .get(claim.semantic_id.as_bytes().as_slice())?
+            .map(|value| parse_transfer_id("semantic item table", value.value()))
+            .transpose()?
+        {
+            return Err(StoreError::SemanticRepresentationConflict {
+                semantic_id: claim.semantic_id,
+                accepted_envelope_id: accepted,
+                received_envelope_id: transfer_id,
+            });
+        }
+        let semantic_count = route_semantic_counts.entry(claim.semantic_id).or_default();
+        *semantic_count = semantic_count
+            .checked_add(1)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        if *semantic_count > MAX_ROUTE_CACHE_REPRESENTATIONS_PER_SEMANTIC {
+            return Err(StoreError::RouteCacheSemanticRepresentationLimit {
+                semantic_id: claim.semantic_id,
+                current: *semantic_count,
+                limit: MAX_ROUTE_CACHE_REPRESENTATIONS_PER_SEMANTIC,
+            });
+        }
+        reconstructed_route_count = reconstructed_route_count
+            .checked_add(1)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        reconstructed_route_bytes = reconstructed_route_bytes
+            .checked_add(
+                u64::try_from(value.value().len())
+                    .map_err(|_| StoreError::PayloadByteAccountingOverflow)?,
+            )
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    }
+    if reconstructed_route_count > MAX_ROUTE_CACHE_ITEMS
+        || reconstructed_route_bytes > MAX_ROUTE_CACHE_BYTES
+    {
+        return Err(StoreError::SemanticInvariant(
+            "route-cache durable usage exceeds its configured safety cap",
+        ));
+    }
+    for row in route_claims.iter()? {
+        let (key, _) = row?;
+        parse_transfer_id("route Event claim table", key.value())?;
+        if route_cache.get(key.value())?.is_none() {
+            return Err(StoreError::SemanticInvariant(
+                "route-cache claim is missing exact source bytes",
+            ));
+        }
+    }
+    {
+        let mut metadata = write.open_table(METADATA)?;
+        audit_or_initialize_counter(
+            &mut metadata,
+            ROUTE_CACHE_ITEM_COUNT,
+            reconstructed_route_count,
+        )?;
+        audit_or_initialize_counter(
+            &mut metadata,
+            ROUTE_CACHE_TOTAL_BYTES,
+            reconstructed_route_bytes,
+        )?;
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct ControlAuditSnapshot {
+    records: std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
+    bytes: std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
+    sequence: std::collections::BTreeMap<u64, Vec<u8>>,
+    pending: std::collections::BTreeMap<u64, Vec<u8>>,
+    applied: std::collections::BTreeMap<u64, Vec<u8>>,
+    revocations: std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
+    scope_epochs: std::collections::BTreeMap<String, Vec<u8>>,
+    reservations: std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
+    publication_intents: std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
+    head: std::collections::BTreeMap<String, Vec<u8>>,
+    event_ids: std::collections::BTreeSet<Vec<u8>>,
+    route_cache_ids: std::collections::BTreeSet<Vec<u8>>,
+}
+
+fn collect_control_snapshot_write(
+    write: &redb::WriteTransaction,
+) -> Result<ControlAuditSnapshot, StoreError> {
+    // Opening every table is the non-destructive schema extension. No old
+    // opaque or Event row is rewritten or promoted.
+    let records = write.open_table(CONTROL_RECORDS)?;
+    let bytes = write.open_table(CONTROL_BYTES)?;
+    let sequence = write.open_table(CONTROL_SEQUENCE)?;
+    let pending = write.open_table(CONTROL_PENDING)?;
+    let applied = write.open_table(CONTROL_APPLIED)?;
+    let revocations = write.open_table(CONTROL_REVOCATIONS)?;
+    let scope_epochs = write.open_table(CONTROL_SCOPE_EPOCHS)?;
+    let reservations = write.open_table(CONTROL_RESERVATIONS)?;
+    let publication_intents = write.open_table(CONTROL_PUBLICATION_INTENTS)?;
+    let head = write.open_table(CONTROL_HEAD)?;
+    let events = write.open_table(EVENTS)?;
+    let route_cache = write.open_table(ROUTE_CACHE)?;
+    let mut snapshot = ControlAuditSnapshot::default();
+    for row in records.iter()? {
+        let (key, value) = row?;
+        snapshot
+            .records
+            .insert(key.value().to_vec(), value.value().to_vec());
+    }
+    for row in bytes.iter()? {
+        let (key, value) = row?;
+        snapshot
+            .bytes
+            .insert(key.value().to_vec(), value.value().to_vec());
+    }
+    for row in sequence.iter()? {
+        let (key, value) = row?;
+        snapshot
+            .sequence
+            .insert(key.value(), value.value().to_vec());
+    }
+    for row in pending.iter()? {
+        let (key, value) = row?;
+        snapshot.pending.insert(key.value(), value.value().to_vec());
+    }
+    for row in applied.iter()? {
+        let (key, value) = row?;
+        snapshot.applied.insert(key.value(), value.value().to_vec());
+    }
+    for row in revocations.iter()? {
+        let (key, value) = row?;
+        snapshot
+            .revocations
+            .insert(key.value().to_vec(), value.value().to_vec());
+    }
+    for row in scope_epochs.iter()? {
+        let (key, value) = row?;
+        snapshot
+            .scope_epochs
+            .insert(key.value().to_owned(), value.value().to_vec());
+    }
+    for row in reservations.iter()? {
+        let (key, value) = row?;
+        snapshot
+            .reservations
+            .insert(key.value().to_vec(), value.value().to_vec());
+    }
+    for row in publication_intents.iter()? {
+        let (key, value) = row?;
+        snapshot
+            .publication_intents
+            .insert(key.value().to_vec(), value.value().to_vec());
+    }
+    for row in head.iter()? {
+        let (key, value) = row?;
+        snapshot
+            .head
+            .insert(key.value().to_owned(), value.value().to_vec());
+    }
+    for row in events.iter()? {
+        let (key, _) = row?;
+        snapshot.event_ids.insert(key.value().to_vec());
+    }
+    for row in route_cache.iter()? {
+        let (key, _) = row?;
+        snapshot.route_cache_ids.insert(key.value().to_vec());
+    }
+    Ok(snapshot)
+}
+
+fn audit_control_tables(write: &redb::WriteTransaction) -> Result<(), StoreError> {
+    let snapshot = collect_control_snapshot_write(write)?;
+    let mission_authority = read_mission_binding(write)?;
+    let stats = validate_control_snapshot(&snapshot, mission_authority)?;
+    let mut metadata = write.open_table(METADATA)?;
+    audit_or_initialize_counter(&mut metadata, CONTROL_ITEM_COUNT, stats.controls)?;
+    audit_or_initialize_counter(&mut metadata, CONTROL_TOTAL_BYTES, stats.total_sealed_bytes)?;
+    audit_or_initialize_counter(
+        &mut metadata,
+        CONTROL_PUBLICATION_INTENT_TOTAL_BYTES,
+        stats.publication_intent_bytes,
+    )?;
+    Ok(())
+}
+
+fn validate_control_snapshot(
+    snapshot: &ControlAuditSnapshot,
+    mission_authority: Option<NodeId>,
+) -> Result<ControlStoreStats, StoreError> {
+    let mut decoded = std::collections::BTreeMap::<ControlTransferId, ControlRecord>::new();
+    let mut total_bytes = 0u64;
+    for (key, encoded) in &snapshot.records {
+        let transfer_id = parse_control_transfer_id("mission control record table", key)?;
+        let record = decode_control_record(encoded)?;
+        if record.transfer_id != transfer_id {
+            return Err(StoreError::ControlInvariant(
+                "control record identity differs from its key",
+            ));
+        }
+        let Some(authority) = mission_authority else {
+            return Err(StoreError::ControlInvariant(
+                "unbound store contains mission-control state",
+            ));
+        };
+        if record.authority != authority {
+            return Err(StoreError::MissionAuthorityMismatch {
+                bound: authority,
+                received: record.authority,
+            });
+        }
+        let sealed = snapshot.bytes.get(key).ok_or(StoreError::ControlInvariant(
+            "control record is missing exact bytes",
+        ))?;
+        if sealed.is_empty() || ControlTransferId::new(Sha256::digest(sealed).into()) != transfer_id
+        {
+            return Err(StoreError::ControlInvariant(
+                "control exact bytes fail transfer identity audit",
+            ));
+        }
+        total_bytes = total_bytes
+            .checked_add(
+                u64::try_from(sealed.len())
+                    .map_err(|_| StoreError::PayloadByteAccountingOverflow)?,
+            )
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        if snapshot.sequence.get(&record.sequence).map(Vec::as_slice) != Some(key.as_slice()) {
+            return Err(StoreError::ControlInvariant(
+                "control sequence forward index is missing or mismatched",
+            ));
+        }
+        let pending = snapshot.pending.get(&record.sequence).map(Vec::as_slice);
+        let applied = snapshot.applied.get(&record.sequence).map(Vec::as_slice);
+        if !matches!((pending, applied), (Some(id), None) | (None, Some(id)) if id == key) {
+            return Err(StoreError::ControlInvariant(
+                "control is not in exactly one pending or applied index",
+            ));
+        }
+        if snapshot.event_ids.contains(key) || snapshot.route_cache_ids.contains(key) {
+            return Err(StoreError::TransferNamespaceCollision {
+                transfer_id: *transfer_id.as_bytes(),
+            });
+        }
+        if decoded.insert(transfer_id, record).is_some() {
+            return Err(StoreError::ControlInvariant(
+                "duplicate control transfer identity",
+            ));
+        }
+    }
+
+    if snapshot.bytes.len() != snapshot.records.len()
+        || snapshot.sequence.len() != snapshot.records.len()
+        || snapshot
+            .pending
+            .len()
+            .saturating_add(snapshot.applied.len())
+            != snapshot.records.len()
+    {
+        return Err(StoreError::ControlInvariant(
+            "control forward and inverse table cardinalities differ",
+        ));
+    }
+    for key in snapshot.bytes.keys() {
+        parse_control_transfer_id("mission control byte table", key)?;
+        if !snapshot.records.contains_key(key) {
+            return Err(StoreError::ControlInvariant(
+                "control exact bytes are missing their record",
+            ));
+        }
+    }
+    for (sequence, id) in &snapshot.sequence {
+        let transfer_id = parse_control_transfer_id("mission control sequence table", id)?;
+        let record = decoded
+            .get(&transfer_id)
+            .ok_or(StoreError::ControlInvariant(
+                "control sequence inverse index points to a missing record",
+            ))?;
+        if record.sequence != *sequence {
+            return Err(StoreError::ControlInvariant(
+                "control sequence inverse index differs from record metadata",
+            ));
+        }
+    }
+
+    let mut previous = None;
+    let mut expected_sequence = 1u64;
+    let mut revoked = std::collections::BTreeSet::<NodeId>::new();
+    let mut expected_revocations = std::collections::BTreeMap::<Vec<u8>, Vec<u8>>::new();
+    let mut revocation_generations = std::collections::BTreeMap::<NodeId, u64>::new();
+    let mut expected_scope_epochs = std::collections::BTreeMap::<String, Vec<u8>>::new();
+    let mut scope_epoch_values = std::collections::BTreeMap::<String, u64>::new();
+    let mut applied_head = None;
+    for (sequence, id) in &snapshot.applied {
+        if *sequence != expected_sequence {
+            return Err(StoreError::ControlInvariant(
+                "applied control chain is not a contiguous sequence from one",
+            ));
+        }
+        let transfer_id = parse_control_transfer_id("applied mission control table", id)?;
+        let record = decoded
+            .get(&transfer_id)
+            .ok_or(StoreError::ControlInvariant(
+                "applied control index points to a missing record",
+            ))?;
+        if record.sequence != *sequence || record.previous_control != previous {
+            return Err(StoreError::ControlInvariant(
+                "applied control predecessor chain is not exact and contiguous",
+            ));
+        }
+        if revoked.contains(&record.authority) || revoked.contains(&record.signer) {
+            return Err(StoreError::ControlInvariant(
+                "applied control was signed after its authority or signer was revoked",
+            ));
+        }
+        match &record.effect {
+            StoredControlEffect::Revocation {
+                subject,
+                generation,
+            } => {
+                if revocation_generations
+                    .get(subject)
+                    .is_some_and(|prior| prior >= generation)
+                {
+                    return Err(StoreError::ControlInvariant(
+                        "applied revocation generations are not strictly increasing",
+                    ));
+                }
+                revocation_generations.insert(*subject, *generation);
+                expected_revocations.insert(
+                    subject.to_vec(),
+                    encode_revocation_index(record.authority, *generation, transfer_id),
+                );
+                revoked.insert(*subject);
+            }
+            StoredControlEffect::ScopeEpoch { scope, epoch } => {
+                if scope_epoch_values
+                    .get(scope.as_str())
+                    .is_some_and(|prior| prior >= epoch)
+                {
+                    return Err(StoreError::ControlInvariant(
+                        "applied scope epochs are not strictly increasing",
+                    ));
+                }
+                scope_epoch_values.insert(scope.as_str().to_owned(), *epoch);
+                expected_scope_epochs.insert(
+                    scope.as_str().to_owned(),
+                    encode_scope_epoch_index(*epoch, transfer_id),
+                );
+            }
+        }
+        previous = Some(transfer_id);
+        applied_head = Some((*sequence, transfer_id));
+        expected_sequence =
+            expected_sequence
+                .checked_add(1)
+                .ok_or(StoreError::ControlInvariant(
+                    "applied control sequence overflow",
+                ))?;
+    }
+
+    match (applied_head, snapshot.head.get(CONTROL_HEAD_KEY)) {
+        (None, None) => {}
+        (Some(expected), Some(encoded)) if decode_control_head(encoded)? == expected => {}
+        _ => {
+            return Err(StoreError::ControlInvariant(
+                "mission-control head differs from the applied prefix",
+            ));
+        }
+    }
+    if snapshot.head.len() > usize::from(applied_head.is_some()) {
+        return Err(StoreError::ControlInvariant(
+            "mission-control head table contains an unknown row",
+        ));
+    }
+
+    let head_sequence = applied_head.map_or(0, |(sequence, _)| sequence);
+    for (sequence, id) in &snapshot.pending {
+        let transfer_id = parse_control_transfer_id("pending mission control table", id)?;
+        let record = decoded
+            .get(&transfer_id)
+            .ok_or(StoreError::ControlInvariant(
+                "pending control index points to a missing record",
+            ))?;
+        if *sequence <= head_sequence || record.sequence != *sequence {
+            return Err(StoreError::ControlInvariant(
+                "pending control overlaps or precedes the applied head",
+            ));
+        }
+        if revoked.contains(&record.authority) || revoked.contains(&record.signer) {
+            return Err(StoreError::ControlInvariant(
+                "pending suffix retains a revoked authority or signer",
+            ));
+        }
+    }
+
+    if snapshot.revocations != expected_revocations {
+        return Err(StoreError::ControlInvariant(
+            "revocation effect index has missing, orphan, stale, or mismatched rows",
+        ));
+    }
+    if snapshot.scope_epochs != expected_scope_epochs {
+        return Err(StoreError::ControlInvariant(
+            "scope-epoch effect index has missing, orphan, stale, or mismatched rows",
+        ));
+    }
+
+    for (key, encoded) in &snapshot.reservations {
+        let transfer_id = parse_control_transfer_id("control reservation receipt table", key)?;
+        let record = decoded
+            .get(&transfer_id)
+            .ok_or(StoreError::ControlInvariant(
+                "control reservation receipt points to a missing record",
+            ))?;
+        if !snapshot.applied.contains_key(&record.sequence) {
+            return Err(StoreError::ControlInvariant(
+                "control reservation receipt points to a non-applied control",
+            ));
+        }
+        let reservation = decode_control_reservation(encoded)?;
+        validate_control_reservation_claims(&reservation, record).map_err(|_| {
+            StoreError::ControlInvariant(
+                "control reservation receipt differs from committed control claims",
+            )
+        })?;
+        match &record.effect {
+            StoredControlEffect::ScopeEpoch { .. }
+                if !snapshot.publication_intents.contains_key(key) =>
+            {
+                return Err(StoreError::ControlInvariant(
+                    "local scope-rekey receipt is missing its publication intent",
+                ));
+            }
+            StoredControlEffect::Revocation { .. }
+                if snapshot.publication_intents.contains_key(key) =>
+            {
+                return Err(StoreError::ControlInvariant(
+                    "revocation receipt has an impossible scope-rekey intent",
+                ));
+            }
+            StoredControlEffect::Revocation { .. } | StoredControlEffect::ScopeEpoch { .. } => {}
+        }
+    }
+
+    for (key, encoded) in &snapshot.publication_intents {
+        let transfer_id = parse_control_transfer_id("control publication-intent table", key)?;
+        let record = decoded
+            .get(&transfer_id)
+            .ok_or(StoreError::ControlInvariant(
+                "control publication intent points to a missing record",
+            ))?;
+        if !snapshot.applied.contains_key(&record.sequence)
+            || !snapshot.reservations.contains_key(key)
+        {
+            return Err(StoreError::ControlInvariant(
+                "control publication intent is not paired with a local applied receipt",
+            ));
+        }
+        let intent = decode_scope_rekey_publication_intent(encoded)?;
+        validate_control_publication_intent(
+            Some(&intent),
+            Some(&decode_control_reservation(
+                snapshot
+                    .reservations
+                    .get(key)
+                    .ok_or(StoreError::ControlInvariant(
+                        "publication intent lost its reservation receipt",
+                    ))?,
+            )?),
+            record,
+        )
+        .map_err(|_| {
+            StoreError::ControlInvariant(
+                "control publication intent differs from committed control claims",
+            )
+        })?;
+    }
+
+    let publication_intent_bytes =
+        snapshot
+            .publication_intents
+            .values()
+            .try_fold(0u64, |total, encoded| {
+                total
+                    .checked_add(
+                        u64::try_from(encoded.len())
+                            .map_err(|_| StoreError::PayloadByteAccountingOverflow)?,
+                    )
+                    .ok_or(StoreError::PayloadByteAccountingOverflow)
+            })?;
+    let controls = u64::try_from(snapshot.records.len())
+        .map_err(|_| StoreError::ItemCountAccountingOverflow)?;
+    if controls > MAX_CONTROL_ITEMS
+        || total_bytes
+            .checked_add(publication_intent_bytes)
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?
+            > MAX_CONTROL_BYTES
+    {
+        return Err(StoreError::ControlInvariant(
+            "durable control usage exceeds its dedicated safety cap",
+        ));
+    }
+    Ok(ControlStoreStats {
+        controls,
+        applied: u64::try_from(snapshot.applied.len())
+            .map_err(|_| StoreError::ItemCountAccountingOverflow)?,
+        pending: u64::try_from(snapshot.pending.len())
+            .map_err(|_| StoreError::ItemCountAccountingOverflow)?,
+        total_sealed_bytes: total_bytes,
+        publication_intent_bytes,
+        head_sequence,
+        revocations: u64::try_from(snapshot.revocations.len())
+            .map_err(|_| StoreError::ItemCountAccountingOverflow)?,
+        scope_epochs: u64::try_from(snapshot.scope_epochs.len())
+            .map_err(|_| StoreError::ItemCountAccountingOverflow)?,
+        reservation_receipts: u64::try_from(snapshot.reservations.len())
+            .map_err(|_| StoreError::ItemCountAccountingOverflow)?,
+    })
+}
+
+fn audit_or_initialize_counter(
+    metadata: &mut redb::Table<'_, &str, u64>,
+    field: &'static str,
+    reconstructed: u64,
+) -> Result<(), StoreError> {
+    let durable = metadata.get(field)?.map(|value| value.value());
+    match durable {
+        Some(durable) if durable != reconstructed => Err(StoreError::AccountingMismatch {
+            field,
+            durable,
+            reconstructed,
+        }),
+        Some(_) => Ok(()),
+        None => {
+            metadata.insert(field, reconstructed)?;
+            Ok(())
+        }
+    }
+}
+
+fn audit_exact_u64_index(
+    table: &redb::Table<'_, &[u8], u64>,
+    expected: &std::collections::BTreeMap<Vec<u8>, u64>,
+    failure: &'static str,
+) -> Result<(), StoreError> {
+    if table.len()?
+        != u64::try_from(expected.len()).map_err(|_| StoreError::ItemCountAccountingOverflow)?
+    {
+        return Err(StoreError::SemanticInvariant(failure));
+    }
+    for row in table.iter()? {
+        let (key, value) = row?;
+        if value.value() == 0 || expected.get(key.value()) != Some(&value.value()) {
+            return Err(StoreError::SemanticInvariant(failure));
+        }
+    }
+    Ok(())
+}
+
+fn validate_event_header(header: &EnvelopeHeader) -> Result<(), StoreError> {
+    if header.class != SemanticDataClass::Event {
+        return Err(StoreError::InvalidSemanticEvent(
+            "authenticated data class is not Event",
+        ));
+    }
+    if header.stamp.dot.counter == 0 {
+        return Err(StoreError::InvalidSemanticEvent(
+            "causal counter must be nonzero",
+        ));
+    }
+    if header.stamp.context.len() > MAX_CAUSAL_CONTEXT_ENTRIES
+        || header
+            .stamp
+            .context
+            .iter()
+            .any(|(_, counter)| *counter == 0)
+        || header.stamp.context.counter(&header.stamp.dot.publisher) >= header.stamp.dot.counter
+    {
+        return Err(StoreError::InvalidSemanticEvent(
+            "causal context is internally inconsistent",
+        ));
+    }
+    if header.logical_key.len() > MAX_LOGICAL_KEY_BYTES {
+        return Err(StoreError::InvalidSemanticEvent(
+            "logical key exceeds 4096 bytes",
+        ));
+    }
+    if event_sequence(header)? == 0 {
+        return Err(StoreError::InvalidSemanticEvent(
+            "Event sequence must be nonzero",
+        ));
+    }
+    if header.blob_route.is_some() {
+        return Err(StoreError::InvalidSemanticEvent(
+            "Event cannot carry a Blob route commitment",
+        ));
+    }
+    if header.ttl_ms.is_some() {
+        return Err(StoreError::InvalidSemanticEvent(
+            "finite TTL requires a durable authenticated custody ledger",
+        ));
+    }
+    Ok(())
+}
+
+fn event_sequence(header: &EnvelopeHeader) -> Result<u64, StoreError> {
+    header
+        .event_sequence
+        .ok_or(StoreError::InvalidSemanticEvent(
+            "Event requires a source-authenticated sequence",
+        ))
+}
+
+fn event_domain_prefix(topic: &Topic, scope: &Scope) -> Result<Vec<u8>, StoreError> {
+    let mut key = Vec::with_capacity(4 + topic.as_str().len() + scope.as_str().len());
+    push_short_bytes(&mut key, topic.as_str().as_bytes())?;
+    push_short_bytes(&mut key, scope.as_str().as_bytes())?;
+    Ok(key)
+}
+
+fn causal_frontier_key(
+    topic: &Topic,
+    scope: &Scope,
+    publisher: NodeId,
+) -> Result<Vec<u8>, StoreError> {
+    let mut key = event_domain_prefix(topic, scope)?;
+    key.extend_from_slice(&publisher);
+    Ok(key)
+}
+
+fn event_stream_key(
+    publisher: NodeId,
+    topic: &Topic,
+    scope: &Scope,
+) -> Result<Vec<u8>, StoreError> {
+    let mut key = Vec::with_capacity(36 + topic.as_str().len() + scope.as_str().len());
+    key.extend_from_slice(&publisher);
+    key.extend_from_slice(&event_domain_prefix(topic, scope)?);
+    Ok(key)
+}
+
+fn accepted_dot_key(dot: Dot) -> [u8; 40] {
+    let mut key = [0u8; 40];
+    key[..32].copy_from_slice(&dot.publisher);
+    key[32..].copy_from_slice(&dot.counter.to_be_bytes());
+    key
+}
+
+fn accepted_event_key(
+    publisher: NodeId,
+    topic: &Topic,
+    scope: &Scope,
+    sequence: u64,
+) -> Result<Vec<u8>, StoreError> {
+    let mut key = event_stream_key(publisher, topic, scope)?;
+    key.extend_from_slice(&sequence.to_be_bytes());
+    Ok(key)
+}
+
+fn push_short_bytes(output: &mut Vec<u8>, bytes: &[u8]) -> Result<(), StoreError> {
+    let length = u16::try_from(bytes.len()).map_err(|_| {
+        StoreError::InvalidSemanticEvent("canonical name exceeds durable encoding bound")
+    })?;
+    output.extend_from_slice(&length.to_be_bytes());
+    output.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn encode_event_metadata(
+    transfer_id: EventTransferId,
+    semantic_id: EventSemanticId,
+    header: &EnvelopeHeader,
+) -> Result<Vec<u8>, StoreError> {
+    validate_event_header(header)?;
+    let sequence = event_sequence(header)?;
+    let mut output = Vec::new();
+    output.push(EVENT_METADATA_VERSION);
+    output.extend_from_slice(transfer_id.as_bytes());
+    output.extend_from_slice(semantic_id.as_bytes());
+    output.push(header.priority as u8);
+    let mut flags = 0u8;
+    if header.ttl_ms.is_some() {
+        flags |= 1;
+    }
+    if header.tombstone {
+        flags |= 2;
+    }
+    output.push(flags);
+    output.extend_from_slice(&header.stamp.dot.publisher);
+    output.extend_from_slice(&header.stamp.dot.counter.to_be_bytes());
+    output.extend_from_slice(&sequence.to_be_bytes());
+    output.extend_from_slice(&header.content_len.to_be_bytes());
+    output.extend_from_slice(&header.key_epoch.to_be_bytes());
+    if let Some(ttl_ms) = header.ttl_ms {
+        output.extend_from_slice(&ttl_ms.to_be_bytes());
+    }
+    push_short_bytes(&mut output, header.topic.as_str().as_bytes())?;
+    push_short_bytes(&mut output, header.scope.as_str().as_bytes())?;
+    let logical_length = u32::try_from(header.logical_key.len()).map_err(|_| {
+        StoreError::InvalidSemanticEvent("logical key exceeds durable encoding bound")
+    })?;
+    output.extend_from_slice(&logical_length.to_be_bytes());
+    output.extend_from_slice(&header.logical_key);
+    let context_length = u32::try_from(header.stamp.context.len()).map_err(|_| {
+        StoreError::InvalidSemanticEvent("causal context exceeds durable encoding bound")
+    })?;
+    output.extend_from_slice(&context_length.to_be_bytes());
+    for (publisher, counter) in header.stamp.context.iter() {
+        output.extend_from_slice(publisher);
+        output.extend_from_slice(&counter.to_be_bytes());
+    }
+    Ok(output)
+}
+
+fn decode_event_metadata(bytes: &[u8]) -> Result<EventMetadata, StoreError> {
+    let mut cursor = MetadataCursor::new(bytes);
+    if cursor.u8()? != EVENT_METADATA_VERSION {
+        return Err(StoreError::SemanticInvariant(
+            "unknown Event metadata encoding version",
+        ));
+    }
+    let transfer_id = EventTransferId::new(cursor.array()?);
+    let semantic_id = EventSemanticId::new(cursor.array()?);
+    let priority = Priority::from_wire(cursor.u8()?).ok_or(StoreError::SemanticInvariant(
+        "unknown authenticated Event priority",
+    ))?;
+    let flags = cursor.u8()?;
+    if flags & !3 != 0 {
+        return Err(StoreError::SemanticInvariant(
+            "Event metadata contains unknown flags",
+        ));
+    }
+    let publisher = cursor.array()?;
+    let counter = cursor.u64()?;
+    let sequence = cursor.u64()?;
+    let content_len = cursor.u64()?;
+    let key_epoch = cursor.u64()?;
+    let ttl_ms = if flags & 1 != 0 {
+        Some(cursor.u64()?)
+    } else {
+        None
+    };
+    let topic = Topic::new(cursor.short_string()?)
+        .map_err(|_| StoreError::SemanticInvariant("invalid Event topic encoding"))?;
+    let scope = Scope::new(cursor.short_string()?)
+        .map_err(|_| StoreError::SemanticInvariant("invalid Event scope encoding"))?;
+    let logical_length = usize::try_from(cursor.u32()?)
+        .map_err(|_| StoreError::SemanticInvariant("invalid Event logical-key length"))?;
+    if logical_length > MAX_LOGICAL_KEY_BYTES {
+        return Err(StoreError::SemanticInvariant(
+            "Event logical key exceeds its bound",
+        ));
+    }
+    let logical_key = cursor.take(logical_length)?.to_vec();
+    let context_length = usize::try_from(cursor.u32()?)
+        .map_err(|_| StoreError::SemanticInvariant("invalid Event context length"))?;
+    if context_length > MAX_CAUSAL_CONTEXT_ENTRIES {
+        return Err(StoreError::SemanticInvariant(
+            "Event causal context exceeds its bound",
+        ));
+    }
+    let mut context = VersionVector::default();
+    for _ in 0..context_length {
+        let context_publisher = cursor.array()?;
+        let context_counter = cursor.u64()?;
+        if context_counter == 0 || context.counter(&context_publisher) != 0 {
+            return Err(StoreError::SemanticInvariant(
+                "Event causal context is not canonical",
+            ));
+        }
+        context.observe(Dot {
+            publisher: context_publisher,
+            counter: context_counter,
+        });
+    }
+    cursor.finish()?;
+    let header = EnvelopeHeader {
+        class: SemanticDataClass::Event,
+        topic,
+        scope,
+        priority,
+        stamp: CausalStamp {
+            dot: Dot { publisher, counter },
+            context,
+        },
+        event_sequence: Some(sequence),
+        logical_key,
+        blob_route: None,
+        ttl_ms,
+        content_len,
+        tombstone: flags & 2 != 0,
+        key_epoch,
+    };
+    validate_event_header(&header).map_err(|_| {
+        StoreError::SemanticInvariant("decoded Event metadata is internally inconsistent")
+    })?;
+    Ok(EventMetadata {
+        transfer_id,
+        semantic_id,
+        header,
+    })
+}
+
+fn encode_operation_record(record: OperationRecord) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(66);
+    encoded.push(EVENT_OPERATION_VERSION);
+    encoded.extend_from_slice(record.transfer_id.as_bytes());
+    match record.predecessor {
+        Some(predecessor) => {
+            encoded.push(1);
+            encoded.extend_from_slice(predecessor.as_bytes());
+        }
+        None => encoded.push(0),
+    }
+    encoded
+}
+
+fn decode_operation_record(bytes: &[u8]) -> Result<OperationRecord, StoreError> {
+    let mut cursor = MetadataCursor::new(bytes);
+    if cursor.u8()? != EVENT_OPERATION_VERSION {
+        return Err(StoreError::SemanticInvariant(
+            "unknown Event operation encoding version",
+        ));
+    }
+    let transfer_id = EventTransferId::new(cursor.array()?);
+    let predecessor = match cursor.u8()? {
+        0 => None,
+        1 => Some(EventSemanticId::new(cursor.array()?)),
+        _ => {
+            return Err(StoreError::SemanticInvariant(
+                "invalid Event operation predecessor flag",
+            ));
+        }
+    };
+    cursor.finish()?;
+    Ok(OperationRecord {
+        transfer_id,
+        predecessor,
+    })
+}
+
+fn encode_control_record(record: &ControlRecord) -> Result<Vec<u8>, StoreError> {
+    validate_control_record(record)?;
+    let mut output = Vec::new();
+    output.push(CONTROL_METADATA_VERSION);
+    output.extend_from_slice(record.transfer_id.as_bytes());
+    output.extend_from_slice(&record.authority);
+    output.extend_from_slice(&record.signer);
+    output.extend_from_slice(&record.sequence.to_be_bytes());
+    match record.previous_control {
+        Some(previous) => {
+            output.push(1);
+            output.extend_from_slice(previous.as_bytes());
+        }
+        None => output.push(0),
+    }
+    match &record.effect {
+        StoredControlEffect::Revocation {
+            subject,
+            generation,
+        } => {
+            output.push(1);
+            output.extend_from_slice(subject);
+            output.extend_from_slice(&generation.to_be_bytes());
+        }
+        StoredControlEffect::ScopeEpoch { scope, epoch } => {
+            output.push(2);
+            let scope = scope.as_str().as_bytes();
+            let length = u16::try_from(scope.len())
+                .map_err(|_| StoreError::InvalidControl("scope exceeds encoded control bound"))?;
+            output.extend_from_slice(&length.to_be_bytes());
+            output.extend_from_slice(scope);
+            output.extend_from_slice(&epoch.to_be_bytes());
+        }
+    }
+    Ok(output)
+}
+
+fn decode_control_record(bytes: &[u8]) -> Result<ControlRecord, StoreError> {
+    let mut cursor = ControlDecodeCursor::new(bytes);
+    if cursor.u8()? != CONTROL_METADATA_VERSION {
+        return Err(StoreError::ControlInvariant(
+            "unsupported durable control metadata version",
+        ));
+    }
+    let transfer_id = ControlTransferId::new(cursor.array()?);
+    let authority = cursor.array()?;
+    let signer = cursor.array()?;
+    let sequence = cursor.u64()?;
+    let previous_control = match cursor.u8()? {
+        0 => None,
+        1 => Some(ControlTransferId::new(cursor.array()?)),
+        _ => {
+            return Err(StoreError::ControlInvariant(
+                "invalid previous-control presence tag",
+            ));
+        }
+    };
+    let effect = match cursor.u8()? {
+        1 => StoredControlEffect::Revocation {
+            subject: cursor.array()?,
+            generation: cursor.u64()?,
+        },
+        2 => {
+            let length = usize::from(cursor.u16()?);
+            let scope = std::str::from_utf8(cursor.take(length)?)
+                .map_err(|_| StoreError::ControlInvariant("control scope is not UTF-8"))?;
+            StoredControlEffect::ScopeEpoch {
+                scope: Scope::new(scope).map_err(|_| {
+                    StoreError::ControlInvariant("control scope is structurally invalid")
+                })?,
+                epoch: cursor.u64()?,
+            }
+        }
+        _ => {
+            return Err(StoreError::ControlInvariant(
+                "unknown durable mission-control kind",
+            ));
+        }
+    };
+    cursor.finish()?;
+    let record = ControlRecord {
+        transfer_id,
+        authority,
+        signer,
+        sequence,
+        previous_control,
+        effect,
+    };
+    validate_control_record(&record).map_err(|_| {
+        StoreError::ControlInvariant("stored control metadata has invalid chain or effect fields")
+    })?;
+    Ok(record)
+}
+
+fn encode_control_reservation(reservation: &ControlReservation) -> Vec<u8> {
+    let mut output = Vec::new();
+    output.push(CONTROL_RESERVATION_VERSION);
+    output.extend_from_slice(&reservation.authority);
+    output.extend_from_slice(&reservation.signer);
+    output.extend_from_slice(&reservation.previous_sequence.to_be_bytes());
+    output.extend_from_slice(&reservation.sequence.to_be_bytes());
+    match reservation.previous_control {
+        Some(previous) => {
+            output.push(1);
+            output.extend_from_slice(previous.as_bytes());
+        }
+        None => output.push(0),
+    }
+    output
+}
+
+fn decode_control_reservation(bytes: &[u8]) -> Result<ControlReservation, StoreError> {
+    let mut cursor = ControlDecodeCursor::new(bytes);
+    if cursor.u8()? != CONTROL_RESERVATION_VERSION {
+        return Err(StoreError::ControlInvariant(
+            "unsupported control reservation receipt version",
+        ));
+    }
+    let authority = cursor.array()?;
+    let signer = cursor.array()?;
+    let previous_sequence = cursor.u64()?;
+    let sequence = cursor.u64()?;
+    let previous_control = match cursor.u8()? {
+        0 => None,
+        1 => Some(ControlTransferId::new(cursor.array()?)),
+        _ => {
+            return Err(StoreError::ControlInvariant(
+                "invalid reservation predecessor tag",
+            ));
+        }
+    };
+    cursor.finish()?;
+    let reservation = ControlReservation {
+        authority,
+        signer,
+        previous_sequence,
+        sequence,
+        previous_control,
+    };
+    if reservation.previous_sequence.checked_add(1) != Some(reservation.sequence)
+        || (reservation.sequence == 1) != reservation.previous_control.is_none()
+    {
+        return Err(StoreError::ControlInvariant(
+            "durable control reservation receipt is inconsistent",
+        ));
+    }
+    Ok(reservation)
+}
+
+fn encode_scope_rekey_publication_intent(
+    intent: &ScopeRekeyPublicationIntent,
+) -> Result<Vec<u8>, StoreError> {
+    validate_scope_rekey_publication_intent_structure(intent)?;
+    let mut output = Vec::new();
+    output.push(CONTROL_PUBLICATION_INTENT_VERSION);
+    output.extend_from_slice(&intent.authority);
+    output.extend_from_slice(&intent.signer);
+    let scope = intent.scope.as_str().as_bytes();
+    let scope_len =
+        u16::try_from(scope.len()).map_err(|_| StoreError::InvalidControlPublicationIntent)?;
+    output.extend_from_slice(&scope_len.to_be_bytes());
+    output.extend_from_slice(scope);
+    output.extend_from_slice(&intent.epoch.to_be_bytes());
+    output.extend_from_slice(&intent.registry_identity);
+    output.extend_from_slice(&intent.registry_generation.to_be_bytes());
+    let recipient_count = u16::try_from(intent.recipients.len())
+        .map_err(|_| StoreError::InvalidControlPublicationIntent)?;
+    output.extend_from_slice(&recipient_count.to_be_bytes());
+    for recipient in &intent.recipients {
+        output.extend_from_slice(&recipient.node);
+        let access_mode = match (recipient.route_access, recipient.readable_topics.is_empty()) {
+            (true, true) => 0,
+            (true, false) => 1,
+            (false, false) => 2,
+            (false, true) => return Err(StoreError::InvalidControlPublicationIntent),
+        };
+        output.push(access_mode);
+        let topic_count = u16::try_from(recipient.readable_topics.len())
+            .map_err(|_| StoreError::InvalidControlPublicationIntent)?;
+        output.extend_from_slice(&topic_count.to_be_bytes());
+        for topic in &recipient.readable_topics {
+            let topic = topic.as_str().as_bytes();
+            let topic_len = u16::try_from(topic.len())
+                .map_err(|_| StoreError::InvalidControlPublicationIntent)?;
+            output.extend_from_slice(&topic_len.to_be_bytes());
+            output.extend_from_slice(topic);
+        }
+    }
+    Ok(output)
+}
+
+fn decode_scope_rekey_publication_intent(
+    bytes: &[u8],
+) -> Result<ScopeRekeyPublicationIntent, StoreError> {
+    let mut cursor = ControlDecodeCursor::new(bytes);
+    if cursor.u8()? != CONTROL_PUBLICATION_INTENT_VERSION {
+        return Err(StoreError::ControlInvariant(
+            "unsupported control publication-intent version",
+        ));
+    }
+    let authority = cursor.array()?;
+    let signer = cursor.array()?;
+    let scope_len = usize::from(cursor.u16()?);
+    let scope = std::str::from_utf8(cursor.take(scope_len)?)
+        .map_err(|_| StoreError::ControlInvariant("publication-intent scope is not UTF-8"))?;
+    let scope = Scope::new(scope)
+        .map_err(|_| StoreError::ControlInvariant("publication-intent scope is invalid"))?;
+    let epoch = cursor.u64()?;
+    let registry_identity = cursor.array()?;
+    let registry_generation = cursor.u64()?;
+    let recipient_count = usize::from(cursor.u16()?);
+    if recipient_count == 0 || recipient_count > MAX_CONTROL_INTENT_RECIPIENTS {
+        return Err(StoreError::ControlInvariant(
+            "publication-intent recipient bound is invalid",
+        ));
+    }
+    let mut recipients = Vec::with_capacity(recipient_count);
+    for _ in 0..recipient_count {
+        let node = cursor.array()?;
+        let access_mode = cursor.u8()?;
+        let topic_count = usize::from(cursor.u16()?);
+        if topic_count > MAX_CONTROL_INTENT_TOPICS_PER_RECIPIENT {
+            return Err(StoreError::ControlInvariant(
+                "publication-intent topic bound is invalid",
+            ));
+        }
+        let mut readable_topics = Vec::with_capacity(topic_count);
+        for _ in 0..topic_count {
+            let topic_len = usize::from(cursor.u16()?);
+            let topic = std::str::from_utf8(cursor.take(topic_len)?).map_err(|_| {
+                StoreError::ControlInvariant("publication-intent topic is not UTF-8")
+            })?;
+            readable_topics.push(Topic::new(topic).map_err(|_| {
+                StoreError::ControlInvariant("publication-intent topic is invalid")
+            })?);
+        }
+        let route_access = match (access_mode, topic_count) {
+            (0, 0) => true,
+            (1, 1..) => true,
+            (2, 1..) => false,
+            _ => {
+                return Err(StoreError::ControlInvariant(
+                    "publication-intent access mode is invalid",
+                ));
+            }
+        };
+        recipients.push(ScopeRekeyRecipientIntent {
+            node,
+            route_access,
+            readable_topics,
+        });
+    }
+    cursor.finish()?;
+    let intent = ScopeRekeyPublicationIntent {
+        authority,
+        signer,
+        scope,
+        epoch,
+        registry_identity,
+        registry_generation,
+        recipients,
+    };
+    validate_scope_rekey_publication_intent_structure(&intent).map_err(|_| {
+        StoreError::ControlInvariant("publication-intent encoding is not canonical")
+    })?;
+    Ok(intent)
+}
+
+fn validate_scope_rekey_publication_intent_structure(
+    intent: &ScopeRekeyPublicationIntent,
+) -> Result<(), StoreError> {
+    if intent.epoch == 0
+        || intent.registry_generation == 0
+        || intent.recipients.is_empty()
+        || intent.recipients.len() > MAX_CONTROL_INTENT_RECIPIENTS
+        || intent
+            .recipients
+            .windows(2)
+            .any(|pair| pair[0].node >= pair[1].node)
+        || intent.recipients.iter().any(|recipient| {
+            (!recipient.route_access && recipient.readable_topics.is_empty())
+                || recipient.readable_topics.len() > MAX_CONTROL_INTENT_TOPICS_PER_RECIPIENT
+                || recipient
+                    .readable_topics
+                    .windows(2)
+                    .any(|pair| pair[0] >= pair[1])
+        })
+    {
+        return Err(StoreError::InvalidControlPublicationIntent);
+    }
+    Ok(())
+}
+
+fn encode_control_head(sequence: u64, transfer_id: ControlTransferId) -> Vec<u8> {
+    let mut output = Vec::with_capacity(41);
+    output.push(CONTROL_HEAD_VERSION);
+    output.extend_from_slice(&sequence.to_be_bytes());
+    output.extend_from_slice(transfer_id.as_bytes());
+    output
+}
+
+fn decode_control_head(bytes: &[u8]) -> Result<(u64, ControlTransferId), StoreError> {
+    let mut cursor = ControlDecodeCursor::new(bytes);
+    if cursor.u8()? != CONTROL_HEAD_VERSION {
+        return Err(StoreError::ControlInvariant(
+            "unsupported mission-control head version",
+        ));
+    }
+    let sequence = cursor.u64()?;
+    let transfer_id = ControlTransferId::new(cursor.array()?);
+    cursor.finish()?;
+    if sequence == 0 {
+        return Err(StoreError::ControlInvariant(
+            "mission-control head sequence is zero",
+        ));
+    }
+    Ok((sequence, transfer_id))
+}
+
+fn encode_revocation_index(
+    authority: NodeId,
+    generation: u64,
+    transfer_id: ControlTransferId,
+) -> Vec<u8> {
+    let mut output = Vec::with_capacity(73);
+    output.push(CONTROL_EFFECT_INDEX_VERSION);
+    output.extend_from_slice(&authority);
+    output.extend_from_slice(&generation.to_be_bytes());
+    output.extend_from_slice(transfer_id.as_bytes());
+    output
+}
+
+fn decode_revocation_index(bytes: &[u8]) -> Result<(NodeId, u64, ControlTransferId), StoreError> {
+    let mut cursor = ControlDecodeCursor::new(bytes);
+    if cursor.u8()? != CONTROL_EFFECT_INDEX_VERSION {
+        return Err(StoreError::ControlInvariant(
+            "unsupported revocation index version",
+        ));
+    }
+    let authority = cursor.array()?;
+    let generation = cursor.u64()?;
+    let transfer_id = ControlTransferId::new(cursor.array()?);
+    cursor.finish()?;
+    if generation == 0 {
+        return Err(StoreError::ControlInvariant(
+            "revocation index generation is zero",
+        ));
+    }
+    Ok((authority, generation, transfer_id))
+}
+
+fn encode_scope_epoch_index(epoch: u64, transfer_id: ControlTransferId) -> Vec<u8> {
+    let mut output = Vec::with_capacity(41);
+    output.push(CONTROL_EFFECT_INDEX_VERSION);
+    output.extend_from_slice(&epoch.to_be_bytes());
+    output.extend_from_slice(transfer_id.as_bytes());
+    output
+}
+
+fn decode_scope_epoch_index(bytes: &[u8]) -> Result<(u64, ControlTransferId), StoreError> {
+    let mut cursor = ControlDecodeCursor::new(bytes);
+    if cursor.u8()? != CONTROL_EFFECT_INDEX_VERSION {
+        return Err(StoreError::ControlInvariant(
+            "unsupported scope-epoch index version",
+        ));
+    }
+    let epoch = cursor.u64()?;
+    let transfer_id = ControlTransferId::new(cursor.array()?);
+    cursor.finish()?;
+    if epoch == 0 {
+        return Err(StoreError::ControlInvariant(
+            "scope-epoch index value is zero",
+        ));
+    }
+    Ok((epoch, transfer_id))
+}
+
+struct ControlDecodeCursor<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> ControlDecodeCursor<'a> {
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn take(&mut self, length: usize) -> Result<&'a [u8], StoreError> {
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or(StoreError::ControlInvariant(
+                "control metadata length overflow",
+            ))?;
+        let value = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or(StoreError::ControlInvariant(
+                "control metadata is truncated",
+            ))?;
+        self.offset = end;
+        Ok(value)
+    }
+
+    fn u8(&mut self) -> Result<u8, StoreError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, StoreError> {
+        Ok(u16::from_be_bytes(
+            self.take(2)?.try_into().expect("two bytes"),
+        ))
+    }
+
+    fn u64(&mut self) -> Result<u64, StoreError> {
+        Ok(u64::from_be_bytes(
+            self.take(8)?.try_into().expect("eight bytes"),
+        ))
+    }
+
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], StoreError> {
+        Ok(self.take(N)?.try_into().expect("exact checked length"))
+    }
+
+    fn finish(self) -> Result<(), StoreError> {
+        if self.offset == self.bytes.len() {
+            Ok(())
+        } else {
+            Err(StoreError::ControlInvariant(
+                "control metadata has trailing bytes",
+            ))
+        }
+    }
+}
+
+fn decode_stored_control(
+    transfer_id: ControlTransferId,
+    encoded: &[u8],
+    sealed: Vec<u8>,
+    applied: bool,
+) -> Result<StoredControl, StoreError> {
+    let record = decode_control_record(encoded)?;
+    if record.transfer_id != transfer_id {
+        return Err(StoreError::ControlInvariant(
+            "control metadata transfer identity differs from its key",
+        ));
+    }
+    if ControlTransferId::new(Sha256::digest(&sealed).into()) != transfer_id {
+        return Err(StoreError::ControlInvariant(
+            "control exact bytes differ from their transfer identity",
+        ));
+    }
+    Ok(StoredControl {
+        transfer_id,
+        authority: record.authority,
+        signer: record.signer,
+        sequence: record.sequence,
+        previous_control: record.previous_control,
+        effect: record.effect,
+        sealed,
+        applied,
+    })
+}
+
+fn load_control_write(
+    write: &redb::WriteTransaction,
+    transfer_id: ControlTransferId,
+) -> Result<Option<StoredControl>, StoreError> {
+    let encoded = write
+        .open_table(CONTROL_RECORDS)?
+        .get(transfer_id.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec());
+    let Some(encoded) = encoded else {
+        return Ok(None);
+    };
+    let sealed = write
+        .open_table(CONTROL_BYTES)?
+        .get(transfer_id.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec())
+        .ok_or(StoreError::ControlInvariant(
+            "control metadata is missing exact bytes",
+        ))?;
+    let record = decode_control_record(&encoded)?;
+    let pending = write
+        .open_table(CONTROL_PENDING)?
+        .get(record.sequence)?
+        .map(|value| value.value().to_vec());
+    let applied = write
+        .open_table(CONTROL_APPLIED)?
+        .get(record.sequence)?
+        .map(|value| value.value().to_vec());
+    let is_applied = match (pending, applied) {
+        (Some(id), None) if id == transfer_id.as_bytes() => false,
+        (None, Some(id)) if id == transfer_id.as_bytes() => true,
+        _ => {
+            return Err(StoreError::ControlInvariant(
+                "control is not in exactly one pending or applied index",
+            ));
+        }
+    };
+    decode_stored_control(transfer_id, &encoded, sealed, is_applied).map(Some)
+}
+
+fn load_control_read(
+    read: &redb::ReadTransaction,
+    transfer_id: ControlTransferId,
+) -> Result<Option<StoredControl>, StoreError> {
+    let encoded = read
+        .open_table(CONTROL_RECORDS)?
+        .get(transfer_id.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec());
+    let Some(encoded) = encoded else {
+        return Ok(None);
+    };
+    let sealed = read
+        .open_table(CONTROL_BYTES)?
+        .get(transfer_id.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec())
+        .ok_or(StoreError::ControlInvariant(
+            "control metadata is missing exact bytes",
+        ))?;
+    let record = decode_control_record(&encoded)?;
+    let pending = read
+        .open_table(CONTROL_PENDING)?
+        .get(record.sequence)?
+        .map(|value| value.value().to_vec());
+    let applied = read
+        .open_table(CONTROL_APPLIED)?
+        .get(record.sequence)?
+        .map(|value| value.value().to_vec());
+    let is_applied = match (pending, applied) {
+        (Some(id), None) if id == transfer_id.as_bytes() => false,
+        (None, Some(id)) if id == transfer_id.as_bytes() => true,
+        _ => {
+            return Err(StoreError::ControlInvariant(
+                "control is not in exactly one pending or applied index",
+            ));
+        }
+    };
+    decode_stored_control(transfer_id, &encoded, sealed, is_applied).map(Some)
+}
+
+fn read_control_head(
+    read: &redb::ReadTransaction,
+) -> Result<Option<(u64, ControlTransferId)>, StoreError> {
+    read.open_table(CONTROL_HEAD)?
+        .get(CONTROL_HEAD_KEY)?
+        .map(|value| decode_control_head(value.value()))
+        .transpose()
+}
+
+fn read_control_head_write(
+    write: &redb::WriteTransaction,
+) -> Result<Option<(u64, ControlTransferId)>, StoreError> {
+    write
+        .open_table(CONTROL_HEAD)?
+        .get(CONTROL_HEAD_KEY)?
+        .map(|value| decode_control_head(value.value()))
+        .transpose()
+}
+
+fn control_policy_snapshot_read(
+    read: &redb::ReadTransaction,
+    authority: NodeId,
+) -> Result<ControlPolicySnapshot, StoreError> {
+    let pending = read.open_table(CONTROL_PENDING)?.len()?;
+    if pending != 0 {
+        return Err(StoreError::ControlPolicyUnsettled { pending });
+    }
+    Ok(ControlPolicySnapshot {
+        authority,
+        head: read_control_head(read)?,
+    })
+}
+
+fn require_control_policy_read(
+    read: &redb::ReadTransaction,
+    authority: NodeId,
+    expected: &ControlPolicySnapshot,
+) -> Result<(), StoreError> {
+    if expected.authority != authority {
+        return Err(StoreError::MissionAuthorityMismatch {
+            bound: authority,
+            received: expected.authority,
+        });
+    }
+    let current = control_policy_snapshot_read(read, authority)?;
+    if current != *expected {
+        return Err(StoreError::ControlPolicyChanged);
+    }
+    Ok(())
+}
+
+fn enforce_event_policy_write(
+    write: &redb::WriteTransaction,
+    authority: NodeId,
+    expected: Option<&ControlPolicySnapshot>,
+    header: &EnvelopeHeader,
+) -> Result<(), StoreError> {
+    if let Some(expected) = expected
+        && expected.authority != authority
+    {
+        return Err(StoreError::MissionAuthorityMismatch {
+            bound: authority,
+            received: expected.authority,
+        });
+    }
+    let pending = write.open_table(CONTROL_PENDING)?.len()?;
+    if pending != 0 {
+        return Err(StoreError::ControlPolicyUnsettled { pending });
+    }
+    if let Some(expected) = expected
+        && read_control_head_write(write)? != expected.head
+    {
+        return Err(StoreError::ControlPolicyChanged);
+    }
+    let publisher = header.stamp.dot.publisher;
+    if control_principal_revoked_write(write, publisher)? {
+        return Err(StoreError::EventPublisherRevoked(publisher));
+    }
+    if let Some((current, _)) = write
+        .open_table(CONTROL_SCOPE_EPOCHS)?
+        .get(header.scope.as_str())?
+        .map(|value| decode_scope_epoch_index(value.value()))
+        .transpose()?
+        && header.key_epoch < current
+    {
+        return Err(StoreError::EventKeyEpochStale {
+            current,
+            received: header.key_epoch,
+        });
+    }
+    Ok(())
+}
+
+fn control_principal_revoked_read(
+    read: &redb::ReadTransaction,
+    principal: NodeId,
+) -> Result<bool, StoreError> {
+    Ok(read
+        .open_table(CONTROL_REVOCATIONS)?
+        .get(principal.as_slice())?
+        .is_some())
+}
+
+fn control_principal_revoked_write(
+    write: &redb::WriteTransaction,
+    principal: NodeId,
+) -> Result<bool, StoreError> {
+    Ok(write
+        .open_table(CONTROL_REVOCATIONS)?
+        .get(principal.as_slice())?
+        .is_some())
+}
+
+struct MetadataCursor<'a> {
+    bytes: &'a [u8],
+    position: usize,
+}
+
+impl<'a> MetadataCursor<'a> {
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, position: 0 }
+    }
+
+    fn take(&mut self, length: usize) -> Result<&'a [u8], StoreError> {
+        let end = self
+            .position
+            .checked_add(length)
+            .ok_or(StoreError::SemanticInvariant(
+                "Event metadata length overflow",
+            ))?;
+        let value = self
+            .bytes
+            .get(self.position..end)
+            .ok_or(StoreError::SemanticInvariant("truncated Event metadata"))?;
+        self.position = end;
+        Ok(value)
+    }
+
+    fn u8(&mut self) -> Result<u8, StoreError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, StoreError> {
+        Ok(u16::from_be_bytes(self.take(2)?.try_into().map_err(
+            |_| StoreError::SemanticInvariant("invalid Event metadata u16"),
+        )?))
+    }
+
+    fn u32(&mut self) -> Result<u32, StoreError> {
+        Ok(u32::from_be_bytes(self.take(4)?.try_into().map_err(
+            |_| StoreError::SemanticInvariant("invalid Event metadata u32"),
+        )?))
+    }
+
+    fn u64(&mut self) -> Result<u64, StoreError> {
+        Ok(u64::from_be_bytes(self.take(8)?.try_into().map_err(
+            |_| StoreError::SemanticInvariant("invalid Event metadata u64"),
+        )?))
+    }
+
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], StoreError> {
+        self.take(N)?
+            .try_into()
+            .map_err(|_| StoreError::SemanticInvariant("invalid Event metadata array"))
+    }
+
+    fn short_string(&mut self) -> Result<String, StoreError> {
+        let length = usize::from(self.u16()?);
+        String::from_utf8(self.take(length)?.to_vec())
+            .map_err(|_| StoreError::SemanticInvariant("Event metadata name is not UTF-8"))
+    }
+
+    fn finish(self) -> Result<(), StoreError> {
+        if self.position != self.bytes.len() {
+            return Err(StoreError::SemanticInvariant(
+                "Event metadata contains trailing bytes",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn parse_transfer_id(table: &'static str, bytes: &[u8]) -> Result<EventTransferId, StoreError> {
+    let bytes: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| StoreError::InvalidStoredIdLength {
+            table,
+            length: bytes.len(),
+        })?;
+    Ok(EventTransferId::new(bytes))
+}
+
+fn parse_control_transfer_id(
+    table: &'static str,
+    bytes: &[u8],
+) -> Result<ControlTransferId, StoreError> {
+    let bytes: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| StoreError::InvalidStoredIdLength {
+            table,
+            length: bytes.len(),
+        })?;
+    Ok(ControlTransferId::new(bytes))
+}
+
+fn parse_semantic_id(table: &'static str, bytes: &[u8]) -> Result<EventSemanticId, StoreError> {
+    let bytes: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| StoreError::InvalidStoredIdLength {
+            table,
+            length: bytes.len(),
+        })?;
+    Ok(EventSemanticId::new(bytes))
+}
+
+fn parse_node_id(table: &'static str, bytes: &[u8]) -> Result<NodeId, StoreError> {
+    bytes
+        .try_into()
+        .map_err(|_| StoreError::InvalidStoredIdLength {
+            table,
+            length: bytes.len(),
+        })
+}
+
+fn inspect_control_tables(
+    read: &redb::ReadTransaction,
+    mission_authority: Option<NodeId>,
+) -> Result<Option<ControlStoreStats>, StoreError> {
+    let table_names = read
+        .list_tables()?
+        .map(|table| table.name().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    let control_tables = [
+        CONTROL_RECORDS.name(),
+        CONTROL_BYTES.name(),
+        CONTROL_SEQUENCE.name(),
+        CONTROL_PENDING.name(),
+        CONTROL_APPLIED.name(),
+        CONTROL_REVOCATIONS.name(),
+        CONTROL_SCOPE_EPOCHS.name(),
+        CONTROL_RESERVATIONS.name(),
+        CONTROL_PUBLICATION_INTENTS.name(),
+        CONTROL_HEAD.name(),
+    ];
+    let present = control_tables
+        .iter()
+        .filter(|name| table_names.contains(**name))
+        .count();
+    if present == 0 {
+        if table_names.contains(METADATA.name()) {
+            let metadata = read.open_table(METADATA)?;
+            if metadata.get(CONTROL_ITEM_COUNT)?.is_some()
+                || metadata.get(CONTROL_TOTAL_BYTES)?.is_some()
+                || metadata
+                    .get(CONTROL_PUBLICATION_INTENT_TOTAL_BYTES)?
+                    .is_some()
+            {
+                return Err(StoreError::ControlInvariant(
+                    "mission-control accounting exists without its schema",
+                ));
+            }
+        }
+        return Ok(None);
+    }
+    if present != control_tables.len() {
+        return Err(StoreError::ControlInvariant(
+            "mission-control schema is incomplete",
+        ));
+    }
+
+    let records = read.open_table(CONTROL_RECORDS)?;
+    let bytes = read.open_table(CONTROL_BYTES)?;
+    let sequence = read.open_table(CONTROL_SEQUENCE)?;
+    let pending = read.open_table(CONTROL_PENDING)?;
+    let applied = read.open_table(CONTROL_APPLIED)?;
+    let revocations = read.open_table(CONTROL_REVOCATIONS)?;
+    let scope_epochs = read.open_table(CONTROL_SCOPE_EPOCHS)?;
+    let reservations = read.open_table(CONTROL_RESERVATIONS)?;
+    let publication_intents = read.open_table(CONTROL_PUBLICATION_INTENTS)?;
+    let head = read.open_table(CONTROL_HEAD)?;
+    let events = read.open_table(EVENTS)?;
+    let route_cache = read.open_table(ROUTE_CACHE)?;
+    let mut snapshot = ControlAuditSnapshot::default();
+    for row in records.iter()? {
+        let (key, value) = row?;
+        snapshot
+            .records
+            .insert(key.value().to_vec(), value.value().to_vec());
+    }
+    for row in bytes.iter()? {
+        let (key, value) = row?;
+        snapshot
+            .bytes
+            .insert(key.value().to_vec(), value.value().to_vec());
+    }
+    for row in sequence.iter()? {
+        let (key, value) = row?;
+        snapshot
+            .sequence
+            .insert(key.value(), value.value().to_vec());
+    }
+    for row in pending.iter()? {
+        let (key, value) = row?;
+        snapshot.pending.insert(key.value(), value.value().to_vec());
+    }
+    for row in applied.iter()? {
+        let (key, value) = row?;
+        snapshot.applied.insert(key.value(), value.value().to_vec());
+    }
+    for row in revocations.iter()? {
+        let (key, value) = row?;
+        snapshot
+            .revocations
+            .insert(key.value().to_vec(), value.value().to_vec());
+    }
+    for row in scope_epochs.iter()? {
+        let (key, value) = row?;
+        snapshot
+            .scope_epochs
+            .insert(key.value().to_owned(), value.value().to_vec());
+    }
+    for row in reservations.iter()? {
+        let (key, value) = row?;
+        snapshot
+            .reservations
+            .insert(key.value().to_vec(), value.value().to_vec());
+    }
+    for row in publication_intents.iter()? {
+        let (key, value) = row?;
+        snapshot
+            .publication_intents
+            .insert(key.value().to_vec(), value.value().to_vec());
+    }
+    for row in head.iter()? {
+        let (key, value) = row?;
+        snapshot
+            .head
+            .insert(key.value().to_owned(), value.value().to_vec());
+    }
+    for row in events.iter()? {
+        let (key, _) = row?;
+        snapshot.event_ids.insert(key.value().to_vec());
+    }
+    for row in route_cache.iter()? {
+        let (key, _) = row?;
+        snapshot.route_cache_ids.insert(key.value().to_vec());
+    }
+    let stats = validate_control_snapshot(&snapshot, mission_authority)?;
+    let metadata = read.open_table(METADATA)?;
+    for (field, reconstructed) in [
+        (CONTROL_ITEM_COUNT, stats.controls),
+        (CONTROL_TOTAL_BYTES, stats.total_sealed_bytes),
+        (
+            CONTROL_PUBLICATION_INTENT_TOTAL_BYTES,
+            stats.publication_intent_bytes,
+        ),
+    ] {
+        let durable = metadata
+            .get(field)?
+            .ok_or(StoreError::MissingAccountingMetadata { field })?
+            .value();
+        if durable != reconstructed {
+            return Err(StoreError::AccountingMismatch {
+                field,
+                durable,
+                reconstructed,
+            });
+        }
+    }
+    Ok(Some(stats))
+}
+
+fn inspect_semantic_readable(
+    read: &redb::ReadTransaction,
+) -> Result<(EventStoreStats, Option<NodeId>), StoreError> {
+    let table_names = read
+        .list_tables()?
+        .map(|table| table.name().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    let semantic_tables = [
+        EVENTS.name(),
+        EVENT_BYTES.name(),
+        EVENT_ACCEPTANCE_MARKERS.name(),
+        SEMANTIC_ITEMS.name(),
+        ACCEPTED_DOTS.name(),
+        ACCEPTED_EVENTS.name(),
+        CAUSAL_FRONTIER.name(),
+        PUBLISHER_HIGH_WATER.name(),
+        EVENT_HIGH_WATER.name(),
+        EVENT_OPERATIONS.name(),
+        ROUTE_CACHE.name(),
+        ROUTE_CACHE_CLAIMS.name(),
+        SEMANTIC_DOMAIN.name(),
+    ];
+    let present = semantic_tables
+        .iter()
+        .filter(|name| table_names.contains(**name))
+        .count();
+    if present == 0 {
+        return Ok((EventStoreStats::default(), None));
+    }
+    if present != semantic_tables.len() {
+        return Err(StoreError::SemanticInvariant(
+            "mission-scoped Event schema is incomplete",
+        ));
+    }
+
+    let events = read.open_table(EVENTS)?;
+    let event_bytes = read.open_table(EVENT_BYTES)?;
+    let event_markers = read.open_table(EVENT_ACCEPTANCE_MARKERS)?;
+    let semantic_items = read.open_table(SEMANTIC_ITEMS)?;
+    let accepted_dots = read.open_table(ACCEPTED_DOTS)?;
+    let accepted_events = read.open_table(ACCEPTED_EVENTS)?;
+    let frontier = read.open_table(CAUSAL_FRONTIER)?;
+    let publisher_high_water = read.open_table(PUBLISHER_HIGH_WATER)?;
+    let event_high_water = read.open_table(EVENT_HIGH_WATER)?;
+    let operations = read.open_table(EVENT_OPERATIONS)?;
+    let route_cache = read.open_table(ROUTE_CACHE)?;
+    let route_claims = read.open_table(ROUTE_CACHE_CLAIMS)?;
+    let domain = read.open_table(SEMANTIC_DOMAIN)?;
+    let metadata = read.open_table(METADATA)?;
+    let mission_authority = domain
+        .get(MISSION_AUTHORITY_ID)?
+        .map(|value| parse_node_id("semantic mission authority", value.value()))
+        .transpose()?;
+
+    let mut event_count = 0u64;
+    let mut total_sealed_bytes = 0u64;
+    let mut last_acceptance_marker = 0u64;
+    let mut marker_values = std::collections::BTreeSet::new();
+    let mut expected_dots = std::collections::BTreeMap::<Vec<u8>, EventSemanticId>::new();
+    let mut expected_positions = std::collections::BTreeMap::<Vec<u8>, EventSemanticId>::new();
+    let mut expected_publisher_high = std::collections::BTreeMap::<Vec<u8>, u64>::new();
+    let mut expected_event_high = std::collections::BTreeMap::<Vec<u8>, u64>::new();
+    let mut expected_frontier = std::collections::BTreeMap::<Vec<u8>, u64>::new();
+    let mut domain_publishers =
+        std::collections::BTreeMap::<Vec<u8>, std::collections::BTreeSet<NodeId>>::new();
+    for row in events.iter()? {
+        let (key, value) = row?;
+        let transfer_id = parse_transfer_id("Event metadata table", key.value())?;
+        let event = decode_event_metadata(value.value())?;
+        if event.transfer_id != transfer_id {
+            return Err(StoreError::SemanticInvariant(
+                "Event metadata transfer identity differs from its table key",
+            ));
+        }
+        let sealed = event_bytes
+            .get(key.value())?
+            .ok_or(StoreError::SemanticInvariant(
+                "Event metadata is missing exact source bytes",
+            ))?;
+        if EventTransferId::new(Sha256::digest(sealed.value()).into()) != transfer_id {
+            return Err(StoreError::SemanticInvariant(
+                "Event source bytes fail exact transfer identity audit",
+            ));
+        }
+        let marker = event_markers
+            .get(key.value())?
+            .map(|value| value.value())
+            .ok_or(StoreError::SemanticInvariant(
+                "Event metadata is missing its acceptance marker",
+            ))?;
+        if marker == 0 || !marker_values.insert(marker) {
+            return Err(StoreError::SemanticInvariant(
+                "semantic acceptance markers must be nonzero and unique",
+            ));
+        }
+        let indexed = semantic_items
+            .get(event.semantic_id.as_bytes().as_slice())?
+            .map(|value| parse_transfer_id("semantic item table", value.value()))
+            .transpose()?
+            .ok_or(StoreError::SemanticInvariant(
+                "Event metadata is missing its semantic item index",
+            ))?;
+        if indexed != transfer_id {
+            return Err(StoreError::SemanticInvariant(
+                "semantic item index points to another Event representation",
+            ));
+        }
+        let dot = event.header.stamp.dot;
+        let dot_key = accepted_dot_key(dot).to_vec();
+        if expected_dots
+            .insert(dot_key.clone(), event.semantic_id)
+            .is_some()
+        {
+            return Err(StoreError::SemanticInvariant(
+                "multiple Events claim one accepted causal dot",
+            ));
+        }
+        let dot_semantic = accepted_dots
+            .get(dot_key.as_slice())?
+            .map(|value| parse_semantic_id("accepted dot table", value.value()))
+            .transpose()?
+            .ok_or(StoreError::SemanticInvariant(
+                "Event metadata is missing its accepted-dot ledger row",
+            ))?;
+        if dot_semantic != event.semantic_id {
+            return Err(StoreError::SemanticInvariant(
+                "accepted-dot ledger points to another semantic item",
+            ));
+        }
+        let sequence = event_sequence(&event.header)?;
+        let position = accepted_event_key(
+            dot.publisher,
+            &event.header.topic,
+            &event.header.scope,
+            sequence,
+        )?;
+        if expected_positions
+            .insert(position.clone(), event.semantic_id)
+            .is_some()
+        {
+            return Err(StoreError::SemanticInvariant(
+                "multiple Events claim one accepted stream position",
+            ));
+        }
+        let position_semantic = accepted_events
+            .get(position.as_slice())?
+            .map(|value| parse_semantic_id("accepted Event table", value.value()))
+            .transpose()?
+            .ok_or(StoreError::SemanticInvariant(
+                "Event metadata is missing its accepted-position ledger row",
+            ))?;
+        if position_semantic != event.semantic_id {
+            return Err(StoreError::SemanticInvariant(
+                "accepted Event position points to another semantic item",
+            ));
+        }
+        expected_publisher_high
+            .entry(dot.publisher.to_vec())
+            .and_modify(|current| *current = (*current).max(dot.counter))
+            .or_insert(dot.counter);
+        let stream = event_stream_key(dot.publisher, &event.header.topic, &event.header.scope)?;
+        expected_event_high
+            .entry(stream)
+            .and_modify(|current| *current = (*current).max(sequence))
+            .or_insert(sequence);
+        let frontier_key =
+            causal_frontier_key(&event.header.topic, &event.header.scope, dot.publisher)?;
+        expected_frontier
+            .entry(frontier_key)
+            .and_modify(|current| *current = (*current).max(dot.counter))
+            .or_insert(dot.counter);
+        domain_publishers
+            .entry(event_domain_prefix(
+                &event.header.topic,
+                &event.header.scope,
+            )?)
+            .or_default()
+            .insert(dot.publisher);
+        event_count = event_count
+            .checked_add(1)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        total_sealed_bytes = total_sealed_bytes
+            .checked_add(
+                u64::try_from(sealed.value().len())
+                    .map_err(|_| StoreError::PayloadByteAccountingOverflow)?,
+            )
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        last_acceptance_marker = last_acceptance_marker.max(marker);
+    }
+    if last_acceptance_marker != event_count || marker_values.iter().copied().ne(1..=event_count) {
+        return Err(StoreError::SemanticInvariant(
+            "semantic acceptance markers are not a contiguous allocation history",
+        ));
+    }
+    if domain_publishers
+        .values()
+        .any(|publishers| publishers.len() > MAX_CAUSAL_CONTEXT_ENTRIES)
+    {
+        return Err(StoreError::SemanticInvariant(
+            "causal frontier exceeds the proven context bound",
+        ));
+    }
+    for row in event_bytes.iter()? {
+        let (key, _) = row?;
+        parse_transfer_id("semantic Event byte table", key.value())?;
+        if events.get(key.value())?.is_none() {
+            return Err(StoreError::SemanticInvariant(
+                "semantic Event bytes are missing metadata",
+            ));
+        }
+    }
+    for row in event_markers.iter()? {
+        let (key, _) = row?;
+        parse_transfer_id("semantic Event marker table", key.value())?;
+        if events.get(key.value())?.is_none() {
+            return Err(StoreError::SemanticInvariant(
+                "semantic Event marker is missing metadata",
+            ));
+        }
+    }
+    for row in semantic_items.iter()? {
+        let (key, value) = row?;
+        let semantic_id = parse_semantic_id("semantic item table", key.value())?;
+        let transfer_id = parse_transfer_id("semantic item table", value.value())?;
+        let encoded =
+            events
+                .get(transfer_id.as_bytes().as_slice())?
+                .ok_or(StoreError::SemanticInvariant(
+                    "semantic item index points to a missing Event",
+                ))?;
+        if decode_event_metadata(encoded.value())?.semantic_id != semantic_id {
+            return Err(StoreError::SemanticInvariant(
+                "semantic item index key differs from Event metadata",
+            ));
+        }
+    }
+    if accepted_dots.len()?
+        != u64::try_from(expected_dots.len())
+            .map_err(|_| StoreError::ItemCountAccountingOverflow)?
+    {
+        return Err(StoreError::SemanticInvariant(
+            "accepted-dot ledger has missing or orphan rows",
+        ));
+    }
+    for row in accepted_dots.iter()? {
+        let (key, value) = row?;
+        let semantic_id = parse_semantic_id("accepted dot table", value.value())?;
+        if expected_dots.get(key.value()) != Some(&semantic_id) {
+            return Err(StoreError::SemanticInvariant(
+                "accepted-dot ledger contains an orphan or mismatched row",
+            ));
+        }
+    }
+    if accepted_events.len()?
+        != u64::try_from(expected_positions.len())
+            .map_err(|_| StoreError::ItemCountAccountingOverflow)?
+    {
+        return Err(StoreError::SemanticInvariant(
+            "accepted Event-position ledger has missing or orphan rows",
+        ));
+    }
+    for row in accepted_events.iter()? {
+        let (key, value) = row?;
+        let semantic_id = parse_semantic_id("accepted Event table", value.value())?;
+        if expected_positions.get(key.value()) != Some(&semantic_id) {
+            return Err(StoreError::SemanticInvariant(
+                "accepted Event-position ledger contains an orphan or mismatched row",
+            ));
+        }
+    }
+    if publisher_high_water.len()?
+        != u64::try_from(expected_publisher_high.len())
+            .map_err(|_| StoreError::ItemCountAccountingOverflow)?
+    {
+        return Err(StoreError::SemanticInvariant(
+            "publisher high-water contains an orphan, missing, or inflated row",
+        ));
+    }
+    for row in publisher_high_water.iter()? {
+        let (key, value) = row?;
+        parse_node_id("publisher high-water", key.value())?;
+        if value.value() == 0 || expected_publisher_high.get(key.value()) != Some(&value.value()) {
+            return Err(StoreError::SemanticInvariant(
+                "publisher high-water contains an orphan, missing, or inflated row",
+            ));
+        }
+    }
+    if event_high_water.len()?
+        != u64::try_from(expected_event_high.len())
+            .map_err(|_| StoreError::ItemCountAccountingOverflow)?
+    {
+        return Err(StoreError::SemanticInvariant(
+            "Event stream high-water contains an orphan, missing, or inflated row",
+        ));
+    }
+    for row in event_high_water.iter()? {
+        let (key, value) = row?;
+        if value.value() == 0 || expected_event_high.get(key.value()) != Some(&value.value()) {
+            return Err(StoreError::SemanticInvariant(
+                "Event stream high-water contains an orphan, missing, or inflated row",
+            ));
+        }
+    }
+    if frontier.len()?
+        != u64::try_from(expected_frontier.len())
+            .map_err(|_| StoreError::ItemCountAccountingOverflow)?
+    {
+        return Err(StoreError::SemanticInvariant(
+            "causal frontier contains an orphan, missing, or inflated row",
+        ));
+    }
+    for row in frontier.iter()? {
+        let (key, value) = row?;
+        if value.value() == 0 || expected_frontier.get(key.value()) != Some(&value.value()) {
+            return Err(StoreError::SemanticInvariant(
+                "causal frontier contains an orphan, missing, or inflated row",
+            ));
+        }
+    }
+    for row in operations.iter()? {
+        let (key, value) = row?;
+        EventOperationKey::new(key.value().to_vec())?;
+        let record = decode_operation_record(value.value())?;
+        let reaction = events
+            .get(record.transfer_id.as_bytes().as_slice())?
+            .map(|value| decode_event_metadata(value.value()))
+            .transpose()?
+            .ok_or(StoreError::SemanticInvariant(
+                "Event operation points to a missing Event",
+            ))?;
+        if let Some(predecessor) = record.predecessor {
+            let predecessor_transfer = semantic_items
+                .get(predecessor.as_bytes().as_slice())?
+                .map(|value| parse_transfer_id("semantic item table", value.value()))
+                .transpose()?
+                .ok_or(StoreError::SemanticInvariant(
+                    "Event operation predecessor is missing",
+                ))?;
+            let predecessor = events
+                .get(predecessor_transfer.as_bytes().as_slice())?
+                .map(|value| decode_event_metadata(value.value()))
+                .transpose()?
+                .ok_or(StoreError::SemanticInvariant(
+                    "Event operation predecessor metadata is missing",
+                ))?;
+            if !reaction
+                .header
+                .stamp
+                .context
+                .observes(predecessor.header.stamp.dot)
+            {
+                return Err(StoreError::SemanticInvariant(
+                    "Event operation result does not observe its predecessor",
+                ));
+            }
+        }
+    }
+
+    let mut route_count = 0u64;
+    let mut route_bytes = 0u64;
+    let mut route_semantic_counts = std::collections::BTreeMap::<EventSemanticId, u64>::new();
+    for row in route_cache.iter()? {
+        let (key, value) = row?;
+        let transfer_id = parse_transfer_id("route Event cache", key.value())?;
+        if events.get(key.value())?.is_some() {
+            return Err(StoreError::SemanticInvariant(
+                "one transfer identity exists in semantic and route-cache namespaces",
+            ));
+        }
+        if EventTransferId::new(Sha256::digest(value.value()).into()) != transfer_id {
+            return Err(StoreError::SemanticInvariant(
+                "route-cache bytes fail exact transfer identity audit",
+            ));
+        }
+        let claim = route_claims
+            .get(key.value())?
+            .map(|value| decode_event_metadata(value.value()))
+            .transpose()?
+            .ok_or(StoreError::SemanticInvariant(
+                "route-cache bytes are missing their route claim",
+            ))?;
+        if claim.transfer_id != transfer_id {
+            return Err(StoreError::SemanticInvariant(
+                "route-cache claim differs from its transfer key",
+            ));
+        }
+        if let Some(accepted) = semantic_items
+            .get(claim.semantic_id.as_bytes().as_slice())?
+            .map(|value| parse_transfer_id("semantic item table", value.value()))
+            .transpose()?
+        {
+            return Err(StoreError::SemanticRepresentationConflict {
+                semantic_id: claim.semantic_id,
+                accepted_envelope_id: accepted,
+                received_envelope_id: transfer_id,
+            });
+        }
+        let per_semantic = route_semantic_counts.entry(claim.semantic_id).or_default();
+        *per_semantic = per_semantic
+            .checked_add(1)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        if *per_semantic > MAX_ROUTE_CACHE_REPRESENTATIONS_PER_SEMANTIC {
+            return Err(StoreError::RouteCacheSemanticRepresentationLimit {
+                semantic_id: claim.semantic_id,
+                current: *per_semantic,
+                limit: MAX_ROUTE_CACHE_REPRESENTATIONS_PER_SEMANTIC,
+            });
+        }
+        route_count = route_count
+            .checked_add(1)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        route_bytes = route_bytes
+            .checked_add(
+                u64::try_from(value.value().len())
+                    .map_err(|_| StoreError::PayloadByteAccountingOverflow)?,
+            )
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    }
+    for row in route_claims.iter()? {
+        let (key, _) = row?;
+        parse_transfer_id("route Event claim table", key.value())?;
+        if route_cache.get(key.value())?.is_none() {
+            return Err(StoreError::SemanticInvariant(
+                "route-cache claim is missing exact source bytes",
+            ));
+        }
+    }
+    if route_count > MAX_ROUTE_CACHE_ITEMS || route_bytes > MAX_ROUTE_CACHE_BYTES {
+        return Err(StoreError::SemanticInvariant(
+            "route-cache durable usage exceeds its configured safety cap",
+        ));
+    }
+    if mission_authority.is_none() && (event_count != 0 || route_count != 0) {
+        return Err(StoreError::SemanticInvariant(
+            "unbound store contains mission-scoped Event state",
+        ));
+    }
+
+    let stats = EventStoreStats {
+        events: event_count,
+        acceptance_markers: event_markers.len()?,
+        total_sealed_bytes,
+        last_acceptance_marker,
+        route_cached: route_count,
+        route_cached_bytes: route_bytes,
+    };
+    for (field, reconstructed) in [
+        (SEMANTIC_ITEM_COUNT, stats.events),
+        (SEMANTIC_TOTAL_BYTES, stats.total_sealed_bytes),
+        (
+            LAST_SEMANTIC_ACCEPTANCE_MARKER,
+            stats.last_acceptance_marker,
+        ),
+        (ROUTE_CACHE_ITEM_COUNT, stats.route_cached),
+        (ROUTE_CACHE_TOTAL_BYTES, stats.route_cached_bytes),
+    ] {
+        let durable = metadata
+            .get(field)?
+            .ok_or(StoreError::MissingAccountingMetadata { field })?
+            .value();
+        if durable != reconstructed {
+            return Err(StoreError::AccountingMismatch {
+                field,
+                durable,
+                reconstructed,
+            });
+        }
+    }
+    Ok((stats, mission_authority))
+}
+
+fn inspect_readable(database: &impl ReadableDatabase) -> Result<StoreInspection, StoreError> {
+    let read = database.begin_read()?;
+    let zeroization = inspect_zeroization_read(&read)?;
+    let items = read.open_table(ITEMS)?;
+    let acceptance_markers = read.open_table(ACCEPTANCE_MARKERS)?;
+    let metadata = read.open_table(METADATA)?;
+    let mut ids = Vec::new();
+    let mut reconstructed_items = 0u64;
+    let mut reconstructed_payload_bytes = 0u64;
+
+    for row in items.iter()? {
+        let (key, value) = row?;
+        let id = parse_id("item table", key.value())?;
+        if acceptance_markers.get(key.value())?.is_none() {
+            return Err(StoreError::MissingAcceptanceMarker { id });
+        }
+        ids.push(id);
+        reconstructed_items = reconstructed_items
+            .checked_add(1)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        let length = u64::try_from(value.value().len())
+            .map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
+        reconstructed_payload_bytes = reconstructed_payload_bytes
+            .checked_add(length)
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    }
+
+    let mut max_acceptance_marker = 0u64;
+    for row in acceptance_markers.iter()? {
+        let (key, value) = row?;
+        let id = parse_id("acceptance-marker table", key.value())?;
+        if items.get(key.value())?.is_none() {
+            return Err(StoreError::OrphanedAcceptanceMarker { id });
+        }
+        max_acceptance_marker = max_acceptance_marker.max(value.value());
+    }
+
+    let durable_items = metadata
+        .get(ITEM_COUNT)?
+        .ok_or(StoreError::MissingAccountingMetadata { field: ITEM_COUNT })?
+        .value();
+    if durable_items != reconstructed_items {
+        return Err(StoreError::AccountingMismatch {
+            field: ITEM_COUNT,
+            durable: durable_items,
+            reconstructed: reconstructed_items,
+        });
+    }
+    let durable_payload_bytes = metadata
+        .get(TOTAL_PAYLOAD_BYTES)?
+        .ok_or(StoreError::MissingAccountingMetadata {
+            field: TOTAL_PAYLOAD_BYTES,
+        })?
+        .value();
+    if durable_payload_bytes != reconstructed_payload_bytes {
+        return Err(StoreError::AccountingMismatch {
+            field: TOTAL_PAYLOAD_BYTES,
+            durable: durable_payload_bytes,
+            reconstructed: reconstructed_payload_bytes,
+        });
+    }
+    let durable_marker = metadata
+        .get(LAST_ACCEPTANCE_MARKER)?
+        .ok_or(StoreError::MissingAccountingMetadata {
+            field: LAST_ACCEPTANCE_MARKER,
+        })?
+        .value();
+    if durable_marker != max_acceptance_marker {
+        return Err(StoreError::AccountingMismatch {
+            field: LAST_ACCEPTANCE_MARKER,
+            durable: durable_marker,
+            reconstructed: max_acceptance_marker,
+        });
+    }
+
+    let (event_stats, mission_authority) = inspect_semantic_readable(&read)?;
+    let control_stats = inspect_control_tables(&read, mission_authority)?.unwrap_or_default();
+
+    Ok(StoreInspection {
+        inventory: InventorySnapshot::new(ids),
+        stats: StoreStats {
+            items: reconstructed_items,
+            acceptance_markers: acceptance_markers.len()?,
+            total_payload_bytes: reconstructed_payload_bytes,
+            last_acceptance_marker: durable_marker,
+        },
+        event_stats,
+        control_stats,
+        mission_authority,
+        zeroization,
+    })
+}
+
+fn parse_id(table: &'static str, bytes: &[u8]) -> Result<ItemId, StoreError> {
+    let bytes: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| StoreError::InvalidStoredIdLength {
+            table,
+            length: bytes.len(),
+        })?;
+    Ok(ItemId::new(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use aster_mesh::{
+        ContentVerifiedEventEnvelope, EventContentVerification, ProvisioningAccess,
+        ProvisioningBundle, ReferenceEnvelopeSealer, ReferenceProvisioner, ScopeRekeyRecipient,
+    };
+
+    use super::*;
+
+    static NEXT_TEST_PATH: AtomicU64 = AtomicU64::new(0);
+    const ABRUPT_STORE_PATH: &str = "ASTER_REDB_TEST_ABRUPT_STORE_PATH";
+    const ABRUPT_STORE_MODE: &str = "ASTER_REDB_TEST_ABRUPT_STORE_MODE";
+
+    struct TestFile(PathBuf);
+
+    impl TestFile {
+        fn new(name: &str) -> Self {
+            let sequence = NEXT_TEST_PATH.fetch_add(1, Ordering::Relaxed);
+            Self(std::env::temp_dir().join(format!(
+                "aster-redb-store-{name}-{}-{sequence}.redb",
+                std::process::id()
+            )))
+        }
+    }
+
+    impl Drop for TestFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn run_abrupt_store_child(file: &TestFile, mode: &str) {
+        let output = Command::new(std::env::current_exe().expect("unit test executable"))
+            .arg("--exact")
+            .arg("tests::abrupt_redb_exit_child")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(ABRUPT_STORE_PATH, &file.0)
+            .env(ABRUPT_STORE_MODE, mode)
+            .output()
+            .expect("run abrupt redb child");
+        assert_eq!(
+            output.status.code(),
+            Some(86),
+            "abrupt child failed unexpectedly: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn item(byte: u8) -> ItemId {
+        ItemId::new([byte; 32])
+    }
+
+    struct EventServices {
+        publisher: ReferenceEnvelopeSealer,
+        reader: ReferenceEnvelopeSealer,
+        relay: ReferenceEnvelopeSealer,
+        authority: NodeId,
+    }
+
+    fn event_topic() -> Topic {
+        Topic::new("mesh-event").expect("topic")
+    }
+
+    fn reaction_topic() -> Topic {
+        Topic::new("mesh-reaction").expect("reaction topic")
+    }
+
+    fn event_scope() -> Scope {
+        Scope::new("mission/events").expect("scope")
+    }
+
+    fn event_services(seed: u8) -> EventServices {
+        let mut provisioner = ReferenceProvisioner::from_seed([seed; 32]).expect("provisioner");
+        let member = ProvisioningAccess::member(
+            event_scope(),
+            vec![1],
+            vec![event_topic(), reaction_topic()],
+        )
+        .expect("member access");
+        let relay = ProvisioningAccess::relay(event_scope(), vec![1]).expect("relay access");
+        let publisher = provisioner
+            .issue_node(1, std::slice::from_ref(&member))
+            .and_then(ReferenceEnvelopeSealer::open)
+            .expect("publisher");
+        let reader = provisioner
+            .issue_node(2, &[member])
+            .and_then(ReferenceEnvelopeSealer::open)
+            .expect("reader");
+        let relay = provisioner
+            .issue_node(3, &[relay])
+            .and_then(ReferenceEnvelopeSealer::open)
+            .expect("relay");
+        let authority = publisher.mission_authority_id();
+        EventServices {
+            publisher,
+            reader,
+            relay,
+            authority,
+        }
+    }
+
+    struct ControlServices {
+        authority: ReferenceEnvelopeSealer,
+        verifier: ReferenceEnvelopeSealer,
+        verifier_bundle: Vec<u8>,
+        registry: Vec<u8>,
+        authority_id: NodeId,
+    }
+
+    fn control_services(seed: u8) -> ControlServices {
+        let mut provisioner = ReferenceProvisioner::from_seed([seed; 32]).expect("provisioner");
+        let access = ProvisioningAccess::member(event_scope(), vec![1], vec![event_topic()])
+            .expect("control test access");
+        let authority_bundle = provisioner
+            .issue_control_authority(1, std::slice::from_ref(&access))
+            .expect("control authority bundle");
+        let verifier_bundle = provisioner
+            .issue_node(2, &[access])
+            .expect("control verifier bundle");
+        let registry = provisioner.export_rekey_registry().expect("rekey registry");
+        let verifier_bundle_bytes = verifier_bundle.to_bytes().expect("persist verifier bundle");
+        let authority = ReferenceEnvelopeSealer::open(authority_bundle).expect("authority");
+        let verifier = ReferenceEnvelopeSealer::open(verifier_bundle).expect("verifier");
+        let authority_id = authority.mission_authority_id();
+        ControlServices {
+            authority,
+            verifier,
+            verifier_bundle: verifier_bundle_bytes,
+            registry,
+            authority_id,
+        }
+    }
+
+    fn verify_control(
+        verifier: &mut ReferenceEnvelopeSealer,
+        sealed: &[u8],
+    ) -> VerifiedControlEnvelope {
+        verifier.verify_control(sealed).expect("verify control")
+    }
+
+    fn content_event(
+        reader: &mut ReferenceEnvelopeSealer,
+        sealed: &[u8],
+    ) -> ContentVerifiedEventEnvelope {
+        let route = reader.verify_event(sealed).expect("route verification");
+        match reader
+            .verify_event_content(route, sealed)
+            .expect("content verification")
+        {
+            EventContentVerification::ContentVerified { event, payload: _ } => event,
+            EventContentVerification::RouteOnly(_) => panic!("reader has a content grant"),
+        }
+    }
+
+    fn event_header(
+        publisher: NodeId,
+        counter: u64,
+        sequence: u64,
+        context: VersionVector,
+        logical_key: &[u8],
+        payload: &[u8],
+        ttl_ms: Option<u64>,
+    ) -> EnvelopeHeader {
+        EnvelopeHeader {
+            class: SemanticDataClass::Event,
+            topic: event_topic(),
+            scope: event_scope(),
+            priority: Priority::Immediate,
+            stamp: CausalStamp {
+                dot: Dot { publisher, counter },
+                context,
+            },
+            event_sequence: Some(sequence),
+            logical_key: logical_key.to_vec(),
+            blob_route: None,
+            ttl_ms,
+            content_len: payload.len() as u64,
+            tombstone: false,
+            key_epoch: 1,
+        }
+    }
+
+    fn write_metadata(path: &std::path::Path, key: &'static str, value: u64) {
+        let database = Database::open(path).expect("open raw database");
+        let write = database.begin_write().expect("begin raw write");
+        {
+            let mut metadata = write.open_table(METADATA).expect("open metadata");
+            metadata.insert(key, value).expect("write metadata");
+        }
+        write.commit().expect("commit metadata");
+    }
+
+    #[test]
+    fn store_limits_require_nonzero_bounds_and_default_conservatively() {
+        assert_eq!(StoreLimits::new(0, 1), Err(StoreLimitsError::ZeroMaxItems));
+        assert_eq!(
+            StoreLimits::new(1, 0),
+            Err(StoreLimitsError::ZeroMaxTotalPayloadBytes)
+        );
+        assert_eq!(
+            StoreLimits::default(),
+            StoreLimits::new(DEFAULT_MAX_ITEMS, DEFAULT_MAX_TOTAL_PAYLOAD_BYTES)
+                .expect("default limits")
+        );
+    }
+
+    #[test]
+    fn read_only_inspection_does_not_create_an_absent_store() {
+        let file = TestFile::new("inspect-absent");
+        assert!(!file.0.exists());
+
+        assert!(matches!(
+            Store::inspect_existing(&file.0),
+            Err(StoreError::Backend(_))
+        ));
+        assert!(!file.0.exists());
+    }
+
+    #[test]
+    fn read_only_inspection_preserves_existing_file_bytes_and_modification_time() {
+        let file = TestFile::new("inspect-no-mutation");
+        let id = item(0x51);
+        {
+            let store = Store::open(&file.0).expect("create store");
+            store.apply(id, b"opaque inspection").expect("apply item");
+        }
+        let bytes_before = std::fs::read(&file.0).expect("read before inspection");
+        let modified_before = std::fs::metadata(&file.0)
+            .expect("metadata before inspection")
+            .modified()
+            .expect("modified before inspection");
+
+        let inspection = Store::inspect_existing(&file.0).expect("read-only inspection");
+        assert_eq!(
+            inspection.inventory.iter().copied().collect::<Vec<_>>(),
+            vec![id]
+        );
+        assert_eq!(
+            inspection.stats,
+            StoreStats {
+                items: 1,
+                acceptance_markers: 1,
+                total_payload_bytes: 17,
+                last_acceptance_marker: 1,
+            }
+        );
+        assert_eq!(inspection.event_stats, EventStoreStats::default());
+        assert_eq!(inspection.mission_authority, None);
+
+        assert_eq!(
+            std::fs::read(&file.0).expect("read after inspection"),
+            bytes_before
+        );
+        assert_eq!(
+            std::fs::metadata(&file.0)
+                .expect("metadata after inspection")
+                .modified()
+                .expect("modified after inspection"),
+            modified_before
+        );
+    }
+
+    #[test]
+    fn read_only_inspection_requires_complete_consistent_accounting_without_repair() {
+        let file = TestFile::new("inspect-accounting");
+        {
+            let store = Store::open(&file.0).expect("create store");
+            store.apply(item(0x61), b"abc").expect("apply item");
+        }
+        {
+            let database = Database::open(&file.0).expect("open raw database");
+            let write = database.begin_write().expect("begin raw write");
+            {
+                let mut metadata = write.open_table(METADATA).expect("open metadata");
+                metadata
+                    .remove(ITEM_COUNT)
+                    .expect("remove item count")
+                    .expect("existing item count");
+            }
+            write.commit().expect("commit missing accounting");
+        }
+        let bytes_without_count = std::fs::read(&file.0).expect("read missing-count store");
+        assert!(matches!(
+            Store::inspect_existing(&file.0),
+            Err(StoreError::MissingAccountingMetadata { field }) if field == ITEM_COUNT
+        ));
+        assert_eq!(
+            std::fs::read(&file.0).expect("read after failed inspection"),
+            bytes_without_count
+        );
+
+        write_metadata(&file.0, ITEM_COUNT, 9);
+        assert!(matches!(
+            Store::inspect_existing(&file.0),
+            Err(StoreError::AccountingMismatch {
+                field,
+                durable: 9,
+                reconstructed: 1,
+            }) if field == ITEM_COUNT
+        ));
+    }
+
+    #[test]
+    fn original_v1_effect_schema_literals_remain_readable_and_writable() {
+        const HISTORICAL_ITEMS: TableDefinition<&[u8], &[u8]> =
+            TableDefinition::new("aster.items.v1");
+        const HISTORICAL_EFFECTS: TableDefinition<&[u8], u64> =
+            TableDefinition::new("aster.effects.v1");
+        const HISTORICAL_METADATA: TableDefinition<&str, u64> =
+            TableDefinition::new("aster.metadata.v1");
+        const HISTORICAL_LAST_EFFECT_MARKER: &str = "last_effect_marker";
+
+        let file = TestFile::new("historical-effect-schema");
+        let first = item(0x71);
+        {
+            let database = Database::create(&file.0).expect("create historical database");
+            let write = database.begin_write().expect("begin historical write");
+            {
+                let mut items = write
+                    .open_table(HISTORICAL_ITEMS)
+                    .expect("open historical items");
+                items
+                    .insert(first.as_bytes().as_slice(), b"old".as_slice())
+                    .expect("insert historical item");
+            }
+            {
+                let mut effects = write
+                    .open_table(HISTORICAL_EFFECTS)
+                    .expect("open historical effects");
+                effects
+                    .insert(first.as_bytes().as_slice(), 1)
+                    .expect("insert historical effect marker");
+            }
+            {
+                let mut metadata = write
+                    .open_table(HISTORICAL_METADATA)
+                    .expect("open historical metadata");
+                metadata
+                    .insert(HISTORICAL_LAST_EFFECT_MARKER, 1)
+                    .expect("insert historical marker high water");
+                metadata.insert(ITEM_COUNT, 1).expect("insert item count");
+                metadata
+                    .insert(TOTAL_PAYLOAD_BYTES, 3)
+                    .expect("insert payload bytes");
+            }
+            write.commit().expect("commit historical schema");
+        }
+
+        let inspection = Store::inspect_existing(&file.0).expect("inspect historical schema");
+        assert_eq!(
+            inspection.inventory.iter().copied().collect::<Vec<_>>(),
+            vec![first]
+        );
+        assert_eq!(inspection.stats.last_acceptance_marker, 1);
+        assert_eq!(inspection.event_stats, EventStoreStats::default());
+        assert_eq!(inspection.mission_authority, None);
+
+        let store = Store::open(&file.0).expect("reopen historical schema for writes");
+        assert_eq!(
+            store
+                .apply(item(0x72), b"new")
+                .expect("append using current API")
+                .acceptance_marker(),
+            2
+        );
+    }
+
+    #[test]
+    fn duplicate_exact_bytes_is_harmless_and_conflicting_bytes_are_rejected() {
+        let file = TestFile::new("duplicate");
+        let store = Store::open(&file.0).expect("open store");
+        let id = item(1);
+
+        assert_eq!(
+            store.apply(id, b"opaque-one").expect("first apply"),
+            ApplyOutcome::Inserted {
+                acceptance_marker: 1
+            }
+        );
+        assert_eq!(
+            store.apply(id, b"opaque-one").expect("duplicate apply"),
+            ApplyOutcome::Duplicate {
+                acceptance_marker: 1
+            }
+        );
+        assert!(matches!(
+            store.apply(id, b"different"),
+            Err(StoreError::IdentityConflict { id: conflict }) if conflict == id
+        ));
+        assert_eq!(
+            store.get(id).expect("read item"),
+            Some(b"opaque-one".to_vec())
+        );
+        assert_eq!(
+            store.stats().expect("store stats"),
+            StoreStats {
+                items: 1,
+                acceptance_markers: 1,
+                total_payload_bytes: 10,
+                last_acceptance_marker: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn item_quota_rejects_new_state_but_allows_exact_duplicate_at_capacity() {
+        let file = TestFile::new("item-quota");
+        let limits = StoreLimits::new(1, 3).expect("limits");
+        let store = Store::open_with_limits(&file.0, limits).expect("open store");
+        let accepted = item(1);
+        let rejected = item(2);
+
+        assert_eq!(store.limits(), limits);
+        assert_eq!(
+            store.apply(accepted, b"abc").expect("first apply"),
+            ApplyOutcome::Inserted {
+                acceptance_marker: 1
+            }
+        );
+        assert_eq!(
+            store.apply(accepted, b"abc").expect("duplicate at quota"),
+            ApplyOutcome::Duplicate {
+                acceptance_marker: 1
+            }
+        );
+        assert!(matches!(
+            store.apply(accepted, b"different"),
+            Err(StoreError::IdentityConflict { id }) if id == accepted
+        ));
+        assert!(matches!(
+            store.apply(rejected, b""),
+            Err(StoreError::ItemLimitExceeded {
+                current: 1,
+                limit: 1
+            })
+        ));
+        assert_eq!(store.get(rejected).expect("rejected item"), None);
+        assert_eq!(
+            store.acceptance_marker(rejected).expect("rejected marker"),
+            None
+        );
+        assert_eq!(
+            store.stats().expect("stats"),
+            StoreStats {
+                items: 1,
+                acceptance_markers: 1,
+                total_payload_bytes: 3,
+                last_acceptance_marker: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn byte_quota_rejection_is_atomic_and_does_not_consume_acceptance_marker() {
+        let file = TestFile::new("byte-quota");
+        let limits = StoreLimits::new(3, 5).expect("limits");
+        let store = Store::open_with_limits(&file.0, limits).expect("open store");
+        let first = item(1);
+        let rejected = item(2);
+        let second = item(3);
+
+        assert_eq!(
+            store.apply(first, b"abc").expect("first apply"),
+            ApplyOutcome::Inserted {
+                acceptance_marker: 1
+            }
+        );
+        assert!(matches!(
+            store.apply(rejected, b"def"),
+            Err(StoreError::PayloadByteLimitExceeded {
+                current: 3,
+                incoming: 3,
+                limit: 5
+            })
+        ));
+        assert_eq!(store.get(rejected).expect("rejected item"), None);
+        assert_eq!(
+            store.acceptance_marker(rejected).expect("rejected marker"),
+            None
+        );
+        assert_eq!(
+            store.apply(second, b"xy").expect("exact remaining bytes"),
+            ApplyOutcome::Inserted {
+                acceptance_marker: 2
+            }
+        );
+        assert_eq!(
+            store.stats().expect("stats"),
+            StoreStats {
+                items: 2,
+                acceptance_markers: 2,
+                total_payload_bytes: 5,
+                last_acceptance_marker: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn reopen_reconstructs_and_persists_payload_accounting_from_item_truth() {
+        let file = TestFile::new("accounting-restart");
+        let limits = StoreLimits::new(3, 6).expect("limits");
+        let first = item(1);
+        let second = item(2);
+        let rejected = item(3);
+
+        {
+            let store = Store::open_with_limits(&file.0, limits).expect("create store");
+            store.apply(first, b"abc").expect("first apply");
+            store.apply(second, b"def").expect("second apply");
+        }
+
+        // Simulate an earlier schema without the new accounting metadata. The
+        // Authoritative item/acceptance-marker pairs remain intact on disk.
+        {
+            let database = Database::open(&file.0).expect("open raw database");
+            let write = database.begin_write().expect("begin raw write");
+            {
+                let mut metadata = write.open_table(METADATA).expect("open metadata");
+                metadata
+                    .remove(ITEM_COUNT)
+                    .expect("remove item count")
+                    .expect("existing item count");
+                metadata
+                    .remove(TOTAL_PAYLOAD_BYTES)
+                    .expect("remove payload count")
+                    .expect("existing payload count");
+            }
+            write.commit().expect("commit stale accounting");
+        }
+
+        {
+            let reopened =
+                Store::open_with_limits(&file.0, limits).expect("reopen and reconstruct");
+            assert_eq!(
+                reopened.stats().expect("reconstructed stats"),
+                StoreStats {
+                    items: 2,
+                    acceptance_markers: 2,
+                    total_payload_bytes: 6,
+                    last_acceptance_marker: 2,
+                }
+            );
+            assert_eq!(
+                reopened.apply(first, b"abc").expect("duplicate at quota"),
+                ApplyOutcome::Duplicate {
+                    acceptance_marker: 1
+                }
+            );
+            assert!(matches!(
+                reopened.apply(rejected, b"x"),
+                Err(StoreError::PayloadByteLimitExceeded {
+                    current: 6,
+                    incoming: 1,
+                    limit: 6
+                })
+            ));
+            assert_eq!(reopened.get(rejected).expect("rejected item"), None);
+        }
+
+        let database = Database::open(&file.0).expect("verify durable reconstruction");
+        let read = database.begin_read().expect("begin raw read");
+        let metadata = read.open_table(METADATA).expect("open metadata");
+        assert_eq!(
+            metadata
+                .get(ITEM_COUNT)
+                .expect("read item count")
+                .expect("item count")
+                .value(),
+            2
+        );
+        assert_eq!(
+            metadata
+                .get(TOTAL_PAYLOAD_BYTES)
+                .expect("read payload count")
+                .expect("payload count")
+                .value(),
+            6
+        );
+    }
+
+    #[test]
+    fn reopen_fails_closed_on_present_item_or_payload_accounting_mismatch() {
+        let file = TestFile::new("accounting-corruption");
+        {
+            let store = Store::open(&file.0).expect("create store");
+            store.apply(item(1), b"abc").expect("apply item");
+        }
+
+        write_metadata(&file.0, ITEM_COUNT, 0);
+        assert!(matches!(
+            Store::open(&file.0),
+            Err(StoreError::AccountingMismatch {
+                field,
+                durable: 0,
+                reconstructed: 1,
+            }) if field == ITEM_COUNT
+        ));
+
+        write_metadata(&file.0, ITEM_COUNT, 1);
+        write_metadata(&file.0, TOTAL_PAYLOAD_BYTES, 2);
+        assert!(matches!(
+            Store::open(&file.0),
+            Err(StoreError::AccountingMismatch {
+                field,
+                durable: 2,
+                reconstructed: 3,
+            }) if field == TOTAL_PAYLOAD_BYTES
+        ));
+
+        write_metadata(&file.0, TOTAL_PAYLOAD_BYTES, 3);
+        let repaired = Store::open(&file.0).expect("open after explicit repair");
+        assert_eq!(repaired.stats().expect("stats").total_payload_bytes, 3);
+    }
+
+    #[test]
+    fn reopen_fails_closed_on_acceptance_marker_high_water_mismatch() {
+        let file = TestFile::new("marker-corruption");
+        {
+            let store = Store::open(&file.0).expect("create store");
+            store.apply(item(1), b"abc").expect("apply item");
+        }
+
+        write_metadata(&file.0, LAST_ACCEPTANCE_MARKER, 9);
+        assert!(matches!(
+            Store::open(&file.0),
+            Err(StoreError::AccountingMismatch {
+                field,
+                durable: 9,
+                reconstructed: 1,
+            }) if field == LAST_ACCEPTANCE_MARKER
+        ));
+
+        write_metadata(&file.0, LAST_ACCEPTANCE_MARKER, 1);
+        let repaired = Store::open(&file.0).expect("open after explicit repair");
+        assert_eq!(repaired.stats().expect("stats").last_acceptance_marker, 1);
+    }
+
+    #[test]
+    fn committed_item_and_acceptance_marker_survive_a_real_close_and_reopen() {
+        let file = TestFile::new("restart");
+        let first = item(0x11);
+        let second = item(0x22);
+
+        {
+            let store = Store::open(&file.0).expect("create store");
+            assert_eq!(
+                store
+                    .apply(first, b"first")
+                    .expect("apply first")
+                    .acceptance_marker(),
+                1
+            );
+            assert_eq!(
+                store
+                    .apply(second, b"second")
+                    .expect("apply second")
+                    .acceptance_marker(),
+                2
+            );
+        }
+
+        let reopened = Store::open(&file.0).expect("reopen store");
+        assert_eq!(
+            reopened.get(first).expect("read first"),
+            Some(b"first".to_vec())
+        );
+        assert_eq!(
+            reopened.get(second).expect("read second"),
+            Some(b"second".to_vec())
+        );
+        assert_eq!(
+            reopened.acceptance_marker(first).expect("first marker"),
+            Some(1)
+        );
+        assert_eq!(
+            reopened.acceptance_marker(second).expect("second marker"),
+            Some(2)
+        );
+        assert_eq!(
+            reopened
+                .inventory()
+                .expect("inventory")
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![first, second]
+        );
+        assert_eq!(
+            reopened
+                .apply(item(0x44), b"third")
+                .expect("apply after restart")
+                .acceptance_marker(),
+            3
+        );
+    }
+
+    #[test]
+    fn dropped_transaction_leaves_neither_item_nor_acceptance_marker_after_restart() {
+        let file = TestFile::new("abort");
+        let id = item(0x33);
+        {
+            let store = Store::open(&file.0).expect("create store");
+            let write = store.database.begin_write().expect("begin write");
+            {
+                let mut items = write.open_table(ITEMS).expect("open items");
+                items
+                    .insert(id.as_bytes().as_slice(), b"uncommitted".as_slice())
+                    .expect("insert item");
+            }
+            {
+                let mut acceptance_markers = write
+                    .open_table(ACCEPTANCE_MARKERS)
+                    .expect("open acceptance_markers");
+                acceptance_markers
+                    .insert(id.as_bytes().as_slice(), 1)
+                    .expect("insert acceptance marker");
+            }
+            drop(write);
+        }
+
+        let reopened = Store::open(&file.0).expect("reopen store");
+        assert_eq!(reopened.get(id).expect("read item"), None);
+        assert_eq!(reopened.acceptance_marker(id).expect("read marker"), None);
+        assert_eq!(reopened.stats().expect("stats"), StoreStats::default());
+    }
+
+    #[test]
+    fn inventory_is_full_id_ordered_not_insertion_ordered() {
+        let file = TestFile::new("inventory");
+        let store = Store::open(&file.0).expect("open store");
+        for id in [item(0xff), item(0x00), item(0x80)] {
+            store.apply(id, id.as_bytes()).expect("apply item");
+        }
+
+        assert_eq!(
+            store
+                .inventory()
+                .expect("inventory")
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![item(0x00), item(0x80), item(0xff)]
+        );
+    }
+
+    #[test]
+    fn mission_binding_precedes_cache_or_semantic_mutation_and_wrong_reopen_is_read_only() {
+        let file = TestFile::new("mission-binding");
+        let mut first = event_services(0x31);
+        let mut second = event_services(0x32);
+        let payload = b"mission-bound";
+        let header = event_header(
+            first.publisher.identity(),
+            1,
+            1,
+            VersionVector::default(),
+            b"mission",
+            payload,
+            None,
+        );
+        let sealed = first
+            .publisher
+            .seal_event(&header, payload)
+            .expect("seal Event");
+        let route = first
+            .relay
+            .verify_event(&sealed.bytes)
+            .expect("route token");
+
+        let unbound = Store::open(&file.0).expect("unbound compatibility store");
+        assert!(matches!(
+            unbound.cache_route_verified_event(&route, &sealed.bytes),
+            Err(StoreError::MissionNotBound)
+        ));
+        drop(unbound);
+
+        let bound = Store::open_for_mission(&file.0, first.authority).expect("bind mission");
+        assert_eq!(bound.mission_authority(), Some(first.authority));
+        bound
+            .cache_route_verified_event(&route, &sealed.bytes)
+            .expect("cache bound route");
+
+        let other_payload = b"other mission";
+        let other_header = event_header(
+            second.publisher.identity(),
+            1,
+            1,
+            VersionVector::default(),
+            b"other",
+            other_payload,
+            None,
+        );
+        let other = second
+            .publisher
+            .seal_event(&other_header, other_payload)
+            .expect("seal other mission");
+        let other_route = second
+            .relay
+            .verify_event(&other.bytes)
+            .expect("other route token");
+        assert!(matches!(
+            bound.cache_route_verified_event(&other_route, &other.bytes),
+            Err(StoreError::MissionAuthorityMismatch { .. })
+        ));
+        drop(bound);
+
+        let bytes_before = std::fs::read(&file.0).expect("read bound store");
+        assert!(matches!(
+            Store::open_for_mission(&file.0, second.authority),
+            Err(StoreError::MissionAuthorityMismatch { .. })
+        ));
+        assert_eq!(
+            std::fs::read(&file.0).expect("read after rejected reopen"),
+            bytes_before
+        );
+    }
+
+    #[test]
+    fn semantic_and_transfer_identity_are_distinct_and_opaque_collision_cannot_poison_acceptance() {
+        let file = TestFile::new("semantic-transfer");
+        let mut services = event_services(0x41);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("bound store");
+        let payload = b"same semantic Event";
+        let header = event_header(
+            services.publisher.identity(),
+            1,
+            1,
+            VersionVector::default(),
+            b"same",
+            payload,
+            None,
+        );
+        let first = services
+            .publisher
+            .seal_event(&header, payload)
+            .expect("first seal");
+        let second = services
+            .publisher
+            .seal_event(&header, payload)
+            .expect("second randomized seal");
+        assert_eq!(first.id, second.id);
+        assert_ne!(
+            <[u8; 32]>::from(Sha256::digest(&first.bytes)),
+            <[u8; 32]>::from(Sha256::digest(&second.bytes))
+        );
+        let first_content = content_event(&mut services.reader, &first.bytes);
+        let second_content = content_event(&mut services.reader, &second.bytes);
+        let first_transfer = EventTransferId::new(first_content.envelope_id());
+
+        store
+            .apply(first_transfer.reconciliation_item_id(), b"opaque collision")
+            .expect("legacy opaque collision is isolated");
+        assert!(matches!(
+            store
+                .apply_verified_event(&first_content, &first.bytes)
+                .expect("semantic acceptance"),
+            ApplyOutcome::Inserted {
+                acceptance_marker: 1
+            }
+        ));
+        let accepted_route = services
+            .relay
+            .verify_event(&first.bytes)
+            .expect("route replay of accepted Event");
+        assert!(matches!(
+            store
+                .cache_route_verified_event(&accepted_route, &first.bytes)
+                .expect("accepted exact transfer is a cache no-op"),
+            RouteCacheOutcome::Duplicate { .. }
+        ));
+        assert_eq!(store.event_stats().expect("separate stats").route_cached, 0);
+        assert_eq!(
+            store
+                .transfer_inventory()
+                .expect("disjoint inventory")
+                .len(),
+            1
+        );
+        let alternate_route = services
+            .relay
+            .verify_event(&second.bytes)
+            .expect("alternate route representation");
+        assert!(matches!(
+            store.cache_route_verified_event(&alternate_route, &second.bytes),
+            Err(StoreError::SemanticRepresentationConflict { .. })
+        ));
+        assert!(matches!(
+            store
+                .apply_verified_event(&first_content, &first.bytes)
+                .expect("exact replay"),
+            ApplyOutcome::Duplicate {
+                acceptance_marker: 1
+            }
+        ));
+        assert!(matches!(
+            store.apply_verified_event(&second_content, &second.bytes),
+            Err(StoreError::SemanticRepresentationConflict { .. })
+        ));
+        assert_eq!(
+            store
+                .get(first_transfer.reconciliation_item_id())
+                .expect("legacy read"),
+            Some(b"opaque collision".to_vec())
+        );
+        assert_eq!(
+            store
+                .get_event(first_transfer)
+                .expect("semantic read")
+                .expect("semantic Event")
+                .sealed,
+            first.bytes
+        );
+        assert_eq!(store.inventory().expect("legacy inventory").len(), 1);
+        assert_eq!(store.event_inventory().expect("Event inventory").len(), 1);
+        assert_eq!(store.stats().expect("legacy stats").items, 1);
+        assert_eq!(store.event_stats().expect("Event stats").events, 1);
+    }
+
+    #[test]
+    fn route_only_content_tamper_cannot_create_semantic_ledgers_or_poison_valid_content() {
+        let file = TestFile::new("route-content-boundary");
+        let mut services = event_services(0x51);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("bound store");
+        let payload = b"content authenticated separately";
+        let header = event_header(
+            services.publisher.identity(),
+            1,
+            1,
+            VersionVector::default(),
+            b"content",
+            payload,
+            None,
+        );
+        let sealed = services
+            .publisher
+            .seal_event(&header, payload)
+            .expect("seal Event");
+        let mut tampered = sealed.bytes.clone();
+        *tampered.last_mut().expect("sealed content") ^= 1;
+        let route = services
+            .relay
+            .verify_event(&tampered)
+            .expect("route metadata remains authenticated");
+        store
+            .cache_route_verified_event(&route, &tampered)
+            .expect("bounded route cache");
+        let alternate = services
+            .publisher
+            .seal_event(&header, payload)
+            .expect("alternate randomized representation");
+        let alternate_route = services
+            .relay
+            .verify_event(&alternate.bytes)
+            .expect("alternate route token");
+        store
+            .cache_route_verified_event(&alternate_route, &alternate.bytes)
+            .expect("second bounded route representation");
+        let member_route = services
+            .reader
+            .verify_event(&tampered)
+            .expect("member route verification");
+        assert!(
+            services
+                .reader
+                .verify_event_content(member_route, &tampered)
+                .is_err()
+        );
+        assert_eq!(store.event_stats().expect("cache stats").events, 0);
+        assert_eq!(store.event_stats().expect("cache stats").route_cached, 2);
+        assert_eq!(store.event_gaps().expect("no semantic gaps"), Vec::new());
+
+        let valid = content_event(&mut services.reader, &sealed.bytes);
+        store
+            .apply_verified_event(&valid, &sealed.bytes)
+            .expect("valid content remains admissible");
+        let stats = store.event_stats().expect("separate stats");
+        assert_eq!(stats.events, 1);
+        assert_eq!(stats.route_cached, 0);
+        assert_eq!(
+            store
+                .transfer_inventory()
+                .expect("combined inventory")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn accepted_dot_and_event_position_ledgers_reject_equivocation_and_track_gaps() {
+        let file = TestFile::new("event-ledgers");
+        let mut services = event_services(0x61);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("bound store");
+        let publisher = services.publisher.identity();
+
+        let mut accepted = Vec::new();
+        for sequence in [1u64, 3] {
+            let payload = format!("event-{sequence}").into_bytes();
+            let header = event_header(
+                publisher,
+                sequence,
+                sequence,
+                VersionVector::default(),
+                &[sequence as u8],
+                &payload,
+                None,
+            );
+            let sealed = services
+                .publisher
+                .seal_event(&header, &payload)
+                .expect("seal out-of-order Event");
+            let event = content_event(&mut services.reader, &sealed.bytes);
+            store
+                .apply_verified_event(&event, &sealed.bytes)
+                .expect("accept out of order");
+            accepted.push((event, sealed.bytes));
+        }
+        assert_eq!(
+            store.event_gaps().expect("gap after 1,3"),
+            vec![EventGap {
+                publisher,
+                topic: event_topic(),
+                scope: event_scope(),
+                start_sequence: 2,
+                end_sequence: 3,
+            }]
+        );
+
+        let payload = b"event-2";
+        let second_header = event_header(
+            publisher,
+            2,
+            2,
+            VersionVector::default(),
+            b"2",
+            payload,
+            None,
+        );
+        let second = services
+            .publisher
+            .seal_event(&second_header, payload)
+            .expect("seal missing Event");
+        let second_event = content_event(&mut services.reader, &second.bytes);
+        store
+            .apply_verified_event(&second_event, &second.bytes)
+            .expect("close gap");
+        assert!(store.event_gaps().expect("closed gap").is_empty());
+
+        let conflicting_dot_payload = b"different dot payload";
+        let conflicting_dot_header = event_header(
+            publisher,
+            1,
+            4,
+            VersionVector::default(),
+            b"dot-conflict",
+            conflicting_dot_payload,
+            None,
+        );
+        let conflicting_dot = services
+            .publisher
+            .seal_event(&conflicting_dot_header, conflicting_dot_payload)
+            .expect("seal dot conflict");
+        let conflicting_dot_event = content_event(&mut services.reader, &conflicting_dot.bytes);
+        assert!(matches!(
+            store.apply_verified_event(&conflicting_dot_event, &conflicting_dot.bytes),
+            Err(StoreError::CausalEquivocation {
+                publisher: source,
+                counter: 1
+            }) if source == publisher
+        ));
+
+        let conflicting_position_payload = b"different position payload";
+        let conflicting_position_header = event_header(
+            publisher,
+            4,
+            1,
+            VersionVector::default(),
+            b"position-conflict",
+            conflicting_position_payload,
+            None,
+        );
+        let conflicting_position = services
+            .publisher
+            .seal_event(&conflicting_position_header, conflicting_position_payload)
+            .expect("seal position conflict");
+        let conflicting_position_event =
+            content_event(&mut services.reader, &conflicting_position.bytes);
+        assert!(matches!(
+            store.apply_verified_event(
+                &conflicting_position_event,
+                &conflicting_position.bytes
+            ),
+            Err(StoreError::EventEquivocation {
+                publisher: source,
+                sequence: 1
+            }) if source == publisher
+        ));
+    }
+
+    #[test]
+    fn operation_and_reaction_commit_are_atomic_causal_and_restart_idempotent() {
+        let file = TestFile::new("operation-reaction");
+        let mut services = event_services(0x71);
+        let publisher = services.publisher.identity();
+        let ping_key = EventOperationKey::new(b"sample/ping/once".to_vec()).expect("Ping key");
+        let ping_alias_key =
+            EventOperationKey::new(b"sample/ping/alias".to_vec()).expect("Ping alias key");
+        let pong_key =
+            EventOperationKey::new(b"sample/pong/for-ping-1".to_vec()).expect("Pong key");
+        let ping_semantic;
+        let pong_event;
+        let pong_bytes;
+        {
+            let store = Store::open_for_mission(&file.0, services.authority).expect("bound store");
+            let ping_payload = b"Ping";
+            let ping_reservation = store
+                .reserve_event(publisher, &event_topic(), &event_scope())
+                .expect("reserve Ping");
+            let ping_header = ping_reservation
+                .header(
+                    Priority::Immediate,
+                    b"ping".to_vec(),
+                    None,
+                    ping_payload.len() as u64,
+                    false,
+                    1,
+                )
+                .expect("Ping header");
+            let ping = services
+                .publisher
+                .seal_event(&ping_header, ping_payload)
+                .expect("seal Ping");
+            let ping_event = content_event(&mut services.reader, &ping.bytes);
+            let ping_outcome = store
+                .commit_reserved_event_once(
+                    &ping_key,
+                    None,
+                    &ping_reservation,
+                    &ping_event,
+                    &ping.bytes,
+                )
+                .expect("atomic Ping");
+            ping_semantic = match ping_outcome {
+                EventOnceOutcome::Inserted { semantic_id, .. } => semantic_id,
+                EventOnceOutcome::BoundExisting { .. } => {
+                    panic!("first Ping cannot bind an existing Event")
+                }
+                EventOnceOutcome::Existing { .. } => panic!("first Ping is new"),
+            };
+            assert!(matches!(
+                store
+                    .commit_reserved_event_once(
+                        &ping_alias_key,
+                        None,
+                        &ping_reservation,
+                        &ping_event,
+                        &ping.bytes,
+                    )
+                    .expect("bind a new operation to the accepted exact Ping"),
+                EventOnceOutcome::BoundExisting { .. }
+            ));
+            let after_alias = store.event_stats().expect("alias stats");
+            assert_eq!(after_alias.events, 1);
+            assert_eq!(after_alias.acceptance_markers, 1);
+
+            let pong_payload = b"Pong";
+            let ordinary_pong_reservation = store
+                .reserve_event(publisher, &reaction_topic(), &event_scope())
+                .expect("ordinary cross-topic reservation");
+            assert!(
+                !ordinary_pong_reservation
+                    .context()
+                    .observes(ping_event.dot())
+            );
+            let pong_reservation = store
+                .reserve_reaction_event(publisher, &reaction_topic(), &event_scope(), ping_semantic)
+                .expect("reserve cross-topic Pong reaction");
+            assert!(pong_reservation.context().observes(ping_event.dot()));
+            let pong_header = pong_reservation
+                .header(
+                    Priority::Immediate,
+                    ping_semantic.as_bytes().to_vec(),
+                    None,
+                    pong_payload.len() as u64,
+                    false,
+                    1,
+                )
+                .expect("Pong header");
+            let sealed_pong = services
+                .publisher
+                .seal_event(&pong_header, pong_payload)
+                .expect("seal Pong");
+            pong_event = content_event(&mut services.reader, &sealed_pong.bytes);
+            pong_bytes = sealed_pong.bytes;
+            assert!(matches!(
+                store
+                    .commit_reserved_event_once(
+                        &pong_key,
+                        Some(ping_semantic),
+                        &pong_reservation,
+                        &pong_event,
+                        &pong_bytes,
+                    )
+                    .expect("atomic reaction"),
+                EventOnceOutcome::Inserted { .. }
+            ));
+            assert!(matches!(
+                store.commit_reserved_event_once(
+                    &pong_key,
+                    None,
+                    &pong_reservation,
+                    &pong_event,
+                    &pong_bytes,
+                ),
+                Err(StoreError::OperationPredecessorMismatch)
+            ));
+        }
+
+        let reopened = Store::open_for_mission(&file.0, services.authority).expect("reopen");
+        assert!(
+            reopened
+                .event_for_operation(&ping_key)
+                .expect("Ping operation")
+                .is_some()
+        );
+        assert!(
+            reopened
+                .event_for_operation(&ping_alias_key)
+                .expect("Ping alias operation")
+                .is_some()
+        );
+        let stale_reservation = reopened
+            .reserve_event(publisher, &event_topic(), &event_scope())
+            .expect("stale retry reservation");
+        assert!(matches!(
+            reopened
+                .commit_reserved_event_once(
+                    &pong_key,
+                    Some(ping_semantic),
+                    &stale_reservation,
+                    &pong_event,
+                    &pong_bytes,
+                )
+                .expect("operation result wins before reservation"),
+            EventOnceOutcome::Existing { .. }
+        ));
+        let stats = reopened.event_stats().expect("Event stats");
+        assert_eq!(stats.events, 2);
+        assert_eq!(stats.acceptance_markers, 2);
+    }
+
+    #[test]
+    fn finite_ttl_fails_closed_for_route_remote_and_local_durability() {
+        let file = TestFile::new("ttl-fail-closed");
+        let mut services = event_services(0x81);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("bound store");
+        let payload = b"finite TTL";
+        let header = event_header(
+            services.publisher.identity(),
+            1,
+            1,
+            VersionVector::default(),
+            b"ttl",
+            payload,
+            Some(100),
+        );
+        let sealed = services
+            .publisher
+            .seal_event(&header, payload)
+            .expect("seal TTL Event");
+        let route = services
+            .relay
+            .verify_event(&sealed.bytes)
+            .expect("route TTL Event");
+        assert!(matches!(
+            store.cache_route_verified_event(&route, &sealed.bytes),
+            Err(StoreError::AuthenticatedCustodyAgeRequired)
+        ));
+        let event = content_event(&mut services.reader, &sealed.bytes);
+        assert!(matches!(
+            store.apply_verified_event(&event, &sealed.bytes),
+            Err(StoreError::AuthenticatedCustodyAgeRequired)
+        ));
+        let reservation = store
+            .reserve_event(
+                services.publisher.identity(),
+                &event_topic(),
+                &event_scope(),
+            )
+            .expect("reserve local TTL Event");
+        let local_header = reservation
+            .header(
+                Priority::Immediate,
+                b"local-ttl".to_vec(),
+                Some(100),
+                payload.len() as u64,
+                false,
+                1,
+            )
+            .expect("local TTL header");
+        let local = services
+            .publisher
+            .seal_event(&local_header, payload)
+            .expect("seal local TTL Event");
+        let local_event = content_event(&mut services.reader, &local.bytes);
+        assert!(matches!(
+            store.commit_reserved_event(&reservation, &local_event, &local.bytes),
+            Err(StoreError::AuthenticatedCustodyAgeRequired)
+        ));
+        assert_eq!(store.event_stats().expect("empty stats").events, 0);
+    }
+
+    #[test]
+    fn route_cache_caps_each_semantic_claim_and_aggregate_quota_spans_namespaces() {
+        let file = TestFile::new("route-cache-cap");
+        let mut services = event_services(0x91);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("bound store");
+        let payload = b"randomized route representation";
+        let header = event_header(
+            services.publisher.identity(),
+            1,
+            1,
+            VersionVector::default(),
+            b"route-cap",
+            payload,
+            None,
+        );
+        for index in 0..=MAX_ROUTE_CACHE_REPRESENTATIONS_PER_SEMANTIC {
+            let sealed = services
+                .publisher
+                .seal_event(&header, payload)
+                .expect("randomized seal");
+            let route = services
+                .relay
+                .verify_event(&sealed.bytes)
+                .expect("route token");
+            let outcome = store.cache_route_verified_event(&route, &sealed.bytes);
+            if index < MAX_ROUTE_CACHE_REPRESENTATIONS_PER_SEMANTIC {
+                outcome.expect("within per-semantic cap");
+            } else {
+                assert!(matches!(
+                    outcome,
+                    Err(StoreError::RouteCacheSemanticRepresentationLimit { .. })
+                ));
+            }
+        }
+        assert_eq!(
+            store.event_stats().expect("route cache stats").route_cached,
+            MAX_ROUTE_CACHE_REPRESENTATIONS_PER_SEMANTIC
+        );
+
+        let quota_file = TestFile::new("aggregate-quota");
+        let limits = StoreLimits::new(2, 1024 * 1024).expect("limits");
+        let quota_store =
+            Store::open_with_limits_for_mission(&quota_file.0, limits, services.authority)
+                .expect("quota store");
+        quota_store
+            .apply(item(0xaa), b"opaque")
+            .expect("opaque namespace");
+        let cached_payload = b"cached";
+        let cached_header = event_header(
+            services.publisher.identity(),
+            10,
+            10,
+            VersionVector::default(),
+            b"cached",
+            cached_payload,
+            None,
+        );
+        let cached = services
+            .publisher
+            .seal_event(&cached_header, cached_payload)
+            .expect("cache seal");
+        let cached_route = services
+            .relay
+            .verify_event(&cached.bytes)
+            .expect("cache route");
+        quota_store
+            .cache_route_verified_event(&cached_route, &cached.bytes)
+            .expect("route namespace");
+        let semantic_payload = b"semantic";
+        let semantic_header = event_header(
+            services.publisher.identity(),
+            11,
+            11,
+            VersionVector::default(),
+            b"semantic",
+            semantic_payload,
+            None,
+        );
+        let semantic = services
+            .publisher
+            .seal_event(&semantic_header, semantic_payload)
+            .expect("semantic seal");
+        let semantic_event = content_event(&mut services.reader, &semantic.bytes);
+        assert!(matches!(
+            quota_store.apply_verified_event(&semantic_event, &semantic.bytes),
+            Err(StoreError::ItemLimitExceeded {
+                current: 2,
+                limit: 2
+            })
+        ));
+    }
+
+    #[test]
+    fn read_only_inspection_reports_all_namespaces_without_mutating_the_store() {
+        let file = TestFile::new("inspect-semantic-namespaces");
+        let mut services = event_services(0xa1);
+        {
+            let store = Store::open_for_mission(&file.0, services.authority).expect("bound store");
+            store.apply(item(0xa1), b"opaque").expect("opaque item");
+
+            let accepted_payload = b"accepted";
+            let accepted_header = event_header(
+                services.publisher.identity(),
+                1,
+                1,
+                VersionVector::default(),
+                b"accepted",
+                accepted_payload,
+                None,
+            );
+            let accepted = services
+                .publisher
+                .seal_event(&accepted_header, accepted_payload)
+                .expect("seal accepted Event");
+            let accepted_event = content_event(&mut services.reader, &accepted.bytes);
+            store
+                .apply_verified_event(&accepted_event, &accepted.bytes)
+                .expect("accept semantic Event");
+
+            let cached_payload = b"route-only";
+            let cached_header = event_header(
+                services.publisher.identity(),
+                2,
+                2,
+                VersionVector::default(),
+                b"cached",
+                cached_payload,
+                None,
+            );
+            let cached = services
+                .publisher
+                .seal_event(&cached_header, cached_payload)
+                .expect("seal cached Event");
+            let cached_route = services
+                .relay
+                .verify_event(&cached.bytes)
+                .expect("route cached Event");
+            store
+                .cache_route_verified_event(&cached_route, &cached.bytes)
+                .expect("cache route Event");
+        }
+        let bytes_before = std::fs::read(&file.0).expect("read before inspection");
+        let modified_before = std::fs::metadata(&file.0)
+            .expect("metadata before inspection")
+            .modified()
+            .expect("modified before inspection");
+        let inspection = Store::inspect_existing(&file.0).expect("strict read-only inspection");
+        assert_eq!(inspection.stats.items, 1);
+        assert_eq!(inspection.event_stats.events, 1);
+        assert_eq!(inspection.event_stats.acceptance_markers, 1);
+        assert_eq!(inspection.event_stats.route_cached, 1);
+        assert!(inspection.event_stats.total_sealed_bytes > 0);
+        assert!(inspection.event_stats.route_cached_bytes > 0);
+        assert_eq!(inspection.mission_authority, Some(services.authority));
+        assert_eq!(
+            std::fs::read(&file.0).expect("read after inspection"),
+            bytes_before
+        );
+        assert_eq!(
+            std::fs::metadata(&file.0)
+                .expect("metadata after inspection")
+                .modified()
+                .expect("modified after inspection"),
+            modified_before
+        );
+    }
+
+    #[test]
+    fn read_only_inspection_rejects_partial_schema_and_inflated_high_water() {
+        let partial = TestFile::new("inspect-partial-semantic-schema");
+        {
+            let store = Store::open(&partial.0).expect("create current schema");
+            let write = store
+                .database
+                .begin_write()
+                .expect("begin schema corruption");
+            write
+                .delete_table(ROUTE_CACHE_CLAIMS)
+                .expect("delete one semantic table");
+            write.commit().expect("commit partial schema");
+        }
+        assert!(matches!(
+            Store::inspect_existing(&partial.0),
+            Err(StoreError::SemanticInvariant(
+                "mission-scoped Event schema is incomplete"
+            ))
+        ));
+
+        let inflated = TestFile::new("inspect-inflated-high-water");
+        let mut services = event_services(0xa2);
+        {
+            let store =
+                Store::open_for_mission(&inflated.0, services.authority).expect("bound store");
+            let payload = b"audited";
+            let header = event_header(
+                services.publisher.identity(),
+                1,
+                1,
+                VersionVector::default(),
+                b"audit",
+                payload,
+                None,
+            );
+            let sealed = services
+                .publisher
+                .seal_event(&header, payload)
+                .expect("seal audited Event");
+            let event = content_event(&mut services.reader, &sealed.bytes);
+            store
+                .apply_verified_event(&event, &sealed.bytes)
+                .expect("accept audited Event");
+        }
+        {
+            let database = Database::open(&inflated.0).expect("open raw database");
+            let write = database.begin_write().expect("begin high-water corruption");
+            write
+                .open_table(PUBLISHER_HIGH_WATER)
+                .expect("publisher high-water")
+                .insert(services.publisher.identity().as_slice(), 99)
+                .expect("inflate publisher high-water");
+            write.commit().expect("commit high-water corruption");
+        }
+        let corrupted = std::fs::read(&inflated.0).expect("read corrupted store");
+        assert!(matches!(
+            Store::inspect_existing(&inflated.0),
+            Err(StoreError::SemanticInvariant(
+                "publisher high-water contains an orphan, missing, or inflated row"
+            ))
+        ));
+        assert_eq!(
+            std::fs::read(&inflated.0).expect("failed inspection is read-only"),
+            corrupted
+        );
+        assert!(matches!(
+            Store::open_for_mission(&inflated.0, services.authority),
+            Err(StoreError::SemanticInvariant(
+                "publisher high-water contains an orphan, missing, or inflated row"
+            ))
+        ));
+    }
+
+    #[test]
+    fn controls_apply_only_as_exact_contiguous_suffix_and_restart_replays_fresh_verification() {
+        let file = TestFile::new("control-contiguous-restart");
+        let mut services = control_services(0xb1);
+        let first = services
+            .authority
+            .seal_chained_revocation_control([0x71; 32], 1, 1, None)
+            .expect("first control");
+        let first_verified = verify_control(&mut services.verifier, &first);
+        let first_id = ControlTransferId::new(first_verified.envelope_id());
+        let second = services
+            .authority
+            .seal_chained_revocation_control([0x72; 32], 1, 2, Some(first_verified.envelope_id()))
+            .expect("second control");
+        let second_verified = verify_control(&mut services.verifier, &second);
+        let second_id = ControlTransferId::new(second_verified.envelope_id());
+        let third = services
+            .authority
+            .seal_chained_revocation_control([0x73; 32], 1, 3, Some(second_verified.envelope_id()))
+            .expect("third control");
+        let third_verified = verify_control(&mut services.verifier, &third);
+        let third_id = ControlTransferId::new(third_verified.envelope_id());
+
+        {
+            let store = Store::open_for_mission(&file.0, services.authority_id)
+                .expect("mission-bound store");
+            let pending = store
+                .ingest_verified_control(&third_verified, &third)
+                .expect("retain out-of-order third");
+            assert!(
+                matches!(pending, ControlOutcome::Pending { transfer_id } if transfer_id == third_id)
+            );
+            assert!(pending.activated().is_empty());
+            assert!(store.applied_controls().expect("applied prefix").is_empty());
+
+            let ControlOutcome::Applied { activated, .. } = store
+                .ingest_verified_control(&first_verified, &first)
+                .expect("apply first")
+            else {
+                panic!("first link must apply");
+            };
+            assert_eq!(
+                activated
+                    .iter()
+                    .map(|control| control.transfer_id)
+                    .collect::<Vec<_>>(),
+                vec![first_id]
+            );
+            assert!(
+                activated
+                    .iter()
+                    .all(|control| control.applied && control.priority() == Priority::Flash)
+            );
+
+            let duplicate = store
+                .ingest_verified_control(&first_verified, &first)
+                .expect("duplicate first");
+            assert!(
+                matches!(duplicate, ControlOutcome::Duplicate { transfer_id } if transfer_id == first_id)
+            );
+            assert!(duplicate.activated().is_empty());
+
+            let ControlOutcome::Applied { activated, .. } = store
+                .ingest_verified_control(&second_verified, &second)
+                .expect("close pending gap")
+            else {
+                panic!("second must activate itself and third");
+            };
+            assert_eq!(
+                activated
+                    .iter()
+                    .map(|control| control.transfer_id)
+                    .collect::<Vec<_>>(),
+                vec![second_id, third_id]
+            );
+            assert_eq!(store.control_head().expect("head"), Some((3, third_id)));
+            assert_eq!(store.control_inventory().expect("inventory").len(), 3);
+            assert!(store.event_inventory().expect("Event inventory").is_empty());
+            assert_eq!(
+                store.control_stats().expect("control stats"),
+                ControlStoreStats {
+                    controls: 3,
+                    applied: 3,
+                    pending: 0,
+                    total_sealed_bytes: (first.len() + second.len() + third.len()) as u64,
+                    publication_intent_bytes: 0,
+                    head_sequence: 3,
+                    revocations: 3,
+                    scope_epochs: 0,
+                    reservation_receipts: 0,
+                }
+            );
+        }
+
+        let reopened =
+            Store::open_for_mission(&file.0, services.authority_id).expect("reopen audited store");
+        let applied = reopened
+            .applied_controls()
+            .expect("restart applied controls");
+        assert_eq!(
+            applied
+                .iter()
+                .map(|control| control.transfer_id)
+                .collect::<Vec<_>>(),
+            vec![first_id, second_id, third_id]
+        );
+        let mut fresh_verifier = ReferenceEnvelopeSealer::open(
+            ProvisioningBundle::from_bytes(&services.verifier_bundle)
+                .expect("restore verifier bundle"),
+        )
+        .expect("fresh verifier");
+        for stored in applied {
+            let verified = fresh_verifier
+                .verify_control(&stored.sealed)
+                .expect("fresh restart verification");
+            assert_eq!(verified.envelope_id(), *stored.transfer_id.as_bytes());
+            assert_eq!(verified.authority_id(), stored.authority);
+            assert_eq!(verified.signer(), stored.signer);
+            assert_eq!(verified.control_sequence(), stored.sequence);
+            assert_eq!(
+                verified.previous_control(),
+                stored.previous_control.map(|id| *id.as_bytes())
+            );
+            let ready = fresh_verifier
+                .prepare_committed_control_activation(&verified, &stored.sealed)
+                .expect("prepare only audited applied row");
+            fresh_verifier
+                .activate_committed_control(ready, false)
+                .expect("idempotent restart activation");
+        }
+        drop(reopened);
+        let inspection = Store::inspect_existing(&file.0).expect("strict read-only inspection");
+        assert_eq!(inspection.control_stats.applied, 3);
+        assert_eq!(inspection.mission_authority, Some(services.authority_id));
+    }
+
+    #[test]
+    fn local_control_reservation_is_atomic_idempotent_and_cannot_survive_race_or_tamper() {
+        let file = TestFile::new("control-local-reservation");
+        let mut services = control_services(0xb2);
+        let store = Store::open_for_mission(&file.0, services.authority_id).expect("store");
+        let principal = services
+            .authority
+            .verified_control_principal()
+            .expect("verified principal");
+        let reservation = store.reserve_control(principal).expect("reserve first");
+        let sealed = services
+            .authority
+            .seal_chained_revocation_control(
+                [0x81; 32],
+                1,
+                reservation.sequence(),
+                reservation.previous_control().map(|id| *id.as_bytes()),
+            )
+            .expect("seal reserved control");
+        let verified = verify_control(&mut services.verifier, &sealed);
+        let transfer_id = ControlTransferId::new(verified.envelope_id());
+        assert!(matches!(
+            store
+                .commit_reserved_control(&reservation, &verified, &sealed)
+                .expect("commit reserved control"),
+            ControlOutcome::Applied { ref activated, .. }
+                if activated.iter().map(|row| row.transfer_id).collect::<Vec<_>>() == vec![transfer_id]
+        ));
+        assert_eq!(
+            store.control_stats().expect("stats").reservation_receipts,
+            1
+        );
+        assert!(matches!(
+            store
+                .commit_reserved_control(&reservation, &verified, &sealed)
+                .expect("exact local replay"),
+            ControlOutcome::Duplicate { transfer_id: id } if id == transfer_id
+        ));
+
+        let stale = store.reserve_control(principal).expect("stale reservation");
+        let remote = services
+            .authority
+            .seal_chained_revocation_control(
+                [0x82; 32],
+                1,
+                stale.sequence(),
+                stale.previous_control().map(|id| *id.as_bytes()),
+            )
+            .expect("remote winner");
+        let remote_verified = verify_control(&mut services.verifier, &remote);
+        store
+            .ingest_verified_control(&remote_verified, &remote)
+            .expect("remote winner applies");
+        let loser = services
+            .authority
+            .seal_chained_revocation_control(
+                [0x83; 32],
+                1,
+                stale.sequence(),
+                stale.previous_control().map(|id| *id.as_bytes()),
+            )
+            .expect("stale loser");
+        let loser_verified = verify_control(&mut services.verifier, &loser);
+        assert!(matches!(
+            store.commit_reserved_control(&stale, &loser_verified, &loser),
+            Err(StoreError::ControlReservationChanged)
+        ));
+        assert_eq!(
+            store
+                .control_stats()
+                .expect("stats after race")
+                .reservation_receipts,
+            1,
+            "the rejected race cannot write a reservation receipt"
+        );
+
+        let mut tampered = remote.clone();
+        *tampered.last_mut().expect("sealed control") ^= 1;
+        assert!(matches!(
+            store.ingest_verified_control(&remote_verified, &tampered),
+            Err(StoreError::ControlVerification(_))
+        ));
+
+        let wrong = control_services(0xb3);
+        let wrong_file = TestFile::new("control-wrong-authority");
+        let wrong_store =
+            Store::open_for_mission(&wrong_file.0, wrong.authority_id).expect("wrong store");
+        assert!(matches!(
+            wrong_store.ingest_verified_control(&remote_verified, &remote),
+            Err(StoreError::MissionAuthorityMismatch { .. })
+        ));
+        assert_eq!(
+            wrong_store.control_stats().expect("wrong stats").controls,
+            0
+        );
+    }
+
+    #[test]
+    fn revoked_signer_far_future_suffix_is_purged_and_recovery_survives_restart() {
+        let file = TestFile::new("control-revoked-future");
+        let mut provisioner = ReferenceProvisioner::from_seed([0xb4; 32]).expect("provisioner");
+        let access = ProvisioningAccess::member(event_scope(), vec![1], vec![event_topic()])
+            .expect("access");
+        let old_bundle = provisioner
+            .issue_control_authority(1, std::slice::from_ref(&access))
+            .expect("old signer");
+        let recovery_bundle = provisioner
+            .issue_control_authority(2, std::slice::from_ref(&access))
+            .expect("recovery signer");
+        let verifier_bundle = provisioner.issue_node(3, &[access]).expect("verifier");
+        let mut old = ReferenceEnvelopeSealer::open(old_bundle).expect("old signer service");
+        let mut recovery =
+            ReferenceEnvelopeSealer::open(recovery_bundle).expect("recovery service");
+        let mut verifier =
+            ReferenceEnvelopeSealer::open(verifier_bundle).expect("verifier service");
+        let authority_id = recovery.mission_authority_id();
+        let old_signer = old.identity();
+
+        let first = recovery
+            .seal_chained_revocation_control(old_signer, 1, 1, None)
+            .expect("revoke old signer");
+        let first_verified = verify_control(&mut verifier, &first);
+        let first_id = ControlTransferId::new(first_verified.envelope_id());
+        let valid_two = recovery
+            .seal_chained_revocation_control([0x91; 32], 1, 2, Some(first_verified.envelope_id()))
+            .expect("valid recovery link");
+        let valid_two_verified = verify_control(&mut verifier, &valid_two);
+        let valid_two_id = ControlTransferId::new(valid_two_verified.envelope_id());
+        let poisoned = old
+            .seal_chained_revocation_control([0x92; 32], 1, 1_000_000, Some([0xee; 32]))
+            .expect("far-future poisoned link");
+        let poisoned_verified = verify_control(&mut verifier, &poisoned);
+        let poisoned_id = ControlTransferId::new(poisoned_verified.envelope_id());
+
+        {
+            let store = Store::open_for_mission(&file.0, authority_id).expect("store");
+            assert!(matches!(
+                store
+                    .ingest_verified_control(&poisoned_verified, &poisoned)
+                    .expect("retain poison pending"),
+                ControlOutcome::Pending { .. }
+            ));
+            assert!(matches!(
+                store
+                    .ingest_verified_control(&valid_two_verified, &valid_two)
+                    .expect("retain valid second pending"),
+                ControlOutcome::Pending { .. }
+            ));
+        }
+        let store = Store::open_for_mission(&file.0, authority_id).expect("restart with pending");
+        let ControlOutcome::Applied {
+            activated,
+            rejected,
+            ..
+        } = store
+            .ingest_verified_control(&first_verified, &first)
+            .expect("commit revocation and recovery")
+        else {
+            panic!("revocation must activate recovery prefix");
+        };
+        assert_eq!(
+            activated
+                .iter()
+                .map(|control| control.transfer_id)
+                .collect::<Vec<_>>(),
+            vec![first_id, valid_two_id]
+        );
+        assert_eq!(
+            rejected,
+            vec![RejectedControl {
+                transfer_id: poisoned_id,
+                signer: old_signer,
+                reason: ControlRejectionReason::SignerRevoked(old_signer),
+            }]
+        );
+        assert!(
+            store
+                .get_control(poisoned_id)
+                .expect("poison query")
+                .is_none()
+        );
+        assert!(
+            store
+                .is_control_principal_revoked(old_signer)
+                .expect("old signer revocation")
+        );
+        assert_eq!(
+            store
+                .active_revocation(old_signer)
+                .expect("active revocation source"),
+            Some((1, first_id))
+        );
+
+        let rejected_three = old
+            .seal_chained_revocation_control(
+                [0x93; 32],
+                1,
+                3,
+                Some(valid_two_verified.envelope_id()),
+            )
+            .expect("revoked signer candidate");
+        let rejected_three_verified = verify_control(&mut verifier, &rejected_three);
+        let outcome = store
+            .ingest_verified_control(&rejected_three_verified, &rejected_three)
+            .expect("attribute revoked input");
+        assert!(matches!(outcome, ControlOutcome::Rejected { .. }));
+        assert_eq!(
+            outcome.rejected_input().map(|value| value.signer),
+            Some(old_signer)
+        );
+        let old_principal = old
+            .verified_control_principal()
+            .expect("old cryptographic principal remains inspectable");
+        assert!(matches!(
+            store.reserve_control(old_principal),
+            Err(StoreError::ControlSignerRevoked(node)) if node == old_signer
+        ));
+        assert_eq!(store.control_stats().expect("stats").controls, 2);
+    }
+
+    #[test]
+    fn control_fork_rollback_quota_and_forward_inverse_tamper_fail_atomically() {
+        let file = TestFile::new("control-fork-rollback");
+        let mut services = control_services(0xb5);
+        let target = [0xa1; 32];
+        let first = services
+            .authority
+            .seal_chained_revocation_control(target, 2, 1, None)
+            .expect("first");
+        let first_verified = verify_control(&mut services.verifier, &first);
+        let first_id = ControlTransferId::new(first_verified.envelope_id());
+        {
+            let store = Store::open_for_mission(&file.0, services.authority_id).expect("store");
+            store
+                .ingest_verified_control(&first_verified, &first)
+                .expect("apply first");
+            let fork = services
+                .authority
+                .seal_chained_revocation_control([0xa2; 32], 1, 1, None)
+                .expect("fork");
+            let fork_verified = verify_control(&mut services.verifier, &fork);
+            assert!(matches!(
+                store.ingest_verified_control(&fork_verified, &fork),
+                Err(StoreError::ControlFork)
+            ));
+            let wrong_predecessor = services
+                .authority
+                .seal_chained_revocation_control(target, 3, 2, Some([0xff; 32]))
+                .expect("wrong predecessor candidate");
+            let wrong_predecessor_verified =
+                verify_control(&mut services.verifier, &wrong_predecessor);
+            assert!(matches!(
+                store.ingest_verified_control(&wrong_predecessor_verified, &wrong_predecessor),
+                Err(StoreError::ControlFork)
+            ));
+            let rollback = services
+                .authority
+                .seal_chained_revocation_control(target, 1, 2, Some(first_verified.envelope_id()))
+                .expect("rollback");
+            let rollback_verified = verify_control(&mut services.verifier, &rollback);
+            assert!(matches!(
+                store.ingest_verified_control(&rollback_verified, &rollback),
+                Err(StoreError::ControlRollback)
+            ));
+            assert_eq!(store.control_stats().expect("atomic stats").controls, 1);
+            assert_eq!(store.control_head().expect("head"), Some((1, first_id)));
+        }
+
+        let database = Database::open(&file.0).expect("raw tamper open");
+        let write = database.begin_write().expect("raw tamper write");
+        write
+            .open_table(CONTROL_REVOCATIONS)
+            .expect("revocations")
+            .remove(target.as_slice())
+            .expect("remove inverse index");
+        write.commit().expect("commit tamper");
+        drop(database);
+        assert!(matches!(
+            Store::inspect_existing(&file.0),
+            Err(StoreError::ControlInvariant(_))
+        ));
+        assert!(matches!(
+            Store::open_for_mission(&file.0, services.authority_id),
+            Err(StoreError::ControlInvariant(_))
+        ));
+
+        let quota_file = TestFile::new("control-aggregate-quota");
+        let limits = StoreLimits::new(1, u64::MAX).expect("limits");
+        let quota =
+            Store::open_with_limits_for_mission(&quota_file.0, limits, services.authority_id)
+                .expect("quota store");
+        quota
+            .apply(item(0xf1), b"opaque")
+            .expect("fill opaque quota");
+        assert!(matches!(
+            quota.ingest_verified_control(&first_verified, &first),
+            Err(StoreError::ItemLimitExceeded { .. })
+        ));
+        assert_eq!(quota.control_stats().expect("quota stats").controls, 0);
+
+        let byte_file = TestFile::new("control-byte-quota");
+        let byte_limits =
+            StoreLimits::new(10, (first.len() as u64).saturating_sub(1)).expect("byte limits");
+        let byte_store =
+            Store::open_with_limits_for_mission(&byte_file.0, byte_limits, services.authority_id)
+                .expect("byte quota store");
+        assert!(matches!(
+            byte_store.ingest_verified_control(&first_verified, &first),
+            Err(StoreError::PayloadByteLimitExceeded { .. })
+        ));
+        assert_eq!(byte_store.control_stats().expect("byte stats").controls, 0);
+
+        let dedicated_file = TestFile::new("control-dedicated-quota");
+        let dedicated =
+            Store::open_for_mission(&dedicated_file.0, services.authority_id).expect("store");
+        let prepared = PreparedControl::from_verified(&first_verified, &first).expect("prepared");
+        {
+            let write = dedicated
+                .database
+                .begin_write()
+                .expect("item cap transaction");
+            write
+                .open_table(METADATA)
+                .expect("metadata")
+                .insert(CONTROL_ITEM_COUNT, MAX_CONTROL_ITEMS)
+                .expect("stage item cap");
+            assert!(matches!(
+                insert_control(&write, &prepared, dedicated.limits()),
+                Err(StoreError::ControlItemLimitExceeded { .. })
+            ));
+            // Dropping this deliberately uncommitted transaction models an
+            // admission failure: neither the synthetic counter nor a control
+            // row may become durable.
+        }
+        assert_eq!(
+            dedicated
+                .control_stats()
+                .expect("item cap rollback")
+                .controls,
+            0
+        );
+        {
+            let write = dedicated
+                .database
+                .begin_write()
+                .expect("byte cap transaction");
+            write
+                .open_table(METADATA)
+                .expect("metadata")
+                .insert(CONTROL_TOTAL_BYTES, MAX_CONTROL_BYTES)
+                .expect("stage byte cap");
+            assert!(matches!(
+                insert_control(&write, &prepared, dedicated.limits()),
+                Err(StoreError::ControlByteLimitExceeded { .. })
+            ));
+        }
+        assert_eq!(
+            dedicated
+                .control_stats()
+                .expect("byte cap rollback")
+                .controls,
+            0
+        );
+    }
+
+    #[test]
+    fn scope_epoch_rollback_is_rejected_without_changing_durable_effect_state() {
+        let file = TestFile::new("control-scope-rollback");
+        let mut services = control_services(0xb6);
+        let recipients = vec![
+            ScopeRekeyRecipient::member(services.authority.identity(), vec![event_topic()])
+                .expect("authority recipient"),
+            ScopeRekeyRecipient::member(services.verifier.identity(), vec![event_topic()])
+                .expect("verifier recipient"),
+        ];
+        let (first, registry_generation) = services
+            .authority
+            .seal_chained_scope_rekey_control_from_registry(
+                &services.registry,
+                0,
+                event_scope(),
+                2,
+                recipients.clone(),
+                1,
+                None,
+            )
+            .expect("scope epoch two");
+        let first_verified = verify_control(&mut services.verifier, &first);
+        let first_id = ControlTransferId::new(first_verified.envelope_id());
+        let store = Store::open_for_mission(&file.0, services.authority_id).expect("store");
+        store
+            .ingest_verified_control(&first_verified, &first)
+            .expect("apply scope epoch two");
+        assert_eq!(
+            store
+                .active_scope_epoch(&event_scope())
+                .expect("active epoch"),
+            Some((2, first_id))
+        );
+        let remote_intent = ScopeRekeyPublicationIntent::new(
+            services
+                .authority
+                .verified_control_principal()
+                .expect("principal"),
+            &services.registry,
+            registry_generation,
+            event_scope(),
+            2,
+            &recipients,
+        )
+        .expect("candidate retry intent");
+        assert!(matches!(
+            store.verify_scope_rekey_publication_intent(first_id, &remote_intent),
+            Err(StoreError::ControlPublicationIntentUnknown { transfer_id })
+                if transfer_id == first_id
+        ));
+
+        let (rollback, _) = services
+            .authority
+            .seal_chained_scope_rekey_control_from_registry(
+                &services.registry,
+                0,
+                event_scope(),
+                1,
+                recipients,
+                2,
+                Some(first_verified.envelope_id()),
+            )
+            .expect("authenticated rollback candidate");
+        let rollback_verified = verify_control(&mut services.verifier, &rollback);
+        assert!(matches!(
+            store.ingest_verified_control(&rollback_verified, &rollback),
+            Err(StoreError::ControlRollback)
+        ));
+        assert_eq!(
+            store
+                .active_scope_epoch(&event_scope())
+                .expect("stable epoch"),
+            Some((2, first_id))
+        );
+        assert_eq!(store.control_stats().expect("stats").controls, 1);
+    }
+
+    #[test]
+    fn local_scope_rekey_intent_is_crash_idempotent_and_rejects_changed_retry_inputs() {
+        let file = TestFile::new("control-rekey-intent");
+        let mut services = control_services(0xc1);
+        let principal = services
+            .authority
+            .verified_control_principal()
+            .expect("control principal");
+        let recipients = vec![
+            ScopeRekeyRecipient::member(services.verifier.identity(), vec![event_topic()])
+                .expect("verifier recipient"),
+            ScopeRekeyRecipient::member(services.authority.identity(), vec![event_topic()])
+                .expect("authority recipient"),
+        ];
+        let reservation = {
+            let store =
+                Store::open_for_mission(&file.0, services.authority_id).expect("intent store");
+            store.reserve_control(principal).expect("reserve rekey")
+        };
+        let (sealed, registry_generation) = services
+            .authority
+            .seal_chained_scope_rekey_control_from_registry(
+                &services.registry,
+                0,
+                event_scope(),
+                2,
+                recipients.clone(),
+                reservation.sequence(),
+                reservation.previous_control().map(|id| *id.as_bytes()),
+            )
+            .expect("seal rekey");
+        let verified = verify_control(&mut services.verifier, &sealed);
+        let transfer_id = ControlTransferId::new(verified.envelope_id());
+        let intent = ScopeRekeyPublicationIntent::new(
+            principal,
+            &services.registry,
+            registry_generation,
+            event_scope(),
+            2,
+            &recipients,
+        )
+        .expect("canonical intent");
+
+        {
+            let store =
+                Store::open_for_mission(&file.0, services.authority_id).expect("commit store");
+            assert!(matches!(
+                store.commit_reserved_control(&reservation, &verified, &sealed),
+                Err(StoreError::MissingControlPublicationIntent)
+            ));
+            assert_eq!(store.control_stats().expect("unmutated stats").controls, 0);
+            assert!(matches!(
+                store
+                    .commit_reserved_scope_rekey_control(&reservation, &verified, &sealed, &intent,)
+                    .expect("commit with intent"),
+                ControlOutcome::Applied { .. }
+            ));
+            store
+                .verify_scope_rekey_publication_intent(transfer_id, &intent)
+                .expect("exact committed intent");
+        }
+
+        let reopened =
+            Store::open_for_mission(&file.0, services.authority_id).expect("crash reopen");
+        assert!(matches!(
+            reopened
+                .commit_reserved_scope_rekey_control(
+                    &reservation,
+                    &verified,
+                    &sealed,
+                    &intent,
+                )
+                .expect("exact retry after lost response"),
+            ControlOutcome::Duplicate { transfer_id: id } if id == transfer_id
+        ));
+        let mut reordered = recipients.clone();
+        reordered.reverse();
+        let reordered_intent = ScopeRekeyPublicationIntent::new(
+            principal,
+            &services.registry,
+            registry_generation,
+            event_scope(),
+            2,
+            &reordered,
+        )
+        .expect("reordered equivalent intent");
+        assert_eq!(reordered_intent, intent);
+        reopened
+            .verify_scope_rekey_publication_intent(transfer_id, &reordered_intent)
+            .expect("reordered intent remains exact");
+
+        let changed_recipients = vec![
+            ScopeRekeyRecipient::route_only(services.verifier.identity()),
+            ScopeRekeyRecipient::member(services.authority.identity(), vec![event_topic()])
+                .expect("authority recipient"),
+        ];
+        let changed_recipient_intent = ScopeRekeyPublicationIntent::new(
+            principal,
+            &services.registry,
+            registry_generation,
+            event_scope(),
+            2,
+            &changed_recipients,
+        )
+        .expect("changed recipient intent");
+        assert!(matches!(
+            reopened.verify_scope_rekey_publication_intent(
+                transfer_id,
+                &changed_recipient_intent
+            ),
+            Err(StoreError::ControlPublicationIntentConflict { transfer_id: id })
+                if id == transfer_id
+        ));
+        assert!(matches!(
+            reopened.commit_reserved_scope_rekey_control(
+                &reservation,
+                &verified,
+                &sealed,
+                &changed_recipient_intent,
+            ),
+            Err(StoreError::ControlPublicationIntentConflict { transfer_id: id })
+                if id == transfer_id
+        ));
+
+        let mut changed_registry = services.registry.clone();
+        *changed_registry.last_mut().expect("registry byte") ^= 1;
+        let changed_registry_intent = ScopeRekeyPublicationIntent::new(
+            principal,
+            &changed_registry,
+            registry_generation,
+            event_scope(),
+            2,
+            &recipients,
+        )
+        .expect("changed registry identity");
+        assert!(matches!(
+            reopened
+                .verify_scope_rekey_publication_intent(transfer_id, &changed_registry_intent),
+            Err(StoreError::ControlPublicationIntentConflict { transfer_id: id })
+                if id == transfer_id
+        ));
+        assert_eq!(reopened.control_stats().expect("stable stats").controls, 1);
+        drop(reopened);
+
+        let missing_intent = TestFile::new("control-rekey-intent-missing");
+        std::fs::copy(&file.0, &missing_intent.0).expect("copy intent store");
+        {
+            let database = Database::open(&missing_intent.0).expect("raw intent store");
+            let write = database.begin_write().expect("intent tamper transaction");
+            write
+                .open_table(CONTROL_PUBLICATION_INTENTS)
+                .expect("intent table")
+                .remove(transfer_id.as_bytes().as_slice())
+                .expect("remove intent");
+            write.commit().expect("commit intent tamper");
+        }
+        assert!(matches!(
+            Store::inspect_existing(&missing_intent.0),
+            Err(StoreError::ControlInvariant(_))
+        ));
+        assert!(matches!(
+            Store::open_for_mission(&missing_intent.0, services.authority_id),
+            Err(StoreError::ControlInvariant(_))
+        ));
+    }
+
+    #[test]
+    fn maximal_scope_rekey_intent_is_quota_bound_and_rolls_back_every_control_row() {
+        let mut provisioner = ReferenceProvisioner::from_seed([0xc4; 32]).expect("provisioner");
+        let member_access = ProvisioningAccess::member(event_scope(), vec![1], vec![event_topic()])
+            .expect("member access");
+        let relay_access = ProvisioningAccess::relay(event_scope(), vec![1]).expect("relay access");
+        let authority_bundle = provisioner
+            .issue_control_authority(1, std::slice::from_ref(&member_access))
+            .expect("authority bundle");
+        let verifier_bundle = provisioner
+            .issue_node(2, std::slice::from_ref(&member_access))
+            .expect("verifier bundle");
+        let mut authority =
+            ReferenceEnvelopeSealer::open(authority_bundle).expect("authority sealer");
+        let mut verifier = ReferenceEnvelopeSealer::open(verifier_bundle).expect("verifier sealer");
+        let mut recipients = vec![
+            ScopeRekeyRecipient::member(authority.identity(), vec![event_topic()])
+                .expect("authority recipient"),
+            ScopeRekeyRecipient::member(verifier.identity(), vec![event_topic()])
+                .expect("verifier recipient"),
+        ];
+        for serial in 3..=MAX_CONTROL_INTENT_RECIPIENTS as u64 {
+            let relay = provisioner
+                .issue_node(serial, std::slice::from_ref(&relay_access))
+                .and_then(ReferenceEnvelopeSealer::open)
+                .expect("relay recipient");
+            recipients.push(ScopeRekeyRecipient::route_only(relay.identity()));
+        }
+        assert_eq!(recipients.len(), MAX_CONTROL_INTENT_RECIPIENTS);
+        let registry = provisioner
+            .export_rekey_registry()
+            .expect("signed registry");
+        let principal = authority
+            .verified_control_principal()
+            .expect("control principal");
+        let authority_id = authority.mission_authority_id();
+
+        let file = TestFile::new("control-rekey-intent-quota");
+        let reservation = {
+            let store = Store::open_for_mission(&file.0, authority_id).expect("initial store");
+            store.reserve_control(principal).expect("reserve rekey")
+        };
+        let (sealed, registry_generation) = authority
+            .seal_chained_scope_rekey_control_from_registry(
+                &registry,
+                0,
+                event_scope(),
+                2,
+                recipients.clone(),
+                reservation.sequence(),
+                reservation.previous_control().map(|id| *id.as_bytes()),
+            )
+            .expect("seal maximal rekey");
+        let verified = verify_control(&mut verifier, &sealed);
+        let transfer_id = ControlTransferId::new(verified.envelope_id());
+        let intent = ScopeRekeyPublicationIntent::new(
+            principal,
+            &registry,
+            registry_generation,
+            event_scope(),
+            2,
+            &recipients,
+        )
+        .expect("maximal canonical intent");
+        let encoded_intent =
+            encode_scope_rekey_publication_intent(&intent).expect("encode maximal intent");
+        assert_eq!(intent.recipient_count(), MAX_CONTROL_INTENT_RECIPIENTS);
+        assert!(!encoded_intent.is_empty());
+
+        let sealed_len = u64::try_from(sealed.len()).expect("sealed length");
+        let intent_len = u64::try_from(encoded_intent.len()).expect("intent length");
+        let aggregate_limit = sealed_len
+            .checked_add(intent_len)
+            .and_then(|total| total.checked_sub(1))
+            .expect("one byte below combined usage");
+        let limits = StoreLimits::new(1, aggregate_limit).expect("restrictive limits");
+        let store = Store::open_with_limits_for_mission(&file.0, limits, authority_id)
+            .expect("quota store");
+        assert!(matches!(
+            store.commit_reserved_scope_rekey_control(
+                &reservation,
+                &verified,
+                &sealed,
+                &intent,
+            ),
+            Err(StoreError::PayloadByteLimitExceeded {
+                current,
+                incoming,
+                limit,
+            }) if current == sealed_len && incoming == intent_len && limit == aggregate_limit
+        ));
+        assert_eq!(
+            store.control_stats().expect("rolled-back stats"),
+            ControlStoreStats::default()
+        );
+        assert!(
+            store
+                .get_control(transfer_id)
+                .expect("rolled-back control lookup")
+                .is_none()
+        );
+        assert_eq!(store.control_head().expect("rolled-back head"), None);
+        assert!(matches!(
+            store.verify_scope_rekey_publication_intent(transfer_id, &intent),
+            Err(StoreError::ControlPublicationIntentUnknown { transfer_id: id })
+                if id == transfer_id
+        ));
+
+        {
+            let write = store
+                .database
+                .begin_write()
+                .expect("dedicated-cap transaction");
+            {
+                let mut metadata = write.open_table(METADATA).expect("metadata");
+                metadata
+                    .insert(
+                        CONTROL_TOTAL_BYTES,
+                        MAX_CONTROL_BYTES
+                            .checked_sub(intent_len)
+                            .and_then(|remaining| remaining.checked_add(1))
+                            .expect("intent smaller than dedicated cap"),
+                    )
+                    .expect("stage dedicated usage");
+            }
+            assert!(matches!(
+                admit_control_publication_intent(&write, encoded_intent.len(), StoreLimits::default()),
+                Err(StoreError::ControlByteLimitExceeded { incoming, limit, .. })
+                    if incoming == intent_len && limit == MAX_CONTROL_BYTES
+            ));
+            // Dropping the transaction proves the synthetic cap state and any
+            // attempted intent accounting cannot become durable.
+        }
+        assert_eq!(
+            store.control_stats().expect("dedicated rollback stats"),
+            ControlStoreStats::default()
+        );
+        drop(store);
+        assert_eq!(
+            Store::inspect_existing(&file.0)
+                .expect("read-only rollback audit")
+                .control_stats,
+            ControlStoreStats::default()
+        );
+    }
+
+    #[test]
+    fn stale_revocation_policy_blocks_existing_operation_and_all_public_event_mutations() {
+        let file = TestFile::new("event-policy-revocation");
+        let mut services = control_services(0xc2);
+        let store = Store::open_for_mission(&file.0, services.authority_id).expect("policy store");
+        store
+            .require_process_exclusive_lock()
+            .expect("redb writer exclusion proof");
+        let policy = store.control_policy_snapshot().expect("initial policy");
+        let reservation = store
+            .reserve_event_with_policy(
+                &policy,
+                services.authority.identity(),
+                &event_topic(),
+                &event_scope(),
+            )
+            .expect("policy-bound reservation");
+        let payload = b"operation before policy change";
+        let header = reservation
+            .header(
+                Priority::Immediate,
+                b"policy-operation".to_vec(),
+                None,
+                payload.len() as u64,
+                false,
+                1,
+            )
+            .expect("reserved header");
+        let sealed = services
+            .authority
+            .seal_event(&header, payload)
+            .expect("seal local event");
+        let event = content_event(&mut services.verifier, &sealed.bytes);
+        let operation = EventOperationKey::new(b"policy/once".to_vec()).expect("operation key");
+        assert!(matches!(
+            store
+                .commit_reserved_event_once_with_policy(
+                    &policy,
+                    &operation,
+                    None,
+                    &reservation,
+                    &event,
+                    &sealed.bytes,
+                )
+                .expect("initial operation"),
+            EventOnceOutcome::Inserted { .. }
+        ));
+
+        let unrelated = [0xe1; 32];
+        let revoke = services
+            .authority
+            .seal_chained_revocation_control(unrelated, 1, 1, None)
+            .expect("policy-changing revocation");
+        let revoke_verified = verify_control(&mut services.verifier, &revoke);
+        store
+            .ingest_verified_control(&revoke_verified, &revoke)
+            .expect("apply revocation");
+        assert!(matches!(
+            store
+                .commit_reserved_event_once(&operation, None, &reservation, &event, &sealed.bytes,),
+            Err(StoreError::ControlPolicyChanged)
+        ));
+        assert!(matches!(
+            store.transfer_inventory_with_policy(&policy),
+            Err(StoreError::ControlPolicyChanged)
+        ));
+        assert_eq!(store.event_stats().expect("stable event stats").events, 1);
+
+        let revoked_publisher = services.verifier.identity();
+        let remote_payload = b"revoked publisher event";
+        let remote_header = event_header(
+            revoked_publisher,
+            1,
+            1,
+            VersionVector::default(),
+            b"revoked-source",
+            remote_payload,
+            None,
+        );
+        let remote = services
+            .verifier
+            .seal_event(&remote_header, remote_payload)
+            .expect("seal before revocation");
+        let remote_route = services
+            .authority
+            .verify_event(&remote.bytes)
+            .expect("route verify remote");
+        let remote_event = content_event(&mut services.authority, &remote.bytes);
+        let revoke_publisher = services
+            .authority
+            .seal_chained_revocation_control(
+                revoked_publisher,
+                1,
+                2,
+                Some(revoke_verified.envelope_id()),
+            )
+            .expect("revoke publisher");
+        let revoke_publisher_verified = verify_control(&mut services.verifier, &revoke_publisher);
+        store
+            .ingest_verified_control(&revoke_publisher_verified, &revoke_publisher)
+            .expect("apply publisher revocation");
+        let current = store
+            .control_policy_snapshot()
+            .expect("settled current policy");
+        for result in [
+            store.apply_verified_event(&remote_event, &remote.bytes),
+            store.apply_verified_event_with_policy(&current, &remote_event, &remote.bytes),
+        ] {
+            assert!(matches!(
+                result,
+                Err(StoreError::EventPublisherRevoked(node)) if node == revoked_publisher
+            ));
+        }
+        for result in [
+            store.cache_route_verified_event(&remote_route, &remote.bytes),
+            store.cache_route_verified_event_with_policy(&current, &remote_route, &remote.bytes),
+        ] {
+            assert!(matches!(
+                result,
+                Err(StoreError::EventPublisherRevoked(node)) if node == revoked_publisher
+            ));
+        }
+        assert_eq!(store.event_stats().expect("no revoked mutation").events, 1);
+        assert_eq!(
+            store.event_stats().expect("no revoked cache").route_cached,
+            0
+        );
+    }
+
+    #[test]
+    fn stale_rekey_and_pending_policy_reject_event_bytes_indexes_and_operations_atomically() {
+        let rekey_file = TestFile::new("event-policy-rekey");
+        let mut services = control_services(0xc3);
+        let store =
+            Store::open_for_mission(&rekey_file.0, services.authority_id).expect("rekey store");
+        let old_policy = store.control_policy_snapshot().expect("old policy");
+        let payload = b"epoch-one event";
+        let header = event_header(
+            services.verifier.identity(),
+            1,
+            1,
+            VersionVector::default(),
+            b"old-epoch",
+            payload,
+            None,
+        );
+        let sealed = services
+            .verifier
+            .seal_event(&header, payload)
+            .expect("seal epoch one");
+        let route = services
+            .authority
+            .verify_event(&sealed.bytes)
+            .expect("route verify");
+        let event = content_event(&mut services.authority, &sealed.bytes);
+        let recipients = vec![
+            ScopeRekeyRecipient::member(services.authority.identity(), vec![event_topic()])
+                .expect("authority recipient"),
+            ScopeRekeyRecipient::member(services.verifier.identity(), vec![event_topic()])
+                .expect("verifier recipient"),
+        ];
+        let (rekey, _) = services
+            .authority
+            .seal_chained_scope_rekey_control_from_registry(
+                &services.registry,
+                0,
+                event_scope(),
+                2,
+                recipients,
+                1,
+                None,
+            )
+            .expect("seal rekey");
+        let rekey_verified = verify_control(&mut services.verifier, &rekey);
+        store
+            .ingest_verified_control(&rekey_verified, &rekey)
+            .expect("apply rekey");
+        assert!(matches!(
+            store.apply_verified_event_with_policy(&old_policy, &event, &sealed.bytes),
+            Err(StoreError::ControlPolicyChanged)
+        ));
+        assert!(matches!(
+            store.cache_route_verified_event_with_policy(&old_policy, &route, &sealed.bytes),
+            Err(StoreError::ControlPolicyChanged)
+        ));
+        let current = store
+            .control_policy_snapshot()
+            .expect("current rekey policy");
+        for result in [
+            store.apply_verified_event(&event, &sealed.bytes),
+            store.apply_verified_event_with_policy(&current, &event, &sealed.bytes),
+        ] {
+            assert!(matches!(
+                result,
+                Err(StoreError::EventKeyEpochStale {
+                    current: 2,
+                    received: 1
+                })
+            ));
+        }
+        assert!(matches!(
+            store.cache_route_verified_event(&route, &sealed.bytes),
+            Err(StoreError::EventKeyEpochStale {
+                current: 2,
+                received: 1
+            })
+        ));
+        assert_eq!(store.event_stats().expect("rekey atomic stats").events, 0);
+        assert_eq!(
+            store.event_stats().expect("rekey cache stats").route_cached,
+            0
+        );
+
+        let pending_file = TestFile::new("event-policy-pending");
+        let mut pending_services = control_services(0xc4);
+        let pending_store = Store::open_for_mission(&pending_file.0, pending_services.authority_id)
+            .expect("pending store");
+        let pending_policy = pending_store
+            .control_policy_snapshot()
+            .expect("pre-pending policy");
+        let reservation = pending_store
+            .reserve_event_with_policy(
+                &pending_policy,
+                pending_services.authority.identity(),
+                &event_topic(),
+                &event_scope(),
+            )
+            .expect("pre-pending reservation");
+        let local_payload = b"must not commit through pending control";
+        let local_header = reservation
+            .header(
+                Priority::Immediate,
+                b"pending-local".to_vec(),
+                None,
+                local_payload.len() as u64,
+                false,
+                1,
+            )
+            .expect("local header");
+        let local = pending_services
+            .authority
+            .seal_event(&local_header, local_payload)
+            .expect("local seal");
+        let local_route = pending_services
+            .verifier
+            .verify_event(&local.bytes)
+            .expect("local route capability");
+        let local_event = content_event(&mut pending_services.verifier, &local.bytes);
+        let operation = EventOperationKey::new(b"pending/once".to_vec()).expect("operation");
+        let pending_control = pending_services
+            .authority
+            .seal_chained_revocation_control([0xe2; 32], 1, 2, Some([0xe3; 32]))
+            .expect("far pending control");
+        let pending_verified = verify_control(&mut pending_services.verifier, &pending_control);
+        assert!(matches!(
+            pending_store
+                .ingest_verified_control(&pending_verified, &pending_control)
+                .expect("retain pending"),
+            ControlOutcome::Pending { .. }
+        ));
+        assert!(matches!(
+            pending_store.control_policy_snapshot(),
+            Err(StoreError::ControlPolicyUnsettled { pending: 1 })
+        ));
+        assert!(matches!(
+            pending_store.commit_reserved_event_once(
+                &operation,
+                None,
+                &reservation,
+                &local_event,
+                &local.bytes,
+            ),
+            Err(StoreError::ControlPolicyUnsettled { pending: 1 })
+        ));
+        for result in [
+            pending_store.apply_verified_event(&local_event, &local.bytes),
+            pending_store.apply_verified_event_with_policy(
+                &pending_policy,
+                &local_event,
+                &local.bytes,
+            ),
+        ] {
+            assert!(matches!(
+                result,
+                Err(StoreError::ControlPolicyUnsettled { pending: 1 })
+            ));
+        }
+        for result in [
+            pending_store.cache_route_verified_event(&local_route, &local.bytes),
+            pending_store.cache_route_verified_event_with_policy(
+                &pending_policy,
+                &local_route,
+                &local.bytes,
+            ),
+        ] {
+            assert!(matches!(
+                result,
+                Err(StoreError::ControlPolicyUnsettled { pending: 1 })
+            ));
+        }
+        assert!(matches!(
+            pending_store.get_transfer_with_policy(
+                &pending_policy,
+                EventTransferId::new(local_event.envelope_id()),
+            ),
+            Err(StoreError::ControlPolicyUnsettled { pending: 1 })
+        ));
+        assert!(matches!(
+            pending_store.transfer_inventory_with_policy(&pending_policy),
+            Err(StoreError::ControlPolicyUnsettled { pending: 1 })
+        ));
+        assert!(matches!(
+            pending_store.events_after_with_policy(&pending_policy, 0, 0),
+            Err(StoreError::ControlPolicyUnsettled { pending: 1 })
+        ));
+        assert!(
+            pending_store
+                .event_for_operation(&operation)
+                .expect("operation state")
+                .is_none()
+        );
+        assert_eq!(
+            pending_store.event_stats().expect("pending stats").events,
+            0
+        );
+        assert_eq!(
+            pending_store
+                .event_stats()
+                .expect("pending cache stats")
+                .route_cached,
+            0
+        );
+    }
+
+    #[test]
+    fn dropped_control_transaction_leaves_no_pending_effect_or_reservation_after_restart() {
+        let file = TestFile::new("control-dropped-transaction");
+        let mut services = control_services(0xb7);
+        let sealed = services
+            .authority
+            .seal_chained_revocation_control([0xb7; 32], 1, 1, None)
+            .expect("control");
+        let verified = verify_control(&mut services.verifier, &sealed);
+        let prepared = PreparedControl::from_verified(&verified, &sealed).expect("prepared");
+        {
+            let store = Store::open_for_mission(&file.0, services.authority_id).expect("store");
+            let write = store.database.begin_write().expect("write");
+            assert_eq!(
+                insert_control(&write, &prepared, store.limits()).expect("stage in transaction"),
+                ControlInsert::Inserted
+            );
+            drop(write);
+        }
+        {
+            let reopened =
+                Store::open_for_mission(&file.0, services.authority_id).expect("reopen abort");
+            assert_eq!(reopened.control_stats().expect("abort stats").controls, 0);
+            assert!(
+                reopened
+                    .control_inventory()
+                    .expect("abort inventory")
+                    .is_empty()
+            );
+            assert!(reopened.control_head().expect("abort head").is_none());
+            reopened
+                .ingest_verified_control(&verified, &sealed)
+                .expect("real committed ingest");
+        }
+        let reopened =
+            Store::open_for_mission(&file.0, services.authority_id).expect("reopen commit");
+        assert_eq!(reopened.control_stats().expect("commit stats").applied, 1);
+        assert!(
+            reopened
+                .is_control_principal_revoked([0xb7; 32])
+                .expect("committed effect")
+        );
+    }
+
+    #[test]
+    fn authority_revocation_purges_suffix_and_rejected_input_survives_other_activation() {
+        let authority_file = TestFile::new("control-authority-revocation");
+        let mut services = control_services(0xb8);
+        let first = services
+            .authority
+            .seal_chained_revocation_control(services.authority_id, 1, 1, None)
+            .expect("authority revocation");
+        let first_verified = verify_control(&mut services.verifier, &first);
+        let second = services
+            .authority
+            .seal_chained_revocation_control([0xb9; 32], 1, 2, Some(first_verified.envelope_id()))
+            .expect("pending suffix");
+        let second_verified = verify_control(&mut services.verifier, &second);
+        let second_id = ControlTransferId::new(second_verified.envelope_id());
+        let third = services
+            .authority
+            .seal_chained_revocation_control([0xba; 32], 1, 3, Some(second_verified.envelope_id()))
+            .expect("dependent pending suffix");
+        let third_verified = verify_control(&mut services.verifier, &third);
+        let third_id = ControlTransferId::new(third_verified.envelope_id());
+        let principal = services
+            .authority
+            .verified_control_principal()
+            .expect("principal");
+        let store =
+            Store::open_for_mission(&authority_file.0, services.authority_id).expect("store");
+        assert!(matches!(
+            store
+                .ingest_verified_control(&second_verified, &second)
+                .expect("pending second"),
+            ControlOutcome::Pending { .. }
+        ));
+        assert!(matches!(
+            store
+                .ingest_verified_control(&third_verified, &third)
+                .expect("pending third"),
+            ControlOutcome::Pending { .. }
+        ));
+        let ControlOutcome::Applied {
+            activated,
+            rejected,
+            ..
+        } = store
+            .ingest_verified_control(&first_verified, &first)
+            .expect("apply authority revocation")
+        else {
+            panic!("authority revocation must apply");
+        };
+        assert_eq!(activated.len(), 1);
+        assert_eq!(
+            rejected
+                .iter()
+                .map(|value| (value.transfer_id, value.reason))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    second_id,
+                    ControlRejectionReason::AuthorityRevoked(services.authority_id)
+                ),
+                (
+                    third_id,
+                    ControlRejectionReason::InvalidatedPredecessor(second_id)
+                )
+            ]
+        );
+        let directly_rejected = store
+            .ingest_verified_control(&second_verified, &second)
+            .expect("attribute post-revocation authority input");
+        assert_eq!(
+            directly_rejected.rejected_input(),
+            Some(RejectedControl {
+                transfer_id: second_id,
+                signer: second_verified.signer(),
+                reason: ControlRejectionReason::AuthorityRevoked(services.authority_id),
+            })
+        );
+        assert!(matches!(
+            store.reserve_control(principal),
+            Err(StoreError::ControlAuthorityRevoked(authority))
+                if authority == services.authority_id
+        ));
+        let member_payload = b"member traffic survives control-authority revocation";
+        let member_header = event_header(
+            services.verifier.identity(),
+            1,
+            1,
+            VersionVector::default(),
+            b"authority-revoked-member-event",
+            member_payload,
+            None,
+        );
+        let member_sealed = services
+            .verifier
+            .seal_event(&member_header, member_payload)
+            .expect("seal nonrevoked member event");
+        let member_event = content_event(&mut services.authority, &member_sealed.bytes);
+        let authority_revoked_policy = store
+            .control_policy_snapshot()
+            .expect("authority-revoked settled policy");
+        assert!(matches!(
+            store
+                .apply_verified_event_with_policy(
+                    &authority_revoked_policy,
+                    &member_event,
+                    &member_sealed.bytes,
+                )
+                .expect("nonrevoked Event remains accepted"),
+            ApplyOutcome::Inserted { .. }
+        ));
+
+        let attribution_file = TestFile::new("control-rejected-attribution");
+        let mut provisioner = ReferenceProvisioner::from_seed([0xba; 32]).expect("provisioner");
+        let access = ProvisioningAccess::member(event_scope(), vec![1], vec![event_topic()])
+            .expect("access");
+        let old_bundle = provisioner
+            .issue_control_authority(1, std::slice::from_ref(&access))
+            .expect("old signer");
+        let recovery_bundle = provisioner
+            .issue_control_authority(2, std::slice::from_ref(&access))
+            .expect("recovery signer");
+        let verifier_bundle = provisioner.issue_node(3, &[access]).expect("verifier");
+        let mut old = ReferenceEnvelopeSealer::open(old_bundle).expect("old");
+        let mut recovery = ReferenceEnvelopeSealer::open(recovery_bundle).expect("recovery");
+        let mut verifier = ReferenceEnvelopeSealer::open(verifier_bundle).expect("verifier");
+        let old_signer = old.identity();
+        let mission = recovery.mission_authority_id();
+        let revoke = recovery
+            .seal_chained_revocation_control(old_signer, 1, 1, None)
+            .expect("revoke old");
+        let revoke_verified = verify_control(&mut verifier, &revoke);
+        let valid = recovery
+            .seal_chained_revocation_control([0xbb; 32], 1, 2, Some(revoke_verified.envelope_id()))
+            .expect("valid pending");
+        let valid_verified = verify_control(&mut verifier, &valid);
+        let valid_id = ControlTransferId::new(valid_verified.envelope_id());
+        let rejected = old
+            .seal_chained_revocation_control([0xbc; 32], 1, 3, Some(valid_verified.envelope_id()))
+            .expect("rejected input");
+        let rejected_verified = verify_control(&mut verifier, &rejected);
+        let rejected_id = ControlTransferId::new(rejected_verified.envelope_id());
+        let store = Store::open_for_mission(&attribution_file.0, mission).expect("store");
+        store
+            .ingest_verified_control(&revoke_verified, &revoke)
+            .expect("apply signer revocation");
+        let prepared = PreparedControl::from_verified(&valid_verified, &valid).expect("prepared");
+        {
+            let write = store.database.begin_write().expect("stage valid pending");
+            assert_eq!(
+                insert_control(&write, &prepared, store.limits()).expect("insert pending"),
+                ControlInsert::Inserted
+            );
+            write.commit().expect("commit pending only");
+        }
+        let outcome = store
+            .ingest_verified_control(&rejected_verified, &rejected)
+            .expect("rejected input also advances staged prefix");
+        let ControlOutcome::Applied {
+            activated,
+            rejected,
+            ..
+        } = &outcome
+        else {
+            panic!("unrelated valid prefix must activate");
+        };
+        assert_eq!(
+            activated
+                .iter()
+                .map(|value| value.transfer_id)
+                .collect::<Vec<_>>(),
+            vec![valid_id]
+        );
+        assert_eq!(
+            rejected
+                .iter()
+                .map(|value| value.transfer_id)
+                .collect::<Vec<_>>(),
+            vec![rejected_id]
+        );
+        assert_eq!(
+            outcome.rejected_input(),
+            Some(RejectedControl {
+                transfer_id: rejected_id,
+                signer: old_signer,
+                reason: ControlRejectionReason::SignerRevoked(old_signer),
+            })
+        );
+        assert!(
+            store
+                .get_control(rejected_id)
+                .expect("rejected query")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn control_read_only_and_reopen_audits_reject_partial_orphan_inflated_and_bad_receipt_state() {
+        let base = TestFile::new("control-audit-base");
+        let mut services = control_services(0xbd);
+        let sealed = services
+            .authority
+            .seal_chained_revocation_control([0xbd; 32], 1, 1, None)
+            .expect("control");
+        let verified = verify_control(&mut services.verifier, &sealed);
+        let transfer_id = ControlTransferId::new(verified.envelope_id());
+        {
+            let store = Store::open_for_mission(&base.0, services.authority_id).expect("store");
+            store
+                .ingest_verified_control(&verified, &sealed)
+                .expect("apply control");
+        }
+        let reject = |file: &TestFile| {
+            let before = std::fs::read(&file.0).expect("corrupted bytes");
+            assert!(Store::inspect_existing(&file.0).is_err());
+            assert_eq!(
+                std::fs::read(&file.0).expect("read after inspection"),
+                before,
+                "strict inspection must remain read-only"
+            );
+            assert!(Store::open_for_mission(&file.0, services.authority_id).is_err());
+        };
+
+        let partial = TestFile::new("control-audit-partial");
+        std::fs::copy(&base.0, &partial.0).expect("copy partial");
+        {
+            let database = Database::open(&partial.0).expect("partial database");
+            let write = database.begin_write().expect("partial write");
+            write
+                .delete_table(CONTROL_PENDING)
+                .expect("delete pending table");
+            write.commit().expect("commit partial");
+        }
+        reject(&partial);
+
+        let orphan = TestFile::new("control-audit-orphan");
+        std::fs::copy(&base.0, &orphan.0).expect("copy orphan");
+        {
+            let database = Database::open(&orphan.0).expect("orphan database");
+            let write = database.begin_write().expect("orphan write");
+            write
+                .open_table(CONTROL_SEQUENCE)
+                .expect("sequence")
+                .insert(99, [0xde; 32].as_slice())
+                .expect("orphan sequence");
+            write.commit().expect("commit orphan");
+        }
+        reject(&orphan);
+
+        let inflated = TestFile::new("control-audit-head");
+        std::fs::copy(&base.0, &inflated.0).expect("copy inflated");
+        {
+            let database = Database::open(&inflated.0).expect("inflated database");
+            let write = database.begin_write().expect("inflated write");
+            let encoded = encode_control_head(99, transfer_id);
+            write
+                .open_table(CONTROL_HEAD)
+                .expect("head")
+                .insert(CONTROL_HEAD_KEY, encoded.as_slice())
+                .expect("inflate head");
+            write.commit().expect("commit inflated head");
+        }
+        reject(&inflated);
+
+        let bad_receipt = TestFile::new("control-audit-receipt");
+        std::fs::copy(&base.0, &bad_receipt.0).expect("copy receipt");
+        {
+            let database = Database::open(&bad_receipt.0).expect("receipt database");
+            let write = database.begin_write().expect("receipt write");
+            let receipt = encode_control_reservation(&ControlReservation {
+                authority: services.authority_id,
+                signer: verified.signer(),
+                previous_sequence: 0,
+                sequence: 1,
+                previous_control: None,
+            });
+            write
+                .open_table(CONTROL_RESERVATIONS)
+                .expect("reservations")
+                .insert([0xdf; 32].as_slice(), receipt.as_slice())
+                .expect("orphan receipt");
+            write.commit().expect("commit receipt");
+        }
+        reject(&bad_receipt);
+
+        let accounting = TestFile::new("control-audit-accounting");
+        std::fs::copy(&base.0, &accounting.0).expect("copy accounting");
+        write_metadata(&accounting.0, CONTROL_ITEM_COUNT, 99);
+        reject(&accounting);
+
+        let counters_without_schema = TestFile::new("control-audit-counters-without-schema");
+        std::fs::copy(&base.0, &counters_without_schema.0).expect("copy counter orphan");
+        {
+            let database =
+                Database::open(&counters_without_schema.0).expect("counter orphan database");
+            let write = database.begin_write().expect("counter orphan write");
+            write.delete_table(CONTROL_RECORDS).expect("records");
+            write.delete_table(CONTROL_BYTES).expect("bytes");
+            write.delete_table(CONTROL_SEQUENCE).expect("sequence");
+            write.delete_table(CONTROL_PENDING).expect("pending");
+            write.delete_table(CONTROL_APPLIED).expect("applied");
+            write
+                .delete_table(CONTROL_REVOCATIONS)
+                .expect("revocations");
+            write
+                .delete_table(CONTROL_SCOPE_EPOCHS)
+                .expect("scope epochs");
+            write
+                .delete_table(CONTROL_RESERVATIONS)
+                .expect("reservations");
+            write
+                .delete_table(CONTROL_PUBLICATION_INTENTS)
+                .expect("publication intents");
+            write.delete_table(CONTROL_HEAD).expect("head");
+            write.commit().expect("commit orphan counters");
+        }
+        reject(&counters_without_schema);
+    }
+
+    #[test]
+    fn causal_frontier_bound_rejects_a_new_direct_publisher_without_partial_acceptance() {
+        let file = TestFile::new("frontier-cap");
+        let mut services = event_services(0xa3);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("bound store");
+        let incoming_publisher = services.publisher.identity();
+        {
+            let write = store.database.begin_write().expect("begin frontier seed");
+            let mut frontier = write.open_table(CAUSAL_FRONTIER).expect("frontier");
+            let mut inserted = 0usize;
+            let mut candidate = 0u64;
+            while inserted < MAX_CAUSAL_CONTEXT_ENTRIES {
+                let mut publisher = [0xee; 32];
+                publisher[24..].copy_from_slice(&candidate.to_be_bytes());
+                candidate += 1;
+                if publisher == incoming_publisher {
+                    continue;
+                }
+                let key = causal_frontier_key(&event_topic(), &event_scope(), publisher)
+                    .expect("frontier key");
+                frontier.insert(key.as_slice(), 1).expect("seed frontier");
+                inserted += 1;
+            }
+            drop(frontier);
+            write.commit().expect("commit frontier seed");
+        }
+        assert!(matches!(
+            store.reserve_event(incoming_publisher, &event_topic(), &event_scope()),
+            Err(StoreError::InvalidSemanticEvent(
+                "causal frontier publisher limit reached"
+            ))
+        ));
+
+        let payload = b"one publisher too many";
+        let header = event_header(
+            incoming_publisher,
+            1,
+            1,
+            VersionVector::default(),
+            b"frontier-overflow",
+            payload,
+            None,
+        );
+        let sealed = services
+            .publisher
+            .seal_event(&header, payload)
+            .expect("seal overflow Event");
+        let event = content_event(&mut services.reader, &sealed.bytes);
+        assert!(matches!(
+            store.apply_verified_event(&event, &sealed.bytes),
+            Err(StoreError::InvalidSemanticEvent(
+                "causal frontier publisher limit reached"
+            ))
+        ));
+        assert_eq!(store.event_count().expect("no accepted Events"), 0);
+        let read = store.database.begin_read().expect("read ledgers");
+        assert_eq!(
+            read.open_table(SEMANTIC_ITEMS)
+                .expect("semantic items")
+                .len()
+                .expect("len"),
+            0
+        );
+        assert_eq!(
+            read.open_table(ACCEPTED_DOTS)
+                .expect("accepted dots")
+                .len()
+                .expect("len"),
+            0
+        );
+        assert_eq!(
+            read.open_table(ACCEPTED_EVENTS)
+                .expect("accepted positions")
+                .len()
+                .expect("len"),
+            0
+        );
+    }
+
+    #[test]
+    fn abrupt_redb_exit_child() {
+        let Some(path) = std::env::var_os(ABRUPT_STORE_PATH) else {
+            return;
+        };
+        let mode = std::env::var(ABRUPT_STORE_MODE).expect("abrupt store mode");
+        let services = event_services(0xd4);
+        let path = PathBuf::from(path);
+        let store = if mode == "unbound-live-missing-accounting" {
+            Store::open(&path).expect("abrupt unbound child store")
+        } else {
+            Store::open_for_mission(&path, services.authority).expect("abrupt child store")
+        };
+        store
+            .apply(item(0xd4), b"committed before abrupt exit")
+            .expect("abrupt child row");
+        match mode.as_str() {
+            "live" => {}
+            "live-missing-accounting" => {
+                let write = store.database.begin_write().expect("remove accounting");
+                write
+                    .open_table(METADATA)
+                    .expect("metadata")
+                    .remove(TOTAL_PAYLOAD_BYTES)
+                    .expect("remove payload accounting");
+                write.commit().expect("commit missing accounting");
+            }
+            "unbound-live-missing-accounting" => {
+                let write = store.database.begin_write().expect("remove accounting");
+                write
+                    .open_table(METADATA)
+                    .expect("metadata")
+                    .remove(TOTAL_PAYLOAD_BYTES)
+                    .expect("remove payload accounting");
+                write.commit().expect("commit missing accounting");
+            }
+            "terminal" => {
+                let intent = ZeroizationIntent::new(
+                    b"abrupt mission descriptor".to_vec(),
+                    b"abrupt identity descriptor".to_vec(),
+                )
+                .expect("abrupt intent");
+                store
+                    .begin_zeroization(&intent)
+                    .expect("abrupt terminal marker");
+            }
+            "terminal-corrupt" => {
+                let intent = ZeroizationIntent::new(
+                    b"abrupt mission descriptor".to_vec(),
+                    b"abrupt identity descriptor".to_vec(),
+                )
+                .expect("abrupt intent");
+                store
+                    .begin_zeroization(&intent)
+                    .expect("abrupt terminal marker");
+                let write = store.database.begin_write().expect("corrupt terminal");
+                write
+                    .open_table(METADATA)
+                    .expect("metadata")
+                    .remove(TOTAL_PAYLOAD_BYTES)
+                    .expect("remove migration target");
+                let mut encoded = write
+                    .open_table(ZEROIZATION)
+                    .expect("terminal table")
+                    .get(ZEROIZATION_STATE_KEY)
+                    .expect("read terminal")
+                    .expect("state row")
+                    .value()
+                    .to_vec();
+                encoded[10] ^= 0x01;
+                write
+                    .open_table(ZEROIZATION)
+                    .expect("terminal table")
+                    .insert(ZEROIZATION_STATE_KEY, encoded.as_slice())
+                    .expect("write corrupt terminal");
+                write.commit().expect("commit corrupt terminal");
+            }
+            _ => panic!("unknown abrupt store mode"),
+        }
+        // Skip Store/Database destructors, matching the dirty redb state seen
+        // when the production node is killed after its last durable commit.
+        std::process::exit(86);
+    }
+
+    #[test]
+    fn dirty_live_store_uses_writer_recovery_then_reopens_normally() {
+        let file = TestFile::new("zeroization-dirty-live-restart");
+        run_abrupt_store_child(&file, "live");
+        assert!(matches!(
+            Store::inspect_zeroization_state(&file.0),
+            Err(ref error) if error.is_read_only_repair_required()
+        ));
+        assert!(matches!(
+            Store::inspect_existing(&file.0),
+            Err(ref error) if error.is_read_only_repair_required()
+        ));
+
+        let services = event_services(0xd4);
+        let store = Store::open_for_mission(&file.0, services.authority)
+            .expect("writer recovery must reach a live normal open");
+        assert_eq!(
+            store.get(item(0xd4)).expect("recovered row"),
+            Some(b"committed before abrupt exit".to_vec())
+        );
+        drop(store);
+        let inspection = Store::inspect_existing(&file.0).expect("clean recovered inspection");
+        assert_eq!(inspection.zeroization.state(), StoreZeroizationState::Live);
+        assert_eq!(inspection.stats.items, 1);
+    }
+
+    #[test]
+    fn terminal_status_inspection_normalizes_live_writer_contention() {
+        let file = TestFile::new("zeroization-status-writer-contention");
+        let store = Store::open(&file.0).expect("live writer");
+        store
+            .apply(item(0xd7), b"writer-owned row")
+            .expect("writer-owned row");
+
+        assert!(matches!(
+            Store::inspect_zeroization_state(&file.0),
+            Err(StoreError::StoreInUse)
+        ));
+        assert_eq!(
+            store.get(item(0xd7)).expect("live writer remains usable"),
+            Some(b"writer-owned row".to_vec())
+        );
+
+        drop(store);
+        let status = Store::inspect_zeroization_state(&file.0).expect("released writer status");
+        assert_eq!(status.state(), StoreZeroizationState::Live);
+    }
+
+    #[test]
+    fn dirty_wrong_mission_rejects_before_reconstructing_application_metadata() {
+        let file = TestFile::new("zeroization-dirty-wrong-mission");
+        run_abrupt_store_child(&file, "live-missing-accounting");
+        assert!(matches!(
+            Store::inspect_zeroization_state(&file.0),
+            Err(ref error) if error.is_read_only_repair_required()
+        ));
+
+        let original = event_services(0xd4);
+        let wrong = event_services(0xd5);
+        assert_ne!(original.authority, wrong.authority);
+        assert!(matches!(
+            Store::open_for_mission(&file.0, wrong.authority),
+            Err(StoreError::MissionAuthorityMismatch { bound, received })
+                if bound == original.authority && received == wrong.authority
+        ));
+
+        let database = redb::Builder::new()
+            .open_read_only(&file.0)
+            .expect("writer recovery completed before mismatch");
+        let read = database.begin_read().expect("read rejected store");
+        assert!(
+            read.open_table(METADATA)
+                .expect("metadata remains present")
+                .get(TOTAL_PAYLOAD_BYTES)
+                .expect("read payload accounting")
+                .is_none(),
+            "wrong-authority rejection must not reconstruct missing accounting"
+        );
+        drop(read);
+        drop(database);
+        assert_eq!(
+            inspect_mission_binding_read_only(&file.0).expect("original binding"),
+            Some(original.authority)
+        );
+
+        let store = Store::open_for_mission(&file.0, original.authority)
+            .expect("correct authority may perform normal reconstruction");
+        assert_eq!(
+            store.get(item(0xd4)).expect("preserved item"),
+            Some(b"committed before abrupt exit".to_vec())
+        );
+        assert_eq!(
+            store
+                .stats()
+                .expect("reconstructed stats")
+                .total_payload_bytes,
+            28
+        );
+    }
+
+    #[test]
+    fn dirty_terminal_store_uses_writer_recovery_then_normal_open_rejects() {
+        let file = TestFile::new("zeroization-dirty-terminal-restart");
+        run_abrupt_store_child(&file, "terminal");
+        assert!(matches!(
+            Store::inspect_zeroization_state(&file.0),
+            Err(ref error) if error.is_read_only_repair_required()
+        ));
+        assert!(matches!(
+            Store::inspect_existing(&file.0),
+            Err(ref error) if error.is_read_only_repair_required()
+        ));
+
+        assert!(matches!(
+            Store::open(&file.0),
+            Err(StoreError::StoreZeroized(
+                StoreZeroizationState::CleanupPending
+            ))
+        ));
+        let status = Store::inspect_zeroization_state(&file.0)
+            .expect("writer recovery leaves terminal state inspectable");
+        assert_eq!(status.state(), StoreZeroizationState::CleanupPending);
+        let inspection = Store::inspect_existing(&file.0).expect("terminal preserved inspection");
+        assert_eq!(inspection.stats.items, 1);
+        assert_eq!(
+            inspection.inventory.iter().copied().collect::<Vec<_>>(),
+            vec![item(0xd4)]
+        );
+        assert_eq!(
+            inspection.zeroization.state(),
+            StoreZeroizationState::CleanupPending
+        );
+    }
+
+    #[test]
+    fn recovery_only_status_repairs_dirty_unbound_live_without_application_migration() {
+        let file = TestFile::new("zeroization-recover-unbound-live");
+        run_abrupt_store_child(&file, "unbound-live-missing-accounting");
+        assert!(matches!(
+            Store::inspect_zeroization_state(&file.0),
+            Err(ref error) if error.is_read_only_repair_required()
+        ));
+
+        let status =
+            Store::recover_zeroization_state(&file.0).expect("recovery-only unbound live status");
+        assert_eq!(status.state(), StoreZeroizationState::Live);
+        assert_eq!(status.mission_authority(), None);
+        assert_eq!(status.intent(), None);
+        let database = redb::Builder::new()
+            .open_read_only(&file.0)
+            .expect("read recovered unbound store");
+        let read = database.begin_read().expect("read transaction");
+        assert!(
+            read.open_table(METADATA)
+                .expect("metadata")
+                .get(TOTAL_PAYLOAD_BYTES)
+                .expect("migration target")
+                .is_none(),
+            "recovery-only status must not reconstruct application accounting"
+        );
+        drop(read);
+        drop(database);
+
+        let store = Store::open(&file.0).expect("normal generic open may reconstruct");
+        assert_eq!(store.mission_authority(), None);
+        assert_eq!(
+            store.get(item(0xd4)).expect("preserved row"),
+            Some(b"committed before abrupt exit".to_vec())
+        );
+        assert_eq!(
+            store
+                .stats()
+                .expect("reconstructed stats")
+                .total_payload_bytes,
+            28
+        );
+    }
+
+    #[test]
+    fn recovery_only_status_repairs_dirty_terminal_before_identity_loading() {
+        let file = TestFile::new("zeroization-recover-terminal");
+        run_abrupt_store_child(&file, "terminal");
+        assert!(matches!(
+            Store::inspect_zeroization_state(&file.0),
+            Err(ref error) if error.is_read_only_repair_required()
+        ));
+
+        let status =
+            Store::recover_zeroization_state(&file.0).expect("recovery-only terminal status");
+        assert_eq!(status.state(), StoreZeroizationState::CleanupPending);
+        assert_eq!(
+            status.mission_authority(),
+            Some(event_services(0xd4).authority)
+        );
+        assert!(status.intent().is_some());
+        assert!(matches!(
+            Store::open(&file.0),
+            Err(StoreError::StoreZeroized(
+                StoreZeroizationState::CleanupPending
+            ))
+        ));
+        let inspection = Store::inspect_existing(&file.0).expect("preserved terminal rows");
+        assert_eq!(inspection.stats.items, 1);
+        assert_eq!(
+            inspection.zeroization.state(),
+            StoreZeroizationState::CleanupPending
+        );
+    }
+
+    #[test]
+    fn recovery_only_status_repairs_backend_but_rejects_corrupt_terminal_schema() {
+        let file = TestFile::new("zeroization-recover-corrupt-terminal");
+        run_abrupt_store_child(&file, "terminal-corrupt");
+        assert!(matches!(
+            Store::inspect_zeroization_state(&file.0),
+            Err(ref error) if error.is_read_only_repair_required()
+        ));
+
+        assert!(matches!(
+            Store::recover_zeroization_state(&file.0),
+            Err(StoreError::ZeroizationInvariant(
+                "terminal record digest does not match its encoded state"
+            ))
+        ));
+        assert!(matches!(
+            Store::inspect_zeroization_state(&file.0),
+            Err(StoreError::ZeroizationInvariant(
+                "terminal record digest does not match its encoded state"
+            ))
+        ));
+        assert!(matches!(
+            Store::open(&file.0),
+            Err(StoreError::ZeroizationInvariant(
+                "terminal record digest does not match its encoded state"
+            ))
+        ));
+        let database = redb::Builder::new()
+            .open_read_only(&file.0)
+            .expect("read recovered corrupt store");
+        let read = database.begin_read().expect("read transaction");
+        assert!(
+            read.open_table(METADATA)
+                .expect("metadata")
+                .get(TOTAL_PAYLOAD_BYTES)
+                .expect("migration target")
+                .is_none(),
+            "corrupt terminal recovery must not repair application accounting"
+        );
+    }
+
+    #[test]
+    fn zeroization_intent_requires_two_bounded_nonsecret_descriptors() {
+        assert!(matches!(
+            ZeroizationIntent::new(Vec::new(), b"identity".to_vec()),
+            Err(StoreError::InvalidZeroizationDescriptor {
+                artifact: ZeroizationArtifact::MissionBundle,
+                length: 0,
+            })
+        ));
+        assert!(matches!(
+            ZeroizationIntent::new(
+                b"mission".to_vec(),
+                vec![0; MAX_ZEROIZATION_DESCRIPTOR_BYTES + 1]
+            ),
+            Err(StoreError::InvalidZeroizationDescriptor {
+                artifact: ZeroizationArtifact::CarrierIdentity,
+                length,
+            }) if length == MAX_ZEROIZATION_DESCRIPTOR_BYTES + 1
+        ));
+        let intent = ZeroizationIntent::new(
+            vec![0x11; MAX_ZEROIZATION_DESCRIPTOR_BYTES],
+            vec![0x22; MAX_ZEROIZATION_DESCRIPTOR_BYTES],
+        )
+        .expect("bounded descriptors");
+        assert_eq!(
+            intent.descriptor(ZeroizationArtifact::MissionBundle).len(),
+            MAX_ZEROIZATION_DESCRIPTOR_BYTES
+        );
+        assert_eq!(
+            intent
+                .descriptor(ZeroizationArtifact::CarrierIdentity)
+                .len(),
+            MAX_ZEROIZATION_DESCRIPTOR_BYTES
+        );
+    }
+
+    #[test]
+    fn stopped_live_store_can_enter_terminal_state_only_through_cleanup_handle() {
+        let file = TestFile::new("zeroization-offline-entry");
+        let services = event_services(0xd0);
+        {
+            let store = Store::open_for_mission(&file.0, services.authority).expect("live store");
+            store.apply(item(0xd0), b"durable row").expect("row");
+        }
+        let live = Store::inspect_zeroization_state(&file.0).expect("live status");
+        assert_eq!(live.state(), StoreZeroizationState::Live);
+        assert_eq!(live.mission_authority(), Some(services.authority));
+        assert_eq!(live.intent(), None);
+
+        let intent = ZeroizationIntent::new(
+            b"mission file identity".to_vec(),
+            b"carrier file identity".to_vec(),
+        )
+        .expect("intent");
+        let mut cleanup = Store::open_for_zeroization(&file.0).expect("offline cleanup writer");
+        assert_eq!(cleanup.zeroization_state(), StoreZeroizationState::Live);
+        assert_eq!(cleanup.zeroization_intent(), None);
+        assert_eq!(
+            cleanup.begin_zeroization(&intent).expect("terminal entry"),
+            BeginZeroizationOutcome::EnteredCleanupPending
+        );
+        drop(cleanup);
+
+        assert!(matches!(
+            Store::open_for_mission(&file.0, services.authority),
+            Err(StoreError::StoreZeroized(
+                StoreZeroizationState::CleanupPending
+            ))
+        ));
+        let preserved = Store::inspect_existing(&file.0).expect("terminal inspection");
+        assert_eq!(preserved.stats.items, 1);
+        assert_eq!(preserved.zeroization.intent(), Some(&intent));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stopped_cleanup_identity_exposes_the_opened_inode_across_path_swap() {
+        let selected = TestFile::new("zeroization-swap-selected");
+        let replacement = TestFile::new("zeroization-swap-replacement");
+        let parked_original = TestFile::new("zeroization-swap-original-parked");
+        let parked_replacement = TestFile::new("zeroization-swap-replacement-parked");
+        let services = event_services(0xd8);
+        let original_identity = {
+            let store =
+                Store::open_for_mission(&selected.0, services.authority).expect("original store");
+            store.apply(item(0xd8), b"original").expect("original row");
+            store.backing_identity()
+        };
+        let replacement_identity = {
+            let store = Store::open_for_mission(&replacement.0, services.authority)
+                .expect("replacement store");
+            store
+                .apply(item(0xd9), b"replacement")
+                .expect("replacement row");
+            store.backing_identity()
+        };
+        assert_ne!(original_identity, replacement_identity);
+
+        std::fs::rename(&selected.0, &parked_original.0).expect("park original");
+        std::fs::rename(&replacement.0, &selected.0).expect("select replacement");
+        let mut cleanup =
+            Store::open_for_zeroization(&selected.0).expect("open selected replacement handle");
+        assert_eq!(cleanup.backing_identity(), replacement_identity);
+        assert_ne!(cleanup.backing_identity(), original_identity);
+
+        std::fs::rename(&selected.0, &parked_replacement.0).expect("park replacement");
+        std::fs::rename(&parked_original.0, &selected.0).expect("restore original pathname");
+        assert_eq!(
+            cleanup.backing_identity(),
+            replacement_identity,
+            "cleanup identity must remain tied to its opened handle, not the restored pathname"
+        );
+        assert!(matches!(
+            cleanup.require_process_exclusive_lock(),
+            Err(StoreError::ProcessExclusiveLockUnavailable)
+        ));
+        let intent = ZeroizationIntent::new(
+            b"swap mission descriptor".to_vec(),
+            b"swap identity descriptor".to_vec(),
+        )
+        .expect("intent");
+        cleanup
+            .begin_zeroization(&intent)
+            .expect("mark exact opened replacement");
+        drop(cleanup);
+
+        assert_eq!(
+            Store::inspect_zeroization_state(&selected.0)
+                .expect("restored original status")
+                .state(),
+            StoreZeroizationState::Live,
+            "restoring the original pathname must not redirect the opened cleanup handle"
+        );
+        assert_eq!(
+            Store::inspect_zeroization_state(&parked_replacement.0)
+                .expect("replacement status")
+                .state(),
+            StoreZeroizationState::CleanupPending
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_store_conversion_preserves_the_same_handle_after_path_replacement() {
+        let selected = TestFile::new("zeroization-convert-selected");
+        let replacement = TestFile::new("zeroization-convert-replacement");
+        let parked_original = TestFile::new("zeroization-convert-original-parked");
+        let services = event_services(0xda);
+        let store =
+            Store::open_for_mission(&selected.0, services.authority).expect("original store");
+        let original_identity = store.backing_identity();
+        let replacement_identity = {
+            let replacement_store = Store::open_for_mission(&replacement.0, services.authority)
+                .expect("replacement store");
+            replacement_store.backing_identity()
+        };
+        let intent = ZeroizationIntent::new(
+            b"conversion mission descriptor".to_vec(),
+            b"conversion identity descriptor".to_vec(),
+        )
+        .expect("intent");
+        store.begin_zeroization(&intent).expect("terminal marker");
+
+        std::fs::rename(&selected.0, &parked_original.0).expect("park original");
+        std::fs::rename(&replacement.0, &selected.0).expect("replace pathname");
+        let mut cleanup = store.into_zeroization().expect("same-handle conversion");
+        assert_eq!(cleanup.backing_identity(), original_identity);
+        assert_ne!(cleanup.backing_identity(), replacement_identity);
+        assert_eq!(
+            cleanup.zeroization_state(),
+            StoreZeroizationState::CleanupPending
+        );
+        cleanup
+            .mark_mission_destroyed()
+            .expect("mission receipt on original handle");
+        cleanup
+            .mark_identity_destroyed()
+            .expect("identity receipt on original handle");
+        cleanup
+            .finalize_zeroization()
+            .expect("finalize original handle");
+        drop(cleanup);
+
+        assert_eq!(
+            Store::inspect_zeroization_state(&selected.0)
+                .expect("replacement status")
+                .state(),
+            StoreZeroizationState::Live
+        );
+        assert_eq!(
+            Store::inspect_zeroization_state(&parked_original.0)
+                .expect("original status")
+                .state(),
+            StoreZeroizationState::Complete
+        );
+    }
+
+    #[test]
+    fn cleanup_conversion_requires_a_bound_terminal_store() {
+        let unbound = TestFile::new("zeroization-convert-unbound");
+        let store = Store::open(&unbound.0).expect("unbound store");
+        assert!(matches!(
+            store.into_zeroization(),
+            Err(StoreError::MissionNotBound)
+        ));
+
+        let live = TestFile::new("zeroization-convert-live");
+        let services = event_services(0xdc);
+        let store = Store::open_for_mission(&live.0, services.authority).expect("bound live store");
+        assert!(matches!(
+            store.into_zeroization(),
+            Err(StoreError::ZeroizationOrderViolation(
+                "terminal lockout is required before converting the live store"
+            ))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_store_opens_reject_unsafe_or_ambiguous_backing_files() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let target = TestFile::new("zeroization-backing-policy-target");
+        let alias = TestFile::new("zeroization-backing-policy-hardlink");
+        let symlink = TestFile::new("zeroization-backing-policy-symlink");
+        let services = event_services(0xdb);
+        {
+            let store =
+                Store::open_for_mission(&target.0, services.authority).expect("policy target");
+            let metadata = std::fs::metadata(&target.0).expect("path metadata");
+            assert_eq!(
+                store.backing_identity().unix_device_inode(),
+                Some((metadata.dev(), metadata.ino()))
+            );
+        }
+
+        std::os::unix::fs::symlink(&target.0, &symlink.0).expect("store symlink");
+        assert!(matches!(
+            Store::open_for_zeroization(&symlink.0),
+            Err(StoreError::StorePath(_))
+        ));
+
+        std::fs::hard_link(&target.0, &alias.0).expect("store hard link");
+        assert!(matches!(
+            Store::open_for_zeroization(&target.0),
+            Err(StoreError::StoreBackingInvariant(
+                "backing handle must have exactly one filesystem link"
+            ))
+        ));
+        std::fs::remove_file(&alias.0).expect("remove hard link");
+
+        let original_permissions = std::fs::metadata(&target.0)
+            .expect("target metadata")
+            .permissions();
+        let mut writable_permissions = original_permissions.clone();
+        writable_permissions.set_mode(original_permissions.mode() | 0o020);
+        std::fs::set_permissions(&target.0, writable_permissions).expect("group writable");
+        assert!(matches!(
+            Store::open_for_zeroization(&target.0),
+            Err(StoreError::StoreBackingInvariant(
+                "backing handle is group- or world-writable"
+            ))
+        ));
+        std::fs::set_permissions(&target.0, original_permissions).expect("restore permissions");
+    }
+
+    #[test]
+    fn existing_empty_file_is_never_initialized_by_exact_file_writer_opens() {
+        let file = TestFile::new("zeroization-existing-empty");
+        std::fs::File::create(&file.0).expect("create empty file");
+
+        assert!(Store::open(&file.0).is_err());
+        assert!(matches!(
+            Store::recover_zeroization_state(&file.0),
+            Err(StoreError::StoreBackingInvariant(
+                "existing backing file is empty"
+            ))
+        ));
+        assert!(matches!(
+            Store::open_for_zeroization(&file.0),
+            Err(StoreError::StoreBackingInvariant(
+                "existing backing file is empty"
+            ))
+        ));
+        assert_eq!(
+            std::fs::metadata(&file.0).expect("empty metadata").len(),
+            0,
+            "writer helpers must not let create_file initialize a pre-existing empty file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn every_writable_open_requires_parent_barrier_before_store_or_terminal_use() {
+        let created = TestFile::new("new-store-parent-sync-observe");
+        let created_path = std::path::absolute(&created.0).expect("absolute created path");
+        {
+            let mut hook = PARENT_SYNC_TEST_HOOK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *hook = Some(ParentSyncTestHook {
+                path: created_path.clone(),
+                action: ParentSyncTestAction::Observe,
+                invocations: 0,
+            });
+        }
+        let store = Store::open(&created.0).expect("exclusive-new store after parent barrier");
+        drop(store);
+        {
+            let hook = PARENT_SYNC_TEST_HOOK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(
+                hook.as_ref().expect("observe hook").invocations,
+                1,
+                "exclusive-new initialization must invoke exactly one parent barrier"
+            );
+        }
+        let store = Store::open(&created.0).expect("existing store reopen");
+        drop(store);
+        {
+            let hook = PARENT_SYNC_TEST_HOOK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(
+                hook.as_ref().expect("observe hook").invocations,
+                2,
+                "an existing writable reopen must repeat the exact parent barrier"
+            );
+        }
+
+        let failed = TestFile::new("new-store-parent-sync-fail");
+        let failed_path = std::path::absolute(&failed.0).expect("absolute failed path");
+        {
+            let mut hook = PARENT_SYNC_TEST_HOOK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *hook = Some(ParentSyncTestHook {
+                path: failed_path,
+                action: ParentSyncTestAction::Fail,
+                invocations: 0,
+            });
+        }
+        assert!(matches!(
+            Store::open(&failed.0),
+            Err(StoreError::StorePath(ref error))
+                if error.to_string()
+                    == "injected new-store parent synchronization failure"
+        ));
+        {
+            let hook = PARENT_SYNC_TEST_HOOK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(hook.as_ref().expect("failure hook").invocations, 1);
+        }
+        let database = redb::Builder::new()
+            .open_read_only(&failed.0)
+            .expect("initialized redb after rejected parent barrier");
+        let read = database.begin_read().expect("read rejected creation");
+        assert_eq!(
+            read.list_tables().expect("regular tables").count(),
+            0,
+            "parent-sync failure must precede every Aster application table"
+        );
+        assert_eq!(
+            read.list_multimap_tables()
+                .expect("multimap tables")
+                .count(),
+            0,
+            "parent-sync failure must precede every Aster application table"
+        );
+        drop(read);
+        drop(database);
+        {
+            let mut hook = PARENT_SYNC_TEST_HOOK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            hook.as_mut().expect("failure hook").action = ParentSyncTestAction::Observe;
+        }
+        let services = event_services(0xdd);
+        let store = Store::open_for_mission(&failed.0, services.authority)
+            .expect("existing retry after successful parent barrier");
+        {
+            let hook = PARENT_SYNC_TEST_HOOK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(
+                hook.as_ref().expect("retry hook").invocations,
+                2,
+                "retry must pass a real parent barrier before returning a usable Store"
+            );
+        }
+        let intent = ZeroizationIntent::new(
+            b"parent-barrier mission descriptor".to_vec(),
+            b"parent-barrier identity descriptor".to_vec(),
+        )
+        .expect("intent");
+        assert_eq!(
+            store.begin_zeroization(&intent).expect("terminal marker"),
+            BeginZeroizationOutcome::EnteredCleanupPending
+        );
+        drop(store);
+        assert_eq!(
+            Store::inspect_zeroization_state(&failed.0)
+                .expect("terminal status after successful retry barrier")
+                .state(),
+            StoreZeroizationState::CleanupPending
+        );
+        *PARENT_SYNC_TEST_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    #[test]
+    fn terminal_zeroization_reopens_linearly_and_preserves_every_data_namespace() {
+        let file = TestFile::new("zeroization-linear-reopen");
+        let mut events = event_services(0xd1);
+        let mut controls = control_services(0xd1);
+        assert_eq!(events.authority, controls.authority_id);
+        let intent = ZeroizationIntent::new(
+            b"v1:mission:/exact/bundle:dev=7:ino=11".to_vec(),
+            b"v1:identity:/exact/state/identity.key:dev=7:ino=12".to_vec(),
+        )
+        .expect("zeroization intent");
+        let different_intent = ZeroizationIntent::new(
+            b"v1:mission:/replacement:dev=7:ino=99".to_vec(),
+            b"v1:identity:/exact/state/identity.key:dev=7:ino=12".to_vec(),
+        )
+        .expect("different intent");
+
+        let store = Store::open_for_mission(&file.0, events.authority).expect("bound store");
+        store
+            .require_process_exclusive_lock()
+            .expect("exact writer exclusion");
+        assert!(matches!(
+            Store::open_for_zeroization(&file.0),
+            Err(StoreError::StoreInUse)
+        ));
+        let opaque_id = item(0xd1);
+        store
+            .apply(opaque_id, b"preserved opaque row")
+            .expect("opaque row");
+
+        let payload = b"preserved semantic Event";
+        let header = event_header(
+            events.publisher.identity(),
+            1,
+            1,
+            VersionVector::default(),
+            b"zeroization-preserved-event",
+            payload,
+            None,
+        );
+        let sealed_event = events
+            .publisher
+            .seal_event(&header, payload)
+            .expect("seal Event");
+        let verified_event = content_event(&mut events.reader, &sealed_event.bytes);
+        store
+            .apply_verified_event(&verified_event, &sealed_event.bytes)
+            .expect("semantic Event row");
+
+        let sealed_control = controls
+            .authority
+            .seal_chained_revocation_control([0xe1; 32], 1, 1, None)
+            .expect("seal control");
+        let verified_control = verify_control(&mut controls.verifier, &sealed_control);
+        store
+            .ingest_verified_control(&verified_control, &sealed_control)
+            .expect("control row");
+
+        let opaque_before = store.stats().expect("opaque stats");
+        let events_before = store.event_stats().expect("Event stats");
+        let controls_before = store.control_stats().expect("control stats");
+        assert_eq!(opaque_before.items, 1);
+        assert_eq!(events_before.events, 1);
+        assert_eq!(controls_before.controls, 1);
+
+        assert_eq!(
+            store.begin_zeroization(&intent).expect("terminal marker"),
+            BeginZeroizationOutcome::EnteredCleanupPending
+        );
+        assert!(matches!(
+            store.get(opaque_id),
+            Err(StoreError::StoreZeroized(
+                StoreZeroizationState::CleanupPending
+            ))
+        ));
+        assert!(matches!(
+            store.event_count(),
+            Err(StoreError::StoreZeroized(
+                StoreZeroizationState::CleanupPending
+            ))
+        ));
+        assert!(matches!(
+            store.control_inventory(),
+            Err(StoreError::StoreZeroized(
+                StoreZeroizationState::CleanupPending
+            ))
+        ));
+        assert!(matches!(
+            store.apply(item(0xd2), b"must not commit"),
+            Err(StoreError::StoreZeroized(
+                StoreZeroizationState::CleanupPending
+            ))
+        ));
+        drop(store);
+
+        for result in [
+            Store::open(&file.0),
+            Store::open_with_limits(&file.0, StoreLimits::default()),
+            Store::open_for_mission(&file.0, events.authority),
+            Store::open_with_limits_for_mission(&file.0, StoreLimits::default(), events.authority),
+        ] {
+            assert!(matches!(
+                result,
+                Err(StoreError::StoreZeroized(
+                    StoreZeroizationState::CleanupPending
+                ))
+            ));
+        }
+
+        let pending = Store::inspect_existing(&file.0).expect("terminal-safe full inspection");
+        assert_eq!(pending.stats, opaque_before);
+        assert_eq!(pending.event_stats, events_before);
+        assert_eq!(pending.control_stats, controls_before);
+        assert_eq!(
+            pending.zeroization.state(),
+            StoreZeroizationState::CleanupPending
+        );
+        assert_eq!(pending.zeroization.intent(), Some(&intent));
+        assert_eq!(
+            pending.inventory.iter().copied().collect::<Vec<_>>(),
+            vec![opaque_id]
+        );
+
+        let mut cleanup = Store::open_for_zeroization(&file.0).expect("resume pending cleanup");
+        cleanup
+            .require_process_exclusive_lock()
+            .expect("cleanup writer exclusion");
+        assert_eq!(cleanup.zeroization_intent(), Some(&intent));
+        assert_eq!(
+            cleanup.begin_zeroization(&intent).expect("exact retry"),
+            BeginZeroizationOutcome::AlreadyStarted(StoreZeroizationState::CleanupPending)
+        );
+        assert!(matches!(
+            cleanup.begin_zeroization(&different_intent),
+            Err(StoreError::ZeroizationIntentConflict)
+        ));
+        assert!(matches!(
+            cleanup.mark_identity_destroyed(),
+            Err(StoreError::ZeroizationOrderViolation(_))
+        ));
+        assert!(matches!(
+            cleanup.finalize_zeroization(),
+            Err(StoreError::ZeroizationOrderViolation(_))
+        ));
+        assert_eq!(
+            cleanup.mark_mission_destroyed().expect("mission receipt"),
+            ArtifactDestructionOutcome::Marked
+        );
+        drop(cleanup);
+
+        let mission = Store::inspect_zeroization_state(&file.0).expect("mission receipt reopen");
+        assert_eq!(mission.state(), StoreZeroizationState::MissionDestroyed);
+        assert_eq!(mission.intent(), Some(&intent));
+        let mut cleanup = Store::open_for_zeroization(&file.0).expect("resume after mission");
+        assert!(cleanup.mission_destroyed());
+        assert!(!cleanup.identity_destroyed());
+        assert_eq!(
+            cleanup
+                .mark_mission_destroyed()
+                .expect("idempotent mission receipt"),
+            ArtifactDestructionOutcome::AlreadyMarked
+        );
+        assert_eq!(
+            cleanup.mark_identity_destroyed().expect("identity receipt"),
+            ArtifactDestructionOutcome::Marked
+        );
+        drop(cleanup);
+
+        assert_eq!(
+            Store::inspect_zeroization_state(&file.0)
+                .expect("identity receipt reopen")
+                .state(),
+            StoreZeroizationState::IdentityDestroyed
+        );
+        let mut cleanup = Store::open_for_zeroization(&file.0).expect("resume before finalize");
+        assert_eq!(
+            cleanup
+                .mark_identity_destroyed()
+                .expect("idempotent identity receipt"),
+            ArtifactDestructionOutcome::AlreadyMarked
+        );
+        assert_eq!(
+            cleanup.finalize_zeroization().expect("finalize"),
+            FinalizeZeroizationOutcome::Finalized
+        );
+        drop(cleanup);
+
+        let mut cleanup = Store::open_for_zeroization(&file.0).expect("complete cleanup reopen");
+        assert_eq!(cleanup.zeroization_state(), StoreZeroizationState::Complete);
+        assert_eq!(
+            cleanup
+                .begin_zeroization(&intent)
+                .expect("complete exact retry"),
+            BeginZeroizationOutcome::AlreadyStarted(StoreZeroizationState::Complete)
+        );
+        assert_eq!(
+            cleanup.finalize_zeroization().expect("idempotent finalize"),
+            FinalizeZeroizationOutcome::AlreadyComplete
+        );
+        let preserved = cleanup
+            .inspect_preserved()
+            .expect("preserved terminal rows");
+        assert_eq!(preserved.stats, opaque_before);
+        assert_eq!(preserved.event_stats, events_before);
+        assert_eq!(preserved.control_stats, controls_before);
+        assert_eq!(
+            preserved.zeroization.state(),
+            StoreZeroizationState::Complete
+        );
+    }
+
+    #[test]
+    fn normal_open_write_gate_observes_terminal_marker_before_any_schema_touch() {
+        let file = TestFile::new("zeroization-open-write-gate");
+        let services = event_services(0xd2);
+        let intent = ZeroizationIntent::new(
+            b"mission write-gate descriptor".to_vec(),
+            b"identity write-gate descriptor".to_vec(),
+        )
+        .expect("intent");
+        {
+            let store = Store::open_for_mission(&file.0, services.authority).expect("store");
+            store.apply(item(0xd2), b"preserved").expect("row");
+            store.begin_zeroization(&intent).expect("terminal marker");
+        }
+
+        let database = Database::open(&file.0).expect("raw normal-open writer");
+        let write = database
+            .begin_write()
+            .expect("normal-open write transaction");
+        let tables_before = write
+            .list_tables()
+            .expect("tables before guard")
+            .map(|table| table.name().to_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(matches!(
+            enforce_live_write(&write),
+            Err(StoreError::StoreZeroized(
+                StoreZeroizationState::CleanupPending
+            ))
+        ));
+        let tables_after = write
+            .list_tables()
+            .expect("tables after guard")
+            .map(|table| table.name().to_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            tables_after, tables_before,
+            "guard must not create or repair tables"
+        );
+        drop(write);
+        drop(database);
+
+        let inspection = Store::inspect_existing(&file.0).expect("preserved terminal store");
+        assert_eq!(inspection.stats.items, 1);
+        assert_eq!(
+            inspection.zeroization.state(),
+            StoreZeroizationState::CleanupPending
+        );
+    }
+
+    #[test]
+    fn wrong_kind_reserved_terminal_table_fails_closed_without_application_repair() {
+        let file = TestFile::new("zeroization-wrong-table-kind");
+        let services = event_services(0xd6);
+        {
+            let store = Store::open_for_mission(&file.0, services.authority).expect("store");
+            store.apply(item(0xd6), b"preserved").expect("row");
+        }
+        {
+            let database = Database::open(&file.0).expect("raw wrong-kind store");
+            let write = database.begin_write().expect("wrong-kind write");
+            write
+                .open_table(METADATA)
+                .expect("metadata")
+                .remove(TOTAL_PAYLOAD_BYTES)
+                .expect("remove migration target");
+            let definition =
+                redb::MultimapTableDefinition::<&str, &[u8]>::new("aster.zeroization.v1");
+            write
+                .open_multimap_table(definition)
+                .expect("reserved-name multimap")
+                .insert("state", b"wrong-kind".as_slice())
+                .expect("wrong-kind row");
+            write.commit().expect("commit wrong-kind schema");
+        }
+
+        for result in [
+            Store::inspect_zeroization_state(&file.0).map(|_| ()),
+            Store::inspect_existing(&file.0).map(|_| ()),
+            Store::open_for_mission(&file.0, services.authority).map(|_| ()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(StoreError::ZeroizationInvariant(
+                    "reserved terminal table name has the wrong table kind"
+                ))
+            ));
+        }
+        let database = redb::Builder::new()
+            .open_read_only(&file.0)
+            .expect("read wrong-kind store");
+        let read = database.begin_read().expect("read transaction");
+        assert!(
+            read.open_table(METADATA)
+                .expect("metadata")
+                .get(TOTAL_PAYLOAD_BYTES)
+                .expect("migration target")
+                .is_none(),
+            "wrong-kind terminal rejection must not repair application metadata"
+        );
+    }
+
+    #[test]
+    fn recovery_only_status_rejects_wrong_kind_mission_domain_without_application_mutation() {
+        let file = TestFile::new("zeroization-wrong-domain-kind");
+        {
+            let database = Database::create(&file.0).expect("create wrong-kind store");
+            let write = database.begin_write().expect("wrong-kind write");
+            let definition =
+                redb::MultimapTableDefinition::<&str, &[u8]>::new("aster.semantic-domain.v1");
+            write
+                .open_multimap_table(definition)
+                .expect("wrong-kind mission domain")
+                .insert(MISSION_AUTHORITY_ID, b"not-a-binding".as_slice())
+                .expect("wrong-kind row");
+            write.commit().expect("commit wrong-kind schema");
+        }
+
+        for result in [
+            Store::inspect_zeroization_state(&file.0).map(|_| ()),
+            Store::recover_zeroization_state(&file.0).map(|_| ()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(StoreError::SemanticInvariant(
+                    "semantic mission domain has the wrong table kind"
+                ))
+            ));
+        }
+
+        let database = redb::Builder::new()
+            .open_read_only(&file.0)
+            .expect("read wrong-kind store");
+        let read = database.begin_read().expect("read transaction");
+        assert_eq!(
+            read.list_tables().expect("regular tables").count(),
+            0,
+            "recovery-only rejection must not create any Aster application table"
+        );
+        assert!(
+            read.list_multimap_tables()
+                .expect("multimap tables")
+                .any(|table| table.name() == SEMANTIC_DOMAIN.name())
+        );
+    }
+
+    #[test]
+    fn partial_or_corrupt_terminal_schema_fails_closed_without_repair() {
+        let base = TestFile::new("zeroization-corruption-base");
+        let services = event_services(0xd3);
+        let intent = ZeroizationIntent::new(
+            b"mission descriptor".to_vec(),
+            b"identity descriptor".to_vec(),
+        )
+        .expect("intent");
+        {
+            let store = Store::open_for_mission(&base.0, services.authority).expect("store");
+            store.apply(item(0xd3), b"preserve me").expect("row");
+            store.begin_zeroization(&intent).expect("begin");
+        }
+
+        let reject_without_repair = |file: &TestFile| {
+            let before = std::fs::read(&file.0).expect("corrupt store bytes");
+            assert!(matches!(
+                Store::inspect_zeroization_state(&file.0),
+                Err(StoreError::ZeroizationInvariant(_))
+            ));
+            assert!(matches!(
+                Store::inspect_existing(&file.0),
+                Err(StoreError::ZeroizationInvariant(_))
+            ));
+            assert!(matches!(
+                Store::open_for_mission(&file.0, services.authority),
+                Err(StoreError::ZeroizationInvariant(_))
+            ));
+            assert_eq!(
+                std::fs::read(&file.0).expect("bytes after rejected opens"),
+                before,
+                "terminal rejection must not repair or rewrite the store"
+            );
+        };
+
+        let empty = TestFile::new("zeroization-empty-table");
+        std::fs::copy(&base.0, &empty.0).expect("copy empty-table case");
+        {
+            let database = Database::open(&empty.0).expect("raw empty store");
+            let write = database.begin_write().expect("raw empty write");
+            write
+                .delete_table(ZEROIZATION)
+                .expect("delete terminal table");
+            write
+                .open_table(ZEROIZATION)
+                .expect("recreate empty terminal table");
+            write.commit().expect("commit empty terminal table");
+        }
+        reject_without_repair(&empty);
+
+        let extra = TestFile::new("zeroization-extra-row");
+        std::fs::copy(&base.0, &extra.0).expect("copy extra-row case");
+        {
+            let database = Database::open(&extra.0).expect("raw extra store");
+            let write = database.begin_write().expect("raw extra write");
+            write
+                .open_table(ZEROIZATION)
+                .expect("terminal table")
+                .insert("extra", b"unexpected".as_slice())
+                .expect("insert extra row");
+            write.commit().expect("commit extra row");
+        }
+        reject_without_repair(&extra);
+
+        let bad_digest = TestFile::new("zeroization-bad-digest");
+        std::fs::copy(&base.0, &bad_digest.0).expect("copy digest case");
+        {
+            let database = Database::open(&bad_digest.0).expect("raw digest store");
+            let write = database.begin_write().expect("raw digest write");
+            let mut encoded = write
+                .open_table(ZEROIZATION)
+                .expect("terminal table")
+                .get(ZEROIZATION_STATE_KEY)
+                .expect("read terminal")
+                .expect("state row")
+                .value()
+                .to_vec();
+            encoded[10] ^= 0x01;
+            write
+                .open_table(ZEROIZATION)
+                .expect("terminal table")
+                .insert(ZEROIZATION_STATE_KEY, encoded.as_slice())
+                .expect("write corrupt digest");
+            write.commit().expect("commit corrupt digest");
+        }
+        reject_without_repair(&bad_digest);
+
+        let bad_receipts = TestFile::new("zeroization-bad-receipts");
+        std::fs::copy(&base.0, &bad_receipts.0).expect("copy receipt case");
+        {
+            let database = Database::open(&bad_receipts.0).expect("raw receipt store");
+            let write = database.begin_write().expect("raw receipt write");
+            let mut encoded = write
+                .open_table(ZEROIZATION)
+                .expect("terminal table")
+                .get(ZEROIZATION_STATE_KEY)
+                .expect("read terminal")
+                .expect("state row")
+                .value()
+                .to_vec();
+            encoded[8] = 1;
+            encoded[9] = 3;
+            let digest_offset = encoded.len() - ZEROIZATION_DIGEST_BYTES;
+            let digest: [u8; ZEROIZATION_DIGEST_BYTES] =
+                Sha256::digest(&encoded[..digest_offset]).into();
+            encoded[digest_offset..].copy_from_slice(&digest);
+            write
+                .open_table(ZEROIZATION)
+                .expect("terminal table")
+                .insert(ZEROIZATION_STATE_KEY, encoded.as_slice())
+                .expect("write inconsistent receipts");
+            write.commit().expect("commit inconsistent receipts");
+        }
+        reject_without_repair(&bad_receipts);
+
+        for (name, length_offset, length, expected_reason) in [
+            (
+                "zeroization-hostile-mission-length",
+                42usize,
+                u32::MAX,
+                "terminal mission descriptor length is outside its bound",
+            ),
+            (
+                "zeroization-hostile-identity-length",
+                46usize,
+                0u32,
+                "terminal identity descriptor length is outside its bound",
+            ),
+        ] {
+            let hostile = TestFile::new(name);
+            std::fs::copy(&base.0, &hostile.0).expect("copy hostile length case");
+            {
+                let database = Database::open(&hostile.0).expect("raw hostile store");
+                let write = database.begin_write().expect("raw hostile write");
+                let mut encoded = write
+                    .open_table(ZEROIZATION)
+                    .expect("terminal table")
+                    .get(ZEROIZATION_STATE_KEY)
+                    .expect("read terminal")
+                    .expect("state row")
+                    .value()
+                    .to_vec();
+                encoded[length_offset..length_offset + 4].copy_from_slice(&length.to_be_bytes());
+                let digest_offset = encoded.len() - ZEROIZATION_DIGEST_BYTES;
+                let digest: [u8; ZEROIZATION_DIGEST_BYTES] =
+                    Sha256::digest(&encoded[..digest_offset]).into();
+                encoded[digest_offset..].copy_from_slice(&digest);
+                write
+                    .open_table(ZEROIZATION)
+                    .expect("terminal table")
+                    .insert(ZEROIZATION_STATE_KEY, encoded.as_slice())
+                    .expect("write hostile valid-digest length");
+                write.commit().expect("commit hostile length");
+            }
+            assert!(matches!(
+                Store::inspect_zeroization_state(&hostile.0),
+                Err(StoreError::ZeroizationInvariant(reason)) if reason == expected_reason
+            ));
+            reject_without_repair(&hostile);
+        }
+
+        let oversized = TestFile::new("zeroization-hostile-oversized-record");
+        std::fs::copy(&base.0, &oversized.0).expect("copy oversized record case");
+        {
+            let database = Database::open(&oversized.0).expect("raw oversized store");
+            let write = database.begin_write().expect("raw oversized write");
+            let mut encoded = write
+                .open_table(ZEROIZATION)
+                .expect("terminal table")
+                .get(ZEROIZATION_STATE_KEY)
+                .expect("read terminal")
+                .expect("state row")
+                .value()
+                .to_vec();
+            encoded.truncate(encoded.len() - ZEROIZATION_DIGEST_BYTES);
+            encoded.resize(
+                (MAX_ZEROIZATION_RECORD_BYTES + 1) - ZEROIZATION_DIGEST_BYTES,
+                0xa5,
+            );
+            let digest: [u8; ZEROIZATION_DIGEST_BYTES] = Sha256::digest(&encoded).into();
+            encoded.extend_from_slice(&digest);
+            assert_eq!(encoded.len(), MAX_ZEROIZATION_RECORD_BYTES + 1);
+            write
+                .open_table(ZEROIZATION)
+                .expect("terminal table")
+                .insert(ZEROIZATION_STATE_KEY, encoded.as_slice())
+                .expect("write oversized valid-digest record");
+            write.commit().expect("commit oversized record");
+        }
+        assert!(matches!(
+            Store::inspect_zeroization_state(&oversized.0),
+            Err(StoreError::ZeroizationInvariant(
+                "terminal record exceeds maximum encoded length"
+            ))
+        ));
+        reject_without_repair(&oversized);
+    }
+}

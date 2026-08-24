@@ -15,6 +15,7 @@ use crate::bridge::{
     MAX_WRAPPER_TOTAL_BYTES, exact_object_id, priority_allowed,
 };
 use crate::crypto::{PendingBatchItem, VerifiedBatchItem, VerifiedBatchProof};
+pub use crate::envelope::{ControlPrincipal, EnvelopeId, Revocation, ScopeEpoch};
 use crate::model::{
     CausalStamp, ConflictAnnotation, DataClass, Dot, ItemId, MAX_CAUSAL_CONTEXT_ENTRIES, NodeId,
     PeerStatus, Priority, Scope, SyncStatus, Topic, VersionVector,
@@ -237,9 +238,6 @@ impl InventoryMetadata {
         }
     }
 }
-
-/// Stable transfer identifier, distinct from the semantic item identifier.
-pub type EnvelopeId = [u8; 32];
 
 /// An authority control which the cryptographic provider has authenticated
 /// before it crosses the durable-store boundary.
@@ -1184,43 +1182,6 @@ impl From<ChunkRange> for crate::wire::ByteRange {
             end: value.end,
         }
     }
-}
-
-/// Persisted revocation after control-plane signature verification.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Revocation {
-    pub subject: NodeId,
-    pub authority: NodeId,
-    pub signer: NodeId,
-    pub generation: u64,
-    pub control_sequence: u64,
-    pub previous_control: Option<EnvelopeId>,
-    pub sealed_notice: Vec<u8>,
-    pub observed_at_ms: Option<u64>,
-}
-
-/// Persisted scope key epoch (key bytes are held by the crypto provider).
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ScopeEpoch {
-    pub authority: NodeId,
-    pub signer: NodeId,
-    pub scope: Scope,
-    pub epoch: u64,
-    pub control_sequence: u64,
-    pub previous_control: Option<EnvelopeId>,
-    pub sealed_notice: Vec<u8>,
-}
-
-/// Stable mission control-chain namespace paired with the delegated identity
-/// authorized to append the reserved link.
-///
-/// `authority` remains stable across signer rotation. Chain heads must never be
-/// keyed by `signer`, because doing so would create an independent history for
-/// every delegated credential.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ControlPrincipal {
-    pub authority: NodeId,
-    pub signer: NodeId,
 }
 
 /// Authority control-chain reservation used before cryptographic sealing.

@@ -40,14 +40,14 @@ fi
 
 if ASTER_TEST_REAL_CARGO="$real_cargo" CARGO="$expanded_paste_cargo" \
   sh "$checker" >/dev/null 2>&1; then
-  printf '%s\n' 'dependency-exception regression failed: expanded paste graph passed' >&2
+  printf '%s\n' 'dependency-exception regression failed: reintroduced paste graph passed' >&2
   exit 1
 else
   status=$?
 fi
 
 if [ "$status" -ne 1 ]; then
-  printf 'dependency-exception regression failed: expected expanded-paste status 1, got %s\n' "$status" >&2
+  printf 'dependency-exception regression failed: expected reintroduced-paste status 1, got %s\n' "$status" >&2
   exit 1
 fi
 
@@ -64,4 +64,4 @@ if [ "$status" -ne 1 ]; then
   exit 1
 fi
 
-printf '%s\n' 'dependency-exception regression passed: fuzz cargo-tree failure propagates; active Hickory, expanded paste graph, and second paste version fail closed'
+printf '%s\n' 'dependency-exception regression passed: fuzz cargo-tree failure propagates; active vulnerable Hickory and any reintroduced paste version fail closed'

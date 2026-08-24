@@ -1,7 +1,7 @@
 # Decision 0027: Bound the active libp2p pilot dependency exceptions
 
-- Status: accepted for a retained non-production test oracle only; provider
-  selection lane closed
+- Status: retained non-production test oracle only; provider selection lane
+  closed; `paste` advisory exception retired 2026-08-23
 - Date: 2026-08-23
 - Review deadline: 2026-11-23, or before any production selection or release,
   whichever comes first
@@ -29,14 +29,16 @@ the repository allowlist:
 expressions for external dependencies does not change the repository's
 Apache-2.0-only rule for first-party packages and distributed project files.
 
-The same active graph contains `paste` 1.0.15 beneath
+At adoption, the same active graph contained `paste` 1.0.15 beneath
 `netlink-packet-core` 0.8.2. Its reviewed reverse graph reaches `if-watch`
 3.2.2 directly and through `netlink-packet-route`, `netlink-proto`, and
 `rtnetlink`, then reaches `libp2p-tcp` 0.44.1.
 [RUSTSEC-2024-0436](https://rustsec.org/advisories/RUSTSEC-2024-0436.html)
 classifies `paste` as unmaintained. It reports no vulnerability and no patched
-release. The exact libp2p pilot cannot remove that path without changing its
-transport dependency graph.
+release. The exact libp2p pilot could not remove that path without changing its
+transport dependency graph. The remediation recorded below now supplies a
+source-compatible patched dependency and removes `paste` from the lock and
+active graphs.
 
 ## Decision
 
@@ -54,9 +56,10 @@ transport dependency graph.
 
 The separate lock-only Hickory disposition in
 [Decision 0026](0026-lock-only-hickory-advisories.md) is not part of this
-active-graph exception. Raw lockfile audit ignores remain limited to Hickory;
-the feature-aware dependency-policy scanner carries only this `paste` ignore
-and the age-pilot exception from Decision 0018.
+active-graph exception. Raw lockfile audit ignores remain limited to Hickory.
+At adoption, the feature-aware dependency-policy scanner carried only this
+`paste` ignore and the age-pilot exception from Decision 0018; the remediation
+below retires the former.
 
 ## Removal and review gates
 
@@ -78,9 +81,8 @@ and the age-pilot exception from Decision 0018.
 
 - CI can distinguish a reviewed non-production dependency hold from an
   unreviewed policy failure.
-- The active unmaintained package remains visible in audit output and in this
-  dated decision; it is not described as maintained or vulnerability-free
-  beyond RustSec's current classification.
+- The dated exception remains visible in this decision, while the remediation
+  removes the unmaintained package rather than broadening its allowed graph.
 - First-party license enforcement remains byte-for-byte Apache-2.0 and is
   unaffected by the external dependency allowlist.
 
@@ -97,8 +99,25 @@ The provider remains an independently buildable workspace test package, so
 explicit and workspace-wide validation may compile it without activating it in
 any default or shipping consumer.
 
-The 2026-11-23 review/removal deadline and the earlier-use expiry remain
-unchanged. Closure does not convert the temporary license allowlist or
-`RUSTSEC-2024-0436` disposition into general or permanent policy. If the pilot
-is removed before the deadline, its lock reachability, advisory ignore, and
-scope assertions must be removed in the same change.
+The 2026-11-23 review deadline and the earlier-use expiry remain unchanged for
+the retained pilot and its license disposition. Closure did not convert the
+temporary `RUSTSEC-2024-0436` disposition into general or permanent policy;
+the remediation below retires that advisory exception before the deadline.
+
+## Advisory remediation — 2026-08-23
+
+The selected Iroh graph reached the same unmaintained `paste` package through
+`netwatch`, so expanding the pilot-only exception would have violated this
+decision. Instead, Aster vendors the exact MIT-licensed
+`netlink-packet-core` 0.8.2 source and changes only its dependency declaration:
+the dependency key `paste` now resolves to exact `pastey` 0.2.2, RustSec's
+maintained drop-in replacement. No vendored Rust source or public macro API is
+changed. [`ASTER-PATCH.md`](../../third-party/netlink-packet-core-0.8.2-aster/ASTER-PATCH.md)
+binds the upstream archive, revision, license, and local delta.
+
+Consequently, `paste` is absent from `Cargo.lock`, the full workspace graph,
+and the fuzz graph. `RUSTSEC-2024-0436` is removed from `deny.toml`; the scope
+gate now fails if any `paste` version reappears instead of permitting an exact
+reverse path. The patch may be removed only after all active netlink consumers
+can use an upstream release that no longer depends on `paste`, with the same
+workspace, retained-oracle, and dependency-policy gates passing.

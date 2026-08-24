@@ -1,32 +1,195 @@
 # Carriers and contacts
 
-This guide explains how data moves between Aster nodes and what the current IP
-and Bluetooth Low Energy adapters do. Read [Core concepts](concepts.md) first if
-terms such as node, topic, or scope are new.
+This guide distinguishes the selected direct-Iroh carrier/storage composition
+from the proven semantic implementation whose protocol and carrier behavior is
+being migrated onto it. Read [Core concepts](concepts.md) first if terms such as
+node, topic, or scope are new.
 
 ## The important separation
 
-Application code publishes data. Deployment code configures carriers.
+Application semantics, mission authentication, control/source authorization,
+and carrier mechanics have separate owners. The selected composition now
+exercises source-authenticated control and Event paths:
 
 ```mermaid
-flowchart TB
-    App["Application API<br/>publish · query · subscribe · conflicts"]
-    Host["MeshService<br/>durable node · authenticated contact · scheduling"]
-    Core["Aster protocol<br/>inventory · transfer · verification · reducers"]
-    IP["IP Link"]
-    BLE["BTLE Link"]
-    Future["Future Link<br/>radio · serial · file"]
-    App --> Host --> Core
-    Core --> IP
-    Core --> BLE
-    Core --> Future
+flowchart LR
+    App["Live Event application<br/>Ping emitter · Pong responder"]
+    Authority["Stopped-state authority CLI<br/>revoke · recipient-filtered rekey"]
+    Operator["Same-UID Unix operator"]
+    Artifacts["Retained mission bundle<br/>and carrier identity"]
+    Control["aster-core control envelope<br/>authority · chain · effect"]
+    Source["aster-core source envelope<br/>publisher · protected header · content"]
+    Node["aster-node<br/>mission-before-inventory · control-before-Event · local zeroize · receipts"]
+    Store["aster-redb-store<br/>control policy · Events · terminal intent · route-only cache"]
+    Profile["aster-profile<br/>canonical exact-ID ordering"]
+    Diff["aster-negentropy<br/>bounded set difference"]
+    Mission["aster-core reference session<br/>hybrid mission auth · frame protection"]
+    Iroh["aster-iroh<br/>direct authenticated carrier · bounded exchange"]
+    Peer["Peer aster-node<br/>independent identity and store"]
+    App --> Source
+    Authority --> Control
+    Control --> Node
+    Source --> Node
+    Node --> Store
+    Node --> Profile --> Diff
+    Node --> Mission
+    Mission --> Iroh <--> Peer
+    Operator -. "local zeroize" .-> Node
+    Artifacts -. "exact retained files" .-> Node
 ```
 
-An item never names UDP, Bluetooth, a relay, or a particular peer. It commits to
-the same durable store regardless of how future contacts happen. This separation
-is what allows interrupted progress to resume through another peer or carrier.
+`aster-iroh` knows only endpoint lifecycle and bounded exchange.
+`aster-negentropy` knows only exact-transfer-ID set difference.
+`aster-redb-store` is the mission-bound transaction authority for the audited
+contiguous control prefix, active policy snapshots, accepted Events,
+causal/operation ledgers, and bounded route-only representations.
+`aster-profile` owns the canonical full-ID vocabulary and ordering, not policy
+or semantic identity. `aster-node` is the only selected composition root. This
+diagram is the selected control/Event lane only; broader semantic/reference
+components are migration sources, not co-running authorities.
 
-In the current repository:
+The requirements still demand transport-neutral, source-authenticated items.
+The proven `aster-core` semantic implementation supplies the migration source
+for the hybrid-PQ handshake, protected control/source envelopes,
+recipient-filtered rekey, source authentication, data classes, causality,
+custody/TTL, scopes, and policy. Those mechanisms are ported, not rewritten.
+The selected node now uses the existing reference session before inventory, the
+existing control provider before Event, and the existing source envelope for
+Event. It freshly verifies exact sealed bytes before admission, serving,
+restart, and application reaction. This is bounded control/Event credit only;
+the old implementation is not removed until each replacement passes equivalent
+tests.
+
+## What is implemented today
+
+| Carrier path | Current capability | What is not yet claimed |
+|---|---|---|
+| Selected direct Iroh | Manually admitted exact endpoint ID and socket, direct authenticated QUIC, bounded exchange, hosted discovery/relay/port mapping disabled | Carrier authentication is not mission or control/source authorization; NAT, hosted relay, physical-network acceptance, and multi-carrier failover remain open |
+| Selected virtual mesh CLI | Real 2–32-node Ping/Pong line plus explicit four-role control scenario; independent identities/stores, mission auth before inventory, ordered Flash controls before source-sealed Event transfer, current scope/epoch route filtering, payload-blind relay cache, restart/idempotency, no-op verification, and a same-UID Unix local software-zeroization hook | Current-tree N=3/13-process, default N=4/18-process, and N=8/38-process Ping/Pong plus explicit N=4/23-process control passed with disclosed transient/denial stderr. The generic line has `2N+1` cohorts and `5N-2` children, isolates both publications and every directed-edge transfer, moves exactly one pre-existing Event per transfer edge with all control counters zero, and finishes with all 11 reconciliation counters zero. The control receipt separately proves converged controls, no-contact Ping publication, later Event forwarding, and four causal Pong barriers before its no-op. A separate real-child zeroization receipt passed. Provisioning is unprotected-reference; non-Unix and physical/copy-on-write/snapshot/swap/backup sanitization, database rollback resistance, generalized/repeated control management, finite TTL, general apps/subscriptions, other data classes, the full range, many-node scale, and physical multi-system acceptance remain open. |
+| Current semantic in-memory link | Full high-level host contact, authentication, reconciliation, resume, and failure tests | It is a test carrier and is not wired to the selected composition |
+| Current semantic UDP/IP | Nonblocking link, manual endpoint mapping, protected local discovery, rendezvous helpers, opaque relay components | Migration onto the selected node; full host acceptance on physical or operational networks |
+| Current semantic NAT/rendezvous and relay | Bounded rendezvous, endpoint-punching, and opaque-relay helpers with local software tests | Selected-node integration and a two-device representative-NAT direct/fallback result |
+| Current semantic BTLE | MTU-aware link, unicast plus an advertisement primitive, disconnect handling, platform `BleRadio` seam | Selected-node integration; a shipped Android, iOS, Linux, or controller-specific radio driver; complete one-to-many profile |
+| LoRa, serial, file | The requirements and semantic design do not preclude them | No selected adapters ship |
+
+Code presence is not deployment credit. See the tracked
+[production requirements status](implementation/requirements-status.md) and
+[Conformance](conformance.md) for the current evidence and open gates.
+
+## Selected direct-Iroh contact
+
+For the fastest two-node result, run `mise run tour` from the
+[capability tour](quickstart/capability-tour.md). The fastest relay example uses
+three nodes and is documented in the [live mesh CLI quickstart](quickstart/mesh-cli.md):
+
+```sh
+ASTER_DEMO_PARENT="$(mktemp -d)"
+cargo run --locked -p aster-node --bin aster -- \
+  demo --nodes 3 --root "$ASTER_DEMO_PARENT/mesh"
+```
+
+Omitting `--scenario` keeps Ping/Pong for every supported node count. The
+separate role-bound control receipt uses exactly four nodes:
+
+```sh
+ASTER_CONTROL_PARENT="$(mktemp -d)"
+cargo run --locked -p aster-node --bin aster -- \
+  demo --nodes 4 --scenario control --root "$ASTER_CONTROL_PARENT/mesh"
+```
+
+In that bounded loopback scenario a payload-blind relay forwards one ordered
+revocation/rekey suffix while the authority CLI and authority carrier node are
+offline. After the survivor commits that prefix, a separate one-process cohort
+publishes epoch-two Ping with no configured peer or contact; only the following
+cohort forwards the Event into the relay. After the captured-node denials, four
+more barriers deliver that durable Ping to node 0, publish causal Pong with no
+peer or contact, move Pong into the relay, and return it to node 2. Eligible
+members reject the captured member, but the captured store retains stale
+epoch-one local signing material. That negative condition is intentional:
+rekey/exclusion is not destruction. A separately invoked local hook covers the
+selected node's retained secret artifacts.
+See the [CLI quickstart](quickstart/mesh-cli.md#run-the-four-role-control-scenario)
+for the exact boundary.
+
+For separately managed processes, initialize a unique persistent state root on
+each system, exchange the endpoint IDs printed by `aster init`, and separately
+provision a reference mission bundle and mission `NodeId` for each node.
+Configure both sides with exact
+`CARRIER_ID@IP:PORT=MISSION_NODE_ID_HEX64` bindings and pass each local bundle
+through `--mission-bundle-unprotected-reference`. The carrier fails closed when
+its handshake identity is not in the configured allowlist; the node then fails
+closed unless the mission identity also matches. Its direct path does not
+perform hosted address lookup, relay discovery, or port mapping.
+
+Iroh carrier authentication is not Aster mission authentication and does not
+satisfy zero trust by itself. `aster-node` carries the existing `aster-core`
+four-flight hybrid session over that carrier, binds mission `NodeId`
+independently from Iroh `EndpointId`, and gates inventory on success. Event then
+uses the existing source-protected envelope after the existing ordered control
+provider has reconciled and activated a gap-free prefix: current peer scope/epoch
+route grants filter inventory and Offer; content grants gate semantic acceptance
+and reaction; revoked mission principals fail closed. State/Record/Blob,
+generalized topic subscriptions/control administration, repeated multi-scope
+rekey, finite-TTL custody, and protected provisioning remain to be composed.
+The mission bundle is owner-only on Unix but explicitly unprotected-reference
+at rest; other platforms fail closed because that owner-only contract cannot be
+verified.
+
+```mermaid
+sequenceDiagram
+    participant L as Local node
+    participant C as Direct Iroh carrier
+    participant P as Peer node
+    participant S as redb store
+    L->>C: exact EndpointId and direct address
+    C->>P: authenticated carrier connection
+    L->>P: hybrid mission flights 1 and 3
+    P->>L: hybrid mission flights 2 and 4
+    Note over L,P: independently verify exact mission NodeId
+    L->>P: control reconciliation query
+    P->>L: source-authenticated control suffix
+    L->>S: commit and activate contiguous control prefix
+    L->>S: capture fresh policy snapshot
+    L->>P: Negentropy query over locally route-filtered exact IDs
+    P->>L: reply lets local derive one exact set difference
+    P->>L: reverse query over peer-filtered exact IDs
+    L->>P: reply lets peer derive the reverse difference
+    L->>P: protected bytes offered for peer-missing IDs
+    P->>L: protected bytes fetched for local-missing IDs
+    alt content grant
+        L->>S: verify source and admit semantic Event
+        L->>L: application reaction may run
+    else route-only grant
+        L->>S: retain bounded exact bytes only
+        Note over L,S: no content open or semantic Event row
+    end
+```
+
+This is the manual direct-Iroh, Event-only selected slice with
+unprotected-reference provisioning. Carrier authentication does not grant
+mission membership, and route authority does not grant content access.
+
+On Unix, a same-UID operator can invoke `aster zeroize` against the exact state
+and mission-bundle paths. A live node accepts the request only through an
+owner-only local socket bound to the state/store inode identities, stops new
+work, drains its owned contact tasks, closes its endpoint, and drops derived
+secret holders. A stopped node instead obtains the exclusive store writer. Both
+paths durably record exact non-secret artifact descriptors before overwriting,
+synchronizing, and truncating the retained mission-bundle and carrier-identity
+inodes. The pathnames remain owner-only zero-length tombstones, and normal store
+open remains terminally denied. Read-only audit inspection and preserved data
+rows remain available.
+
+This hook is local, not a control message or remote carrier action. It neither
+deletes the inode nor guarantees when an arbitrary mid-flight stream disappears
+from a remote peer. It makes no claim about physical flash, copy-on-write
+history, snapshots, swap, backups, replacement of the retained redb database,
+or non-Unix platforms. Exact usage and the crash-resumption boundary are in the
+[CLI quickstart](quickstart/mesh-cli.md#trigger-bounded-local-software-zeroization).
+
+## Current semantic/reference carrier composition
+
+The repository also retains the current semantic application and host surfaces:
 
 - `ApplicationNode` is the offline application surface.
 - `MeshService` composes that application surface with authenticated sync, Blob
@@ -35,20 +198,7 @@ In the current repository:
 - The maintained [capability-boundary table](README.md#current-capability-boundary)
   records which operations each Rust and language-binding surface exposes.
 
-## What is implemented today
-
-| Carrier path | Current capability | What is not yet claimed |
-|---|---|---|
-| Controlled in-memory link | Full high-level host contact, authentication, reconciliation, resume, and failure tests | It is a test carrier, not a deployment |
-| UDP/IP | Nonblocking link, manual endpoint mapping, protected local discovery, rendezvous helpers, opaque relay components | Full application-host acceptance on physical or operational networks |
-| NAT/rendezvous and relay | Bounded rendezvous, endpoint-punching, and opaque-relay helpers with local software tests | A two-device test on representative hardware behind two controlled NATs, proving direct contact where permitted and relay fallback otherwise |
-| BTLE | MTU-aware link, unicast plus an advertisement primitive, disconnect handling, platform `BleRadio` seam | A shipped Android, iOS, Linux, or controller-specific radio implementation; complete one-to-many replication profile |
-| LoRa, serial, file | The transport-neutral design does not preclude them | No adapters are shipped |
-
-The distinction between code being present and a deployment claim is deliberate.
-See [Conformance](conformance.md) for the current evidence and open gates.
-
-## Contact lifecycle
+## Current semantic host lifecycle
 
 The high-level host has a small, nonblocking lifecycle:
 
@@ -71,14 +221,10 @@ automatically fail over to the next carrier. Pausing destroys session keys but
 retains verified objects and partial Blob ranges. A later `begin_sync(peer)`
 selects the next configured carrier for that peer.
 
-The non-normative [operational IP mesh experiment](proposals/0001-ip-mesh-vertical-slice.md)
-defines a controlled comparison for discovery, multi-peer host scheduling, NAT,
-and failover. It is a proposal, not a current capability claim.
-
 `pump()` is nonblocking. Do not drive it in a busy loop. Integrate it with the
 platform's I/O readiness and timer mechanism.
 
-## Common Rust host setup
+## Current semantic Rust host setup
 
 The transport quickstarts assume two **different** authority-issued node bundles
 with compatible mission, scope, topic, and epoch access. Do not copy one bundle
@@ -129,7 +275,7 @@ let mut bob = MeshService::open(
 
 At this point both nodes can publish, query, and subscribe while offline.
 
-## IP quickstart
+## Current semantic IP example
 
 `IpLink` uses nonblocking UDP. The simplest integration uses known peer socket
 addresses:
@@ -181,7 +327,7 @@ Drive both services from their host loops until the desired item appears in a
 subscription or bounded query, then pause the contact. Aster does not make a
 remote-delivery promise from the local publish result.
 
-### IP discovery, rendezvous, and relay
+### Current semantic discovery, rendezvous, and relay
 
 The IP crate provides separate tools for three deployment situations:
 
@@ -200,7 +346,7 @@ The IP crate provides separate tools for three deployment situations:
 Start with manually known addresses. Add discovery or rendezvous only after the
 authenticated two-node path is understood and measured in the target network.
 
-## BTLE quickstart
+## Current semantic BTLE integration seam
 
 The BTLE crate deliberately does not choose an operating-system Bluetooth API.
 Your platform integration implements the narrow `BleRadio` trait:
@@ -271,10 +417,10 @@ BTLE advertisement support is currently a carrier primitive. It is not a claim
 that the complete authenticated replication exchange has a one-to-many broadcast
 profile.
 
-## Adding another carrier
+## Carrier migration and extension
 
-A new carrier implements the `Link` contract exposed by `aster-core`'s
-`adapter-sdk` feature. It supplies:
+The current semantic carrier pattern implements the `Link` contract exposed by
+`aster-core`'s `adapter-sdk` feature. It supplies:
 
 - a stable diagnostic name;
 - characteristics such as MTU, estimated bit rate, cost, emission footprint, and
@@ -287,10 +433,13 @@ conflict resolution, or treat transport security as Aster authentication. The
 core owns fragmentation, handshake, replay defense, exact reconciliation,
 source verification, and reducers.
 
-Use the [binding pattern](bindings/pattern.md) for a language API. Use the `Link`
-trait and existing IP/BTLE adapters as the integration pattern for a carrier.
+Use the `Link` trait and existing IP/BTLE adapters as semantic and test migration
+sources. The selected node does not yet expose the final multi-carrier adapter
+contract, so a new production adapter must not create a second persistence,
+reconciliation, authentication, or scheduling authority. Use the
+[binding pattern](bindings/pattern.md) for a language API.
 
-## Protocol versions you may see
+## Semantic protocol versions you may see
 
 Aster separates stable bytes from negotiated behavior:
 
@@ -319,6 +468,10 @@ compatibility is not downgrade-resistance evidence.
 
 ## Before a real deployment
 
+- Complete the migration ledger in
+  [production requirements status](implementation/requirements-status.md), and
+  do not interpret the direct-Iroh carrier handshake as mission authentication
+  or the reference mission session as source-item authorization.
 - Issue distinct operational bundles through an approved provisioning process,
   wrap them with an admitted protected-artifact provider, and do not fall back
   to the raw fixture/compatibility path.

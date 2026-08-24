@@ -13,9 +13,27 @@ That makes Aster useful for field teams, vehicles, sensors, and edge systems tha
 move between IP, Bluetooth Low Energy, tactical radio, SATCOM, and disconnected
 operation.
 
-> **Project status:** Aster 0.1 is a reference candidate. It is not a completed
-> MVP, production-authorized build, or claim of FIPS 140-3 validation.
-> Production use is **blocked** by explicit gates in
+> **Project status:** Aster 0.1 now has an executable production-implementation
+> lane for bounded source-authenticated Event and mission-control meshes over
+> direct IP. Iroh
+> carrier authentication remains separate from the ported `aster-core` hybrid
+> mission session, which completes before inventory. The runtime source-seals
+> ordered Flash revocation/rekey controls and Events through the existing
+> `aster-core` providers, activates a durable contiguous control prefix before
+> Event transfer, keeps exact transfer identity distinct from semantic identity,
+> and separates content admission from payload-blind routing. It is still not a
+> completed MVP,
+> production-authorized build, or claim of FIPS 140-3 validation. State, Record,
+> Blob, finite-TTL custody, generalized applications/subscriptions, protected
+> provisioning, generalized control administration, and physical/multi-carrier
+> acceptance remain open. A bounded same-UID Unix hook now drains a selected
+> node, terminally locks its retained redb state, and software-erases its exact
+> mission-bundle and carrier-identity file contents. Non-Unix support, physical
+> media/copy-on-write/snapshot/swap/backup sanitization, and database
+> rollback/replacement resistance remain open. The broader
+> `aster-core` implementation is the proven migration source, not legacy to
+> discard, and remains until replacements pass equivalent tests. Production
+> use is **blocked** by explicit gates in
 > [security](docs/security.md) and
 > [conformance and acceptance](docs/conformance.md); read both before planning
 > an operational deployment.
@@ -68,7 +86,118 @@ The [Application recipes](docs/application-recipes.md) show commented code for
 all four classes, queries, subscriptions, batches, deletion, conflicts, and
 emission policy.
 
-## Get a local publish/subscribe working
+## Try Aster in one command
+
+The fastest tour runs a causal two-node Ping/Pong exchange with real processes,
+independent stores, direct Iroh contacts, peerless publication, restart, and a
+zero-difference no-op:
+
+```sh
+mise install
+mise run tour
+```
+
+Two follow-on tours make the more unusual boundaries visible:
+
+```sh
+mise run tour-relay    # three nodes; middle node stores bytes it cannot read
+mise run tour-control  # four roles; revocation, rekey, captured-node exclusion
+```
+
+Each command retains its complete root and prints stopped-state inspections.
+See the [capability tour](docs/quickstart/capability-tour.md) for what to look
+for and the [selected architecture](docs/architecture.md) for the trust and
+authority boundaries.
+
+## Run the live mesh slice by hand
+
+The selected implementation starts an N-node, multi-process line with
+independent stores and identities. A live node-0 application source-seals and
+durably publishes Ping;
+route-only intermediates exact-forward it without content access; the origin
+process exits; and a live destination atomically publishes a causally correlated
+Pong. Restarts reuse both durable operations and equal inventory transfers
+nothing:
+
+```sh
+ASTER_DEMO_PARENT="$(mktemp -d)"
+cargo run --locked -p aster-node --bin aster -- \
+  demo --nodes 3 --root "$ASTER_DEMO_PARENT/mesh"
+```
+
+The `--root` path must not already exist. The demo uses real Iroh connections,
+independent redb stores, persisted random carrier identities, and demo-issued
+random mission bundles persisted as unprotected-reference files. Only the
+demo-scoped issuing authority seed is ephemeral. Bounded Negentropy reconciles
+exact sealed-transfer IDs. Every contact authenticates the expected mission peer
+before inventory and protects later mechanics frames. Each Event independently
+authenticates its publisher and protected semantic header. This slice does
+**not** validate State/Record/Blob, generalized applications or topic
+subscriptions, finite-TTL custody, protected provisioning at rest, NAT/hosted
+relay operation, BTLE, physical multi-system operation, or any production
+security gate. See the [capability tour](docs/quickstart/capability-tour.md),
+the [mesh CLI quickstart](docs/quickstart/mesh-cli.md),
+and the tracked [production requirements status](docs/implementation/requirements-status.md)
+for the exact observed result and open work.
+
+Omitting `--scenario` always selects that configurable Ping/Pong path, including
+at four nodes. A separate exact four-role control scenario demonstrates one
+ordered revocation and one recipient-filtered scope rekey:
+
+```sh
+ASTER_CONTROL_PARENT="$(mktemp -d)"
+cargo run --locked -p aster-node --bin aster -- \
+  demo --nodes 4 --scenario control --root "$ASTER_CONTROL_PARENT/mesh"
+```
+
+The authority CLI and authority carrier node are absent while a route-only node
+forwards the two-control suffix. The surviving member reaches epoch two, the
+captured member is excluded, and eligible members exchange epoch-two Ping/Pong.
+This is not local key destruction: the captured node can still create a stale
+epoch-one signature, which current eligible peers reject. The demo retains raw,
+unprotected reference provisioning material and does not establish a protected
+operator workflow.
+
+Separately managed Unix nodes expose a binding local destruction hook:
+
+```sh
+target/debug/aster zeroize --state ./aster-state \
+  --mission-bundle-unprotected-reference ./mission.unprotected-reference.bundle
+```
+
+For a live node the same-UID command uses owner-only local IPC, stops new work,
+drains owned contact tasks, closes the Iroh endpoint, and drops derived secret
+holders before committing a terminal redb cleanup intent. It then overwrites,
+synchronizes, and truncates the exact retained mission-bundle and
+`identity.key` inodes. Their owner-only pathnames remain as zero-length
+tombstones; application and mesh rows remain for audit. Normal reopen is denied
+while that redb terminal marker is retained, including if credential bytes are
+later restored. This is bounded software erasure, not inode deletion or a claim
+about physical media, filesystem copies, snapshots, swap, backups, or a restored
+pre-marker database. There is no network zeroization trigger.
+
+The frozen-tree receipts cover three-node/13-process, default
+four-node/18-process, and eight-node/38-process Ping/Pong runs plus the explicit
+four-node/23-process control run. The generic line isolates Ping publication,
+each forward edge, Pong publication, each return edge, and the final no-op into
+`2N+1` cohorts and `5N-2` child processes. Their child logs retain zero, five,
+ten, and 109 stderr lines respectively. Every directed generic transfer edge moved
+exactly one pre-existing Event with all control counters zero; the N=3, N=4,
+and N=8 no-ops completed 36, 62, and 228 passing contacts with all six control
+and all five Event counters zero. The control path places a one-process,
+zero-contact epoch-two Ping publication after control convergence and before a separate
+Event-transfer cohort. After the captured-node denials it similarly separates
+pre-existing Ping delivery to node 0, a one-process zero-contact Pong commit,
+Pong transfer to the route-only relay, and Pong return to node 2. All 109
+control-run stderr lines arose inside the two required captured-node denial
+cohorts; every successful cohort retained zero stderr. Corresponding required
+contacts and all terminal invariants passed. These are not zero-error, physical,
+or scale claims; eight nodes are not many-node scale.
+In a separate live-child receipt, the zeroize CLI completed bounded local
+software zeroization in 0.074759 seconds while preserving the audited rows and
+terminal redb marker.
+
+## Get the current semantic application API working
 
 The fastest first success uses the checked-in disposable provisioning fixture.
 It exercises durable, offline application behavior without pretending to be an
@@ -110,29 +239,35 @@ service, a conventional database or broker will usually be simpler.
 
 | Area | Purpose |
 |---|---|
-| [`crates/aster-profile`](crates/aster-profile) | Requirements-owned item vocabulary and stable reconciliation ordering |
-| [`crates/aster-core`](crates/aster-core) | Data model, durable store, reducers, security, and synchronization |
-| [`crates/aster-host`](crates/aster-host) | High-level node plus authenticated contact and carrier composition |
-| [`crates/aster-ip`](crates/aster-ip) | Nonblocking UDP/IP link, discovery, rendezvous, and opaque relay support |
-| [`crates/aster-ble`](crates/aster-ble) | BTLE link over a small platform-radio interface |
+| [`crates/aster-profile`](crates/aster-profile) | Requirements-owned reconciliation key and stable inventory ordering; exact Event transfer IDs enter by explicit conversion |
+| [`crates/aster-redb-store`](crates/aster-redb-store) | Mission-bound atomic ordered-control policy plus Event/causal/operation persistence, bounded route-only cache, and disjoint opaque compatibility storage |
+| [`crates/aster-negentropy`](crates/aster-negentropy) | Selected bounded, clock-independent inventory set-difference mechanism |
+| [`crates/aster-iroh`](crates/aster-iroh) | Selected profile-independent direct-IP carrier; endpoint authentication is not mission or data authorization |
+| [`crates/aster-node`](crates/aster-node) | Selected composition root and CLI; enforces mission-before-inventory, control-before-Event, peer route filtering, exact control/Event transfer, and live sample applications |
+| [`crates/aster-core`](crates/aster-core) | Proven current semantic implementation and migration source for the data model, reducers, mission/source/control security, and synchronization behavior |
+| [`crates/aster-host`](crates/aster-host) | Current semantic/reference high-level host and carrier composition |
+| [`crates/aster-ip`](crates/aster-ip) | Current semantic/reference UDP/IP, discovery, rendezvous, and opaque-relay mechanisms |
+| [`crates/aster-ble`](crates/aster-ble) | Current semantic/reference BTLE seam; no platform radio driver ships |
 | [`crates/aster-provisioning-age`](crates/aster-provisioning-age) | Experimental Rust-only age-v1 X25519 provisioning-artifact provider |
-| [`crates/aster-ffi`](crates/aster-ffi) | Stable C-compatible application boundary |
-| [`bindings`](bindings) | C header plus first-class Go and Python bindings |
-| [`crates/aster-conformance`](crates/aster-conformance) | Black-box scenarios and interoperability vectors |
-| [`lab`](lab) | Controlled network and impairment experiments |
+| [`crates/aster-ffi`](crates/aster-ffi) | Current semantic/reference C-compatible offline application boundary |
+| [`bindings`](bindings) | Current semantic/reference C header plus Go and Python bindings |
+| [`crates/aster-conformance`](crates/aster-conformance) | Reference black-box scenarios and interoperability vectors |
+| [`lab`](lab) | Research-only controlled network and impairment experiments |
 | [`docs`](docs) | Tutorials, concepts, operations, specifications, and evidence |
-| [`site`](site) | Self-contained static project landing page |
+| [`docs/index.html`](docs/index.html) | Self-contained static project landing page |
 
 ## Documentation map
 
 - **New to Aster:** [Documentation home](docs/README.md) →
-  [Core concepts](docs/concepts.md) → a [language quickstart](docs/quickstart/README.md) →
+  [live mesh CLI](docs/quickstart/mesh-cli.md) or a
+  [current semantic API language quickstart](docs/quickstart/README.md) →
   [Application recipes](docs/application-recipes.md)
 - **Integrating a deployment:** [Carriers and contacts](docs/transports.md) →
   [Security model and production gates](docs/security.md)
 - **Implementing the protocol:** [Protocol specification](docs/protocol.md) →
   [wire grammar](docs/wire.cddl) → [fixed security objects](docs/envelope.md)
 - **Evaluating readiness:** [Conformance and acceptance](docs/conformance.md) →
+  [production requirements status](docs/implementation/requirements-status.md) →
   [CI evidence](docs/ci.md) → [security gates](docs/security.md)
 - **Contributing:** [CONTRIBUTING.md](CONTRIBUTING.md)
 

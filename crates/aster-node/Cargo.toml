@@ -1,0 +1,34 @@
+[package]
+name = "aster-node"
+description = "Selected-stack Aster node composition and operator CLI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+fuzzing = []
+
+[lib]
+name = "aster_node"
+
+[[bin]]
+name = "aster"
+path = "src/main.rs"
+
+[dependencies]
+aster-iroh = { path = "../aster-iroh" }
+aster-mesh = { package = "aster-core", path = "../aster-core", default-features = false, features = ["reference-session"] }
+aster-negentropy = { path = "../aster-negentropy" }
+aster-profile = { path = "../aster-profile" }
+aster-redb-store = { path = "../aster-redb-store" }
+tokio.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+rustix.workspace = true
+
+[lints]
+workspace = true
