@@ -15,11 +15,13 @@ authenticates each Event's source and protected metadata through the existing
 `aster-core` envelopes. A successful run remains bounded to Event, one sample
 topic/scope, durable `ttl=None`, direct loopback, and unprotected reference
 provisioning. It does not prove State, Record, Blob, finite-TTL custody,
-subscription update/delete, a live application handle, generalized control
+atomic subscription update, generalized control
 administration, protected provisioning,
 non-Unix or physical-media zeroization assurance, physical multi-system
 operation, NAT/hosted relay, BTLE, independent interoperability, or release
-authorization.
+authorization. The selected live Event handle is documented separately; this
+CLI tour uses built-in roles and does not turn last-contact status into a
+global-convergence claim.
 
 ## Prerequisites
 
@@ -161,9 +163,9 @@ three-node no-op retained 36 passing contact lines, each with all 11
 reconciliation counters zero. Every terminal invariant passed.
 
 These retained generic/control/zeroization roots predate the PR-B
-subscription-aware wire change. PR B credits its exact current code and
-authenticated-Iroh tests rather than relabeling the older roots as
-current-tree evidence.
+subscription-aware wire change and PR-C live Event surface. Those slices credit
+their exact current code and automated tests rather than relabeling the older
+roots as current-tree evidence.
 
 The omitted-selector default also passed at four nodes and 18 child processes
 across nine cohorts in 40.74 seconds at:

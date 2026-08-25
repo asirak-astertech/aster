@@ -5,17 +5,26 @@
 //! the same mission-bound redb authority used by the selected runtime and
 //! freshly verifies every application result before returning plaintext.
 
-use std::{fmt, fs, path::Path};
+use std::{
+    fmt, fs,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use aster_mesh::{EventContentVerification, ReferenceEnvelopeSealer};
 pub use aster_mesh::{NodeId, Priority, Scope, Topic};
 use aster_redb_store::{
     ControlPolicySnapshot, ControlTransferId, EventDeliveryAck as StoreEventDeliveryAck,
-    EventOperationKey, EventQueryFilter, EventSemanticId,
-    EventSubscriptionId as StoreEventSubscriptionId, EventSubscriptionKey, EventSubscriptionMode,
-    EventSubscriptionPollSelection, EventSubscriptionSpec, MAX_EVENT_PAGE,
-    MAX_EVENT_POLL_DELIVERIES, MAX_EVENT_SUBSCRIPTION_SCAN, Store, StoreError, StoredEvent,
+    EventGapScanPlan, EventOperationKey, EventQueryFilter, EventReplicationPolicySnapshot,
+    EventSemanticId, EventSubscriptionId as StoreEventSubscriptionId, EventSubscriptionKey,
+    EventSubscriptionMode, EventSubscriptionPollSelection, EventSubscriptionRemoveOutcome,
+    EventSubscriptionSpec, MAX_EVENT_PAGE, MAX_EVENT_POLL_DELIVERIES, MAX_EVENT_SUBSCRIPTION_SCAN,
+    Store, StoreError, StoredEvent,
 };
+use tokio::sync::{mpsc, oneshot};
 
 use crate::{
     NodeError,
@@ -362,6 +371,334 @@ pub enum EventAcknowledgement {
     AlreadyAcknowledged,
 }
 
+/// Idempotent disposition from withdrawing one durable receive selector.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EventUnsubscribe {
+    /// This call removed the selector and its delivery ledger.
+    Removed,
+    /// The exact selector was already absent.
+    AlreadyAbsent,
+}
+
+/// One bounded exact publisher/topic/scope stream gap query.
+///
+/// `scan_limit` bounds accepted stream positions which are freshly source
+/// verified. Continue from `scanned_through_sequence`, including when a page
+/// contains no gap.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventGapQuery {
+    pub publisher: NodeId,
+    pub topic: Topic,
+    pub scope: Scope,
+    pub after_sequence: u64,
+    pub scan_limit: usize,
+}
+
+impl EventGapQuery {
+    fn validate(&self) -> Result<(), ApplicationError> {
+        if self.scan_limit == 0 || self.scan_limit > MAX_SELECTED_EVENT_PAGE {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::InvalidRequest,
+                "gaps",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Missing half-open sequence interval anchored by a later authenticated Event.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventGap {
+    pub publisher: NodeId,
+    pub topic: Topic,
+    pub scope: Scope,
+    pub start_sequence: u64,
+    pub end_sequence: u64,
+}
+
+/// Bounded authenticated stream-gap page.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventGapPage {
+    pub gaps: Vec<EventGap>,
+    pub scanned_through_sequence: u64,
+    /// Conservative continuation hint derived only from a full verified page.
+    ///
+    /// A full page may be followed by an empty page; this never exposes an
+    /// unverified structural look-ahead row.
+    pub has_more: bool,
+}
+
+/// Current authorization of a previously authenticated mission peer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PeerAuthorization {
+    Active,
+    Revoked,
+}
+
+/// Bounded outcome of the most recently completed authenticated contact.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContactSyncStatus {
+    /// That contact completed its negotiated bounded control and Event work.
+    CompleteForLastNegotiatedContact,
+    /// That contact reported bounded work which must continue later.
+    WorkRemained,
+    /// Durable control or receive-selector policy changed after that contact.
+    PolicyChangedSinceContact,
+}
+
+/// One mission-authenticated peer observation without carrier or protocol details.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthenticatedPeerStatus {
+    pub peer: NodeId,
+    pub contacts: u64,
+    pub authorization: PeerAuthorization,
+    pub last_contact: ContactSyncStatus,
+}
+
+/// High-level local synchronization disposition.
+///
+/// This deliberately does not claim global convergence. `LastContactComplete`
+/// describes only the last bounded authenticated negotiation with every
+/// currently configured active peer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EventSyncStatus {
+    Offline,
+    NoActiveConfiguredPeers,
+    AwaitingAuthenticatedContact,
+    LastContactComplete,
+    WorkRemained,
+    PolicyChangedSinceContact,
+}
+
+/// Sanitized live selected-Event status snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SelectedEventStatus {
+    pub sync: EventSyncStatus,
+    pub authenticated_contacts: u64,
+    pub failed_contact_attempts: u64,
+    pub peers: Vec<AuthenticatedPeerStatus>,
+}
+
+/// Cloneable live application handle backed by the running node's sole authority.
+#[derive(Clone)]
+pub struct SelectedEventHandle {
+    commands: mpsc::Sender<SelectedEventCommand>,
+    admission: Arc<AtomicBool>,
+    identity: NodeId,
+    mission_authority: NodeId,
+}
+
+impl SelectedEventHandle {
+    pub(crate) fn new(
+        commands: mpsc::Sender<SelectedEventCommand>,
+        admission: Arc<AtomicBool>,
+        identity: NodeId,
+        mission_authority: NodeId,
+    ) -> Self {
+        Self {
+            commands,
+            admission,
+            identity,
+            mission_authority,
+        }
+    }
+
+    /// Authenticated local publisher identity.
+    pub const fn identity(&self) -> NodeId {
+        self.identity
+    }
+
+    /// Stable mission authority bound to the live store.
+    pub const fn mission_authority(&self) -> NodeId {
+        self.mission_authority
+    }
+
+    pub async fn publish(
+        &self,
+        request: EventPublishRequest,
+    ) -> Result<EventPublishResult, ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedEventCommand::Publish { request, response },
+            received,
+            "publish",
+        )
+        .await
+    }
+
+    pub async fn query(&self, query: EventQuery) -> Result<EventQueryPage, ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedEventCommand::Query { query, response },
+            received,
+            "query",
+        )
+        .await
+    }
+
+    pub async fn subscribe(
+        &self,
+        request: EventSubscriptionRequest,
+    ) -> Result<EventSubscription, ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedEventCommand::Subscribe { request, response },
+            received,
+            "subscribe",
+        )
+        .await
+    }
+
+    pub async fn poll(
+        &self,
+        request: EventPollRequest,
+    ) -> Result<EventDeliveryPage, ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedEventCommand::Poll { request, response },
+            received,
+            "poll",
+        )
+        .await
+    }
+
+    pub async fn acknowledge(
+        &self,
+        subscription: EventSubscriptionId,
+        event: EventId,
+    ) -> Result<EventAcknowledgement, ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedEventCommand::Acknowledge {
+                subscription,
+                event,
+                response,
+            },
+            received,
+            "acknowledge",
+        )
+        .await
+    }
+
+    pub async fn unsubscribe(
+        &self,
+        subscription: EventSubscriptionId,
+    ) -> Result<EventUnsubscribe, ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedEventCommand::Unsubscribe {
+                subscription,
+                response,
+            },
+            received,
+            "unsubscribe",
+        )
+        .await
+    }
+
+    pub async fn gaps(&self, query: EventGapQuery) -> Result<EventGapPage, ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedEventCommand::Gaps { query, response },
+            received,
+            "gaps",
+        )
+        .await
+    }
+
+    pub async fn status(&self) -> Result<SelectedEventStatus, ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedEventCommand::Status { response },
+            received,
+            "status",
+        )
+        .await
+    }
+
+    async fn send<T>(
+        &self,
+        command: SelectedEventCommand,
+        received: oneshot::Receiver<Result<T, ApplicationError>>,
+        operation: &'static str,
+    ) -> Result<T, ApplicationError> {
+        if !self.admission.load(Ordering::Acquire) {
+            return Err(actor_unavailable(operation));
+        }
+        self.commands
+            .send(command)
+            .await
+            .map_err(|_| actor_unavailable(operation))?;
+        received.await.map_err(|_| actor_unavailable(operation))?
+    }
+}
+
+fn actor_unavailable(operation: &'static str) -> ApplicationError {
+    ApplicationError::new(ApplicationErrorKind::StateUnavailable, operation)
+}
+
+pub(crate) enum SelectedEventCommand {
+    Publish {
+        request: EventPublishRequest,
+        response: oneshot::Sender<Result<EventPublishResult, ApplicationError>>,
+    },
+    Query {
+        query: EventQuery,
+        response: oneshot::Sender<Result<EventQueryPage, ApplicationError>>,
+    },
+    Subscribe {
+        request: EventSubscriptionRequest,
+        response: oneshot::Sender<Result<EventSubscription, ApplicationError>>,
+    },
+    Poll {
+        request: EventPollRequest,
+        response: oneshot::Sender<Result<EventDeliveryPage, ApplicationError>>,
+    },
+    Acknowledge {
+        subscription: EventSubscriptionId,
+        event: EventId,
+        response: oneshot::Sender<Result<EventAcknowledgement, ApplicationError>>,
+    },
+    Unsubscribe {
+        subscription: EventSubscriptionId,
+        response: oneshot::Sender<Result<EventUnsubscribe, ApplicationError>>,
+    },
+    Gaps {
+        query: EventGapQuery,
+        response: oneshot::Sender<Result<EventGapPage, ApplicationError>>,
+    },
+    Status {
+        response: oneshot::Sender<Result<SelectedEventStatus, ApplicationError>>,
+    },
+}
+
+impl SelectedEventCommand {
+    pub(crate) const fn mutates_selectors(&self) -> bool {
+        matches!(self, Self::Subscribe { .. } | Self::Unsubscribe { .. })
+    }
+
+    pub(crate) fn reject(self) {
+        match self {
+            Self::Publish { response, .. } => {
+                _ = response.send(Err(actor_unavailable("publish")));
+            }
+            Self::Query { response, .. } => _ = response.send(Err(actor_unavailable("query"))),
+            Self::Subscribe { response, .. } => {
+                _ = response.send(Err(actor_unavailable("subscribe")));
+            }
+            Self::Poll { response, .. } => _ = response.send(Err(actor_unavailable("poll"))),
+            Self::Acknowledge { response, .. } => {
+                _ = response.send(Err(actor_unavailable("acknowledge")));
+            }
+            Self::Unsubscribe { response, .. } => {
+                _ = response.send(Err(actor_unavailable("unsubscribe")));
+            }
+            Self::Gaps { response, .. } => _ = response.send(Err(actor_unavailable("gaps"))),
+            Self::Status { response } => _ = response.send(Err(actor_unavailable("status"))),
+        }
+    }
+}
+
 enum VerifiedSubscriptionCandidate {
     Inactive(EventSemanticId),
     NotSelected,
@@ -372,11 +709,11 @@ enum VerifiedSubscriptionCandidate {
 ///
 /// This stopped-state handle owns the same exact redb writer lock as the mesh
 /// runtime, so a second process cannot mutate or query around its policy
-/// snapshot. A later stacked slice adds a live actor handle while `run_node`
-/// owns this authority.
+/// snapshot. While the runtime is active, `SelectedEventHandle` reaches this
+/// same authority only through its bounded actor.
 pub struct SelectedEventNode {
     mission: UnprotectedReferenceMission,
-    store: Store,
+    store: Arc<Store>,
     verifier: ReferenceEnvelopeSealer,
     verifier_head: Option<(u64, ControlTransferId)>,
 }
@@ -411,12 +748,41 @@ impl SelectedEventNode {
             .map_err(|error| application_error("open", error.into()))?;
         let mut selected = Self {
             mission,
-            store,
+            store: Arc::new(store),
             verifier,
             verifier_head,
         };
         selected.current_policy("open")?;
         Ok(selected)
+    }
+
+    pub(crate) fn from_runtime(
+        mission: UnprotectedReferenceMission,
+        store: Arc<Store>,
+        verifier: ReferenceEnvelopeSealer,
+        verifier_head: Option<(u64, ControlTransferId)>,
+    ) -> Self {
+        Self {
+            mission,
+            store,
+            verifier,
+            verifier_head,
+        }
+    }
+
+    pub(crate) fn refresh_runtime_policy(
+        &mut self,
+    ) -> Result<Option<ControlPolicySnapshot>, NodeError> {
+        refresh_application_policy(
+            &self.store,
+            &self.mission,
+            &mut self.verifier,
+            &mut self.verifier_head,
+        )
+    }
+
+    pub(crate) fn runtime_verifier_mut(&mut self) -> &mut ReferenceEnvelopeSealer {
+        &mut self.verifier
     }
 
     /// Authenticated local publisher identity.
@@ -585,6 +951,80 @@ impl SelectedEventNode {
         }
     }
 
+    /// Idempotently withdraws one durable receive selector and its delivery ledger.
+    pub fn unsubscribe(
+        &mut self,
+        subscription: EventSubscriptionId,
+    ) -> Result<EventUnsubscribe, ApplicationError> {
+        let policy = self.current_policy("unsubscribe")?;
+        let EventSubscriptionRemoveOutcome { removed, .. } = self
+            .store
+            .remove_event_subscription_with_policy(&policy, subscription.into_store())
+            .map_err(|error| application_error("unsubscribe", error.into()))?;
+        Ok(if removed {
+            EventUnsubscribe::Removed
+        } else {
+            EventUnsubscribe::AlreadyAbsent
+        })
+    }
+
+    /// Returns bounded, freshly authenticated gaps in one exact Event stream.
+    ///
+    /// The store's structural plan is not treated as authority: every retained
+    /// anchor is source- and content-verified, and the exact plan is required
+    /// again after verification before any gap is exposed.
+    pub fn gaps(&mut self, query: EventGapQuery) -> Result<EventGapPage, ApplicationError> {
+        query.validate()?;
+        let policy = self.current_policy("gaps")?;
+        if self
+            .store
+            .is_control_principal_revoked(query.publisher)
+            .map_err(|error| application_error("gaps", error.into()))?
+        {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::UnauthorizedOrRevoked,
+                "gaps",
+            ));
+        }
+        let epoch = self
+            .store
+            .active_scope_epoch(&query.scope)
+            .map_err(|error| application_error("gaps", error.into()))?
+            .map_or(1, |(epoch, _)| epoch);
+        if !self.verifier.can_route_event(&query.scope, epoch)
+            || !self
+                .verifier
+                .can_open_event_content(&query.scope, &query.topic, epoch)
+        {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::RequestRejected,
+                "gaps",
+            ));
+        }
+
+        let plan = self
+            .store
+            .prepare_event_gap_scan_with_policy(
+                &policy,
+                query.publisher,
+                &query.topic,
+                &query.scope,
+                query.after_sequence,
+                query.scan_limit,
+            )
+            .map_err(|error| application_error("gaps", error.into()))?;
+        let gaps = self.verify_gap_plan(&query, &plan)?;
+        self.store
+            .require_event_gap_scan_plan_with_policy(&policy, &plan)
+            .map_err(|error| application_error("gaps", error.into()))?;
+        let has_more = plan.candidates().len() == query.scan_limit;
+        Ok(EventGapPage {
+            gaps,
+            scanned_through_sequence: plan.scanned_through(),
+            has_more,
+        })
+    }
+
     /// Durably publishes one arbitrary selected Event exactly once per operation key.
     pub fn publish(
         &mut self,
@@ -655,6 +1095,116 @@ impl SelectedEventNode {
             scanned_through: candidates.scanned_through,
             has_more: candidates.has_more,
         })
+    }
+
+    pub(crate) fn runtime_policy_for_status(
+        &mut self,
+    ) -> Result<EventReplicationPolicySnapshot, ApplicationError> {
+        let policy = self.current_policy("status")?;
+        let replication = self
+            .store
+            .event_replication_policy_snapshot()
+            .map_err(|error| application_error("status", error.into()))?;
+        if replication.control_policy() != &policy {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::PolicyUnsettled,
+                "status",
+            ));
+        }
+        Ok(replication)
+    }
+
+    fn verify_gap_plan(
+        &mut self,
+        query: &EventGapQuery,
+        plan: &EventGapScanPlan,
+    ) -> Result<Vec<EventGap>, ApplicationError> {
+        if plan.publisher() != query.publisher
+            || plan.topic() != &query.topic
+            || plan.scope() != &query.scope
+            || plan.after_sequence() != query.after_sequence
+            || plan.scan_limit() != query.scan_limit
+            || plan.candidates().len() > query.scan_limit
+            || (plan.has_more() && plan.candidates().len() != query.scan_limit)
+        {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::Integrity,
+                "gaps",
+            ));
+        }
+
+        let mut gaps = Vec::new();
+        let mut expected = query.after_sequence.checked_add(1);
+        let mut previous = query.after_sequence;
+        for candidate in plan.candidates() {
+            let sequence = candidate.sequence();
+            if sequence <= previous {
+                return Err(ApplicationError::new(
+                    ApplicationErrorKind::Integrity,
+                    "gaps",
+                ));
+            }
+            let stored = candidate.event();
+            let route_verified = self
+                .verifier
+                .verify_event(&stored.sealed)
+                .map_err(|error| application_error("gaps", error.into()))?;
+            verify_stored_claim(
+                &route_verified,
+                stored.transfer_id,
+                stored.semantic_id,
+                &stored.header,
+            )
+            .map_err(|error| application_error("gaps", error))?;
+            if stored.header.stamp.dot.publisher != query.publisher
+                || stored.header.topic != query.topic
+                || stored.header.scope != query.scope
+                || event_sequence(stored, "gaps")? != sequence
+            {
+                return Err(ApplicationError::new(
+                    ApplicationErrorKind::Integrity,
+                    "gaps",
+                ));
+            }
+            match self
+                .verifier
+                .verify_event_content(route_verified, &stored.sealed)
+                .map_err(|error| application_error("gaps", error.into()))?
+            {
+                EventContentVerification::ContentVerified { event, .. } => {
+                    verify_content_stored_claim(&event, stored)
+                        .map_err(|error| application_error("gaps", error))?;
+                }
+                EventContentVerification::RouteOnly(_) => {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::RequestRejected,
+                        "gaps",
+                    ));
+                }
+            }
+            if let Some(start_sequence) = expected
+                && start_sequence < sequence
+            {
+                gaps.push(EventGap {
+                    publisher: query.publisher,
+                    topic: query.topic.clone(),
+                    scope: query.scope.clone(),
+                    start_sequence,
+                    end_sequence: sequence,
+                });
+            }
+            expected = sequence.checked_add(1);
+            previous = sequence;
+        }
+        if previous != plan.scanned_through()
+            || (!plan.candidates().is_empty() && plan.scanned_through() > plan.high_water())
+        {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::Integrity,
+                "gaps",
+            ));
+        }
+        Ok(gaps)
     }
 
     fn verify_subscription_candidate(
@@ -831,6 +1381,13 @@ fn application_error(operation: &'static str, error: NodeError) -> ApplicationEr
     ApplicationError::new(kind, operation)
 }
 
+pub(crate) fn runtime_application_error(
+    operation: &'static str,
+    error: NodeError,
+) -> ApplicationError {
+    application_error(operation, error)
+}
+
 fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
     match error {
         StoreError::InvalidEventOperationKey { .. }
@@ -853,6 +1410,7 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         | StoreError::ControlPolicyChanged
         | StoreError::ReservationChanged
         | StoreError::EventSubscriptionPlanChanged
+        | StoreError::EventGapScanPlanChanged
         | StoreError::EventSelectorRevisionChanged => ApplicationErrorKind::PolicyUnsettled,
         StoreError::IdentityConflict { .. }
         | StoreError::SemanticRepresentationConflict { .. }

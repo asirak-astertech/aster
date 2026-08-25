@@ -17,10 +17,11 @@ mod runtime;
 pub use identity::{IdentityError, NodeIdentity};
 pub use runtime::{
     ControlPublicationReceipt, DemoScenario, MissionExpectedPeer, NodeApplication, NodeConfig,
-    NodeError, NodeReceipt, PeerReceipt, SoftwareZeroizationPathState, SoftwareZeroizationReceipt,
-    SoftwareZeroizationState, StoreReceipt, ensure_state_accepts_normal_operation,
-    format_control_transfer_id, inspect_store, publish_revocation_control,
-    publish_scope_rekey_control, put_opaque, run_demo, run_demo_scenario, run_node, zeroize_node,
+    NodeError, NodeReceipt, PeerReceipt, RunningNode, SoftwareZeroizationPathState,
+    SoftwareZeroizationReceipt, SoftwareZeroizationState, StoreReceipt,
+    ensure_state_accepts_normal_operation, format_control_transfer_id, inspect_store,
+    publish_revocation_control, publish_scope_rekey_control, put_opaque, run_demo,
+    run_demo_scenario, run_node, start_node, zeroize_node,
 };
 
 use aster_mesh::NodeId;

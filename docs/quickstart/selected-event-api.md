@@ -1,24 +1,25 @@
 # Selected Event API quickstart
 
 This is the shortest application-code path into the **selected production-lane
-store and security composition**. It opens a stopped node, publishes one
-source-authenticated Event without a peer, and queries the freshly verified
-application projection. The compiled example uses only
-`aster_node::application`; it does not construct envelopes, select
+store, runtime, and security composition**. The live API starts the sole node
+actor, publishes while no peer is configured, queries and consumes the durable
+Event locally, inspects authenticated stream gaps and contact status, and shuts
+down cleanly. Application code does not construct envelopes, select
 cryptography, inspect sealed bytes, choose a carrier, or drive reconciliation.
 
-This stacked Event slice provides publish, bounded query, durable
-subscribe/poll/ack, and subscription-aware Event reconciliation. It is still a
-stopped-state handle rather than the completed live application surface.
-Public authenticated gap inspection, subscription update/delete, a live actor
-handle with peer/sync status, finite TTL, State, Record, Blob, language
-bindings, and operational protected provisioning remain open.
+The selected Event surface now provides live and stopped-state publish, bounded
+query, durable subscribe/poll/ack, idempotent unsubscribe, and authenticated gap
+inspection. A live `SelectedEventHandle` additionally reports bounded peer and
+last-contact status while the actor owns the store. State, Record, Blob, finite
+TTL, subscription update, selected-node language bindings, protected
+operational provisioning, and generalized control administration remain open.
 
-## Run the compiled example
+## Run the live example
 
 Install the pinned toolchain, then create a disposable two-node fixture. The
 demo finishes and releases both stores before the application example opens
-node 0, so the publication below is local and peerless.
+node 0. The example deliberately configures no peers, so its publication and
+application delivery succeed offline through the running actor.
 
 ```sh
 mise install
@@ -26,92 +27,159 @@ ASTER_EVENT_ROOT="$(mktemp -d)"
 cargo run --locked -p aster-node --bin aster -- \
   demo --nodes 2 --root "$ASTER_EVENT_ROOT/mesh"
 
-cargo run --locked -p aster-node --example event_application -- \
+cargo run --locked -p aster-node --example live_event_application -- \
   "$ASTER_EVENT_ROOT/mesh/node-0" \
-  "$ASTER_EVENT_ROOT/mesh/node-0/mission.unprotected-reference.bundle"
+  "$ASTER_EVENT_ROOT/mesh/node-0/mission.unprotected-reference.bundle" \
+  demo/mesh mesh.ping-pong
 ```
 
-The example publishes `asset-7=ready` to the fixture's provisioned
-`mesh.ping-pong` topic and `demo/mesh` scope, then queries that stream. Expect
-output shaped like this (the authenticated ID and sequence depend on the
-retained fixture):
+Among the runtime lifecycle lines, expect one application line shaped like:
 
 ```text
-published id=<64 hex characters> sequence=<n> inserted=true
-event id=<same ID> sequence=<n> key=asset-7 payload=ready
-subscription id=<64 hex characters> inserted=true published_event=delivered-attempt-1
+LIVE_EVENT id=<64 hex characters> inserted=true query_items=<n> deliveries=<n> gaps=0 scanned_through=<n> sync=Offline
 ```
 
-Run the `cargo run --locked -p aster-node --example event_application` command
-again with the same two paths. Its fixed application operation key makes the
-retry idempotent: `inserted=false`, and it returns the original semantic Event
-identity instead of consuming another publisher counter or Event sequence. The
-fixed subscription operation key also returns `inserted=false`; because the
-first run acknowledged the delivery, the final field reports
-`AlreadyAcknowledged` rather than delivering it again.
+`query_items` and `deliveries` can exceed one because the disposable demo
+already populated the topic. The example filters its query to the local
+publisher, acknowledges every returned delivery, reports only gaps anchored by
+freshly verified local observations, unsubscribes, and gracefully shuts down.
 
-The fixture persists an explicitly unprotected reference mission bundle. It is
+Run the same example again. Its fixed publication operation key makes publish
+idempotent, so `inserted=false` and the original Event identity returns. Because
+the example deliberately unsubscribes at the end, the next subscribe is a new
+replacement selector with a new delivery ledger; existing matching Events can
+therefore be delivered again. This is replacement behavior, not a subscription
+update claim.
+
+The fixture persists explicitly unprotected reference mission bundles. They are
 suitable for this disposable demonstration, not operational provisioning.
 Remove the temporary directory when you no longer need it.
 
-## Use the API
+## Prove offline publish and later synchronization
+
+On Unix, the focused integration test uses separate operating-system processes
+and independent stores. It publishes through the live handle with no peer
+configured, stops that process, starts a subscribed receiver, restarts the
+publisher with the exact peer binding, receives and acknowledges the Event,
+then restarts the receiver and verifies that the acknowledgement remains
+durable:
+
+```sh
+cargo test --locked -p aster-node --test mesh_cli \
+  offline_publish_later_real_process_sync_poll_ack_and_restart -- \
+  --exact --nocapture
+```
+
+This is current-code loopback evidence for one same-implementation Event flow.
+It is not the stakeholder-set supported offline interval, all-reachable-node
+convergence, physical-network acceptance, mixed-implementation
+interoperability, or a no-loss claim for State, Record, and Blob.
+
+```mermaid
+sequenceDiagram
+    participant P as Publisher process/store
+    participant R as Receiver process/store
+
+    Note over P: peers = 0
+    P->>P: live publish commits locally
+    P->>P: graceful shutdown
+    R->>R: start and durably subscribe
+    P->>P: restart with exact peer binding
+    P->>R: carrier + mission authentication
+    P->>R: protected interest and Event reconciliation
+    R->>R: poll, fresh verify, durable attempt
+    R->>R: acknowledge semantic Event ID
+    R->>R: shutdown and restart offline
+    R->>R: same subscription, empty poll
+```
+
+## Use the live API
 
 The complete runnable source is
-[`crates/aster-node/examples/event_application.rs`](../../crates/aster-node/examples/event_application.rs).
-Its central operation is:
+[`crates/aster-node/examples/live_event_application.rs`](../../crates/aster-node/examples/live_event_application.rs).
+Its central shape is:
 
 ```rust
-use aster_node::application::{
-    EventPollRequest, EventPublishRequest, EventQuery, EventSubscriptionRequest,
-    Priority, Scope, SelectedEventNode, Topic,
-};
+let running = start_node(NodeConfig {
+    state,
+    bind: "127.0.0.1:0".parse()?,
+    mission,
+    peers: Vec::new(),
+    sync_interval: Duration::from_millis(250),
+    run_for: None,
+    application: NodeApplication::Relay,
+})
+.await?;
+let events = running.selected_events();
 
-let mut node = SelectedEventNode::open_unprotected_reference(state, mission)?;
-let topic = Topic::new("mesh.ping-pong")?;
-let scope = Scope::new("demo/mesh")?;
-let published = node.publish(EventPublishRequest {
-    operation_key: b"my-app/asset-7/ready".to_vec(),
-    predecessor: None,
-    topic: topic.clone(),
-    scope: scope.clone(),
-    priority: Priority::Priority,
-    logical_key: b"asset-7".to_vec(),
-    payload: b"ready".to_vec(),
-    tombstone: false,
-})?;
+let subscription = events
+    .subscribe(EventSubscriptionRequest {
+        operation_key: b"my-app/ops/consume".to_vec(),
+        topic: topic.clone(),
+        scope: scope.clone(),
+        include_descendant_scopes: false,
+    })
+    .await?;
 
-let page = node.query(EventQuery {
-    topic: Some(topic.clone()),
-    scope: Some(scope.clone()),
-    logical_key: Some(b"asset-7".to_vec()),
-    ..EventQuery::default()
-})?;
+let published = events
+    .publish(EventPublishRequest {
+        operation_key: b"my-app/asset-7/ready".to_vec(),
+        predecessor: None,
+        topic: topic.clone(),
+        scope: scope.clone(),
+        priority: Priority::Priority,
+        logical_key: b"asset-7".to_vec(),
+        payload: b"ready".to_vec(),
+        tombstone: false,
+    })
+    .await?;
 
-let subscription = node.subscribe(EventSubscriptionRequest {
-    operation_key: b"my-app/mesh-ping-pong/consume".to_vec(),
-    topic,
-    scope,
-    include_descendant_scopes: false,
-})?;
-let deliveries = node.poll(EventPollRequest {
-    subscription: subscription.id,
-    delivery_limit: 128,
-    scan_limit: 128,
-})?;
+let page = events
+    .query(EventQuery {
+        publisher: Some(events.identity()),
+        topic: Some(topic.clone()),
+        scope: Some(scope.clone()),
+        ..EventQuery::default()
+    })
+    .await?;
+
+let deliveries = events
+    .poll(EventPollRequest {
+        subscription: subscription.id,
+        delivery_limit: 128,
+        scan_limit: 128,
+    })
+    .await?;
 for delivery in deliveries.deliveries {
-    println!("{} attempt={}", delivery.event.id, delivery.attempt);
-    node.acknowledge(subscription.id, delivery.event.id)?;
+    events
+        .acknowledge(subscription.id, delivery.event.id)
+        .await?;
 }
-println!("{} {}", published.id, page.items.len());
+
+let status = events.status().await?;
+let gaps = events
+    .gaps(EventGapQuery {
+        publisher: events.identity(),
+        topic,
+        scope,
+        after_sequence: 0,
+        scan_limit: 128,
+    })
+    .await?;
+
+events.unsubscribe(subscription.id).await?;
+running.shutdown().await?;
 ```
 
 Choose an operation key that identifies the application effect, not a random
-attempt. Reusing it with the same request returns the original commit; reusing
-it with different content fails closed. Resolution still requires the caller
-to remain authorized by current mission policy. Topics and scopes must be
-authorized by that policy. Tombstones must have an empty payload. There is
-deliberately no finite-TTL field while authenticated cumulative forwarding age
-and expiry are unimplemented.
+attempt. Reusing it with the same publish request returns the original commit;
+reusing it with different content fails closed. Topics and scopes must be
+authorized by current mission policy. Tombstones must have an empty payload.
+The selected Event slice authenticates and returns priority, but does not yet
+schedule contacts, retries, or eviction by that value. That behavior remains
+open in the constrained-operation stack.
+There is deliberately no finite-TTL field while authenticated cumulative
+forwarding age and expiry remain unimplemented.
 
 `EventQuery::limit` bounds accepted rows **scanned**, not only matching rows
 returned. A selective page can therefore contain no items while `has_more` is
@@ -121,89 +189,97 @@ sealed bytes, keys, route caches, and reconciliation state are not exposed.
 
 A subscription operation key identifies one durable Consume selector. Reusing
 the key with the same topic/scope contract returns the same subscription;
-changing that contract fails closed. `scan_limit` bounds pending plus accepted
-rows freshly source-verified in a poll, while `delivery_limit` bounds returned
-Events. The store advances its private discovery cursor only after every row in
-the unfiltered plan has been authenticated. A selective poll can therefore be
-empty with `has_more=true`; poll again. An attempt is incremented durably before
-return, so an unacknowledged Event repeats after a process crash. Acknowledging
-its semantic Event identity is idempotent.
+changing that contract while it exists fails closed. `scan_limit` bounds
+pending plus accepted rows freshly source-verified in a poll, while
+`delivery_limit` bounds returned Events. An attempt is incremented durably
+before return, so an unacknowledged Event repeats after a process crash.
+Acknowledging its semantic Event identity is idempotent.
 
-The live runtime projects both application `Consume` selectors and internal
-route-only `Carry` selectors into a canonical protected interest. An empty
-selector set means **receive nothing**, never wildcard. After mission and
-control authentication, each contact exchanges those interests and reconciles
-two independent directional universes—one for each receiver. A selector only
-narrows exchange: fresh source verification, active epoch/revocation state, and
-the receiver's current route grant are rechecked before every offer, fetch, and
-commit. `Carry` can retain exact protected bytes without exposing plaintext or
-creating an application delivery. If any matching local `Consume` selector
-overlaps a `Carry` selector, `Consume` wins for that Event; `Carry` cannot
-suppress an otherwise authorized application delivery.
+`unsubscribe` atomically removes the selector and purges its pending and
+acknowledgement ledger. Retrying removal returns `AlreadyAbsent`. To change a
+selector, unsubscribe and then subscribe to the replacement. Those are two
+distinct operations and can create an interval with no receive selector; Aster
+does not claim an atomic or seamless subscription update.
 
-Selector topic/scope names are protected from network outsiders by the mission
-session, but they are visible to the authenticated mission peer, matching the
-current membership-visible forwarding-metadata model. A peer without the route
-grant still receives no matching Event ID or bytes. Scope-private subscription
-metadata would require a later opaque, provider-owned selector design and is
-not claimed here.
+## Interpret gaps conservatively
 
-Operations return a sanitized `ApplicationError`. Use its stable `kind()` for
-control flow; raw store tables, transfer identities, source-envelope failures,
-carrier errors, and provider internals are deliberately not available through
-the error or its source chain.
+`EventGapQuery` selects one exact publisher/topic/scope stream. Its
+`after_sequence` is exclusive and `scan_limit` bounds accepted positions that
+the node freshly source- and content-verifies. Each returned `EventGap` is a
+half-open interval `[start_sequence, end_sequence)` anchored by the verified
+Event at `end_sequence`. Continue from `scanned_through_sequence`; a full page's
+`has_more` is deliberately conservative and can be followed by an empty page.
 
-The lower-level `aster-redb-store` crate is unpublished and privileged. Its
-poll-plan/commit-selection API trusts the selected-node composition to supply
-freshly verified classifications; it is not a cryptographic capability for
-application callers. Use `SelectedEventNode` for the supported safe boundary.
+Gap truth is local and store-ledger anchored. No gap in a page means only that
+the freshly verified positions already observed by this mission-bound store
+were contiguous over that scanned interval. It does **not** prove that the
+publisher has emitted nothing later, that no unseen higher sequence exists, or
+that the mesh has converged. A trailing absence without a later authenticated
+anchor is not reported as a gap.
 
-The durable store already audits publisher sequence gaps internally, but the
-selected Event API does not expose them directly. A later slice must derive a public gap view from
-freshly source-verified, currently authorized Events. Likewise, peer and
-synchronization status arrives with the live actor rather than being
-manufactured by this stopped-state handle.
+## Interpret status conservatively
 
-## Where this handle sits
+`SelectedEventStatus` is an in-memory observation of this running actor, not a
+durable or global synchronization checkpoint.
+
+| `EventSyncStatus` | Exact meaning |
+|---|---|
+| `Offline` | No peers are configured. Local publish, query, and delivery still work. |
+| `NoActiveConfiguredPeers` | Peers are configured, but current control policy marks all of them revoked. |
+| `AwaitingAuthenticatedContact` | At least one active configured peer has not completed an authenticated contact in this process. |
+| `LastContactComplete` | Every active configured peer's most recent authenticated contact under the current control/selector policy reported no bounded control or Event work remaining. |
+| `WorkRemained` | At least one most recent authenticated contact reported bounded work still remaining. |
+| `PolicyChangedSinceContact` | Control state or the durable selector generation changed after at least one peer's most recent authenticated contact. |
+
+Each `AuthenticatedPeerStatus` identifies a mission-authenticated peer, its
+process-local completed-contact count, its current active/revoked disposition,
+and the result of its last contact. `authenticated_contacts` is the sum of
+those observations; `failed_contact_attempts` is a local runtime counter.
+
+`LastContactComplete` is **not** global convergence, current reachability,
+durable peer knowledge, or proof that a peer possesses every Event. It reports
+only the last bounded negotiation with each currently active configured peer.
+Restarting the actor begins a new status observation window.
+
+## One authority, two application modes
 
 ```mermaid
 flowchart LR
-    App["Application"] --> API["SelectedEventNode<br/>publish · query · subscribe · poll · ack"]
-    API --> Policy["Replay controls<br/>capture active policy"]
-    Policy -->|"publish"| Seal["Source seal + content policy"]
-    Seal --> Store["Mission-bound redb (privileged)<br/>acceptance order + subscription cursor<br/>pending attempts + ack receipts"]
-    Policy -->|"query / poll"| Store
-    Store -->|"untrusted bounded candidate / plan"| Verify["Fresh source verification<br/>content open only for matches"]
-    Verify -->|"verified query result"| API
-    Verify -->|"verified poll selection"| Store
-    Policy -->|"subscribe / acknowledge"| Store
-    Store -->|"durable result / committed attempt"| API
-    API --> App
+    App["Application"] --> Handle["SelectedEventHandle<br/>async high-level operations"]
+    Handle -->|"bounded command + one-shot result"| Actor["RunningNode actor<br/>sole live authority"]
+    Actor --> Facade["SelectedEventNode internals<br/>fresh policy + verification"]
+    Facade --> Store["Mission-bound redb<br/>Events · selectors · delivery ledger"]
+    Actor --> Contact["Authenticated contacts<br/>protected receive interests"]
+    Contact --> Peer["Configured mission peer"]
+    Contact --> Store
+    Store --> Facade -->|"sanitized result"| Actor --> Handle --> App
 
-    subgraph Contact["Live authenticated contact"]
-        Local["Local runtime<br/>Consume / Carry snapshot"]
-        Remote["Peer runtime<br/>Consume / Carry snapshot"]
-        Local -->|"protected local interest"| Remote
-        Remote -->|"protected peer interest"| Local
-        Local -->|"Event lane for peer receiver"| Remote
-        Remote -->|"Event lane for local receiver"| Local
-    end
-
-    Store -. "same durable selectors;<br/>live actor still separate" .-> Local
+    Stopped["Stopped SelectedEventNode<br/>exclusive maintenance/application mode"] --> Store
 ```
 
-The exclusive handle owns the selected redb writer lock. Do not run it beside
-the `aster node` process for the same state directory. A later stacked slice
-adds a live application actor without creating a second store authority.
+The live actor and stopped handle never run as two store authorities. The live
+handle sends bounded commands to the actor that already owns the mission-bound
+writer. Selector-changing commands serialize against contact policy capture;
+query, poll, gap, and status results are freshly policy-bound. Shutdown and
+zeroization close handle admission and reject queued work before the actor
+releases its authority. The stopped `SelectedEventNode` remains useful when no
+runtime owns that same state directory.
 
-Continue with the [capability tour](capability-tour.md) to watch protected
-Events cross real process boundaries, the [selected architecture](../architecture.md)
-for the complete authority split, and the [requirements status](../implementation/requirements-status.md)
-for the exact credited and open obligations.
+Operations return a sanitized `ApplicationError`. Use its stable `kind()` for
+control flow; raw store tables, transfer identities, source-envelope failures,
+carrier errors, and provider internals are deliberately unavailable through
+the error or its source chain. The lower-level `aster-redb-store` crate is
+unpublished and privileged; its plans are not cryptographic capabilities for
+application callers.
 
-This compiled sample and the authenticated two-topic contact tests are
-selected-lane evidence relevant to `DM-5.2-02`, `DM-5.2-06` through
-`DM-5.2-08`, `DM-5.5-02`, `DM-7-16`, `DM-7-17`, and `DM-7-20`. The
-requirements ledger keeps every claim bounded to the selected Event slice and
-records the remaining real-process, multi-class, physical, and independent
-acceptance evidence.
+The live runtime projects application `Consume` selectors and internal
+route-only `Carry` selectors into a canonical protected interest. Empty means
+**receive nothing**, never wildcard. Each direction independently intersects
+the receiver's interest with current route authority. `Carry` can retain exact
+protected bytes without exposing plaintext or creating application delivery;
+overlapping `Consume` wins for local delivery.
+
+Continue with the [capability tour](capability-tour.md) for a fast visible mesh,
+the [selected architecture](../architecture.md) for the complete authority
+split, and the [requirements status](../implementation/requirements-status.md)
+for exact credited and open obligations.

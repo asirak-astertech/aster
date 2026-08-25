@@ -50,7 +50,7 @@ evidence or release authorization.
 
 PR B adds a separate selected Event subscription gate. Store tests cover
 partial/wrong-kind migration, corrupt and terminal-open handling, canonical
-Consume/Carry projection and selector revision, idempotent subscription replay
+Consume/Carry projection and selector generation, idempotent subscription replay
 and conflict, attempts across reopen, idempotent semantic-ID acknowledgement,
 gap delivery, zero-match cursor advance, inactive-pending retirement, and stale
 plan/policy rejection. Frame tests enforce a maximum of 256 canonical selectors
@@ -59,6 +59,70 @@ verify poll candidates and prove that protected receiver interest transfers
 subscribed `beta`, withholds authorized-unsubscribed `alpha`, and transfers
 nothing when the durable selector set is empty. These are current code/test
 claims only; no retained real-process PR-B root is identified here.
+
+PR C extends that current-code gate through the running node's sole actor.
+`SelectedEventHandle` covers async publish/query/subscribe/poll/ack,
+idempotent unsubscribe, bounded authenticated gap inspection, and sanitized
+peer/last-contact status. The selected store adds atomic selector removal,
+delivery-ledger purge, monotonic selector generations, and policy-bound gap
+plans that are freshly verified and race-rechecked before exposure. The
+compiled `live_event_application` example exercises the public surface while
+no peer is configured.
+
+The PR-C validation set includes all of the following:
+
+```sh
+cargo check -p aster-node --all-targets
+cargo test -p aster-node --all-targets --no-run
+cargo clippy -p aster-node --all-targets -- -D warnings
+cargo test -p aster-node application::tests
+cargo test -p aster-node oversized_run_for_is_rejected_before_readiness_or_state_mutation
+cargo test -p aster-node queued_live_zeroization_outranks_an_elapsed_run_for_deadline
+cargo test -p aster-node run_for_preempts_a_saturated_application_queue_and_closes_every_caller
+cargo test -p aster-node authenticated_contact_status_progresses_with_saturated_application_queues
+cargo test -p aster-node live_selected_event_actor_is_peerless_durable_and_closes_admission
+cargo test -p aster-node live_zeroization_closes_selected_event_admission_before_erasure
+cargo test -p aster-node --test mesh_cli \
+  offline_publish_later_real_process_sync_poll_ack_and_restart -- --exact
+```
+
+The application module has seven passing tests. Focused runtime cells prove
+peerless live operations, reject an overflowing `run_for` before readiness or
+state mutation, ensure a queued zeroization request outranks an already elapsed
+deadline, preserve a nonzero operational interval under saturated application
+callers, allow authenticated contact/status progress despite saturated callers
+and continuously overdue one-nanosecond ticks, and close admission during
+shutdown/zeroization. The focused Unix integration cell uses separate processes
+and stores to publish with no configured peer, restart into a later
+authenticated contact, poll and acknowledge at the receiver, and verify the
+acknowledgement after receiver restart. The current-toolchain selected-code
+suite passed 499 of 499 tests: 336 core, 68 node-library, six node-binary, 13
+`mesh_cli`, and 76 selected-store tests; the examples had no tests.
+
+A later timeout-only hardening gave the offline cell one shared 40-second
+cold-start deadline across retries and kill/reap cleanup on publisher spawn
+failure.
+Against the final test bytes, that focused cell then passed twice on the current
+toolchain and three times on Rust 1.91.
+
+The separate exact-tree Rust 1.91.0 matrix then passed 499 of 499: core 336/336
+(126.48s), node library 68/68 (28.43s), node binary 6/6 (0.02s), `mesh_cli`
+13/13 (148.26s), and selected store 76/76 (31.81s); the examples had no tests.
+These are separate executions; their timings are not pooled. No individual
+offline-cell elapsed time or retained execution root is claimed.
+
+The frozen SHA-256 identities are:
+
+- `crates/aster-node/src/application.rs`: `2ad1b080bfed2ba654b0d29c0cd6eab5f1eb6f4799dbb09203dc18a085b713d0`
+- `crates/aster-node/src/runtime.rs`: `81021e226bd413826e3afcea6adf7e8c6e0f22f547f59631a30238e1a015c6c2`
+- `crates/aster-node/src/lib.rs`: `b3a684b32b474c5ee22d1c24e0e7bdb19ff2f9613ca42cf3cdf3ebda5262476c`
+- `crates/aster-node/examples/live_event_application.rs`: `e31a456a98950d5439b3b6ecd6492f0cbdfb50ad827856c97041b9645d278f82`
+- `crates/aster-node/tests/mesh_cli.rs`: `59c858c0bc559944546e88eefee550523fd64905e4b2779a9a3d1a7eb2b8ce0e`
+- `crates/aster-redb-store/src/lib.rs`: `364e5a1d8d7f7b24ab75afe8ec2791023db83b11997bd07722c7d107a16a6a00`
+
+This is current-code automated loopback evidence only: no retained PR-C
+execution root or log artifact, physical system, independent implementation,
+or release artifact is claimed.
 
 The 57th test in that parent redb-store receipt is a Unix writable-open
 durability adversary. Every new or existing writer, including a terminal
@@ -187,10 +251,11 @@ replay, stale/revoked rejection, peer scope-route filtering, and durable
 reaction replay. The real-process tests require successful protected contacts
 on every eligible line edge and the expected failure on captured-node edges.
 They remain bounded to Event, one control family/scope, and loopback. The
-current code additionally has durable Event Consume/Carry selectors,
-stopped-state poll/ack, and protected receiver-directed filtering; it does not
-turn the retained parent roots into PR-B receipts. The tests do not claim
-State/Record/Blob, a live generalized application/status surface or control
+current code additionally has durable Event Consume/Carry selectors, live and
+stopped-state poll/ack, idempotent unsubscribe, verified gap inspection,
+bounded last-contact status, and protected receiver-directed filtering; it
+does not turn the retained parent roots into PR-B or PR-C receipts. The tests
+do not claim State/Record/Blob, global convergence, generalized control
 administration, finite-TTL custody, protected provisioning, platform-complete
 zeroization assurance, admitted release cryptography, independent review, or
 physical-network acceptance.

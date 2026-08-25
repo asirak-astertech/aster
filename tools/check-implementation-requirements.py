@@ -77,6 +77,14 @@ EVENT_SUBSCRIPTION_SLICE = (
     "crates/aster-node/src/runtime.rs; crates/aster-node/src/application.rs; "
     "crates/aster-node/examples/event_application.rs"
 )
+EVENT_LIVE_SLICE = (
+    "crates/aster-node/src/application.rs; crates/aster-node/src/runtime.rs; "
+    "crates/aster-node/src/lib.rs; "
+    "crates/aster-node/examples/live_event_application.rs; "
+    "crates/aster-node/tests/mesh_cli.rs::"
+    "offline_publish_later_real_process_sync_poll_ack_and_restart; "
+    "docs/quickstart/selected-event-api.md"
+)
 CONTROL_SLICE = (
     "crates/aster-core/src/source_control.rs; crates/aster-redb-store/src/lib.rs; "
     "crates/aster-node/src/frame.rs; crates/aster-node/src/runtime.rs; "
@@ -187,8 +195,8 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     ),
     "DM-5.1-04": selected_claim(
         "observed-bounded", "aster-core + aster-redb-store + aster-node",
-        f"{RECEIPT}; {EVENT_SLICE}; the live sample publishes, source-seals, stores, transfers, verifies, and reacts to Event objects",
-        f"The selected slice also supports durable stopped-state Event subscribe/poll/ack through {EVENT_SUBSCRIPTION_SLICE}, but live later-sync application evidence, other data classes, and independent wire interoperability remain open.",
+        f"{RECEIPT}; {EVENT_SLICE}; {EVENT_LIVE_SLICE}; the built-in sample and high-level live handle publish, source-seal, store, transfer, freshly verify, query, and durably deliver Event objects",
+        "The retained receipt covers the built-in Event sample; the generalized live-handle later-sync path has current-code automated loopback evidence only. Other data classes and independent wire interoperability remain open.",
     ),
     "DM-5.1-05": selected_claim(
         "implemented-uncredited", "aster-redb-store",
@@ -201,22 +209,22 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
         "Verify ordering through durable cross-process consumer delivery, independent interoperability, and at requirement scale.",
     ),
     "DM-5.1-07": selected_claim(
-        "implemented-uncredited", "aster-redb-store",
-        f"{EVENT_SLICE}; durable Event stream high-water and gap inspection are transactionally maintained",
-        "The durable store audits gaps internally; expose a freshly verified authorized application view and verify cross-process durable consumer behavior and independent interoperability.",
+        "implemented-uncredited", "aster-redb-store + aster-node",
+        f"{EVENT_SLICE}; {EVENT_LIVE_SLICE}; the public Event gap query bounds one exact publisher/topic/scope stream, freshly source/content verifies every observed anchor, and race-rechecks the policy-bound plan before returning half-open gaps",
+        "Gap absence is limited to verified positions already observed by the local mission-bound store; verify actual missing-position detection through a cross-process consumer and independent implementation without implying publisher completeness or convergence.",
     ),
     "DM-5.1-17": selected_claim(
         "implemented-uncredited", "aster-core + aster-node", EVENT_SLICE,
-        f"The selected application boundary publishes, queries, subscribes to, polls, and acknowledges Event through {EVENT_SUBSCRIPTION_SLICE}, but State, Record, Blob, live synchronization, and language bindings remain open.",
+        f"The selected live and stopped application boundaries publish, query, subscribe to, poll, acknowledge, unsubscribe from, and inspect Event through {EVENT_SUBSCRIPTION_SLICE} and {EVENT_LIVE_SLICE}, but State, Record, Blob, and selected-node language bindings remain open.",
     ),
     "DM-5.1-18": selected_claim(
         "implemented-uncredited", "aster-core + aster-redb-store + aster-node",
-        f"{EVENT_SLICE}; {EVENT_SUBSCRIPTION_SLICE}; Event topic is source-authenticated, content access is topic-granted, and durable Consume/Carry selectors constrain receive inventory and delivery",
-        "The mechanism is Event-only; live actor/status integration, repeated dynamic selector lifecycle, every other data class, and independent interoperability remain open.",
+        f"{EVENT_SLICE}; {EVENT_SUBSCRIPTION_SLICE}; {EVENT_LIVE_SLICE}; Event topic is source-authenticated, content access is topic-granted, and durable Consume/Carry selectors constrain live receive inventory and delivery",
+        "The mechanism is Event-only; repeated dynamic selector lifecycle, every other data class, and independent interoperability remain open.",
     ),
     "DM-5.1-19": selected_claim(
         "implemented-uncredited", "aster-core + aster-redb-store + aster-node",
-        f"{EVENT_SLICE}; {EVENT_SUBSCRIPTION_SLICE}; Event scope and key epoch are source-authenticated; canonical selectors support exact or descendant scope matching; current peer route grants still filter inventory and Offer",
+        f"{EVENT_SLICE}; {EVENT_SUBSCRIPTION_SLICE}; {EVENT_LIVE_SLICE}; Event scope and key epoch are source-authenticated; canonical selectors support exact or descendant scope matching; current peer route grants still filter inventory and Offer",
         "Repeated dynamic multi-scope lifecycle, all other data classes, physical peers, and independent interoperability remain open.",
     ),
     "DM-5.1-20": selected_claim(
@@ -241,25 +249,25 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     "DM-5.2-02": selected_claim(
         "implemented-uncredited",
         "aster-redb-store + aster-node",
-        f"{EVENT_SUBSCRIPTION_SLICE}; durable canonical Consume/Carry topic/scope selectors are projected into a mission-protected receiver interest; each directional inventory and Offer/Fetch path intersects that interest with current scope/epoch route authority; a runtime test transfers subscribed beta while withholding authorized but unsubscribed alpha, and an empty durable selector set receives nothing",
-        "This is Event-only same-implementation in-process evidence, not real-process later-sync acceptance, repeated multi-scope selector lifecycle, State/Record/Blob, physical peers, scale, or mixed-implementation convergence.",
+        f"{EVENT_SUBSCRIPTION_SLICE}; {EVENT_LIVE_SLICE}; durable canonical Consume/Carry topic/scope selectors become mission-protected receiver interests; an in-process negative test withholds unselected Event data, and a separate real-process current-code test delivers one Event published offline to a later subscribed receiver",
+        "The real-process test observes one same-implementation two-node Event flow, not all reachable subscribed nodes or global convergence. No retained PR-C acceptance receipt exists; repeated multi-scope lifecycle, State/Record/Blob, physical peers, scale, and mixed implementations remain open.",
     ),
     "DM-5.2-06": selected_claim(
         "implemented-uncredited",
         "aster-redb-store + aster-node",
-        f"{RECEIPT}; {EVENT_SUBSCRIPTION_SLICE}; a running destination content-verified Ping and emitted Pong, while the selected application facade durably prepares bounded Event delivery, freshly re-verifies source/content authorization, and commits an attempt before returning it",
-        "Compose delivery with the live actor/status surface and verify real-process contact/retry behavior, every other data class, bindings, and independent interoperability.",
+        f"{RECEIPT}; {EVENT_SUBSCRIPTION_SLICE}; {EVENT_LIVE_SLICE}; the live facade durably prepares bounded Event delivery, freshly re-verifies source/content authorization, and commits an attempt before returning it; current-code real processes poll and acknowledge an Event after later synchronization",
+        "The retained receipt covers the built-in Event reaction, while generalized live delivery has current-code automated evidence only. Verify unacknowledged real-process crash retry, every other data class, bindings, and independent interoperability.",
     ),
     "DM-5.2-07": selected_claim(
         "implemented-uncredited", "aster-redb-store + aster-node",
-        f"{RECEIPT}; {EVENT_SUBSCRIPTION_SLICE}; exact transfer replay reuses durable acceptance, and the durable pending ledger repeats an unacknowledged Event by semantic ID until idempotent acknowledgement",
-        "Verify duplicate suppression across live network cycles and cyclic topologies, every other data class, bindings, and independent interoperability.",
+        f"{RECEIPT}; {EVENT_SUBSCRIPTION_SLICE}; {EVENT_LIVE_SLICE}; exact transfer replay reuses durable acceptance, the pending ledger repeats an unacknowledged Event by semantic ID, and a current-code real-process receiver restart observes no delivery after acknowledgement",
+        "Verify duplicate suppression across live network cycles, unacknowledged crash retry, cyclic topologies, every other data class, bindings, and independent interoperability.",
     ),
     "DM-5.2-08": selected_claim(
         "observed-bounded",
         "aster-redb-store + aster-node",
-        f"{RECEIPT}; {EVENT_SUBSCRIPTION_SLICE}; peerless Ping and causal-Pong cohorts commit under durable operation keys; subscription replay/conflict, attempt persistence across reopen, idempotent acknowledgement, gap delivery, zero-match cursor advance, inactive-pending retirement, and stale-plan/policy rejection are covered by selected store/application tests",
-        "The cross-process receipt still covers only the built-in Event reaction; live actor delivery, crash injection at every external boundary, other data classes, bindings, and independent implementations remain open.",
+        f"{RECEIPT}; {EVENT_SUBSCRIPTION_SLICE}; {EVENT_LIVE_SLICE}; peerless cohorts commit under durable operation keys; tests cover subscription replay/conflict, attempt persistence, idempotent acknowledgement, selector removal/replacement, verified gap plans, stale-policy rejection, and receiver restart",
+        "The retained receipt still covers only the built-in Event reaction; the generalized live actor has current-code automated evidence but no retained PR-C receipt. Crash injection at every external boundary, other data classes, bindings, and independent implementations remain open.",
     ),
     "DM-5.2-09": selected_claim(
         "observed-bounded", "aster-core + aster-redb-store + aster-node",
@@ -301,8 +309,8 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     ),
     "DM-5.5-02": selected_claim(
         "implemented-uncredited", "aster-redb-store + aster-node",
-        f"{EVENT_SUBSCRIPTION_SLICE}; a bounded canonical union of durable Consume and Carry selectors becomes the receiver's mission-protected interest; empty means receive-none; each directional inventory and Offer/Fetch path rechecks selector revision, source protection, and current route authority; the selected runtime test receives subscribed beta but not authorized-unsubscribed alpha and receives zero Events with no selectors",
-        "Evidence is Event-only and same-implementation in-process; live actor/status integration, real-process later-sync, State/Record/Blob, repeated multi-scope selector lifecycle, physical peers, scale, and mixed-implementation acceptance remain open.",
+        f"{EVENT_SUBSCRIPTION_SLICE}; {EVENT_LIVE_SLICE}; a bounded canonical union of durable Consume and Carry selectors becomes the receiver's mission-protected interest; empty means receive-none; unsubscribe advances the selector generation; an in-process negative test withholds unselected data and a current-code real-process test later synchronizes one subscribed Event",
+        "Evidence is Event-only and same-implementation, with no retained PR-C acceptance receipt. State/Record/Blob, repeated multi-scope replacement lifecycle, physical peers, scale, and mixed-implementation acceptance remain open.",
     ),
     "DM-5.5-03": selected_claim(
         "implemented-uncredited", "aster-node",
@@ -387,8 +395,8 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     ),
     "DM-6-06": selected_claim(
         "observed-bounded", "aster-core + aster-node",
-        f"{RECEIPT}; {EVENT_SUBSCRIPTION_SLICE}; endpoint applications react only to exact content-verified Event capabilities and freshly verified payloads; stopped-state poll freshly verifies every selected candidate before committing its durable attempt",
-        "Live actor/status integration, other data classes, bindings, physical peers, and independent interoperability remain open.",
+        f"{RECEIPT}; {EVENT_SUBSCRIPTION_SLICE}; {EVENT_LIVE_SLICE}; endpoint applications react only to exact content-verified Event capabilities and freshly verified payloads; live and stopped poll freshly verify each selected candidate before committing its durable attempt",
+        "The generalized live path has current-code automated evidence only. Other data classes, bindings, physical peers, and independent interoperability remain open.",
     ),
     "DM-6-07": selected_claim(
         "observed-bounded", "aster-core + aster-redb-store + aster-node",
@@ -458,8 +466,8 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     "DM-6-23": selected_claim(
         "observed-bounded",
         "aster-core + aster-redb-store + aster-node",
-        f"{MISSION_RECEIPT}; {CONTROL_RECEIPT}; {EVENT_SUBSCRIPTION_SLICE}; protected-frame replay/plaintext, control rollback/fork, stale epoch and revoked-source traffic fail closed; exact controls, Event transfers, publication operations, subscription creation, delivery attempts, and semantic-ID acknowledgement are durable or idempotent across restart",
-        "Verify captured replay across physical sessions, every data class, live actor interruption, long retention/eviction boundaries, crash injection at every external boundary, and independent implementations.",
+        f"{MISSION_RECEIPT}; {CONTROL_RECEIPT}; {EVENT_SUBSCRIPTION_SLICE}; {EVENT_LIVE_SLICE}; protected-frame replay/plaintext, control rollback/fork, stale epoch and revoked-source traffic fail closed; Event publication, selector insert/remove, delivery attempts, acknowledgement, live admission closure, and receiver restart are durable, idempotent, or fail closed",
+        "Verify captured replay across physical sessions, every data class, abrupt interruption at each live command/contact boundary, long retention/eviction boundaries, and independent implementations.",
     ),
     "DM-6-25": selected_claim(
         "observed-bounded",
@@ -473,23 +481,47 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
         f"{MISSION_RECEIPT}; the existing hybrid-authenticated session and source-authenticated Event envelopes are used unchanged, and cross-mission credentials fail closed",
         "Complete all data classes, protected provisioning, algorithm-policy/admitted-module gates, and independent review.",
     ),
+    "DM-7-11": selected_claim(
+        "implemented-uncredited",
+        "aster-node::application",
+        f"{EVENT_LIVE_SLICE}; SelectedEventHandle exposes typed publish, query, subscribe, poll, acknowledge, unsubscribe, authenticated gaps, sync status, and peer status with sanitized errors",
+        "This is an Event-only partial boundary. State/Record/Blob, conflict annotations, control/provisioning administration, selected-node bindings, and the complete adopter-facing API remain open.",
+    ),
+    "DM-7-14": selected_claim(
+        "implemented-uncredited",
+        "aster-node::application",
+        f"{EVENT_LIVE_SLICE}; SelectedEventHandle operations and results contain no carrier type, endpoint, address, path choice, or transport selection",
+        "Node startup still requires separate direct-Iroh configuration, and the complete multi-class API, bindings, local-agent decision, and future multi-carrier composition require the same boundary audit.",
+    ),
+    "DM-7-15": selected_claim(
+        "implemented-uncredited",
+        "aster-node::application",
+        f"{EVENT_LIVE_SLICE}; the live Event surface returns application items, delivery attempts, verified gap intervals, and high-level last-contact status without exposing inventories, exact transfer IDs, Negentropy state, or contact protocol frames",
+        "Complete and audit the same abstraction across State/Record/Blob, conflict workflows, bindings, control administration, and any optional local agent.",
+    ),
     "DM-7-16": selected_claim(
         "implemented-uncredited",
         "aster-node",
-        f"{CONTROL_RECEIPT}; {EVENT_SLICE}; after epoch-two control convergence the surviving member reserved, source-sealed, and atomically committed Ping in a one-process cohort with peers=0 and contacts=0; the stopped-state API publishes arbitrary policy-authorized Events while legacy put_opaque remains isolated",
-        f"The selected application boundary also provides durable stopped-state subscribe/poll/ack through {EVENT_SUBSCRIPTION_SLICE}; compose it with a live actor, every data class, stakeholder-set offline intervals, and selected-node bindings.",
+        f"{CONTROL_RECEIPT}; {EVENT_SLICE}; {EVENT_LIVE_SLICE}; after epoch-two control convergence one retained cohort published Ping with peers=0 and contacts=0, and the generalized live handle publishes arbitrary authorized Events while no peer is configured",
+        "The generalized live path has current-code automated evidence only. Compose every data class, stakeholder-set offline intervals, and selected-node bindings.",
     ),
     "DM-7-17": selected_claim(
         "observed-bounded",
         "aster-node",
-        f"{RECEIPT}; a peerless origin published source-authenticated Ping, its process exited, isolated edge cohorts synchronized the exact Event onward, and a separate peerless destination published causal Pong before isolated return cohorts",
-        f"The stopped-state selected Event publish/query/subscribe/poll/ack foundation exists through {EVENT_SUBSCRIPTION_SLICE}; live later-sync API evidence, other classes, physical systems, and independent interoperability remain open.",
+        f"{RECEIPT}; {EVENT_LIVE_SLICE}; the retained built-in flow published while peerless and synchronized later; a separate current-code process test publishes through SelectedEventHandle with no peer, restarts the publisher for contact, and polls/acks at the receiver",
+        "The generalized live path has no retained PR-C receipt. Stakeholder-set offline duration, other classes, physical systems, no-loss acceptance, and independent interoperability remain open.",
+    ),
+    "DM-7-18": selected_claim(
+        "implemented-uncredited",
+        "aster-node + shipped documentation",
+        f"{EVENT_LIVE_SLICE}; docs ship a runnable live example, a complete high-level code path, conservative gap/status semantics, and the focused offline-publish/later-sync test command",
+        "Compilation and automated tests are not an independent developer-usability study; other data classes, selected-node bindings, operational provisioning, and the complete integration surface remain open.",
     ),
     "DM-7-20": selected_claim(
         "observed-bounded",
         "aster-node",
-        f"docs/quickstart/mesh-cli.md; docs/quickstart/selected-event-api.md; {EVENT_SUBSCRIPTION_SLICE}; the shipped CLI runs bounded source-authenticated Event Ping/Pong, and the compiled stopped-state example publishes, queries, subscribes, polls, and acknowledges through the selected Event authority",
-        "Add a live peer/sync surface, other data classes, selected-node bindings, and physical multi-system instructions/evidence.",
+        f"docs/quickstart/mesh-cli.md; {EVENT_LIVE_SLICE}; the shipped CLI runs bounded source-authenticated Event Ping/Pong, and compiled stopped/live examples exercise high-level Event publication, query, durable delivery, unsubscribe, gaps, and status",
+        "Add other data classes, selected-node bindings, operational provisioning, and physical multi-system instructions/evidence.",
     ),
     "DM-8-01": selected_claim(
         "observed-bounded",
@@ -544,7 +576,11 @@ RELEVANT_ARTIFACTS = {
     "DM-7-02": "bindings/c",
     "DM-7-03": "docs/bindings/pattern.md",
     "DM-7-04": "docs/bindings/pattern.md; bindings/c; bindings/go; bindings/python",
-    "DM-7-20": "docs/quickstart/mesh-cli.md",
+    "DM-7-11": "crates/aster-node/src/application.rs; docs/decisions/0009-public-api-boundary.md",
+    "DM-7-14": "crates/aster-node/src/application.rs; docs/decisions/0009-public-api-boundary.md",
+    "DM-7-15": "crates/aster-node/src/application.rs; docs/decisions/0009-public-api-boundary.md",
+    "DM-7-18": "docs/quickstart/selected-event-api.md; crates/aster-node/src/application.rs",
+    "DM-7-20": "docs/quickstart/mesh-cli.md; docs/quickstart/selected-event-api.md",
     "DM-8-01": "Cargo.toml; Cargo.lock",
     "DM-8-02": "Cargo.toml; Cargo.lock",
     "DM-8-05": "deny.toml; tools/check-dependency-exception-scope.sh",
