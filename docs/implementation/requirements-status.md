@@ -1,6 +1,6 @@
 # Production implementation requirements status
 
-- Status date: 2026-08-24
+- Status date: 2026-08-25
 - Requirements authority: [`data-mesh-requirements.md`](../../data-mesh-requirements.md)
 - Requirements SHA-256: `e88bcc6c717a5175a460205fdc084aaa2e1f020a142a84087f9881677da02987`
 - Atomic requirements index: [`requirements-matrix.csv`](../evaluations/0005/requirements-matrix.csv)
@@ -94,8 +94,8 @@ phase, class, and final-stack flag.
 unique rows, valid selected states, exact selected-status containment, and the
 conservative generated claim boundary.
 
-The current generated totals are 47 `implemented-uncredited`, 40
-`observed-bounded`, and 261 `open` rows across 88 exact selected mappings. The
+The current generated totals are 49 `implemented-uncredited`, 40
+`observed-bounded`, and 259 `open` rows across 90 exact selected mappings. The
 selected State slice moved `DM-5.1-01`, `DM-5.1-02`, `DM-5.3-01`, and
 `DM-5.3-02`; the selected Record slice moved `DM-5.1-08`, `DM-5.1-09`, and
 `DM-5.3-06` through `DM-5.3-10` from `open`. Typed class-specific State and
@@ -120,7 +120,12 @@ hundreds-of-MiB acceptance, or complete physical allocation accounting.
 PR C previously moved `DM-7-11`, `DM-7-14`, `DM-7-15`, and `DM-7-18` to
 `implemented-uncredited` for the live Event boundary. The preceding PR-B
 movement was `DM-5.5-02`; the most recent retained-receipt movement remains
-`DM-6-22` to `observed-bounded`.
+`DM-6-22` to `observed-bounded`. The local ConnectRPC agent slice moves
+`DM-7-09` and `DM-7-10` from `open` to `implemented-uncredited`: an
+authenticated loopback process now exposes that live Event authority through a
+repository-owned v1alpha1 schema. This is current-code same-implementation
+evidence, not a retained receipt, independent client result, production
+deployment authorization, or a claim for live State/Record/Blob RPCs.
 
 ### Where the selected lane stands
 
@@ -129,7 +134,7 @@ not completion percentages: `implemented-uncredited` means a partial mechanism
 exists, and `observed-bounded` means only the stated environment and claim
 boundary passed.
 
-All 57 rows with an external gate are included within the 261 `open` rows:
+All 57 rows with an external gate are included within the 259 `open` rows:
 `gate_kind` is an independent ownership dimension, not a fourth selected status.
 The generator validates the trace totals; this family roll-up is the human
 summary of that same CSV.
@@ -141,7 +146,7 @@ summary of that same CSV.
 | DM-3 Operating environment | 0 | 1 | 12 | 13 |
 | DM-5 Functional requirements | 34 | 13 | 75 | 122 |
 | DM-6 Security requirements | 3 | 18 | 15 | 36 |
-| DM-7 Developer experience | 5 | 2 | 14 | 21 |
+| DM-7 Developer experience | 7 | 2 | 12 | 21 |
 | DM-8 Implementation constraints | 0 | 2 | 17 | 19 |
 | DM-9 Performance and scale | 3 | 0 | 29 | 32 |
 | DM-10 Compatibility | 0 | 0 | 6 | 6 |
@@ -430,8 +435,9 @@ column.
 | `DM-6-22` local zeroization | `observed-bounded` | Same-UID Unix `aster zeroize`, retained-inode secret handles, live drain, and durable terminal redb cleanup phases | A live child drained and destroyed its exact mission-bundle and carrier-identity contents; another child exited immediately after the terminal marker and a later CLI resumed cleanup. Data rows and zero-length pathnames were preserved, and restored credential bytes could not reopen the retained database. This does not prove inode deletion, deterministic remote observation of mid-flight teardown, physical/copy-on-write/snapshot/swap/backup sanitization, redb rollback/replacement resistance, non-Unix behavior, remote triggering, or independent platform assurance. |
 | `DM-6-23` freshness and replay rejection | `observed-bounded` | Protected session replay checks, exact chained controls, policy-bound Event transactions, and durable/idempotent publication, selector, delivery-attempt, acknowledgement, and live-admission operations | Control rollback/fork, stale epoch, revoked-source traffic, stale plans, and commands after shutdown/zeroization fail closed in bounded tests; acknowledgement survives receiver restart. Physical capture replay, abrupt interruption at every live command/contact boundary, every data class, long retention/eviction, and independent implementations remain open. |
 | `DM-11-20` MVP revocation | `implemented-uncredited` | Durable revocation is present in the selected production lane | One real-process captured-leaf scenario passed, but the complete MVP, protected administration, platform-complete zeroization assurance, generalized control management, and release gates remain incomplete. |
-| `DM-7-11`, `DM-7-14`, `DM-7-15`, `DM-7-18` high-level documented boundary | `implemented-uncredited` | Typed live Event operations, typed stopped State/Record/Blob operations, sanitized errors/status, no transport or reconciliation types in application handles, and compiled shipped examples | These row movements remain based on PR C's live Event boundary. State/Record reconciliation is runtime configuration, not a live application API; live State/Record/Blob handles, automatic merge, selected-node bindings, operational provisioning, and an independent developer-usability study remain open. |
-| `DM-7-16`, `DM-7-17`, `DM-7-20` offline publication/later sync/sample | `implemented-uncredited` / `observed-bounded` | Built-in applications plus compiled live/stopped selected Event examples | Retained built-in receipts publish peerless and forward later. Current-code real processes also publish through the live handle with no peer, restart into later contact, poll/ack, and preserve the ack across receiver restart. This does not establish the supported offline interval, no-loss acceptance, other classes, physical systems, or independent interoperability. |
+| `DM-7-09`, `DM-7-10` optional local agent and gRPC-like IPC | `implemented-uncredited` | `aster-agent`, local v1alpha1 Protobuf/Buf schema, mandatory loopback bearer boundary, and real-node ConnectRPC integration test | The test covers same-implementation Connect unary/streaming calls, including unauthenticated rejection and durable redelivery. Independent gRPC/gRPC-Web clients, protected provisioning, token reload/rotation, stronger OS identity, packaging, supported targets, and production deployment acceptance remain open. |
+| `DM-7-11`, `DM-7-14`, `DM-7-15`, `DM-7-18` high-level documented boundary | `implemented-uncredited` | Typed live Event operations, typed stopped State/Record/Blob operations, sanitized errors/status, no transport or reconciliation types in application handles or agent RPCs, and compiled shipped examples | The agent preserves PR C's high-level Event boundary but does not broaden its class support. State/Record reconciliation is runtime configuration, not a live application API; live State/Record/Blob handles, automatic merge, selected-node bindings, operational provisioning, and an independent developer-usability study remain open. |
+| `DM-7-16`, `DM-7-17`, `DM-7-20` offline publication/later sync/sample | `implemented-uncredited` / `observed-bounded` | Built-in applications, compiled live/stopped selected Event examples, and a 35-line ConnectRPC sample | Retained built-in receipts publish peerless and forward later. Current-code real processes also publish through the live handle with no peer, restart into later contact, poll/ack, and preserve the ack across receiver restart; the agent test publishes and consumes against that real handle. This does not establish the supported offline interval, independent developer usability, no-loss acceptance, other classes, physical systems, or independent interoperability. |
 | `DM-8-01`, `DM-8-02` Rust implementation | `observed-bounded` | Rust 1.91 workspace and current selected-lane checks/tests | The retained locked/offline Darwin arm64 artifact identified below belongs to the parent PR-A/pre-subscription freeze. PR B, PR C, and the selected State/Record/Blob slices have source/test evidence only until a new release receipt is produced; supported-target and release acceptance remain open. |
 | `DM-9-13`, `DM-9-14` Blob streamed reading and bounded working memory | `implemented-uncredited` | Synchronous `read_into`, canonical independently authenticated chunks, final whole-content verification, one manifest-bounded digest vector, a reported core-engine peak chunk buffer, and independently chunk-bounded adapter buffers | The public metric is the core reader capacity, not whole-operation peak memory. Current tests use modest local fixtures. Remote transfer, alternate carriers, supported-target resident-memory measurement, large-Blob brackets, complete physical accounting, and retained resource evidence remain open. |
 | `DM-9-21A` many-node operation | `implemented-uncredited` | Demo accepts `--nodes 2..=32`; its deterministic schedule is `2N+1` cohorts and `5N-2` children | Parent PR-A/pre-subscription N=3/13-process and N=8/38-process receipts passed. N=32 would schedule 65 cohorts and 158 children, but no N=32 execution is claimed. Neither receipt proves the full range, bracketed many-node target, physical scale, or resource targets. |

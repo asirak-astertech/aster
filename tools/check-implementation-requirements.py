@@ -85,6 +85,12 @@ EVENT_LIVE_SLICE = (
     "offline_publish_later_real_process_sync_poll_ack_and_restart; "
     "docs/quickstart/selected-event-api.md"
 )
+AGENT_SLICE = (
+    "proto/aster/application/v1alpha1/aster.proto; crates/aster-agent/src/lib.rs; "
+    "crates/aster-agent/src/main.rs; crates/aster-agent/tests/real_node_connect.rs; "
+    "examples/connect_agent.sh; docs/quickstart/connect-agent.md; "
+    "docs/decisions/0030-event-first-local-connect-agent.md"
+)
 STATE_LOCAL_SLICE = (
     "crates/aster-core/src/source_state.rs; crates/aster-redb-store/src/lib.rs; "
     "crates/aster-node/src/application/state.rs; "
@@ -593,23 +599,35 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
         f"{MISSION_RECEIPT}; the existing hybrid-authenticated session and source-authenticated Event envelopes are used unchanged, and cross-mission credentials fail closed",
         "Complete all data classes, protected provisioning, algorithm-policy/admitted-module gates, and independent review.",
     ),
+    "DM-7-09": selected_claim(
+        "implemented-uncredited",
+        "aster-agent",
+        f"{AGENT_SLICE}; a separate process owns the running selected node and serves its live Event authority through an authenticated loopback application listener",
+        "This is an alpha same-host agent without protected mission provisioning, credential rotation/reload, OS socket identity, supported-target packaging, production deployment acceptance, or live State/Record/Blob operations.",
+    ),
+    "DM-7-10": selected_claim(
+        "implemented-uncredited",
+        "aster-agent",
+        f"{AGENT_SLICE}; the repository-owned v1alpha1 Protobuf service accepts Connect, gRPC, and gRPC-Web calls without requiring the Buf Schema Registry",
+        "Only same-implementation Connect client evidence exists. Independent gRPC/gRPC-Web clients, supported-target packaging, protected provisioning, and production local-IPC acceptance remain open.",
+    ),
     "DM-7-11": selected_claim(
         "implemented-uncredited",
-        "aster-node::application",
-        f"{EVENT_LIVE_SLICE}; SelectedEventHandle exposes typed publish, query, subscribe, poll, acknowledge, unsubscribe, authenticated gaps, sync status, and peer status with sanitized errors",
+        "aster-node::application + aster-agent",
+        f"{EVENT_LIVE_SLICE}; {AGENT_SLICE}; SelectedEventHandle and the authenticated agent expose typed publish, query, subscribe, poll/stream, acknowledge, unsubscribe, authenticated gaps, sync status, and peer status with sanitized errors",
         "This is an Event-only partial boundary. State/Record/Blob, conflict annotations, control/provisioning administration, selected-node bindings, and the complete adopter-facing API remain open.",
     ),
     "DM-7-14": selected_claim(
         "implemented-uncredited",
         "aster-node::application",
-        f"{EVENT_LIVE_SLICE}; SelectedEventHandle operations and results contain no carrier type, endpoint, address, path choice, or transport selection",
-        "Node startup still requires separate direct-Iroh configuration, and the complete multi-class API, bindings, local-agent decision, and future multi-carrier composition require the same boundary audit.",
+        f"{EVENT_LIVE_SLICE}; {AGENT_SLICE}; SelectedEventHandle and agent operations/results contain no carrier type, endpoint, address, path choice, or transport selection",
+        "Node startup still requires separate direct-Iroh configuration, and the complete multi-class API, bindings, and future multi-carrier composition require the same boundary audit.",
     ),
     "DM-7-15": selected_claim(
         "implemented-uncredited",
         "aster-node::application",
-        f"{EVENT_LIVE_SLICE}; the live Event surface returns application items, delivery attempts, verified gap intervals, and high-level last-contact status without exposing inventories, exact transfer IDs, Negentropy state, or contact protocol frames",
-        "Complete and audit the same abstraction across State/Record/Blob, conflict workflows, bindings, control administration, and any optional local agent.",
+        f"{EVENT_LIVE_SLICE}; {AGENT_SLICE}; the live Event and agent surfaces return application items, delivery attempts, verified gap intervals, and high-level last-contact status without exposing inventories, exact transfer IDs, Negentropy state, or contact protocol frames",
+        "Complete and audit the same abstraction across State/Record/Blob, conflict workflows, bindings, and control administration.",
     ),
     "DM-7-16": selected_claim(
         "implemented-uncredited",
@@ -625,15 +643,15 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     ),
     "DM-7-18": selected_claim(
         "implemented-uncredited",
-        "aster-node + shipped documentation",
-        f"{EVENT_LIVE_SLICE}; docs ship a runnable live example, a complete high-level code path, conservative gap/status semantics, and the focused offline-publish/later-sync test command",
-        "Compilation and automated tests are not an independent developer-usability study; other data classes, selected-node bindings, operational provisioning, and the complete integration surface remain open.",
+        "aster-node + aster-agent + shipped documentation",
+        f"{EVENT_LIVE_SLICE}; {AGENT_SLICE}; docs ship runnable embedded and 35-line local-agent examples, complete high-level Event paths, conservative delivery/gap/status semantics, and focused real-node tests",
+        "Compilation and automated tests are not an independent developer-usability study; other data classes, selected-node bindings, operational provisioning, production packaging, and the complete integration surface remain open.",
     ),
     "DM-7-20": selected_claim(
         "observed-bounded",
-        "aster-node",
-        f"docs/quickstart/mesh-cli.md; {EVENT_LIVE_SLICE}; the shipped CLI runs bounded source-authenticated Event Ping/Pong, and compiled stopped/live examples exercise high-level Event publication, query, durable delivery, unsubscribe, gaps, and status",
-        "Add other data classes, selected-node bindings, operational provisioning, and physical multi-system instructions/evidence.",
+        "aster-node + aster-agent",
+        f"docs/quickstart/mesh-cli.md; {EVENT_LIVE_SLICE}; {AGENT_SLICE}; the shipped CLI runs bounded source-authenticated Event Ping/Pong, compiled stopped/live examples exercise the high-level Event API, and the 35-line agent sample performs status, subscribe, offline publish, poll, and acknowledge",
+        "The retained observation predates the agent sample. Add an independent usability exercise, other data classes, selected-node bindings, operational provisioning, and physical multi-system instructions/evidence.",
     ),
     "DM-8-01": selected_claim(
         "observed-bounded",
@@ -700,11 +718,13 @@ RELEVANT_ARTIFACTS = {
     "DM-7-02": "bindings/c",
     "DM-7-03": "docs/bindings/pattern.md",
     "DM-7-04": "docs/bindings/pattern.md; bindings/c; bindings/go; bindings/python",
+    "DM-7-09": "crates/aster-agent; docs/quickstart/connect-agent.md",
+    "DM-7-10": "proto/aster/application/v1alpha1/aster.proto; crates/aster-agent",
     "DM-7-11": "crates/aster-node/src/application.rs; docs/decisions/0009-public-api-boundary.md",
     "DM-7-14": "crates/aster-node/src/application.rs; docs/decisions/0009-public-api-boundary.md",
     "DM-7-15": "crates/aster-node/src/application.rs; docs/decisions/0009-public-api-boundary.md",
-    "DM-7-18": "docs/quickstart/selected-event-api.md; crates/aster-node/src/application.rs",
-    "DM-7-20": "docs/quickstart/mesh-cli.md; docs/quickstart/selected-event-api.md",
+    "DM-7-18": "docs/quickstart/selected-event-api.md; docs/quickstart/connect-agent.md; crates/aster-node/src/application.rs; crates/aster-agent",
+    "DM-7-20": "docs/quickstart/mesh-cli.md; docs/quickstart/selected-event-api.md; examples/connect_agent.sh",
     "DM-8-01": "Cargo.toml; Cargo.lock",
     "DM-8-02": "Cargo.toml; Cargo.lock",
     "DM-8-05": "deny.toml; tools/check-dependency-exception-scope.sh",

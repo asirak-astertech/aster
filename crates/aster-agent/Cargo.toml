@@ -1,0 +1,37 @@
+[package]
+name = "aster-agent"
+description = "Loopback-first ConnectRPC application agent for the selected Aster node"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = ["server"]
+server = ["connectrpc/server"]
+client = ["connectrpc/client"]
+
+[dependencies]
+aster-node = { path = "../aster-node" }
+buffa.workspace = true
+connectrpc = { workspace = true, features = ["json"] }
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+subtle.workspace = true
+tokio.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+rustix.workspace = true
+
+[build-dependencies]
+connectrpc-build.workspace = true
+
+[dev-dependencies]
+connectrpc = { workspace = true, features = ["client", "json", "server"] }
+
+[lints]
+workspace = true

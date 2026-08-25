@@ -1,0 +1,210 @@
+syntax = "proto3";
+
+package aster.application.v1alpha1;
+
+// AsterApplicationService is the process-local, high-level application API.
+//
+// The alpha surface exposes only the live Event and status operations backed
+// by the running node's sole durable-store authority. It intentionally omits
+// cryptographic material, carriers, reconciliation mechanics, sealed bytes,
+// provisioning secrets, and stopped-only State/Record operations.
+service AsterApplicationService {
+  // GetStatus returns a bounded local synchronization snapshot.
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+  // PublishEvent durably accepts an idempotent offline-first publication.
+  rpc PublishEvent(PublishEventRequest) returns (PublishEventResponse);
+  // QueryEvents returns one marker-ordered, bounded Event page.
+  rpc QueryEvents(QueryEventsRequest) returns (QueryEventsResponse);
+  // CreateEventSubscription creates or replays a durable receive selector.
+  rpc CreateEventSubscription(CreateEventSubscriptionRequest) returns (CreateEventSubscriptionResponse);
+  // PollEvents returns one bounded page of at-least-once deliveries.
+  rpc PollEvents(PollEventsRequest) returns (PollEventsResponse);
+  // StreamEvents repeatedly performs bounded durable polls until cancellation.
+  rpc StreamEvents(StreamEventsRequest) returns (stream StreamEventsResponse);
+  // AcknowledgeEvent durably marks one delivered semantic Event complete.
+  rpc AcknowledgeEvent(AcknowledgeEventRequest) returns (AcknowledgeEventResponse);
+  // DeleteEventSubscription withdraws a selector and its delivery ledger.
+  rpc DeleteEventSubscription(DeleteEventSubscriptionRequest) returns (DeleteEventSubscriptionResponse);
+  // QueryEventGaps reports authenticated gaps in one exact publisher stream.
+  rpc QueryEventGaps(QueryEventGapsRequest) returns (QueryEventGapsResponse);
+}
+
+message GetStatusRequest {}
+
+message GetStatusResponse {
+  bytes identity = 1;
+  bytes mission_authority = 2;
+  SyncStatus sync = 3;
+  uint64 authenticated_contacts = 4;
+  uint64 failed_contact_attempts = 5;
+  repeated PeerStatus peers = 6;
+}
+
+message PeerStatus {
+  bytes peer = 1;
+  PeerAuthorization authorization = 2;
+  uint64 authenticated_contacts = 3;
+  ContactStatus last_contact = 4;
+}
+
+enum Priority {
+  PRIORITY_UNSPECIFIED = 0;
+  PRIORITY_ROUTINE = 1;
+  PRIORITY_PRIORITY = 2;
+  PRIORITY_IMMEDIATE = 3;
+  PRIORITY_FLASH = 4;
+}
+
+enum SyncStatus {
+  SYNC_STATUS_UNSPECIFIED = 0;
+  SYNC_STATUS_OFFLINE = 1;
+  SYNC_STATUS_NO_ACTIVE_CONFIGURED_PEERS = 2;
+  SYNC_STATUS_AWAITING_AUTHENTICATED_CONTACT = 3;
+  SYNC_STATUS_LAST_CONTACT_COMPLETE = 4;
+  SYNC_STATUS_WORK_REMAINED = 5;
+  SYNC_STATUS_POLICY_CHANGED_SINCE_CONTACT = 6;
+}
+
+enum PeerAuthorization {
+  PEER_AUTHORIZATION_UNSPECIFIED = 0;
+  PEER_AUTHORIZATION_ACTIVE = 1;
+  PEER_AUTHORIZATION_REVOKED = 2;
+}
+
+enum ContactStatus {
+  CONTACT_STATUS_UNSPECIFIED = 0;
+  CONTACT_STATUS_COMPLETE_FOR_LAST_NEGOTIATED_CONTACT = 1;
+  CONTACT_STATUS_WORK_REMAINED = 2;
+  CONTACT_STATUS_POLICY_CHANGED_SINCE_CONTACT = 3;
+}
+
+message PublishEventRequest {
+  bytes operation_key = 1;
+  optional bytes predecessor_id = 2;
+  string topic = 3;
+  string scope = 4;
+  Priority priority = 5;
+  bytes logical_key = 6;
+  bytes payload = 7;
+  bool tombstone = 8;
+}
+
+message PublishEventResponse {
+  bytes id = 1;
+  bytes publisher = 2;
+  uint64 publisher_counter = 3;
+  uint64 event_sequence = 4;
+  Priority priority = 5;
+  uint64 acceptance_marker = 6;
+  bool inserted = 7;
+}
+
+message QueryEventsRequest {
+  optional bytes publisher = 1;
+  optional string topic = 2;
+  optional string scope = 3;
+  bool include_descendant_scopes = 4;
+  optional bytes logical_key = 5;
+  uint64 after_acceptance_marker = 6;
+  uint32 limit = 7;
+}
+
+message QueryEventsResponse {
+  repeated Event events = 1;
+  uint64 scanned_through = 2;
+  bool has_more = 3;
+}
+
+message Event {
+  bytes id = 1;
+  bytes publisher = 2;
+  uint64 publisher_counter = 3;
+  uint64 event_sequence = 4;
+  string topic = 5;
+  string scope = 6;
+  Priority priority = 7;
+  bytes logical_key = 8;
+  bytes payload = 9;
+  bool tombstone = 10;
+  uint64 acceptance_marker = 11;
+}
+
+message CreateEventSubscriptionRequest {
+  bytes operation_key = 1;
+  string topic = 2;
+  string scope = 3;
+  bool include_descendant_scopes = 4;
+}
+
+message CreateEventSubscriptionResponse {
+  bytes subscription_id = 1;
+  bool inserted = 2;
+}
+
+message PollEventsRequest {
+  bytes subscription_id = 1;
+  uint32 delivery_limit = 2;
+  uint32 scan_limit = 3;
+}
+
+message PollEventsResponse {
+  repeated EventDelivery deliveries = 1;
+  bool has_more = 2;
+}
+
+message StreamEventsRequest {
+  bytes subscription_id = 1;
+  uint32 delivery_limit = 2;
+  uint32 scan_limit = 3;
+  // Delay after each delivered or caught-up poll. Accepted range is 100..=60000.
+  uint32 poll_backoff_ms = 4;
+}
+
+message StreamEventsResponse {
+  Event event = 1;
+  uint64 attempt = 2;
+}
+
+message EventDelivery {
+  Event event = 1;
+  uint64 attempt = 2;
+}
+
+message AcknowledgeEventRequest {
+  bytes subscription_id = 1;
+  bytes event_id = 2;
+}
+
+message AcknowledgeEventResponse {
+  bool already_acknowledged = 1;
+}
+
+message DeleteEventSubscriptionRequest {
+  bytes subscription_id = 1;
+}
+
+message DeleteEventSubscriptionResponse {
+  bool already_absent = 1;
+}
+
+message QueryEventGapsRequest {
+  bytes publisher = 1;
+  string topic = 2;
+  string scope = 3;
+  uint64 after_sequence = 4;
+  uint32 scan_limit = 5;
+}
+
+message QueryEventGapsResponse {
+  repeated EventGap gaps = 1;
+  uint64 scanned_through_sequence = 2;
+  bool has_more = 3;
+}
+
+message EventGap {
+  bytes publisher = 1;
+  string topic = 2;
+  string scope = 3;
+  uint64 start_sequence = 4;
+  uint64 end_sequence = 5;
+}

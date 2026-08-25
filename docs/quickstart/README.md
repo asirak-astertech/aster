@@ -21,11 +21,18 @@ and exact durable retry. Live or replicated State/Record/Blob, automatic
 registered-policy Record merge, atomic subscription update, remote Blob chunk
 transfer, and selected-node language bindings remain open.
 
+The alpha [local ConnectRPC agent](connect-agent.md) exposes that live Event
+handle to standard Connect, gRPC, and gRPC-Web clients over an authenticated
+loopback listener. Its schema is repository-owned and requires no Buf Schema
+Registry. Live State/Record/Blob RPCs and production deployment authorization
+remain open.
+
 Choose the API closest to your application:
 
 | Language | API you use | Quickstart |
 |---|---|---|
 | Rust (selected live Event slice) | `aster_node::start_node` + `SelectedEventHandle` | [Selected Event API](selected-event-api.md) |
+| ConnectRPC client (alpha live Event slice) | local `aster.application.v1alpha1` schema | [Local ConnectRPC agent](connect-agent.md) |
 | Rust (selected stopped Event slice) | `aster-node::application::SelectedEventNode` | [Selected Event API](selected-event-api.md#one-authority-two-application-modes) |
 | Rust (selected stopped State slice) | `aster-node::application::SelectedStateNode` | [Selected State API](selected-state-api.md) |
 | Rust (selected stopped Record slice) | `aster-node::application::SelectedRecordNode` | [Selected Record API](selected-record-api.md) |
