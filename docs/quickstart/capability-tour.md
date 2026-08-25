@@ -47,10 +47,17 @@ sequenceDiagram
 Look for these terminal receipts:
 
 ```text
+SUBSCRIPTIONS status=seeded consume=2 carry=0 selectors=2 interest_exchange=mission-protected lanes=receiver-directed
 PING status=received ... source_authenticated=true ttl=none
 PONG status=received ... causal_observation=verified ttl=none
 DEMO_RESULT status=pass scenario=ping-pong nodes=2 processes=8 ...
 ```
+
+The `SUBSCRIPTIONS` receipt is the receive-policy boundary: endpoints get
+durable `Consume` selectors, route-only intermediates get durable `Carry`
+selectors, and every authenticated contact exchanges the canonical interests
+before loading an Event inventory. An empty selector set means receive-none,
+not wildcard.
 
 IDs vary on every run because identities and sealed representations are fresh.
 `transfer_id` identifies exact sealed bytes; `semantic_id` identifies the
@@ -66,7 +73,8 @@ The script prints all three stopped-state inspections. The endpoints (nodes 0
 and 2) end with `events=2 route_cached_events=0`. The middle node ends with
 `events=0 route_cached_events=2`: it retained the protected representations
 needed for forwarding without receiving content access or creating semantic
-rows.
+rows. Its `Carry` selector narrows what it retains; it does not grant route or
+content authority.
 
 The demo root printed by the script remains available for exploration:
 

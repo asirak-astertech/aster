@@ -351,7 +351,7 @@
       <div class="wrap" style="position: relative; display: flex; flex-direction: column; align-items: center; gap: 28px;">
         <div class="eyebrow">Apache-2.0 · Offline-first · Transport-neutral</div>
         <h1 id="hero-title" style="font-size: clamp(36px, 6vw, 64px); font-weight: 500; max-width: 900px;">Data sync for the edge, where the network is the last thing you can trust</h1>
-        <p style="font-size: 21px; max-width: 780px; color: #d4d6e2;">Aster is a free, open-source synchronization protocol and framework. Its selected implementation now runs source-authenticated control and Event paths across real Rust processes over direct Iroh, authenticates a separate hybrid-PQ mission identity before inventory, activates an ordered control prefix before Event, keeps payload-blind relays outside the content boundary, and exposes a bounded same-UID Unix local software-zeroization hook.</p>
+        <p style="font-size: 21px; max-width: 780px; color: #d4d6e2;">Aster is a free, open-source synchronization protocol and framework. Its selected implementation now runs source-authenticated control and Event paths across real Rust processes over direct Iroh, authenticates a separate hybrid-PQ mission identity before inventory, activates an ordered control prefix before Event, applies durable receiver-directed Event interest inside that protected session, keeps payload-blind relays outside the content boundary, and exposes a bounded same-UID Unix local software-zeroization hook.</p>
         <div style="display: flex; gap: 16px; flex-wrap: wrap; justify-content: center; margin-top: 8px;">
           <a class="btn btn-primary" href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/quickstart/capability-tour.md">Try Aster</a>
           <a class="btn btn-secondary" href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/architecture.md">View architecture</a>
@@ -414,7 +414,7 @@ cargo run --locked -p aster-node --bin aster -- \
         <div class="section-head">
           <div class="eyebrow">Semantic target being migrated</div>
           <h2>Publish locally. Deliver during configured contacts.</h2>
-          <p>The proven semantic implementation defines this behavior without a central coordinator or synchronized wall clock. The selected composition now uses its hybrid reference session before inventory, its ordered control/rekey provider before Event, its source-envelope profile for Event, and a tested local Unix destruction hook for two retained secret artifacts. State, Record, Blob, generalized subscriptions/control policy, finite-TTL custody, protected provisioning, and platform-complete zeroization assurance still require equivalent migration tests.</p>
+          <p>The proven semantic implementation defines this behavior without a central coordinator or synchronized wall clock. The selected composition now uses its hybrid reference session before inventory, its ordered control/rekey provider before Event, its source-envelope profile for Event, durable Event Consume/Carry receive intent, and a tested local Unix destruction hook for two retained secret artifacts. State, Record, Blob, live application/status integration, generalized control policy, finite-TTL custody, protected provisioning, and platform-complete zeroization assurance still require equivalent migration tests.</p>
         </div>
         <div class="flow">
           <div class="flow-step">
@@ -430,7 +430,7 @@ cargo run --locked -p aster-node --bin aster -- \
           <div class="flow-step">
             <div class="flow-num">3</div>
             <h3>Difference</h3>
-            <p>The selected node uses bounded Negentropy for exact sealed-transfer-ID difference after filtering inventory through the authenticated peer's scope/epoch route grants. Priority scheduling, general subscriptions, other classes, and resumable Blob chunks remain to migrate.</p>
+            <p>The selected node uses bounded Negentropy for exact sealed-transfer-ID difference. Each direction intersects the receiver's mission-protected canonical Event interest with current scope/epoch route authority before inventory and again before Offer/Fetch. Empty interest means receive-none. Priority scheduling, other classes, and resumable Blob chunks remain to migrate.</p>
           </div>
           <div class="flow-step">
             <div class="flow-num">4</div>
@@ -440,7 +440,7 @@ cargo run --locked -p aster-node --bin aster -- \
           <div class="flow-step">
             <div class="flow-num">5</div>
             <h3>Deliver</h3>
-            <p>The selected store atomically commits content-verified Events with acceptance, causal, stream-position, and durable application-operation indexes. The sample restart reuses <code>Existing</code>; a generalized high-level application-effects API remains open.</p>
+            <p>The selected store atomically commits content-verified Events with acceptance, causal, stream-position, and durable application-operation indexes. Durable Consume subscriptions provide bounded at-least-once poll, attempt-before-return, and semantic-ID idempotent acknowledgement; Carry expresses receive/forward without local polling. A live high-level application/status surface remains open.</p>
           </div>
         </div>
       </div>
@@ -451,7 +451,7 @@ cargo run --locked -p aster-node --bin aster -- \
         <div class="section-head">
           <div class="eyebrow">Proven semantic implementation</div>
           <h2>The class tells every node how your data should converge</h2>
-          <p>Pick by how disconnected updates should behave, not by payload size. All four classes and their clock-independent behavior exist in the semantic implementation and specification. Event now has a bounded selected-node slice; State, Record, Blob, and the generalized application surface remain to migrate.</p>
+          <p>Pick by how disconnected updates should behave, not by payload size. All four classes and their clock-independent behavior exist in the semantic implementation and specification. Event now has a bounded selected-node publish/query/subscribe/poll/ack and receiver-interest slice; State, Record, Blob, and live application/status integration remain to migrate.</p>
         </div>
         <div class="classes">
           <article class="klass">
@@ -502,7 +502,7 @@ cargo run --locked -p aster-node --bin aster -- \
           <article class="card">
             <div class="icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h10M18 7h2"></path><circle cx="16" cy="7" r="2"></circle><path d="M4 17h4M12 17h8"></path><circle cx="10" cy="17" r="2"></circle><path d="M4 12h14M20 12h0"></path></svg></div>
             <h3>Deliberate resource policy</h3>
-            <p>Priority, TTL, quotas, and receive-only policy constrain protocol work. Receive-only is not a promise of RF silence; links may still emit mandatory control traffic.</p>
+            <p>Priority, TTL, quotas, and receive-only policy constrain protocol work. Selected Event Carry now expresses receive/forward without local application polling; priority scheduling, finite TTL, operator quotas, and equivalent behavior for other classes remain open. Receive-only is not a promise of RF silence; links may still emit mandatory control traffic.</p>
           </article>
           <article class="card">
             <div class="icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 9 5-9 5-9-5 9-5z"></path><path d="m3 13 9 5 9-5"></path></svg></div>
@@ -512,7 +512,7 @@ cargo run --locked -p aster-node --bin aster -- \
           <article class="card">
             <div class="icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 8 4.5v9L12 21l-8-4.5v-9L12 3z"></path><path d="M12 12 20 7.5M12 12v9M12 12 4 7.5"></path></svg></div>
             <h3>Embeddable boundaries</h3>
-            <p>The semantic implementation exposes offline operations through Rust, C, Go, and Python. The selected live node is a Rust CLI with bounded Event sample roles; generalized high-level APIs and bindings are not wired to it yet.</p>
+            <p>The semantic implementation exposes offline operations through Rust, C, Go, and Python. The selected Rust stopped-state facade now publishes, queries, subscribes, polls, and acknowledges Event, while the live node remains a CLI with bounded sample roles. Live peer/sync status, other data classes, and selected-node bindings are not wired yet.</p>
           </article>
           <article class="card">
             <div class="icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4h10a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V9"></path><path d="m4 6 2 2 4-4"></path><path d="M9 12h7M9 16h7"></path></svg></div>
@@ -563,7 +563,7 @@ mise install</pre>
           <div class="icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 9v4"></path><path d="M12 17h.01"></path><path d="M10.3 3.9 2.6 17a2 2 0 0 0 1.7 3h15.4a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"></path></svg></div>
           <div style="display: flex; flex-direction: column; gap: 10px;">
             <h3>Real implementation progress—not production authorization</h3>
-            <p>The frozen-tree Iroh/redb/Negentropy composition passes N=3/13-process, default N=4/18-process, and N=8/38-process Ping/Pong runs plus an explicit N=4/23-process control run. The generic line uses 2N+1 causal cohorts and 5N-2 children: isolated peerless Ping publication, one exact pre-existing Event transfer per forward edge, isolated peerless causal Pong publication, one exact Pong transfer per return edge, and a final no-op. Every generic transfer edge retained all control counters at zero; the N=3, N=4, and N=8 no-ops retained 36, 62, and 228 passing contacts with all 11 counters zero. The control path separately places a zero-contact epoch-two Ping publication before Event forwarding, then uses four more stopped-state barriers to deliver Ping to node 0, publish causal Pong without a peer or contact, move Pong to the relay, and return it to node 2. Retained child logs disclose zero, five, ten, and 109 stderr lines respectively; all 109 control-run lines arise inside required denial cohorts, so these are not zero-error claims. The captured-node phase still has stale local signing material because exclusion is not destruction. Separately, a live-child zeroize CLI completed bounded software erasure in 0.074759 seconds, retained two owner-only zero-length secret pathnames and all audited rows, and blocked restored credentials through the retained terminal database. A distinct abrupt-post-marker integration child proved bounded cleanup resumption. This does not establish physical sanitization, inode deletion, database rollback protection, non-Unix support, or remote zeroization. Provisioning remains unprotected-reference, and one-host loopback is not physical or scale evidence. State, Record, Blob, finite-TTL custody, generalized applications/control administration, repeated multi-scope rekey, NAT/hosted relay, BTLE, independent interoperability/review, physical acceptance, and any required FIPS boundary remain open. Dependency admission is also blocked pending exact CDLA-Permissive-2.0 and Unlicense dispositions plus a supported-target decision; no exception was silently added.</p>
+            <p>The retained parent PR-A/pre-subscription Iroh/redb/Negentropy composition passed N=3/13-process, default N=4/18-process, and N=8/38-process Ping/Pong runs plus an explicit N=4/23-process control run. The generic line uses 2N+1 causal cohorts and 5N-2 children: isolated peerless Ping publication, one exact pre-existing Event transfer per forward edge, isolated peerless causal Pong publication, one exact Pong transfer per return edge, and a final no-op. Every generic transfer edge retained all control counters at zero; the N=3, N=4, and N=8 no-ops retained 36, 62, and 228 passing contacts with all 11 counters zero. The control path separately places a zero-contact epoch-two Ping publication before Event forwarding, then uses four more stopped-state barriers to deliver Ping to node 0, publish causal Pong without a peer or contact, move Pong to the relay, and return it to node 2. Retained child logs disclose zero, five, ten, and 109 stderr lines respectively; all 109 control-run lines arise inside required denial cohorts, so these are not zero-error claims. A separate current-code bounded runtime test proves protected receiver-directed Event filtering: subscribed <code>beta</code> transfers while authorized-unsubscribed <code>alpha</code> does not, and empty durable selectors receive nothing. That is same-implementation in-process evidence, not a new real-process acceptance receipt or a relabeling of the parent roots. The captured-node phase still has stale local signing material because exclusion is not destruction. Separately, the parent-snapshot live-child zeroize CLI completed bounded software erasure in 0.074759 seconds, retained two owner-only zero-length secret pathnames and all audited rows, and blocked restored credentials through the retained terminal database. A distinct abrupt-post-marker integration child proved bounded cleanup resumption. This does not establish physical sanitization, inode deletion, database rollback protection, non-Unix support, or remote zeroization. Provisioning remains unprotected-reference, and one-host loopback is not physical or scale evidence. State, Record, Blob, finite-TTL custody, live applications/control administration, repeated multi-scope lifecycle, NAT/hosted relay, BTLE, independent interoperability/review, physical acceptance, and any required FIPS boundary remain open. Dependency admission is also blocked pending exact CDLA-Permissive-2.0 and Unlicense dispositions plus a supported-target decision; no exception was silently added.</p>
             <div style="display: flex; gap: 24px; flex-wrap: wrap; font-weight: 600;">
               <a href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/implementation/requirements-status.md">Production requirements status →</a>
               <a href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/architecture.md">Selected architecture →</a>

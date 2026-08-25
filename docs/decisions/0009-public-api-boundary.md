@@ -84,23 +84,54 @@ publish reviewed output through explicit `resolve()`. This prevents
 peer-triggered ingestion from creating recursive merge publications and leaves
 requirements §5.3 automatic merge partial pending a convergent design.
 
-## Selected production-lane Event foundation (2026-08-24)
+## Selected production-lane Event slices (2026-08-24)
 
 `aster-node::application::SelectedEventNode` is the first high-level surface
 over the selected redb/runtime security composition. It owns the exact
 mission-bound redb writer authority while the mesh process is stopped and
 exposes arbitrary policy-authorized Event publication and bounded
 marker-ordered query. Publication is durably idempotent by an application
-operation key.
+operation key. A stacked slice adds durable Consume subscriptions, bounded
+at-least-once poll attempts, and idempotent semantic-Event acknowledgement.
 Queries return freshly source/content-verified plaintext application fields and
 semantic Event identities; they omit exact transfer IDs, sealed bytes, keys,
 provider selection, inventories, reconciliation, and carrier choice.
 
-This foundation does not replace the broader proven semantic `ApplicationNode`
-or complete the accepted boundary. It has no durable subscribe/poll/ack
-delivery, public authenticated gap inspection, subscription-aware replication
-filter, live actor handle, peer/sync status, State, Record, Blob, bindings,
-protected operational provisioning, or
+Subscription filters are durable receive intent, not capabilities. The live
+runtime projects Consume plus internal route-only Carry selectors into a
+canonical mission-protected interest, where an empty set means receive-none.
+For overlapping local selectors, Consume dominates Carry so forwarding intent
+cannot suppress an otherwise authorized application delivery.
+Legacy selected stores migrate with an empty selector set and therefore also
+receive nothing until explicit local intent is created; there is no wildcard
+compatibility fallback or pre-interest Event inventory.
+Each contact reconciles a separate exact-ID universe for each receiver and
+rechecks source, active control/epoch state, negotiated interest, and current
+route authority before transfer or commit. Poll discovery scans unfiltered
+acceptance rows so stored header metadata cannot suppress fresh source
+verification before the durable cursor advances. The selected surface exposes
+only fixed, sanitized error categories rather than store, envelope, provider,
+carrier, or transfer details.
+
+The mission channel protects selector names from outside observers, but an
+authenticated mission peer can read their topic/scope values under the current
+membership-visible forwarding-metadata policy. Route checks still withhold
+unauthorized Event identities and bytes. Scope-private subscription intent is
+a separate future opaque-selector boundary, not a claim of this slice.
+
+`aster-redb-store` remains an unpublished, privileged composition crate. Its
+two-phase poll plan and commit-selection types carry trusted classifications
+from the selected node; they do not mint or prove cryptographic authority on
+their own. Calling those methods directly is inside Aster's in-process trusted
+computing base, just like the broader `adapter-sdk` seams above. The supported
+application boundary is `SelectedEventNode`, which freshly authenticates every
+planned row, opens content only for authorized Consume deliveries, and returns
+only sanitized application records and errors.
+
+These slices do not replace the broader proven semantic `ApplicationNode` or
+complete the accepted boundary. They have no subscription update/delete,
+public authenticated gap inspection, live actor handle, peer/sync status,
+State, Record, Blob, bindings, protected operational provisioning, or
 generalized control administration. Finite TTL is absent and therefore cannot
 be requested until authenticated cumulative forwarding age and expiry exist.
 The compiled example and exact claim boundary are documented in the

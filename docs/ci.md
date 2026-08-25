@@ -39,15 +39,30 @@ mechanically: required selected crates and `reference-session` must remain
 reachable, while `sqlite-store`, `adapter-sdk`, SQLite packages, the legacy
 host/IP runtime, the lab, and the libp2p pilot must remain absent.
 
-The 2026-08-24 frozen-tree run passed 336 `aster-core`, 57 redb-store, 48
-node-library, six node-binary, and ten node-integration tests plus doc tests.
+The retained parent PR-A/pre-subscription 2026-08-24 frozen-tree run passed 336
+`aster-core`, 57 redb-store, 48 node-library, six node-binary, and ten
+node-integration tests plus doc tests.
 Formatting, Clippy with warnings denied, current-toolchain workspace validation,
 and the Rust 1.91 every-target/every-feature check passed. Five bounded fuzz
 targets completed 10,000 cases each (50,000 total) without a finding. These
-counts are execution evidence, not release authorization.
+counts are execution evidence for that parent snapshot, not PR-B/current-tree
+evidence or release authorization.
 
-The 57th redb-store cell is a Unix writable-open durability adversary. Every
-new or existing writer, including a terminal cleanup handle, must synchronize
+PR B adds a separate selected Event subscription gate. Store tests cover
+partial/wrong-kind migration, corrupt and terminal-open handling, canonical
+Consume/Carry projection and selector revision, idempotent subscription replay
+and conflict, attempts across reopen, idempotent semantic-ID acknowledgement,
+gap delivery, zero-match cursor advance, inactive-pending retirement, and stale
+plan/policy rejection. Frame tests enforce a maximum of 256 canonical selectors
+and empty-as-receive-none. Application/runtime tests freshly source/content
+verify poll candidates and prove that protected receiver interest transfers
+subscribed `beta`, withholds authorized-unsubscribed `alpha`, and transfers
+nothing when the durable selector set is empty. These are current code/test
+claims only; no retained real-process PR-B root is identified here.
+
+The 57th test in that parent redb-store receipt is a Unix writable-open
+durability adversary. Every new or existing writer, including a terminal
+cleanup handle, must synchronize
 the exact retained parent directory before becoming usable. An injected sync
 failure exposes no Aster application table, and retry must pass a real barrier.
 This is bounded host/filesystem evidence, not non-Unix or physical power-loss
@@ -84,8 +99,9 @@ A pass must finish with
 `emitted_by=running-node-processes`, `restarts=pass`, `atomic_reaction=pass`,
 `equal_inventory_noop=pass`, `transfers_each=2`,
 `semantics=source-authenticated-event`, `payload_blind_relays=pass`, and
-`ttl=durable-none`. The 2026-08-24 frozen-tree N3, default N4, and N8 observed
-loopback results and their exact claim boundaries are recorded in
+`ttl=durable-none`. The retained parent PR-A/pre-subscription 2026-08-24 N3,
+default N4, and N8 observed loopback results and their exact claim boundaries
+are recorded in
 the [mesh CLI quickstart](quickstart/mesh-cli.md) and [requirements
 status](implementation/requirements-status.md). Unit-test or demo success does
 not override dependency-policy failure and does not authorize a production
@@ -147,8 +163,9 @@ copy-on-write sanitization, snapshot/swap/backup destruction, redb
 rollback/replacement resistance, non-Unix support, remote triggering, or
 independent platform assurance.
 
-A separate retained same-tree probe exercised the Event/mission boundary across
-eight loopback nodes and 38 child processes in 17 causal cohorts. It is a manual
+A separate retained parent PR-A/pre-subscription probe exercised the
+Event/mission boundary across eight loopback nodes and 38 child processes in 17
+causal cohorts. It is a manual
 receipt, not a CI lane; seven nonempty stderr files preserve ten transient
 duplicate-contact or connection-loss lines from the final no-op despite the
 exact terminal convergence pass. All 228 passing no-op contacts reported all
@@ -169,8 +186,11 @@ ordering and pending gaps, atomic commit-before-activate, restart activation
 replay, stale/revoked rejection, peer scope-route filtering, and durable
 reaction replay. The real-process tests require successful protected contacts
 on every eligible line edge and the expected failure on captured-node edges.
-They remain bounded to Event, one control family/scope, and loopback; they do not
-claim State/Record/Blob, generalized subscriptions/applications or control
+They remain bounded to Event, one control family/scope, and loopback. The
+current code additionally has durable Event Consume/Carry selectors,
+stopped-state poll/ack, and protected receiver-directed filtering; it does not
+turn the retained parent roots into PR-B receipts. The tests do not claim
+State/Record/Blob, a live generalized application/status surface or control
 administration, finite-TTL custody, protected provisioning, platform-complete
 zeroization assurance, admitted release cryptography, independent review, or
 physical-network acceptance.

@@ -1558,6 +1558,22 @@ impl ReferenceEnvelopeSealer {
         <Self as EnvelopeSealer>::peer_can_route(self, peer, peer_route_commitments, scope, epoch)
     }
 
+    /// Reports whether this node owns the exact route capability for an Event scope epoch.
+    ///
+    /// This exposes only a high-level authorization decision. Route key bytes and
+    /// provider handles remain private.
+    pub fn can_route_event(&self, scope: &Scope, epoch: u64) -> bool {
+        self.route_grant(scope, epoch).is_some()
+    }
+
+    /// Reports whether this node can open Event content for an exact topic and scope epoch.
+    ///
+    /// This exposes only a high-level authorization decision. Content key bytes
+    /// and provider handles remain private.
+    pub fn can_open_event_content(&self, scope: &Scope, topic: &Topic, epoch: u64) -> bool {
+        self.content_grant(scope, topic, epoch).is_some()
+    }
+
     /// Verifies an opaque authority-signed public registry and resolves only
     /// high-level recipient identities/topic grants into a private fresh-rekey
     /// plan. No issuing seed, private recipient key, or generated scope key
@@ -7584,6 +7600,10 @@ mod tests {
         assert_eq!(publisher.identity(), reopened_publisher.identity());
         assert_ne!(publisher.identity(), reader.identity());
         assert!(relay.is_route_only(&scope("alpha"), &topic("ops"), 0));
+        assert!(relay.can_route_event(&scope("alpha"), 0));
+        assert!(!relay.can_open_event_content(&scope("alpha"), &topic("ops"), 0));
+        assert!(publisher.can_route_event(&scope("alpha"), 0));
+        assert!(publisher.can_open_event_content(&scope("alpha"), &topic("ops"), 0));
 
         let metadata = header(publisher.identity(), 0);
         let first = publisher
@@ -7774,6 +7794,8 @@ mod tests {
         assert_eq!(target.credential.roles & ROLE_RELAY, 0);
         assert_ne!(target.credential.roles & ROLE_READER, 0);
         assert!(target.is_content_only(&scope("alpha"), &topic("ops"), 7));
+        assert!(!target.can_route_event(&scope("alpha"), 7));
+        assert!(target.can_open_event_content(&scope("alpha"), &topic("ops"), 7));
         let source_header = header(publisher.identity(), 7);
         let source = publisher
             .seal(SealRequest {

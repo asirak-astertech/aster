@@ -66,6 +66,14 @@ const EVENT_HIGH_WATER: TableDefinition<&[u8], u64> =
     TableDefinition::new("aster.event-high-water.v1");
 const EVENT_OPERATIONS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.event-operations.v1");
+// Durable application selectors and pending at-least-once deliveries are a
+// single schema group. A selector is intent, never content or route authority.
+const EVENT_SUBSCRIPTIONS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("aster.semantic-event-subscriptions.v1");
+const EVENT_SUBSCRIPTION_PENDING: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("aster.semantic-event-delivery-pending.v1");
+const EVENT_DELIVERY_ACKNOWLEDGEMENTS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("aster.semantic-event-delivery-acknowledgements.v1");
 const ROUTE_CACHE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.route-event-cache.v1");
 const ROUTE_CACHE_CLAIMS: TableDefinition<&[u8], &[u8]> =
@@ -78,6 +86,10 @@ const SEMANTIC_TOTAL_BYTES: &str = "semantic_event_total_bytes";
 const LAST_SEMANTIC_ACCEPTANCE_MARKER: &str = "last_semantic_acceptance_marker";
 const ROUTE_CACHE_ITEM_COUNT: &str = "route_event_cache_item_count";
 const ROUTE_CACHE_TOTAL_BYTES: &str = "route_event_cache_total_bytes";
+const EVENT_SUBSCRIPTION_COUNT: &str = "semantic_event_subscription_count";
+const EVENT_PENDING_DELIVERY_COUNT: &str = "semantic_event_pending_delivery_count";
+const EVENT_ACKNOWLEDGEMENT_COUNT: &str = "semantic_event_acknowledgement_count";
+const EVENT_SELECTOR_REVISION: &str = "semantic_event_selector_revision";
 
 // Mission controls use their own exact-transfer namespace. A control becomes
 // applied only when one redb transaction moves it from CONTROL_PENDING into the
@@ -132,6 +144,10 @@ const MAX_ZEROIZATION_RECORD_BYTES: usize =
 
 const EVENT_METADATA_VERSION: u8 = 1;
 const EVENT_OPERATION_VERSION: u8 = 1;
+const EVENT_SUBSCRIPTION_VERSION: u8 = 1;
+const EVENT_PENDING_DELIVERY_VERSION: u8 = 1;
+const EVENT_ACKNOWLEDGEMENT_VERSION: u8 = 1;
+const EVENT_SUBSCRIPTION_ID_DOMAIN: &[u8] = b"aster/event-subscription-id/v1";
 const CONTROL_METADATA_VERSION: u8 = 1;
 const CONTROL_RESERVATION_VERSION: u8 = 1;
 const CONTROL_PUBLICATION_INTENT_VERSION: u8 = 1;
@@ -141,6 +157,18 @@ const CONTROL_HEAD_VERSION: u8 = 1;
 pub const MAX_EVENT_PAGE: usize = 1_024;
 /// Maximum byte length of one application operation key.
 pub const MAX_EVENT_OPERATION_KEY_BYTES: usize = 256;
+/// Maximum byte length of one durable Event subscription operation key.
+pub const MAX_EVENT_SUBSCRIPTION_KEY_BYTES: usize = 256;
+/// Maximum durable Consume plus Carry selectors in one mission-bound store.
+pub const MAX_EVENT_SUBSCRIPTIONS: u64 = 256;
+/// Maximum application deliveries returned by one Event poll.
+pub const MAX_EVENT_POLL_DELIVERIES: usize = 128;
+/// Maximum accepted or pending rows freshly verified by one Event poll.
+pub const MAX_EVENT_SUBSCRIPTION_SCAN: usize = MAX_EVENT_PAGE;
+/// Dedicated hard cap for unacknowledged Event deliveries across subscriptions.
+pub const MAX_EVENT_PENDING_DELIVERIES: u64 = 262_144;
+/// Hard cap for durable idempotent Event acknowledgement receipts.
+pub const MAX_EVENT_ACKNOWLEDGEMENT_RECEIPTS: u64 = 262_144;
 const MAX_LOGICAL_KEY_BYTES: usize = 4 * 1024;
 /// Maximum route-verified, content-unopened source representations retained per store.
 pub const MAX_ROUTE_CACHE_ITEMS: u64 = 1_024;
@@ -704,6 +732,293 @@ impl EventOperationKey {
     }
 }
 
+/// Stable mission-local identity of one durable Event subscription.
+///
+/// The identifier is deterministically derived from the mission authority and
+/// application operation key. It carries no content, route, or policy authority.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct EventSubscriptionId([u8; 32]);
+
+impl EventSubscriptionId {
+    /// Constructs an identifier from complete durable bytes.
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the complete durable identifier bytes.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// Bounded application idempotency key for one Event subscription.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct EventSubscriptionKey(Vec<u8>);
+
+impl EventSubscriptionKey {
+    /// Validates one nonempty durable subscription key.
+    pub fn new(bytes: impl Into<Vec<u8>>) -> Result<Self, StoreError> {
+        let bytes = bytes.into();
+        if bytes.is_empty() || bytes.len() > MAX_EVENT_SUBSCRIPTION_KEY_BYTES {
+            return Err(StoreError::InvalidEventSubscriptionKey {
+                length: bytes.len(),
+            });
+        }
+        Ok(Self(bytes))
+    }
+
+    /// Returns the exact durable operation-key bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// Local effect requested for Events selected by a durable topic/scope filter.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum EventSubscriptionMode {
+    /// Replicate matching Events and deliver content-authorized Events to the application.
+    Consume,
+    /// Replicate matching Events for store-and-forward without application delivery.
+    Carry,
+}
+
+/// One durable Event receive selector.
+///
+/// This is local intent only. Callers must independently enforce current
+/// mission policy, route grants, source verification, and content grants.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct EventSubscriptionSpec {
+    /// Whether matching Events are application-delivered or retained only for forwarding.
+    pub mode: EventSubscriptionMode,
+    /// Exact selected topic.
+    pub topic: Topic,
+    /// Exact selected scope or ancestor scope when descendants are enabled.
+    pub scope: Scope,
+    /// Whether descendant scopes are included in addition to the exact scope.
+    pub include_descendant_scopes: bool,
+}
+
+impl EventSubscriptionSpec {
+    fn matches(&self, event: &StoredEvent) -> bool {
+        self.topic == event.header.topic
+            && if self.include_descendant_scopes {
+                self.scope.contains(&event.header.scope)
+            } else {
+                self.scope == event.header.scope
+            }
+    }
+
+    fn replication_selector(&self) -> EventReplicationSelector {
+        EventReplicationSelector {
+            topic: self.topic.clone(),
+            scope: self.scope.clone(),
+            include_descendant_scopes: self.include_descendant_scopes,
+            mode: self.mode,
+        }
+    }
+}
+
+/// Canonical peer-interest projection with its effective local delivery mode.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct EventReplicationSelector {
+    /// Exact requested topic.
+    pub topic: Topic,
+    /// Exact requested scope or ancestor scope when descendants are enabled.
+    pub scope: Scope,
+    /// Whether descendant scopes are included in addition to the exact scope.
+    pub include_descendant_scopes: bool,
+    mode: EventSubscriptionMode,
+}
+
+impl EventReplicationSelector {
+    /// Effective local mode for this exact canonical selector projection.
+    ///
+    /// When multiple durable rows have the same projection, Consume dominates
+    /// Carry. Call [`EventReplicationPolicySnapshot::effective_mode`] when
+    /// different selector projections may overlap for one Event.
+    pub const fn mode(&self) -> EventSubscriptionMode {
+        self.mode
+    }
+
+    /// Returns whether a freshly source-verified Event is within this receive intent.
+    pub fn matches(&self, topic: &Topic, scope: &Scope) -> bool {
+        &self.topic == topic
+            && if self.include_descendant_scopes {
+                self.scope.contains(scope)
+            } else {
+                &self.scope == scope
+            }
+    }
+}
+
+/// Exact control and receive-selector state captured in one redb read transaction.
+///
+/// Empty `selectors` means receive-none. Persisted selectors remain intent,
+/// not authority; runtime code must intersect them with authenticated route policy.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventReplicationPolicySnapshot {
+    control: ControlPolicySnapshot,
+    selector_revision: u64,
+    selectors: Vec<EventReplicationSelector>,
+}
+
+impl EventReplicationPolicySnapshot {
+    /// Exact settled control policy captured with the selector projection.
+    pub const fn control_policy(&self) -> &ControlPolicySnapshot {
+        &self.control
+    }
+
+    /// Revision advances on every new durable subscription insertion.
+    ///
+    /// An idempotent exact retry does not advance it. A distinct subscription
+    /// advances it even when its projected topic/scope union is unchanged, so
+    /// an in-flight Event guard always observes the durable intent mutation.
+    pub const fn selector_revision(&self) -> u64 {
+        self.selector_revision
+    }
+
+    /// Canonically sorted unique receive selectors. Empty means receive-none.
+    pub fn selectors(&self) -> &[EventReplicationSelector] {
+        &self.selectors
+    }
+
+    /// Returns the effective local mode for a freshly source-verified Event.
+    ///
+    /// `None` means receive-none. Consume dominates Carry whenever any
+    /// overlapping canonical selector requests application delivery. This is
+    /// read-only local intent and cannot expand route or content authority.
+    pub fn effective_mode(&self, topic: &Topic, scope: &Scope) -> Option<EventSubscriptionMode> {
+        let mut matched = None;
+        for selector in &self.selectors {
+            if !selector.matches(topic, scope) {
+                continue;
+            }
+            if selector.mode == EventSubscriptionMode::Consume {
+                return Some(EventSubscriptionMode::Consume);
+            }
+            matched = Some(EventSubscriptionMode::Carry);
+        }
+        matched
+    }
+}
+
+/// Result of idempotently creating one durable Event subscription.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EventSubscriptionCreateOutcome {
+    /// Stable mission-local subscription identity.
+    pub id: EventSubscriptionId,
+    /// True only when this call inserted the durable row.
+    pub inserted: bool,
+}
+
+/// Existing unacknowledged Event returned for fresh verification before poll commit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventPendingDeliveryCandidate {
+    /// Exact accepted Event requiring fresh source and content verification.
+    pub event: StoredEvent,
+    /// Last durably committed attempt; commit increments it before returning delivery.
+    pub previous_attempt: u64,
+}
+
+/// Bounded structural poll plan which confers no source or content authority.
+///
+/// Before committing, the selected node must freshly source-verify every
+/// `pending` and `scanned` Event, content-open every selected delivery, and
+/// classify verified inactive pending Events for retirement. Commit rechecks
+/// policy, cursor, pending attempts, and the exact structural selection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventSubscriptionPollPlan {
+    subscription: EventSubscriptionId,
+    spec: EventSubscriptionSpec,
+    expected_discovered_through: u64,
+    pending: Vec<EventPendingDeliveryCandidate>,
+    scanned: Vec<StoredEvent>,
+    scanned_through: u64,
+    delivery_limit: usize,
+    has_more: bool,
+}
+
+impl EventSubscriptionPollPlan {
+    /// Stable identity of the planned subscription.
+    pub const fn subscription(&self) -> EventSubscriptionId {
+        self.subscription
+    }
+
+    /// Exact durable selector observed by the plan transaction.
+    pub const fn spec(&self) -> &EventSubscriptionSpec {
+        &self.spec
+    }
+
+    /// Durable cursor before the unfiltered acceptance scan.
+    pub const fn discovered_through(&self) -> u64 {
+        self.expected_discovered_through
+    }
+
+    /// Marker-ordered unacknowledged candidates requiring fresh verification.
+    pub fn pending_candidates(&self) -> &[EventPendingDeliveryCandidate] {
+        &self.pending
+    }
+
+    /// Unfiltered acceptance-order rows which must all be freshly source-verified.
+    pub fn scanned_candidates(&self) -> &[StoredEvent] {
+        &self.scanned
+    }
+
+    /// Last acceptance marker included in the unfiltered scan.
+    pub const fn scanned_through(&self) -> u64 {
+        self.scanned_through
+    }
+
+    /// Whether bounded preparation observed undiscovered or unplanned pending work.
+    pub const fn has_more(&self) -> bool {
+        self.has_more
+    }
+}
+
+/// Privileged unpublished-store composition input after fresh node verification.
+///
+/// This type is deliberately not a type-enforced cryptographic capability.
+/// `aster-node` must freshly source/content verify the complete poll plan before
+/// constructing it. Commit only rechecks durable policy and the exact structural
+/// active/inactive classification; using this seam from an untrusted caller is
+/// outside the crate's security boundary.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct EventSubscriptionPollSelection {
+    /// Exact active matching semantic IDs, pending first then newly scanned.
+    pub deliveries: Vec<EventSemanticId>,
+    /// Exact inactive pending semantic IDs, in pending-candidate order.
+    pub inactive_pending: Vec<EventSemanticId>,
+}
+
+/// One at-least-once Event delivery attempt committed before application return.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventSubscriptionDelivery {
+    /// Exact accepted Event for this committed attempt.
+    pub event: StoredEvent,
+    /// Nonzero durable delivery-attempt number.
+    pub attempt: u64,
+}
+
+/// Result of one bounded Event subscription poll commit.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct EventSubscriptionDeliveryPage {
+    /// Marker-ordered attempts committed before return.
+    pub deliveries: Vec<EventSubscriptionDelivery>,
+    /// Durable discovery cursor committed by this page.
+    pub scanned_through: u64,
+    /// Whether preparation observed bounded work beyond this page.
+    pub has_more: bool,
+}
+
+/// Idempotent acknowledgement result for one semantic Event delivery.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EventDeliveryAck {
+    /// This call atomically removed the pending delivery row.
+    Acknowledged,
+    /// An exact durable acknowledgement receipt already exists.
+    AlreadyAcknowledged,
+}
+
 /// Optimistic Event publication reservation derived only from durable ledgers.
 ///
 /// Sealing may occur after this value is returned. Commit rechecks both high
@@ -1015,6 +1330,19 @@ pub struct EventStoreStats {
     pub route_cached_bytes: u64,
 }
 
+/// Consistent durable counts for Event selectors and application deliveries.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EventSubscriptionStats {
+    /// Consume plus Carry subscription rows.
+    pub subscriptions: u64,
+    /// Unacknowledged application delivery rows.
+    pub pending_deliveries: u64,
+    /// Durable idempotent acknowledgement receipts.
+    pub acknowledged_deliveries: u64,
+    /// Revision advanced by each new subscription insertion.
+    pub selector_revision: u64,
+}
+
 /// Consistent counts for the mission-wide control namespace.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ControlStoreStats {
@@ -1192,6 +1520,8 @@ pub struct StoreInspection {
     pub stats: StoreStats,
     /// Mission-bound semantic Event and route-cache counts from the same read transaction.
     pub event_stats: EventStoreStats,
+    /// Event receive-selector and pending-delivery counts from the same transaction.
+    pub event_subscription_stats: EventSubscriptionStats,
     /// Mission-wide Flash control counts from the same audited read transaction.
     pub control_stats: ControlStoreStats,
     /// Stable mission authority binding, when this store has been provisioned.
@@ -1325,6 +1655,37 @@ pub enum StoreError {
         /// Maximum rows accepted in one request.
         maximum: usize,
     },
+    /// A durable Event subscription operation key was empty or over its bound.
+    InvalidEventSubscriptionKey {
+        /// Observed key length.
+        length: usize,
+    },
+    /// The dedicated durable Event subscription cap was reached.
+    EventSubscriptionLimitExceeded { current: u64, limit: u64 },
+    /// The dedicated unacknowledged Event delivery cap was reached.
+    EventPendingDeliveryLimitExceeded { current: u64, limit: u64 },
+    /// The durable Event acknowledgement-receipt cap was reached.
+    EventAcknowledgementReceiptLimitExceeded { current: u64, limit: u64 },
+    /// An Event subscription operation key was replayed with another specification.
+    EventSubscriptionConflict,
+    /// The requested durable Event subscription does not exist.
+    EventSubscriptionNotFound,
+    /// Carry selectors cannot be polled or acknowledged as application subscriptions.
+    EventSubscriptionNotConsumable,
+    /// One bounded Event subscription poll limit was invalid.
+    EventSubscriptionPollLimitExceeded { requested: usize, maximum: usize },
+    /// A prepared poll no longer matches the durable cursor or pending attempts.
+    EventSubscriptionPlanChanged,
+    /// A selected Event was never durably delivered by this subscription.
+    EventDeliveryNotFound,
+    /// The durable delivery-attempt counter is exhausted.
+    EventDeliveryAttemptExhausted,
+    /// The canonical receive-selector state changed or belongs to another store.
+    EventSelectorRevisionChanged,
+    /// The exact replication snapshot does not select this Event for receipt.
+    EventReplicationNotSelected,
+    /// The exact replication snapshot selects this Event only for Carry retention.
+    EventReplicationNotConsumable,
     /// A reactive predecessor was not an accepted semantic Event.
     MissingReactionPredecessor { semantic_id: EventSemanticId },
     /// A reaction reservation did not causally observe its accepted predecessor.
@@ -1519,6 +1880,52 @@ impl fmt::Display for StoreError {
                 formatter,
                 "Event page request {requested} exceeds maximum {maximum}"
             ),
+            Self::InvalidEventSubscriptionKey { length } => write!(
+                formatter,
+                "Event subscription key length {length} is outside 1..={MAX_EVENT_SUBSCRIPTION_KEY_BYTES}"
+            ),
+            Self::EventSubscriptionLimitExceeded { current, limit } => write!(
+                formatter,
+                "Event subscription count {current} is at dedicated limit {limit}"
+            ),
+            Self::EventPendingDeliveryLimitExceeded { current, limit } => write!(
+                formatter,
+                "pending Event delivery count {current} is at dedicated limit {limit}"
+            ),
+            Self::EventAcknowledgementReceiptLimitExceeded { current, limit } => write!(
+                formatter,
+                "Event acknowledgement receipt count {current} is at dedicated limit {limit}"
+            ),
+            Self::EventSubscriptionConflict => formatter
+                .write_str("Event subscription retry differs from its durable specification"),
+            Self::EventSubscriptionNotFound => {
+                formatter.write_str("durable Event subscription was not found")
+            }
+            Self::EventSubscriptionNotConsumable => {
+                formatter.write_str("Carry Event selector has no application delivery surface")
+            }
+            Self::EventSubscriptionPollLimitExceeded { requested, maximum } => write!(
+                formatter,
+                "Event subscription poll request {requested} exceeds maximum {maximum}"
+            ),
+            Self::EventSubscriptionPlanChanged => {
+                formatter.write_str("durable Event subscription poll state changed; prepare again")
+            }
+            Self::EventDeliveryNotFound => {
+                formatter.write_str("semantic Event was not delivered by this subscription")
+            }
+            Self::EventDeliveryAttemptExhausted => {
+                formatter.write_str("Event delivery attempt counter is exhausted")
+            }
+            Self::EventSelectorRevisionChanged => {
+                formatter.write_str("durable Event receive-selector state changed")
+            }
+            Self::EventReplicationNotSelected => {
+                formatter.write_str("exact Event replication snapshot selects receive-none")
+            }
+            Self::EventReplicationNotConsumable => {
+                formatter.write_str("exact Event replication snapshot selects Carry, not Consume")
+            }
             Self::MissingReactionPredecessor { .. } => {
                 formatter.write_str("reactive predecessor is not an accepted semantic Event")
             }
@@ -1688,6 +2095,22 @@ enum EventOrigin {
     Remote,
 }
 
+#[derive(Clone, Copy)]
+enum EventAdmissionGuard<'a> {
+    Current,
+    Control(&'a ControlPolicySnapshot),
+    Replication {
+        expected: &'a EventReplicationPolicySnapshot,
+        requirement: EventReplicationRequirement,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum EventReplicationRequirement {
+    Receive,
+    Consume,
+}
+
 struct PreparedEvent {
     mission_authority: NodeId,
     transfer_id: EventTransferId,
@@ -1782,6 +2205,25 @@ struct EventMetadata {
 struct OperationRecord {
     transfer_id: EventTransferId,
     predecessor: Option<EventSemanticId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EventSubscriptionRecord {
+    operation_key: EventSubscriptionKey,
+    spec: EventSubscriptionSpec,
+    discovered_through: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EventPendingDeliveryRecord {
+    semantic_id: EventSemanticId,
+    attempts: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EventAcknowledgementRecord {
+    acceptance_marker: u64,
+    attempts: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2459,6 +2901,704 @@ impl Store {
         let authority = self.require_bound_mission()?;
         let read = self.database.begin_read()?;
         control_policy_snapshot_read(&read, authority)
+    }
+
+    /// Captures settled control policy and the canonical receive-selector projection atomically.
+    ///
+    /// An empty selector slice means receive-none. The snapshot is a durable
+    /// consistency token only; it does not confer route or content authority.
+    pub fn event_replication_policy_snapshot(
+        &self,
+    ) -> Result<EventReplicationPolicySnapshot, StoreError> {
+        let authority = self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        let control = control_policy_snapshot_read(&read, authority)?;
+        let metadata = read.open_table(METADATA)?;
+        let selector_revision = metadata
+            .get(EVENT_SELECTOR_REVISION)?
+            .ok_or(StoreError::MissingAccountingMetadata {
+                field: EVENT_SELECTOR_REVISION,
+            })?
+            .value();
+        let subscriptions = read.open_table(EVENT_SUBSCRIPTIONS)?;
+        let mut effective_modes = std::collections::BTreeMap::new();
+        for row in subscriptions.iter()? {
+            let (_, value) = row?;
+            let selector = decode_event_subscription_record(value.value())?
+                .spec
+                .replication_selector();
+            let key = (
+                selector.topic.clone(),
+                selector.scope.clone(),
+                selector.include_descendant_scopes,
+            );
+            effective_modes
+                .entry(key)
+                .and_modify(|mode| {
+                    if selector.mode == EventSubscriptionMode::Consume {
+                        *mode = EventSubscriptionMode::Consume;
+                    }
+                })
+                .or_insert(selector.mode);
+        }
+        let selectors = effective_modes
+            .into_iter()
+            .map(
+                |((topic, scope, include_descendant_scopes), mode)| EventReplicationSelector {
+                    topic,
+                    scope,
+                    include_descendant_scopes,
+                    mode,
+                },
+            )
+            .collect();
+        Ok(EventReplicationPolicySnapshot {
+            control,
+            selector_revision,
+            selectors,
+        })
+    }
+
+    /// Rechecks a replication snapshot in one current read transaction.
+    pub fn require_event_replication_policy(
+        &self,
+        expected: &EventReplicationPolicySnapshot,
+    ) -> Result<(), StoreError> {
+        let authority = self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        require_control_policy_read(&read, authority, &expected.control)?;
+        let revision = read
+            .open_table(METADATA)?
+            .get(EVENT_SELECTOR_REVISION)?
+            .ok_or(StoreError::MissingAccountingMetadata {
+                field: EVENT_SELECTOR_REVISION,
+            })?
+            .value();
+        if revision != expected.selector_revision {
+            return Err(StoreError::EventSelectorRevisionChanged);
+        }
+        Ok(())
+    }
+
+    /// Returns structurally audited Event subscription counts.
+    pub fn event_subscription_stats(&self) -> Result<EventSubscriptionStats, StoreError> {
+        self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        event_subscription_stats_read(&read)
+    }
+
+    /// Idempotently creates one durable Consume or Carry Event selector.
+    pub fn create_event_subscription_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        key: &EventSubscriptionKey,
+        spec: EventSubscriptionSpec,
+    ) -> Result<EventSubscriptionCreateOutcome, StoreError> {
+        self.require_live()?;
+        let authority = self.require_bound_mission()?;
+        let id = event_subscription_id(authority, key);
+        let write = self.database.begin_write()?;
+        enforce_live_write(&write)?;
+        require_control_policy_write(&write, authority, policy)?;
+        let existing = write
+            .open_table(EVENT_SUBSCRIPTIONS)?
+            .get(id.as_bytes().as_slice())?
+            .map(|value| decode_event_subscription_record(value.value()))
+            .transpose()?;
+        if let Some(existing) = existing {
+            if existing.operation_key != *key || existing.spec != spec {
+                return Err(StoreError::EventSubscriptionConflict);
+            }
+            return Ok(EventSubscriptionCreateOutcome {
+                id,
+                inserted: false,
+            });
+        }
+
+        let current_count = {
+            let subscriptions = write.open_table(EVENT_SUBSCRIPTIONS)?;
+            for row in subscriptions.iter()? {
+                let (_, value) = row?;
+                decode_event_subscription_record(value.value())?;
+            }
+            subscriptions.len()?
+        };
+        if current_count >= MAX_EVENT_SUBSCRIPTIONS {
+            return Err(StoreError::EventSubscriptionLimitExceeded {
+                current: current_count,
+                limit: MAX_EVENT_SUBSCRIPTIONS,
+            });
+        }
+        let record = EventSubscriptionRecord {
+            operation_key: key.clone(),
+            spec,
+            discovered_through: 0,
+        };
+        let encoded = encode_event_subscription_record(&record)?;
+        write
+            .open_table(EVENT_SUBSCRIPTIONS)?
+            .insert(id.as_bytes().as_slice(), encoded.as_slice())?;
+        {
+            let mut metadata = write.open_table(METADATA)?;
+            let durable_count = metadata
+                .get(EVENT_SUBSCRIPTION_COUNT)?
+                .ok_or(StoreError::MissingAccountingMetadata {
+                    field: EVENT_SUBSCRIPTION_COUNT,
+                })?
+                .value();
+            if durable_count != current_count {
+                return Err(StoreError::AccountingMismatch {
+                    field: EVENT_SUBSCRIPTION_COUNT,
+                    durable: durable_count,
+                    reconstructed: current_count,
+                });
+            }
+            metadata.insert(
+                EVENT_SUBSCRIPTION_COUNT,
+                current_count
+                    .checked_add(1)
+                    .ok_or(StoreError::ItemCountAccountingOverflow)?,
+            )?;
+            let revision = metadata
+                .get(EVENT_SELECTOR_REVISION)?
+                .ok_or(StoreError::MissingAccountingMetadata {
+                    field: EVENT_SELECTOR_REVISION,
+                })?
+                .value();
+            metadata.insert(
+                EVENT_SELECTOR_REVISION,
+                revision
+                    .checked_add(1)
+                    .ok_or(StoreError::ItemCountAccountingOverflow)?,
+            )?;
+        }
+        write.commit()?;
+        Ok(EventSubscriptionCreateOutcome { id, inserted: true })
+    }
+
+    /// Prepares one bounded unfiltered verification plan for a Consume subscription.
+    ///
+    /// This read returns durable bytes and structural intent, never source or
+    /// content authority. The selected node must freshly authenticate every
+    /// pending and scanned candidate. Pending candidates precede newly scanned
+    /// candidates, and both groups are in acceptance-marker order.
+    pub fn prepare_event_subscription_poll_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        subscription: EventSubscriptionId,
+        delivery_limit: usize,
+        scan_limit: usize,
+    ) -> Result<EventSubscriptionPollPlan, StoreError> {
+        self.require_live()?;
+        let authority = self.require_bound_mission()?;
+        if delivery_limit == 0 || delivery_limit > MAX_EVENT_POLL_DELIVERIES {
+            return Err(StoreError::EventSubscriptionPollLimitExceeded {
+                requested: delivery_limit,
+                maximum: MAX_EVENT_POLL_DELIVERIES,
+            });
+        }
+        if scan_limit == 0 || scan_limit > MAX_EVENT_SUBSCRIPTION_SCAN {
+            return Err(StoreError::EventSubscriptionPollLimitExceeded {
+                requested: scan_limit,
+                maximum: MAX_EVENT_SUBSCRIPTION_SCAN,
+            });
+        }
+        let read = self.database.begin_read()?;
+        require_control_policy_read(&read, authority, policy)?;
+        let record = read
+            .open_table(EVENT_SUBSCRIPTIONS)?
+            .get(subscription.as_bytes().as_slice())?
+            .map(|value| decode_event_subscription_record(value.value()))
+            .transpose()?
+            .ok_or(StoreError::EventSubscriptionNotFound)?;
+        if record.spec.mode != EventSubscriptionMode::Consume {
+            return Err(StoreError::EventSubscriptionNotConsumable);
+        }
+
+        let mut pending_candidates = Vec::new();
+        let mut structurally_active = 0usize;
+        let mut pending_has_more = false;
+        let mut start = [0u8; 40];
+        start[..32].copy_from_slice(subscription.as_bytes());
+        let mut end = [0xffu8; 40];
+        end[..32].copy_from_slice(subscription.as_bytes());
+        {
+            let pending = read.open_table(EVENT_SUBSCRIPTION_PENDING)?;
+            let bounds = (
+                std::ops::Bound::Included(start.as_slice()),
+                std::ops::Bound::Included(end.as_slice()),
+            );
+            let mut rows = pending.range::<&[u8]>(bounds)?;
+            loop {
+                if pending_candidates.len() == scan_limit || structurally_active == delivery_limit {
+                    pending_has_more = rows.next().transpose()?.is_some();
+                    break;
+                }
+                let Some(row) = rows.next().transpose()? else {
+                    break;
+                };
+                let (key, value) = row;
+                let (row_subscription, marker) = parse_event_pending_delivery_key(key.value())?;
+                if row_subscription != subscription {
+                    return Err(StoreError::SemanticInvariant(
+                        "Event pending-delivery range escaped its subscription prefix",
+                    ));
+                }
+                let pending_record = decode_event_pending_delivery_record(value.value())?;
+                let event = load_event_by_semantic_from_read(&read, pending_record.semantic_id)?
+                    .ok_or(StoreError::SemanticInvariant(
+                        "pending Event delivery references a missing Event",
+                    ))?;
+                if event.acceptance_marker != marker
+                    || marker > record.discovered_through
+                    || !record.spec.matches(&event)
+                {
+                    return Err(StoreError::SemanticInvariant(
+                        "pending Event delivery differs from its subscription ledger",
+                    ));
+                }
+                if !event_is_inactive_read(&read, &event)? {
+                    structurally_active = structurally_active
+                        .checked_add(1)
+                        .ok_or(StoreError::ItemCountAccountingOverflow)?;
+                }
+                pending_candidates.push(EventPendingDeliveryCandidate {
+                    event,
+                    previous_attempt: pending_record.attempts,
+                });
+            }
+        }
+
+        let last_marker = read
+            .open_table(METADATA)?
+            .get(LAST_SEMANTIC_ACCEPTANCE_MARKER)?
+            .ok_or(StoreError::MissingAccountingMetadata {
+                field: LAST_SEMANTIC_ACCEPTANCE_MARKER,
+            })?
+            .value();
+        let mut scanned = Vec::new();
+        let mut scanned_through = record.discovered_through;
+        if !pending_has_more
+            && pending_candidates.len() < scan_limit
+            && structurally_active < delivery_limit
+        {
+            let acceptance_order = read.open_table(EVENT_ACCEPTANCE_ORDER)?;
+            let bounds = (
+                std::ops::Bound::Excluded(record.discovered_through),
+                std::ops::Bound::Unbounded,
+            );
+            let mut expected_marker = record.discovered_through.checked_add(1);
+            for row in acceptance_order.range(bounds)? {
+                if pending_candidates.len() + scanned.len() == scan_limit
+                    || structurally_active == delivery_limit
+                {
+                    break;
+                }
+                let (marker, transfer) = row?;
+                let marker = marker.value();
+                if expected_marker != Some(marker) {
+                    return Err(StoreError::SemanticInvariant(
+                        "Event subscription scan encountered a nonconsecutive marker",
+                    ));
+                }
+                let transfer = parse_transfer_id("Event acceptance-order table", transfer.value())?;
+                let event =
+                    load_event_from_read(&read, transfer)?.ok_or(StoreError::SemanticInvariant(
+                        "Event acceptance-order index points to a missing accepted Event",
+                    ))?;
+                if event.acceptance_marker != marker {
+                    return Err(StoreError::SemanticInvariant(
+                        "Event acceptance-order index differs from its forward marker",
+                    ));
+                }
+                scanned_through = marker;
+                expected_marker = marker.checked_add(1);
+                if record.spec.matches(&event) && !event_is_inactive_read(&read, &event)? {
+                    structurally_active = structurally_active
+                        .checked_add(1)
+                        .ok_or(StoreError::ItemCountAccountingOverflow)?;
+                }
+                scanned.push(event);
+            }
+        }
+        if scanned_through < last_marker
+            && !pending_has_more
+            && pending_candidates.len() + scanned.len() < scan_limit
+            && structurally_active < delivery_limit
+        {
+            return Err(StoreError::SemanticInvariant(
+                "Event subscription scan ended before the acceptance high-water",
+            ));
+        }
+        Ok(EventSubscriptionPollPlan {
+            subscription,
+            spec: record.spec,
+            expected_discovered_through: record.discovered_through,
+            pending: pending_candidates,
+            scanned,
+            scanned_through,
+            delivery_limit,
+            has_more: pending_has_more || scanned_through < last_marker,
+        })
+    }
+
+    /// Commits the exact freshly verified classification of one poll plan.
+    ///
+    /// This is a privileged unpublished-store composition seam, not a
+    /// type-enforced security capability. `aster-node` must construct
+    /// `selection` only after fresh source verification and content
+    /// authorization. The transaction atomically rechecks control policy,
+    /// subscription state, cursor, candidates, structural matching,
+    /// inactivity, and attempts, but cannot prove the caller performed those
+    /// cryptographic checks.
+    pub fn commit_event_subscription_poll_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        plan: &EventSubscriptionPollPlan,
+        selection: &EventSubscriptionPollSelection,
+    ) -> Result<EventSubscriptionDeliveryPage, StoreError> {
+        self.require_live()?;
+        let authority = self.require_bound_mission()?;
+        if plan.delivery_limit == 0
+            || plan.delivery_limit > MAX_EVENT_POLL_DELIVERIES
+            || plan.pending.len() + plan.scanned.len() > MAX_EVENT_SUBSCRIPTION_SCAN
+        {
+            return Err(StoreError::EventSubscriptionPlanChanged);
+        }
+        let write = self.database.begin_write()?;
+        enforce_live_write(&write)?;
+        require_control_policy_write(&write, authority, policy)?;
+        let mut subscription_record = write
+            .open_table(EVENT_SUBSCRIPTIONS)?
+            .get(plan.subscription.as_bytes().as_slice())?
+            .map(|value| decode_event_subscription_record(value.value()))
+            .transpose()?
+            .ok_or(StoreError::EventSubscriptionNotFound)?;
+        if subscription_record.spec.mode != EventSubscriptionMode::Consume {
+            return Err(StoreError::EventSubscriptionNotConsumable);
+        }
+        if subscription_record.spec != plan.spec
+            || subscription_record.discovered_through != plan.expected_discovered_through
+        {
+            return Err(StoreError::EventSubscriptionPlanChanged);
+        }
+
+        let mut required_deliveries = Vec::new();
+        let mut required_inactive = Vec::new();
+        let mut pending_attempts = std::collections::BTreeMap::new();
+        for candidate in &plan.pending {
+            let marker = candidate.event.acceptance_marker;
+            let key = event_pending_delivery_key(plan.subscription, marker);
+            let durable = write
+                .open_table(EVENT_SUBSCRIPTION_PENDING)?
+                .get(key.as_slice())?
+                .map(|value| decode_event_pending_delivery_record(value.value()))
+                .transpose()?
+                .ok_or(StoreError::EventSubscriptionPlanChanged)?;
+            let event = load_event_by_semantic_from_write(&write, durable.semantic_id)?
+                .ok_or(StoreError::EventSubscriptionPlanChanged)?;
+            if durable.semantic_id != candidate.event.semantic_id
+                || durable.attempts != candidate.previous_attempt
+                || event != candidate.event
+                || marker > subscription_record.discovered_through
+                || !subscription_record.spec.matches(&event)
+            {
+                return Err(StoreError::EventSubscriptionPlanChanged);
+            }
+            pending_attempts.insert(event.semantic_id, durable.attempts);
+            if event_is_inactive_write(&write, &event)? {
+                required_inactive.push(event.semantic_id);
+            } else {
+                required_deliveries.push(event.semantic_id);
+            }
+        }
+
+        let mut expected_marker = plan.expected_discovered_through.checked_add(1);
+        let mut durable_scanned = Vec::new();
+        if plan.scanned_through < plan.expected_discovered_through {
+            return Err(StoreError::EventSubscriptionPlanChanged);
+        }
+        if plan.scanned_through > plan.expected_discovered_through {
+            let acceptance_order = write.open_table(EVENT_ACCEPTANCE_ORDER)?;
+            let bounds = (
+                std::ops::Bound::Excluded(plan.expected_discovered_through),
+                std::ops::Bound::Included(plan.scanned_through),
+            );
+            for row in acceptance_order.range(bounds)? {
+                let (marker, transfer) = row?;
+                let marker = marker.value();
+                if expected_marker != Some(marker) {
+                    return Err(StoreError::EventSubscriptionPlanChanged);
+                }
+                let transfer = parse_transfer_id("Event acceptance-order table", transfer.value())?;
+                let event = load_event_from_write(&write, transfer)?
+                    .ok_or(StoreError::EventSubscriptionPlanChanged)?;
+                if event.acceptance_marker != marker {
+                    return Err(StoreError::EventSubscriptionPlanChanged);
+                }
+                expected_marker = marker.checked_add(1);
+                if subscription_record.spec.matches(&event)
+                    && !event_is_inactive_write(&write, &event)?
+                {
+                    required_deliveries.push(event.semantic_id);
+                }
+                durable_scanned.push(event);
+            }
+        }
+        if durable_scanned != plan.scanned
+            || required_deliveries != selection.deliveries
+            || required_inactive != selection.inactive_pending
+            || required_deliveries.len() > plan.delivery_limit
+        {
+            return Err(StoreError::EventSubscriptionPlanChanged);
+        }
+
+        let durable_pending_count = write
+            .open_table(METADATA)?
+            .get(EVENT_PENDING_DELIVERY_COUNT)?
+            .ok_or(StoreError::MissingAccountingMetadata {
+                field: EVENT_PENDING_DELIVERY_COUNT,
+            })?
+            .value();
+        let current_acceptance_high_water = write
+            .open_table(METADATA)?
+            .get(LAST_SEMANTIC_ACCEPTANCE_MARKER)?
+            .ok_or(StoreError::MissingAccountingMetadata {
+                field: LAST_SEMANTIC_ACCEPTANCE_MARKER,
+            })?
+            .value();
+        let actual_pending_count = write.open_table(EVENT_SUBSCRIPTION_PENDING)?.len()?;
+        if durable_pending_count != actual_pending_count {
+            return Err(StoreError::AccountingMismatch {
+                field: EVENT_PENDING_DELIVERY_COUNT,
+                durable: durable_pending_count,
+                reconstructed: actual_pending_count,
+            });
+        }
+        let inactive_count = u64::try_from(required_inactive.len())
+            .map_err(|_| StoreError::ItemCountAccountingOverflow)?;
+        let new_delivery_count = required_deliveries
+            .iter()
+            .filter(|semantic_id| !pending_attempts.contains_key(semantic_id))
+            .count();
+        let new_delivery_count = u64::try_from(new_delivery_count)
+            .map_err(|_| StoreError::ItemCountAccountingOverflow)?;
+        let final_pending_count = durable_pending_count
+            .checked_sub(inactive_count)
+            .ok_or(StoreError::SemanticInvariant(
+                "inactive Event delivery retirement underflows accounting",
+            ))?
+            .checked_add(new_delivery_count)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        if final_pending_count > MAX_EVENT_PENDING_DELIVERIES {
+            return Err(StoreError::EventPendingDeliveryLimitExceeded {
+                current: final_pending_count,
+                limit: MAX_EVENT_PENDING_DELIVERIES,
+            });
+        }
+
+        {
+            let mut pending = write.open_table(EVENT_SUBSCRIPTION_PENDING)?;
+            for semantic_id in &required_inactive {
+                let event = plan
+                    .pending
+                    .iter()
+                    .find(|candidate| candidate.event.semantic_id == *semantic_id)
+                    .ok_or(StoreError::EventSubscriptionPlanChanged)?;
+                let key =
+                    event_pending_delivery_key(plan.subscription, event.event.acceptance_marker);
+                if pending.remove(key.as_slice())?.is_none() {
+                    return Err(StoreError::EventSubscriptionPlanChanged);
+                }
+            }
+        }
+
+        let mut deliveries = Vec::with_capacity(required_deliveries.len());
+        for semantic_id in &required_deliveries {
+            let event = plan
+                .pending
+                .iter()
+                .map(|candidate| &candidate.event)
+                .chain(plan.scanned.iter())
+                .find(|event| event.semantic_id == *semantic_id)
+                .cloned()
+                .ok_or(StoreError::EventSubscriptionPlanChanged)?;
+            let attempt = match pending_attempts.get(semantic_id) {
+                Some(previous) => previous
+                    .checked_add(1)
+                    .ok_or(StoreError::EventDeliveryAttemptExhausted)?,
+                None => 1,
+            };
+            let key = event_pending_delivery_key(plan.subscription, event.acceptance_marker);
+            let encoded = encode_event_pending_delivery_record(EventPendingDeliveryRecord {
+                semantic_id: *semantic_id,
+                attempts: attempt,
+            });
+            write
+                .open_table(EVENT_SUBSCRIPTION_PENDING)?
+                .insert(key.as_slice(), encoded.as_slice())?;
+            deliveries.push(EventSubscriptionDelivery { event, attempt });
+        }
+
+        subscription_record.discovered_through = plan.scanned_through;
+        let encoded_subscription = encode_event_subscription_record(&subscription_record)?;
+        write.open_table(EVENT_SUBSCRIPTIONS)?.insert(
+            plan.subscription.as_bytes().as_slice(),
+            encoded_subscription.as_slice(),
+        )?;
+        write
+            .open_table(METADATA)?
+            .insert(EVENT_PENDING_DELIVERY_COUNT, final_pending_count)?;
+        write.commit()?;
+        Ok(EventSubscriptionDeliveryPage {
+            deliveries,
+            scanned_through: plan.scanned_through,
+            has_more: plan.has_more || plan.scanned_through < current_acceptance_high_water,
+        })
+    }
+
+    /// Idempotently acknowledges one semantic Event delivery.
+    ///
+    /// A first acknowledgement succeeds only while the exact pending-delivery
+    /// row exists. It atomically replaces that row with a bounded durable
+    /// receipt. Exact retries consult the receipt directly; merely discovered,
+    /// inactive, missing, or structurally matching Events without either proof
+    /// fail closed.
+    pub fn acknowledge_event_delivery_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        subscription: EventSubscriptionId,
+        semantic_id: EventSemanticId,
+    ) -> Result<EventDeliveryAck, StoreError> {
+        self.require_live()?;
+        let authority = self.require_bound_mission()?;
+        let write = self.database.begin_write()?;
+        enforce_live_write(&write)?;
+        require_control_policy_write(&write, authority, policy)?;
+        let record = write
+            .open_table(EVENT_SUBSCRIPTIONS)?
+            .get(subscription.as_bytes().as_slice())?
+            .map(|value| decode_event_subscription_record(value.value()))
+            .transpose()?
+            .ok_or(StoreError::EventSubscriptionNotFound)?;
+        if record.spec.mode != EventSubscriptionMode::Consume {
+            return Err(StoreError::EventSubscriptionNotConsumable);
+        }
+        let acknowledgement_key = event_acknowledgement_key(subscription, semantic_id);
+        let durable_acknowledgement_count = write
+            .open_table(METADATA)?
+            .get(EVENT_ACKNOWLEDGEMENT_COUNT)?
+            .ok_or(StoreError::MissingAccountingMetadata {
+                field: EVENT_ACKNOWLEDGEMENT_COUNT,
+            })?
+            .value();
+        let actual_acknowledgement_count =
+            write.open_table(EVENT_DELIVERY_ACKNOWLEDGEMENTS)?.len()?;
+        if durable_acknowledgement_count != actual_acknowledgement_count {
+            return Err(StoreError::AccountingMismatch {
+                field: EVENT_ACKNOWLEDGEMENT_COUNT,
+                durable: durable_acknowledgement_count,
+                reconstructed: actual_acknowledgement_count,
+            });
+        }
+        let existing_receipt = write
+            .open_table(EVENT_DELIVERY_ACKNOWLEDGEMENTS)?
+            .get(acknowledgement_key.as_slice())?
+            .map(|value| decode_event_acknowledgement_record(value.value()))
+            .transpose()?;
+        if let Some(receipt) = existing_receipt {
+            let event = load_event_by_semantic_from_write(&write, semantic_id)?.ok_or(
+                StoreError::SemanticInvariant(
+                    "Event acknowledgement references a missing accepted Event",
+                ),
+            )?;
+            if receipt.acceptance_marker != event.acceptance_marker
+                || receipt.acceptance_marker > record.discovered_through
+                || !record.spec.matches(&event)
+            {
+                return Err(StoreError::SemanticInvariant(
+                    "Event acknowledgement differs from its subscription ledger",
+                ));
+            }
+            let pending_key = event_pending_delivery_key(subscription, receipt.acceptance_marker);
+            if write
+                .open_table(EVENT_SUBSCRIPTION_PENDING)?
+                .get(pending_key.as_slice())?
+                .is_some()
+            {
+                return Err(StoreError::SemanticInvariant(
+                    "Event delivery is both pending and acknowledged",
+                ));
+            }
+            return Ok(EventDeliveryAck::AlreadyAcknowledged);
+        }
+        let event = load_event_by_semantic_from_write(&write, semantic_id)?
+            .ok_or(StoreError::EventDeliveryNotFound)?;
+        if event.acceptance_marker > record.discovered_through || !record.spec.matches(&event) {
+            return Err(StoreError::EventDeliveryNotFound);
+        }
+        let key = event_pending_delivery_key(subscription, event.acceptance_marker);
+        let pending_record = write
+            .open_table(EVENT_SUBSCRIPTION_PENDING)?
+            .get(key.as_slice())?
+            .map(|value| decode_event_pending_delivery_record(value.value()))
+            .transpose()?;
+        let Some(pending_record) = pending_record else {
+            return Err(StoreError::EventDeliveryNotFound);
+        };
+        if pending_record.semantic_id != semantic_id {
+            return Err(StoreError::SemanticInvariant(
+                "pending Event delivery key differs from its semantic identity",
+            ));
+        }
+        let acknowledgement_count =
+            next_event_acknowledgement_count(durable_acknowledgement_count)?;
+        let durable_pending_count = write
+            .open_table(METADATA)?
+            .get(EVENT_PENDING_DELIVERY_COUNT)?
+            .ok_or(StoreError::MissingAccountingMetadata {
+                field: EVENT_PENDING_DELIVERY_COUNT,
+            })?
+            .value();
+        let actual_pending_count = write.open_table(EVENT_SUBSCRIPTION_PENDING)?.len()?;
+        if durable_pending_count != actual_pending_count {
+            return Err(StoreError::AccountingMismatch {
+                field: EVENT_PENDING_DELIVERY_COUNT,
+                durable: durable_pending_count,
+                reconstructed: actual_pending_count,
+            });
+        }
+        let acknowledgement = encode_event_acknowledgement_record(EventAcknowledgementRecord {
+            acceptance_marker: event.acceptance_marker,
+            attempts: pending_record.attempts,
+        });
+        if write
+            .open_table(EVENT_DELIVERY_ACKNOWLEDGEMENTS)?
+            .insert(acknowledgement_key.as_slice(), acknowledgement.as_slice())?
+            .is_some()
+        {
+            return Err(StoreError::EventSubscriptionPlanChanged);
+        }
+        if write
+            .open_table(EVENT_SUBSCRIPTION_PENDING)?
+            .remove(key.as_slice())?
+            .is_none()
+        {
+            return Err(StoreError::EventSubscriptionPlanChanged);
+        }
+        let pending_count =
+            durable_pending_count
+                .checked_sub(1)
+                .ok_or(StoreError::SemanticInvariant(
+                    "Event pending-delivery acknowledgement underflows accounting",
+                ))?;
+        {
+            let mut metadata = write.open_table(METADATA)?;
+            metadata.insert(EVENT_PENDING_DELIVERY_COUNT, pending_count)?;
+            metadata.insert(EVENT_ACKNOWLEDGEMENT_COUNT, acknowledgement_count)?;
+        }
+        write.commit()?;
+        Ok(EventDeliveryAck::Acknowledged)
     }
 
     /// Proves that a second writable redb open is rejected while this handle is live.
@@ -3180,7 +4320,7 @@ impl Store {
         sealed: &[u8],
     ) -> Result<RouteCacheOutcome, StoreError> {
         self.require_live()?;
-        self.cache_route_verified_event_internal(None, event, sealed)
+        self.cache_route_verified_event_internal(EventAdmissionGuard::Current, event, sealed)
     }
 
     /// Retains one route-verified Event only under an exact settled control policy.
@@ -3191,12 +4331,38 @@ impl Store {
         sealed: &[u8],
     ) -> Result<RouteCacheOutcome, StoreError> {
         self.require_live()?;
-        self.cache_route_verified_event_internal(Some(policy), event, sealed)
+        self.cache_route_verified_event_internal(
+            EventAdmissionGuard::Control(policy),
+            event,
+            sealed,
+        )
+    }
+
+    /// Retains one route-verified Event only while an exact replication snapshot remains current.
+    ///
+    /// The snapshot's control policy and selector revision are rechecked in
+    /// the same write transaction before cache mutation. Both Carry and
+    /// Consume select receipt; receive-none fails closed.
+    pub fn cache_route_verified_event_with_replication_policy(
+        &self,
+        expected: &EventReplicationPolicySnapshot,
+        event: &RouteVerifiedEventEnvelope,
+        sealed: &[u8],
+    ) -> Result<RouteCacheOutcome, StoreError> {
+        self.require_live()?;
+        self.cache_route_verified_event_internal(
+            EventAdmissionGuard::Replication {
+                expected,
+                requirement: EventReplicationRequirement::Receive,
+            },
+            event,
+            sealed,
+        )
     }
 
     fn cache_route_verified_event_internal(
         &self,
-        policy: Option<&ControlPolicySnapshot>,
+        guard: EventAdmissionGuard<'_>,
         event: &RouteVerifiedEventEnvelope,
         sealed: &[u8],
     ) -> Result<RouteCacheOutcome, StoreError> {
@@ -3213,7 +4379,7 @@ impl Store {
         let encoded = encode_event_metadata(transfer_id, semantic_claim, event.header())?;
         let write = self.database.begin_write()?;
         enforce_live_write(&write)?;
-        enforce_event_policy_write(&write, event.mission_authority_id(), policy, event.header())?;
+        enforce_event_policy_write(&write, event.mission_authority_id(), guard, event.header())?;
         if write
             .open_table(CONTROL_RECORDS)?
             .get(transfer_id.as_bytes().as_slice())?
@@ -3543,7 +4709,7 @@ impl Store {
     ) -> Result<ApplyOutcome, StoreError> {
         self.require_live()?;
         let prepared = PreparedEvent::from_verified(event, sealed, EventOrigin::Remote)?;
-        self.commit_prepared_event(&prepared, None, None, None)
+        self.commit_prepared_event(&prepared, None, None, EventAdmissionGuard::Current)
             .map(|outcome| outcome.apply)
     }
 
@@ -3556,8 +4722,33 @@ impl Store {
     ) -> Result<ApplyOutcome, StoreError> {
         self.require_live()?;
         let prepared = PreparedEvent::from_verified(event, sealed, EventOrigin::Remote)?;
-        self.commit_prepared_event(&prepared, None, None, Some(policy))
+        self.commit_prepared_event(&prepared, None, None, EventAdmissionGuard::Control(policy))
             .map(|outcome| outcome.apply)
+    }
+
+    /// Accepts one remotely verified Event only while an exact replication snapshot remains current.
+    ///
+    /// The snapshot's control policy, selector revision, and effective
+    /// Consume mode for this Event are checked in the same write transaction
+    /// before any semantic or route-cache mutation.
+    pub fn apply_verified_event_with_replication_policy(
+        &self,
+        expected: &EventReplicationPolicySnapshot,
+        event: &ContentVerifiedEventEnvelope,
+        sealed: &[u8],
+    ) -> Result<ApplyOutcome, StoreError> {
+        self.require_live()?;
+        let prepared = PreparedEvent::from_verified(event, sealed, EventOrigin::Remote)?;
+        self.commit_prepared_event(
+            &prepared,
+            None,
+            None,
+            EventAdmissionGuard::Replication {
+                expected,
+                requirement: EventReplicationRequirement::Consume,
+            },
+        )
+        .map(|outcome| outcome.apply)
     }
 
     /// Commits one locally sealed Event against its optimistic durable reservation.
@@ -3573,7 +4764,7 @@ impl Store {
             &prepared,
             Some(reservation),
             None,
-            Some(&reservation.control_policy),
+            EventAdmissionGuard::Control(&reservation.control_policy),
         )
         .map(|outcome| outcome.apply)
     }
@@ -3591,8 +4782,13 @@ impl Store {
             return Err(StoreError::ControlPolicyChanged);
         }
         let prepared = PreparedEvent::from_verified(event, sealed, EventOrigin::Local)?;
-        self.commit_prepared_event(&prepared, Some(reservation), None, Some(policy))
-            .map(|outcome| outcome.apply)
+        self.commit_prepared_event(
+            &prepared,
+            Some(reservation),
+            None,
+            EventAdmissionGuard::Control(policy),
+        )
+        .map(|outcome| outcome.apply)
     }
 
     /// Atomically commits a local Event and a durable application operation mapping.
@@ -3619,7 +4815,7 @@ impl Store {
             &prepared,
             Some(reservation),
             Some(operation),
-            Some(&reservation.control_policy),
+            EventAdmissionGuard::Control(&reservation.control_policy),
         )?;
         event_once_outcome(committed)
     }
@@ -3647,7 +4843,7 @@ impl Store {
             &prepared,
             Some(reservation),
             Some(operation),
-            Some(policy),
+            EventAdmissionGuard::Control(policy),
         )?;
         event_once_outcome(committed)
     }
@@ -4058,12 +5254,12 @@ impl Store {
         prepared: &PreparedEvent,
         reservation: Option<&EventReservation>,
         operation: Option<PendingOperation<'_>>,
-        policy: Option<&ControlPolicySnapshot>,
+        guard: EventAdmissionGuard<'_>,
     ) -> Result<EventCommit, StoreError> {
         self.require_mission_authority(prepared.mission_authority)?;
         let write = self.database.begin_write()?;
         enforce_live_write(&write)?;
-        enforce_event_policy_write(&write, prepared.mission_authority, policy, &prepared.header)?;
+        enforce_event_policy_write(&write, prepared.mission_authority, guard, &prepared.header)?;
 
         if write
             .open_table(CONTROL_RECORDS)?
@@ -6199,6 +7395,14 @@ fn read_mission_binding(write: &redb::WriteTransaction) -> Result<Option<NodeId>
         .transpose()
 }
 
+fn read_mission_binding_read(read: &redb::ReadTransaction) -> Result<Option<NodeId>, StoreError> {
+    let domain = read.open_table(SEMANTIC_DOMAIN)?;
+    domain
+        .get(MISSION_AUTHORITY_ID)?
+        .map(|value| parse_node_id("semantic mission authority", value.value()))
+        .transpose()
+}
+
 fn audit_semantic_tables(write: &redb::WriteTransaction) -> Result<(), StoreError> {
     // Opening every table here is the non-destructive schema extension for old
     // stores. Existing v1 opaque item/effect bytes remain untouched and use a
@@ -6713,6 +7917,327 @@ fn audit_semantic_tables(write: &redb::WriteTransaction) -> Result<(), StoreErro
             ROUTE_CACHE_TOTAL_BYTES,
             reconstructed_route_bytes,
         )?;
+    }
+    drop(events);
+    drop(event_bytes);
+    drop(event_markers);
+    drop(event_acceptance_order);
+    drop(semantic_items);
+    drop(accepted_dots);
+    drop(accepted_events);
+    drop(frontier);
+    drop(publisher_high_water);
+    drop(event_high_water);
+    drop(operations);
+    drop(route_cache);
+    drop(route_claims);
+    drop(_domain);
+    audit_event_subscription_tables(write)?;
+    Ok(())
+}
+
+fn parse_event_subscription_id(bytes: &[u8]) -> Result<EventSubscriptionId, StoreError> {
+    let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
+        StoreError::SemanticInvariant("Event subscription identifier has invalid length")
+    })?;
+    Ok(EventSubscriptionId::from_bytes(bytes))
+}
+
+fn load_event_by_semantic_from_write(
+    write: &redb::WriteTransaction,
+    semantic_id: EventSemanticId,
+) -> Result<Option<StoredEvent>, StoreError> {
+    let transfer = write
+        .open_table(SEMANTIC_ITEMS)?
+        .get(semantic_id.as_bytes().as_slice())?
+        .map(|value| parse_transfer_id("semantic item table", value.value()))
+        .transpose()?;
+    match transfer {
+        Some(transfer) => load_event_from_write(write, transfer),
+        None => Ok(None),
+    }
+}
+
+fn load_event_by_semantic_from_read(
+    read: &redb::ReadTransaction,
+    semantic_id: EventSemanticId,
+) -> Result<Option<StoredEvent>, StoreError> {
+    let transfer = read
+        .open_table(SEMANTIC_ITEMS)?
+        .get(semantic_id.as_bytes().as_slice())?
+        .map(|value| parse_transfer_id("semantic item table", value.value()))
+        .transpose()?;
+    match transfer {
+        Some(transfer) => load_event_from_read(read, transfer),
+        None => Ok(None),
+    }
+}
+
+fn audit_event_subscription_tables(write: &redb::WriteTransaction) -> Result<(), StoreError> {
+    let wrong_kind = write.list_multimap_tables()?.any(|table| {
+        table.name() == EVENT_SUBSCRIPTIONS.name()
+            || table.name() == EVENT_SUBSCRIPTION_PENDING.name()
+            || table.name() == EVENT_DELIVERY_ACKNOWLEDGEMENTS.name()
+    });
+    if wrong_kind {
+        return Err(StoreError::SemanticInvariant(
+            "Event subscription schema has the wrong table kind",
+        ));
+    }
+    let table_names = write
+        .list_tables()?
+        .map(|table| table.name().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    let subscription_table_present = table_names.contains(EVENT_SUBSCRIPTIONS.name());
+    let pending_table_present = table_names.contains(EVENT_SUBSCRIPTION_PENDING.name());
+    let mut acknowledgement_table_present =
+        table_names.contains(EVENT_DELIVERY_ACKNOWLEDGEMENTS.name());
+    let mut metadata_presence = {
+        let metadata = write.open_table(METADATA)?;
+        [
+            metadata.get(EVENT_SUBSCRIPTION_COUNT)?.is_some(),
+            metadata.get(EVENT_PENDING_DELIVERY_COUNT)?.is_some(),
+            metadata.get(EVENT_SELECTOR_REVISION)?.is_some(),
+            metadata.get(EVENT_ACKNOWLEDGEMENT_COUNT)?.is_some(),
+        ]
+    };
+    let present_metadata = metadata_presence.iter().filter(|present| **present).count();
+    if !subscription_table_present
+        && !pending_table_present
+        && !acknowledgement_table_present
+        && present_metadata == 0
+    {
+        write.open_table(EVENT_SUBSCRIPTIONS)?;
+        write.open_table(EVENT_SUBSCRIPTION_PENDING)?;
+        write.open_table(EVENT_DELIVERY_ACKNOWLEDGEMENTS)?;
+        let mut metadata = write.open_table(METADATA)?;
+        metadata.insert(EVENT_SUBSCRIPTION_COUNT, 0)?;
+        metadata.insert(EVENT_PENDING_DELIVERY_COUNT, 0)?;
+        metadata.insert(EVENT_SELECTOR_REVISION, 0)?;
+        metadata.insert(EVENT_ACKNOWLEDGEMENT_COUNT, 0)?;
+        return Ok(());
+    }
+    let exact_legacy_group = subscription_table_present
+        && pending_table_present
+        && !acknowledgement_table_present
+        && metadata_presence[..3].iter().all(|present| *present)
+        && !metadata_presence[3];
+    if exact_legacy_group {
+        let mut legacy_projections = std::collections::BTreeSet::new();
+        let legacy_subscription_count = {
+            let subscriptions = write.open_table(EVENT_SUBSCRIPTIONS)?;
+            for row in subscriptions.iter()? {
+                let (_, value) = row?;
+                let spec = decode_event_subscription_record(value.value())?.spec;
+                legacy_projections.insert((spec.topic, spec.scope, spec.include_descendant_scopes));
+            }
+            subscriptions.len()?
+        };
+        let legacy_revision = write
+            .open_table(METADATA)?
+            .get(EVENT_SELECTOR_REVISION)?
+            .ok_or(StoreError::MissingAccountingMetadata {
+                field: EVENT_SELECTOR_REVISION,
+            })?
+            .value();
+        let expected_legacy_revision = u64::try_from(legacy_projections.len())
+            .map_err(|_| StoreError::ItemCountAccountingOverflow)?;
+        if legacy_revision != expected_legacy_revision {
+            return Err(StoreError::AccountingMismatch {
+                field: EVENT_SELECTOR_REVISION,
+                durable: legacy_revision,
+                reconstructed: expected_legacy_revision,
+            });
+        }
+        write.open_table(EVENT_DELIVERY_ACKNOWLEDGEMENTS)?;
+        {
+            let mut metadata = write.open_table(METADATA)?;
+            metadata.insert(EVENT_ACKNOWLEDGEMENT_COUNT, 0)?;
+            metadata.insert(EVENT_SELECTOR_REVISION, legacy_subscription_count)?;
+        }
+        acknowledgement_table_present = true;
+        metadata_presence[3] = true;
+    }
+    if !subscription_table_present
+        || !pending_table_present
+        || !acknowledgement_table_present
+        || !metadata_presence.iter().all(|present| *present)
+    {
+        return Err(StoreError::SemanticInvariant(
+            "Event subscription schema group is incomplete",
+        ));
+    }
+
+    let authority = read_mission_binding(write)?;
+    let last_marker = write
+        .open_table(METADATA)?
+        .get(LAST_SEMANTIC_ACCEPTANCE_MARKER)?
+        .ok_or(StoreError::MissingAccountingMetadata {
+            field: LAST_SEMANTIC_ACCEPTANCE_MARKER,
+        })?
+        .value();
+    let mut subscriptions = std::collections::BTreeMap::new();
+    {
+        let table = write.open_table(EVENT_SUBSCRIPTIONS)?;
+        for row in table.iter()? {
+            let (key, value) = row?;
+            let id = parse_event_subscription_id(key.value())?;
+            let record = decode_event_subscription_record(value.value())?;
+            let authority = authority.ok_or(StoreError::SemanticInvariant(
+                "unbound store contains Event subscriptions",
+            ))?;
+            if event_subscription_id(authority, &record.operation_key) != id {
+                return Err(StoreError::SemanticInvariant(
+                    "Event subscription identifier differs from its operation key",
+                ));
+            }
+            if record.discovered_through > last_marker {
+                return Err(StoreError::SemanticInvariant(
+                    "Event subscription cursor exceeds the acceptance high-water",
+                ));
+            }
+            if record.spec.mode == EventSubscriptionMode::Carry && record.discovered_through != 0 {
+                return Err(StoreError::SemanticInvariant(
+                    "Carry Event subscription has an application-delivery cursor",
+                ));
+            }
+            if subscriptions.insert(id, record).is_some() {
+                return Err(StoreError::SemanticInvariant(
+                    "duplicate Event subscription identifier",
+                ));
+            }
+        }
+    }
+    let subscription_count =
+        u64::try_from(subscriptions.len()).map_err(|_| StoreError::ItemCountAccountingOverflow)?;
+    if subscription_count > MAX_EVENT_SUBSCRIPTIONS {
+        return Err(StoreError::SemanticInvariant(
+            "Event subscription count exceeds its durable safety cap",
+        ));
+    }
+
+    let mut pending_count = 0u64;
+    let mut pending_semantics = std::collections::BTreeSet::new();
+    {
+        let pending = write.open_table(EVENT_SUBSCRIPTION_PENDING)?;
+        for row in pending.iter()? {
+            let (key, value) = row?;
+            let (subscription, marker) = parse_event_pending_delivery_key(key.value())?;
+            let record = decode_event_pending_delivery_record(value.value())?;
+            let subscription_record =
+                subscriptions
+                    .get(&subscription)
+                    .ok_or(StoreError::SemanticInvariant(
+                        "pending Event delivery references a missing subscription",
+                    ))?;
+            if subscription_record.spec.mode != EventSubscriptionMode::Consume {
+                return Err(StoreError::SemanticInvariant(
+                    "pending Event delivery references a Carry subscription",
+                ));
+            }
+            let event = load_event_by_semantic_from_write(write, record.semantic_id)?.ok_or(
+                StoreError::SemanticInvariant("pending Event delivery references a missing Event"),
+            )?;
+            if event.acceptance_marker != marker
+                || marker > subscription_record.discovered_through
+                || !subscription_record.spec.matches(&event)
+            {
+                return Err(StoreError::SemanticInvariant(
+                    "pending Event delivery differs from its subscription ledger",
+                ));
+            }
+            if !pending_semantics.insert((subscription, record.semantic_id)) {
+                return Err(StoreError::SemanticInvariant(
+                    "duplicate pending Event semantic delivery",
+                ));
+            }
+            pending_count = pending_count
+                .checked_add(1)
+                .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        }
+    }
+    if pending_count > MAX_EVENT_PENDING_DELIVERIES {
+        return Err(StoreError::SemanticInvariant(
+            "pending Event delivery count exceeds its durable safety cap",
+        ));
+    }
+    let mut acknowledgement_count = 0u64;
+    {
+        let acknowledgements = write.open_table(EVENT_DELIVERY_ACKNOWLEDGEMENTS)?;
+        for row in acknowledgements.iter()? {
+            let (key, value) = row?;
+            let (subscription, semantic_id) = parse_event_acknowledgement_key(key.value())?;
+            let receipt = decode_event_acknowledgement_record(value.value())?;
+            let subscription_record =
+                subscriptions
+                    .get(&subscription)
+                    .ok_or(StoreError::SemanticInvariant(
+                        "Event acknowledgement references a missing subscription",
+                    ))?;
+            if subscription_record.spec.mode != EventSubscriptionMode::Consume {
+                return Err(StoreError::SemanticInvariant(
+                    "Event acknowledgement references a Carry subscription",
+                ));
+            }
+            let event = load_event_by_semantic_from_write(write, semantic_id)?.ok_or(
+                StoreError::SemanticInvariant(
+                    "Event acknowledgement references a missing accepted Event",
+                ),
+            )?;
+            if receipt.acceptance_marker != event.acceptance_marker
+                || receipt.acceptance_marker > subscription_record.discovered_through
+                || !subscription_record.spec.matches(&event)
+            {
+                return Err(StoreError::SemanticInvariant(
+                    "Event acknowledgement differs from its subscription ledger",
+                ));
+            }
+            if pending_semantics.contains(&(subscription, semantic_id)) {
+                return Err(StoreError::SemanticInvariant(
+                    "Event delivery is both pending and acknowledged",
+                ));
+            }
+            acknowledgement_count = acknowledgement_count
+                .checked_add(1)
+                .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        }
+    }
+    if acknowledgement_count > MAX_EVENT_ACKNOWLEDGEMENT_RECEIPTS {
+        return Err(StoreError::SemanticInvariant(
+            "Event acknowledgement count exceeds its durable safety cap",
+        ));
+    }
+    let metadata = write.open_table(METADATA)?;
+    for (field, reconstructed) in [
+        (EVENT_SUBSCRIPTION_COUNT, subscription_count),
+        (EVENT_PENDING_DELIVERY_COUNT, pending_count),
+        (EVENT_ACKNOWLEDGEMENT_COUNT, acknowledgement_count),
+    ] {
+        let durable = metadata
+            .get(field)?
+            .ok_or(StoreError::MissingAccountingMetadata { field })?
+            .value();
+        if durable != reconstructed {
+            return Err(StoreError::AccountingMismatch {
+                field,
+                durable,
+                reconstructed,
+            });
+        }
+    }
+    let selector_revision = metadata
+        .get(EVENT_SELECTOR_REVISION)?
+        .ok_or(StoreError::MissingAccountingMetadata {
+            field: EVENT_SELECTOR_REVISION,
+        })?
+        .value();
+    let expected_revision = subscription_count;
+    if selector_revision != expected_revision {
+        return Err(StoreError::AccountingMismatch {
+            field: EVENT_SELECTOR_REVISION,
+            durable: selector_revision,
+            reconstructed: expected_revision,
+        });
     }
     Ok(())
 }
@@ -7487,6 +9012,225 @@ fn decode_operation_record(bytes: &[u8]) -> Result<OperationRecord, StoreError> 
     })
 }
 
+fn event_subscription_id(authority: NodeId, key: &EventSubscriptionKey) -> EventSubscriptionId {
+    let mut digest = Sha256::new();
+    digest.update(EVENT_SUBSCRIPTION_ID_DOMAIN);
+    digest.update(authority);
+    digest.update(
+        u16::try_from(key.as_bytes().len())
+            .expect("validated subscription key fits u16")
+            .to_be_bytes(),
+    );
+    digest.update(key.as_bytes());
+    EventSubscriptionId(digest.finalize().into())
+}
+
+fn encode_event_subscription_record(
+    record: &EventSubscriptionRecord,
+) -> Result<Vec<u8>, StoreError> {
+    let key_length = u16::try_from(record.operation_key.as_bytes().len()).map_err(|_| {
+        StoreError::SemanticInvariant("Event subscription operation key exceeds its bound")
+    })?;
+    let topic = record.spec.topic.as_str().as_bytes();
+    let scope = record.spec.scope.as_str().as_bytes();
+    let topic_length = u16::try_from(topic.len())
+        .map_err(|_| StoreError::SemanticInvariant("Event subscription topic exceeds its bound"))?;
+    let scope_length = u16::try_from(scope.len())
+        .map_err(|_| StoreError::SemanticInvariant("Event subscription scope exceeds its bound"))?;
+    let mut encoded =
+        Vec::with_capacity(17 + record.operation_key.as_bytes().len() + topic.len() + scope.len());
+    encoded.push(EVENT_SUBSCRIPTION_VERSION);
+    encoded.push(match record.spec.mode {
+        EventSubscriptionMode::Consume => 0,
+        EventSubscriptionMode::Carry => 1,
+    });
+    encoded.push(u8::from(record.spec.include_descendant_scopes));
+    encoded.extend_from_slice(&record.discovered_through.to_be_bytes());
+    encoded.extend_from_slice(&key_length.to_be_bytes());
+    encoded.extend_from_slice(record.operation_key.as_bytes());
+    encoded.extend_from_slice(&topic_length.to_be_bytes());
+    encoded.extend_from_slice(topic);
+    encoded.extend_from_slice(&scope_length.to_be_bytes());
+    encoded.extend_from_slice(scope);
+    Ok(encoded)
+}
+
+fn decode_event_subscription_record(bytes: &[u8]) -> Result<EventSubscriptionRecord, StoreError> {
+    let mut cursor = MetadataCursor::new(bytes);
+    if cursor.u8()? != EVENT_SUBSCRIPTION_VERSION {
+        return Err(StoreError::SemanticInvariant(
+            "unknown Event subscription encoding version",
+        ));
+    }
+    let mode = match cursor.u8()? {
+        0 => EventSubscriptionMode::Consume,
+        1 => EventSubscriptionMode::Carry,
+        _ => {
+            return Err(StoreError::SemanticInvariant(
+                "invalid Event subscription mode",
+            ));
+        }
+    };
+    let include_descendant_scopes = match cursor.u8()? {
+        0 => false,
+        1 => true,
+        _ => {
+            return Err(StoreError::SemanticInvariant(
+                "invalid Event subscription descendant flag",
+            ));
+        }
+    };
+    let discovered_through = cursor.u64()?;
+    let key_length = usize::from(cursor.u16()?);
+    let operation_key = EventSubscriptionKey::new(cursor.take(key_length)?.to_vec())
+        .map_err(|_| StoreError::SemanticInvariant("invalid Event subscription operation key"))?;
+    let topic = Topic::new(cursor.short_string()?)
+        .map_err(|_| StoreError::SemanticInvariant("invalid Event subscription topic"))?;
+    let scope = Scope::new(cursor.short_string()?)
+        .map_err(|_| StoreError::SemanticInvariant("invalid Event subscription scope"))?;
+    cursor.finish()?;
+    let record = EventSubscriptionRecord {
+        operation_key,
+        spec: EventSubscriptionSpec {
+            mode,
+            topic,
+            scope,
+            include_descendant_scopes,
+        },
+        discovered_through,
+    };
+    if encode_event_subscription_record(&record)?.as_slice() != bytes {
+        return Err(StoreError::SemanticInvariant(
+            "Event subscription encoding is not canonical",
+        ));
+    }
+    Ok(record)
+}
+
+fn event_pending_delivery_key(subscription: EventSubscriptionId, marker: u64) -> [u8; 40] {
+    let mut key = [0u8; 40];
+    key[..32].copy_from_slice(subscription.as_bytes());
+    key[32..].copy_from_slice(&marker.to_be_bytes());
+    key
+}
+
+fn parse_event_pending_delivery_key(
+    bytes: &[u8],
+) -> Result<(EventSubscriptionId, u64), StoreError> {
+    let bytes: [u8; 40] = bytes.try_into().map_err(|_| {
+        StoreError::SemanticInvariant("Event pending-delivery key has invalid length")
+    })?;
+    let subscription = EventSubscriptionId(bytes[..32].try_into().expect("fixed prefix"));
+    let marker = u64::from_be_bytes(bytes[32..].try_into().expect("fixed suffix"));
+    if marker == 0 {
+        return Err(StoreError::SemanticInvariant(
+            "Event pending-delivery key contains a zero marker",
+        ));
+    }
+    Ok((subscription, marker))
+}
+
+fn encode_event_pending_delivery_record(record: EventPendingDeliveryRecord) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(41);
+    encoded.push(EVENT_PENDING_DELIVERY_VERSION);
+    encoded.extend_from_slice(record.semantic_id.as_bytes());
+    encoded.extend_from_slice(&record.attempts.to_be_bytes());
+    encoded
+}
+
+fn decode_event_pending_delivery_record(
+    bytes: &[u8],
+) -> Result<EventPendingDeliveryRecord, StoreError> {
+    let mut cursor = MetadataCursor::new(bytes);
+    if cursor.u8()? != EVENT_PENDING_DELIVERY_VERSION {
+        return Err(StoreError::SemanticInvariant(
+            "unknown Event pending-delivery encoding version",
+        ));
+    }
+    let semantic_id = EventSemanticId::new(cursor.array()?);
+    let attempts = cursor.u64()?;
+    cursor.finish()?;
+    if attempts == 0 {
+        return Err(StoreError::SemanticInvariant(
+            "Event pending-delivery attempt count is zero",
+        ));
+    }
+    Ok(EventPendingDeliveryRecord {
+        semantic_id,
+        attempts,
+    })
+}
+
+fn event_acknowledgement_key(
+    subscription: EventSubscriptionId,
+    semantic_id: EventSemanticId,
+) -> [u8; 64] {
+    let mut key = [0u8; 64];
+    key[..32].copy_from_slice(subscription.as_bytes());
+    key[32..].copy_from_slice(semantic_id.as_bytes());
+    key
+}
+
+fn next_event_acknowledgement_count(current: u64) -> Result<u64, StoreError> {
+    if current >= MAX_EVENT_ACKNOWLEDGEMENT_RECEIPTS {
+        return Err(StoreError::EventAcknowledgementReceiptLimitExceeded {
+            current,
+            limit: MAX_EVENT_ACKNOWLEDGEMENT_RECEIPTS,
+        });
+    }
+    current
+        .checked_add(1)
+        .ok_or(StoreError::ItemCountAccountingOverflow)
+}
+
+fn parse_event_acknowledgement_key(
+    bytes: &[u8],
+) -> Result<(EventSubscriptionId, EventSemanticId), StoreError> {
+    let bytes: [u8; 64] = bytes.try_into().map_err(|_| {
+        StoreError::SemanticInvariant("Event acknowledgement key has invalid length")
+    })?;
+    Ok((
+        EventSubscriptionId(bytes[..32].try_into().expect("fixed prefix")),
+        EventSemanticId::new(bytes[32..].try_into().expect("fixed suffix")),
+    ))
+}
+
+fn encode_event_acknowledgement_record(record: EventAcknowledgementRecord) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(17);
+    encoded.push(EVENT_ACKNOWLEDGEMENT_VERSION);
+    encoded.extend_from_slice(&record.acceptance_marker.to_be_bytes());
+    encoded.extend_from_slice(&record.attempts.to_be_bytes());
+    encoded
+}
+
+fn decode_event_acknowledgement_record(
+    bytes: &[u8],
+) -> Result<EventAcknowledgementRecord, StoreError> {
+    let mut cursor = MetadataCursor::new(bytes);
+    if cursor.u8()? != EVENT_ACKNOWLEDGEMENT_VERSION {
+        return Err(StoreError::SemanticInvariant(
+            "unknown Event acknowledgement encoding version",
+        ));
+    }
+    let acceptance_marker = cursor.u64()?;
+    let attempts = cursor.u64()?;
+    cursor.finish()?;
+    if acceptance_marker == 0 {
+        return Err(StoreError::SemanticInvariant(
+            "Event acknowledgement contains a zero acceptance marker",
+        ));
+    }
+    if attempts == 0 {
+        return Err(StoreError::SemanticInvariant(
+            "Event acknowledgement contains a zero attempt count",
+        ));
+    }
+    Ok(EventAcknowledgementRecord {
+        acceptance_marker,
+        attempts,
+    })
+}
+
 fn encode_control_record(record: &ControlRecord) -> Result<Vec<u8>, StoreError> {
     validate_control_record(record)?;
     let mut output = Vec::new();
@@ -8080,15 +9824,12 @@ fn require_control_policy_read(
     Ok(())
 }
 
-fn enforce_event_policy_write(
+fn require_control_policy_write(
     write: &redb::WriteTransaction,
     authority: NodeId,
-    expected: Option<&ControlPolicySnapshot>,
-    header: &EnvelopeHeader,
+    expected: &ControlPolicySnapshot,
 ) -> Result<(), StoreError> {
-    if let Some(expected) = expected
-        && expected.authority != authority
-    {
+    if expected.authority != authority {
         return Err(StoreError::MissionAuthorityMismatch {
             bound: authority,
             received: expected.authority,
@@ -8098,10 +9839,88 @@ fn enforce_event_policy_write(
     if pending != 0 {
         return Err(StoreError::ControlPolicyUnsettled { pending });
     }
-    if let Some(expected) = expected
-        && read_control_head_write(write)? != expected.head
-    {
+    if read_control_head_write(write)? != expected.head {
         return Err(StoreError::ControlPolicyChanged);
+    }
+    Ok(())
+}
+
+fn event_is_inactive_read(
+    read: &redb::ReadTransaction,
+    event: &StoredEvent,
+) -> Result<bool, StoreError> {
+    if control_principal_revoked_read(read, event.header.stamp.dot.publisher)? {
+        return Ok(true);
+    }
+    Ok(read
+        .open_table(CONTROL_SCOPE_EPOCHS)?
+        .get(event.header.scope.as_str())?
+        .map(|value| decode_scope_epoch_index(value.value()))
+        .transpose()?
+        .is_some_and(|(current, _)| event.header.key_epoch < current))
+}
+
+fn event_is_inactive_write(
+    write: &redb::WriteTransaction,
+    event: &StoredEvent,
+) -> Result<bool, StoreError> {
+    if control_principal_revoked_write(write, event.header.stamp.dot.publisher)? {
+        return Ok(true);
+    }
+    Ok(write
+        .open_table(CONTROL_SCOPE_EPOCHS)?
+        .get(event.header.scope.as_str())?
+        .map(|value| decode_scope_epoch_index(value.value()))
+        .transpose()?
+        .is_some_and(|(current, _)| event.header.key_epoch < current))
+}
+
+fn enforce_event_policy_write(
+    write: &redb::WriteTransaction,
+    authority: NodeId,
+    guard: EventAdmissionGuard<'_>,
+    header: &EnvelopeHeader,
+) -> Result<(), StoreError> {
+    match guard {
+        EventAdmissionGuard::Current => {
+            let pending = write.open_table(CONTROL_PENDING)?.len()?;
+            if pending != 0 {
+                return Err(StoreError::ControlPolicyUnsettled { pending });
+            }
+        }
+        EventAdmissionGuard::Control(expected) => {
+            require_control_policy_write(write, authority, expected)?;
+        }
+        EventAdmissionGuard::Replication {
+            expected,
+            requirement,
+        } => {
+            require_control_policy_write(write, authority, expected.control_policy())?;
+            let revision = write
+                .open_table(METADATA)?
+                .get(EVENT_SELECTOR_REVISION)?
+                .ok_or(StoreError::MissingAccountingMetadata {
+                    field: EVENT_SELECTOR_REVISION,
+                })?
+                .value();
+            if revision != expected.selector_revision() {
+                return Err(StoreError::EventSelectorRevisionChanged);
+            }
+            let expected_mode = expected.effective_mode(&header.topic, &header.scope);
+            let current_mode =
+                event_replication_effective_mode_write(write, &header.topic, &header.scope)?;
+            if current_mode != expected_mode {
+                return Err(StoreError::EventSelectorRevisionChanged);
+            }
+            match (current_mode, requirement) {
+                (None, _) => return Err(StoreError::EventReplicationNotSelected),
+                (Some(EventSubscriptionMode::Carry), EventReplicationRequirement::Consume) => {
+                    return Err(StoreError::EventReplicationNotConsumable);
+                }
+                (Some(_), EventReplicationRequirement::Receive)
+                | (Some(EventSubscriptionMode::Consume), EventReplicationRequirement::Consume) => {}
+            }
+        }
     }
     let publisher = header.stamp.dot.publisher;
     if control_principal_revoked_write(write, publisher)? {
@@ -8120,6 +9939,35 @@ fn enforce_event_policy_write(
         });
     }
     Ok(())
+}
+
+fn event_replication_effective_mode_write(
+    write: &redb::WriteTransaction,
+    topic: &Topic,
+    scope: &Scope,
+) -> Result<Option<EventSubscriptionMode>, StoreError> {
+    let subscriptions = write.open_table(EVENT_SUBSCRIPTIONS)?;
+    let count = subscriptions.len()?;
+    if count > MAX_EVENT_SUBSCRIPTIONS {
+        return Err(StoreError::SemanticInvariant(
+            "Event subscription table exceeds its proven admission bound",
+        ));
+    }
+    let mut matched = None;
+    for row in subscriptions.iter()? {
+        let (_, encoded) = row?;
+        let selector = decode_event_subscription_record(encoded.value())?
+            .spec
+            .replication_selector();
+        if !selector.matches(topic, scope) {
+            continue;
+        }
+        if selector.mode() == EventSubscriptionMode::Consume {
+            return Ok(Some(EventSubscriptionMode::Consume));
+        }
+        matched = Some(EventSubscriptionMode::Carry);
+    }
+    Ok(matched)
 }
 
 fn control_principal_revoked_read(
@@ -8934,6 +10782,229 @@ fn inspect_semantic_readable(
     Ok((stats, mission_authority))
 }
 
+fn event_subscription_stats_read(
+    read: &redb::ReadTransaction,
+) -> Result<EventSubscriptionStats, StoreError> {
+    if read.list_multimap_tables()?.any(|table| {
+        table.name() == EVENT_SUBSCRIPTIONS.name()
+            || table.name() == EVENT_SUBSCRIPTION_PENDING.name()
+            || table.name() == EVENT_DELIVERY_ACKNOWLEDGEMENTS.name()
+    }) {
+        return Err(StoreError::SemanticInvariant(
+            "Event subscription schema has the wrong table kind",
+        ));
+    }
+    let table_names = read
+        .list_tables()?
+        .map(|table| table.name().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    let subscription_table_present = table_names.contains(EVENT_SUBSCRIPTIONS.name());
+    let pending_table_present = table_names.contains(EVENT_SUBSCRIPTION_PENDING.name());
+    let acknowledgement_table_present =
+        table_names.contains(EVENT_DELIVERY_ACKNOWLEDGEMENTS.name());
+    let metadata = read.open_table(METADATA)?;
+    let metadata_presence = [
+        metadata.get(EVENT_SUBSCRIPTION_COUNT)?.is_some(),
+        metadata.get(EVENT_PENDING_DELIVERY_COUNT)?.is_some(),
+        metadata.get(EVENT_SELECTOR_REVISION)?.is_some(),
+        metadata.get(EVENT_ACKNOWLEDGEMENT_COUNT)?.is_some(),
+    ];
+    let present_metadata = metadata_presence.iter().filter(|present| **present).count();
+    if !subscription_table_present
+        && !pending_table_present
+        && !acknowledgement_table_present
+        && present_metadata == 0
+    {
+        return Ok(EventSubscriptionStats::default());
+    }
+    let exact_legacy_group = subscription_table_present
+        && pending_table_present
+        && !acknowledgement_table_present
+        && metadata_presence[..3].iter().all(|present| *present)
+        && !metadata_presence[3];
+    let exact_current_group = subscription_table_present
+        && pending_table_present
+        && acknowledgement_table_present
+        && metadata_presence.iter().all(|present| *present);
+    if !exact_legacy_group && !exact_current_group {
+        return Err(StoreError::SemanticInvariant(
+            "Event subscription schema group is incomplete",
+        ));
+    }
+
+    let subscriptions = read.open_table(EVENT_SUBSCRIPTIONS)?;
+    let pending = read.open_table(EVENT_SUBSCRIPTION_PENDING)?;
+    let authority = read_mission_binding_read(read)?;
+    let last_marker = metadata
+        .get(LAST_SEMANTIC_ACCEPTANCE_MARKER)?
+        .ok_or(StoreError::MissingAccountingMetadata {
+            field: LAST_SEMANTIC_ACCEPTANCE_MARKER,
+        })?
+        .value();
+    let mut decoded_subscriptions = std::collections::BTreeMap::new();
+    let mut legacy_projections = std::collections::BTreeSet::new();
+    for row in subscriptions.iter()? {
+        let (key, value) = row?;
+        let id = parse_event_subscription_id(key.value())?;
+        let record = decode_event_subscription_record(value.value())?;
+        let authority = authority.ok_or(StoreError::SemanticInvariant(
+            "unbound store contains Event subscriptions",
+        ))?;
+        if event_subscription_id(authority, &record.operation_key) != id {
+            return Err(StoreError::SemanticInvariant(
+                "Event subscription identifier differs from its operation key",
+            ));
+        }
+        if record.discovered_through > last_marker
+            || (record.spec.mode == EventSubscriptionMode::Carry && record.discovered_through != 0)
+        {
+            return Err(StoreError::SemanticInvariant(
+                "Event subscription contains an invalid delivery cursor",
+            ));
+        }
+        legacy_projections.insert((
+            record.spec.topic.clone(),
+            record.spec.scope.clone(),
+            record.spec.include_descendant_scopes,
+        ));
+        decoded_subscriptions.insert(id, record);
+    }
+    if subscriptions.len()? > MAX_EVENT_SUBSCRIPTIONS {
+        return Err(StoreError::SemanticInvariant(
+            "Event subscription count exceeds its durable safety cap",
+        ));
+    }
+    let mut pending_semantics = std::collections::BTreeSet::new();
+    for row in pending.iter()? {
+        let (key, value) = row?;
+        let (subscription, marker) = parse_event_pending_delivery_key(key.value())?;
+        let record = decode_event_pending_delivery_record(value.value())?;
+        let subscription_record =
+            decoded_subscriptions
+                .get(&subscription)
+                .ok_or(StoreError::SemanticInvariant(
+                    "pending Event delivery references a missing subscription",
+                ))?;
+        if subscription_record.spec.mode != EventSubscriptionMode::Consume {
+            return Err(StoreError::SemanticInvariant(
+                "pending Event delivery references a Carry subscription",
+            ));
+        }
+        let event = load_event_by_semantic_from_read(read, record.semantic_id)?.ok_or(
+            StoreError::SemanticInvariant("pending Event delivery references a missing Event"),
+        )?;
+        if event.acceptance_marker != marker
+            || marker > subscription_record.discovered_through
+            || !subscription_record.spec.matches(&event)
+        {
+            return Err(StoreError::SemanticInvariant(
+                "pending Event delivery differs from its subscription ledger",
+            ));
+        }
+        if !pending_semantics.insert((subscription, record.semantic_id)) {
+            return Err(StoreError::SemanticInvariant(
+                "duplicate pending Event semantic delivery",
+            ));
+        }
+    }
+    if pending.len()? > MAX_EVENT_PENDING_DELIVERIES {
+        return Err(StoreError::SemanticInvariant(
+            "pending Event delivery count exceeds its durable safety cap",
+        ));
+    }
+    let acknowledged_deliveries = if acknowledgement_table_present {
+        let acknowledgements = read.open_table(EVENT_DELIVERY_ACKNOWLEDGEMENTS)?;
+        for row in acknowledgements.iter()? {
+            let (key, value) = row?;
+            let (subscription, semantic_id) = parse_event_acknowledgement_key(key.value())?;
+            let receipt = decode_event_acknowledgement_record(value.value())?;
+            let subscription_record =
+                decoded_subscriptions
+                    .get(&subscription)
+                    .ok_or(StoreError::SemanticInvariant(
+                        "Event acknowledgement references a missing subscription",
+                    ))?;
+            if subscription_record.spec.mode != EventSubscriptionMode::Consume {
+                return Err(StoreError::SemanticInvariant(
+                    "Event acknowledgement references a Carry subscription",
+                ));
+            }
+            let event = load_event_by_semantic_from_read(read, semantic_id)?.ok_or(
+                StoreError::SemanticInvariant(
+                    "Event acknowledgement references a missing accepted Event",
+                ),
+            )?;
+            if receipt.acceptance_marker != event.acceptance_marker
+                || receipt.acceptance_marker > subscription_record.discovered_through
+                || !subscription_record.spec.matches(&event)
+            {
+                return Err(StoreError::SemanticInvariant(
+                    "Event acknowledgement differs from its subscription ledger",
+                ));
+            }
+            if pending_semantics.contains(&(subscription, semantic_id)) {
+                return Err(StoreError::SemanticInvariant(
+                    "Event delivery is both pending and acknowledged",
+                ));
+            }
+        }
+        let count = acknowledgements.len()?;
+        if count > MAX_EVENT_ACKNOWLEDGEMENT_RECEIPTS {
+            return Err(StoreError::SemanticInvariant(
+                "Event acknowledgement count exceeds its durable safety cap",
+            ));
+        }
+        count
+    } else {
+        0
+    };
+    let stats = EventSubscriptionStats {
+        subscriptions: subscriptions.len()?,
+        pending_deliveries: pending.len()?,
+        acknowledged_deliveries,
+        selector_revision: metadata
+            .get(EVENT_SELECTOR_REVISION)?
+            .ok_or(StoreError::MissingAccountingMetadata {
+                field: EVENT_SELECTOR_REVISION,
+            })?
+            .value(),
+    };
+    for (field, reconstructed) in [
+        (EVENT_SUBSCRIPTION_COUNT, stats.subscriptions),
+        (EVENT_PENDING_DELIVERY_COUNT, stats.pending_deliveries),
+        (EVENT_ACKNOWLEDGEMENT_COUNT, stats.acknowledged_deliveries),
+    ] {
+        if exact_legacy_group && field == EVENT_ACKNOWLEDGEMENT_COUNT {
+            continue;
+        }
+        let durable = metadata
+            .get(field)?
+            .ok_or(StoreError::MissingAccountingMetadata { field })?
+            .value();
+        if durable != reconstructed {
+            return Err(StoreError::AccountingMismatch {
+                field,
+                durable,
+                reconstructed,
+            });
+        }
+    }
+    let expected_revision = if exact_legacy_group {
+        u64::try_from(legacy_projections.len())
+            .map_err(|_| StoreError::ItemCountAccountingOverflow)?
+    } else {
+        stats.subscriptions
+    };
+    if stats.selector_revision != expected_revision {
+        return Err(StoreError::AccountingMismatch {
+            field: EVENT_SELECTOR_REVISION,
+            durable: stats.selector_revision,
+            reconstructed: expected_revision,
+        });
+    }
+    Ok(stats)
+}
+
 fn inspect_readable(database: &impl ReadableDatabase) -> Result<StoreInspection, StoreError> {
     let read = database.begin_read()?;
     let zeroization = inspect_zeroization_read(&read)?;
@@ -9010,6 +11081,7 @@ fn inspect_readable(database: &impl ReadableDatabase) -> Result<StoreInspection,
     }
 
     let (event_stats, mission_authority) = inspect_semantic_readable(&read)?;
+    let event_subscription_stats = event_subscription_stats_read(&read)?;
     let control_stats = inspect_control_tables(&read, mission_authority)?.unwrap_or_default();
 
     Ok(StoreInspection {
@@ -9021,6 +11093,7 @@ fn inspect_readable(database: &impl ReadableDatabase) -> Result<StoreInspection,
             last_acceptance_marker: durable_marker,
         },
         event_stats,
+        event_subscription_stats,
         control_stats,
         mission_authority,
         zeroization,
@@ -9287,6 +11360,45 @@ mod tests {
             metadata.insert(key, value).expect("write metadata");
         }
         write.commit().expect("commit metadata");
+    }
+
+    fn subscription_spec(mode: EventSubscriptionMode) -> EventSubscriptionSpec {
+        EventSubscriptionSpec {
+            mode,
+            topic: event_topic(),
+            scope: event_scope(),
+            include_descendant_scopes: false,
+        }
+    }
+
+    fn verify_subscription_plan(
+        verifier: &mut ReferenceEnvelopeSealer,
+        plan: &EventSubscriptionPollPlan,
+    ) -> EventSubscriptionPollSelection {
+        for event in plan
+            .pending_candidates()
+            .iter()
+            .map(|candidate| &candidate.event)
+            .chain(plan.scanned_candidates())
+        {
+            let verified = content_event(verifier, &event.sealed);
+            assert_eq!(
+                EventTransferId::new(verified.envelope_id()),
+                event.transfer_id,
+                "fresh verification must bind the exact stored source bytes"
+            );
+        }
+        EventSubscriptionPollSelection {
+            deliveries: plan
+                .pending_candidates()
+                .iter()
+                .map(|candidate| &candidate.event)
+                .chain(plan.scanned_candidates())
+                .filter(|event| plan.spec().matches(event))
+                .map(|event| event.semantic_id)
+                .collect(),
+            inactive_pending: Vec::new(),
+        }
     }
 
     #[test]
@@ -10013,6 +12125,1498 @@ mod tests {
         assert_eq!(store.event_inventory().expect("Event inventory").len(), 1);
         assert_eq!(store.stats().expect("legacy stats").items, 1);
         assert_eq!(store.event_stats().expect("Event stats").events, 1);
+    }
+
+    #[test]
+    fn event_subscription_identity_snapshot_modes_and_quota_are_stable() {
+        let vector_key = EventSubscriptionKey::new(b"app/feed".to_vec()).expect("vector key");
+        assert_eq!(
+            event_subscription_id([0x11; 32], &vector_key).as_bytes(),
+            &[
+                0xfa, 0x5c, 0xbe, 0x02, 0x70, 0xc7, 0x6d, 0xdc, 0x00, 0x24, 0x5b, 0x72, 0x21, 0x50,
+                0x76, 0x46, 0x30, 0xe1, 0x24, 0xd9, 0xb1, 0x7a, 0xfd, 0xe3, 0xed, 0x71, 0xfa, 0xee,
+                0xe1, 0xf5, 0xbf, 0x29,
+            ],
+            "domain-separated subscription identity is a frozen durable vector"
+        );
+        assert!(matches!(
+            EventSubscriptionKey::new(Vec::new()),
+            Err(StoreError::InvalidEventSubscriptionKey { length: 0 })
+        ));
+        assert!(matches!(
+            EventSubscriptionKey::new(vec![0; MAX_EVENT_SUBSCRIPTION_KEY_BYTES + 1]),
+            Err(StoreError::InvalidEventSubscriptionKey { .. })
+        ));
+        assert_eq!(
+            next_event_acknowledgement_count(MAX_EVENT_ACKNOWLEDGEMENT_RECEIPTS - 1)
+                .expect("last bounded acknowledgement receipt"),
+            MAX_EVENT_ACKNOWLEDGEMENT_RECEIPTS
+        );
+        assert!(matches!(
+            next_event_acknowledgement_count(MAX_EVENT_ACKNOWLEDGEMENT_RECEIPTS),
+            Err(StoreError::EventAcknowledgementReceiptLimitExceeded {
+                current: MAX_EVENT_ACKNOWLEDGEMENT_RECEIPTS,
+                limit: MAX_EVENT_ACKNOWLEDGEMENT_RECEIPTS,
+            })
+        ));
+
+        let file = TestFile::new("event-subscription-snapshot");
+        let services = event_services(0x45);
+        let store =
+            Store::open_for_mission(&file.0, services.authority).expect("subscription store");
+        let policy = store.control_policy_snapshot().expect("settled policy");
+        let empty = store
+            .event_replication_policy_snapshot()
+            .expect("empty receive intent");
+        assert!(empty.selectors().is_empty(), "empty means receive-none");
+        assert_eq!(empty.selector_revision(), 0);
+
+        let carry_key = EventSubscriptionKey::new(b"relay/carry".to_vec()).expect("carry key");
+        let carry = subscription_spec(EventSubscriptionMode::Carry);
+        let carry_created = store
+            .create_event_subscription_with_policy(&policy, &carry_key, carry.clone())
+            .expect("create Carry selector");
+        assert!(carry_created.inserted);
+        assert_eq!(
+            store
+                .create_event_subscription_with_policy(&policy, &carry_key, carry.clone())
+                .expect("exact retry"),
+            EventSubscriptionCreateOutcome {
+                id: carry_created.id,
+                inserted: false,
+            }
+        );
+        assert!(matches!(
+            store.create_event_subscription_with_policy(
+                &policy,
+                &carry_key,
+                subscription_spec(EventSubscriptionMode::Consume),
+            ),
+            Err(StoreError::EventSubscriptionConflict)
+        ));
+        assert!(matches!(
+            store.prepare_event_subscription_poll_with_policy(&policy, carry_created.id, 1, 1),
+            Err(StoreError::EventSubscriptionNotConsumable)
+        ));
+        let carry_snapshot = store
+            .event_replication_policy_snapshot()
+            .expect("Carry projection");
+        assert_eq!(carry_snapshot.selector_revision(), 1);
+        assert_eq!(
+            carry_snapshot.selectors()[0].mode(),
+            EventSubscriptionMode::Carry
+        );
+        assert_eq!(
+            carry_snapshot.effective_mode(&event_topic(), &event_scope()),
+            Some(EventSubscriptionMode::Carry)
+        );
+
+        let consume_key =
+            EventSubscriptionKey::new(b"application/consume".to_vec()).expect("consume key");
+        let consume_created = store
+            .create_event_subscription_with_policy(
+                &policy,
+                &consume_key,
+                subscription_spec(EventSubscriptionMode::Consume),
+            )
+            .expect("same projected selector in Consume mode");
+        let snapshot = store
+            .event_replication_policy_snapshot()
+            .expect("canonical projection");
+        assert!(matches!(
+            store.require_event_replication_policy(&carry_snapshot),
+            Err(StoreError::EventSelectorRevisionChanged)
+        ));
+        assert_eq!(snapshot.selectors().len(), 1);
+        assert_eq!(
+            snapshot.selectors()[0].mode(),
+            EventSubscriptionMode::Consume
+        );
+        assert_eq!(snapshot.selector_revision(), 2);
+        assert_eq!(
+            snapshot.effective_mode(&event_topic(), &event_scope()),
+            Some(EventSubscriptionMode::Consume),
+            "Consume dominates an identical Carry projection"
+        );
+        assert_eq!(
+            store.event_subscription_stats().expect("audited stats"),
+            EventSubscriptionStats {
+                subscriptions: 2,
+                pending_deliveries: 0,
+                acknowledged_deliveries: 0,
+                selector_revision: 2,
+            }
+        );
+
+        let mut child_carry = subscription_spec(EventSubscriptionMode::Carry);
+        child_carry.scope = child_event_scope();
+        store
+            .create_event_subscription_with_policy(
+                &policy,
+                &EventSubscriptionKey::new(b"relay/child".to_vec()).expect("child key"),
+                child_carry,
+            )
+            .expect("child Carry selector");
+        let mut descendant_consume = subscription_spec(EventSubscriptionMode::Consume);
+        descendant_consume.include_descendant_scopes = true;
+        store
+            .create_event_subscription_with_policy(
+                &policy,
+                &EventSubscriptionKey::new(b"application/descendants".to_vec())
+                    .expect("descendant key"),
+                descendant_consume,
+            )
+            .expect("descendant Consume selector");
+        let overlapping = store
+            .event_replication_policy_snapshot()
+            .expect("overlapping effective modes");
+        assert_eq!(overlapping.selector_revision(), 4);
+        assert_eq!(overlapping.selectors().len(), 3);
+        assert_eq!(
+            overlapping.effective_mode(&event_topic(), &child_event_scope()),
+            Some(EventSubscriptionMode::Consume),
+            "Consume dominates a distinct overlapping Carry selector"
+        );
+        assert_eq!(
+            overlapping.effective_mode(&reaction_topic(), &child_event_scope()),
+            None,
+            "unselected topics remain receive-none"
+        );
+        for requested in [0, MAX_EVENT_POLL_DELIVERIES + 1] {
+            assert!(matches!(
+                store.prepare_event_subscription_poll_with_policy(
+                    &policy,
+                    consume_created.id,
+                    requested,
+                    1,
+                ),
+                Err(StoreError::EventSubscriptionPollLimitExceeded { .. })
+            ));
+        }
+
+        for index in 4..MAX_EVENT_SUBSCRIPTIONS {
+            let key = EventSubscriptionKey::new(format!("duplicate/{index}").into_bytes())
+                .expect("bounded quota key");
+            store
+                .create_event_subscription_with_policy(&policy, &key, carry.clone())
+                .expect("fill subscription quota");
+        }
+        let overflow_key =
+            EventSubscriptionKey::new(b"quota/overflow".to_vec()).expect("overflow key");
+        assert!(matches!(
+            store.create_event_subscription_with_policy(&policy, &overflow_key, carry),
+            Err(StoreError::EventSubscriptionLimitExceeded {
+                current: MAX_EVENT_SUBSCRIPTIONS,
+                limit: MAX_EVENT_SUBSCRIPTIONS,
+            })
+        ));
+        let bounded = store
+            .event_replication_policy_snapshot()
+            .expect("bounded projection");
+        assert_eq!(bounded.selectors().len(), 3);
+        assert_eq!(bounded.selector_revision(), MAX_EVENT_SUBSCRIPTIONS);
+    }
+
+    #[test]
+    fn replication_snapshot_atomically_guards_route_cache_admission() {
+        let file = TestFile::new("replication-route-admission");
+        let mut services = event_services(0x4c);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("bound store");
+        let policy = store.control_policy_snapshot().expect("settled policy");
+        let receive_none = store
+            .event_replication_policy_snapshot()
+            .expect("empty receive intent");
+
+        let first_payload = b"Carry-selected route representation";
+        let first_header = event_header(
+            services.publisher.identity(),
+            1,
+            1,
+            VersionVector::default(),
+            b"route-first",
+            first_payload,
+            None,
+        );
+        let first = services
+            .publisher
+            .seal_event(&first_header, first_payload)
+            .expect("seal first route Event");
+        let first_route = services
+            .relay
+            .verify_event(&first.bytes)
+            .expect("verify first route Event");
+        assert!(matches!(
+            store.cache_route_verified_event_with_replication_policy(
+                &receive_none,
+                &first_route,
+                &first.bytes,
+            ),
+            Err(StoreError::EventReplicationNotSelected)
+        ));
+        assert_eq!(
+            store.event_stats().expect("receive-none stats"),
+            EventStoreStats::default()
+        );
+
+        store
+            .create_event_subscription_with_policy(
+                &policy,
+                &EventSubscriptionKey::new(b"relay/carry-atomic".to_vec()).expect("Carry key"),
+                subscription_spec(EventSubscriptionMode::Carry),
+            )
+            .expect("create Carry selector");
+        let stale_carry = store
+            .event_replication_policy_snapshot()
+            .expect("Carry snapshot");
+        assert!(matches!(
+            store.cache_route_verified_event_with_replication_policy(
+                &stale_carry,
+                &first_route,
+                &first.bytes,
+            ),
+            Ok(RouteCacheOutcome::Inserted { .. })
+        ));
+
+        store
+            .create_event_subscription_with_policy(
+                &policy,
+                &EventSubscriptionKey::new(b"application/consume-atomic".to_vec())
+                    .expect("Consume key"),
+                subscription_spec(EventSubscriptionMode::Consume),
+            )
+            .expect("insert overlapping Consume selector");
+        let before_stale_attempt = store.event_stats().expect("pre-attempt stats");
+
+        let second_payload = b"must not enter cache under stale mode";
+        let second_header = event_header(
+            services.publisher.identity(),
+            2,
+            2,
+            VersionVector::default(),
+            b"route-second",
+            second_payload,
+            None,
+        );
+        let second = services
+            .publisher
+            .seal_event(&second_header, second_payload)
+            .expect("seal second route Event");
+        let second_route = services
+            .relay
+            .verify_event(&second.bytes)
+            .expect("verify second route Event");
+        let second_transfer = EventTransferId::new(second_route.envelope_id());
+        assert!(matches!(
+            store.cache_route_verified_event_with_replication_policy(
+                &stale_carry,
+                &second_route,
+                &second.bytes,
+            ),
+            Err(StoreError::EventSelectorRevisionChanged)
+        ));
+        assert_eq!(
+            store.event_stats().expect("post-attempt stats"),
+            before_stale_attempt,
+            "a stale replication snapshot cannot mutate route-cache accounting"
+        );
+        assert!(
+            store
+                .get_route_cached_event(second_transfer)
+                .expect("read rejected transfer")
+                .is_none(),
+            "a stale replication snapshot cannot insert route bytes or claims"
+        );
+
+        let current = store
+            .event_replication_policy_snapshot()
+            .expect("current Consume snapshot");
+        assert!(matches!(
+            store.cache_route_verified_event_with_replication_policy(
+                &current,
+                &second_route,
+                &second.bytes,
+            ),
+            Ok(RouteCacheOutcome::Inserted { .. })
+        ));
+    }
+
+    #[test]
+    fn replication_snapshot_atomically_guards_semantic_event_admission() {
+        let file = TestFile::new("replication-semantic-admission");
+        let mut services = event_services(0x4d);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("bound store");
+        let policy = store.control_policy_snapshot().expect("settled policy");
+        let receive_none = store
+            .event_replication_policy_snapshot()
+            .expect("empty receive intent");
+        let payload = b"Consume-only semantic admission";
+        let header = event_header(
+            services.publisher.identity(),
+            1,
+            1,
+            VersionVector::default(),
+            b"semantic-atomic",
+            payload,
+            None,
+        );
+        let sealed = services
+            .publisher
+            .seal_event(&header, payload)
+            .expect("seal semantic Event");
+        let event = content_event(&mut services.reader, &sealed.bytes);
+        let transfer_id = EventTransferId::new(event.envelope_id());
+
+        assert!(matches!(
+            store.apply_verified_event_with_replication_policy(
+                &receive_none,
+                &event,
+                &sealed.bytes,
+            ),
+            Err(StoreError::EventReplicationNotSelected)
+        ));
+        store
+            .create_event_subscription_with_policy(
+                &policy,
+                &EventSubscriptionKey::new(b"relay/carry-semantic".to_vec()).expect("Carry key"),
+                subscription_spec(EventSubscriptionMode::Carry),
+            )
+            .expect("create Carry selector");
+        let stale_carry = store
+            .event_replication_policy_snapshot()
+            .expect("Carry snapshot");
+        assert!(matches!(
+            store
+                .apply_verified_event_with_replication_policy(&stale_carry, &event, &sealed.bytes,),
+            Err(StoreError::EventReplicationNotConsumable)
+        ));
+        assert_eq!(
+            store.event_stats().expect("pre-stale stats"),
+            EventStoreStats::default()
+        );
+
+        store
+            .create_event_subscription_with_policy(
+                &policy,
+                &EventSubscriptionKey::new(b"application/consume-semantic".to_vec())
+                    .expect("Consume key"),
+                subscription_spec(EventSubscriptionMode::Consume),
+            )
+            .expect("insert overlapping Consume selector");
+        let before_stale_attempt = store.event_stats().expect("pre-attempt stats");
+        assert!(matches!(
+            store
+                .apply_verified_event_with_replication_policy(&stale_carry, &event, &sealed.bytes,),
+            Err(StoreError::EventSelectorRevisionChanged)
+        ));
+        assert_eq!(
+            store.event_stats().expect("post-attempt stats"),
+            before_stale_attempt,
+            "a stale replication snapshot cannot mutate semantic accounting"
+        );
+        assert!(
+            store
+                .get_event(transfer_id)
+                .expect("read rejected semantic Event")
+                .is_none(),
+            "a stale replication snapshot cannot insert semantic bytes or indexes"
+        );
+
+        let current = store
+            .event_replication_policy_snapshot()
+            .expect("current Consume snapshot");
+        assert!(matches!(
+            store.apply_verified_event_with_replication_policy(&current, &event, &sealed.bytes),
+            Ok(ApplyOutcome::Inserted { .. })
+        ));
+    }
+
+    #[test]
+    fn cross_store_same_revision_snapshot_cannot_admit_route_cache() {
+        let source_file = TestFile::new("cross-store-route-source");
+        let target_file = TestFile::new("cross-store-route-target");
+        let mut services = event_services(0x4e);
+        let source =
+            Store::open_for_mission(&source_file.0, services.authority).expect("source store");
+        let target =
+            Store::open_for_mission(&target_file.0, services.authority).expect("target store");
+        let source_policy = source.control_policy_snapshot().expect("source policy");
+        let target_policy = target.control_policy_snapshot().expect("target policy");
+        source
+            .create_event_subscription_with_policy(
+                &source_policy,
+                &EventSubscriptionKey::new(b"source/carry".to_vec()).expect("source key"),
+                subscription_spec(EventSubscriptionMode::Carry),
+            )
+            .expect("source selector");
+        let mut unrelated = subscription_spec(EventSubscriptionMode::Carry);
+        unrelated.topic = reaction_topic();
+        target
+            .create_event_subscription_with_policy(
+                &target_policy,
+                &EventSubscriptionKey::new(b"target/carry".to_vec()).expect("target key"),
+                unrelated,
+            )
+            .expect("target unrelated selector");
+        let cross_wired = source
+            .event_replication_policy_snapshot()
+            .expect("source snapshot");
+        let target_snapshot = target
+            .event_replication_policy_snapshot()
+            .expect("target snapshot");
+        assert_eq!(cross_wired.selector_revision(), 1);
+        assert_eq!(target_snapshot.selector_revision(), 1);
+        assert_eq!(
+            cross_wired.effective_mode(&event_topic(), &event_scope()),
+            Some(EventSubscriptionMode::Carry)
+        );
+        assert_eq!(
+            target_snapshot.effective_mode(&event_topic(), &event_scope()),
+            None
+        );
+
+        let payload = b"cross-wired route snapshot";
+        let header = event_header(
+            services.publisher.identity(),
+            1,
+            1,
+            VersionVector::default(),
+            b"cross-route",
+            payload,
+            None,
+        );
+        let sealed = services
+            .publisher
+            .seal_event(&header, payload)
+            .expect("seal route Event");
+        let route = services
+            .relay
+            .verify_event(&sealed.bytes)
+            .expect("verify route Event");
+        let transfer_id = EventTransferId::new(route.envelope_id());
+        let before = target.event_stats().expect("target stats before");
+        assert!(matches!(
+            target.cache_route_verified_event_with_replication_policy(
+                &cross_wired,
+                &route,
+                &sealed.bytes,
+            ),
+            Err(StoreError::EventSelectorRevisionChanged)
+        ));
+        assert_eq!(target.event_stats().expect("target stats after"), before);
+        assert!(
+            target
+                .get_route_cached_event(transfer_id)
+                .expect("read rejected route Event")
+                .is_none(),
+            "same numeric revision cannot cross-wire route authority between stores"
+        );
+    }
+
+    #[test]
+    fn cross_store_same_revision_snapshot_cannot_admit_semantic_event() {
+        let source_file = TestFile::new("cross-store-semantic-source");
+        let target_file = TestFile::new("cross-store-semantic-target");
+        let mut services = event_services(0x4f);
+        let source =
+            Store::open_for_mission(&source_file.0, services.authority).expect("source store");
+        let target =
+            Store::open_for_mission(&target_file.0, services.authority).expect("target store");
+        let source_policy = source.control_policy_snapshot().expect("source policy");
+        let target_policy = target.control_policy_snapshot().expect("target policy");
+        source
+            .create_event_subscription_with_policy(
+                &source_policy,
+                &EventSubscriptionKey::new(b"source/consume".to_vec()).expect("source key"),
+                subscription_spec(EventSubscriptionMode::Consume),
+            )
+            .expect("source Consume selector");
+        target
+            .create_event_subscription_with_policy(
+                &target_policy,
+                &EventSubscriptionKey::new(b"target/carry".to_vec()).expect("target key"),
+                subscription_spec(EventSubscriptionMode::Carry),
+            )
+            .expect("target Carry selector");
+        let cross_wired = source
+            .event_replication_policy_snapshot()
+            .expect("source snapshot");
+        let target_snapshot = target
+            .event_replication_policy_snapshot()
+            .expect("target snapshot");
+        assert_eq!(cross_wired.selector_revision(), 1);
+        assert_eq!(target_snapshot.selector_revision(), 1);
+        assert_eq!(
+            cross_wired.effective_mode(&event_topic(), &event_scope()),
+            Some(EventSubscriptionMode::Consume)
+        );
+        assert_eq!(
+            target_snapshot.effective_mode(&event_topic(), &event_scope()),
+            Some(EventSubscriptionMode::Carry)
+        );
+
+        let payload = b"cross-wired semantic snapshot";
+        let header = event_header(
+            services.publisher.identity(),
+            1,
+            1,
+            VersionVector::default(),
+            b"cross-semantic",
+            payload,
+            None,
+        );
+        let sealed = services
+            .publisher
+            .seal_event(&header, payload)
+            .expect("seal semantic Event");
+        let event = content_event(&mut services.reader, &sealed.bytes);
+        let transfer_id = EventTransferId::new(event.envelope_id());
+        let before = target.event_stats().expect("target stats before");
+        assert!(matches!(
+            target.apply_verified_event_with_replication_policy(
+                &cross_wired,
+                &event,
+                &sealed.bytes,
+            ),
+            Err(StoreError::EventSelectorRevisionChanged)
+        ));
+        assert_eq!(target.event_stats().expect("target stats after"), before);
+        assert!(
+            target
+                .get_event(transfer_id)
+                .expect("read rejected semantic Event")
+                .is_none(),
+            "same numeric revision cannot cross-wire content authority between stores"
+        );
+        assert!(matches!(
+            target.apply_verified_event_with_replication_policy(
+                &target_snapshot,
+                &event,
+                &sealed.bytes,
+            ),
+            Err(StoreError::EventReplicationNotConsumable)
+        ));
+    }
+
+    #[test]
+    fn event_subscription_poll_restarts_retries_acks_and_closes_filter_gaps() {
+        let file = TestFile::new("event-subscription-delivery");
+        let mut services = event_services(0x46);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("bound store");
+        let policy = store.control_policy_snapshot().expect("poll policy");
+        let key = EventSubscriptionKey::new(b"application/events".to_vec()).expect("key");
+        let subscription = store
+            .create_event_subscription_with_policy(
+                &policy,
+                &key,
+                subscription_spec(EventSubscriptionMode::Consume),
+            )
+            .expect("create Consume")
+            .id;
+        let publisher = services.publisher.identity();
+        let first_payload = b"first delivery";
+        let first = accept_event(
+            &store,
+            &mut services,
+            event_header(
+                publisher,
+                1,
+                1,
+                VersionVector::default(),
+                b"first",
+                first_payload,
+                None,
+            ),
+            first_payload,
+        );
+        let skipped_payload = b"different topic creates a filter gap";
+        let mut skipped_header = event_header(
+            publisher,
+            2,
+            1,
+            VersionVector::default(),
+            b"skip",
+            skipped_payload,
+            None,
+        );
+        skipped_header.topic = reaction_topic();
+        let skipped = accept_event(&store, &mut services, skipped_header, skipped_payload);
+        let third_payload = b"delivery after the filter gap";
+        let third = accept_event(
+            &store,
+            &mut services,
+            event_header(
+                publisher,
+                3,
+                2,
+                VersionVector::default(),
+                b"third",
+                third_payload,
+                None,
+            ),
+            third_payload,
+        );
+        assert_eq!(
+            (
+                first.acceptance_marker,
+                skipped.acceptance_marker,
+                third.acceptance_marker
+            ),
+            (1, 2, 3)
+        );
+        assert!(matches!(
+            store.acknowledge_event_delivery_with_policy(
+                &policy,
+                subscription,
+                EventSemanticId::new([0xff; 32]),
+            ),
+            Err(StoreError::EventDeliveryNotFound)
+        ));
+        assert!(matches!(
+            store.acknowledge_event_delivery_with_policy(&policy, subscription, first.semantic_id,),
+            Err(StoreError::EventDeliveryNotFound)
+        ));
+
+        let plan = store
+            .prepare_event_subscription_poll_with_policy(&policy, subscription, 1, 1)
+            .expect("first bounded plan");
+        assert_eq!(plan.discovered_through(), 0);
+        assert_eq!(plan.scanned_candidates(), std::slice::from_ref(&first));
+        let stale_plan = plan.clone();
+        let selection = verify_subscription_plan(&mut services.reader, &plan);
+        let first_attempt = store
+            .commit_event_subscription_poll_with_policy(&policy, &plan, &selection)
+            .expect("commit attempt one");
+        assert_eq!(first_attempt.deliveries[0].attempt, 1);
+        assert_eq!(first_attempt.scanned_through, 1);
+        assert!(first_attempt.has_more);
+        assert!(matches!(
+            store.commit_event_subscription_poll_with_policy(&policy, &stale_plan, &selection),
+            Err(StoreError::EventSubscriptionPlanChanged)
+        ));
+        drop(store);
+
+        let store = Store::open_for_mission(&file.0, services.authority).expect("restart store");
+        let policy = store.control_policy_snapshot().expect("restart policy");
+        let retry_plan = store
+            .prepare_event_subscription_poll_with_policy(&policy, subscription, 1, 4)
+            .expect("pending retry plan");
+        assert!(retry_plan.scanned_candidates().is_empty());
+        assert_eq!(retry_plan.pending_candidates().len(), 1);
+        assert_eq!(retry_plan.pending_candidates()[0].previous_attempt, 1);
+        let retry_selection = verify_subscription_plan(&mut services.reader, &retry_plan);
+        let retry = store
+            .commit_event_subscription_poll_with_policy(&policy, &retry_plan, &retry_selection)
+            .expect("durably commit retry");
+        assert_eq!(retry.deliveries[0].attempt, 2);
+        assert_eq!(retry.deliveries[0].event, first);
+        assert_eq!(
+            store
+                .acknowledge_event_delivery_with_policy(&policy, subscription, first.semantic_id)
+                .expect("ack first"),
+            EventDeliveryAck::Acknowledged
+        );
+        drop(store);
+        let store = Store::open_for_mission(&file.0, services.authority)
+            .expect("acknowledgement receipt restart");
+        let policy = store
+            .control_policy_snapshot()
+            .expect("acknowledgement retry policy");
+        assert_eq!(
+            store
+                .acknowledge_event_delivery_with_policy(&policy, subscription, first.semantic_id)
+                .expect("durable idempotent ack retry"),
+            EventDeliveryAck::AlreadyAcknowledged
+        );
+
+        let gap_plan = store
+            .prepare_event_subscription_poll_with_policy(&policy, subscription, 4, 1)
+            .expect("bounded unfiltered gap plan");
+        assert_eq!(
+            gap_plan.scanned_candidates(),
+            std::slice::from_ref(&skipped)
+        );
+        let gap_selection = verify_subscription_plan(&mut services.reader, &gap_plan);
+        assert!(gap_selection.deliveries.is_empty());
+        let gap_page = store
+            .commit_event_subscription_poll_with_policy(&policy, &gap_plan, &gap_selection)
+            .expect("advance over verified nonmatch");
+        assert_eq!(gap_page.scanned_through, 2);
+        assert!(gap_page.deliveries.is_empty());
+        assert!(gap_page.has_more);
+        assert!(matches!(
+            store.acknowledge_event_delivery_with_policy(
+                &policy,
+                subscription,
+                skipped.semantic_id,
+            ),
+            Err(StoreError::EventDeliveryNotFound)
+        ));
+
+        let final_plan = store
+            .prepare_event_subscription_poll_with_policy(&policy, subscription, 4, 4)
+            .expect("post-gap plan");
+        assert_eq!(
+            final_plan.scanned_candidates(),
+            std::slice::from_ref(&third)
+        );
+        let final_selection = verify_subscription_plan(&mut services.reader, &final_plan);
+        let appended_payload = b"accepted after prepare before commit";
+        let appended = accept_event(
+            &store,
+            &mut services,
+            event_header(
+                publisher,
+                4,
+                3,
+                VersionVector::default(),
+                b"appended",
+                appended_payload,
+                None,
+            ),
+            appended_payload,
+        );
+        let final_page = store
+            .commit_event_subscription_poll_with_policy(&policy, &final_plan, &final_selection)
+            .expect("post-gap delivery");
+        assert_eq!(final_page.deliveries[0].attempt, 1);
+        assert_eq!(final_page.deliveries[0].event, third);
+        assert!(
+            final_page.has_more,
+            "commit must observe Events accepted after bounded preparation"
+        );
+        assert_eq!(
+            store
+                .acknowledge_event_delivery_with_policy(&policy, subscription, third.semantic_id)
+                .expect("ack post-gap delivery"),
+            EventDeliveryAck::Acknowledged
+        );
+        let appended_plan = store
+            .prepare_event_subscription_poll_with_policy(&policy, subscription, 1, 1)
+            .expect("appended Event plan");
+        assert_eq!(
+            appended_plan.scanned_candidates(),
+            std::slice::from_ref(&appended)
+        );
+        let appended_selection = verify_subscription_plan(&mut services.reader, &appended_plan);
+        let appended_page = store
+            .commit_event_subscription_poll_with_policy(
+                &policy,
+                &appended_plan,
+                &appended_selection,
+            )
+            .expect("appended Event delivery");
+        assert!(!appended_page.has_more);
+        assert_eq!(appended_page.deliveries[0].event, appended);
+        assert_eq!(
+            store
+                .acknowledge_event_delivery_with_policy(
+                    &policy,
+                    subscription,
+                    appended.semantic_id,
+                )
+                .expect("ack appended delivery"),
+            EventDeliveryAck::Acknowledged
+        );
+        assert_eq!(
+            store.event_subscription_stats().expect("empty ledger"),
+            EventSubscriptionStats {
+                subscriptions: 1,
+                pending_deliveries: 0,
+                acknowledged_deliveries: 3,
+                selector_revision: 1,
+            }
+        );
+
+        let intent = ZeroizationIntent::new(
+            b"v1:mission:/subscription-test".to_vec(),
+            b"v1:identity:/subscription-test".to_vec(),
+        )
+        .expect("terminal intent");
+        store
+            .begin_zeroization(&intent)
+            .expect("enter terminal state");
+        assert!(matches!(
+            store.prepare_event_subscription_poll_with_policy(&policy, subscription, 1, 1),
+            Err(StoreError::StoreZeroized(
+                StoreZeroizationState::CleanupPending
+            ))
+        ));
+    }
+
+    #[test]
+    fn event_subscription_retires_verified_inactive_pending_without_starvation() {
+        let file = TestFile::new("event-subscription-inactive");
+        let mut services = control_services(0x47);
+        let store =
+            Store::open_for_mission(&file.0, services.authority_id).expect("control-bound store");
+        let initial_policy = store.control_policy_snapshot().expect("initial policy");
+        let key = EventSubscriptionKey::new(b"application/inactive".to_vec()).expect("key");
+        let subscription = store
+            .create_event_subscription_with_policy(
+                &initial_policy,
+                &key,
+                subscription_spec(EventSubscriptionMode::Consume),
+            )
+            .expect("create Consume")
+            .id;
+        let payload = b"delivery revoked after first attempt";
+        let header = event_header(
+            services.verifier.identity(),
+            1,
+            1,
+            VersionVector::default(),
+            b"inactive",
+            payload,
+            None,
+        );
+        let sealed = services
+            .verifier
+            .seal_event(&header, payload)
+            .expect("seal pre-revocation Event");
+        let event = content_event(&mut services.authority, &sealed.bytes);
+        store
+            .apply_verified_event_with_policy(&initial_policy, &event, &sealed.bytes)
+            .expect("accept pre-revocation Event");
+        let stored = store
+            .event_by_semantic_id(EventSemanticId::new(event.item_id()))
+            .expect("read Event")
+            .expect("stored Event");
+        let never_delivered_payload = b"inactive before first bounded scan";
+        let never_delivered_header = event_header(
+            services.verifier.identity(),
+            2,
+            2,
+            VersionVector::default(),
+            b"inactive-first-scan",
+            never_delivered_payload,
+            None,
+        );
+        let never_delivered_sealed = services
+            .verifier
+            .seal_event(&never_delivered_header, never_delivered_payload)
+            .expect("seal undiscovered pre-revocation Event");
+        let never_delivered_event =
+            content_event(&mut services.authority, &never_delivered_sealed.bytes);
+        store
+            .apply_verified_event_with_policy(
+                &initial_policy,
+                &never_delivered_event,
+                &never_delivered_sealed.bytes,
+            )
+            .expect("accept undiscovered pre-revocation Event");
+        let never_delivered = store
+            .event_by_semantic_id(EventSemanticId::new(never_delivered_event.item_id()))
+            .expect("read undiscovered Event")
+            .expect("undiscovered Event row");
+        let first_plan = store
+            .prepare_event_subscription_poll_with_policy(&initial_policy, subscription, 1, 1)
+            .expect("initial plan");
+        let first_selection = verify_subscription_plan(&mut services.authority, &first_plan);
+        store
+            .commit_event_subscription_poll_with_policy(
+                &initial_policy,
+                &first_plan,
+                &first_selection,
+            )
+            .expect("first attempt");
+
+        let revoked = services.verifier.identity();
+        let control = services
+            .authority
+            .seal_chained_revocation_control(revoked, 1, 1, None)
+            .expect("seal revocation");
+        let verified = verify_control(&mut services.verifier, &control);
+        store
+            .ingest_verified_control(&verified, &control)
+            .expect("apply revocation");
+        let current_policy = store.control_policy_snapshot().expect("current policy");
+        assert!(matches!(
+            store.prepare_event_subscription_poll_with_policy(&initial_policy, subscription, 1, 1,),
+            Err(StoreError::ControlPolicyChanged)
+        ));
+        let inactive_plan = store
+            .prepare_event_subscription_poll_with_policy(&current_policy, subscription, 1, 1)
+            .expect("inactive pending plan");
+        assert_eq!(inactive_plan.pending_candidates().len(), 1);
+        content_event(
+            &mut services.authority,
+            &inactive_plan.pending_candidates()[0].event.sealed,
+        );
+        let selection = EventSubscriptionPollSelection {
+            deliveries: Vec::new(),
+            inactive_pending: vec![stored.semantic_id],
+        };
+        let retired = store
+            .commit_event_subscription_poll_with_policy(&current_policy, &inactive_plan, &selection)
+            .expect("retire inactive pending row");
+        assert!(retired.deliveries.is_empty());
+        assert_eq!(
+            store
+                .event_subscription_stats()
+                .expect("retired pending stats")
+                .pending_deliveries,
+            0
+        );
+        let first_inactive_scan = store
+            .prepare_event_subscription_poll_with_policy(&current_policy, subscription, 1, 1)
+            .expect("first scan of already-inactive Event");
+        assert!(first_inactive_scan.pending_candidates().is_empty());
+        assert_eq!(
+            first_inactive_scan.scanned_candidates(),
+            std::slice::from_ref(&never_delivered)
+        );
+        content_event(
+            &mut services.authority,
+            &first_inactive_scan.scanned_candidates()[0].sealed,
+        );
+        let inactive_scan_page = store
+            .commit_event_subscription_poll_with_policy(
+                &current_policy,
+                &first_inactive_scan,
+                &EventSubscriptionPollSelection::default(),
+            )
+            .expect("advance over first-scan inactive Event");
+        assert!(inactive_scan_page.deliveries.is_empty());
+        assert_eq!(
+            inactive_scan_page.scanned_through,
+            never_delivered.acceptance_marker
+        );
+        assert!(matches!(
+            store.acknowledge_event_delivery_with_policy(
+                &current_policy,
+                subscription,
+                stored.semantic_id,
+            ),
+            Err(StoreError::EventDeliveryNotFound)
+        ));
+        assert!(matches!(
+            store.acknowledge_event_delivery_with_policy(
+                &current_policy,
+                subscription,
+                never_delivered.semantic_id,
+            ),
+            Err(StoreError::EventDeliveryNotFound)
+        ));
+        assert_eq!(
+            store
+                .event_subscription_stats()
+                .expect("inactive retirement has no false receipt")
+                .acknowledged_deliveries,
+            0
+        );
+        let empty = store
+            .prepare_event_subscription_poll_with_policy(&current_policy, subscription, 1, 1)
+            .expect("no starvation after inactive first scan");
+        assert!(empty.pending_candidates().is_empty());
+        assert!(empty.scanned_candidates().is_empty());
+    }
+
+    #[test]
+    fn event_acknowledgement_receipt_corruption_and_accounting_fail_closed() {
+        let file = TestFile::new("event-acknowledgement-corruption");
+        let mut services = event_services(0x4a);
+        let subscription;
+        let stored;
+        {
+            let store = Store::open_for_mission(&file.0, services.authority).expect("bound store");
+            let policy = store.control_policy_snapshot().expect("settled policy");
+            subscription = store
+                .create_event_subscription_with_policy(
+                    &policy,
+                    &EventSubscriptionKey::new(b"application/receipt-audit".to_vec())
+                        .expect("subscription key"),
+                    subscription_spec(EventSubscriptionMode::Consume),
+                )
+                .expect("create Consume")
+                .id;
+            let payload = b"acknowledgement receipt audit";
+            let publisher = services.publisher.identity();
+            stored = accept_event(
+                &store,
+                &mut services,
+                event_header(
+                    publisher,
+                    1,
+                    1,
+                    VersionVector::default(),
+                    b"receipt-audit",
+                    payload,
+                    None,
+                ),
+                payload,
+            );
+            let plan = store
+                .prepare_event_subscription_poll_with_policy(&policy, subscription, 1, 1)
+                .expect("receipt poll plan");
+            let selection = verify_subscription_plan(&mut services.reader, &plan);
+            store
+                .commit_event_subscription_poll_with_policy(&policy, &plan, &selection)
+                .expect("durable delivery attempt");
+            assert_eq!(
+                store
+                    .acknowledge_event_delivery_with_policy(
+                        &policy,
+                        subscription,
+                        stored.semantic_id,
+                    )
+                    .expect("first acknowledgement"),
+                EventDeliveryAck::Acknowledged
+            );
+            assert_eq!(
+                store
+                    .event_subscription_stats()
+                    .expect("receipt stats")
+                    .acknowledged_deliveries,
+                1
+            );
+        }
+
+        let acknowledgement_key = event_acknowledgement_key(subscription, stored.semantic_id);
+        {
+            let database = Database::open(&file.0).expect("open receipt corruption");
+            let write = database.begin_write().expect("begin receipt corruption");
+            let corrupt = encode_event_acknowledgement_record(EventAcknowledgementRecord {
+                acceptance_marker: stored.acceptance_marker,
+                attempts: 0,
+            });
+            write
+                .open_table(EVENT_DELIVERY_ACKNOWLEDGEMENTS)
+                .expect("acknowledgement table")
+                .insert(acknowledgement_key.as_slice(), corrupt.as_slice())
+                .expect("stage corrupt receipt");
+            write.commit().expect("commit corrupt receipt");
+        }
+        for result in [
+            Store::inspect_existing(&file.0).map(|_| ()),
+            Store::open_for_mission(&file.0, services.authority).map(|_| ()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(StoreError::SemanticInvariant(
+                    "Event acknowledgement contains a zero attempt count"
+                ))
+            ));
+        }
+
+        {
+            let database = Database::open(&file.0).expect("open receipt accounting corruption");
+            let write = database
+                .begin_write()
+                .expect("begin receipt accounting corruption");
+            let valid = encode_event_acknowledgement_record(EventAcknowledgementRecord {
+                acceptance_marker: stored.acceptance_marker,
+                attempts: 1,
+            });
+            write
+                .open_table(EVENT_DELIVERY_ACKNOWLEDGEMENTS)
+                .expect("acknowledgement table")
+                .insert(acknowledgement_key.as_slice(), valid.as_slice())
+                .expect("restore canonical receipt");
+            write
+                .open_table(METADATA)
+                .expect("metadata")
+                .insert(EVENT_ACKNOWLEDGEMENT_COUNT, 0)
+                .expect("corrupt receipt accounting");
+            write
+                .commit()
+                .expect("commit receipt accounting corruption");
+        }
+        for result in [
+            Store::inspect_existing(&file.0).map(|_| ()),
+            Store::open_for_mission(&file.0, services.authority).map(|_| ()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(StoreError::AccountingMismatch {
+                    field: EVENT_ACKNOWLEDGEMENT_COUNT,
+                    durable: 0,
+                    reconstructed: 1,
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn event_acknowledgement_cap_preserves_the_pending_delivery() {
+        let file = TestFile::new("event-acknowledgement-cap");
+        let mut services = event_services(0x4b);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("bound store");
+        let policy = store.control_policy_snapshot().expect("settled policy");
+        let subscription = store
+            .create_event_subscription_with_policy(
+                &policy,
+                &EventSubscriptionKey::new(b"application/receipt-cap".to_vec())
+                    .expect("subscription key"),
+                subscription_spec(EventSubscriptionMode::Consume),
+            )
+            .expect("create Consume")
+            .id;
+        let payload = b"pending at acknowledgement cap";
+        let publisher = services.publisher.identity();
+        let stored = accept_event(
+            &store,
+            &mut services,
+            event_header(
+                publisher,
+                1,
+                1,
+                VersionVector::default(),
+                b"receipt-cap",
+                payload,
+                None,
+            ),
+            payload,
+        );
+        let plan = store
+            .prepare_event_subscription_poll_with_policy(&policy, subscription, 1, 1)
+            .expect("cap poll plan");
+        let selection = verify_subscription_plan(&mut services.reader, &plan);
+        store
+            .commit_event_subscription_poll_with_policy(&policy, &plan, &selection)
+            .expect("pending delivery");
+
+        {
+            let write = store.database.begin_write().expect("begin cap fixture");
+            let dummy_subscription = EventSubscriptionId::from_bytes([0xa5; 32]);
+            let encoded = encode_event_acknowledgement_record(EventAcknowledgementRecord {
+                acceptance_marker: 1,
+                attempts: 1,
+            });
+            {
+                let mut acknowledgements = write
+                    .open_table(EVENT_DELIVERY_ACKNOWLEDGEMENTS)
+                    .expect("acknowledgement table");
+                for index in 0..MAX_EVENT_ACKNOWLEDGEMENT_RECEIPTS {
+                    let mut semantic = [0x5a; 32];
+                    semantic[24..].copy_from_slice(&index.to_be_bytes());
+                    let key = event_acknowledgement_key(
+                        dummy_subscription,
+                        EventSemanticId::new(semantic),
+                    );
+                    acknowledgements
+                        .insert(key.as_slice(), encoded.as_slice())
+                        .expect("fill bounded receipt fixture");
+                }
+            }
+            write
+                .open_table(METADATA)
+                .expect("metadata")
+                .insert(
+                    EVENT_ACKNOWLEDGEMENT_COUNT,
+                    MAX_EVENT_ACKNOWLEDGEMENT_RECEIPTS,
+                )
+                .expect("set bounded receipt accounting");
+            write.commit().expect("commit full receipt fixture");
+        }
+
+        assert!(matches!(
+            store
+                .acknowledge_event_delivery_with_policy(&policy, subscription, stored.semantic_id,),
+            Err(StoreError::EventAcknowledgementReceiptLimitExceeded {
+                current: MAX_EVENT_ACKNOWLEDGEMENT_RECEIPTS,
+                limit: MAX_EVENT_ACKNOWLEDGEMENT_RECEIPTS,
+            })
+        ));
+        let read = store.database.begin_read().expect("read cap rollback");
+        let pending_key = event_pending_delivery_key(subscription, stored.acceptance_marker);
+        assert!(
+            read.open_table(EVENT_SUBSCRIPTION_PENDING)
+                .expect("pending table")
+                .get(pending_key.as_slice())
+                .expect("read pending")
+                .is_some(),
+            "failed acknowledgement must retain the pending delivery"
+        );
+        let acknowledgement_key = event_acknowledgement_key(subscription, stored.semantic_id);
+        assert!(
+            read.open_table(EVENT_DELIVERY_ACKNOWLEDGEMENTS)
+                .expect("acknowledgement table")
+                .get(acknowledgement_key.as_slice())
+                .expect("read target acknowledgement")
+                .is_none(),
+            "failed acknowledgement must not create a target receipt"
+        );
+    }
+
+    #[test]
+    fn event_subscription_schema_migrates_absent_and_exact_legacy_groups_only() {
+        let file = TestFile::new("event-subscription-migration");
+        let services = event_services(0x48);
+        {
+            let store =
+                Store::open_for_mission(&file.0, services.authority).expect("initialize store");
+            assert_eq!(
+                store.event_subscription_stats().expect("initial stats"),
+                EventSubscriptionStats::default()
+            );
+        }
+        {
+            let database = Database::open(&file.0).expect("open legacy simulation");
+            let write = database.begin_write().expect("begin legacy simulation");
+            write
+                .delete_table(EVENT_SUBSCRIPTIONS)
+                .expect("remove selector table");
+            write
+                .delete_table(EVENT_SUBSCRIPTION_PENDING)
+                .expect("remove pending table");
+            write
+                .delete_table(EVENT_DELIVERY_ACKNOWLEDGEMENTS)
+                .expect("remove acknowledgement table");
+            {
+                let mut metadata = write.open_table(METADATA).expect("metadata");
+                metadata
+                    .remove(EVENT_SUBSCRIPTION_COUNT)
+                    .expect("remove selector counter");
+                metadata
+                    .remove(EVENT_PENDING_DELIVERY_COUNT)
+                    .expect("remove pending counter");
+                metadata
+                    .remove(EVENT_SELECTOR_REVISION)
+                    .expect("remove selector revision");
+                metadata
+                    .remove(EVENT_ACKNOWLEDGEMENT_COUNT)
+                    .expect("remove acknowledgement counter");
+            }
+            write.commit().expect("commit wholly absent legacy group");
+        }
+        assert_eq!(
+            Store::inspect_existing(&file.0)
+                .expect("legacy read-only inspection")
+                .event_subscription_stats,
+            EventSubscriptionStats::default()
+        );
+        {
+            let migrated = Store::open_for_mission(&file.0, services.authority)
+                .expect("all-absent group migrates");
+            assert_eq!(
+                migrated.event_subscription_stats().expect("migrated stats"),
+                EventSubscriptionStats::default()
+            );
+            let policy = migrated
+                .control_policy_snapshot()
+                .expect("legacy setup policy");
+            for (key, mode) in [
+                (b"legacy/carry".as_slice(), EventSubscriptionMode::Carry),
+                (b"legacy/consume".as_slice(), EventSubscriptionMode::Consume),
+            ] {
+                migrated
+                    .create_event_subscription_with_policy(
+                        &policy,
+                        &EventSubscriptionKey::new(key.to_vec()).expect("legacy key"),
+                        subscription_spec(mode),
+                    )
+                    .expect("legacy duplicate projection");
+            }
+        }
+        {
+            let database = Database::open(&file.0).expect("open exact legacy group");
+            let write = database.begin_write().expect("begin exact legacy group");
+            write
+                .delete_table(EVENT_DELIVERY_ACKNOWLEDGEMENTS)
+                .expect("remove new receipt table");
+            {
+                let mut metadata = write.open_table(METADATA).expect("legacy metadata");
+                metadata
+                    .remove(EVENT_ACKNOWLEDGEMENT_COUNT)
+                    .expect("remove new receipt counter");
+                metadata
+                    .insert(EVENT_SELECTOR_REVISION, 1)
+                    .expect("restore projection-count legacy revision");
+            }
+            write.commit().expect("commit exact legacy group");
+        }
+        assert_eq!(
+            Store::inspect_existing(&file.0)
+                .expect("exact legacy group remains read-only inspectable")
+                .event_subscription_stats,
+            EventSubscriptionStats {
+                subscriptions: 2,
+                pending_deliveries: 0,
+                acknowledged_deliveries: 0,
+                selector_revision: 1,
+            }
+        );
+        {
+            let migrated = Store::open_for_mission(&file.0, services.authority)
+                .expect("exact legacy group migrates atomically");
+            assert_eq!(
+                migrated
+                    .event_subscription_stats()
+                    .expect("current grouped stats"),
+                EventSubscriptionStats {
+                    subscriptions: 2,
+                    pending_deliveries: 0,
+                    acknowledged_deliveries: 0,
+                    selector_revision: 2,
+                }
+            );
+        }
+        {
+            let database = Database::open(&file.0).expect("open partial simulation");
+            let write = database.begin_write().expect("begin partial simulation");
+            write
+                .delete_table(EVENT_SUBSCRIPTION_PENDING)
+                .expect("remove one grouped table");
+            write.commit().expect("commit partial schema");
+        }
+        assert!(matches!(
+            Store::inspect_existing(&file.0),
+            Err(StoreError::SemanticInvariant(
+                "Event subscription schema group is incomplete"
+            ))
+        ));
+        assert!(matches!(
+            Store::open_for_mission(&file.0, services.authority),
+            Err(StoreError::SemanticInvariant(
+                "Event subscription schema group is incomplete"
+            ))
+        ));
+        let database = Database::open(&file.0).expect("inspect failed migration");
+        let read = database.begin_read().expect("read failed migration");
+        assert!(
+            !read
+                .list_tables()
+                .expect("list tables")
+                .any(|table| table.name() == EVENT_SUBSCRIPTION_PENDING.name()),
+            "partial schema must never be repaired"
+        );
+
+        let wrong_kind = TestFile::new("event-subscription-wrong-kind");
+        {
+            let store = Store::open_for_mission(&wrong_kind.0, services.authority)
+                .expect("initialize wrong-kind store");
+            drop(store);
+            let database = Database::open(&wrong_kind.0).expect("open wrong-kind store");
+            let write = database.begin_write().expect("begin wrong-kind write");
+            write
+                .delete_table(EVENT_DELIVERY_ACKNOWLEDGEMENTS)
+                .expect("remove regular acknowledgement table");
+            let definition = redb::MultimapTableDefinition::<&[u8], &[u8]>::new(
+                EVENT_DELIVERY_ACKNOWLEDGEMENTS.name(),
+            );
+            write
+                .open_multimap_table(definition)
+                .expect("wrong-kind acknowledgement table")
+                .insert(b"bad-key".as_slice(), b"bad-value".as_slice())
+                .expect("wrong-kind row");
+            write.commit().expect("commit wrong-kind schema");
+        }
+        for result in [
+            Store::inspect_existing(&wrong_kind.0).map(|_| ()),
+            Store::open_for_mission(&wrong_kind.0, services.authority).map(|_| ()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(StoreError::SemanticInvariant(
+                    "Event subscription schema has the wrong table kind"
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn event_subscription_attempt_overflow_and_pending_corruption_fail_closed() {
+        let file = TestFile::new("event-subscription-attempt-terminal");
+        let mut services = event_services(0x49);
+        let subscription;
+        let stored;
+        {
+            let store = Store::open_for_mission(&file.0, services.authority).expect("bound store");
+            let policy = store.control_policy_snapshot().expect("policy");
+            subscription = store
+                .create_event_subscription_with_policy(
+                    &policy,
+                    &EventSubscriptionKey::new(b"application/overflow".to_vec()).expect("key"),
+                    subscription_spec(EventSubscriptionMode::Consume),
+                )
+                .expect("create Consume")
+                .id;
+            let payload = b"attempt overflow candidate";
+            let publisher = services.publisher.identity();
+            stored = accept_event(
+                &store,
+                &mut services,
+                event_header(
+                    publisher,
+                    1,
+                    1,
+                    VersionVector::default(),
+                    b"overflow",
+                    payload,
+                    None,
+                ),
+                payload,
+            );
+            let plan = store
+                .prepare_event_subscription_poll_with_policy(&policy, subscription, 1, 1)
+                .expect("first plan");
+            let selection = verify_subscription_plan(&mut services.reader, &plan);
+            store
+                .commit_event_subscription_poll_with_policy(&policy, &plan, &selection)
+                .expect("first attempt");
+        }
+        let pending_key = event_pending_delivery_key(subscription, stored.acceptance_marker);
+        {
+            let database = Database::open(&file.0).expect("open attempt simulation");
+            let write = database.begin_write().expect("begin attempt simulation");
+            let encoded = encode_event_pending_delivery_record(EventPendingDeliveryRecord {
+                semantic_id: stored.semantic_id,
+                attempts: u64::MAX,
+            });
+            write
+                .open_table(EVENT_SUBSCRIPTION_PENDING)
+                .expect("pending table")
+                .insert(pending_key.as_slice(), encoded.as_slice())
+                .expect("stage terminal attempt");
+            write.commit().expect("commit terminal attempt");
+        }
+        {
+            let store = Store::open_for_mission(&file.0, services.authority)
+                .expect("maximum nonzero attempt audits");
+            let policy = store.control_policy_snapshot().expect("reopen policy");
+            let plan = store
+                .prepare_event_subscription_poll_with_policy(&policy, subscription, 1, 1)
+                .expect("terminal attempt plan");
+            assert_eq!(plan.pending_candidates()[0].previous_attempt, u64::MAX);
+            let selection = verify_subscription_plan(&mut services.reader, &plan);
+            assert!(matches!(
+                store.commit_event_subscription_poll_with_policy(&policy, &plan, &selection),
+                Err(StoreError::EventDeliveryAttemptExhausted)
+            ));
+            assert_eq!(
+                store
+                    .event_subscription_stats()
+                    .expect("overflow rollback stats")
+                    .pending_deliveries,
+                1
+            );
+        }
+        {
+            let database = Database::open(&file.0).expect("open corruption simulation");
+            let write = database.begin_write().expect("begin corruption simulation");
+            let mut invalid = Vec::with_capacity(41);
+            invalid.push(EVENT_PENDING_DELIVERY_VERSION);
+            invalid.extend_from_slice(stored.semantic_id.as_bytes());
+            invalid.extend_from_slice(&0u64.to_be_bytes());
+            write
+                .open_table(EVENT_SUBSCRIPTION_PENDING)
+                .expect("pending table")
+                .insert(pending_key.as_slice(), invalid.as_slice())
+                .expect("stage zero attempt corruption");
+            write.commit().expect("commit zero attempt corruption");
+        }
+        assert!(matches!(
+            Store::inspect_existing(&file.0),
+            Err(StoreError::SemanticInvariant(
+                "Event pending-delivery attempt count is zero"
+            ))
+        ));
+        assert!(matches!(
+            Store::open_for_mission(&file.0, services.authority),
+            Err(StoreError::SemanticInvariant(
+                "Event pending-delivery attempt count is zero"
+            ))
+        ));
     }
 
     #[test]
@@ -12795,7 +16399,7 @@ mod tests {
             return;
         };
         let mode = std::env::var(ABRUPT_STORE_MODE).expect("abrupt store mode");
-        let services = event_services(0xd4);
+        let mut services = event_services(0xd4);
         let path = PathBuf::from(path);
         let store = if mode == "unbound-live-missing-accounting" {
             Store::open(&path).expect("abrupt unbound child store")
@@ -12807,6 +16411,44 @@ mod tests {
             .expect("abrupt child row");
         match mode.as_str() {
             "live" => {}
+            "subscription" => {
+                let policy = store
+                    .control_policy_snapshot()
+                    .expect("subscription policy");
+                let subscription = store
+                    .create_event_subscription_with_policy(
+                        &policy,
+                        &EventSubscriptionKey::new(b"abrupt/subscription".to_vec())
+                            .expect("subscription key"),
+                        subscription_spec(EventSubscriptionMode::Consume),
+                    )
+                    .expect("create abrupt subscription")
+                    .id;
+                let payload = b"committed delivery before abrupt exit";
+                let publisher = services.publisher.identity();
+                accept_event(
+                    &store,
+                    &mut services,
+                    event_header(
+                        publisher,
+                        1,
+                        1,
+                        VersionVector::default(),
+                        b"abrupt-delivery",
+                        payload,
+                        None,
+                    ),
+                    payload,
+                );
+                let plan = store
+                    .prepare_event_subscription_poll_with_policy(&policy, subscription, 1, 1)
+                    .expect("abrupt delivery plan");
+                let selection = verify_subscription_plan(&mut services.reader, &plan);
+                let page = store
+                    .commit_event_subscription_poll_with_policy(&policy, &plan, &selection)
+                    .expect("commit abrupt delivery");
+                assert_eq!(page.deliveries[0].attempt, 1);
+            }
             "live-missing-accounting" => {
                 let write = store.database.begin_write().expect("remove accounting");
                 write
@@ -12871,6 +16513,38 @@ mod tests {
         // Skip Store/Database destructors, matching the dirty redb state seen
         // when the production node is killed after its last durable commit.
         std::process::exit(86);
+    }
+
+    #[test]
+    fn committed_subscription_attempt_survives_abrupt_process_exit() {
+        let file = TestFile::new("event-subscription-abrupt-restart");
+        run_abrupt_store_child(&file, "subscription");
+        assert!(matches!(
+            Store::inspect_existing(&file.0),
+            Err(ref error) if error.is_read_only_repair_required()
+        ));
+
+        let mut services = event_services(0xd4);
+        let store = Store::open_for_mission(&file.0, services.authority)
+            .expect("writer recovery after abrupt subscription commit");
+        let policy = store.control_policy_snapshot().expect("recovered policy");
+        let subscription = store
+            .create_event_subscription_with_policy(
+                &policy,
+                &EventSubscriptionKey::new(b"abrupt/subscription".to_vec()).expect("same key"),
+                subscription_spec(EventSubscriptionMode::Consume),
+            )
+            .expect("exact subscription retry")
+            .id;
+        let plan = store
+            .prepare_event_subscription_poll_with_policy(&policy, subscription, 1, 1)
+            .expect("recovered pending attempt");
+        assert_eq!(plan.pending_candidates()[0].previous_attempt, 1);
+        let selection = verify_subscription_plan(&mut services.reader, &plan);
+        let page = store
+            .commit_event_subscription_poll_with_policy(&policy, &plan, &selection)
+            .expect("commit post-crash retry");
+        assert_eq!(page.deliveries[0].attempt, 2);
     }
 
     #[test]
@@ -13609,11 +17283,49 @@ mod tests {
         assert_eq!(event_candidates.scanned_through, 1);
         assert!(!event_candidates.has_more);
 
+        let subscription = store
+            .create_event_subscription_with_policy(
+                &event_query_policy,
+                &EventSubscriptionKey::new(b"terminal/preserved".to_vec())
+                    .expect("terminal subscription key"),
+                subscription_spec(EventSubscriptionMode::Consume),
+            )
+            .expect("terminal subscription")
+            .id;
+        let subscription_plan = store
+            .prepare_event_subscription_poll_with_policy(&event_query_policy, subscription, 1, 1)
+            .expect("terminal subscription plan");
+        let subscription_selection =
+            verify_subscription_plan(&mut events.reader, &subscription_plan);
+        store
+            .commit_event_subscription_poll_with_policy(
+                &event_query_policy,
+                &subscription_plan,
+                &subscription_selection,
+            )
+            .expect("terminal pending delivery");
+        assert_eq!(
+            store
+                .acknowledge_event_delivery_with_policy(
+                    &event_query_policy,
+                    subscription,
+                    event_candidates.events[0].semantic_id,
+                )
+                .expect("terminal acknowledgement receipt"),
+            EventDeliveryAck::Acknowledged
+        );
+
         let opaque_before = store.stats().expect("opaque stats");
         let events_before = store.event_stats().expect("Event stats");
+        let subscriptions_before = store
+            .event_subscription_stats()
+            .expect("subscription stats");
         let controls_before = store.control_stats().expect("control stats");
         assert_eq!(opaque_before.items, 1);
         assert_eq!(events_before.events, 1);
+        assert_eq!(subscriptions_before.subscriptions, 1);
+        assert_eq!(subscriptions_before.pending_deliveries, 0);
+        assert_eq!(subscriptions_before.acknowledged_deliveries, 1);
         assert_eq!(controls_before.controls, 1);
 
         assert_eq!(
@@ -13638,6 +17350,27 @@ mod tests {
                 &EventQueryFilter::default(),
                 0,
                 1,
+            ),
+            Err(StoreError::StoreZeroized(
+                StoreZeroizationState::CleanupPending
+            ))
+        ));
+        assert!(matches!(
+            store.prepare_event_subscription_poll_with_policy(
+                &event_query_policy,
+                subscription,
+                1,
+                1,
+            ),
+            Err(StoreError::StoreZeroized(
+                StoreZeroizationState::CleanupPending
+            ))
+        ));
+        assert!(matches!(
+            store.acknowledge_event_delivery_with_policy(
+                &event_query_policy,
+                subscription,
+                event_candidates.events[0].semantic_id,
             ),
             Err(StoreError::StoreZeroized(
                 StoreZeroizationState::CleanupPending
@@ -13674,6 +17407,7 @@ mod tests {
         let pending = Store::inspect_existing(&file.0).expect("terminal-safe full inspection");
         assert_eq!(pending.stats, opaque_before);
         assert_eq!(pending.event_stats, events_before);
+        assert_eq!(pending.event_subscription_stats, subscriptions_before);
         assert_eq!(pending.control_stats, controls_before);
         assert_eq!(
             pending.zeroization.state(),
@@ -13766,6 +17500,7 @@ mod tests {
             .expect("preserved terminal rows");
         assert_eq!(preserved.stats, opaque_before);
         assert_eq!(preserved.event_stats, events_before);
+        assert_eq!(preserved.event_subscription_stats, subscriptions_before);
         assert_eq!(preserved.control_stats, controls_before);
         assert_eq!(
             preserved.zeroization.state(),

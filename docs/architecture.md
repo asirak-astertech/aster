@@ -2,12 +2,13 @@
 
 This page depicts the bounded control/Event composition that executes today.
 It is intentionally narrower than Aster's complete protocol and semantic
-reference implementation. The stopped-state selected Event API now provides a
-foundation for publish and bounded query. Public authenticated gap inspection,
-State, Record, Blob, durable subscriptions, a live application handle with
-peer/sync status, finite-TTL custody, protected operational provisioning,
-additional carriers, and release authorization remain outside this selected
-lane.
+reference implementation. The stopped-state selected Event API now provides
+publish, bounded query, and durable subscribe/poll/ack; the live runtime
+exchanges protected receive interests and reconciles only selected Events.
+Public authenticated gap inspection, subscription update/delete, State,
+Record, Blob, a live application handle with peer/sync status, finite-TTL
+custody, protected operational provisioning, additional carriers, and release
+authorization remain outside this selected lane.
 
 ## Components and trust boundaries
 
@@ -15,7 +16,8 @@ lane.
 flowchart LR
     Operator["Same-UID Unix operator"]
     Authority["Stopped authority CLI"]
-    App["Built-in or stopped-state<br/>Event application"]
+    LiveApp["Live built-in roles<br/>Ping · Pong · relay"]
+    StoppedApp["Stopped SelectedEventNode<br/>publish · query · subscribe · poll · ack"]
     Artifacts["Retained mission bundle<br/>and carrier identity"]
 
     subgraph Local["Selected aster-node composition"]
@@ -24,13 +26,15 @@ flowchart LR
         Session["aster-core mission session<br/>four-flight hybrid authentication"]
         Profile["aster-profile<br/>canonical exact-ID ordering"]
         Diff["aster-negentropy<br/>set difference only"]
-        Store["aster-redb-store<br/>durable acceptance/effect authority"]
+        Store["aster-redb-store<br/>durable acceptance/effect authority<br/>Consume/Carry selectors + delivery ledger"]
         Carrier["aster-iroh<br/>direct authenticated carrier"]
     end
 
     Peer["Peer aster-node<br/>independent identity and store"]
 
-    App -->|"publication input"| Node
+    LiveApp -. "runs inside actor" .-> Node
+    StoppedApp -->|"application operations"| Node
+    Node -->|"verified results and receipts"| StoppedApp
     Authority -->|"control input"| Node
     Node -->|"uses control/source providers"| Core
     Node -->|"uses canonical ordering"| Profile
@@ -46,8 +50,8 @@ carrier endpoint and provides bounded direct exchange. The mission `NodeId` is
 independent from the Iroh `EndpointId`. `aster-negentropy` computes exact-ID set
 difference; it does not transfer objects, establish causality, or make policy.
 `aster-redb-store` is the selected durable authority for accepted Events,
-ordered control effects, policy snapshots, route-only representations, and the
-terminal zeroization marker.
+ordered control effects, policy/selector snapshots, at-least-once application
+delivery, route-only representations, and the terminal zeroization marker.
 
 ## One authenticated contact
 
@@ -66,13 +70,16 @@ sequenceDiagram
     L->>P: control reconciliation query
     P->>L: source-authenticated control suffix
     L->>S: commit and activate contiguous control prefix
-    L->>S: capture fresh policy snapshot
-    L->>P: Negentropy query over locally route-filtered exact IDs
-    P->>L: reply lets local derive one exact set difference
-    P->>L: reverse query over peer-filtered exact IDs
-    L->>P: reply lets peer derive the reverse difference
-    L->>P: protected bytes offered for peer-missing IDs
-    P->>L: protected bytes fetched for local-missing IDs
+    L->>S: atomically capture policy + selector revision
+    L->>P: protected canonical receive interest
+    P->>L: protected canonical receive interest
+    Note over L,P: empty interest means receive-none
+    L->>P: reconcile IDs in peer-receiver universe
+    P->>L: independently authorize peer-receiver difference
+    L->>P: offer only peer-selected, peer-routable bytes
+    P->>L: reconcile IDs in local-receiver universe
+    L->>P: independently authorize local-receiver difference
+    P->>L: local fetches only locally selected, locally routable bytes
     alt content grant
         L->>S: verify source + admit semantic Event
         L->>L: application reaction may run
@@ -83,9 +90,11 @@ sequenceDiagram
 ```
 
 The ordering is security-relevant: mission authentication precedes inventory;
-control reconciliation and durable activation precede Event inventory; a fresh
-policy snapshot filters every peer's route visibility; and content admission is
-separate from forwarding authority.
+control reconciliation and durable activation precede protected interest or
+Event inventory; each receiver gets an independent filtered reconciliation
+universe; and content admission is separate from forwarding authority. Receive
+intent never grants access: current source, epoch, revocation, and route policy
+are rechecked at inventory, transfer, and commit boundaries.
 
 ## Identity and authorization are deliberately separate
 
@@ -95,6 +104,7 @@ separate from forwarding authority.
 | Mission | Hybrid-session possession of the expected mission `NodeId` | Control authority, source authorship, route, or content grant |
 | Control | Ordered authority/delegation chain and policy effect | Event source identity or plaintext access |
 | Event source | Publisher and protected semantic header | Permission for every peer to route or read it |
+| Receive selector | Membership-visible topic/scope intent inside the protected mission session; empty means receive-none | Route or content authority, Event-ID disclosure, or scope-private subscription metadata |
 | Route policy | Whether an exact representation may be advertised/carried | Content decryption or semantic admission |
 | Content policy | Whether protected bytes may become a semantic Event | Authority to alter source identity or control state |
 
@@ -122,7 +132,7 @@ and non-Unix behavior are outside the proof.
 ## Follow the evidence
 
 - [Capability tour](quickstart/capability-tour.md) — fastest visible behavior.
-- [Selected Event API](quickstart/selected-event-api.md) — stopped-state publish/query foundation.
+- [Selected Event API](quickstart/selected-event-api.md) — publish/query plus durable subscribe/poll/ack.
 - [Carriers and contacts](transports.md) — selected and migration-source carrier boundaries.
 - [Mesh CLI guide](quickstart/mesh-cli.md) — phase-by-phase and retained receipts.
 - [Requirements status](implementation/requirements-status.md) — exact credited rows and open gaps.

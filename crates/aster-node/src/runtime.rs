@@ -31,10 +31,12 @@ use aster_negentropy::{
 use aster_profile::{InventorySnapshot, ItemId};
 use aster_redb_store::{
     ControlOutcome, ControlPolicySnapshot, ControlRejectionReason, ControlTransferId,
-    EventOnceOutcome, EventOperationKey, EventSemanticId, EventTransferId, MAX_EVENT_PAGE,
-    RejectedControl, RouteCacheOutcome, ScopeRekeyPublicationIntent, Store, StoreBackingIdentity,
-    StoreError, StoreInspection, StoreZeroizationState, StoredControl, StoredControlEffect,
-    StoredEvent, StoredEventTransfer, ZeroizationArtifact, ZeroizationIntent, ZeroizationStore,
+    EventOnceOutcome, EventOperationKey, EventReplicationPolicySnapshot, EventSemanticId,
+    EventSubscriptionKey, EventSubscriptionMode, EventSubscriptionSpec, EventTransferId,
+    MAX_EVENT_PAGE, RejectedControl, RouteCacheOutcome, ScopeRekeyPublicationIntent, Store,
+    StoreBackingIdentity, StoreError, StoreInspection, StoreZeroizationState, StoredControl,
+    StoredControlEffect, StoredEvent, StoredEventTransfer, ZeroizationArtifact, ZeroizationIntent,
+    ZeroizationStore,
 };
 #[cfg(unix)]
 use tokio::{
@@ -50,7 +52,7 @@ use zeroize::Zeroize as _;
 
 use crate::{
     NodeIdentity, format_node_id, format_path_field, format_receipt_field,
-    frame::{Frame, MAX_OBJECT_BYTES},
+    frame::{EventDirection, EventInterest, EventInterestSelector, Frame, MAX_OBJECT_BYTES},
     mission::{
         MissionHandshakeReceipt, MissionPeerBinding, MissionProvisioningError, MissionSession,
         MissionSessionError, PreparedIdentityErasure, PreparedMissionErasure,
@@ -78,6 +80,7 @@ const DEMO_PONG_PAYLOAD: &[u8] = b"ASTER_SAMPLE_PONG_V1";
 const DEMO_PING_LOGICAL_KEY: &[u8] = b"ping";
 const DEMO_PING_OPERATION: &[u8] = b"aster.sample.ping-pong.v1/ping";
 const DEMO_PONG_OPERATION_PREFIX: &[u8] = b"aster.sample.ping-pong.v1/pong/";
+const DEMO_EVENT_SUBSCRIPTION_KEY: &[u8] = b"aster.sample.ping-pong.v1/receive";
 const MAX_EVENT_PUBLISH_RETRIES: usize = 4;
 pub(crate) const EVENT_OPERATION_CONFLICT: &str =
     "durable Event operation differs from the requested application Event";
@@ -1179,6 +1182,33 @@ fn demo_event_topic() -> Result<Topic, NodeError> {
     Topic::new(DEMO_EVENT_TOPIC).map_err(|error| NodeError::Configuration(error.to_string()))
 }
 
+fn seed_demo_event_subscription(
+    state: &Path,
+    mission: &UnprotectedReferenceMission,
+    mode: EventSubscriptionMode,
+) -> Result<(), NodeError> {
+    let store = Store::open_for_mission(state.join(STORE_FILE), mission.mission_authority_id())?;
+    store.require_process_exclusive_lock()?;
+    let policy = store.control_policy_snapshot()?;
+    store.create_event_subscription_with_policy(
+        &policy,
+        &EventSubscriptionKey::new(DEMO_EVENT_SUBSCRIPTION_KEY.to_vec())?,
+        EventSubscriptionSpec {
+            mode,
+            topic: demo_event_topic()?,
+            scope: demo_scope()?,
+            include_descendant_scopes: false,
+        },
+    )?;
+    let snapshot = store.event_replication_policy_snapshot()?;
+    if snapshot.selectors().len() != 1 {
+        return Err(NodeError::Demo(
+            "demo Event subscription projection differs from its one explicit selector".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn ping_operation_key() -> Result<EventOperationKey, NodeError> {
     EventOperationKey::new(DEMO_PING_OPERATION.to_vec()).map_err(Into::into)
 }
@@ -1574,7 +1604,7 @@ fn ensure_contact_principals_active(
 struct EventLaneGuard {
     local: NodeId,
     peer: NodeId,
-    policy: ControlPolicySnapshot,
+    policy: EventReplicationPolicySnapshot,
     _lease: OwnedRwLockReadGuard<()>,
 }
 
@@ -1592,8 +1622,9 @@ impl EventLaneGuard {
                 "control reconciliation is incomplete; Event lane deferred".into(),
             ));
         }
-        // Snapshot capture itself fails closed while a control gap is pending.
-        let policy = store.control_policy_snapshot()?;
+        // Snapshot capture itself fails closed while a control gap is pending
+        // and binds the complete Event lane to the exact durable receive intent.
+        let policy = store.event_replication_policy_snapshot()?;
         Ok(Self {
             local,
             peer,
@@ -1604,17 +1635,51 @@ impl EventLaneGuard {
 
     fn check(&self, store: &Store) -> Result<(), NodeError> {
         ensure_contact_principals_active(store, self.local, self.peer)?;
-        if store.control_policy_snapshot()? != self.policy {
-            return Err(NodeError::Protocol(
-                "mission-control state changed during the Event lane; reconnect required".into(),
-            ));
-        }
+        store.require_event_replication_policy(&self.policy)?;
         Ok(())
     }
 
     const fn policy(&self) -> &ControlPolicySnapshot {
+        self.policy.control_policy()
+    }
+
+    const fn replication_policy(&self) -> &EventReplicationPolicySnapshot {
         &self.policy
     }
+
+    fn interest(&self) -> Result<EventInterest, NodeError> {
+        if self.policy.selectors().is_empty() {
+            return Ok(EventInterest::empty());
+        }
+        EventInterest::new(
+            self.policy
+                .selectors()
+                .iter()
+                .map(|selector| {
+                    EventInterestSelector::new(
+                        selector.topic.clone(),
+                        selector.scope.clone(),
+                        selector.include_descendant_scopes,
+                    )
+                })
+                .collect(),
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DirectedEventLane<'a> {
+    guard: &'a EventLaneGuard,
+    receiver_interest: &'a EventInterest,
+    direction: EventDirection,
+}
+
+#[derive(Clone, Copy)]
+struct EventReceiveAuthority<'a> {
+    peer: NodeId,
+    peer_route_commitments: &'a [[u8; 32]],
+    receiver_interest: &'a EventInterest,
+    local_replication_policy: &'a EventReplicationPolicySnapshot,
 }
 
 fn activate_committed_controls(
@@ -2026,9 +2091,47 @@ fn load_verified_transfer(
     verifier: &mut ReferenceEnvelopeSealer,
     transfer_id: EventTransferId,
 ) -> Result<Vec<u8>, NodeError> {
-    let (verified, sealed) = load_route_verified_transfer(store, policy, verifier, transfer_id)?;
+    let (verified, sealed, _) = load_route_verified_transfer(store, policy, verifier, transfer_id)?;
     ensure_event_epoch_active(store, &verified)?;
     Ok(sealed)
+}
+
+/// Reauthenticates one exact outbound Event against both the negotiated receive
+/// interest and the authenticated peer's current route grant before disclosure.
+fn load_verified_transfer_for_peer(
+    store: &Store,
+    policy: &ControlPolicySnapshot,
+    verifier: &mut ReferenceEnvelopeSealer,
+    transfer_id: EventTransferId,
+    peer: NodeId,
+    peer_route_commitments: &[[u8; 32]],
+    receiver_interest: &EventInterest,
+) -> Result<Vec<u8>, NodeError> {
+    let (verified, sealed, _) = load_route_verified_transfer(store, policy, verifier, transfer_id)?;
+    ensure_event_epoch_active(store, &verified)?;
+    if !receiver_interest.matches(verified.topic(), verified.scope()) {
+        return Err(NodeError::Protocol(
+            "outbound Event is outside the peer's protected receive interest".into(),
+        ));
+    }
+    if !verifier.peer_can_route(
+        peer,
+        peer_route_commitments,
+        verified.scope(),
+        verified.key_epoch(),
+    ) {
+        return Err(NodeError::Protocol(
+            "authenticated peer no longer has the Event route grant for this scope and epoch"
+                .into(),
+        ));
+    }
+    Ok(sealed)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EventTransferState {
+    Accepted,
+    RouteCached,
 }
 
 fn load_route_verified_transfer(
@@ -2036,7 +2139,7 @@ fn load_route_verified_transfer(
     policy: &ControlPolicySnapshot,
     verifier: &mut ReferenceEnvelopeSealer,
     transfer_id: EventTransferId,
-) -> Result<(RouteVerifiedEventEnvelope, Vec<u8>), NodeError> {
+) -> Result<(RouteVerifiedEventEnvelope, Vec<u8>, EventTransferState), NodeError> {
     let transfer = store
         .get_transfer_with_policy(policy, transfer_id)?
         .ok_or_else(|| NodeError::Protocol("authorized Event transfer is missing".into()))?;
@@ -2049,7 +2152,7 @@ fn load_route_verified_transfer(
                 event.semantic_id,
                 &event.header,
             )?;
-            Ok((verified, event.sealed))
+            Ok((verified, event.sealed, EventTransferState::Accepted))
         }
         StoredEventTransfer::RouteCached(event) => {
             let verified = verifier.verify_event(&event.sealed)?;
@@ -2059,7 +2162,7 @@ fn load_route_verified_transfer(
                 event.semantic_claim,
                 &event.header_claim,
             )?;
-            Ok((verified, event.sealed))
+            Ok((verified, event.sealed, EventTransferState::RouteCached))
         }
     }
 }
@@ -2070,12 +2173,19 @@ fn transfer_inventory_for_peer(
     verifier: &mut ReferenceEnvelopeSealer,
     peer: NodeId,
     peer_route_commitments: &[[u8; 32]],
+    receiver_interest: &EventInterest,
 ) -> Result<InventorySnapshot, NodeError> {
+    if receiver_interest.is_empty() {
+        return Ok(InventorySnapshot::default());
+    }
     let inventory = store.transfer_inventory_with_policy(policy)?;
     let mut authorized = Vec::new();
     for transfer_id in inventory.iter().copied() {
-        let (verified, _) = load_route_verified_transfer(store, policy, verifier, transfer_id)?;
+        let (verified, _, _) = load_route_verified_transfer(store, policy, verifier, transfer_id)?;
         if event_is_inactive(store, &verified)? {
+            continue;
+        }
+        if !receiver_interest.matches(verified.topic(), verified.scope()) {
             continue;
         }
         if verifier.peer_can_route(
@@ -2086,6 +2196,42 @@ fn transfer_inventory_for_peer(
         ) {
             authorized.push(transfer_id.reconciliation_item_id());
         }
+    }
+    Ok(InventorySnapshot::new(authorized))
+}
+
+/// Builds the local receiver baseline for one directed lane.
+///
+/// Fresh envelope verification above the store boundary proves the local node's
+/// current route capability. A receiver baseline must not substitute the
+/// sender peer's grants for that local authority check.
+fn transfer_inventory_for_receiver(
+    store: &Store,
+    policy: &EventReplicationPolicySnapshot,
+    verifier: &mut ReferenceEnvelopeSealer,
+    receiver_interest: &EventInterest,
+) -> Result<InventorySnapshot, NodeError> {
+    if receiver_interest.is_empty() {
+        return Ok(InventorySnapshot::default());
+    }
+    let inventory = store.transfer_inventory_with_policy(policy.control_policy())?;
+    let mut authorized = Vec::new();
+    for transfer_id in inventory.iter().copied() {
+        let (verified, _, state) =
+            load_route_verified_transfer(store, policy.control_policy(), verifier, transfer_id)?;
+        if event_is_inactive(store, &verified)? {
+            continue;
+        }
+        if !receiver_interest.matches(verified.topic(), verified.scope()) {
+            continue;
+        }
+        let Some(mode) = policy.effective_mode(verified.topic(), verified.scope()) else {
+            continue;
+        };
+        if state == EventTransferState::RouteCached && mode == EventSubscriptionMode::Consume {
+            continue;
+        }
+        authorized.push(transfer_id.reconciliation_item_id());
     }
     Ok(InventorySnapshot::new(authorized))
 }
@@ -2131,10 +2277,8 @@ fn ensure_event_epoch_active(
 
 fn accept_received_transfer(
     store: &Store,
-    policy: &ControlPolicySnapshot,
     verifier: &mut ReferenceEnvelopeSealer,
-    peer: NodeId,
-    peer_route_commitments: &[[u8; 32]],
+    authority: EventReceiveAuthority<'_>,
     transfer_id: EventTransferId,
     sealed: &[u8],
 ) -> Result<bool, NodeError> {
@@ -2145,9 +2289,18 @@ fn accept_received_transfer(
         ));
     }
     ensure_event_epoch_active(store, &route_verified)?;
+    if !authority
+        .receiver_interest
+        .matches(route_verified.topic(), route_verified.scope())
+    {
+        return Err(NodeError::Protocol(
+            "received Event is outside the durable receive interest captured for this contact"
+                .into(),
+        ));
+    }
     if !verifier.peer_can_route(
-        peer,
-        peer_route_commitments,
+        authority.peer,
+        authority.peer_route_commitments,
         route_verified.scope(),
         route_verified.key_epoch(),
     ) {
@@ -2155,12 +2308,36 @@ fn accept_received_transfer(
             "authenticated peer lacks the Event route grant for this scope and epoch".into(),
         ));
     }
+    let Some(mode) = authority
+        .local_replication_policy
+        .effective_mode(route_verified.topic(), route_verified.scope())
+    else {
+        return Err(NodeError::Protocol(
+            "received Event is outside the durable local receive-mode snapshot".into(),
+        ));
+    };
+    if mode == EventSubscriptionMode::Carry {
+        let outcome = store.cache_route_verified_event_with_replication_policy(
+            authority.local_replication_policy,
+            &route_verified,
+            sealed,
+        )?;
+        return Ok(matches!(outcome, RouteCacheOutcome::Inserted { .. }));
+    }
     match verifier.verify_event_content(route_verified, sealed)? {
         EventContentVerification::ContentVerified { event, .. } => Ok(store
-            .apply_verified_event_with_policy(policy, &event, sealed)?
+            .apply_verified_event_with_replication_policy(
+                authority.local_replication_policy,
+                &event,
+                sealed,
+            )?
             .inserted()),
         EventContentVerification::RouteOnly(event) => {
-            let outcome = store.cache_route_verified_event_with_policy(policy, &event, sealed)?;
+            let outcome = store.cache_route_verified_event_with_replication_policy(
+                authority.local_replication_policy,
+                &event,
+                sealed,
+            )?;
             Ok(matches!(outcome, RouteCacheOutcome::Inserted { .. }))
         }
     }
@@ -3653,6 +3830,311 @@ async fn sync_control_lane(
     Ok(())
 }
 
+async fn sync_event_interests(
+    store: &Store,
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    event_guard: &EventLaneGuard,
+    receipt: &mut PeerReceipt,
+) -> Result<(EventInterest, EventInterest), NodeError> {
+    event_guard.check(store)?;
+    let local_interest = event_guard.interest()?;
+    let response = request_mission_frame(
+        connection,
+        mission,
+        Frame::EventInterest(local_interest.clone()),
+        receipt,
+    )
+    .await?;
+    let Frame::EventInterestReply(peer_interest) = response else {
+        return Err(NodeError::Protocol(
+            "protected Event interest request received another response".into(),
+        ));
+    };
+    event_guard.check(store)?;
+    Ok((local_interest, peer_interest))
+}
+
+async fn sync_event_reconciliation_lane(
+    store: &Store,
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    event_verifier: &mut ReferenceEnvelopeSealer,
+    lane: DirectedEventLane<'_>,
+    receipt: &mut PeerReceipt,
+) -> Result<EventDifference, NodeError> {
+    let DirectedEventLane {
+        guard: event_guard,
+        receiver_interest,
+        direction,
+    } = lane;
+    event_guard.check(store)?;
+    let inventory = match direction {
+        EventDirection::ToSessionResponder => transfer_inventory_for_peer(
+            store,
+            event_guard.policy(),
+            event_verifier,
+            mission.peer().mission_id(),
+            mission.peer_route_grant_commitments(),
+            receiver_interest,
+        )?,
+        EventDirection::ToSessionInitiator => transfer_inventory_for_receiver(
+            store,
+            event_guard.replication_policy(),
+            event_verifier,
+            receiver_interest,
+        )?,
+    };
+    let limits = ReconciliationLimits::default();
+    let mut initiator = Initiator::new(&inventory, limits)?;
+    let mut query = initiator.initiate()?;
+    let difference = loop {
+        event_guard.check(store)?;
+        let response = request_mission_frame(
+            connection,
+            mission,
+            Frame::InventoryQuery {
+                direction,
+                bytes: query,
+            },
+            receipt,
+        )
+        .await?;
+        let Frame::InventoryReply {
+            direction: response_direction,
+            bytes: response,
+        } = response
+        else {
+            return Err(NodeError::Protocol(
+                "directional inventory query received another response".into(),
+            ));
+        };
+        if response_direction != direction {
+            return Err(NodeError::Protocol(
+                "inventory reply crossed Event reconciliation lanes".into(),
+            ));
+        }
+        match initiator.reconcile_response(&response)? {
+            InitiatorStep::Continue(next) => query = next,
+            InitiatorStep::Complete(difference) => {
+                break EventDifference::from_reconciliation(difference);
+            }
+        }
+    };
+    let first_rounds = initiator.rounds();
+    event_guard.check(store)?;
+    if request_mission_frame(
+        connection,
+        mission,
+        Frame::InventoryComplete { direction },
+        receipt,
+    )
+    .await?
+        != (Frame::InventoryCompleteAck { direction })
+    {
+        return Err(NodeError::Protocol(
+            "directional inventory completion acknowledgement differs".into(),
+        ));
+    }
+
+    let mut reverse = Responder::new(&inventory, limits)?;
+    loop {
+        event_guard.check(store)?;
+        let wire_budget = exchange_wire_budget(receipt)?;
+        let (complete, request_bytes, response_bytes) = respond_mission_frame(
+            connection,
+            mission,
+            wire_budget,
+            |frame, _request_wire_len| match frame {
+                Frame::DifferenceQuery {
+                    direction: request_direction,
+                    bytes: query,
+                } if request_direction == direction => {
+                    event_guard.check(store)?;
+                    Ok((
+                        Frame::DifferenceReply {
+                            direction,
+                            bytes: reverse.reconcile_query(&query)?,
+                        },
+                        false,
+                    ))
+                }
+                Frame::DifferenceBound {
+                    direction: request_direction,
+                } if request_direction == direction && reverse.rounds() > 0 => {
+                    event_guard.check(store)?;
+                    Ok((Frame::DifferenceBoundAck { direction }, true))
+                }
+                Frame::DifferenceBound {
+                    direction: request_direction,
+                } if request_direction == direction => Err(NodeError::Protocol(
+                    "difference bound preceded directional reverse reconciliation".into(),
+                )),
+                _ => Err(NodeError::Protocol(
+                    "reverse reconciliation crossed Event lanes or phases".into(),
+                )),
+            },
+        )
+        .await?;
+        account(receipt, request_bytes, response_bytes)?;
+        if complete {
+            break;
+        }
+    }
+    receipt.rounds = receipt
+        .rounds
+        .checked_add(first_rounds)
+        .and_then(|rounds| rounds.checked_add(reverse.rounds()))
+        .ok_or_else(|| NodeError::Protocol("combined round count overflow".into()))?;
+    Ok(difference)
+}
+
+fn event_transfer_capacity(receipt: &PeerReceipt) -> Result<usize, NodeError> {
+    let transferred = receipt
+        .offered
+        .checked_add(receipt.fetched)
+        .ok_or_else(|| NodeError::Protocol("contact item count overflow".into()))?;
+    MAX_CONTACT_ITEMS
+        .checked_sub(transferred)
+        .ok_or_else(|| NodeError::Protocol("contact item count exceeds its bound".into()))
+}
+
+fn add_unscheduled_events(receipt: &mut PeerReceipt, remaining: usize) -> Result<(), NodeError> {
+    receipt.remaining = receipt
+        .remaining
+        .checked_add(remaining)
+        .ok_or_else(|| NodeError::Protocol("remaining Event count overflow".into()))?;
+    Ok(())
+}
+
+async fn sync_event_transfer_lane(
+    store: &Store,
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    event_verifier: &mut ReferenceEnvelopeSealer,
+    lane: DirectedEventLane<'_>,
+    difference: &EventDifference,
+    receipt: &mut PeerReceipt,
+) -> Result<(), NodeError> {
+    let DirectedEventLane {
+        guard: event_guard,
+        receiver_interest,
+        direction,
+    } = lane;
+    let authenticated_peer = mission.peer().mission_id();
+    let peer_route_commitments = mission.peer_route_grant_commitments().to_vec();
+    let capacity = event_transfer_capacity(receipt)?;
+    match direction {
+        EventDirection::ToSessionResponder => {
+            let limit = difference.local_only.len().min(capacity);
+            add_unscheduled_events(receipt, difference.local_only.len() - limit)?;
+            for id in difference.local_only.iter().take(limit) {
+                event_guard.check(store)?;
+                let bytes = load_verified_transfer_for_peer(
+                    store,
+                    event_guard.policy(),
+                    event_verifier,
+                    *id,
+                    authenticated_peer,
+                    &peer_route_commitments,
+                    receiver_interest,
+                )?;
+                let response = request_mission_frame(
+                    connection,
+                    mission,
+                    Frame::Offer {
+                        direction,
+                        id: *id,
+                        bytes,
+                    },
+                    receipt,
+                )
+                .await?;
+                let Frame::ApplyResult {
+                    direction: response_direction,
+                    id: applied,
+                    inserted,
+                } = response
+                else {
+                    return Err(NodeError::Protocol(
+                        "directional offer acknowledgement differs".into(),
+                    ));
+                };
+                if response_direction != direction || applied != *id {
+                    return Err(NodeError::Protocol(
+                        "offer acknowledgement crossed Event lanes or identifies another item"
+                            .into(),
+                    ));
+                }
+                receipt.offered += 1;
+                if !inserted {
+                    receipt.duplicates += 1;
+                }
+            }
+        }
+        EventDirection::ToSessionInitiator => {
+            let limit = difference.remote_only.len().min(capacity);
+            add_unscheduled_events(receipt, difference.remote_only.len() - limit)?;
+            for id in difference.remote_only.iter().take(limit) {
+                event_guard.check(store)?;
+                let response = request_mission_frame(
+                    connection,
+                    mission,
+                    Frame::Fetch { direction, id: *id },
+                    receipt,
+                )
+                .await?;
+                let Frame::Object {
+                    direction: response_direction,
+                    id: received,
+                    bytes,
+                } = response
+                else {
+                    return Err(NodeError::Protocol(
+                        "directional fetch response differs".into(),
+                    ));
+                };
+                if response_direction != direction
+                    || received != *id
+                    || bytes.len() > MAX_OBJECT_BYTES
+                {
+                    return Err(NodeError::Protocol(
+                        "fetched Event crossed lanes or its identity or bound differs".into(),
+                    ));
+                }
+                event_guard.check(store)?;
+                if accept_received_transfer(
+                    store,
+                    event_verifier,
+                    EventReceiveAuthority {
+                        peer: authenticated_peer,
+                        peer_route_commitments: &peer_route_commitments,
+                        receiver_interest,
+                        local_replication_policy: event_guard.replication_policy(),
+                    },
+                    received,
+                    &bytes,
+                )? {
+                    receipt.inserted += 1;
+                } else {
+                    receipt.duplicates += 1;
+                }
+                receipt.fetched += 1;
+                event_guard.check(store)?;
+            }
+        }
+    }
+    event_guard.check(store)?;
+    if request_mission_frame(connection, mission, Frame::Finish { direction }, receipt).await?
+        != (Frame::Finished { direction })
+    {
+        return Err(NodeError::Protocol(
+            "directional finish acknowledgement differs".into(),
+        ));
+    }
+    Ok(())
+}
+
 async fn sync_authenticated_session(
     store: &Store,
     connection: &aster_iroh::Connection,
@@ -3703,200 +4185,62 @@ async fn sync_authenticated_session(
         mission.peer().mission_id(),
         receipt.controls_remaining,
     )?;
-    event_guard.check(store)?;
-    let inventory = transfer_inventory_for_peer(
-        store,
-        event_guard.policy(),
-        &mut event_verifier,
-        mission.peer().mission_id(),
-        mission.peer_route_grant_commitments(),
-    )?;
-    let limits = ReconciliationLimits::default();
-    let mut initiator = Initiator::new(&inventory, limits)?;
-    let mut query = initiator.initiate()?;
-    let difference = loop {
-        event_guard.check(store)?;
-        let response = request_mission_frame(
-            connection,
-            &mut mission,
-            Frame::InventoryQuery(query),
-            &mut receipt,
-        )
-        .await?;
-        let Frame::InventoryReply(response) = response else {
-            return Err(NodeError::Protocol(
-                "inventory query received a different response".into(),
-            ));
-        };
-        match initiator.reconcile_response(&response)? {
-            InitiatorStep::Continue(next) => query = next,
-            InitiatorStep::Complete(difference) => {
-                break EventDifference::from_reconciliation(difference);
-            }
-        }
+    let (local_interest, peer_interest) =
+        sync_event_interests(store, connection, &mut mission, &event_guard, &mut receipt).await?;
+
+    // Each receiver's protected interest defines a separate reconciliation
+    // universe. Both endpoints independently derive each exact one-way plan.
+    let to_responder_lane = DirectedEventLane {
+        guard: &event_guard,
+        receiver_interest: &peer_interest,
+        direction: EventDirection::ToSessionResponder,
     };
-    let first_rounds = initiator.rounds();
-    event_guard.check(store)?;
-    if request_mission_frame(
-        connection,
-        &mut mission,
-        Frame::InventoryComplete,
-        &mut receipt,
-    )
-    .await?
-        != Frame::InventoryCompleteAck
-    {
-        return Err(NodeError::Protocol(
-            "inventory completion acknowledgement differs".into(),
-        ));
-    }
-
-    // The responder now initiates the same bounded reconciliation in reverse.
-    // Serving it gives both authenticated endpoints an independently derived
-    // exact difference; neither endpoint trusts a peer-declared transfer list.
-    let mut reverse = Responder::new(&inventory, limits)?;
-    loop {
-        event_guard.check(store)?;
-        let wire_budget = exchange_wire_budget(&receipt)?;
-        let (complete, request_bytes, response_bytes) = respond_mission_frame(
-            connection,
-            &mut mission,
-            wire_budget,
-            |frame, _request_wire_len| match frame {
-                Frame::DifferenceQuery(query) => {
-                    event_guard.check(store)?;
-                    Ok((
-                        Frame::DifferenceReply(reverse.reconcile_query(&query)?),
-                        false,
-                    ))
-                }
-                Frame::DifferenceBound if reverse.rounds() > 0 => {
-                    event_guard.check(store)?;
-                    Ok((Frame::DifferenceBoundAck, true))
-                }
-                Frame::DifferenceBound => Err(NodeError::Protocol(
-                    "difference bound preceded reverse reconciliation".into(),
-                )),
-                _ => Err(NodeError::Protocol(
-                    "reverse reconciliation received an out-of-phase frame".into(),
-                )),
-            },
-        )
-        .await?;
-        account(&mut receipt, request_bytes, response_bytes)?;
-        if complete {
-            break;
-        }
-    }
-    receipt.rounds = receipt
-        .rounds
-        .checked_add(first_rounds)
-        .and_then(|rounds| rounds.checked_add(reverse.rounds()))
-        .ok_or_else(|| NodeError::Protocol("combined round count overflow".into()))?;
-
-    transfer_difference(
+    let to_responder = sync_event_reconciliation_lane(
         store,
         connection,
         &mut mission,
         &mut event_verifier,
-        &difference,
-        &event_guard,
+        to_responder_lane,
         &mut receipt,
     )
     .await?;
-    event_guard.check(store)?;
-    if request_mission_frame(connection, &mut mission, Frame::Finish, &mut receipt).await?
-        != Frame::Finished
-    {
-        return Err(NodeError::Protocol("finish acknowledgement differs".into()));
-    }
+    sync_event_transfer_lane(
+        store,
+        connection,
+        &mut mission,
+        &mut event_verifier,
+        to_responder_lane,
+        &to_responder,
+        &mut receipt,
+    )
+    .await?;
+
+    let to_initiator_lane = DirectedEventLane {
+        guard: &event_guard,
+        receiver_interest: &local_interest,
+        direction: EventDirection::ToSessionInitiator,
+    };
+    let to_initiator = sync_event_reconciliation_lane(
+        store,
+        connection,
+        &mut mission,
+        &mut event_verifier,
+        to_initiator_lane,
+        &mut receipt,
+    )
+    .await?;
+    sync_event_transfer_lane(
+        store,
+        connection,
+        &mut mission,
+        &mut event_verifier,
+        to_initiator_lane,
+        &to_initiator,
+        &mut receipt,
+    )
+    .await?;
     connection.close();
     Ok(receipt)
-}
-
-async fn transfer_difference(
-    store: &Store,
-    connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
-    event_verifier: &mut ReferenceEnvelopeSealer,
-    difference: &EventDifference,
-    event_guard: &EventLaneGuard,
-    receipt: &mut PeerReceipt,
-) -> Result<(), NodeError> {
-    let authenticated_peer = mission.peer().mission_id();
-    let peer_route_commitments = mission.peer_route_grant_commitments().to_vec();
-    let (local_limit, remote_limit) =
-        transfer_limits(difference.local_only.len(), difference.remote_only.len());
-    let difference_items = difference
-        .local_only
-        .len()
-        .checked_add(difference.remote_only.len())
-        .ok_or_else(|| NodeError::Protocol("difference item count overflow".into()))?;
-    let scheduled_items = local_limit
-        .checked_add(remote_limit)
-        .ok_or_else(|| NodeError::Protocol("scheduled item count overflow".into()))?;
-    receipt.remaining = difference_items.saturating_sub(scheduled_items);
-    for id in difference.local_only.iter().take(local_limit) {
-        event_guard.check(store)?;
-        let bytes = load_verified_transfer(store, event_guard.policy(), event_verifier, *id)?;
-        let response = request_mission_frame(
-            connection,
-            mission,
-            Frame::Offer { id: *id, bytes },
-            receipt,
-        )
-        .await?;
-        let Frame::ApplyResult {
-            id: applied,
-            inserted,
-        } = response
-        else {
-            return Err(NodeError::Protocol("offer acknowledgement differs".into()));
-        };
-        if applied != *id {
-            return Err(NodeError::Protocol(
-                "offer acknowledgement identifies another item".into(),
-            ));
-        }
-        receipt.offered += 1;
-        if !inserted {
-            receipt.duplicates += 1;
-        }
-    }
-    for id in difference.remote_only.iter().take(remote_limit) {
-        event_guard.check(store)?;
-        let response =
-            request_mission_frame(connection, mission, Frame::Fetch(*id), receipt).await?;
-        let Frame::Object {
-            id: received,
-            bytes,
-        } = response
-        else {
-            return Err(NodeError::Protocol("fetch response differs".into()));
-        };
-        if received != *id || bytes.len() > MAX_OBJECT_BYTES {
-            return Err(NodeError::Protocol(
-                "fetched Event transfer identity or bound differs".into(),
-            ));
-        }
-        event_guard.check(store)?;
-        if accept_received_transfer(
-            store,
-            event_guard.policy(),
-            event_verifier,
-            authenticated_peer,
-            &peer_route_commitments,
-            received,
-            &bytes,
-        )? {
-            receipt.inserted += 1;
-        } else {
-            receipt.duplicates += 1;
-        }
-        receipt.fetched += 1;
-        event_guard.check(store)?;
-    }
-    Ok(())
 }
 
 async fn serve_connection(
@@ -4092,6 +4436,310 @@ async fn serve_control_lane(
     Ok(())
 }
 
+async fn serve_event_interests(
+    store: &Store,
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    event_guard: &EventLaneGuard,
+    receipt: &mut PeerReceipt,
+) -> Result<(EventInterest, EventInterest), NodeError> {
+    event_guard.check(store)?;
+    let local_interest = event_guard.interest()?;
+    let mut peer_interest = None;
+    let wire_budget = exchange_wire_budget(receipt)?;
+    let (complete, request_bytes, response_bytes) = respond_mission_frame(
+        connection,
+        mission,
+        wire_budget,
+        |frame, _request_wire_len| match frame {
+            Frame::EventInterest(interest) => {
+                peer_interest = Some(interest);
+                Ok((Frame::EventInterestReply(local_interest.clone()), true))
+            }
+            _ => Err(NodeError::Protocol(
+                "Event inventory preceded the protected interest request".into(),
+            )),
+        },
+    )
+    .await?;
+    account(receipt, request_bytes, response_bytes)?;
+    if !complete {
+        return Err(NodeError::Protocol(
+            "protected Event interest exchange did not complete".into(),
+        ));
+    }
+    event_guard.check(store)?;
+    Ok((
+        local_interest,
+        peer_interest.ok_or_else(|| {
+            NodeError::Protocol("protected Event interest request disappeared".into())
+        })?,
+    ))
+}
+
+async fn serve_event_reconciliation_lane(
+    store: &Store,
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    event_verifier: &mut ReferenceEnvelopeSealer,
+    lane: DirectedEventLane<'_>,
+    receipt: &mut PeerReceipt,
+) -> Result<EventDifference, NodeError> {
+    let DirectedEventLane {
+        guard: event_guard,
+        receiver_interest,
+        direction,
+    } = lane;
+    event_guard.check(store)?;
+    let inventory = match direction {
+        EventDirection::ToSessionResponder => transfer_inventory_for_receiver(
+            store,
+            event_guard.replication_policy(),
+            event_verifier,
+            receiver_interest,
+        )?,
+        EventDirection::ToSessionInitiator => transfer_inventory_for_peer(
+            store,
+            event_guard.policy(),
+            event_verifier,
+            mission.peer().mission_id(),
+            mission.peer_route_grant_commitments(),
+            receiver_interest,
+        )?,
+    };
+    let limits = ReconciliationLimits::default();
+    let mut responder = Responder::new(&inventory, limits)?;
+    loop {
+        event_guard.check(store)?;
+        let wire_budget = exchange_wire_budget(receipt)?;
+        let (complete, request_bytes, response_bytes) = respond_mission_frame(
+            connection,
+            mission,
+            wire_budget,
+            |frame, _request_wire_len| match frame {
+                Frame::InventoryQuery {
+                    direction: request_direction,
+                    bytes: query,
+                } if request_direction == direction => {
+                    event_guard.check(store)?;
+                    Ok((
+                        Frame::InventoryReply {
+                            direction,
+                            bytes: responder.reconcile_query(&query)?,
+                        },
+                        false,
+                    ))
+                }
+                Frame::InventoryComplete {
+                    direction: request_direction,
+                } if request_direction == direction && responder.rounds() > 0 => {
+                    event_guard.check(store)?;
+                    Ok((Frame::InventoryCompleteAck { direction }, true))
+                }
+                Frame::InventoryComplete {
+                    direction: request_direction,
+                } if request_direction == direction => Err(NodeError::Protocol(
+                    "inventory completion preceded directional reconciliation".into(),
+                )),
+                _ => Err(NodeError::Protocol(
+                    "inventory reconciliation crossed Event lanes or phases".into(),
+                )),
+            },
+        )
+        .await?;
+        account(receipt, request_bytes, response_bytes)?;
+        if complete {
+            break;
+        }
+    }
+
+    let mut reverse = Initiator::new(&inventory, limits)?;
+    let mut query = reverse.initiate()?;
+    let difference = loop {
+        event_guard.check(store)?;
+        let response = request_mission_frame(
+            connection,
+            mission,
+            Frame::DifferenceQuery {
+                direction,
+                bytes: query,
+            },
+            receipt,
+        )
+        .await?;
+        let Frame::DifferenceReply {
+            direction: response_direction,
+            bytes: response,
+        } = response
+        else {
+            return Err(NodeError::Protocol(
+                "directional reverse difference query received another response".into(),
+            ));
+        };
+        if response_direction != direction {
+            return Err(NodeError::Protocol(
+                "difference reply crossed Event reconciliation lanes".into(),
+            ));
+        }
+        match reverse.reconcile_response(&response)? {
+            InitiatorStep::Continue(next) => query = next,
+            InitiatorStep::Complete(difference) => {
+                break EventDifference::from_reconciliation(difference);
+            }
+        }
+    };
+    event_guard.check(store)?;
+    if request_mission_frame(
+        connection,
+        mission,
+        Frame::DifferenceBound { direction },
+        receipt,
+    )
+    .await?
+        != (Frame::DifferenceBoundAck { direction })
+    {
+        return Err(NodeError::Protocol(
+            "directional difference-bound acknowledgement differs".into(),
+        ));
+    }
+    receipt.rounds = receipt
+        .rounds
+        .checked_add(responder.rounds())
+        .and_then(|rounds| rounds.checked_add(reverse.rounds()))
+        .ok_or_else(|| NodeError::Protocol("combined round count overflow".into()))?;
+    Ok(difference)
+}
+
+async fn serve_event_transfer_lane(
+    store: &Store,
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    event_verifier: &mut ReferenceEnvelopeSealer,
+    lane: DirectedEventLane<'_>,
+    difference: &EventDifference,
+    receipt: &mut PeerReceipt,
+) -> Result<(), NodeError> {
+    let DirectedEventLane {
+        guard: event_guard,
+        receiver_interest,
+        direction,
+    } = lane;
+    let capacity = event_transfer_capacity(receipt)?;
+    let mut authorization = TransferAuthorization::for_peer(difference, direction, capacity);
+    add_unscheduled_events(receipt, authorization.remaining)?;
+    let authenticated_peer = mission.peer().mission_id();
+    let peer_route_commitments = mission.peer_route_grant_commitments().to_vec();
+    loop {
+        event_guard.check(store)?;
+        let wire_budget = exchange_wire_budget(receipt)?;
+        let (complete, request_bytes, response_bytes) = respond_mission_frame(
+            connection,
+            mission,
+            wire_budget,
+            |frame, request_wire_len| match frame {
+                Frame::Offer {
+                    direction: request_direction,
+                    id,
+                    bytes,
+                } if direction == EventDirection::ToSessionResponder
+                    && request_direction == direction =>
+                {
+                    event_guard.check(store)?;
+                    authorize_transfer_item(
+                        authorization.offers_from_peer.remove(&id),
+                        receipt,
+                        "offer",
+                    )?;
+                    if bytes.len() > MAX_OBJECT_BYTES {
+                        return Err(NodeError::Protocol(format!(
+                            "offered object exceeds {MAX_OBJECT_BYTES} bytes"
+                        )));
+                    }
+                    check_account(receipt, request_wire_len, 4_096)?;
+                    event_guard.check(store)?;
+                    let inserted = accept_received_transfer(
+                        store,
+                        event_verifier,
+                        EventReceiveAuthority {
+                            peer: authenticated_peer,
+                            peer_route_commitments: &peer_route_commitments,
+                            receiver_interest,
+                            local_replication_policy: event_guard.replication_policy(),
+                        },
+                        id,
+                        &bytes,
+                    )?;
+                    if inserted {
+                        receipt.inserted += 1;
+                    } else {
+                        receipt.duplicates += 1;
+                    }
+                    receipt.fetched += 1;
+                    event_guard.check(store)?;
+                    Ok((
+                        Frame::ApplyResult {
+                            direction,
+                            id,
+                            inserted,
+                        },
+                        false,
+                    ))
+                }
+                Frame::Fetch {
+                    direction: request_direction,
+                    id,
+                } if direction == EventDirection::ToSessionInitiator
+                    && request_direction == direction =>
+                {
+                    event_guard.check(store)?;
+                    authorize_transfer_item(
+                        authorization.fetches_by_peer.remove(&id),
+                        receipt,
+                        "fetch",
+                    )?;
+                    let bytes = load_verified_transfer_for_peer(
+                        store,
+                        event_guard.policy(),
+                        event_verifier,
+                        id,
+                        authenticated_peer,
+                        &peer_route_commitments,
+                        receiver_interest,
+                    )?;
+                    receipt.offered += 1;
+                    Ok((
+                        Frame::Object {
+                            direction,
+                            id,
+                            bytes,
+                        },
+                        false,
+                    ))
+                }
+                Frame::Finish {
+                    direction: request_direction,
+                } if request_direction == direction && authorization.is_consumed() => {
+                    event_guard.check(store)?;
+                    Ok((Frame::Finished { direction }, true))
+                }
+                Frame::Finish {
+                    direction: request_direction,
+                } if request_direction == direction => Err(NodeError::Protocol(
+                    "finish preceded consumption of the directional transfer plan".into(),
+                )),
+                _ => Err(NodeError::Protocol(
+                    "transfer crossed Event lanes or used an unauthorized phase operation".into(),
+                )),
+            },
+        )
+        .await?;
+        account(receipt, request_bytes, response_bytes)?;
+        if complete {
+            return Ok(());
+        }
+    }
+}
+
 async fn serve_session(
     store: Arc<Store>,
     connection: aster_iroh::Connection,
@@ -4131,179 +4779,66 @@ async fn serve_session(
         mission.peer().mission_id(),
         receipt.controls_remaining,
     )?;
-    event_guard.check(&store)?;
-    let inventory = transfer_inventory_for_peer(
+    let (local_interest, peer_interest) = serve_event_interests(
         &store,
-        event_guard.policy(),
-        &mut event_verifier,
-        mission.peer().mission_id(),
-        mission.peer_route_grant_commitments(),
-    )?;
-    let limits = ReconciliationLimits::default();
-    let mut responder = Responder::new(&inventory, limits)?;
-
-    // First direction: answer the authenticated peer's reconciliation until it
-    // explicitly completes. Object operations remain out of phase here.
-    loop {
-        event_guard.check(&store)?;
-        let wire_budget = exchange_wire_budget(&receipt)?;
-        let (complete, request_bytes, response_bytes) = respond_mission_frame(
-            &connection,
-            &mut mission,
-            wire_budget,
-            |frame, _request_wire_len| match frame {
-                Frame::InventoryQuery(query) => {
-                    event_guard.check(&store)?;
-                    Ok((
-                        Frame::InventoryReply(responder.reconcile_query(&query)?),
-                        false,
-                    ))
-                }
-                Frame::InventoryComplete if responder.rounds() > 0 => {
-                    event_guard.check(&store)?;
-                    Ok((Frame::InventoryCompleteAck, true))
-                }
-                Frame::InventoryComplete => Err(NodeError::Protocol(
-                    "inventory completion preceded reconciliation".into(),
-                )),
-                _ => Err(NodeError::Protocol(
-                    "inventory reconciliation received an out-of-phase frame".into(),
-                )),
-            },
-        )
-        .await?;
-        account(&mut receipt, request_bytes, response_bytes)?;
-        if complete {
-            break;
-        }
-    }
-
-    // Second direction: independently derive the exact difference from this
-    // endpoint's point of view. This becomes the only transfer authorization.
-    let mut reverse = Initiator::new(&inventory, limits)?;
-    let mut query = reverse.initiate()?;
-    let difference = loop {
-        event_guard.check(&store)?;
-        let response = request_mission_frame(
-            &connection,
-            &mut mission,
-            Frame::DifferenceQuery(query),
-            &mut receipt,
-        )
-        .await?;
-        let Frame::DifferenceReply(response) = response else {
-            return Err(NodeError::Protocol(
-                "reverse difference query received a different response".into(),
-            ));
-        };
-        match reverse.reconcile_response(&response)? {
-            InitiatorStep::Continue(next) => query = next,
-            InitiatorStep::Complete(difference) => {
-                break EventDifference::from_reconciliation(difference);
-            }
-        }
-    };
-    event_guard.check(&store)?;
-    if request_mission_frame(
         &connection,
         &mut mission,
-        Frame::DifferenceBound,
+        &event_guard,
         &mut receipt,
     )
-    .await?
-        != Frame::DifferenceBoundAck
-    {
-        return Err(NodeError::Protocol(
-            "difference-bound acknowledgement differs".into(),
-        ));
-    }
-    receipt.rounds = receipt
-        .rounds
-        .checked_add(responder.rounds())
-        .and_then(|rounds| rounds.checked_add(reverse.rounds()))
-        .ok_or_else(|| NodeError::Protocol("combined round count overflow".into()))?;
+    .await?;
 
-    let mut authorization = TransferAuthorization::for_peer(&difference);
-    let authenticated_peer = mission.peer().mission_id();
-    let peer_route_commitments = mission.peer_route_grant_commitments().to_vec();
-    receipt.remaining = authorization.remaining;
-    loop {
-        event_guard.check(&store)?;
-        let wire_budget = exchange_wire_budget(&receipt)?;
-        let (complete, request_bytes, response_bytes) = respond_mission_frame(
-            &connection,
-            &mut mission,
-            wire_budget,
-            |frame, request_wire_len| match frame {
-                Frame::Fetch(id) => {
-                    event_guard.check(&store)?;
-                    authorize_transfer_item(
-                        authorization.fetches_by_peer.remove(&id),
-                        &receipt,
-                        "fetch",
-                    )?;
-                    let bytes = load_verified_transfer(
-                        &store,
-                        event_guard.policy(),
-                        &mut event_verifier,
-                        id,
-                    )?;
-                    receipt.offered += 1;
-                    Ok((Frame::Object { id, bytes }, false))
-                }
-                Frame::Offer { id, bytes } => {
-                    event_guard.check(&store)?;
-                    authorize_transfer_item(
-                        authorization.offers_from_peer.remove(&id),
-                        &receipt,
-                        "offer",
-                    )?;
-                    if bytes.len() > MAX_OBJECT_BYTES {
-                        return Err(NodeError::Protocol(format!(
-                            "offered object exceeds {MAX_OBJECT_BYTES} bytes"
-                        )));
-                    }
-                    // Reserve a deliberately conservative protected control
-                    // response before making the durable apply irreversible.
-                    check_account(&receipt, request_wire_len, 4_096)?;
-                    event_guard.check(&store)?;
-                    let inserted = accept_received_transfer(
-                        &store,
-                        event_guard.policy(),
-                        &mut event_verifier,
-                        authenticated_peer,
-                        &peer_route_commitments,
-                        id,
-                        &bytes,
-                    )?;
-                    if inserted {
-                        receipt.inserted += 1;
-                    } else {
-                        receipt.duplicates += 1;
-                    }
-                    receipt.fetched += 1;
-                    event_guard.check(&store)?;
-                    Ok((Frame::ApplyResult { id, inserted }, false))
-                }
-                Frame::Finish if authorization.is_consumed() => {
-                    event_guard.check(&store)?;
-                    Ok((Frame::Finished, true))
-                }
-                Frame::Finish => Err(NodeError::Protocol(
-                    "finish preceded consumption of the authorized transfer plan".into(),
-                )),
-                _ => Err(NodeError::Protocol(
-                    "transfer received an out-of-phase or response-only frame".into(),
-                )),
-            },
-        )
-        .await?;
-        account(&mut receipt, request_bytes, response_bytes)?;
-        if complete {
-            connection.close();
-            return Ok(receipt);
-        }
-    }
+    let to_responder_lane = DirectedEventLane {
+        guard: &event_guard,
+        receiver_interest: &local_interest,
+        direction: EventDirection::ToSessionResponder,
+    };
+    let to_responder = serve_event_reconciliation_lane(
+        &store,
+        &connection,
+        &mut mission,
+        &mut event_verifier,
+        to_responder_lane,
+        &mut receipt,
+    )
+    .await?;
+    serve_event_transfer_lane(
+        &store,
+        &connection,
+        &mut mission,
+        &mut event_verifier,
+        to_responder_lane,
+        &to_responder,
+        &mut receipt,
+    )
+    .await?;
+
+    let to_initiator_lane = DirectedEventLane {
+        guard: &event_guard,
+        receiver_interest: &peer_interest,
+        direction: EventDirection::ToSessionInitiator,
+    };
+    let to_initiator = serve_event_reconciliation_lane(
+        &store,
+        &connection,
+        &mut mission,
+        &mut event_verifier,
+        to_initiator_lane,
+        &mut receipt,
+    )
+    .await?;
+    serve_event_transfer_lane(
+        &store,
+        &connection,
+        &mut mission,
+        &mut event_verifier,
+        to_initiator_lane,
+        &to_initiator,
+        &mut receipt,
+    )
+    .await?;
+    connection.close();
+    Ok(receipt)
 }
 
 #[derive(Debug)]
@@ -4398,31 +4933,42 @@ impl ControlTransferAuthorization {
 }
 
 impl TransferAuthorization {
-    fn for_peer(local_difference: &EventDifference) -> Self {
-        // The peer's point of view is the exact inverse of this endpoint's:
-        // peer local-only == local remote-only, and vice versa.
-        let (peer_offer_limit, peer_fetch_limit) = transfer_limits(
-            local_difference.remote_only.len(),
-            local_difference.local_only.len(),
-        );
-        let total = local_difference
-            .local_only
-            .len()
-            .saturating_add(local_difference.remote_only.len());
-        Self {
-            offers_from_peer: local_difference
-                .remote_only
-                .iter()
-                .take(peer_offer_limit)
-                .copied()
-                .collect(),
-            fetches_by_peer: local_difference
-                .local_only
-                .iter()
-                .take(peer_fetch_limit)
-                .copied()
-                .collect(),
-            remaining: total.saturating_sub(peer_offer_limit.saturating_add(peer_fetch_limit)),
+    fn for_peer(
+        local_difference: &EventDifference,
+        direction: EventDirection,
+        capacity: usize,
+    ) -> Self {
+        match direction {
+            EventDirection::ToSessionResponder => {
+                // The responder is the receiver, so only initiator-only items
+                // (remote-only from this endpoint's view) may arrive as offers.
+                let limit = local_difference.remote_only.len().min(capacity);
+                Self {
+                    offers_from_peer: local_difference
+                        .remote_only
+                        .iter()
+                        .take(limit)
+                        .copied()
+                        .collect(),
+                    fetches_by_peer: BTreeSet::new(),
+                    remaining: local_difference.remote_only.len() - limit,
+                }
+            }
+            EventDirection::ToSessionInitiator => {
+                // The initiator is the receiver, so it may fetch only items
+                // local to this responder in the independently derived lane.
+                let limit = local_difference.local_only.len().min(capacity);
+                Self {
+                    offers_from_peer: BTreeSet::new(),
+                    fetches_by_peer: local_difference
+                        .local_only
+                        .iter()
+                        .take(limit)
+                        .copied()
+                        .collect(),
+                    remaining: local_difference.local_only.len() - limit,
+                }
+            }
         }
     }
 
@@ -4708,11 +5254,27 @@ pub fn run_demo_scenario(
         let bytes = bundle.to_bytes().map_err(MissionSessionError::from)?;
         let path = state.join(DEMO_MISSION_BUNDLE_FILE);
         let mission = UnprotectedReferenceMission::persist(&path, bytes)?;
+        seed_demo_event_subscription(
+            state,
+            &mission,
+            if member {
+                EventSubscriptionMode::Consume
+            } else {
+                EventSubscriptionMode::Carry
+            },
+        )?;
         missions.push(DemoMission {
             path,
             identity: mission.identity(),
         });
     }
+    let consume_selectors = if controlled_demo { 3 } else { 2 };
+    println!(
+        "SUBSCRIPTIONS status=seeded consume={} carry={} selectors={} interest_exchange=mission-protected lanes=receiver-directed",
+        consume_selectors,
+        nodes - consume_selectors,
+        nodes,
+    );
     let signed_registry = controlled_demo
         .then(|| {
             provisioner
@@ -5930,6 +6492,39 @@ mod tests {
             .collect()
     }
 
+    fn exact_event_interest(topic: &Topic, scope: &Scope) -> EventInterest {
+        EventInterest::new(vec![EventInterestSelector::new(
+            topic.clone(),
+            scope.clone(),
+            false,
+        )])
+        .expect("bounded exact Event interest")
+    }
+
+    fn seed_test_event_subscription(
+        store: &Store,
+        mode: EventSubscriptionMode,
+        topic: &Topic,
+        scope: &Scope,
+        key: &[u8],
+    ) {
+        let policy = store
+            .control_policy_snapshot()
+            .expect("settled subscription policy");
+        store
+            .create_event_subscription_with_policy(
+                &policy,
+                &EventSubscriptionKey::new(key.to_vec()).expect("subscription key"),
+                EventSubscriptionSpec {
+                    mode,
+                    topic: topic.clone(),
+                    scope: scope.clone(),
+                    include_descendant_scopes: false,
+                },
+            )
+            .expect("create explicit test Event subscription");
+    }
+
     fn loopback(endpoint: &Endpoint) -> SocketAddr {
         endpoint
             .bound_sockets()
@@ -5942,6 +6537,7 @@ mod tests {
         connection: &aster_iroh::Connection,
         mission: &mut MissionSession,
         inventory: aster_profile::InventorySnapshot,
+        interest: EventInterest,
     ) -> PeerReceipt {
         let limits = ReconciliationLimits::default();
         let mut receipt = PeerReceipt {
@@ -6017,19 +6613,40 @@ mod tests {
             Frame::ControlFinished
         );
 
-        let mut initiator = Initiator::new(&inventory, limits).expect("initiator");
-        let mut query = initiator.initiate().expect("initial query");
-        loop {
-            let Frame::InventoryReply(response) = request_mission_frame(
+        assert!(matches!(
+            request_mission_frame(
                 connection,
                 mission,
-                Frame::InventoryQuery(query),
+                Frame::EventInterest(interest),
                 &mut receipt,
             )
             .await
-            .expect("inventory response") else {
+            .expect("protected interest response"),
+            Frame::EventInterestReply(interest) if interest.is_empty()
+        ));
+
+        let direction = EventDirection::ToSessionResponder;
+        let mut initiator = Initiator::new(&inventory, limits).expect("initiator");
+        let mut query = initiator.initiate().expect("initial query");
+        loop {
+            let Frame::InventoryReply {
+                direction: response_direction,
+                bytes: response,
+            } = request_mission_frame(
+                connection,
+                mission,
+                Frame::InventoryQuery {
+                    direction,
+                    bytes: query,
+                },
+                &mut receipt,
+            )
+            .await
+            .expect("inventory response")
+            else {
                 panic!("inventory response frame differs");
             };
+            assert_eq!(response_direction, direction);
             match initiator
                 .reconcile_response(&response)
                 .expect("reconcile response")
@@ -6042,22 +6659,35 @@ mod tests {
             }
         }
         assert_eq!(
-            request_mission_frame(connection, mission, Frame::InventoryComplete, &mut receipt,)
-                .await
-                .expect("inventory complete"),
-            Frame::InventoryCompleteAck
+            request_mission_frame(
+                connection,
+                mission,
+                Frame::InventoryComplete { direction },
+                &mut receipt,
+            )
+            .await
+            .expect("inventory complete"),
+            Frame::InventoryCompleteAck { direction }
         );
         let mut reverse = Responder::new(&inventory, limits).expect("reverse responder");
         loop {
             let wire_budget = exchange_wire_budget(&receipt).expect("wire budget");
             let (complete, request_bytes, response_bytes) =
                 respond_mission_frame(connection, mission, wire_budget, |frame, _| match frame {
-                    Frame::DifferenceQuery(query) => Ok((
-                        Frame::DifferenceReply(reverse.reconcile_query(&query)?),
+                    Frame::DifferenceQuery {
+                        direction: request_direction,
+                        bytes: query,
+                    } if request_direction == direction => Ok((
+                        Frame::DifferenceReply {
+                            direction,
+                            bytes: reverse.reconcile_query(&query)?,
+                        },
                         false,
                     )),
-                    Frame::DifferenceBound if reverse.rounds() > 0 => {
-                        Ok((Frame::DifferenceBoundAck, true))
+                    Frame::DifferenceBound {
+                        direction: request_direction,
+                    } if request_direction == direction && reverse.rounds() > 0 => {
+                        Ok((Frame::DifferenceBoundAck { direction }, true))
                     }
                     _ => Err(NodeError::Protocol("test reverse phase differs".into())),
                 })
@@ -6069,6 +6699,93 @@ mod tests {
             }
         }
         receipt
+    }
+
+    async fn reconcile_equal_event_lane(
+        connection: &aster_iroh::Connection,
+        mission: &mut MissionSession,
+        inventory: InventorySnapshot,
+        direction: EventDirection,
+        receipt: &mut PeerReceipt,
+    ) {
+        let limits = ReconciliationLimits::default();
+        let mut initiator = Initiator::new(&inventory, limits).expect("lane initiator");
+        let mut query = initiator.initiate().expect("lane initial query");
+        loop {
+            let Frame::InventoryReply {
+                direction: response_direction,
+                bytes: response,
+            } = request_mission_frame(
+                connection,
+                mission,
+                Frame::InventoryQuery {
+                    direction,
+                    bytes: query,
+                },
+                receipt,
+            )
+            .await
+            .expect("lane inventory response")
+            else {
+                panic!("lane inventory response frame differs");
+            };
+            assert_eq!(response_direction, direction);
+            match initiator
+                .reconcile_response(&response)
+                .expect("lane reconcile response")
+            {
+                InitiatorStep::Continue(next) => query = next,
+                InitiatorStep::Complete(difference) => {
+                    assert!(
+                        difference.is_empty(),
+                        "directional reconciliation disclosed an unauthorized difference"
+                    );
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            request_mission_frame(
+                connection,
+                mission,
+                Frame::InventoryComplete { direction },
+                receipt,
+            )
+            .await
+            .expect("lane inventory complete"),
+            Frame::InventoryCompleteAck { direction }
+        );
+        let mut reverse = Responder::new(&inventory, limits).expect("lane reverse responder");
+        loop {
+            let wire_budget = exchange_wire_budget(receipt).expect("lane wire budget");
+            let (complete, request_bytes, response_bytes) =
+                respond_mission_frame(connection, mission, wire_budget, |frame, _| match frame {
+                    Frame::DifferenceQuery {
+                        direction: request_direction,
+                        bytes: query,
+                    } if request_direction == direction => Ok((
+                        Frame::DifferenceReply {
+                            direction,
+                            bytes: reverse.reconcile_query(&query)?,
+                        },
+                        false,
+                    )),
+                    Frame::DifferenceBound {
+                        direction: request_direction,
+                    } if request_direction == direction && reverse.rounds() > 0 => {
+                        Ok((Frame::DifferenceBoundAck { direction }, true))
+                    }
+                    _ => Err(NodeError::Protocol(
+                        "test directional reverse phase differs".into(),
+                    )),
+                })
+                .await
+                .expect("lane reverse response");
+            account(receipt, request_bytes, response_bytes).expect("account lane reverse");
+            if complete {
+                break;
+            }
+        }
     }
 
     async fn reject_hostile_transfer(frame: Frame, label: &str) {
@@ -6138,6 +6855,7 @@ mod tests {
             &connection,
             &mut mission,
             aster_profile::InventorySnapshot::default(),
+            EventInterest::empty(),
         )
         .await;
         let client_error = request_mission_frame(&connection, &mut mission, frame, &mut receipt)
@@ -6154,7 +6872,10 @@ mod tests {
         assert!(
             server_error
                 .to_string()
-                .contains("outside this authenticated contact's negotiated difference"),
+                .contains("outside this authenticated contact's negotiated difference")
+                || server_error
+                    .to_string()
+                    .contains("transfer crossed Event lanes"),
             "unexpected server rejection: {server_error}"
         );
         let stats = server_store.stats().expect("server stats");
@@ -6939,6 +7660,45 @@ mod tests {
         }
     }
 
+    fn publish_test_epoch_one_event(
+        store: &Store,
+        sealer: &mut ReferenceEnvelopeSealer,
+        topic: &Topic,
+        scope: &Scope,
+        logical_key: &[u8],
+    ) -> EventTransferId {
+        let reservation = store
+            .reserve_event(sealer.identity(), topic, scope)
+            .expect("reserve epoch-one test Event");
+        let payload = logical_key;
+        let header = reservation
+            .header(
+                Priority::Routine,
+                logical_key.to_vec(),
+                None,
+                payload.len() as u64,
+                false,
+                1,
+            )
+            .expect("epoch-one test header");
+        let sealed = sealer
+            .seal_event(&header, payload)
+            .expect("seal epoch-one test Event");
+        let route = sealer
+            .verify_event(&sealed.bytes)
+            .expect("verify epoch-one test route");
+        let EventContentVerification::ContentVerified { event, .. } = sealer
+            .verify_event_content(route, &sealed.bytes)
+            .expect("verify epoch-one test content")
+        else {
+            panic!("test member lost content grant");
+        };
+        store
+            .commit_reserved_event(&reservation, &event, &sealed.bytes)
+            .expect("commit epoch-one test Event");
+        EventTransferId::new(event.envelope_id())
+    }
+
     async fn contact_test_pair(
         server_store: Arc<Store>,
         server_mission: UnprotectedReferenceMission,
@@ -7015,15 +7775,388 @@ mod tests {
     #[tokio::test]
     async fn valid_mission_session_rejects_arbitrary_fetch_and_offer_after_reconciliation() {
         let shared = EventTransferId::new([0xe0; 32]);
-        reject_hostile_transfer(Frame::Fetch(shared), "fetch").await;
+        reject_hostile_transfer(
+            Frame::Fetch {
+                direction: EventDirection::ToSessionResponder,
+                id: shared,
+            },
+            "fetch",
+        )
+        .await;
         reject_hostile_transfer(
             Frame::Offer {
+                direction: EventDirection::ToSessionResponder,
                 id: shared,
                 bytes: b"shared".to_vec(),
             },
             "offer",
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn protected_interest_selects_only_beta_and_empty_means_receive_none() {
+        let scope = Scope::new("test/interest-filter").expect("interest scope");
+        let alpha = Topic::new("alpha").expect("alpha topic");
+        let beta = Topic::new("beta").expect("beta topic");
+        let access =
+            ProvisioningAccess::member(scope.clone(), vec![1], vec![alpha.clone(), beta.clone()])
+                .expect("two-topic access");
+        let mut provisioner =
+            ReferenceProvisioner::from_seed([0x94; 32]).expect("interest provisioner");
+        let server_mission = UnprotectedReferenceMission::from_bytes(
+            provisioner
+                .issue_node(1, std::slice::from_ref(&access))
+                .and_then(|bundle| bundle.to_bytes())
+                .expect("server bundle"),
+        )
+        .expect("server mission");
+        let beta_mission = UnprotectedReferenceMission::from_bytes(
+            provisioner
+                .issue_node(2, std::slice::from_ref(&access))
+                .and_then(|bundle| bundle.to_bytes())
+                .expect("beta receiver bundle"),
+        )
+        .expect("beta receiver mission");
+        let empty_mission = UnprotectedReferenceMission::from_bytes(
+            provisioner
+                .issue_node(3, &[access])
+                .and_then(|bundle| bundle.to_bytes())
+                .expect("empty receiver bundle"),
+        )
+        .expect("empty receiver mission");
+
+        let server_state = root("interest-filter-server");
+        let beta_state = root("interest-filter-beta");
+        let empty_state = root("interest-filter-empty");
+        for state in [&server_state, &beta_state, &empty_state] {
+            fs::create_dir_all(state).expect("interest test state");
+        }
+        let mut server_sealer = open_test_sealer(&server_mission);
+        let authority = server_sealer.mission_authority_id();
+        let server_store = Arc::new(
+            Store::open_for_mission(server_state.join(STORE_FILE), authority)
+                .expect("server store"),
+        );
+        let beta_store = Store::open_for_mission(beta_state.join(STORE_FILE), authority)
+            .expect("beta receiver store");
+        let empty_store = Store::open_for_mission(empty_state.join(STORE_FILE), authority)
+            .expect("empty receiver store");
+        seed_test_event_subscription(
+            &server_store,
+            EventSubscriptionMode::Consume,
+            &beta,
+            &scope,
+            b"server-receive-beta-baseline",
+        );
+        seed_test_event_subscription(
+            &beta_store,
+            EventSubscriptionMode::Consume,
+            &beta,
+            &scope,
+            b"receive-beta-only",
+        );
+
+        let alpha_id = publish_test_epoch_one_event(
+            &server_store,
+            &mut server_sealer,
+            &alpha,
+            &scope,
+            b"alpha-event",
+        );
+        let beta_id = publish_test_epoch_one_event(
+            &server_store,
+            &mut server_sealer,
+            &beta,
+            &scope,
+            b"beta-event",
+        );
+        let server_policy = server_store
+            .event_replication_policy_snapshot()
+            .expect("server replication policy");
+        let beta_interest = exact_event_interest(&beta, &scope);
+        assert_eq!(
+            transfer_inventory_for_receiver(
+                &server_store,
+                &server_policy,
+                &mut server_sealer,
+                &beta_interest,
+            )
+            .expect("beta-filtered inventory"),
+            InventorySnapshot::new(vec![beta_id.reconciliation_item_id()]),
+        );
+        assert!(
+            transfer_inventory_for_receiver(
+                &server_store,
+                &server_policy,
+                &mut server_sealer,
+                &EventInterest::empty(),
+            )
+            .expect("empty inventory")
+            .is_empty(),
+            "empty interest must be receive-none rather than a wildcard"
+        );
+
+        let (beta_receipt, beta_server_receipt) = contact_test_pair(
+            server_store.clone(),
+            server_mission.clone(),
+            &beta_store,
+            beta_mission,
+        )
+        .await;
+        assert_eq!(beta_receipt.fetched, 1);
+        assert_eq!(beta_receipt.inserted, 1);
+        assert_eq!(beta_server_receipt.offered, 1);
+        assert!(
+            beta_store
+                .get_event(beta_id)
+                .expect("beta lookup")
+                .is_some()
+        );
+        assert!(
+            beta_store
+                .get_event(alpha_id)
+                .expect("alpha exclusion lookup")
+                .is_none(),
+            "authorized but unsubscribed alpha crossed the beta receive lane"
+        );
+        assert_eq!(beta_store.event_count().expect("beta Event count"), 1);
+
+        let (empty_receipt, empty_server_receipt) = contact_test_pair(
+            server_store.clone(),
+            server_mission,
+            &empty_store,
+            empty_mission,
+        )
+        .await;
+        assert_eq!(empty_receipt.fetched, 0);
+        assert_eq!(empty_receipt.inserted, 0);
+        assert_eq!(empty_server_receipt.offered, 0);
+        assert_eq!(empty_store.event_count().expect("empty Event count"), 0);
+        assert_eq!(
+            empty_store
+                .event_subscription_stats()
+                .expect("empty subscription stats")
+                .subscriptions,
+            0
+        );
+
+        drop(server_store);
+        drop(beta_store);
+        drop(empty_store);
+        for state in [server_state, beta_state, empty_state] {
+            fs::remove_dir_all(state).expect("cleanup interest test state");
+        }
+    }
+
+    #[tokio::test]
+    async fn content_capable_carry_stays_route_only_until_consume_dominates() {
+        let scope = Scope::new("test/effective-receive-mode").expect("mode scope");
+        let topic = Topic::new("mode").expect("mode topic");
+        let access = ProvisioningAccess::member(scope.clone(), vec![1], vec![topic.clone()])
+            .expect("content-capable access");
+        let mut provisioner =
+            ReferenceProvisioner::from_seed([0x9a; 32]).expect("mode provisioner");
+        let server_mission = UnprotectedReferenceMission::from_bytes(
+            provisioner
+                .issue_node(1, std::slice::from_ref(&access))
+                .and_then(|bundle| bundle.to_bytes())
+                .expect("mode server bundle"),
+        )
+        .expect("mode server mission");
+        let receiver_mission = UnprotectedReferenceMission::from_bytes(
+            provisioner
+                .issue_node(2, &[access])
+                .and_then(|bundle| bundle.to_bytes())
+                .expect("mode receiver bundle"),
+        )
+        .expect("mode receiver mission");
+
+        let server_state = root("effective-mode-server");
+        let receiver_state = root("effective-mode-receiver");
+        for state in [&server_state, &receiver_state] {
+            fs::create_dir_all(state).expect("mode test state");
+        }
+        let mut server_sealer = open_test_sealer(&server_mission);
+        let authority = server_sealer.mission_authority_id();
+        let server_store = Arc::new(
+            Store::open_for_mission(server_state.join(STORE_FILE), authority)
+                .expect("mode server store"),
+        );
+        let receiver_store = Store::open_for_mission(receiver_state.join(STORE_FILE), authority)
+            .expect("mode receiver store");
+        seed_test_event_subscription(
+            &receiver_store,
+            EventSubscriptionMode::Carry,
+            &topic,
+            &scope,
+            b"mode-carry",
+        );
+        let stale_guard = EventLaneGuard::capture(
+            Arc::new(RwLock::new(())).read_owned().await,
+            &receiver_store,
+            receiver_mission.identity(),
+            server_mission.identity(),
+            0,
+        )
+        .expect("capture Carry lane guard");
+        let stale_revision = stale_guard.replication_policy().selector_revision();
+        assert_eq!(
+            stale_guard
+                .replication_policy()
+                .effective_mode(&topic, &scope),
+            Some(EventSubscriptionMode::Carry)
+        );
+
+        let carried_id = publish_test_epoch_one_event(
+            &server_store,
+            &mut server_sealer,
+            &topic,
+            &scope,
+            b"content-capable-carry",
+        );
+        let (carry_receipt, _) = contact_test_pair(
+            server_store.clone(),
+            server_mission.clone(),
+            &receiver_store,
+            receiver_mission.clone(),
+        )
+        .await;
+        assert_eq!(carry_receipt.fetched, 1);
+        assert_eq!(carry_receipt.inserted, 1);
+        assert_eq!(receiver_store.event_count().expect("Carry Event count"), 0);
+        let carry_stats = receiver_store.event_stats().expect("Carry Event stats");
+        assert_eq!(carry_stats.events, 0);
+        assert_eq!(carry_stats.route_cached, 1);
+        let receiver_policy = receiver_store
+            .control_policy_snapshot()
+            .expect("Carry control policy");
+        let carried = match receiver_store
+            .get_transfer_with_policy(&receiver_policy, carried_id)
+            .expect("Carry exact transfer")
+        {
+            Some(StoredEventTransfer::RouteCached(event)) => event,
+            _ => panic!("content-capable Carry crossed semantic acceptance boundary"),
+        };
+        let mut receiver_verifier = open_test_sealer(&receiver_mission);
+        let carried_route = receiver_verifier
+            .verify_event(&carried.sealed)
+            .expect("content-capable receiver verifies route");
+        assert!(matches!(
+            receiver_verifier
+                .verify_event_content(carried_route, &carried.sealed)
+                .expect("content-capable receiver opens Carry bytes"),
+            EventContentVerification::ContentVerified { .. }
+        ));
+        stale_guard
+            .check(&receiver_store)
+            .expect("unchanged Carry guard remains current");
+
+        seed_test_event_subscription(
+            &receiver_store,
+            EventSubscriptionMode::Consume,
+            &topic,
+            &scope,
+            b"mode-overlapping-consume",
+        );
+        assert!(matches!(
+            stale_guard.check(&receiver_store),
+            Err(NodeError::Store(StoreError::EventSelectorRevisionChanged))
+        ));
+        let current_policy = receiver_store
+            .event_replication_policy_snapshot()
+            .expect("current Consume replication policy");
+        assert_eq!(current_policy.selector_revision(), stale_revision + 1);
+        assert_eq!(current_policy.selectors().len(), 1);
+        assert_eq!(
+            current_policy.selectors()[0].mode(),
+            EventSubscriptionMode::Consume
+        );
+        assert_eq!(
+            current_policy.effective_mode(&topic, &scope),
+            Some(EventSubscriptionMode::Consume)
+        );
+
+        let consumed_id = publish_test_epoch_one_event(
+            &server_store,
+            &mut server_sealer,
+            &topic,
+            &scope,
+            b"overlapping-consume",
+        );
+        let server_policy = server_store
+            .control_policy_snapshot()
+            .expect("server policy for stale admission evidence");
+        let consumed_bytes = match server_store
+            .get_transfer_with_policy(&server_policy, consumed_id)
+            .expect("server exact Consume candidate")
+        {
+            Some(StoredEventTransfer::Accepted(event)) => event.sealed,
+            _ => panic!("server lost the semantic Consume candidate"),
+        };
+        let consumed_route = receiver_verifier
+            .verify_event(&consumed_bytes)
+            .expect("receiver verifies stale admission candidate route");
+        let EventContentVerification::ContentVerified {
+            event: consumed_event,
+            ..
+        } = receiver_verifier
+            .verify_event_content(consumed_route, &consumed_bytes)
+            .expect("receiver opens stale admission candidate")
+        else {
+            panic!("content-capable receiver lost its content grant");
+        };
+        let stale_error = receiver_store
+            .apply_verified_event_with_replication_policy(
+                stale_guard.replication_policy(),
+                &consumed_event,
+                &consumed_bytes,
+            )
+            .expect_err("stale Carry snapshot must not admit after Consume mutation");
+        assert!(matches!(
+            stale_error,
+            StoreError::EventSelectorRevisionChanged
+        ));
+        assert!(
+            receiver_store
+                .get_transfer_with_policy(current_policy.control_policy(), consumed_id)
+                .expect("stale candidate absence")
+                .is_none()
+        );
+        let (consume_receipt, _) = contact_test_pair(
+            server_store.clone(),
+            server_mission,
+            &receiver_store,
+            receiver_mission,
+        )
+        .await;
+        assert_eq!(consume_receipt.fetched, 2);
+        assert_eq!(consume_receipt.inserted, 2);
+        assert_eq!(
+            receiver_store.event_count().expect("Consume Event count"),
+            2
+        );
+        let consume_stats = receiver_store.event_stats().expect("Consume Event stats");
+        assert_eq!(consume_stats.events, 2);
+        assert_eq!(consume_stats.route_cached, 0);
+        assert!(matches!(
+            receiver_store
+                .get_transfer_with_policy(current_policy.control_policy(), consumed_id)
+                .expect("Consume exact transfer"),
+            Some(StoredEventTransfer::Accepted(_))
+        ));
+        assert!(matches!(
+            receiver_store
+                .get_transfer_with_policy(current_policy.control_policy(), carried_id)
+                .expect("promoted Carry exact transfer"),
+            Some(StoredEventTransfer::Accepted(_))
+        ));
+
+        drop(server_store);
+        drop(receiver_store);
+        for state in [server_state, receiver_state] {
+            fs::remove_dir_all(state).expect("cleanup mode test state");
+        }
     }
 
     #[tokio::test]
@@ -7315,6 +8448,13 @@ mod tests {
             open_test_sealer(&services.member).mission_authority_id(),
         )
         .expect("member store");
+        seed_test_event_subscription(
+            &member_store,
+            EventSubscriptionMode::Consume,
+            &services.topic,
+            &services.scope,
+            b"same-contact-member",
+        );
         let (member_receipt, _) = contact_test_pair(
             authority_store.clone(),
             services.authority.clone(),
@@ -7357,6 +8497,13 @@ mod tests {
             open_test_sealer(&services.other).mission_authority_id(),
         )
         .expect("route-only store");
+        seed_test_event_subscription(
+            &route_store,
+            EventSubscriptionMode::Carry,
+            &services.topic,
+            &services.scope,
+            b"same-contact-route",
+        );
         let (route_receipt, _) = contact_test_pair(
             authority_store.clone(),
             services.authority.clone(),
@@ -7399,6 +8546,13 @@ mod tests {
             open_test_sealer(&services.excluded).mission_authority_id(),
         )
         .expect("excluded store");
+        seed_test_event_subscription(
+            &excluded_store,
+            EventSubscriptionMode::Carry,
+            &services.topic,
+            &services.scope,
+            b"same-contact-excluded",
+        );
         let (excluded_receipt, _) = contact_test_pair(
             authority_store.clone(),
             services.authority.clone(),
@@ -7443,6 +8597,7 @@ mod tests {
         let authority_policy = authority_store
             .control_policy_snapshot()
             .expect("authority settled policy");
+        let receiver_interest = exact_event_interest(&services.topic, &services.scope);
         assert_eq!(
             transfer_inventory_for_peer(
                 &authority_store,
@@ -7450,6 +8605,7 @@ mod tests {
                 &mut authority_verifier,
                 services.member.identity(),
                 &[],
+                &receiver_interest,
             )
             .expect("member dynamic inventory")
             .len(),
@@ -7462,6 +8618,7 @@ mod tests {
                 &mut authority_verifier,
                 services.other.identity(),
                 &[],
+                &receiver_interest,
             )
             .expect("route dynamic inventory")
             .len(),
@@ -7474,6 +8631,7 @@ mod tests {
                 &mut authority_verifier,
                 services.excluded.identity(),
                 &[],
+                &receiver_interest,
             )
             .expect("excluded dynamic inventory")
             .is_empty()
@@ -7543,6 +8701,20 @@ mod tests {
             assert_eq!(accepted.activated, 1);
             assert_eq!(store.control_stats().expect("settled rekey").pending, 0);
         }
+        seed_test_event_subscription(
+            &authority_store,
+            EventSubscriptionMode::Consume,
+            &services.topic,
+            &services.scope,
+            b"revoked-source-authority-consume",
+        );
+        seed_test_event_subscription(
+            &relay_store,
+            EventSubscriptionMode::Carry,
+            &services.topic,
+            &services.scope,
+            b"revoked-source-relay-carry",
+        );
 
         let source_policy = source_store
             .control_policy_snapshot()
@@ -7590,16 +8762,20 @@ mod tests {
             )
             .expect("commit source Event");
         let event_id = EventTransferId::new(source_event.envelope_id());
-        let authority_policy = authority_store
-            .control_policy_snapshot()
-            .expect("authority pre-revoke policy");
+        let receiver_interest = exact_event_interest(&services.topic, &services.scope);
+        let authority_replication_policy = authority_store
+            .event_replication_policy_snapshot()
+            .expect("authority pre-revoke replication policy");
         assert!(
             accept_received_transfer(
                 &authority_store,
-                &authority_policy,
                 &mut authority,
-                source.identity(),
-                &[],
+                EventReceiveAuthority {
+                    peer: source.identity(),
+                    peer_route_commitments: &[],
+                    receiver_interest: &receiver_interest,
+                    local_replication_policy: &authority_replication_policy,
+                },
                 event_id,
                 &sealed.bytes,
             )
@@ -7625,38 +8801,39 @@ mod tests {
             assert_eq!(accepted.activated, 1);
         }
 
-        let authority_policy = authority_store
-            .control_policy_snapshot()
-            .expect("authority post-revoke policy");
+        let authority_replication_policy = authority_store
+            .event_replication_policy_snapshot()
+            .expect("authority post-revoke replication policy");
+        let authority_policy = authority_replication_policy.control_policy();
         assert!(
             transfer_inventory_for_peer(
                 &authority_store,
-                &authority_policy,
+                authority_policy,
                 &mut authority,
                 relay.identity(),
                 &[],
+                &receiver_interest,
             )
             .expect("relay inventory after source revocation")
             .is_empty(),
             "revoked source Event identity leaked through a valid relay path"
         );
-        let serve_error = load_verified_transfer(
-            &authority_store,
-            &authority_policy,
-            &mut authority,
-            event_id,
-        )
-        .expect_err("revoked source Event cannot be served");
+        let serve_error =
+            load_verified_transfer(&authority_store, authority_policy, &mut authority, event_id)
+                .expect_err("revoked source Event cannot be served");
         assert!(matches!(
             serve_error,
             NodeError::Revoked(principal) if principal == source.identity()
         ));
         let reintroduction_error = accept_received_transfer(
             &authority_store,
-            &authority_policy,
             &mut authority,
-            relay.identity(),
-            &[],
+            EventReceiveAuthority {
+                peer: relay.identity(),
+                peer_route_commitments: &[],
+                receiver_interest: &receiver_interest,
+                local_replication_policy: &authority_replication_policy,
+            },
             event_id,
             &sealed.bytes,
         )
@@ -7666,15 +8843,18 @@ mod tests {
             NodeError::Revoked(principal) if principal == source.identity()
         ));
 
-        let relay_policy = relay_store
-            .control_policy_snapshot()
-            .expect("relay post-revoke policy");
+        let relay_replication_policy = relay_store
+            .event_replication_policy_snapshot()
+            .expect("relay post-revoke replication policy");
         let relay_error = accept_received_transfer(
             &relay_store,
-            &relay_policy,
             &mut relay,
-            authority.identity(),
-            &[],
+            EventReceiveAuthority {
+                peer: authority.identity(),
+                peer_route_commitments: &[],
+                receiver_interest: &receiver_interest,
+                local_replication_policy: &relay_replication_policy,
+            },
             event_id,
             &sealed.bytes,
         )
@@ -7809,6 +8989,13 @@ mod tests {
         let peer_store =
             Store::open_for_mission(peer_state.join(STORE_FILE), member.mission_authority_id())
                 .expect("nonrevoked peer store");
+        seed_test_event_subscription(
+            &peer_store,
+            EventSubscriptionMode::Consume,
+            &services.topic,
+            &services.scope,
+            b"post-authority-revocation-peer",
+        );
         let (client_receipt, server_receipt) = contact_test_pair(
             store.clone(),
             services.member.clone(),
@@ -8273,6 +9460,7 @@ mod tests {
             .commit_reserved_event(&reservation, &event, &sealed.bytes)
             .expect("commit hidden Event");
         let hidden_id = EventTransferId::new(event.envelope_id());
+        let matching_interest = exact_event_interest(&topic, &allowed_scope);
 
         let server_task = tokio::spawn({
             let server = server.clone();
@@ -8307,12 +9495,43 @@ mod tests {
         )
         .await
         .expect("valid mission handshake");
-        let mut receipt =
-            finish_equal_difference(&connection, &mut mission, InventorySnapshot::default()).await;
+        let mut receipt = finish_equal_difference(
+            &connection,
+            &mut mission,
+            InventorySnapshot::default(),
+            matching_interest.clone(),
+        )
+        .await;
+        assert_eq!(
+            request_mission_frame(
+                &connection,
+                &mut mission,
+                Frame::Finish {
+                    direction: EventDirection::ToSessionResponder,
+                },
+                &mut receipt,
+            )
+            .await
+            .expect("finish empty responder receive lane"),
+            Frame::Finished {
+                direction: EventDirection::ToSessionResponder,
+            }
+        );
+        reconcile_equal_event_lane(
+            &connection,
+            &mut mission,
+            InventorySnapshot::default(),
+            EventDirection::ToSessionInitiator,
+            &mut receipt,
+        )
+        .await;
         let client_error = request_mission_frame(
             &connection,
             &mut mission,
-            Frame::Fetch(hidden_id),
+            Frame::Fetch {
+                direction: EventDirection::ToSessionInitiator,
+                id: hidden_id,
+            },
             &mut receipt,
         )
         .await
@@ -8333,6 +9552,27 @@ mod tests {
         assert_eq!(server_store.event_count().expect("server Event count"), 1);
         client.close().await;
         server.close().await;
+        seed_test_event_subscription(
+            &server_store,
+            EventSubscriptionMode::Consume,
+            &topic,
+            &allowed_scope,
+            b"local-receiver-baseline",
+        );
+        let server_policy = server_store
+            .event_replication_policy_snapshot()
+            .expect("server replication policy");
+        assert_eq!(
+            transfer_inventory_for_receiver(
+                &server_store,
+                &server_policy,
+                &mut server_sealer,
+                &matching_interest,
+            )
+            .expect("local receiver baseline"),
+            InventorySnapshot::new(vec![hidden_id.reconciliation_item_id()]),
+            "receiver baseline must use the local current route grant, not the unrelated peer grant"
+        );
         fs::remove_dir_all(server_root).expect("cleanup");
     }
 

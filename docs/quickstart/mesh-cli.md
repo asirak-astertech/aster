@@ -15,7 +15,8 @@ authenticates each Event's source and protected metadata through the existing
 `aster-core` envelopes. A successful run remains bounded to Event, one sample
 topic/scope, durable `ttl=None`, direct loopback, and unprotected reference
 provisioning. It does not prove State, Record, Blob, finite-TTL custody,
-generalized publish/subscribe or control administration, protected provisioning,
+subscription update/delete, a live application handle, generalized control
+administration, protected provisioning,
 non-Unix or physical-media zeroization assurance, physical multi-system
 operation, NAT/hosted relay, BTLE, independent interoperability, or release
 authorization.
@@ -58,6 +59,19 @@ only the route grant.
 
 The command performs `2N+1` bounded cohorts and `5N-2` child-process
 executions:
+
+Before those cohorts, the demo seeds one durable receive selector per node and
+prints a receipt like:
+
+```text
+SUBSCRIPTIONS status=seeded consume=2 carry=<N-2> selectors=<N> interest_exchange=mission-protected lanes=receiver-directed
+```
+
+Endpoints use `Consume`; route-only intermediates use `Carry`. Each contact
+exchanges those interests inside the authenticated mission session and runs a
+separate reconciliation lane for each receiver. Empty interest is
+receive-none. The selector narrows inventory and transfer but never replaces
+fresh source, epoch/revocation, or route authorization.
 
 1. Node 0 runs alone in `ping-publish` with no configured peer or contact. Its
    live `ping-emitter` reserves a durable Event sequence/dot, source-seals Ping,
@@ -129,8 +143,8 @@ Exact sealed-byte totals match even though the relay has no semantic row.
 
 ## Observed bounded results
 
-On 2026-08-24 the final frozen-tree debug binary completed the three-node
-command with
+On 2026-08-24 the parent PR-A frozen-tree debug binary completed the
+three-node command with
 exit status zero at:
 
 ```text
@@ -145,6 +159,11 @@ All 13 child stdout logs were nonempty (142 lines, 81,708 bytes); all 13 child
 stderr files were empty. The
 three-node no-op retained 36 passing contact lines, each with all 11
 reconciliation counters zero. Every terminal invariant passed.
+
+These retained generic/control/zeroization roots predate the PR-B
+subscription-aware wire change. PR B credits its exact current code and
+authenticated-Iroh tests rather than relabeling the older roots as
+current-tree evidence.
 
 The omitted-selector default also passed at four nodes and 18 child processes
 across nine cohorts in 40.74 seconds at:
@@ -178,7 +197,7 @@ passed. The generic formulas imply 65 cohorts and 158 child processes at the
 accepted maximum N=32, but no N=32 execution receipt is claimed. Eight nodes do
 not prove the full 2–32 range, a many-node target, physical multi-system
 operation, or resource targets. Exact
-terminal receipts and the current release artifact digest are in the
+terminal receipts and the parent-snapshot release artifact digest are in the
 [requirements status](../implementation/requirements-status.md).
 
 ## Run the four-role control scenario

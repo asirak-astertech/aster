@@ -1390,6 +1390,9 @@ fn four_real_processes_default_to_ping_pong_and_restart_cleanly() {
         "RELAY status=pass intermediates=2 exact_forward=true content_access=denied semantic_acceptance=none"
     ));
     assert!(stdout.contains(
+        "SUBSCRIPTIONS status=seeded consume=2 carry=2 selectors=4 interest_exchange=mission-protected lanes=receiver-directed"
+    ));
+    assert!(stdout.contains(
         "PHASE status=pass name=ping-publish processes=1 carrier_authenticated_edges=not-applicable mission_authenticated_edges=not-applicable"
     ));
     for phase in [
@@ -1572,6 +1575,9 @@ fn two_real_processes_use_the_same_stopped_state_ping_pong_plan() {
     assert!(stdout.contains("PONG status=received emitted_by=destination-process"));
     assert!(stdout.contains("RELAY status=not-applicable intermediates=0"));
     assert!(stdout.contains(
+        "SUBSCRIPTIONS status=seeded consume=2 carry=0 selectors=2 interest_exchange=mission-protected lanes=receiver-directed"
+    ));
+    assert!(stdout.contains(
         "DEMO_RESULT status=pass scenario=ping-pong nodes=2 processes=8 contacts=real-iroh"
     ));
     assert!(stdout.contains("payload_blind_relays=not-applicable ttl=durable-none"));
@@ -1669,6 +1675,9 @@ fn four_real_processes_propagate_controls_without_authority_and_exclude_captured
     assert!(stdout.contains("PONG status=received") && stdout.contains("key_epoch=2"));
     assert!(stdout.contains(
         "CONTROL_RESULT status=pass nodes=4 authority_processes=2 emitted_by=authority-process controls=2 control_priority=flash authority_absent_forwarding=pass route_only_forward=pass survivor_epoch=2 captured_node=3 captured_sync=denied captured_epoch2_read=denied captured_mesh_publication=denied captured_rejoin=denied captured_local_signing=stale-only"
+    ));
+    assert!(stdout.contains(
+        "SUBSCRIPTIONS status=seeded consume=3 carry=1 selectors=4 interest_exchange=mission-protected lanes=receiver-directed"
     ));
     assert!(stdout.contains(
         "DEMO_RESULT status=pass scenario=control nodes=4 processes=23 contacts=real-iroh mission_auth=hybrid-pq"

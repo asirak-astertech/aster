@@ -10,8 +10,11 @@ use std::{fmt, fs, path::Path};
 use aster_mesh::{EventContentVerification, ReferenceEnvelopeSealer};
 pub use aster_mesh::{NodeId, Priority, Scope, Topic};
 use aster_redb_store::{
-    ControlPolicySnapshot, ControlTransferId, EventOperationKey, EventQueryFilter, EventSemanticId,
-    MAX_EVENT_PAGE, Store, StoreError, StoredEvent,
+    ControlPolicySnapshot, ControlTransferId, EventDeliveryAck as StoreEventDeliveryAck,
+    EventOperationKey, EventQueryFilter, EventSemanticId,
+    EventSubscriptionId as StoreEventSubscriptionId, EventSubscriptionKey, EventSubscriptionMode,
+    EventSubscriptionPollSelection, EventSubscriptionSpec, MAX_EVENT_PAGE,
+    MAX_EVENT_POLL_DELIVERIES, MAX_EVENT_SUBSCRIPTION_SCAN, Store, StoreError, StoredEvent,
 };
 
 use crate::{
@@ -27,6 +30,12 @@ use crate::{
 
 /// Maximum number of accepted Event rows one query call may scan.
 pub const MAX_SELECTED_EVENT_PAGE: usize = MAX_EVENT_PAGE;
+
+/// Maximum number of at-least-once deliveries returned by one poll.
+pub const MAX_SELECTED_EVENT_DELIVERIES: usize = MAX_EVENT_POLL_DELIVERIES;
+
+/// Maximum accepted or pending rows freshly verified by one poll.
+pub const MAX_SELECTED_EVENT_SUBSCRIPTION_SCAN: usize = MAX_EVENT_SUBSCRIPTION_SCAN;
 
 /// Stable, high-level failure category for selected Event operations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -249,6 +258,116 @@ pub struct EventQueryPage {
     pub has_more: bool,
 }
 
+/// Stable mission-local identity of one durable application subscription.
+///
+/// This is a local ledger identity, not a content or route capability.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct EventSubscriptionId([u8; 32]);
+
+impl EventSubscriptionId {
+    /// Constructs an identifier from complete durable bytes.
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the complete durable identifier bytes.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    fn from_store(id: StoreEventSubscriptionId) -> Self {
+        Self(*id.as_bytes())
+    }
+
+    fn into_store(self) -> StoreEventSubscriptionId {
+        StoreEventSubscriptionId::from_bytes(self.0)
+    }
+}
+
+impl fmt::Display for EventSubscriptionId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Idempotent creation request for one durable Consume subscription.
+///
+/// The operation key identifies the subscription across process restarts.
+/// Topic and scope intent never grant authority: current mission policy must
+/// independently permit both route verification and content opening.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventSubscriptionRequest {
+    pub operation_key: Vec<u8>,
+    pub topic: Topic,
+    pub scope: Scope,
+    pub include_descendant_scopes: bool,
+}
+
+/// Result of creating or replaying one durable subscription request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EventSubscription {
+    pub id: EventSubscriptionId,
+    pub inserted: bool,
+}
+
+/// One bounded at-least-once delivery poll.
+///
+/// `scan_limit` bounds all pending and accepted rows freshly source-verified,
+/// not only matching rows returned. An empty page can therefore report
+/// `has_more=true`; poll again to continue from the durable internal cursor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EventPollRequest {
+    pub subscription: EventSubscriptionId,
+    pub delivery_limit: usize,
+    pub scan_limit: usize,
+}
+
+impl EventPollRequest {
+    fn validate(self) -> Result<Self, ApplicationError> {
+        if self.delivery_limit == 0
+            || self.delivery_limit > MAX_SELECTED_EVENT_DELIVERIES
+            || self.scan_limit == 0
+            || self.scan_limit > MAX_SELECTED_EVENT_SUBSCRIPTION_SCAN
+        {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::InvalidRequest,
+                "poll",
+            ));
+        }
+        Ok(self)
+    }
+}
+
+/// One Event delivery whose attempt was durably incremented before return.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventDelivery {
+    pub event: EventItem,
+    pub attempt: u64,
+}
+
+/// Bounded at-least-once delivery result.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct EventDeliveryPage {
+    pub deliveries: Vec<EventDelivery>,
+    pub has_more: bool,
+}
+
+/// Idempotent acknowledgement disposition for one semantic Event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EventAcknowledgement {
+    Acknowledged,
+    AlreadyAcknowledged,
+}
+
+enum VerifiedSubscriptionCandidate {
+    Inactive(EventSemanticId),
+    NotSelected,
+    Delivery(EventSemanticId, EventItem),
+}
+
 /// Exclusive high-level handle over the selected Event composition.
 ///
 /// This stopped-state handle owns the same exact redb writer lock as the mesh
@@ -308,6 +427,162 @@ impl SelectedEventNode {
     /// Stable mission authority bound to this store and provisioning artifact.
     pub const fn mission_authority(&self) -> NodeId {
         self.mission.mission_authority_id()
+    }
+
+    /// Idempotently creates one durable application-delivery subscription.
+    ///
+    /// The local selector is intersected with current mission route and
+    /// content capabilities. It narrows what the node asks to receive and does
+    /// not grant authority to receive, retain, or open an Event.
+    pub fn subscribe(
+        &mut self,
+        request: EventSubscriptionRequest,
+    ) -> Result<EventSubscription, ApplicationError> {
+        let EventSubscriptionRequest {
+            operation_key,
+            topic,
+            scope,
+            include_descendant_scopes,
+        } = request;
+        let key = EventSubscriptionKey::new(operation_key)
+            .map_err(|error| application_error("subscribe", error.into()))?;
+        let policy = self.current_policy("subscribe")?;
+        let epoch = self
+            .store
+            .active_scope_epoch(&scope)
+            .map_err(|error| application_error("subscribe", error.into()))?
+            .map_or(1, |(epoch, _)| epoch);
+        if !self.verifier.can_route_event(&scope, epoch)
+            || !self.verifier.can_open_event_content(&scope, &topic, epoch)
+        {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::RequestRejected,
+                "subscribe",
+            ));
+        }
+        let outcome = self
+            .store
+            .create_event_subscription_with_policy(
+                &policy,
+                &key,
+                EventSubscriptionSpec {
+                    mode: EventSubscriptionMode::Consume,
+                    topic,
+                    scope,
+                    include_descendant_scopes,
+                },
+            )
+            .map_err(|error| application_error("subscribe", error.into()))?;
+        Ok(EventSubscription {
+            id: EventSubscriptionId::from_store(outcome.id),
+            inserted: outcome.inserted,
+        })
+    }
+
+    /// Polls one durable subscription with at-least-once delivery semantics.
+    ///
+    /// Every pending and newly accepted row in the bounded plan is freshly
+    /// source-verified before the durable discovery cursor advances. Matching
+    /// active rows are also content-verified. Attempts are incremented in the
+    /// same commit that records delivery, so a crash before return repeats the
+    /// Event with a larger attempt number until acknowledged.
+    pub fn poll(
+        &mut self,
+        request: EventPollRequest,
+    ) -> Result<EventDeliveryPage, ApplicationError> {
+        let request = request.validate()?;
+        let policy = self.current_policy("poll")?;
+        let plan = self
+            .store
+            .prepare_event_subscription_poll_with_policy(
+                &policy,
+                request.subscription.into_store(),
+                request.delivery_limit,
+                request.scan_limit,
+            )
+            .map_err(|error| application_error("poll", error.into()))?;
+        let spec = plan.spec().clone();
+        let mut selection = EventSubscriptionPollSelection::default();
+        let mut opened = Vec::new();
+
+        for candidate in plan.pending_candidates() {
+            match self.verify_subscription_candidate(&spec, candidate.event.clone())? {
+                VerifiedSubscriptionCandidate::Inactive(id) => {
+                    selection.inactive_pending.push(id);
+                }
+                VerifiedSubscriptionCandidate::Delivery(id, event) => {
+                    selection.deliveries.push(id);
+                    opened.push((id, event));
+                }
+                VerifiedSubscriptionCandidate::NotSelected => {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::Integrity,
+                        "poll",
+                    ));
+                }
+            }
+        }
+        for candidate in plan.scanned_candidates() {
+            match self.verify_subscription_candidate(&spec, candidate.clone())? {
+                VerifiedSubscriptionCandidate::Delivery(id, event) => {
+                    selection.deliveries.push(id);
+                    opened.push((id, event));
+                }
+                VerifiedSubscriptionCandidate::Inactive(_)
+                | VerifiedSubscriptionCandidate::NotSelected => {}
+            }
+        }
+
+        let committed = self
+            .store
+            .commit_event_subscription_poll_with_policy(&policy, &plan, &selection)
+            .map_err(|error| application_error("poll", error.into()))?;
+        if committed.deliveries.len() != opened.len() {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::Integrity,
+                "poll",
+            ));
+        }
+        let mut deliveries = Vec::with_capacity(committed.deliveries.len());
+        for (committed, (verified_id, event)) in committed.deliveries.into_iter().zip(opened) {
+            if committed.event.semantic_id != verified_id {
+                return Err(ApplicationError::new(
+                    ApplicationErrorKind::Integrity,
+                    "poll",
+                ));
+            }
+            deliveries.push(EventDelivery {
+                event,
+                attempt: committed.attempt,
+            });
+        }
+        Ok(EventDeliveryPage {
+            deliveries,
+            has_more: committed.has_more,
+        })
+    }
+
+    /// Idempotently acknowledges one semantic Event delivery.
+    pub fn acknowledge(
+        &mut self,
+        subscription: EventSubscriptionId,
+        event: EventId,
+    ) -> Result<EventAcknowledgement, ApplicationError> {
+        let policy = self.current_policy("acknowledge")?;
+        match self
+            .store
+            .acknowledge_event_delivery_with_policy(
+                &policy,
+                subscription.into_store(),
+                event.into_store(),
+            )
+            .map_err(|error| application_error("acknowledge", error.into()))?
+        {
+            StoreEventDeliveryAck::Acknowledged => Ok(EventAcknowledgement::Acknowledged),
+            StoreEventDeliveryAck::AlreadyAcknowledged => {
+                Ok(EventAcknowledgement::AlreadyAcknowledged)
+            }
+        }
     }
 
     /// Durably publishes one arbitrary selected Event exactly once per operation key.
@@ -380,6 +655,72 @@ impl SelectedEventNode {
             scanned_through: candidates.scanned_through,
             has_more: candidates.has_more,
         })
+    }
+
+    fn verify_subscription_candidate(
+        &mut self,
+        spec: &EventSubscriptionSpec,
+        stored: StoredEvent,
+    ) -> Result<VerifiedSubscriptionCandidate, ApplicationError> {
+        let route_verified = self
+            .verifier
+            .verify_event(&stored.sealed)
+            .map_err(|error| application_error("poll", error.into()))?;
+        verify_stored_claim(
+            &route_verified,
+            stored.transfer_id,
+            stored.semantic_id,
+            &stored.header,
+        )
+        .map_err(|error| application_error("poll", error))?;
+        if event_is_inactive(&self.store, &route_verified)
+            .map_err(|error| application_error("poll", error))?
+        {
+            return Ok(VerifiedSubscriptionCandidate::Inactive(stored.semantic_id));
+        }
+        let matches = spec.topic == stored.header.topic
+            && if spec.include_descendant_scopes {
+                spec.scope.contains(&stored.header.scope)
+            } else {
+                spec.scope == stored.header.scope
+            };
+        if !matches {
+            return Ok(VerifiedSubscriptionCandidate::NotSelected);
+        }
+        let payload = match self
+            .verifier
+            .verify_event_content(route_verified, &stored.sealed)
+            .map_err(|error| application_error("poll", error.into()))?
+        {
+            EventContentVerification::ContentVerified { event, payload } => {
+                verify_content_stored_claim(&event, &stored)
+                    .map_err(|error| application_error("poll", error))?;
+                payload
+            }
+            EventContentVerification::RouteOnly(_) => {
+                return Err(ApplicationError::new(
+                    ApplicationErrorKind::Integrity,
+                    "poll",
+                ));
+            }
+        };
+        let id = stored.semantic_id;
+        Ok(VerifiedSubscriptionCandidate::Delivery(
+            id,
+            EventItem {
+                id: EventId::from_store(id),
+                publisher: stored.header.stamp.dot.publisher,
+                publisher_counter: stored.header.stamp.dot.counter,
+                event_sequence: event_sequence(&stored, "poll")?,
+                topic: stored.header.topic,
+                scope: stored.header.scope,
+                priority: stored.header.priority,
+                logical_key: stored.header.logical_key,
+                payload,
+                tombstone: stored.header.tombstone,
+                acceptance_marker: stored.acceptance_marker,
+            },
+        ))
     }
 
     fn current_policy(
@@ -493,7 +834,14 @@ fn application_error(operation: &'static str, error: NodeError) -> ApplicationEr
 fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
     match error {
         StoreError::InvalidEventOperationKey { .. }
+        | StoreError::InvalidEventSubscriptionKey { .. }
         | StoreError::EventPageLimitExceeded { .. }
+        | StoreError::EventSubscriptionNotFound
+        | StoreError::EventSubscriptionNotConsumable
+        | StoreError::EventSubscriptionPollLimitExceeded { .. }
+        | StoreError::EventDeliveryNotFound
+        | StoreError::EventReplicationNotSelected
+        | StoreError::EventReplicationNotConsumable
         | StoreError::InvalidSemanticEvent(_)
         | StoreError::AuthenticatedCustodyAgeRequired => ApplicationErrorKind::InvalidRequest,
         StoreError::EventPublisherRevoked(_)
@@ -503,15 +851,22 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         | StoreError::ControlAuthorityRevoked(_) => ApplicationErrorKind::UnauthorizedOrRevoked,
         StoreError::ControlPolicyUnsettled { .. }
         | StoreError::ControlPolicyChanged
-        | StoreError::ReservationChanged => ApplicationErrorKind::PolicyUnsettled,
+        | StoreError::ReservationChanged
+        | StoreError::EventSubscriptionPlanChanged
+        | StoreError::EventSelectorRevisionChanged => ApplicationErrorKind::PolicyUnsettled,
         StoreError::IdentityConflict { .. }
         | StoreError::SemanticRepresentationConflict { .. }
         | StoreError::CausalEquivocation { .. }
         | StoreError::EventEquivocation { .. }
         | StoreError::MissingReactionPredecessor { .. }
         | StoreError::ReactionContextMissing { .. }
-        | StoreError::OperationPredecessorMismatch => ApplicationErrorKind::Conflict,
+        | StoreError::OperationPredecessorMismatch
+        | StoreError::EventSubscriptionConflict => ApplicationErrorKind::Conflict,
         StoreError::ItemLimitExceeded { .. }
+        | StoreError::EventSubscriptionLimitExceeded { .. }
+        | StoreError::EventPendingDeliveryLimitExceeded { .. }
+        | StoreError::EventAcknowledgementReceiptLimitExceeded { .. }
+        | StoreError::EventDeliveryAttemptExhausted
         | StoreError::PayloadByteLimitExceeded { .. }
         | StoreError::AcceptanceMarkerExhausted
         | StoreError::ItemCountAccountingOverflow
@@ -626,6 +981,15 @@ mod tests {
         }
     }
 
+    fn subscription_request(operation: &[u8], topic: &str) -> EventSubscriptionRequest {
+        EventSubscriptionRequest {
+            operation_key: operation.to_vec(),
+            topic: Topic::new(topic).expect("topic"),
+            scope: Scope::new("mission/apps").expect("scope"),
+            include_descendant_scopes: false,
+        }
+    }
+
     #[test]
     fn arbitrary_event_publish_query_and_retry_share_one_selected_authority() {
         let root = TestRoot::new("publish-query");
@@ -677,6 +1041,130 @@ mod tests {
         assert_eq!(all.items.len(), 2);
         assert_eq!(all.scanned_through, 2);
         assert!(!all.has_more);
+    }
+
+    #[test]
+    fn durable_subscription_repeats_until_idempotent_ack_across_restart() {
+        let root = TestRoot::new("subscription-retry");
+        let (subscription_id, event_id) = {
+            let mut node = selected_node(&root);
+            let published = node
+                .publish(request(
+                    b"ops/subscribed",
+                    "ops.alpha",
+                    b"asset-7",
+                    b"ready",
+                ))
+                .expect("publish");
+            let subscription = node
+                .subscribe(subscription_request(b"subscriptions/alpha", "ops.alpha"))
+                .expect("subscribe");
+            assert!(subscription.inserted);
+            let replayed = node
+                .subscribe(subscription_request(b"subscriptions/alpha", "ops.alpha"))
+                .expect("replay subscribe");
+            assert!(!replayed.inserted);
+            assert_eq!(replayed.id, subscription.id);
+            let conflict = node
+                .subscribe(subscription_request(b"subscriptions/alpha", "ops.beta"))
+                .expect_err("subscription operation mismatch must fail");
+            assert_eq!(conflict.kind(), ApplicationErrorKind::Conflict);
+
+            let first = node
+                .poll(EventPollRequest {
+                    subscription: subscription.id,
+                    delivery_limit: 8,
+                    scan_limit: 8,
+                })
+                .expect("first poll");
+            assert_eq!(first.deliveries.len(), 1);
+            assert_eq!(first.deliveries[0].event.id, published.id);
+            assert_eq!(first.deliveries[0].attempt, 1);
+            assert!(!first.has_more);
+            (subscription.id, published.id)
+        };
+
+        let mut reopened = SelectedEventNode::open_unprotected_reference(
+            root.path(),
+            root.path().join("mission.unprotected-reference.bundle"),
+        )
+        .expect("reopen selected Event node");
+        let repeated = reopened
+            .poll(EventPollRequest {
+                subscription: subscription_id,
+                delivery_limit: 8,
+                scan_limit: 8,
+            })
+            .expect("repeat pending delivery");
+        assert_eq!(repeated.deliveries.len(), 1);
+        assert_eq!(repeated.deliveries[0].event.id, event_id);
+        assert_eq!(repeated.deliveries[0].attempt, 2);
+
+        assert_eq!(
+            reopened
+                .acknowledge(subscription_id, event_id)
+                .expect("acknowledge"),
+            EventAcknowledgement::Acknowledged
+        );
+        assert_eq!(
+            reopened
+                .acknowledge(subscription_id, event_id)
+                .expect("idempotent acknowledge"),
+            EventAcknowledgement::AlreadyAcknowledged
+        );
+        assert!(
+            reopened
+                .poll(EventPollRequest {
+                    subscription: subscription_id,
+                    delivery_limit: 8,
+                    scan_limit: 8,
+                })
+                .expect("empty after acknowledgement")
+                .deliveries
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn subscription_scan_advances_over_verified_nonmatching_events() {
+        let root = TestRoot::new("subscription-selective-scan");
+        let mut node = selected_node(&root);
+        node.publish(request(
+            b"ops/alpha-first",
+            "ops.alpha",
+            b"asset-7",
+            b"alpha",
+        ))
+        .expect("publish alpha");
+        let beta = node
+            .publish(request(b"ops/beta-second", "ops.beta", b"asset-8", b"beta"))
+            .expect("publish beta");
+        let subscription = node
+            .subscribe(subscription_request(b"subscriptions/beta", "ops.beta"))
+            .expect("subscribe beta");
+
+        let first = node
+            .poll(EventPollRequest {
+                subscription: subscription.id,
+                delivery_limit: 1,
+                scan_limit: 1,
+            })
+            .expect("scan nonmatching alpha");
+        assert!(first.deliveries.is_empty());
+        assert!(first.has_more);
+
+        let second = node
+            .poll(EventPollRequest {
+                subscription: subscription.id,
+                delivery_limit: 1,
+                scan_limit: 1,
+            })
+            .expect("deliver matching beta");
+        assert_eq!(second.deliveries.len(), 1);
+        assert_eq!(second.deliveries[0].event.id, beta.id);
+        assert_eq!(second.deliveries[0].event.payload, b"beta");
+        assert_eq!(second.deliveries[0].attempt, 1);
+        assert!(!second.has_more);
     }
 
     #[test]
@@ -745,6 +1233,16 @@ mod tests {
     fn unauthorized_topic_fails_without_consuming_publisher_or_stream_position() {
         let root = TestRoot::new("unauthorized-topic");
         let mut node = selected_node(&root);
+        let denied_subscription = node
+            .subscribe(subscription_request(
+                b"subscriptions/denied",
+                "ops.unprovisioned",
+            ))
+            .expect_err("unprovisioned subscription must fail");
+        assert_eq!(
+            denied_subscription.kind(),
+            ApplicationErrorKind::RequestRejected
+        );
         let denied = node
             .publish(request(
                 b"ops/denied",

@@ -1483,7 +1483,7 @@ impl fmt::Debug for MissionSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frame::Frame;
+    use crate::frame::{EventDirection, Frame};
     use aster_iroh::{Endpoint, EndpointConfig, ExpectedPeer, SecretKey};
     use aster_mesh::{
         ProvisioningAccess, ReferenceEnvelopeSealer, ReferenceProvisioner, Scope, Topic,
@@ -1669,7 +1669,11 @@ mod tests {
                 .expect("authenticate pong"),
             b"pong"
         );
-        let plaintext_finish = Frame::Finish.encode().expect("encode plaintext mechanics");
+        let plaintext_finish = Frame::Finish {
+            direction: EventDirection::ToSessionResponder,
+        }
+        .encode()
+        .expect("encode plaintext mechanics");
         if let Ok(response) = connection.request(&plaintext_finish).await {
             assert!(
                 mission.open_application_frame(&response).is_err(),
