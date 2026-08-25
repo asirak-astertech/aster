@@ -1,4 +1,4 @@
-//! High-level selected Event application surface.
+//! High-level selected Event and State application surfaces.
 //!
 //! This module deliberately exposes no source-envelope, cryptographic-provider,
 //! carrier, inventory, reconciliation, or sealed-byte operations. It composes
@@ -37,6 +37,12 @@ use crate::{
     },
 };
 
+mod state;
+pub use state::{
+    SelectedStateNode, StateId, StateItem, StateProjection, StatePublishRequest,
+    StatePublishResult, StateQuery, StateVersionDisposition,
+};
+
 /// Maximum number of accepted Event rows one query call may scan.
 pub const MAX_SELECTED_EVENT_PAGE: usize = MAX_EVENT_PAGE;
 
@@ -46,7 +52,7 @@ pub const MAX_SELECTED_EVENT_DELIVERIES: usize = MAX_EVENT_POLL_DELIVERIES;
 /// Maximum accepted or pending rows freshly verified by one poll.
 pub const MAX_SELECTED_EVENT_SUBSCRIPTION_SCAN: usize = MAX_EVENT_SUBSCRIPTION_SCAN;
 
-/// Stable, high-level failure category for selected Event operations.
+/// Stable, high-level failure category for selected application operations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ApplicationErrorKind {
@@ -61,7 +67,7 @@ pub enum ApplicationErrorKind {
     Provisioning,
 }
 
-/// Sanitized selected Event application failure.
+/// Sanitized selected application failure.
 ///
 /// The underlying store, source-envelope, carrier, and provider errors remain
 /// private so an application cannot couple itself to privileged mechanics or
@@ -92,20 +98,20 @@ impl fmt::Display for ApplicationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let disposition = match self.kind {
             ApplicationErrorKind::InvalidRequest => "invalid application request",
-            ApplicationErrorKind::RequestRejected => "request rejected by selected Event policy",
+            ApplicationErrorKind::RequestRejected => "request rejected by selected data policy",
             ApplicationErrorKind::UnauthorizedOrRevoked => {
-                "application identity or Event is not currently authorized"
+                "application identity or selected data is not currently authorized"
             }
             ApplicationErrorKind::PolicyUnsettled => "mission policy is not settled",
             ApplicationErrorKind::Conflict => "idempotency or causal conflict",
-            ApplicationErrorKind::ResourceLimit => "selected Event resource limit reached",
-            ApplicationErrorKind::StateUnavailable => "selected Event state is unavailable",
-            ApplicationErrorKind::Integrity => "selected Event integrity check failed",
+            ApplicationErrorKind::ResourceLimit => "selected data resource limit reached",
+            ApplicationErrorKind::StateUnavailable => "selected application state is unavailable",
+            ApplicationErrorKind::Integrity => "selected data integrity check failed",
             ApplicationErrorKind::Provisioning => "mission provisioning is unavailable",
         };
         write!(
             formatter,
-            "selected Event {} failed: {disposition}",
+            "selected application {} failed: {disposition}",
             self.operation
         )
     }
@@ -1391,6 +1397,7 @@ pub(crate) fn runtime_application_error(
 fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
     match error {
         StoreError::InvalidEventOperationKey { .. }
+        | StoreError::InvalidStateOperationKey { .. }
         | StoreError::InvalidEventSubscriptionKey { .. }
         | StoreError::EventPageLimitExceeded { .. }
         | StoreError::EventSubscriptionNotFound
@@ -1400,27 +1407,38 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         | StoreError::EventReplicationNotSelected
         | StoreError::EventReplicationNotConsumable
         | StoreError::InvalidSemanticEvent(_)
+        | StoreError::InvalidSemanticState(_)
         | StoreError::AuthenticatedCustodyAgeRequired => ApplicationErrorKind::InvalidRequest,
         StoreError::EventPublisherRevoked(_)
+        | StoreError::StatePublisherRevoked(_)
         | StoreError::EventKeyEpochStale { .. }
+        | StoreError::StateKeyEpochStale { .. }
+        | StoreError::StateKeyEpochNotActive { .. }
         | StoreError::MissionAuthorityMismatch { .. }
         | StoreError::ControlSignerRevoked(_)
         | StoreError::ControlAuthorityRevoked(_) => ApplicationErrorKind::UnauthorizedOrRevoked,
         StoreError::ControlPolicyUnsettled { .. }
         | StoreError::ControlPolicyChanged
         | StoreError::ReservationChanged
+        | StoreError::StateReservationChanged
+        | StoreError::StateProjectionPlanChanged
         | StoreError::EventSubscriptionPlanChanged
         | StoreError::EventGapScanPlanChanged
         | StoreError::EventSelectorRevisionChanged => ApplicationErrorKind::PolicyUnsettled,
         StoreError::IdentityConflict { .. }
         | StoreError::SemanticRepresentationConflict { .. }
+        | StoreError::StateRepresentationConflict { .. }
         | StoreError::CausalEquivocation { .. }
         | StoreError::EventEquivocation { .. }
         | StoreError::MissingReactionPredecessor { .. }
         | StoreError::ReactionContextMissing { .. }
         | StoreError::OperationPredecessorMismatch
+        | StoreError::StateOperationConflict
         | StoreError::EventSubscriptionConflict => ApplicationErrorKind::Conflict,
         StoreError::ItemLimitExceeded { .. }
+        | StoreError::StateProjectionLimitExceeded { .. }
+        | StoreError::StateOperationLimitExceeded { .. }
+        | StoreError::StateOperationByteLimitExceeded { .. }
         | StoreError::EventSubscriptionLimitExceeded { .. }
         | StoreError::EventPendingDeliveryLimitExceeded { .. }
         | StoreError::EventAcknowledgementReceiptLimitExceeded { .. }
@@ -1443,12 +1461,15 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         | StoreError::StoreInUse
         | StoreError::StoreZeroized(_) => ApplicationErrorKind::StateUnavailable,
         StoreError::SemanticVerification(_)
+        | StoreError::StateVerification(_)
         | StoreError::MissingAcceptanceMarker { .. }
         | StoreError::OrphanedAcceptanceMarker { .. }
         | StoreError::InvalidStoredIdLength { .. }
         | StoreError::AccountingMismatch { .. }
         | StoreError::MissingAccountingMetadata { .. }
         | StoreError::SemanticInvariant(_)
+        | StoreError::StateInvariant(_)
+        | StoreError::SemanticNamespaceCollision { .. }
         | StoreError::ControlVerification(_)
         | StoreError::InvalidControl(_)
         | StoreError::ControlFork

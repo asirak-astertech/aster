@@ -1,14 +1,15 @@
 //! Crash-safe storage for mission-bound Aster semantic Events and compatibility data.
 //!
-//! One redb transaction authority owns four disjoint namespaces: content-verified
-//! semantic Events and their causal/operation ledgers; a bounded, non-semantic cache
-//! of route-verified exact transfers; and the retained caller-ID opaque API used by
-//! the legacy compatibility lane; plus source-authenticated, mission-wide Flash
-//! controls and their pending/applied chain ledgers. Opaque IDs can never collide
-//! with or promote into Event or control state. Semantic mutation requires a live
-//! strong capability from `aster-core`, while persisted decoded metadata is only
+//! One redb transaction authority owns five disjoint namespaces: content-verified
+//! semantic Events; content-verified selected State versions; a bounded,
+//! non-semantic cache of route-verified exact Event transfers; the retained
+//! caller-ID opaque API used by the legacy compatibility lane; and
+//! source-authenticated, mission-wide Flash controls. Event and State share only
+//! their causal ledgers. Opaque IDs can never collide with or promote into a
+//! semantic or control namespace. Semantic mutation requires a live strong
+//! capability from `aster-core`, while persisted decoded metadata is only
 //! structurally audited. Configured item and byte limits apply to the aggregate
-//! usage of all four namespaces.
+//! usage of all five namespaces.
 
 #![forbid(unsafe_code)]
 
@@ -19,10 +20,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use aster_mesh::engine::EnvelopeHeader;
 use aster_mesh::{
-    CausalStamp, ContentVerifiedEventEnvelope, DataClass as SemanticDataClass, Dot,
-    MAX_CAUSAL_CONTEXT_ENTRIES, NodeId, Priority, RouteVerifiedEventEnvelope, Scope,
-    ScopeRekeyRecipient, Topic, VerifiedControlEnvelope, VerifiedControlKind,
-    VerifiedControlPrincipal, VersionVector,
+    CausalStamp, ContentVerifiedEventEnvelope, ContentVerifiedStateEnvelope,
+    DataClass as SemanticDataClass, Dot, MAX_CAUSAL_CONTEXT_ENTRIES, NodeId, Priority,
+    RouteVerifiedEventEnvelope, Scope, ScopeRekeyRecipient, Topic, VerifiedControlEnvelope,
+    VerifiedControlKind, VerifiedControlPrincipal, VersionVector,
 };
 use aster_profile::{InventorySnapshot, ItemId};
 use redb::{
@@ -66,6 +67,20 @@ const EVENT_HIGH_WATER: TableDefinition<&[u8], u64> =
     TableDefinition::new("aster.event-high-water.v1");
 const EVENT_OPERATIONS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.event-operations.v1");
+// State exact representations and acceptance markers are intentionally disjoint
+// from Event storage. The causal dot, publisher counter, and topic/scope
+// frontier ledgers above remain shared across semantic classes.
+const STATES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("aster.semantic-states.v1");
+const STATE_BYTES: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("aster.semantic-state-bytes.v1");
+const STATE_ACCEPTANCE_MARKERS: TableDefinition<&[u8], u64> =
+    TableDefinition::new("aster.semantic-state-markers.v1");
+const STATE_SEMANTIC_ITEMS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("aster.semantic-state-items.v1");
+const STATE_GROUP_VERSIONS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("aster.semantic-state-group-versions.v1");
+const STATE_OPERATIONS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("aster.state-operations.v1");
 // Durable application selectors and pending at-least-once deliveries are a
 // single schema group. A selector is intent, never content or route authority.
 const EVENT_SUBSCRIPTIONS: TableDefinition<&[u8], &[u8]> =
@@ -84,6 +99,11 @@ const MISSION_AUTHORITY_ID: &str = "mission_authority_id";
 const SEMANTIC_ITEM_COUNT: &str = "semantic_event_item_count";
 const SEMANTIC_TOTAL_BYTES: &str = "semantic_event_total_bytes";
 const LAST_SEMANTIC_ACCEPTANCE_MARKER: &str = "last_semantic_acceptance_marker";
+const STATE_ITEM_COUNT: &str = "semantic_state_item_count";
+const STATE_TOTAL_BYTES: &str = "semantic_state_total_bytes";
+const LAST_STATE_ACCEPTANCE_MARKER: &str = "last_semantic_state_acceptance_marker";
+const STATE_OPERATION_COUNT: &str = "semantic_state_operation_count";
+const STATE_OPERATION_TOTAL_BYTES: &str = "semantic_state_operation_total_bytes";
 const ROUTE_CACHE_ITEM_COUNT: &str = "route_event_cache_item_count";
 const ROUTE_CACHE_TOTAL_BYTES: &str = "route_event_cache_total_bytes";
 const EVENT_SUBSCRIPTION_COUNT: &str = "semantic_event_subscription_count";
@@ -144,6 +164,9 @@ const MAX_ZEROIZATION_RECORD_BYTES: usize =
 
 const EVENT_METADATA_VERSION: u8 = 1;
 const EVENT_OPERATION_VERSION: u8 = 1;
+const STATE_METADATA_VERSION: u8 = 1;
+const STATE_OPERATION_VERSION: u8 = 1;
+const STATE_PUBLICATION_INTENT_DOMAIN: &[u8] = b"aster/state-publication-intent/v1";
 const EVENT_SUBSCRIPTION_VERSION: u8 = 1;
 const EVENT_PENDING_DELIVERY_VERSION: u8 = 1;
 const EVENT_ACKNOWLEDGEMENT_VERSION: u8 = 1;
@@ -157,6 +180,16 @@ const CONTROL_HEAD_VERSION: u8 = 1;
 pub const MAX_EVENT_PAGE: usize = 1_024;
 /// Maximum byte length of one application operation key.
 pub const MAX_EVENT_OPERATION_KEY_BYTES: usize = 256;
+/// Maximum byte length of one selected-State application operation key.
+pub const MAX_STATE_OPERATION_KEY_BYTES: usize = 256;
+/// Maximum source-authenticated logical-key bytes for one selected State.
+pub const MAX_STATE_LOGICAL_KEY_BYTES: usize = 4 * 1024;
+/// Maximum retained versions freshly projected for one exact State key.
+pub const MAX_STATE_VERSIONS_PER_KEY: usize = 1_024;
+/// Maximum durable idempotent State operation mappings per store.
+pub const MAX_STATE_OPERATIONS: u64 = 4_096;
+/// Maximum aggregate key plus record bytes retained by State operation mappings.
+pub const MAX_STATE_OPERATION_BYTES: u64 = 512 * 1024;
 /// Maximum byte length of one durable Event subscription operation key.
 pub const MAX_EVENT_SUBSCRIPTION_KEY_BYTES: usize = 256;
 /// Maximum durable Consume plus Carry selectors in one mission-bound store.
@@ -191,9 +224,9 @@ pub const DEFAULT_MAX_TOTAL_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
 /// Validated durable admission limits for one store.
 ///
 /// Both limits count aggregate legacy opaque rows, accepted exact source-sealed
-/// Event representations, route-only cache entries, exact controls, and canonical
-/// local control-publication intents. Filesystem and redb allocation overhead
-/// remain backend-specific.
+/// Event and State representations, durable State operation mappings, route-only
+/// cache entries, exact controls, and canonical local control-publication intents.
+/// Filesystem and redb allocation overhead remain backend-specific.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StoreLimits {
     max_items: u64,
@@ -326,6 +359,41 @@ impl EventSemanticId {
     }
 
     /// Returns the exact semantic identifier bytes.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// Exact SHA-256 identity of one stable source-sealed State representation.
+///
+/// State is deliberately absent from the Event reconciliation inventory in
+/// this foundation slice, so this type has no reconciliation adapter.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct StateTransferId([u8; 32]);
+
+impl StateTransferId {
+    /// Constructs an exact State transfer identifier from complete digest bytes.
+    pub const fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the exact State transfer identifier bytes.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// Source-authenticated semantic identity of a State version.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct StateSemanticId([u8; 32]);
+
+impl StateSemanticId {
+    /// Constructs a semantic State identifier from complete bytes.
+    pub const fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the semantic State identifier bytes.
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
@@ -732,6 +800,165 @@ impl EventOperationKey {
     }
 }
 
+/// Bounded application idempotency key for one local State publication.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct StateOperationKey(Vec<u8>);
+
+impl StateOperationKey {
+    /// Validates a nonempty bounded operation key.
+    pub fn new(bytes: impl Into<Vec<u8>>) -> Result<Self, StoreError> {
+        let bytes = bytes.into();
+        if bytes.is_empty() || bytes.len() > MAX_STATE_OPERATION_KEY_BYTES {
+            return Err(StoreError::InvalidStateOperationKey {
+                length: bytes.len(),
+            });
+        }
+        Ok(Self(bytes))
+    }
+
+    /// Returns the exact durable key bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// Canonical public-request identity for one idempotent State publication.
+///
+/// The digest intentionally excludes reservation counters, causal context, and
+/// key epoch. An exact retry after a crash or rekey therefore resolves the
+/// original committed result, while any change to application-visible request
+/// fields fails closed as an operation conflict.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StatePublicationIntent {
+    publisher: NodeId,
+    topic: Topic,
+    scope: Scope,
+    priority: Priority,
+    logical_key: Vec<u8>,
+    content_len: u64,
+    payload_digest: [u8; 32],
+    tombstone: bool,
+    digest: [u8; 32],
+}
+
+impl StatePublicationIntent {
+    /// Constructs and hashes one canonical State request.
+    pub fn new(
+        publisher: NodeId,
+        topic: Topic,
+        scope: Scope,
+        priority: Priority,
+        logical_key: Vec<u8>,
+        payload: &[u8],
+        tombstone: bool,
+    ) -> Result<Self, StoreError> {
+        if logical_key.is_empty() || logical_key.len() > MAX_STATE_LOGICAL_KEY_BYTES {
+            return Err(StoreError::InvalidSemanticState(
+                "logical key length is outside 1..=4096 bytes",
+            ));
+        }
+        if tombstone && !payload.is_empty() {
+            return Err(StoreError::InvalidSemanticState(
+                "State tombstone payload must be empty",
+            ));
+        }
+        let content_len =
+            u64::try_from(payload.len()).map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
+        let payload_digest = Sha256::digest(payload).into();
+        let mut intent = Self {
+            publisher,
+            topic,
+            scope,
+            priority,
+            logical_key,
+            content_len,
+            payload_digest,
+            tombstone,
+            digest: [0; 32],
+        };
+        intent.digest = state_publication_intent_digest(&intent)?;
+        Ok(intent)
+    }
+
+    /// Returns the authenticated publisher bound into this request identity.
+    pub const fn publisher(&self) -> NodeId {
+        self.publisher
+    }
+
+    pub const fn topic(&self) -> &Topic {
+        &self.topic
+    }
+
+    pub const fn scope(&self) -> &Scope {
+        &self.scope
+    }
+
+    pub const fn priority(&self) -> Priority {
+        self.priority
+    }
+
+    pub fn logical_key(&self) -> &[u8] {
+        &self.logical_key
+    }
+
+    pub const fn content_len(&self) -> u64 {
+        self.content_len
+    }
+
+    pub const fn tombstone(&self) -> bool {
+        self.tombstone
+    }
+
+    fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+
+    fn matches_payload(&self, payload: &[u8]) -> bool {
+        u64::try_from(payload.len()) == Ok(self.content_len)
+            && <[u8; 32]>::from(Sha256::digest(payload)) == self.payload_digest
+    }
+}
+
+/// Exact borrowed inputs for one atomic idempotent State commit.
+pub struct StateOperationRequest<'a> {
+    operation: &'a StateOperationKey,
+    intent: &'a StatePublicationIntent,
+    payload: &'a [u8],
+}
+
+impl<'a> StateOperationRequest<'a> {
+    /// Binds an operation key to one canonical intent and exact plaintext.
+    pub fn new(
+        operation: &'a StateOperationKey,
+        intent: &'a StatePublicationIntent,
+        payload: &'a [u8],
+    ) -> Result<Self, StoreError> {
+        if !intent.matches_payload(payload) {
+            return Err(StoreError::StateOperationConflict);
+        }
+        Ok(Self {
+            operation,
+            intent,
+            payload,
+        })
+    }
+
+    /// Returns the durable operation key.
+    pub const fn operation(&self) -> &StateOperationKey {
+        self.operation
+    }
+
+    /// Returns the canonical public-request intent.
+    pub const fn intent(&self) -> &StatePublicationIntent {
+        self.intent
+    }
+
+    /// Returns the exact plaintext authenticated by the strong State capability.
+    pub const fn payload(&self) -> &[u8] {
+        self.payload
+    }
+}
+
 /// Stable mission-local identity of one durable Event subscription.
 ///
 /// The identifier is deterministically derived from the mission authority and
@@ -1118,6 +1345,201 @@ impl EventReservation {
     }
 }
 
+/// Optimistic local State publication reservation derived from shared causal ledgers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StateReservation {
+    control_policy: ControlPolicySnapshot,
+    publisher: NodeId,
+    topic: Topic,
+    scope: Scope,
+    previous_counter: u64,
+    counter: u64,
+    context: VersionVector,
+}
+
+impl StateReservation {
+    /// Exact settled control policy observed with the reservation.
+    pub const fn control_policy(&self) -> &ControlPolicySnapshot {
+        &self.control_policy
+    }
+
+    /// Source identity for this reservation.
+    pub const fn publisher(&self) -> NodeId {
+        self.publisher
+    }
+
+    /// Reserved nonzero publisher-global causal counter.
+    pub const fn counter(&self) -> u64 {
+        self.counter
+    }
+
+    /// Topic/scope causal frontier captured by this reservation.
+    pub const fn context(&self) -> &VersionVector {
+        &self.context
+    }
+
+    /// Builds the exact authenticated State header for source sealing.
+    pub fn header(
+        &self,
+        priority: Priority,
+        logical_key: Vec<u8>,
+        content_len: u64,
+        tombstone: bool,
+        key_epoch: u64,
+    ) -> Result<EnvelopeHeader, StoreError> {
+        if logical_key.is_empty() || logical_key.len() > MAX_STATE_LOGICAL_KEY_BYTES {
+            return Err(StoreError::InvalidSemanticState(
+                "logical key length is outside 1..=4096 bytes",
+            ));
+        }
+        if tombstone && content_len != 0 {
+            return Err(StoreError::InvalidSemanticState(
+                "State tombstone content length must be zero",
+            ));
+        }
+        Ok(EnvelopeHeader {
+            class: SemanticDataClass::State,
+            topic: self.topic.clone(),
+            scope: self.scope.clone(),
+            priority,
+            stamp: CausalStamp {
+                dot: Dot {
+                    publisher: self.publisher,
+                    counter: self.counter,
+                },
+                context: self.context.clone(),
+            },
+            event_sequence: None,
+            logical_key,
+            blob_route: None,
+            ttl_ms: None,
+            content_len,
+            tombstone,
+            key_epoch,
+        })
+    }
+}
+
+/// One source-authenticated State version and its exact retained representation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredState {
+    /// SHA-256 identity of the exact sealed representation.
+    pub transfer_id: StateTransferId,
+    /// Stable source-authenticated identity of this semantic version.
+    pub semantic_id: StateSemanticId,
+    /// Full source-authenticated State header.
+    pub header: EnvelopeHeader,
+    /// Exact stable source-sealed representation.
+    pub sealed: Vec<u8>,
+    /// State-local marker allocated at first acceptance.
+    pub acceptance_marker: u64,
+}
+
+/// Deterministic role of one retained version in an exact-key State projection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StateVersionDisposition {
+    /// Deterministic current value: the greatest semantic ID among causal maxima.
+    Current,
+    /// Another causal maximum retained for recovery.
+    Concurrent,
+    /// A retained version causally dominated by another accepted version.
+    Superseded,
+}
+
+/// One retained State version plus its freshly recomputed structural disposition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StateProjectionCandidate {
+    state: StoredState,
+    disposition: Option<StateVersionDisposition>,
+}
+
+impl StateProjectionCandidate {
+    /// Returns the retained version that requires fresh cryptographic verification.
+    pub const fn state(&self) -> &StoredState {
+        &self.state
+    }
+
+    /// Returns this candidate's deterministic active disposition.
+    ///
+    /// `None` means the current structural policy marks the retained row
+    /// revoked or stale. The row remains in the plan so callers must freshly
+    /// authenticate it before trusting either its exclusion or its claims.
+    pub const fn disposition(&self) -> Option<StateVersionDisposition> {
+        self.disposition
+    }
+}
+
+/// Exact policy-bound State version set prepared for fresh application verification.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StateProjectionPlan {
+    control_policy: ControlPolicySnapshot,
+    topic: Topic,
+    scope: Scope,
+    logical_key: Vec<u8>,
+    candidates: Vec<StateProjectionCandidate>,
+}
+
+impl StateProjectionPlan {
+    /// Exact settled control policy captured with this projection.
+    pub const fn control_policy(&self) -> &ControlPolicySnapshot {
+        &self.control_policy
+    }
+
+    /// Exact selected topic.
+    pub const fn topic(&self) -> &Topic {
+        &self.topic
+    }
+
+    /// Exact selected scope.
+    pub const fn scope(&self) -> &Scope {
+        &self.scope
+    }
+
+    /// Exact selected application key.
+    pub fn logical_key(&self) -> &[u8] {
+        &self.logical_key
+    }
+
+    /// Semantic-ID ordered versions requiring fresh verification.
+    pub fn candidates(&self) -> &[StateProjectionCandidate] {
+        &self.candidates
+    }
+
+    /// Returns the one deterministic current candidate, when any active version exists.
+    pub fn current(&self) -> Option<&StateProjectionCandidate> {
+        self.candidates
+            .iter()
+            .find(|candidate| candidate.disposition == Some(StateVersionDisposition::Current))
+    }
+}
+
+/// Result of an atomic idempotent local State publication.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StateOnceOutcome {
+    /// This transaction inserted both the State and operation mapping.
+    Inserted { state: StoredState },
+    /// This transaction bound a new operation key to an already accepted State.
+    BoundExisting { state: StoredState },
+    /// The exact operation and request intent were already committed.
+    Existing { state: StoredState },
+}
+
+impl StateOnceOutcome {
+    /// Returns the durable State resolved by this operation.
+    pub const fn state(&self) -> &StoredState {
+        match self {
+            Self::Inserted { state } | Self::BoundExisting { state } | Self::Existing { state } => {
+                state
+            }
+        }
+    }
+
+    /// Returns whether this call inserted a new semantic State representation.
+    pub const fn inserted(&self) -> bool {
+        matches!(self, Self::Inserted { .. })
+    }
+}
+
 /// One source-authenticated Event and its exact retained transfer representation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoredEvent {
@@ -1442,6 +1864,23 @@ pub struct EventStoreStats {
     pub route_cached_bytes: u64,
 }
 
+/// Consistent counts for the mission-bound semantic State namespace.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StateStoreStats {
+    /// Number of content-verified State versions retained without silent discard.
+    pub states: u64,
+    /// Number of State-local acceptance markers.
+    pub acceptance_markers: u64,
+    /// Sum of exact retained source-sealed State bytes.
+    pub total_sealed_bytes: u64,
+    /// Last State-local marker, or zero when empty.
+    pub last_acceptance_marker: u64,
+    /// Durable idempotent State operation mappings.
+    pub operations: u64,
+    /// Aggregate operation-key plus operation-record bytes.
+    pub operation_bytes: u64,
+}
+
 /// Consistent durable counts for Event selectors and application deliveries.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct EventSubscriptionStats {
@@ -1632,6 +2071,8 @@ pub struct StoreInspection {
     pub stats: StoreStats,
     /// Mission-bound semantic Event and route-cache counts from the same read transaction.
     pub event_stats: EventStoreStats,
+    /// Mission-bound semantic State counts from the same read transaction.
+    pub state_stats: StateStoreStats,
     /// Event receive-selector and pending-delivery counts from the same transaction.
     pub event_subscription_stats: EventSubscriptionStats,
     /// Mission-wide Flash control counts from the same audited read transaction.
@@ -1760,6 +2201,44 @@ pub enum StoreError {
         /// Observed key length.
         length: usize,
     },
+    /// A core State capability did not match its exact sealed bytes or payload.
+    StateVerification(String),
+    /// Source-authenticated State metadata was internally inconsistent.
+    InvalidSemanticState(&'static str),
+    /// One semantic State was replayed with a different exact representation.
+    StateRepresentationConflict {
+        semantic_id: StateSemanticId,
+        accepted_envelope_id: StateTransferId,
+        received_envelope_id: StateTransferId,
+    },
+    /// An optimistic State publisher reservation changed before commit.
+    StateReservationChanged,
+    /// A State operation key was empty or exceeded its explicit bound.
+    InvalidStateOperationKey { length: usize },
+    /// A State operation key was replayed with another public-request intent.
+    StateOperationConflict,
+    /// The dedicated durable State operation row cap was reached.
+    StateOperationLimitExceeded { current: u64, limit: u64 },
+    /// Retaining another State operation would exceed its dedicated byte cap.
+    StateOperationByteLimitExceeded {
+        current: u64,
+        incoming: u64,
+        limit: u64,
+    },
+    /// One exact-key State projection exceeded its explicit retained-version bound.
+    StateProjectionLimitExceeded { current: usize, limit: usize },
+    /// A prepared State projection no longer matches durable structure or policy.
+    StateProjectionPlanChanged,
+    /// A durable State table or index disagreed with its paired authority row.
+    StateInvariant(&'static str),
+    /// A State publisher was revoked by the applied mission-control prefix.
+    StatePublisherRevoked(NodeId),
+    /// A State uses a scope key epoch older than durable control policy.
+    StateKeyEpochStale { current: u64, received: u64 },
+    /// A State claims a provisioned future epoch that is not durably active.
+    StateKeyEpochNotActive { current: u64, received: u64 },
+    /// One semantic digest appears in both Event and State namespaces.
+    SemanticNamespaceCollision { semantic_id: [u8; 32] },
     /// One Event cursor request exceeded the explicit page bound.
     EventPageLimitExceeded {
         /// Requested number of rows.
@@ -1990,6 +2469,62 @@ impl fmt::Display for StoreError {
                 formatter,
                 "Event operation key length {length} is outside 1..={MAX_EVENT_OPERATION_KEY_BYTES}"
             ),
+            Self::StateVerification(error) => {
+                write!(formatter, "source State verification failed: {error}")
+            }
+            Self::InvalidSemanticState(reason) => {
+                write!(formatter, "invalid source-authenticated State: {reason}")
+            }
+            Self::StateRepresentationConflict { .. } => formatter
+                .write_str("semantic State was replayed with another source representation"),
+            Self::StateReservationChanged => {
+                formatter.write_str("durable State reservation changed before commit")
+            }
+            Self::InvalidStateOperationKey { length } => write!(
+                formatter,
+                "State operation key length {length} is outside 1..={MAX_STATE_OPERATION_KEY_BYTES}"
+            ),
+            Self::StateOperationConflict => {
+                formatter.write_str("State operation retry differs from its durable request intent")
+            }
+            Self::StateOperationLimitExceeded { current, limit } => write!(
+                formatter,
+                "State operation count {current} is at dedicated limit {limit}"
+            ),
+            Self::StateOperationByteLimitExceeded {
+                current,
+                incoming,
+                limit,
+            } => write!(
+                formatter,
+                "retaining {incoming} State operation bytes at {current} would exceed dedicated limit {limit}"
+            ),
+            Self::StateProjectionLimitExceeded { current, limit } => write!(
+                formatter,
+                "State key has {current} retained versions beyond projection limit {limit}"
+            ),
+            Self::StateProjectionPlanChanged => {
+                formatter.write_str("durable State projection changed; prepare and verify again")
+            }
+            Self::StateInvariant(reason) => {
+                write!(
+                    formatter,
+                    "durable semantic State invariant failed: {reason}"
+                )
+            }
+            Self::StatePublisherRevoked(_) => {
+                formatter.write_str("State publisher is durably revoked")
+            }
+            Self::StateKeyEpochStale { current, received } => write!(
+                formatter,
+                "State key epoch {received} is older than durable scope epoch {current}"
+            ),
+            Self::StateKeyEpochNotActive { current, received } => write!(
+                formatter,
+                "State key epoch {received} is not the active scope epoch {current}"
+            ),
+            Self::SemanticNamespaceCollision { .. } => formatter
+                .write_str("one semantic digest appears in both Event and State namespaces"),
             Self::EventPageLimitExceeded { requested, maximum } => write!(
                 formatter,
                 "Event page request {requested} exceeds maximum {maximum}"
@@ -2273,6 +2808,67 @@ impl PreparedEvent {
     }
 }
 
+struct PreparedState {
+    mission_authority: NodeId,
+    transfer_id: StateTransferId,
+    semantic_id: StateSemanticId,
+    header: EnvelopeHeader,
+    sealed: Vec<u8>,
+    encoded_metadata: Vec<u8>,
+}
+
+impl PreparedState {
+    fn from_verified(
+        state: &ContentVerifiedStateEnvelope,
+        sealed: &[u8],
+    ) -> Result<Self, StoreError> {
+        state
+            .verify_exact_sealed(sealed)
+            .map_err(|error| StoreError::StateVerification(error.to_string()))?;
+        state
+            .ensure_live_for_local_publication()
+            .map_err(|error| StoreError::StateVerification(error.to_string()))?;
+        let header = state.header().clone();
+        validate_state_header(&header)?;
+        let transfer_id = StateTransferId::new(state.envelope_id());
+        let semantic_id = StateSemanticId::new(state.item_id());
+        let encoded_metadata = encode_state_metadata(transfer_id, semantic_id, &header)?;
+        Ok(Self {
+            mission_authority: state.mission_authority_id(),
+            transfer_id,
+            semantic_id,
+            header,
+            sealed: sealed.to_vec(),
+            encoded_metadata,
+        })
+    }
+}
+
+struct StateCommit {
+    state: StoredState,
+    apply: ApplyOutcome,
+    operation_existing: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StateMetadata {
+    transfer_id: StateTransferId,
+    semantic_id: StateSemanticId,
+    header: EnvelopeHeader,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StateOperationRecord {
+    transfer_id: StateTransferId,
+    intent_digest: [u8; 32],
+}
+
+#[derive(Clone, Copy)]
+struct PendingStateOperation<'a> {
+    key: &'a StateOperationKey,
+    intent_digest: [u8; 32],
+}
+
 #[derive(Clone, Copy)]
 struct PendingOperation<'a> {
     key: &'a EventOperationKey,
@@ -2308,6 +2904,22 @@ fn event_once_outcome(committed: EventCommit) -> Result<EventOnceOutcome, StoreE
             semantic_id,
             acceptance_marker,
         })
+    }
+}
+
+fn state_once_outcome(committed: StateCommit) -> StateOnceOutcome {
+    if committed.operation_existing {
+        StateOnceOutcome::Existing {
+            state: committed.state,
+        }
+    } else if committed.apply.inserted() {
+        StateOnceOutcome::Inserted {
+            state: committed.state,
+        }
+    } else {
+        StateOnceOutcome::BoundExisting {
+            state: committed.state,
+        }
     }
 }
 
@@ -2939,11 +3551,12 @@ impl Store {
         let mut mission_authority = read_mission_binding(&write)?;
         if mission_authority.is_none()
             && (write.open_table(EVENTS)?.len()? != 0
+                || write.open_table(STATES)?.len()? != 0
                 || write.open_table(ROUTE_CACHE)?.len()? != 0
                 || write.open_table(CONTROL_RECORDS)?.len()? != 0)
         {
             return Err(StoreError::SemanticInvariant(
-                "unbound store contains mission-scoped Event or control state",
+                "unbound store contains mission-scoped Event, State, or control state",
             ));
         }
         if mission_authority.is_none()
@@ -4278,6 +4891,12 @@ impl Store {
             let semantic_items = metadata
                 .get(SEMANTIC_ITEM_COUNT)?
                 .map_or(0, |value| value.value());
+            let state_items = metadata
+                .get(STATE_ITEM_COUNT)?
+                .map_or(0, |value| value.value());
+            let state_operation_items = metadata
+                .get(STATE_OPERATION_COUNT)?
+                .map_or(0, |value| value.value());
             let route_items = metadata
                 .get(ROUTE_CACHE_ITEM_COUNT)?
                 .map_or(0, |value| value.value());
@@ -4286,6 +4905,8 @@ impl Store {
                 .map_or(0, |value| value.value());
             let aggregate_items = current_items
                 .checked_add(semantic_items)
+                .and_then(|value| value.checked_add(state_items))
+                .and_then(|value| value.checked_add(state_operation_items))
                 .and_then(|value| value.checked_add(route_items))
                 .and_then(|value| value.checked_add(control_items))
                 .ok_or(StoreError::ItemCountAccountingOverflow)?;
@@ -4308,6 +4929,12 @@ impl Store {
             let semantic_payload_bytes = metadata
                 .get(SEMANTIC_TOTAL_BYTES)?
                 .map_or(0, |value| value.value());
+            let state_payload_bytes = metadata
+                .get(STATE_TOTAL_BYTES)?
+                .map_or(0, |value| value.value());
+            let state_operation_bytes = metadata
+                .get(STATE_OPERATION_TOTAL_BYTES)?
+                .map_or(0, |value| value.value());
             let route_payload_bytes = metadata
                 .get(ROUTE_CACHE_TOTAL_BYTES)?
                 .map_or(0, |value| value.value());
@@ -4319,6 +4946,8 @@ impl Store {
                 .map_or(0, |value| value.value());
             let aggregate_payload_bytes = current_payload_bytes
                 .checked_add(semantic_payload_bytes)
+                .and_then(|value| value.checked_add(state_payload_bytes))
+                .and_then(|value| value.checked_add(state_operation_bytes))
                 .and_then(|value| value.checked_add(route_payload_bytes))
                 .and_then(|value| value.checked_add(control_payload_bytes))
                 .and_then(|value| value.checked_add(control_intent_bytes))
@@ -4546,6 +5175,107 @@ impl Store {
         })
     }
 
+    /// Derives the next local State dot and topic/scope causal context from the
+    /// same permanent ledgers used by Event publication.
+    pub fn reserve_state(
+        &self,
+        publisher: NodeId,
+        topic: &Topic,
+        scope: &Scope,
+    ) -> Result<StateReservation, StoreError> {
+        self.require_live()?;
+        self.reserve_state_internal(publisher, topic, scope, None)
+    }
+
+    /// Reserves a local State publication under one exact settled control policy.
+    pub fn reserve_state_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        publisher: NodeId,
+        topic: &Topic,
+        scope: &Scope,
+    ) -> Result<StateReservation, StoreError> {
+        self.require_live()?;
+        self.reserve_state_internal(publisher, topic, scope, Some(policy))
+    }
+
+    fn reserve_state_internal(
+        &self,
+        publisher: NodeId,
+        topic: &Topic,
+        scope: &Scope,
+        expected_policy: Option<&ControlPolicySnapshot>,
+    ) -> Result<StateReservation, StoreError> {
+        let authority = self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        let control_policy = match expected_policy {
+            Some(expected) => {
+                require_control_policy_read(&read, authority, expected)?;
+                *expected
+            }
+            None => control_policy_snapshot_read(&read, authority)?,
+        };
+        if control_principal_revoked_read(&read, publisher)? {
+            return Err(StoreError::StatePublisherRevoked(publisher));
+        }
+        let previous_counter = read
+            .open_table(PUBLISHER_HIGH_WATER)?
+            .get(publisher.as_slice())?
+            .map_or(0, |value| value.value());
+        let counter = previous_counter
+            .checked_add(1)
+            .ok_or(StoreError::InvalidSemanticState(
+                "publisher causal counter is exhausted",
+            ))?;
+
+        let prefix = event_domain_prefix(topic, scope)?;
+        let frontier = read.open_table(CAUSAL_FRONTIER)?;
+        let mut context = VersionVector::default();
+        let mut direct_publishers = 0usize;
+        for row in frontier.iter()? {
+            let (key, value) = row?;
+            let key = key.value();
+            if !key.starts_with(&prefix) {
+                continue;
+            }
+            if key.len() != prefix.len() + 32 || value.value() == 0 {
+                return Err(StoreError::StateInvariant(
+                    "causal frontier contains an invalid domain row",
+                ));
+            }
+            direct_publishers = direct_publishers
+                .checked_add(1)
+                .ok_or(StoreError::ItemCountAccountingOverflow)?;
+            if direct_publishers > MAX_CAUSAL_CONTEXT_ENTRIES {
+                return Err(StoreError::StateInvariant(
+                    "causal frontier exceeds the proven context bound",
+                ));
+            }
+            let context_publisher: NodeId = key[prefix.len()..]
+                .try_into()
+                .map_err(|_| StoreError::StateInvariant("invalid causal frontier key"))?;
+            context.observe(Dot {
+                publisher: context_publisher,
+                counter: value.value(),
+            });
+        }
+        if context.counter(&publisher) == 0 && direct_publishers == MAX_CAUSAL_CONTEXT_ENTRIES {
+            return Err(StoreError::InvalidSemanticState(
+                "causal frontier publisher limit reached",
+            ));
+        }
+
+        Ok(StateReservation {
+            control_policy,
+            publisher,
+            topic: topic.clone(),
+            scope: scope.clone(),
+            previous_counter,
+            counter,
+            context,
+        })
+    }
+
     /// Retains one exact route/source-metadata-verified representation without
     /// granting semantic acceptance.
     ///
@@ -4624,9 +5354,22 @@ impl Store {
             .open_table(CONTROL_RECORDS)?
             .get(transfer_id.as_bytes().as_slice())?
             .is_some()
+            || write
+                .open_table(STATES)?
+                .get(transfer_id.as_bytes().as_slice())?
+                .is_some()
         {
             return Err(StoreError::TransferNamespaceCollision {
                 transfer_id: *transfer_id.as_bytes(),
+            });
+        }
+        if write
+            .open_table(STATE_SEMANTIC_ITEMS)?
+            .get(semantic_claim.as_bytes().as_slice())?
+            .is_some()
+        {
+            return Err(StoreError::SemanticNamespaceCollision {
+                semantic_id: *semantic_claim.as_bytes(),
             });
         }
         let accepted_transfer = write
@@ -4736,11 +5479,19 @@ impl Store {
             let semantic_items = metadata
                 .get(SEMANTIC_ITEM_COUNT)?
                 .map_or(0, |value| value.value());
+            let state_items = metadata
+                .get(STATE_ITEM_COUNT)?
+                .map_or(0, |value| value.value());
+            let state_operation_items = metadata
+                .get(STATE_OPERATION_COUNT)?
+                .map_or(0, |value| value.value());
             let control_items = metadata
                 .get(CONTROL_ITEM_COUNT)?
                 .map_or(0, |value| value.value());
             let aggregate_items = opaque_items
                 .checked_add(semantic_items)
+                .and_then(|value| value.checked_add(state_items))
+                .and_then(|value| value.checked_add(state_operation_items))
                 .and_then(|value| value.checked_add(next_items))
                 .and_then(|value| value.checked_add(control_items))
                 .ok_or(StoreError::ItemCountAccountingOverflow)?;
@@ -4769,6 +5520,12 @@ impl Store {
             let semantic_bytes = metadata
                 .get(SEMANTIC_TOTAL_BYTES)?
                 .map_or(0, |value| value.value());
+            let state_bytes = metadata
+                .get(STATE_TOTAL_BYTES)?
+                .map_or(0, |value| value.value());
+            let state_operation_bytes = metadata
+                .get(STATE_OPERATION_TOTAL_BYTES)?
+                .map_or(0, |value| value.value());
             let control_bytes = metadata
                 .get(CONTROL_TOTAL_BYTES)?
                 .map_or(0, |value| value.value());
@@ -4777,6 +5534,8 @@ impl Store {
                 .map_or(0, |value| value.value());
             let aggregate_bytes = opaque_bytes
                 .checked_add(semantic_bytes)
+                .and_then(|value| value.checked_add(state_bytes))
+                .and_then(|value| value.checked_add(state_operation_bytes))
                 .and_then(|value| value.checked_add(next_bytes))
                 .and_then(|value| value.checked_add(control_bytes))
                 .and_then(|value| value.checked_add(control_intent_bytes))
@@ -5575,6 +6334,10 @@ impl Store {
             .open_table(CONTROL_RECORDS)?
             .get(prepared.transfer_id.as_bytes().as_slice())?
             .is_some()
+            || write
+                .open_table(STATES)?
+                .get(prepared.transfer_id.as_bytes().as_slice())?
+                .is_some()
         {
             return Err(StoreError::TransferNamespaceCollision {
                 transfer_id: *prepared.transfer_id.as_bytes(),
@@ -5645,6 +6408,15 @@ impl Store {
             }
         }
 
+        if write
+            .open_table(STATE_SEMANTIC_ITEMS)?
+            .get(prepared.semantic_id.as_bytes().as_slice())?
+            .is_some()
+        {
+            return Err(StoreError::SemanticNamespaceCollision {
+                semantic_id: *prepared.semantic_id.as_bytes(),
+            });
+        }
         let accepted_representation = {
             let semantic_items = write.open_table(SEMANTIC_ITEMS)?;
             semantic_items
@@ -5767,6 +6539,7 @@ impl Store {
             &prepared.header.topic,
             &prepared.header.scope,
             prepared.header.stamp.dot.publisher,
+            SemanticDataClass::Event,
         )?;
 
         if write
@@ -5807,6 +6580,12 @@ impl Store {
             let semantic_items = metadata
                 .get(SEMANTIC_ITEM_COUNT)?
                 .map_or(0, |value| value.value());
+            let state_items = metadata
+                .get(STATE_ITEM_COUNT)?
+                .map_or(0, |value| value.value());
+            let state_operation_items = metadata
+                .get(STATE_OPERATION_COUNT)?
+                .map_or(0, |value| value.value());
             let route_items = metadata
                 .get(ROUTE_CACHE_ITEM_COUNT)?
                 .map_or(0, |value| value.value());
@@ -5815,6 +6594,8 @@ impl Store {
                 .map_or(0, |value| value.value());
             let aggregate_items = opaque_items
                 .checked_add(semantic_items)
+                .and_then(|value| value.checked_add(state_items))
+                .and_then(|value| value.checked_add(state_operation_items))
                 .and_then(|value| value.checked_add(route_items))
                 .and_then(|value| value.checked_add(control_items))
                 .and_then(|value| value.checked_add(1))
@@ -5831,6 +6612,12 @@ impl Store {
             let semantic_bytes = metadata
                 .get(SEMANTIC_TOTAL_BYTES)?
                 .map_or(0, |value| value.value());
+            let state_bytes = metadata
+                .get(STATE_TOTAL_BYTES)?
+                .map_or(0, |value| value.value());
+            let state_operation_bytes = metadata
+                .get(STATE_OPERATION_TOTAL_BYTES)?
+                .map_or(0, |value| value.value());
             let route_bytes = metadata
                 .get(ROUTE_CACHE_TOTAL_BYTES)?
                 .map_or(0, |value| value.value());
@@ -5842,6 +6629,8 @@ impl Store {
                 .map_or(0, |value| value.value());
             let aggregate_bytes = opaque_bytes
                 .checked_add(semantic_bytes)
+                .and_then(|value| value.checked_add(state_bytes))
+                .and_then(|value| value.checked_add(state_operation_bytes))
                 .and_then(|value| value.checked_add(route_bytes))
                 .and_then(|value| value.checked_add(control_bytes))
                 .and_then(|value| value.checked_add(control_intent_bytes))
@@ -5928,6 +6717,579 @@ impl Store {
         Ok(EventCommit {
             transfer_id: prepared.transfer_id,
             semantic_id: prepared.semantic_id,
+            apply: ApplyOutcome::Inserted {
+                acceptance_marker: marker,
+            },
+            operation_existing: false,
+        })
+    }
+
+    /// Commits one locally sealed State against its optimistic durable reservation.
+    pub fn commit_reserved_state(
+        &self,
+        reservation: &StateReservation,
+        state: &ContentVerifiedStateEnvelope,
+        sealed: &[u8],
+    ) -> Result<ApplyOutcome, StoreError> {
+        self.require_live()?;
+        let prepared = PreparedState::from_verified(state, sealed)?;
+        self.commit_prepared_state(&prepared, Some(reservation), None)
+            .map(|committed| committed.apply)
+    }
+
+    /// Commits one reserved State only while its exact captured policy remains current.
+    pub fn commit_reserved_state_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        reservation: &StateReservation,
+        state: &ContentVerifiedStateEnvelope,
+        sealed: &[u8],
+    ) -> Result<ApplyOutcome, StoreError> {
+        self.require_live()?;
+        if policy != &reservation.control_policy {
+            return Err(StoreError::ControlPolicyChanged);
+        }
+        let prepared = PreparedState::from_verified(state, sealed)?;
+        self.commit_prepared_state(&prepared, Some(reservation), None)
+            .map(|committed| committed.apply)
+    }
+
+    /// Atomically commits one local State and its canonical application request intent.
+    pub fn commit_reserved_state_once(
+        &self,
+        request: &StateOperationRequest<'_>,
+        reservation: &StateReservation,
+        state: &ContentVerifiedStateEnvelope,
+        sealed: &[u8],
+    ) -> Result<StateOnceOutcome, StoreError> {
+        self.require_live()?;
+        state
+            .verify_exact_payload(request.payload)
+            .map_err(|error| StoreError::StateVerification(error.to_string()))?;
+        validate_state_publication_intent(request.intent, request.payload, state.header())?;
+        let prepared = PreparedState::from_verified(state, sealed)?;
+        let committed = self.commit_prepared_state(
+            &prepared,
+            Some(reservation),
+            Some(PendingStateOperation {
+                key: request.operation,
+                intent_digest: request.intent.digest(),
+            }),
+        )?;
+        Ok(state_once_outcome(committed))
+    }
+
+    /// Commits one idempotent local State request under an exact settled policy.
+    pub fn commit_reserved_state_once_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        request: &StateOperationRequest<'_>,
+        reservation: &StateReservation,
+        state: &ContentVerifiedStateEnvelope,
+        sealed: &[u8],
+    ) -> Result<StateOnceOutcome, StoreError> {
+        self.require_live()?;
+        if policy != &reservation.control_policy {
+            return Err(StoreError::ControlPolicyChanged);
+        }
+        state
+            .verify_exact_payload(request.payload)
+            .map_err(|error| StoreError::StateVerification(error.to_string()))?;
+        validate_state_publication_intent(request.intent, request.payload, state.header())?;
+        let prepared = PreparedState::from_verified(state, sealed)?;
+        let committed = self.commit_prepared_state(
+            &prepared,
+            Some(reservation),
+            Some(PendingStateOperation {
+                key: request.operation,
+                intent_digest: request.intent.digest(),
+            }),
+        )?;
+        Ok(state_once_outcome(committed))
+    }
+
+    /// Resolves one idempotent State operation to its accepted durable version.
+    ///
+    /// This is a privileged structural lookup, not an exposure capability. The
+    /// operation mapping grants no current authority, and callers must freshly
+    /// source/content verify the returned exact bytes and enforce current policy
+    /// before returning the State outside the trusted node boundary.
+    pub fn state_for_operation(
+        &self,
+        operation: &StateOperationKey,
+    ) -> Result<Option<StoredState>, StoreError> {
+        self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        let transfer = read
+            .open_table(STATE_OPERATIONS)?
+            .get(operation.as_bytes())?
+            .map(|value| {
+                decode_state_operation_record(value.value()).map(|record| record.transfer_id)
+            })
+            .transpose()?;
+        transfer
+            .map(|transfer| load_state_from_read(&read, transfer))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    /// Reads one exact source State by its transfer identity.
+    pub fn get_state(
+        &self,
+        transfer_id: StateTransferId,
+    ) -> Result<Option<StoredState>, StoreError> {
+        self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        load_state_from_read(&read, transfer_id)
+    }
+
+    /// Resolves one semantic State identity to its retained exact representation.
+    pub fn state_by_semantic_id(
+        &self,
+        semantic_id: StateSemanticId,
+    ) -> Result<Option<StoredState>, StoreError> {
+        self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        let transfer = read
+            .open_table(STATE_SEMANTIC_ITEMS)?
+            .get(semantic_id.as_bytes().as_slice())?
+            .map(|value| parse_state_transfer_id("State semantic item table", value.value()))
+            .transpose()?;
+        transfer
+            .map(|transfer| load_state_from_read(&read, transfer))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    /// Prepares every retained version for one exact State key under settled policy.
+    ///
+    /// Returned metadata remains structural. The selected node must freshly
+    /// source/content verify every candidate and then call
+    /// [`Self::require_state_projection_plan_with_policy`] before exposure.
+    pub fn prepare_state_projection_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        topic: &Topic,
+        scope: &Scope,
+        logical_key: &[u8],
+    ) -> Result<StateProjectionPlan, StoreError> {
+        let authority = self.require_bound_mission()?;
+        validate_state_logical_key(logical_key)?;
+        let read = self.database.begin_read()?;
+        require_control_policy_read(&read, authority, policy)?;
+        state_projection_plan_read(&read, *policy, topic, scope, logical_key)
+    }
+
+    /// Rechecks exact policy and the complete freshly verified State projection set.
+    pub fn require_state_projection_plan_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        plan: &StateProjectionPlan,
+    ) -> Result<(), StoreError> {
+        let authority = self.require_bound_mission()?;
+        if policy != plan.control_policy() {
+            return Err(StoreError::StateProjectionPlanChanged);
+        }
+        let read = self.database.begin_read()?;
+        require_control_policy_read(&read, authority, policy)?;
+        let current = state_projection_plan_read(
+            &read,
+            *policy,
+            plan.topic(),
+            plan.scope(),
+            plan.logical_key(),
+        )?;
+        if current != *plan {
+            return Err(StoreError::StateProjectionPlanChanged);
+        }
+        Ok(())
+    }
+
+    /// Returns structurally audited State counts from one read snapshot.
+    pub fn state_stats(&self) -> Result<StateStoreStats, StoreError> {
+        self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        let states = read.open_table(STATES)?;
+        let state_bytes = read.open_table(STATE_BYTES)?;
+        let markers = read.open_table(STATE_ACCEPTANCE_MARKERS)?;
+        let operations = read.open_table(STATE_OPERATIONS)?;
+        let metadata = read.open_table(METADATA)?;
+        let mut total_sealed_bytes = 0u64;
+        let mut last_acceptance_marker = 0u64;
+        for row in states.iter()? {
+            let (key, _) = row?;
+            let bytes = state_bytes
+                .get(key.value())?
+                .ok_or(StoreError::StateInvariant(
+                    "State stats row is missing exact source bytes",
+                ))?;
+            total_sealed_bytes = total_sealed_bytes
+                .checked_add(
+                    u64::try_from(bytes.value().len())
+                        .map_err(|_| StoreError::PayloadByteAccountingOverflow)?,
+                )
+                .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+            let marker = markers.get(key.value())?.map(|value| value.value()).ok_or(
+                StoreError::StateInvariant("State stats row is missing its acceptance marker"),
+            )?;
+            last_acceptance_marker = last_acceptance_marker.max(marker);
+        }
+        let mut operation_bytes = 0u64;
+        for row in operations.iter()? {
+            let (key, value) = row?;
+            StateOperationKey::new(key.value().to_vec())?;
+            decode_state_operation_record(value.value())?;
+            operation_bytes = operation_bytes
+                .checked_add(
+                    key.value()
+                        .len()
+                        .checked_add(value.value().len())
+                        .and_then(|length| u64::try_from(length).ok())
+                        .ok_or(StoreError::PayloadByteAccountingOverflow)?,
+                )
+                .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        }
+        let stats = StateStoreStats {
+            states: states.len()?,
+            acceptance_markers: markers.len()?,
+            total_sealed_bytes,
+            last_acceptance_marker,
+            operations: operations.len()?,
+            operation_bytes,
+        };
+        for (field, durable, reconstructed) in [
+            (
+                STATE_ITEM_COUNT,
+                metadata
+                    .get(STATE_ITEM_COUNT)?
+                    .map_or(0, |value| value.value()),
+                stats.states,
+            ),
+            (
+                STATE_TOTAL_BYTES,
+                metadata
+                    .get(STATE_TOTAL_BYTES)?
+                    .map_or(0, |value| value.value()),
+                stats.total_sealed_bytes,
+            ),
+            (
+                LAST_STATE_ACCEPTANCE_MARKER,
+                metadata
+                    .get(LAST_STATE_ACCEPTANCE_MARKER)?
+                    .map_or(0, |value| value.value()),
+                stats.last_acceptance_marker,
+            ),
+            (
+                STATE_OPERATION_COUNT,
+                metadata
+                    .get(STATE_OPERATION_COUNT)?
+                    .map_or(0, |value| value.value()),
+                stats.operations,
+            ),
+            (
+                STATE_OPERATION_TOTAL_BYTES,
+                metadata
+                    .get(STATE_OPERATION_TOTAL_BYTES)?
+                    .map_or(0, |value| value.value()),
+                stats.operation_bytes,
+            ),
+        ] {
+            if durable != reconstructed {
+                return Err(StoreError::AccountingMismatch {
+                    field,
+                    durable,
+                    reconstructed,
+                });
+            }
+        }
+        Ok(stats)
+    }
+
+    fn commit_prepared_state(
+        &self,
+        prepared: &PreparedState,
+        reservation: Option<&StateReservation>,
+        operation: Option<PendingStateOperation<'_>>,
+    ) -> Result<StateCommit, StoreError> {
+        self.require_mission_authority(prepared.mission_authority)?;
+        let write = self.database.begin_write()?;
+        enforce_live_write(&write)?;
+        let policy = reservation
+            .map(|reservation| &reservation.control_policy)
+            .ok_or(StoreError::StateReservationChanged)?;
+        enforce_state_policy_write(&write, prepared.mission_authority, policy, &prepared.header)?;
+
+        if write
+            .open_table(EVENTS)?
+            .get(prepared.transfer_id.as_bytes().as_slice())?
+            .is_some()
+            || write
+                .open_table(ROUTE_CACHE)?
+                .get(prepared.transfer_id.as_bytes().as_slice())?
+                .is_some()
+            || write
+                .open_table(CONTROL_RECORDS)?
+                .get(prepared.transfer_id.as_bytes().as_slice())?
+                .is_some()
+        {
+            return Err(StoreError::TransferNamespaceCollision {
+                transfer_id: *prepared.transfer_id.as_bytes(),
+            });
+        }
+
+        // Authority, settled policy, revocation, and key epoch are checked above.
+        // Only then may an operation mapping resolve a durable result.
+        if let Some(operation) = operation {
+            let existing = write
+                .open_table(STATE_OPERATIONS)?
+                .get(operation.key.as_bytes())?
+                .map(|value| decode_state_operation_record(value.value()))
+                .transpose()?;
+            if let Some(existing) = existing {
+                if existing.intent_digest != operation.intent_digest {
+                    return Err(StoreError::StateOperationConflict);
+                }
+                let state = load_state_from_write(&write, existing.transfer_id)?.ok_or(
+                    StoreError::StateInvariant(
+                        "State operation points to a missing semantic version",
+                    ),
+                )?;
+                return Ok(StateCommit {
+                    apply: ApplyOutcome::Duplicate {
+                        acceptance_marker: state.acceptance_marker,
+                    },
+                    state,
+                    operation_existing: true,
+                });
+            }
+        }
+
+        let reservation = reservation.ok_or(StoreError::StateReservationChanged)?;
+        validate_state_reservation(reservation, prepared)?;
+
+        if write
+            .open_table(SEMANTIC_ITEMS)?
+            .get(prepared.semantic_id.as_bytes().as_slice())?
+            .is_some()
+        {
+            return Err(StoreError::SemanticNamespaceCollision {
+                semantic_id: *prepared.semantic_id.as_bytes(),
+            });
+        }
+        for row in write.open_table(ROUTE_CACHE_CLAIMS)?.iter()? {
+            let (_, claim) = row?;
+            if decode_event_metadata(claim.value())?.semantic_id.as_bytes()
+                == prepared.semantic_id.as_bytes()
+            {
+                return Err(StoreError::SemanticNamespaceCollision {
+                    semantic_id: *prepared.semantic_id.as_bytes(),
+                });
+            }
+        }
+        let accepted_representation = write
+            .open_table(STATE_SEMANTIC_ITEMS)?
+            .get(prepared.semantic_id.as_bytes().as_slice())?
+            .map(|value| parse_state_transfer_id("State semantic item table", value.value()))
+            .transpose()?;
+        if let Some(accepted) = accepted_representation {
+            if accepted != prepared.transfer_id {
+                return Err(StoreError::StateRepresentationConflict {
+                    semantic_id: prepared.semantic_id,
+                    accepted_envelope_id: accepted,
+                    received_envelope_id: prepared.transfer_id,
+                });
+            }
+            let state =
+                load_state_from_write(&write, accepted)?.ok_or(StoreError::StateInvariant(
+                    "State semantic item index points to a missing representation",
+                ))?;
+            if state.semantic_id != prepared.semantic_id
+                || state.header != prepared.header
+                || state.sealed != prepared.sealed
+            {
+                return Err(StoreError::StateInvariant(
+                    "accepted State representation differs from exact replay",
+                ));
+            }
+            if let Some(operation) = operation {
+                let encoded = encode_state_operation_record(StateOperationRecord {
+                    transfer_id: prepared.transfer_id,
+                    intent_digest: operation.intent_digest,
+                });
+                admit_state_operation(&write, self.limits, operation.key, encoded.len())?;
+                write
+                    .open_table(STATE_OPERATIONS)?
+                    .insert(operation.key.as_bytes(), encoded.as_slice())?;
+            }
+            write.commit()?;
+            return Ok(StateCommit {
+                apply: ApplyOutcome::Duplicate {
+                    acceptance_marker: state.acceptance_marker,
+                },
+                state,
+                operation_existing: false,
+            });
+        }
+
+        let current_counter = write
+            .open_table(PUBLISHER_HIGH_WATER)?
+            .get(reservation.publisher.as_slice())?
+            .map_or(0, |value| value.value());
+        if current_counter != reservation.previous_counter {
+            return Err(StoreError::StateReservationChanged);
+        }
+
+        let dot_key = accepted_dot_key(prepared.header.stamp.dot);
+        if let Some(accepted) = write
+            .open_table(ACCEPTED_DOTS)?
+            .get(dot_key.as_slice())?
+            .map(|value| parse_digest32("accepted dot table", value.value()))
+            .transpose()?
+        {
+            if accepted != *prepared.semantic_id.as_bytes() {
+                return Err(StoreError::CausalEquivocation {
+                    publisher: prepared.header.stamp.dot.publisher,
+                    counter: prepared.header.stamp.dot.counter,
+                });
+            }
+            return Err(StoreError::StateInvariant(
+                "accepted dot is missing its State semantic item index",
+            ));
+        }
+
+        ensure_frontier_capacity(
+            &write,
+            &prepared.header.topic,
+            &prepared.header.scope,
+            prepared.header.stamp.dot.publisher,
+            SemanticDataClass::State,
+        )?;
+        if write
+            .open_table(STATES)?
+            .get(prepared.transfer_id.as_bytes().as_slice())?
+            .is_some()
+            || write
+                .open_table(STATE_BYTES)?
+                .get(prepared.transfer_id.as_bytes().as_slice())?
+                .is_some()
+            || write
+                .open_table(STATE_ACCEPTANCE_MARKERS)?
+                .get(prepared.transfer_id.as_bytes().as_slice())?
+                .is_some()
+        {
+            return Err(StoreError::StateInvariant(
+                "State exact namespace contains an unindexed partial representation",
+            ));
+        }
+
+        let group_prefix = state_group_prefix(
+            &prepared.header.topic,
+            &prepared.header.scope,
+            &prepared.header.logical_key,
+        )?;
+        let group_versions = write.open_table(STATE_GROUP_VERSIONS)?;
+        let mut version_count = 0usize;
+        for row in group_versions.iter()? {
+            let (key, _) = row?;
+            if key.value().starts_with(&group_prefix) {
+                version_count = version_count
+                    .checked_add(1)
+                    .ok_or(StoreError::ItemCountAccountingOverflow)?;
+                if version_count >= MAX_STATE_VERSIONS_PER_KEY {
+                    return Err(StoreError::StateProjectionLimitExceeded {
+                        current: version_count,
+                        limit: MAX_STATE_VERSIONS_PER_KEY,
+                    });
+                }
+            }
+        }
+        drop(group_versions);
+
+        let incoming = u64::try_from(prepared.sealed.len())
+            .map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
+        let marker = {
+            let mut metadata = write.open_table(METADATA)?;
+            require_aggregate_capacity(&metadata, self.limits, 1, incoming)?;
+            let state_items = metadata
+                .get(STATE_ITEM_COUNT)?
+                .map_or(0, |value| value.value());
+            let state_bytes = metadata
+                .get(STATE_TOTAL_BYTES)?
+                .map_or(0, |value| value.value());
+            let next_state_items = state_items
+                .checked_add(1)
+                .ok_or(StoreError::ItemCountAccountingOverflow)?;
+            let next_state_bytes = state_bytes
+                .checked_add(incoming)
+                .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+            let previous_marker = metadata
+                .get(LAST_STATE_ACCEPTANCE_MARKER)?
+                .map_or(0, |value| value.value());
+            let marker = previous_marker
+                .checked_add(1)
+                .ok_or(StoreError::AcceptanceMarkerExhausted)?;
+            metadata.insert(STATE_ITEM_COUNT, next_state_items)?;
+            metadata.insert(STATE_TOTAL_BYTES, next_state_bytes)?;
+            metadata.insert(LAST_STATE_ACCEPTANCE_MARKER, marker)?;
+            marker
+        };
+
+        write.open_table(STATE_BYTES)?.insert(
+            prepared.transfer_id.as_bytes().as_slice(),
+            prepared.sealed.as_slice(),
+        )?;
+        write
+            .open_table(STATE_ACCEPTANCE_MARKERS)?
+            .insert(prepared.transfer_id.as_bytes().as_slice(), marker)?;
+        write.open_table(STATES)?.insert(
+            prepared.transfer_id.as_bytes().as_slice(),
+            prepared.encoded_metadata.as_slice(),
+        )?;
+        write.open_table(STATE_SEMANTIC_ITEMS)?.insert(
+            prepared.semantic_id.as_bytes().as_slice(),
+            prepared.transfer_id.as_bytes().as_slice(),
+        )?;
+        let group_key = state_group_version_key(
+            &prepared.header.topic,
+            &prepared.header.scope,
+            &prepared.header.logical_key,
+            prepared.semantic_id,
+        )?;
+        write.open_table(STATE_GROUP_VERSIONS)?.insert(
+            group_key.as_slice(),
+            prepared.transfer_id.as_bytes().as_slice(),
+        )?;
+        write.open_table(ACCEPTED_DOTS)?.insert(
+            dot_key.as_slice(),
+            prepared.semantic_id.as_bytes().as_slice(),
+        )?;
+        update_causal_high_water(
+            &write,
+            prepared.header.stamp.dot.publisher,
+            &prepared.header.topic,
+            &prepared.header.scope,
+            prepared.header.stamp.dot.counter,
+        )?;
+        if let Some(operation) = operation {
+            let encoded = encode_state_operation_record(StateOperationRecord {
+                transfer_id: prepared.transfer_id,
+                intent_digest: operation.intent_digest,
+            });
+            admit_state_operation(&write, self.limits, operation.key, encoded.len())?;
+            write
+                .open_table(STATE_OPERATIONS)?
+                .insert(operation.key.as_bytes(), encoded.as_slice())?;
+        }
+        write.commit()?;
+
+        Ok(StateCommit {
+            state: StoredState {
+                transfer_id: prepared.transfer_id,
+                semantic_id: prepared.semantic_id,
+                header: prepared.header.clone(),
+                sealed: prepared.sealed.clone(),
+                acceptance_marker: marker,
+            },
             apply: ApplyOutcome::Inserted {
                 acceptance_marker: marker,
             },
@@ -6317,6 +7679,10 @@ fn insert_control(
         .get(prepared.record.transfer_id.as_bytes().as_slice())?
         .is_some()
         || write
+            .open_table(STATES)?
+            .get(prepared.record.transfer_id.as_bytes().as_slice())?
+            .is_some()
+        || write
             .open_table(ROUTE_CACHE)?
             .get(prepared.record.transfer_id.as_bytes().as_slice())?
             .is_some()
@@ -6366,11 +7732,19 @@ fn insert_control(
         let event_items = metadata
             .get(SEMANTIC_ITEM_COUNT)?
             .map_or(0, |value| value.value());
+        let state_items = metadata
+            .get(STATE_ITEM_COUNT)?
+            .map_or(0, |value| value.value());
+        let state_operation_items = metadata
+            .get(STATE_OPERATION_COUNT)?
+            .map_or(0, |value| value.value());
         let cache_items = metadata
             .get(ROUTE_CACHE_ITEM_COUNT)?
             .map_or(0, |value| value.value());
         let aggregate_items = opaque_items
             .checked_add(event_items)
+            .and_then(|value| value.checked_add(state_items))
+            .and_then(|value| value.checked_add(state_operation_items))
             .and_then(|value| value.checked_add(cache_items))
             .and_then(|value| value.checked_add(next_controls))
             .ok_or(StoreError::ItemCountAccountingOverflow)?;
@@ -6387,11 +7761,19 @@ fn insert_control(
         let event_bytes = metadata
             .get(SEMANTIC_TOTAL_BYTES)?
             .map_or(0, |value| value.value());
+        let state_bytes = metadata
+            .get(STATE_TOTAL_BYTES)?
+            .map_or(0, |value| value.value());
+        let state_operation_bytes = metadata
+            .get(STATE_OPERATION_TOTAL_BYTES)?
+            .map_or(0, |value| value.value());
         let cache_bytes = metadata
             .get(ROUTE_CACHE_TOTAL_BYTES)?
             .map_or(0, |value| value.value());
         let aggregate_bytes = opaque_bytes
             .checked_add(event_bytes)
+            .and_then(|value| value.checked_add(state_bytes))
+            .and_then(|value| value.checked_add(state_operation_bytes))
             .and_then(|value| value.checked_add(cache_bytes))
             .and_then(|value| value.checked_add(next_retained_control_bytes))
             .ok_or(StoreError::PayloadByteAccountingOverflow)?;
@@ -6461,11 +7843,19 @@ fn admit_control_publication_intent(
     let event_bytes = metadata
         .get(SEMANTIC_TOTAL_BYTES)?
         .map_or(0, |value| value.value());
+    let state_bytes = metadata
+        .get(STATE_TOTAL_BYTES)?
+        .map_or(0, |value| value.value());
+    let state_operation_bytes = metadata
+        .get(STATE_OPERATION_TOTAL_BYTES)?
+        .map_or(0, |value| value.value());
     let cache_bytes = metadata
         .get(ROUTE_CACHE_TOTAL_BYTES)?
         .map_or(0, |value| value.value());
     let aggregate_bytes = opaque_bytes
         .checked_add(event_bytes)
+        .and_then(|value| value.checked_add(state_bytes))
+        .and_then(|value| value.checked_add(state_operation_bytes))
         .and_then(|value| value.checked_add(cache_bytes))
         .and_then(|value| value.checked_add(next_control_bytes))
         .ok_or(StoreError::PayloadByteAccountingOverflow)?;
@@ -6827,6 +8217,24 @@ fn validate_reservation(
     Ok(())
 }
 
+fn validate_state_reservation(
+    reservation: &StateReservation,
+    prepared: &PreparedState,
+) -> Result<(), StoreError> {
+    let header = &prepared.header;
+    if header.stamp.dot.publisher != reservation.publisher
+        || header.stamp.dot.counter != reservation.counter
+        || header.topic != reservation.topic
+        || header.scope != reservation.scope
+        || header.stamp.context != reservation.context
+    {
+        return Err(StoreError::InvalidSemanticState(
+            "sealed State does not match its durable reservation",
+        ));
+    }
+    Ok(())
+}
+
 fn purge_route_cache_semantic_claim(
     write: &redb::WriteTransaction,
     accepted_transfer_id: EventTransferId,
@@ -6924,15 +8332,7 @@ fn update_high_water(
     counter: u64,
     sequence: u64,
 ) -> Result<(), StoreError> {
-    {
-        let mut publishers = write.open_table(PUBLISHER_HIGH_WATER)?;
-        let current = publishers
-            .get(publisher.as_slice())?
-            .map_or(0, |value| value.value());
-        if counter > current {
-            publishers.insert(publisher.as_slice(), counter)?;
-        }
-    }
+    update_causal_high_water(write, publisher, topic, scope, counter)?;
     let stream = event_stream_key(publisher, topic, scope)?;
     {
         let mut events = write.open_table(EVENT_HIGH_WATER)?;
@@ -6941,6 +8341,25 @@ fn update_high_water(
             .map_or(0, |value| value.value());
         if sequence > current {
             events.insert(stream.as_slice(), sequence)?;
+        }
+    }
+    Ok(())
+}
+
+fn update_causal_high_water(
+    write: &redb::WriteTransaction,
+    publisher: NodeId,
+    topic: &Topic,
+    scope: &Scope,
+    counter: u64,
+) -> Result<(), StoreError> {
+    {
+        let mut publishers = write.open_table(PUBLISHER_HIGH_WATER)?;
+        let current = publishers
+            .get(publisher.as_slice())?
+            .map_or(0, |value| value.value());
+        if counter > current {
+            publishers.insert(publisher.as_slice(), counter)?;
         }
     }
     let frontier_key = causal_frontier_key(topic, scope, publisher)?;
@@ -6956,11 +8375,114 @@ fn update_high_water(
     Ok(())
 }
 
+fn require_aggregate_capacity(
+    metadata: &redb::Table<'_, &str, u64>,
+    limits: StoreLimits,
+    incoming_items: u64,
+    incoming_bytes: u64,
+) -> Result<(), StoreError> {
+    let current_items = [
+        ITEM_COUNT,
+        SEMANTIC_ITEM_COUNT,
+        STATE_ITEM_COUNT,
+        STATE_OPERATION_COUNT,
+        ROUTE_CACHE_ITEM_COUNT,
+        CONTROL_ITEM_COUNT,
+    ]
+    .into_iter()
+    .try_fold(0u64, |total, field| {
+        total
+            .checked_add(metadata.get(field)?.map_or(0, |value| value.value()))
+            .ok_or(StoreError::ItemCountAccountingOverflow)
+    })?;
+    let next_items = current_items
+        .checked_add(incoming_items)
+        .ok_or(StoreError::ItemCountAccountingOverflow)?;
+    if next_items > limits.max_items {
+        return Err(StoreError::ItemLimitExceeded {
+            current: current_items,
+            limit: limits.max_items,
+        });
+    }
+
+    let current_bytes = [
+        TOTAL_PAYLOAD_BYTES,
+        SEMANTIC_TOTAL_BYTES,
+        STATE_TOTAL_BYTES,
+        STATE_OPERATION_TOTAL_BYTES,
+        ROUTE_CACHE_TOTAL_BYTES,
+        CONTROL_TOTAL_BYTES,
+        CONTROL_PUBLICATION_INTENT_TOTAL_BYTES,
+    ]
+    .into_iter()
+    .try_fold(0u64, |total, field| {
+        total
+            .checked_add(metadata.get(field)?.map_or(0, |value| value.value()))
+            .ok_or(StoreError::PayloadByteAccountingOverflow)
+    })?;
+    let next_bytes = current_bytes
+        .checked_add(incoming_bytes)
+        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    if next_bytes > limits.max_total_payload_bytes {
+        return Err(StoreError::PayloadByteLimitExceeded {
+            current: current_bytes,
+            incoming: incoming_bytes,
+            limit: limits.max_total_payload_bytes,
+        });
+    }
+    Ok(())
+}
+
+fn admit_state_operation(
+    write: &redb::WriteTransaction,
+    limits: StoreLimits,
+    operation: &StateOperationKey,
+    encoded_record_len: usize,
+) -> Result<(), StoreError> {
+    let incoming = operation
+        .as_bytes()
+        .len()
+        .checked_add(encoded_record_len)
+        .and_then(|length| u64::try_from(length).ok())
+        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    let mut metadata = write.open_table(METADATA)?;
+    let current_count = metadata
+        .get(STATE_OPERATION_COUNT)?
+        .map_or(0, |value| value.value());
+    let next_count = current_count
+        .checked_add(1)
+        .ok_or(StoreError::ItemCountAccountingOverflow)?;
+    if next_count > MAX_STATE_OPERATIONS {
+        return Err(StoreError::StateOperationLimitExceeded {
+            current: current_count,
+            limit: MAX_STATE_OPERATIONS,
+        });
+    }
+    let current_bytes = metadata
+        .get(STATE_OPERATION_TOTAL_BYTES)?
+        .map_or(0, |value| value.value());
+    let next_bytes = current_bytes
+        .checked_add(incoming)
+        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    if next_bytes > MAX_STATE_OPERATION_BYTES {
+        return Err(StoreError::StateOperationByteLimitExceeded {
+            current: current_bytes,
+            incoming,
+            limit: MAX_STATE_OPERATION_BYTES,
+        });
+    }
+    require_aggregate_capacity(&metadata, limits, 1, incoming)?;
+    metadata.insert(STATE_OPERATION_COUNT, next_count)?;
+    metadata.insert(STATE_OPERATION_TOTAL_BYTES, next_bytes)?;
+    Ok(())
+}
+
 fn ensure_frontier_capacity(
     write: &redb::WriteTransaction,
     topic: &Topic,
     scope: &Scope,
     incoming_publisher: NodeId,
+    class: SemanticDataClass,
 ) -> Result<(), StoreError> {
     let prefix = event_domain_prefix(topic, scope)?;
     let frontier = write.open_table(CAUSAL_FRONTIER)?;
@@ -6990,9 +8512,11 @@ fn ensure_frontier_capacity(
         ));
     }
     if !incoming_present && direct_publishers == MAX_CAUSAL_CONTEXT_ENTRIES {
-        return Err(StoreError::InvalidSemanticEvent(
-            "causal frontier publisher limit reached",
-        ));
+        return Err(if class == SemanticDataClass::State {
+            StoreError::InvalidSemanticState("causal frontier publisher limit reached")
+        } else {
+            StoreError::InvalidSemanticEvent("causal frontier publisher limit reached")
+        });
     }
     Ok(())
 }
@@ -7078,6 +8602,198 @@ fn load_event_from_read(
             "Event metadata is missing its acceptance marker",
         ))?;
     decode_stored_event(transfer_id, &encoded, sealed, marker).map(Some)
+}
+
+fn load_state_from_write(
+    write: &redb::WriteTransaction,
+    transfer_id: StateTransferId,
+) -> Result<Option<StoredState>, StoreError> {
+    let encoded = write
+        .open_table(STATES)?
+        .get(transfer_id.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec());
+    let Some(encoded) = encoded else {
+        return Ok(None);
+    };
+    let sealed = write
+        .open_table(STATE_BYTES)?
+        .get(transfer_id.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec())
+        .ok_or(StoreError::StateInvariant(
+            "State metadata is missing exact source bytes",
+        ))?;
+    let marker = write
+        .open_table(STATE_ACCEPTANCE_MARKERS)?
+        .get(transfer_id.as_bytes().as_slice())?
+        .map(|value| value.value())
+        .ok_or(StoreError::StateInvariant(
+            "State metadata is missing its acceptance marker",
+        ))?;
+    decode_stored_state(transfer_id, &encoded, sealed, marker).map(Some)
+}
+
+fn load_state_from_read(
+    read: &redb::ReadTransaction,
+    transfer_id: StateTransferId,
+) -> Result<Option<StoredState>, StoreError> {
+    let encoded = read
+        .open_table(STATES)?
+        .get(transfer_id.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec());
+    let Some(encoded) = encoded else {
+        return Ok(None);
+    };
+    let sealed = read
+        .open_table(STATE_BYTES)?
+        .get(transfer_id.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec())
+        .ok_or(StoreError::StateInvariant(
+            "State metadata is missing exact source bytes",
+        ))?;
+    let marker = read
+        .open_table(STATE_ACCEPTANCE_MARKERS)?
+        .get(transfer_id.as_bytes().as_slice())?
+        .map(|value| value.value())
+        .ok_or(StoreError::StateInvariant(
+            "State metadata is missing its acceptance marker",
+        ))?;
+    decode_stored_state(transfer_id, &encoded, sealed, marker).map(Some)
+}
+
+fn decode_stored_state(
+    transfer_id: StateTransferId,
+    encoded: &[u8],
+    sealed: Vec<u8>,
+    acceptance_marker: u64,
+) -> Result<StoredState, StoreError> {
+    let metadata = decode_state_metadata(encoded)?;
+    if metadata.transfer_id != transfer_id {
+        return Err(StoreError::StateInvariant(
+            "State metadata transfer identity differs from its table key",
+        ));
+    }
+    if StateTransferId::new(Sha256::digest(&sealed).into()) != transfer_id {
+        return Err(StoreError::StateInvariant(
+            "exact source bytes differ from their State transfer identity",
+        ));
+    }
+    Ok(StoredState {
+        transfer_id,
+        semantic_id: metadata.semantic_id,
+        header: metadata.header,
+        sealed,
+        acceptance_marker,
+    })
+}
+
+fn state_is_inactive_read(
+    read: &redb::ReadTransaction,
+    state: &StoredState,
+) -> Result<bool, StoreError> {
+    if control_principal_revoked_read(read, state.header.stamp.dot.publisher)? {
+        return Ok(true);
+    }
+    let current_epoch = read
+        .open_table(CONTROL_SCOPE_EPOCHS)?
+        .get(state.header.scope.as_str())?
+        .map(|value| decode_scope_epoch_index(value.value()))
+        .transpose()?
+        .map_or(1, |(current, _)| current);
+    Ok(state.header.key_epoch != current_epoch)
+}
+
+fn state_projection_plan_read(
+    read: &redb::ReadTransaction,
+    control_policy: ControlPolicySnapshot,
+    topic: &Topic,
+    scope: &Scope,
+    logical_key: &[u8],
+) -> Result<StateProjectionPlan, StoreError> {
+    let prefix = state_group_prefix(topic, scope, logical_key)?;
+    let groups = read.open_table(STATE_GROUP_VERSIONS)?;
+    let mut states = Vec::new();
+    let mut retained_count = 0usize;
+    for row in groups.iter()? {
+        let (key, value) = row?;
+        if !key.value().starts_with(&prefix) {
+            continue;
+        }
+        if key.value().len() != prefix.len() + 32 {
+            return Err(StoreError::StateInvariant(
+                "State group index contains an invalid exact-key row",
+            ));
+        }
+        retained_count = retained_count
+            .checked_add(1)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        if retained_count > MAX_STATE_VERSIONS_PER_KEY {
+            return Err(StoreError::StateProjectionLimitExceeded {
+                current: retained_count,
+                limit: MAX_STATE_VERSIONS_PER_KEY,
+            });
+        }
+        let semantic_id = StateSemanticId::new(
+            key.value()[prefix.len()..]
+                .try_into()
+                .map_err(|_| StoreError::StateInvariant("invalid State group semantic ID"))?,
+        );
+        let transfer_id = parse_state_transfer_id("State group index", value.value())?;
+        let state = load_state_from_read(read, transfer_id)?.ok_or(StoreError::StateInvariant(
+            "State group index points to a missing version",
+        ))?;
+        if state.semantic_id != semantic_id
+            || state.header.topic != *topic
+            || state.header.scope != *scope
+            || state.header.logical_key != logical_key
+        {
+            return Err(StoreError::StateInvariant(
+                "State group index differs from authenticated metadata",
+            ));
+        }
+        let active = !state_is_inactive_read(read, &state)?;
+        states.push((state, active));
+    }
+    states.sort_by_key(|(state, _)| state.semantic_id);
+
+    let maximal = states
+        .iter()
+        .filter(|(_, active)| *active)
+        .filter(|(candidate, _)| {
+            !states.iter().any(|(other, other_active)| {
+                *other_active
+                    && other.semantic_id != candidate.semantic_id
+                    && other
+                        .header
+                        .stamp
+                        .context
+                        .observes(candidate.header.stamp.dot)
+            })
+        })
+        .map(|(state, _)| state.semantic_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    let winner = maximal.iter().next_back().copied();
+    let candidates = states
+        .into_iter()
+        .map(|(state, active)| {
+            let disposition = if !active {
+                None
+            } else if Some(state.semantic_id) == winner {
+                Some(StateVersionDisposition::Current)
+            } else if maximal.contains(&state.semantic_id) {
+                Some(StateVersionDisposition::Concurrent)
+            } else {
+                Some(StateVersionDisposition::Superseded)
+            };
+            StateProjectionCandidate { state, disposition }
+        })
+        .collect();
+    Ok(StateProjectionPlan {
+        control_policy,
+        topic: topic.clone(),
+        scope: scope.clone(),
+        logical_key: logical_key.to_vec(),
+        candidates,
+    })
 }
 
 fn load_route_cached_event_read(
@@ -7712,6 +9428,11 @@ fn inspect_mission_binding_read_only(path: &Path) -> Result<Option<NodeId>, Stor
         } else {
             0
         };
+        let state_rows = if table_names.contains(STATES.name()) {
+            read.open_table(STATES)?.len()?
+        } else {
+            0
+        };
         let cached_rows = if table_names.contains(ROUTE_CACHE.name()) {
             read.open_table(ROUTE_CACHE)?.len()?
         } else {
@@ -7722,9 +9443,9 @@ fn inspect_mission_binding_read_only(path: &Path) -> Result<Option<NodeId>, Stor
         } else {
             0
         };
-        if semantic_rows != 0 || cached_rows != 0 || control_rows != 0 {
+        if semantic_rows != 0 || state_rows != 0 || cached_rows != 0 || control_rows != 0 {
             return Err(StoreError::SemanticInvariant(
-                "unbound store contains mission-scoped Event or control state",
+                "unbound store contains mission-scoped Event, State, or control state",
             ));
         }
     }
@@ -7800,10 +9521,386 @@ fn read_mission_binding_read(read: &redb::ReadTransaction) -> Result<Option<Node
         .transpose()
 }
 
+#[derive(Default)]
+struct StateAuditSnapshot {
+    count: u64,
+    total_bytes: u64,
+    last_marker: u64,
+    expected_dots: std::collections::BTreeMap<Vec<u8>, [u8; 32]>,
+    expected_publisher_high: std::collections::BTreeMap<Vec<u8>, u64>,
+    expected_frontier: std::collections::BTreeMap<Vec<u8>, u64>,
+    domain_publishers: std::collections::BTreeMap<Vec<u8>, std::collections::BTreeSet<NodeId>>,
+}
+
+fn audit_state_tables(write: &redb::WriteTransaction) -> Result<StateAuditSnapshot, StoreError> {
+    preflight_state_schema_group(write)?;
+    let states = write.open_table(STATES)?;
+    let state_bytes = write.open_table(STATE_BYTES)?;
+    let state_markers = write.open_table(STATE_ACCEPTANCE_MARKERS)?;
+    let state_semantic_items = write.open_table(STATE_SEMANTIC_ITEMS)?;
+    let state_groups = write.open_table(STATE_GROUP_VERSIONS)?;
+    let state_operations = write.open_table(STATE_OPERATIONS)?;
+    let events = write.open_table(EVENTS)?;
+    let event_semantic_items = write.open_table(SEMANTIC_ITEMS)?;
+    let route_cache = write.open_table(ROUTE_CACHE)?;
+    let route_claims = write.open_table(ROUTE_CACHE_CLAIMS)?;
+    let controls = write.open_table(CONTROL_RECORDS)?;
+    let accepted_dots = write.open_table(ACCEPTED_DOTS)?;
+    let publisher_high_water = write.open_table(PUBLISHER_HIGH_WATER)?;
+    let frontier = write.open_table(CAUSAL_FRONTIER)?;
+    // Decode each bounded route claim once; State collision checks below are
+    // logarithmic set lookups rather than a State-by-claim nested scan.
+    let mut route_semantic_ids = std::collections::BTreeSet::<[u8; 32]>::new();
+    for row in route_claims.iter()? {
+        let (_, claim) = row?;
+        route_semantic_ids.insert(*decode_event_metadata(claim.value())?.semantic_id.as_bytes());
+    }
+
+    let mut snapshot = StateAuditSnapshot::default();
+    let mut marker_values = std::collections::BTreeSet::new();
+    let mut expected_groups = std::collections::BTreeMap::<Vec<u8>, StateTransferId>::new();
+    let mut group_counts = std::collections::BTreeMap::<Vec<u8>, usize>::new();
+    for row in states.iter()? {
+        let (key, value) = row?;
+        let transfer_id = parse_state_transfer_id("State metadata table", key.value())?;
+        let metadata = decode_state_metadata(value.value())?;
+        if metadata.transfer_id != transfer_id {
+            return Err(StoreError::StateInvariant(
+                "State metadata transfer identity differs from its table key",
+            ));
+        }
+        if events.get(key.value())?.is_some()
+            || route_cache.get(key.value())?.is_some()
+            || controls.get(key.value())?.is_some()
+        {
+            return Err(StoreError::TransferNamespaceCollision {
+                transfer_id: *transfer_id.as_bytes(),
+            });
+        }
+        let sealed = state_bytes
+            .get(key.value())?
+            .ok_or(StoreError::StateInvariant(
+                "State metadata is missing exact source bytes",
+            ))?;
+        if StateTransferId::new(Sha256::digest(sealed.value()).into()) != transfer_id {
+            return Err(StoreError::StateInvariant(
+                "State source bytes fail exact transfer identity audit",
+            ));
+        }
+        let marker = state_markers
+            .get(key.value())?
+            .map(|value| value.value())
+            .ok_or(StoreError::StateInvariant(
+                "State metadata is missing its acceptance marker",
+            ))?;
+        if marker == 0 || !marker_values.insert(marker) {
+            return Err(StoreError::StateInvariant(
+                "State acceptance markers must be nonzero and unique",
+            ));
+        }
+        let indexed_transfer = state_semantic_items
+            .get(metadata.semantic_id.as_bytes().as_slice())?
+            .map(|value| parse_state_transfer_id("State semantic item table", value.value()))
+            .transpose()?
+            .ok_or(StoreError::StateInvariant(
+                "State metadata is missing its semantic item index",
+            ))?;
+        if indexed_transfer != transfer_id {
+            return Err(StoreError::StateInvariant(
+                "State semantic item index points to another representation",
+            ));
+        }
+        if event_semantic_items
+            .get(metadata.semantic_id.as_bytes().as_slice())?
+            .is_some()
+        {
+            return Err(StoreError::SemanticNamespaceCollision {
+                semantic_id: *metadata.semantic_id.as_bytes(),
+            });
+        }
+        if route_semantic_ids.contains(metadata.semantic_id.as_bytes()) {
+            return Err(StoreError::SemanticNamespaceCollision {
+                semantic_id: *metadata.semantic_id.as_bytes(),
+            });
+        }
+
+        let dot = metadata.header.stamp.dot;
+        let dot_key = accepted_dot_key(dot).to_vec();
+        if snapshot
+            .expected_dots
+            .insert(dot_key.clone(), *metadata.semantic_id.as_bytes())
+            .is_some()
+        {
+            return Err(StoreError::StateInvariant(
+                "multiple States claim one accepted causal dot",
+            ));
+        }
+        let accepted_semantic = accepted_dots
+            .get(dot_key.as_slice())?
+            .map(|value| parse_digest32("accepted dot table", value.value()))
+            .transpose()?
+            .ok_or(StoreError::StateInvariant(
+                "State metadata is missing its accepted-dot ledger row",
+            ))?;
+        if accepted_semantic != *metadata.semantic_id.as_bytes() {
+            return Err(StoreError::StateInvariant(
+                "accepted-dot ledger points to another semantic item",
+            ));
+        }
+
+        let group_prefix = state_group_prefix(
+            &metadata.header.topic,
+            &metadata.header.scope,
+            &metadata.header.logical_key,
+        )?;
+        let group_count = group_counts.entry(group_prefix).or_default();
+        *group_count = group_count
+            .checked_add(1)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        if *group_count > MAX_STATE_VERSIONS_PER_KEY {
+            return Err(StoreError::StateProjectionLimitExceeded {
+                current: *group_count,
+                limit: MAX_STATE_VERSIONS_PER_KEY,
+            });
+        }
+        let group_key = state_group_version_key(
+            &metadata.header.topic,
+            &metadata.header.scope,
+            &metadata.header.logical_key,
+            metadata.semantic_id,
+        )?;
+        if expected_groups.insert(group_key, transfer_id).is_some() {
+            return Err(StoreError::StateInvariant(
+                "multiple State versions claim one group index key",
+            ));
+        }
+
+        let publisher_high = publisher_high_water
+            .get(dot.publisher.as_slice())?
+            .map_or(0, |value| value.value());
+        if publisher_high < dot.counter {
+            return Err(StoreError::StateInvariant(
+                "publisher high-water is behind an accepted State dot",
+            ));
+        }
+        snapshot
+            .expected_publisher_high
+            .entry(dot.publisher.to_vec())
+            .and_modify(|current| *current = (*current).max(dot.counter))
+            .or_insert(dot.counter);
+        let frontier_key = causal_frontier_key(
+            &metadata.header.topic,
+            &metadata.header.scope,
+            dot.publisher,
+        )?;
+        let direct_frontier = frontier
+            .get(frontier_key.as_slice())?
+            .map_or(0, |value| value.value());
+        if direct_frontier < dot.counter {
+            return Err(StoreError::StateInvariant(
+                "causal frontier is behind a directly accepted State dot",
+            ));
+        }
+        snapshot
+            .expected_frontier
+            .entry(frontier_key)
+            .and_modify(|current| *current = (*current).max(dot.counter))
+            .or_insert(dot.counter);
+        snapshot
+            .domain_publishers
+            .entry(event_domain_prefix(
+                &metadata.header.topic,
+                &metadata.header.scope,
+            )?)
+            .or_default()
+            .insert(dot.publisher);
+
+        snapshot.count = snapshot
+            .count
+            .checked_add(1)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        snapshot.total_bytes = snapshot
+            .total_bytes
+            .checked_add(
+                u64::try_from(sealed.value().len())
+                    .map_err(|_| StoreError::PayloadByteAccountingOverflow)?,
+            )
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        snapshot.last_marker = snapshot.last_marker.max(marker);
+    }
+
+    if snapshot.last_marker != snapshot.count
+        || marker_values.iter().copied().ne(1..=snapshot.count)
+    {
+        return Err(StoreError::StateInvariant(
+            "State acceptance markers are not a contiguous allocation history",
+        ));
+    }
+    for row in state_bytes.iter()? {
+        let (key, _) = row?;
+        parse_state_transfer_id("State byte table", key.value())?;
+        if states.get(key.value())?.is_none() {
+            return Err(StoreError::StateInvariant(
+                "State bytes are missing metadata",
+            ));
+        }
+    }
+    for row in state_markers.iter()? {
+        let (key, _) = row?;
+        parse_state_transfer_id("State marker table", key.value())?;
+        if states.get(key.value())?.is_none() {
+            return Err(StoreError::StateInvariant(
+                "State marker is missing metadata",
+            ));
+        }
+    }
+    if state_semantic_items.len()? != snapshot.count {
+        return Err(StoreError::StateInvariant(
+            "State semantic item index has missing or orphan rows",
+        ));
+    }
+    for row in state_semantic_items.iter()? {
+        let (key, value) = row?;
+        let semantic_id = parse_state_semantic_id("State semantic item table", key.value())?;
+        let transfer_id = parse_state_transfer_id("State semantic item table", value.value())?;
+        let encoded =
+            states
+                .get(transfer_id.as_bytes().as_slice())?
+                .ok_or(StoreError::StateInvariant(
+                    "State semantic item index points to a missing version",
+                ))?;
+        if decode_state_metadata(encoded.value())?.semantic_id != semantic_id {
+            return Err(StoreError::StateInvariant(
+                "State semantic item index differs from metadata",
+            ));
+        }
+    }
+    if state_groups.len()? != snapshot.count {
+        return Err(StoreError::StateInvariant(
+            "State group index has missing or orphan rows",
+        ));
+    }
+    for row in state_groups.iter()? {
+        let (key, value) = row?;
+        let transfer_id = parse_state_transfer_id("State group index", value.value())?;
+        if expected_groups.get(key.value()) != Some(&transfer_id) {
+            return Err(StoreError::StateInvariant(
+                "State group index contains an orphan or mismatched row",
+            ));
+        }
+    }
+    let mut operation_count = 0u64;
+    let mut operation_bytes = 0u64;
+    for row in state_operations.iter()? {
+        let (key, value) = row?;
+        StateOperationKey::new(key.value().to_vec())?;
+        let record = decode_state_operation_record(value.value())?;
+        if states
+            .get(record.transfer_id.as_bytes().as_slice())?
+            .is_none()
+        {
+            return Err(StoreError::StateInvariant(
+                "State operation points to a missing version",
+            ));
+        }
+        operation_count = operation_count
+            .checked_add(1)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        let row_bytes = key
+            .value()
+            .len()
+            .checked_add(value.value().len())
+            .and_then(|length| u64::try_from(length).ok())
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        operation_bytes = operation_bytes
+            .checked_add(row_bytes)
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    }
+    if operation_count > MAX_STATE_OPERATIONS || operation_bytes > MAX_STATE_OPERATION_BYTES {
+        return Err(StoreError::StateInvariant(
+            "State operation usage exceeds its durable safety caps",
+        ));
+    }
+
+    {
+        let mut metadata = write.open_table(METADATA)?;
+        audit_or_initialize_counter(&mut metadata, STATE_ITEM_COUNT, snapshot.count)?;
+        audit_or_initialize_counter(&mut metadata, STATE_TOTAL_BYTES, snapshot.total_bytes)?;
+        audit_or_initialize_counter(
+            &mut metadata,
+            LAST_STATE_ACCEPTANCE_MARKER,
+            snapshot.last_marker,
+        )?;
+        audit_or_initialize_counter(&mut metadata, STATE_OPERATION_COUNT, operation_count)?;
+        audit_or_initialize_counter(&mut metadata, STATE_OPERATION_TOTAL_BYTES, operation_bytes)?;
+    }
+    Ok(snapshot)
+}
+
+fn preflight_state_schema_group(write: &redb::WriteTransaction) -> Result<(), StoreError> {
+    let state_tables = [
+        STATES.name(),
+        STATE_BYTES.name(),
+        STATE_ACCEPTANCE_MARKERS.name(),
+        STATE_SEMANTIC_ITEMS.name(),
+        STATE_GROUP_VERSIONS.name(),
+        STATE_OPERATIONS.name(),
+    ];
+    if write
+        .list_multimap_tables()?
+        .any(|table| state_tables.contains(&table.name()))
+    {
+        return Err(StoreError::StateInvariant(
+            "mission-scoped State schema has the wrong table kind",
+        ));
+    }
+    let table_names = write
+        .list_tables()?
+        .map(|table| table.name().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    let present_tables = state_tables
+        .iter()
+        .filter(|name| table_names.contains(**name))
+        .count();
+    let metadata_presence = {
+        let metadata = write.open_table(METADATA)?;
+        [
+            metadata.get(STATE_ITEM_COUNT)?.is_some(),
+            metadata.get(STATE_TOTAL_BYTES)?.is_some(),
+            metadata.get(LAST_STATE_ACCEPTANCE_MARKER)?.is_some(),
+            metadata.get(STATE_OPERATION_COUNT)?.is_some(),
+            metadata.get(STATE_OPERATION_TOTAL_BYTES)?.is_some(),
+        ]
+    };
+    let present_metadata = metadata_presence.iter().filter(|present| **present).count();
+    if present_tables == 0 && present_metadata == 0 {
+        write.open_table(STATES)?;
+        write.open_table(STATE_BYTES)?;
+        write.open_table(STATE_ACCEPTANCE_MARKERS)?;
+        write.open_table(STATE_SEMANTIC_ITEMS)?;
+        write.open_table(STATE_GROUP_VERSIONS)?;
+        write.open_table(STATE_OPERATIONS)?;
+        let mut metadata = write.open_table(METADATA)?;
+        metadata.insert(STATE_ITEM_COUNT, 0)?;
+        metadata.insert(STATE_TOTAL_BYTES, 0)?;
+        metadata.insert(LAST_STATE_ACCEPTANCE_MARKER, 0)?;
+        metadata.insert(STATE_OPERATION_COUNT, 0)?;
+        metadata.insert(STATE_OPERATION_TOTAL_BYTES, 0)?;
+        return Ok(());
+    }
+    if present_tables != state_tables.len() || present_metadata != metadata_presence.len() {
+        return Err(StoreError::StateInvariant(
+            "mission-scoped State schema group is incomplete",
+        ));
+    }
+    Ok(())
+}
+
 fn audit_semantic_tables(write: &redb::WriteTransaction) -> Result<(), StoreError> {
     // Opening every table here is the non-destructive schema extension for old
     // stores. Existing v1 opaque item/effect bytes remain untouched and use a
     // disjoint caller-controlled key namespace.
+    let state_audit = audit_state_tables(write)?;
     if write
         .list_multimap_tables()?
         .any(|table| table.name() == EVENT_ACCEPTANCE_ORDER.name())
@@ -7820,6 +9917,7 @@ fn audit_semantic_tables(write: &redb::WriteTransaction) -> Result<(), StoreErro
     let event_markers = write.open_table(EVENT_ACCEPTANCE_MARKERS)?;
     let mut event_acceptance_order = write.open_table(EVENT_ACCEPTANCE_ORDER)?;
     let semantic_items = write.open_table(SEMANTIC_ITEMS)?;
+    let state_semantic_items = write.open_table(STATE_SEMANTIC_ITEMS)?;
     let accepted_dots = write.open_table(ACCEPTED_DOTS)?;
     let accepted_events = write.open_table(ACCEPTED_EVENTS)?;
     let frontier = write.open_table(CAUSAL_FRONTIER)?;
@@ -7834,13 +9932,12 @@ fn audit_semantic_tables(write: &redb::WriteTransaction) -> Result<(), StoreErro
     let mut reconstructed_event_bytes = 0u64;
     let mut reconstructed_last_marker = 0u64;
     let mut acceptance_marker_values = std::collections::BTreeSet::new();
-    let mut expected_dots = std::collections::BTreeMap::<Vec<u8>, EventSemanticId>::new();
+    let mut expected_dots = state_audit.expected_dots;
     let mut expected_positions = std::collections::BTreeMap::<Vec<u8>, EventSemanticId>::new();
-    let mut expected_publisher_high = std::collections::BTreeMap::<Vec<u8>, u64>::new();
+    let mut expected_publisher_high = state_audit.expected_publisher_high;
     let mut expected_event_high = std::collections::BTreeMap::<Vec<u8>, u64>::new();
-    let mut expected_frontier = std::collections::BTreeMap::<Vec<u8>, u64>::new();
-    let mut domain_publishers =
-        std::collections::BTreeMap::<Vec<u8>, std::collections::BTreeSet<NodeId>>::new();
+    let mut expected_frontier = state_audit.expected_frontier;
+    let mut domain_publishers = state_audit.domain_publishers;
 
     for row in events.iter()? {
         let (key, value) = row?;
@@ -7924,10 +10021,18 @@ fn audit_semantic_tables(write: &redb::WriteTransaction) -> Result<(), StoreErro
                 "semantic item index points to another Event representation",
             ));
         }
+        if state_semantic_items
+            .get(metadata.semantic_id.as_bytes().as_slice())?
+            .is_some()
+        {
+            return Err(StoreError::SemanticNamespaceCollision {
+                semantic_id: *metadata.semantic_id.as_bytes(),
+            });
+        }
         let dot = metadata.header.stamp.dot;
         let dot_key = accepted_dot_key(dot).to_vec();
         if expected_dots
-            .insert(dot_key.clone(), metadata.semantic_id)
+            .insert(dot_key.clone(), *metadata.semantic_id.as_bytes())
             .is_some()
         {
             return Err(StoreError::SemanticInvariant(
@@ -8140,7 +10245,7 @@ fn audit_semantic_tables(write: &redb::WriteTransaction) -> Result<(), StoreErro
     }
     for row in accepted_dots.iter()? {
         let (key, value) = row?;
-        let semantic_id = parse_semantic_id("accepted dot table", value.value())?;
+        let semantic_id = parse_digest32("accepted dot table", value.value())?;
         if expected_dots.get(key.value()) != Some(&semantic_id) {
             return Err(StoreError::SemanticInvariant(
                 "accepted-dot ledger contains an orphan or mismatched row",
@@ -8320,6 +10425,7 @@ fn audit_semantic_tables(write: &redb::WriteTransaction) -> Result<(), StoreErro
     drop(event_markers);
     drop(event_acceptance_order);
     drop(semantic_items);
+    drop(state_semantic_items);
     drop(accepted_dots);
     drop(accepted_events);
     drop(frontier);
@@ -9166,6 +11272,62 @@ fn validate_event_header(header: &EnvelopeHeader) -> Result<(), StoreError> {
     Ok(())
 }
 
+fn validate_state_logical_key(logical_key: &[u8]) -> Result<(), StoreError> {
+    if logical_key.is_empty() || logical_key.len() > MAX_STATE_LOGICAL_KEY_BYTES {
+        return Err(StoreError::InvalidSemanticState(
+            "logical key length is outside 1..=4096 bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_state_header(header: &EnvelopeHeader) -> Result<(), StoreError> {
+    if header.class != SemanticDataClass::State {
+        return Err(StoreError::InvalidSemanticState(
+            "authenticated data class is not State",
+        ));
+    }
+    if header.stamp.dot.counter == 0 {
+        return Err(StoreError::InvalidSemanticState(
+            "causal counter must be nonzero",
+        ));
+    }
+    if header.stamp.context.len() > MAX_CAUSAL_CONTEXT_ENTRIES
+        || header
+            .stamp
+            .context
+            .iter()
+            .any(|(_, counter)| *counter == 0)
+        || header.stamp.context.counter(&header.stamp.dot.publisher) >= header.stamp.dot.counter
+    {
+        return Err(StoreError::InvalidSemanticState(
+            "causal context is internally inconsistent",
+        ));
+    }
+    validate_state_logical_key(&header.logical_key)?;
+    if header.event_sequence.is_some() {
+        return Err(StoreError::InvalidSemanticState(
+            "State cannot carry an Event sequence",
+        ));
+    }
+    if header.blob_route.is_some() {
+        return Err(StoreError::InvalidSemanticState(
+            "State cannot carry a Blob route commitment",
+        ));
+    }
+    if header.ttl_ms.is_some() {
+        return Err(StoreError::InvalidSemanticState(
+            "selected State foundation does not admit finite TTL",
+        ));
+    }
+    if header.tombstone && header.content_len != 0 {
+        return Err(StoreError::InvalidSemanticState(
+            "State tombstone content length must be zero",
+        ));
+    }
+    Ok(())
+}
+
 fn event_sequence(header: &EnvelopeHeader) -> Result<u64, StoreError> {
     header
         .event_sequence
@@ -9178,6 +11340,32 @@ fn event_domain_prefix(topic: &Topic, scope: &Scope) -> Result<Vec<u8>, StoreErr
     let mut key = Vec::with_capacity(4 + topic.as_str().len() + scope.as_str().len());
     push_short_bytes(&mut key, topic.as_str().as_bytes())?;
     push_short_bytes(&mut key, scope.as_str().as_bytes())?;
+    Ok(key)
+}
+
+fn state_group_prefix(
+    topic: &Topic,
+    scope: &Scope,
+    logical_key: &[u8],
+) -> Result<Vec<u8>, StoreError> {
+    validate_state_logical_key(logical_key)?;
+    let mut key = event_domain_prefix(topic, scope)?;
+    let length = u32::try_from(logical_key.len()).map_err(|_| {
+        StoreError::InvalidSemanticState("logical key exceeds group-index encoding bound")
+    })?;
+    key.extend_from_slice(&length.to_be_bytes());
+    key.extend_from_slice(logical_key);
+    Ok(key)
+}
+
+fn state_group_version_key(
+    topic: &Topic,
+    scope: &Scope,
+    logical_key: &[u8],
+    semantic_id: StateSemanticId,
+) -> Result<Vec<u8>, StoreError> {
+    let mut key = state_group_prefix(topic, scope, logical_key)?;
+    key.extend_from_slice(semantic_id.as_bytes());
     Ok(key)
 }
 
@@ -9361,6 +11549,191 @@ fn decode_event_metadata(bytes: &[u8]) -> Result<EventMetadata, StoreError> {
         transfer_id,
         semantic_id,
         header,
+    })
+}
+
+fn encode_state_metadata(
+    transfer_id: StateTransferId,
+    semantic_id: StateSemanticId,
+    header: &EnvelopeHeader,
+) -> Result<Vec<u8>, StoreError> {
+    validate_state_header(header)?;
+    let mut output = Vec::new();
+    output.push(STATE_METADATA_VERSION);
+    output.extend_from_slice(transfer_id.as_bytes());
+    output.extend_from_slice(semantic_id.as_bytes());
+    output.push(header.priority as u8);
+    output.push(u8::from(header.tombstone));
+    output.extend_from_slice(&header.stamp.dot.publisher);
+    output.extend_from_slice(&header.stamp.dot.counter.to_be_bytes());
+    output.extend_from_slice(&header.content_len.to_be_bytes());
+    output.extend_from_slice(&header.key_epoch.to_be_bytes());
+    push_short_bytes(&mut output, header.topic.as_str().as_bytes())?;
+    push_short_bytes(&mut output, header.scope.as_str().as_bytes())?;
+    let logical_length = u32::try_from(header.logical_key.len()).map_err(|_| {
+        StoreError::InvalidSemanticState("logical key exceeds durable encoding bound")
+    })?;
+    output.extend_from_slice(&logical_length.to_be_bytes());
+    output.extend_from_slice(&header.logical_key);
+    let context_length = u32::try_from(header.stamp.context.len()).map_err(|_| {
+        StoreError::InvalidSemanticState("causal context exceeds durable encoding bound")
+    })?;
+    output.extend_from_slice(&context_length.to_be_bytes());
+    for (publisher, counter) in header.stamp.context.iter() {
+        output.extend_from_slice(publisher);
+        output.extend_from_slice(&counter.to_be_bytes());
+    }
+    Ok(output)
+}
+
+fn decode_state_metadata(bytes: &[u8]) -> Result<StateMetadata, StoreError> {
+    let mut cursor = MetadataCursor::new(bytes);
+    if cursor.u8()? != STATE_METADATA_VERSION {
+        return Err(StoreError::StateInvariant(
+            "unknown State metadata encoding version",
+        ));
+    }
+    let transfer_id = StateTransferId::new(cursor.array()?);
+    let semantic_id = StateSemanticId::new(cursor.array()?);
+    let priority = Priority::from_wire(cursor.u8()?).ok_or(StoreError::StateInvariant(
+        "unknown authenticated State priority",
+    ))?;
+    let tombstone = match cursor.u8()? {
+        0 => false,
+        1 => true,
+        _ => return Err(StoreError::StateInvariant("invalid State metadata flags")),
+    };
+    let publisher = cursor.array()?;
+    let counter = cursor.u64()?;
+    let content_len = cursor.u64()?;
+    let key_epoch = cursor.u64()?;
+    let topic = Topic::new(cursor.short_string()?)
+        .map_err(|_| StoreError::StateInvariant("invalid State topic encoding"))?;
+    let scope = Scope::new(cursor.short_string()?)
+        .map_err(|_| StoreError::StateInvariant("invalid State scope encoding"))?;
+    let logical_length = usize::try_from(cursor.u32()?)
+        .map_err(|_| StoreError::StateInvariant("invalid State logical-key length"))?;
+    if logical_length == 0 || logical_length > MAX_STATE_LOGICAL_KEY_BYTES {
+        return Err(StoreError::StateInvariant(
+            "State logical key exceeds its bound",
+        ));
+    }
+    let logical_key = cursor.take(logical_length)?.to_vec();
+    let context_length = usize::try_from(cursor.u32()?)
+        .map_err(|_| StoreError::StateInvariant("invalid State context length"))?;
+    if context_length > MAX_CAUSAL_CONTEXT_ENTRIES {
+        return Err(StoreError::StateInvariant(
+            "State causal context exceeds its bound",
+        ));
+    }
+    let mut context = VersionVector::default();
+    for _ in 0..context_length {
+        let context_publisher = cursor.array()?;
+        let context_counter = cursor.u64()?;
+        if context_counter == 0 || context.counter(&context_publisher) != 0 {
+            return Err(StoreError::StateInvariant(
+                "State causal context is not canonical",
+            ));
+        }
+        context.observe(Dot {
+            publisher: context_publisher,
+            counter: context_counter,
+        });
+    }
+    cursor.finish()?;
+    let header = EnvelopeHeader {
+        class: SemanticDataClass::State,
+        topic,
+        scope,
+        priority,
+        stamp: CausalStamp {
+            dot: Dot { publisher, counter },
+            context,
+        },
+        event_sequence: None,
+        logical_key,
+        blob_route: None,
+        ttl_ms: None,
+        content_len,
+        tombstone,
+        key_epoch,
+    };
+    validate_state_header(&header).map_err(|_| {
+        StoreError::StateInvariant("decoded State metadata is internally inconsistent")
+    })?;
+    Ok(StateMetadata {
+        transfer_id,
+        semantic_id,
+        header,
+    })
+}
+
+fn state_publication_intent_digest(
+    intent: &StatePublicationIntent,
+) -> Result<[u8; 32], StoreError> {
+    let topic_len = u16::try_from(intent.topic.as_str().len())
+        .map_err(|_| StoreError::InvalidSemanticState("topic exceeds intent encoding bound"))?;
+    let scope_len = u16::try_from(intent.scope.as_str().len())
+        .map_err(|_| StoreError::InvalidSemanticState("scope exceeds intent encoding bound"))?;
+    let logical_len = u32::try_from(intent.logical_key.len()).map_err(|_| {
+        StoreError::InvalidSemanticState("logical key exceeds intent encoding bound")
+    })?;
+    let mut digest = Sha256::new();
+    digest.update(STATE_PUBLICATION_INTENT_DOMAIN);
+    digest.update(intent.publisher);
+    digest.update(topic_len.to_be_bytes());
+    digest.update(intent.topic.as_str().as_bytes());
+    digest.update(scope_len.to_be_bytes());
+    digest.update(intent.scope.as_str().as_bytes());
+    digest.update([intent.priority as u8]);
+    digest.update(logical_len.to_be_bytes());
+    digest.update(&intent.logical_key);
+    digest.update(intent.content_len.to_be_bytes());
+    digest.update(intent.payload_digest);
+    digest.update([u8::from(intent.tombstone)]);
+    Ok(digest.finalize().into())
+}
+
+fn validate_state_publication_intent(
+    intent: &StatePublicationIntent,
+    payload: &[u8],
+    header: &EnvelopeHeader,
+) -> Result<(), StoreError> {
+    if !intent.matches_payload(payload)
+        || header.stamp.dot.publisher != intent.publisher
+        || header.topic != intent.topic
+        || header.scope != intent.scope
+        || header.priority != intent.priority
+        || header.logical_key != intent.logical_key
+        || header.content_len != intent.content_len
+        || header.tombstone != intent.tombstone
+    {
+        return Err(StoreError::StateOperationConflict);
+    }
+    Ok(())
+}
+
+fn encode_state_operation_record(record: StateOperationRecord) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(65);
+    encoded.push(STATE_OPERATION_VERSION);
+    encoded.extend_from_slice(record.transfer_id.as_bytes());
+    encoded.extend_from_slice(&record.intent_digest);
+    encoded
+}
+
+fn decode_state_operation_record(bytes: &[u8]) -> Result<StateOperationRecord, StoreError> {
+    let mut cursor = MetadataCursor::new(bytes);
+    if cursor.u8()? != STATE_OPERATION_VERSION {
+        return Err(StoreError::StateInvariant(
+            "unknown State operation encoding version",
+        ));
+    }
+    let transfer_id = StateTransferId::new(cursor.array()?);
+    let intent_digest = cursor.array()?;
+    cursor.finish()?;
+    Ok(StateOperationRecord {
+        transfer_id,
+        intent_digest,
     })
 }
 
@@ -10334,6 +12707,38 @@ fn enforce_event_policy_write(
     Ok(())
 }
 
+fn enforce_state_policy_write(
+    write: &redb::WriteTransaction,
+    authority: NodeId,
+    expected: &ControlPolicySnapshot,
+    header: &EnvelopeHeader,
+) -> Result<(), StoreError> {
+    require_control_policy_write(write, authority, expected)?;
+    let publisher = header.stamp.dot.publisher;
+    if control_principal_revoked_write(write, publisher)? {
+        return Err(StoreError::StatePublisherRevoked(publisher));
+    }
+    let current_epoch = write
+        .open_table(CONTROL_SCOPE_EPOCHS)?
+        .get(header.scope.as_str())?
+        .map(|value| decode_scope_epoch_index(value.value()))
+        .transpose()?
+        .map_or(1, |(epoch, _)| epoch);
+    if header.key_epoch < current_epoch {
+        return Err(StoreError::StateKeyEpochStale {
+            current: current_epoch,
+            received: header.key_epoch,
+        });
+    }
+    if header.key_epoch > current_epoch {
+        return Err(StoreError::StateKeyEpochNotActive {
+            current: current_epoch,
+            received: header.key_epoch,
+        });
+    }
+    Ok(())
+}
+
 fn canonical_event_replication_projection(
     selectors: impl IntoIterator<Item = EventReplicationSelector>,
 ) -> Vec<EventReplicationSelector> {
@@ -10548,6 +12953,29 @@ fn parse_transfer_id(table: &'static str, bytes: &[u8]) -> Result<EventTransferI
     Ok(EventTransferId::new(bytes))
 }
 
+fn parse_state_transfer_id(
+    table: &'static str,
+    bytes: &[u8],
+) -> Result<StateTransferId, StoreError> {
+    Ok(StateTransferId::new(parse_digest32(table, bytes)?))
+}
+
+fn parse_state_semantic_id(
+    table: &'static str,
+    bytes: &[u8],
+) -> Result<StateSemanticId, StoreError> {
+    Ok(StateSemanticId::new(parse_digest32(table, bytes)?))
+}
+
+fn parse_digest32(table: &'static str, bytes: &[u8]) -> Result<[u8; 32], StoreError> {
+    bytes
+        .try_into()
+        .map_err(|_| StoreError::InvalidStoredIdLength {
+            table,
+            length: bytes.len(),
+        })
+}
+
 fn parse_control_transfer_id(
     table: &'static str,
     bytes: &[u8],
@@ -10728,9 +13156,373 @@ fn inspect_control_tables(
     Ok(Some(stats))
 }
 
+fn inspect_state_readable(
+    read: &redb::ReadTransaction,
+) -> Result<(StateStoreStats, StateAuditSnapshot), StoreError> {
+    let state_tables = [
+        STATES.name(),
+        STATE_BYTES.name(),
+        STATE_ACCEPTANCE_MARKERS.name(),
+        STATE_SEMANTIC_ITEMS.name(),
+        STATE_GROUP_VERSIONS.name(),
+        STATE_OPERATIONS.name(),
+    ];
+    if read
+        .list_multimap_tables()?
+        .any(|table| state_tables.contains(&table.name()))
+    {
+        return Err(StoreError::StateInvariant(
+            "mission-scoped State schema has the wrong table kind",
+        ));
+    }
+    let table_names = read
+        .list_tables()?
+        .map(|table| table.name().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    let present = state_tables
+        .iter()
+        .filter(|name| table_names.contains(**name))
+        .count();
+    let metadata = read.open_table(METADATA)?;
+    let metadata_presence = [
+        metadata.get(STATE_ITEM_COUNT)?.is_some(),
+        metadata.get(STATE_TOTAL_BYTES)?.is_some(),
+        metadata.get(LAST_STATE_ACCEPTANCE_MARKER)?.is_some(),
+        metadata.get(STATE_OPERATION_COUNT)?.is_some(),
+        metadata.get(STATE_OPERATION_TOTAL_BYTES)?.is_some(),
+    ];
+    if present == 0 && metadata_presence.iter().all(|present| !present) {
+        return Ok((StateStoreStats::default(), StateAuditSnapshot::default()));
+    }
+    if present != state_tables.len() || metadata_presence.iter().any(|present| !present) {
+        return Err(StoreError::StateInvariant(
+            "mission-scoped State schema group is incomplete",
+        ));
+    }
+
+    let states = read.open_table(STATES)?;
+    let state_bytes = read.open_table(STATE_BYTES)?;
+    let state_markers = read.open_table(STATE_ACCEPTANCE_MARKERS)?;
+    let state_semantic_items = read.open_table(STATE_SEMANTIC_ITEMS)?;
+    let state_groups = read.open_table(STATE_GROUP_VERSIONS)?;
+    let state_operations = read.open_table(STATE_OPERATIONS)?;
+    let events = table_names
+        .contains(EVENTS.name())
+        .then(|| read.open_table(EVENTS))
+        .transpose()?;
+    let event_semantic_items = table_names
+        .contains(SEMANTIC_ITEMS.name())
+        .then(|| read.open_table(SEMANTIC_ITEMS))
+        .transpose()?;
+    let route_cache = table_names
+        .contains(ROUTE_CACHE.name())
+        .then(|| read.open_table(ROUTE_CACHE))
+        .transpose()?;
+    let route_claims = table_names
+        .contains(ROUTE_CACHE_CLAIMS.name())
+        .then(|| read.open_table(ROUTE_CACHE_CLAIMS))
+        .transpose()?;
+    let controls = table_names
+        .contains(CONTROL_RECORDS.name())
+        .then(|| read.open_table(CONTROL_RECORDS))
+        .transpose()?;
+    let accepted_dots = read.open_table(ACCEPTED_DOTS)?;
+    // Mirror writable audit shape so strict inspection is O(claims log claims +
+    // States log claims), while the complete route-table audit still runs later.
+    let mut route_semantic_ids = std::collections::BTreeSet::<[u8; 32]>::new();
+    if let Some(route_claims) = &route_claims {
+        for row in route_claims.iter()? {
+            let (_, claim) = row?;
+            route_semantic_ids
+                .insert(*decode_event_metadata(claim.value())?.semantic_id.as_bytes());
+        }
+    }
+
+    let mut snapshot = StateAuditSnapshot::default();
+    let mut marker_values = std::collections::BTreeSet::new();
+    let mut expected_groups = std::collections::BTreeMap::<Vec<u8>, StateTransferId>::new();
+    let mut group_counts = std::collections::BTreeMap::<Vec<u8>, usize>::new();
+    for row in states.iter()? {
+        let (key, value) = row?;
+        let transfer_id = parse_state_transfer_id("State metadata table", key.value())?;
+        let state = decode_state_metadata(value.value())?;
+        if state.transfer_id != transfer_id {
+            return Err(StoreError::StateInvariant(
+                "State metadata transfer identity differs from its table key",
+            ));
+        }
+        if events
+            .as_ref()
+            .map(|events| events.get(key.value()))
+            .transpose()?
+            .flatten()
+            .is_some()
+            || route_cache
+                .as_ref()
+                .map(|cache| cache.get(key.value()))
+                .transpose()?
+                .flatten()
+                .is_some()
+            || controls
+                .as_ref()
+                .map(|controls| controls.get(key.value()))
+                .transpose()?
+                .flatten()
+                .is_some()
+        {
+            return Err(StoreError::TransferNamespaceCollision {
+                transfer_id: *transfer_id.as_bytes(),
+            });
+        }
+        let sealed = state_bytes
+            .get(key.value())?
+            .ok_or(StoreError::StateInvariant(
+                "State metadata is missing exact source bytes",
+            ))?;
+        if StateTransferId::new(Sha256::digest(sealed.value()).into()) != transfer_id {
+            return Err(StoreError::StateInvariant(
+                "State source bytes fail exact transfer identity audit",
+            ));
+        }
+        let marker = state_markers
+            .get(key.value())?
+            .map(|value| value.value())
+            .ok_or(StoreError::StateInvariant(
+                "State metadata is missing its acceptance marker",
+            ))?;
+        if marker == 0 || !marker_values.insert(marker) {
+            return Err(StoreError::StateInvariant(
+                "State acceptance markers must be nonzero and unique",
+            ));
+        }
+        let indexed = state_semantic_items
+            .get(state.semantic_id.as_bytes().as_slice())?
+            .map(|value| parse_state_transfer_id("State semantic item table", value.value()))
+            .transpose()?
+            .ok_or(StoreError::StateInvariant(
+                "State metadata is missing its semantic item index",
+            ))?;
+        if indexed != transfer_id {
+            return Err(StoreError::StateInvariant(
+                "State semantic item index points to another representation",
+            ));
+        }
+        if event_semantic_items
+            .as_ref()
+            .map(|items| items.get(state.semantic_id.as_bytes().as_slice()))
+            .transpose()?
+            .flatten()
+            .is_some()
+        {
+            return Err(StoreError::SemanticNamespaceCollision {
+                semantic_id: *state.semantic_id.as_bytes(),
+            });
+        }
+        if route_semantic_ids.contains(state.semantic_id.as_bytes()) {
+            return Err(StoreError::SemanticNamespaceCollision {
+                semantic_id: *state.semantic_id.as_bytes(),
+            });
+        }
+
+        let dot = state.header.stamp.dot;
+        let dot_key = accepted_dot_key(dot).to_vec();
+        if snapshot
+            .expected_dots
+            .insert(dot_key.clone(), *state.semantic_id.as_bytes())
+            .is_some()
+        {
+            return Err(StoreError::StateInvariant(
+                "multiple States claim one accepted causal dot",
+            ));
+        }
+        let durable_dot = accepted_dots
+            .get(dot_key.as_slice())?
+            .map(|value| parse_digest32("accepted dot table", value.value()))
+            .transpose()?
+            .ok_or(StoreError::StateInvariant(
+                "State metadata is missing its accepted-dot ledger row",
+            ))?;
+        if durable_dot != *state.semantic_id.as_bytes() {
+            return Err(StoreError::StateInvariant(
+                "accepted-dot ledger points to another semantic item",
+            ));
+        }
+        let group_prefix = state_group_prefix(
+            &state.header.topic,
+            &state.header.scope,
+            &state.header.logical_key,
+        )?;
+        let count = group_counts.entry(group_prefix).or_default();
+        *count = count
+            .checked_add(1)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        if *count > MAX_STATE_VERSIONS_PER_KEY {
+            return Err(StoreError::StateProjectionLimitExceeded {
+                current: *count,
+                limit: MAX_STATE_VERSIONS_PER_KEY,
+            });
+        }
+        let group_key = state_group_version_key(
+            &state.header.topic,
+            &state.header.scope,
+            &state.header.logical_key,
+            state.semantic_id,
+        )?;
+        expected_groups.insert(group_key, transfer_id);
+        snapshot
+            .expected_publisher_high
+            .entry(dot.publisher.to_vec())
+            .and_modify(|current| *current = (*current).max(dot.counter))
+            .or_insert(dot.counter);
+        snapshot
+            .expected_frontier
+            .entry(causal_frontier_key(
+                &state.header.topic,
+                &state.header.scope,
+                dot.publisher,
+            )?)
+            .and_modify(|current| *current = (*current).max(dot.counter))
+            .or_insert(dot.counter);
+        snapshot
+            .domain_publishers
+            .entry(event_domain_prefix(
+                &state.header.topic,
+                &state.header.scope,
+            )?)
+            .or_default()
+            .insert(dot.publisher);
+        snapshot.count = snapshot
+            .count
+            .checked_add(1)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        snapshot.total_bytes = snapshot
+            .total_bytes
+            .checked_add(
+                u64::try_from(sealed.value().len())
+                    .map_err(|_| StoreError::PayloadByteAccountingOverflow)?,
+            )
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        snapshot.last_marker = snapshot.last_marker.max(marker);
+    }
+    if snapshot.last_marker != snapshot.count
+        || marker_values.iter().copied().ne(1..=snapshot.count)
+    {
+        return Err(StoreError::StateInvariant(
+            "State acceptance markers are not a contiguous allocation history",
+        ));
+    }
+    if state_bytes.len()? != snapshot.count
+        || state_markers.len()? != snapshot.count
+        || state_semantic_items.len()? != snapshot.count
+        || state_groups.len()? != snapshot.count
+    {
+        return Err(StoreError::StateInvariant(
+            "State schema has missing or orphan rows",
+        ));
+    }
+    for row in state_bytes.iter()? {
+        let (key, _) = row?;
+        if states.get(key.value())?.is_none() {
+            return Err(StoreError::StateInvariant("State bytes are orphaned"));
+        }
+    }
+    for row in state_markers.iter()? {
+        let (key, _) = row?;
+        if states.get(key.value())?.is_none() {
+            return Err(StoreError::StateInvariant("State marker is orphaned"));
+        }
+    }
+    for row in state_semantic_items.iter()? {
+        let (key, value) = row?;
+        let semantic_id = parse_state_semantic_id("State semantic item table", key.value())?;
+        let transfer_id = parse_state_transfer_id("State semantic item table", value.value())?;
+        let encoded =
+            states
+                .get(transfer_id.as_bytes().as_slice())?
+                .ok_or(StoreError::StateInvariant(
+                    "State semantic item index points to a missing version",
+                ))?;
+        if decode_state_metadata(encoded.value())?.semantic_id != semantic_id {
+            return Err(StoreError::StateInvariant(
+                "State semantic item index differs from metadata",
+            ));
+        }
+    }
+    for row in state_groups.iter()? {
+        let (key, value) = row?;
+        let transfer_id = parse_state_transfer_id("State group index", value.value())?;
+        if expected_groups.get(key.value()) != Some(&transfer_id) {
+            return Err(StoreError::StateInvariant(
+                "State group index contains an orphan or mismatched row",
+            ));
+        }
+    }
+    let mut operation_count = 0u64;
+    let mut operation_bytes = 0u64;
+    for row in state_operations.iter()? {
+        let (key, value) = row?;
+        StateOperationKey::new(key.value().to_vec())?;
+        let record = decode_state_operation_record(value.value())?;
+        if states
+            .get(record.transfer_id.as_bytes().as_slice())?
+            .is_none()
+        {
+            return Err(StoreError::StateInvariant(
+                "State operation points to a missing version",
+            ));
+        }
+        operation_count = operation_count
+            .checked_add(1)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        let row_bytes = key
+            .value()
+            .len()
+            .checked_add(value.value().len())
+            .and_then(|length| u64::try_from(length).ok())
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        operation_bytes = operation_bytes
+            .checked_add(row_bytes)
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    }
+    if operation_count > MAX_STATE_OPERATIONS || operation_bytes > MAX_STATE_OPERATION_BYTES {
+        return Err(StoreError::StateInvariant(
+            "State operation usage exceeds its durable safety caps",
+        ));
+    }
+    let stats = StateStoreStats {
+        states: snapshot.count,
+        acceptance_markers: state_markers.len()?,
+        total_sealed_bytes: snapshot.total_bytes,
+        last_acceptance_marker: snapshot.last_marker,
+        operations: operation_count,
+        operation_bytes,
+    };
+    for (field, reconstructed) in [
+        (STATE_ITEM_COUNT, stats.states),
+        (STATE_TOTAL_BYTES, stats.total_sealed_bytes),
+        (LAST_STATE_ACCEPTANCE_MARKER, stats.last_acceptance_marker),
+        (STATE_OPERATION_COUNT, stats.operations),
+        (STATE_OPERATION_TOTAL_BYTES, stats.operation_bytes),
+    ] {
+        let durable = metadata
+            .get(field)?
+            .ok_or(StoreError::MissingAccountingMetadata { field })?
+            .value();
+        if durable != reconstructed {
+            return Err(StoreError::AccountingMismatch {
+                field,
+                durable,
+                reconstructed,
+            });
+        }
+    }
+    Ok((stats, snapshot))
+}
+
 fn inspect_semantic_readable(
     read: &redb::ReadTransaction,
-) -> Result<(EventStoreStats, Option<NodeId>), StoreError> {
+) -> Result<(EventStoreStats, StateStoreStats, Option<NodeId>), StoreError> {
+    let (state_stats, state_audit) = inspect_state_readable(read)?;
     if read
         .list_multimap_tables()?
         .any(|table| table.name() == EVENT_ACCEPTANCE_ORDER.name())
@@ -10769,7 +13561,7 @@ fn inspect_semantic_readable(
                 "mission-scoped Event schema is incomplete",
             ));
         }
-        return Ok((EventStoreStats::default(), None));
+        return Ok((EventStoreStats::default(), state_stats, None));
     }
     if present != semantic_tables.len() {
         return Err(StoreError::SemanticInvariant(
@@ -10784,6 +13576,10 @@ fn inspect_semantic_readable(
         .then(|| read.open_table(EVENT_ACCEPTANCE_ORDER))
         .transpose()?;
     let semantic_items = read.open_table(SEMANTIC_ITEMS)?;
+    let state_semantic_items = table_names
+        .contains(STATE_SEMANTIC_ITEMS.name())
+        .then(|| read.open_table(STATE_SEMANTIC_ITEMS))
+        .transpose()?;
     let accepted_dots = read.open_table(ACCEPTED_DOTS)?;
     let accepted_events = read.open_table(ACCEPTED_EVENTS)?;
     let frontier = read.open_table(CAUSAL_FRONTIER)?;
@@ -10803,13 +13599,12 @@ fn inspect_semantic_readable(
     let mut total_sealed_bytes = 0u64;
     let mut last_acceptance_marker = 0u64;
     let mut marker_values = std::collections::BTreeSet::new();
-    let mut expected_dots = std::collections::BTreeMap::<Vec<u8>, EventSemanticId>::new();
+    let mut expected_dots = state_audit.expected_dots;
     let mut expected_positions = std::collections::BTreeMap::<Vec<u8>, EventSemanticId>::new();
-    let mut expected_publisher_high = std::collections::BTreeMap::<Vec<u8>, u64>::new();
+    let mut expected_publisher_high = state_audit.expected_publisher_high;
     let mut expected_event_high = std::collections::BTreeMap::<Vec<u8>, u64>::new();
-    let mut expected_frontier = std::collections::BTreeMap::<Vec<u8>, u64>::new();
-    let mut domain_publishers =
-        std::collections::BTreeMap::<Vec<u8>, std::collections::BTreeSet<NodeId>>::new();
+    let mut expected_frontier = state_audit.expected_frontier;
+    let mut domain_publishers = state_audit.domain_publishers;
     for row in events.iter()? {
         let (key, value) = row?;
         let transfer_id = parse_transfer_id("Event metadata table", key.value())?;
@@ -10866,10 +13661,21 @@ fn inspect_semantic_readable(
                 "semantic item index points to another Event representation",
             ));
         }
+        if state_semantic_items
+            .as_ref()
+            .map(|items| items.get(event.semantic_id.as_bytes().as_slice()))
+            .transpose()?
+            .flatten()
+            .is_some()
+        {
+            return Err(StoreError::SemanticNamespaceCollision {
+                semantic_id: *event.semantic_id.as_bytes(),
+            });
+        }
         let dot = event.header.stamp.dot;
         let dot_key = accepted_dot_key(dot).to_vec();
         if expected_dots
-            .insert(dot_key.clone(), event.semantic_id)
+            .insert(dot_key.clone(), *event.semantic_id.as_bytes())
             .is_some()
         {
             return Err(StoreError::SemanticInvariant(
@@ -11036,7 +13842,7 @@ fn inspect_semantic_readable(
     }
     for row in accepted_dots.iter()? {
         let (key, value) = row?;
-        let semantic_id = parse_semantic_id("accepted dot table", value.value())?;
+        let semantic_id = parse_digest32("accepted dot table", value.value())?;
         if expected_dots.get(key.value()) != Some(&semantic_id) {
             return Err(StoreError::SemanticInvariant(
                 "accepted-dot ledger contains an orphan or mismatched row",
@@ -11222,7 +14028,9 @@ fn inspect_semantic_readable(
             "route-cache durable usage exceeds its configured safety cap",
         ));
     }
-    if mission_authority.is_none() && (event_count != 0 || route_count != 0) {
+    if mission_authority.is_none()
+        && (event_count != 0 || state_stats.states != 0 || route_count != 0)
+    {
         return Err(StoreError::SemanticInvariant(
             "unbound store contains mission-scoped Event state",
         ));
@@ -11258,7 +14066,7 @@ fn inspect_semantic_readable(
             });
         }
     }
-    Ok((stats, mission_authority))
+    Ok((stats, state_stats, mission_authority))
 }
 
 fn event_subscription_stats_read(
@@ -11559,7 +14367,7 @@ fn inspect_readable(database: &impl ReadableDatabase) -> Result<StoreInspection,
         });
     }
 
-    let (event_stats, mission_authority) = inspect_semantic_readable(&read)?;
+    let (event_stats, state_stats, mission_authority) = inspect_semantic_readable(&read)?;
     let event_subscription_stats = event_subscription_stats_read(&read)?;
     let control_stats = inspect_control_tables(&read, mission_authority)?.unwrap_or_default();
 
@@ -11572,6 +14380,7 @@ fn inspect_readable(database: &impl ReadableDatabase) -> Result<StoreInspection,
             last_acceptance_marker: durable_marker,
         },
         event_stats,
+        state_stats,
         event_subscription_stats,
         control_stats,
         mission_authority,
@@ -11596,8 +14405,9 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use aster_mesh::{
-        ContentVerifiedEventEnvelope, EventContentVerification, ProvisioningAccess,
-        ProvisioningBundle, ReferenceEnvelopeSealer, ReferenceProvisioner, ScopeRekeyRecipient,
+        ContentVerifiedEventEnvelope, ContentVerifiedStateEnvelope, EventContentVerification,
+        ProvisioningAccess, ProvisioningBundle, ReferenceEnvelopeSealer, ReferenceProvisioner,
+        ScopeRekeyRecipient, StateContentVerification,
     };
 
     use super::*;
@@ -11654,6 +14464,13 @@ mod tests {
         authority: NodeId,
     }
 
+    struct StateServices {
+        first: ReferenceEnvelopeSealer,
+        second: ReferenceEnvelopeSealer,
+        reader: ReferenceEnvelopeSealer,
+        authority: NodeId,
+    }
+
     fn event_topic() -> Topic {
         Topic::new("mesh-event").expect("topic")
     }
@@ -11668,6 +14485,39 @@ mod tests {
 
     fn child_event_scope() -> Scope {
         Scope::new("mission/events/child").expect("child scope")
+    }
+
+    fn state_topic() -> Topic {
+        Topic::new("mesh-state").expect("State topic")
+    }
+
+    fn state_scope() -> Scope {
+        Scope::new("mission/state").expect("State scope")
+    }
+
+    fn state_services(seed: u8) -> StateServices {
+        let mut provisioner = ReferenceProvisioner::from_seed([seed; 32]).expect("provisioner");
+        let member = ProvisioningAccess::member(state_scope(), vec![1, 2], vec![state_topic()])
+            .expect("State member access");
+        let first = provisioner
+            .issue_node(1, std::slice::from_ref(&member))
+            .and_then(ReferenceEnvelopeSealer::open)
+            .expect("first State publisher");
+        let second = provisioner
+            .issue_node(2, std::slice::from_ref(&member))
+            .and_then(ReferenceEnvelopeSealer::open)
+            .expect("second State publisher");
+        let reader = provisioner
+            .issue_node(3, &[member])
+            .and_then(ReferenceEnvelopeSealer::open)
+            .expect("State reader");
+        let authority = first.mission_authority_id();
+        StateServices {
+            first,
+            second,
+            reader,
+            authority,
+        }
     }
 
     fn event_services(seed: u8) -> EventServices {
@@ -11780,6 +14630,62 @@ mod tests {
             EventContentVerification::ContentVerified { event, payload: _ } => event,
             EventContentVerification::RouteOnly(_) => panic!("reader has a content grant"),
         }
+    }
+
+    fn content_state(
+        reader: &mut ReferenceEnvelopeSealer,
+        sealed: &[u8],
+    ) -> (ContentVerifiedStateEnvelope, Vec<u8>) {
+        let route = reader
+            .verify_state(sealed)
+            .expect("State route verification");
+        match reader
+            .verify_state_content(route, sealed)
+            .expect("State content verification")
+        {
+            StateContentVerification::ContentVerified { state, payload } => (state, payload),
+            StateContentVerification::RouteOnly(_) => panic!("reader has a State content grant"),
+        }
+    }
+
+    fn reserved_state(
+        publisher: &mut ReferenceEnvelopeSealer,
+        reader: &mut ReferenceEnvelopeSealer,
+        reservation: &StateReservation,
+        logical_key: &[u8],
+        payload: &[u8],
+        tombstone: bool,
+        key_epoch: u64,
+    ) -> (
+        ContentVerifiedStateEnvelope,
+        Vec<u8>,
+        StatePublicationIntent,
+    ) {
+        let header = reservation
+            .header(
+                Priority::Immediate,
+                logical_key.to_vec(),
+                payload.len() as u64,
+                tombstone,
+                key_epoch,
+            )
+            .expect("reserved State header");
+        let intent = StatePublicationIntent::new(
+            reservation.publisher(),
+            header.topic.clone(),
+            header.scope.clone(),
+            header.priority,
+            header.logical_key.clone(),
+            payload,
+            tombstone,
+        )
+        .expect("State publication intent");
+        let sealed = publisher
+            .seal_state(&header, payload)
+            .expect("seal reserved State");
+        let (state, opened) = content_state(reader, &sealed.bytes);
+        assert_eq!(opened, payload);
+        (state, sealed.bytes, intent)
     }
 
     fn event_header(
@@ -18808,5 +21714,1420 @@ mod tests {
             ))
         ));
         reject_without_repair(&oversized);
+    }
+
+    #[test]
+    fn state_operation_intent_is_restart_idempotent_epoch_independent_and_publisher_bound() {
+        let file = TestFile::new("State operation intent");
+        let mut services = state_services(0xb1);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("open store");
+        let policy = store.control_policy_snapshot().expect("settled policy");
+        let operation = StateOperationKey::new(b"state/op/1".to_vec()).expect("operation key");
+
+        let reservation = store
+            .reserve_state_with_policy(
+                &policy,
+                services.first.identity(),
+                &state_topic(),
+                &state_scope(),
+            )
+            .expect("reserve first State");
+        let (future, future_sealed, future_intent) = reserved_state(
+            &mut services.first,
+            &mut services.reader,
+            &reservation,
+            b"asset/7",
+            b"alpha",
+            false,
+            2,
+        );
+        let future_request = StateOperationRequest::new(&operation, &future_intent, b"alpha")
+            .expect("future operation request");
+        assert!(matches!(
+            store.commit_reserved_state_once_with_policy(
+                &policy,
+                &future_request,
+                &reservation,
+                &future,
+                &future_sealed,
+            ),
+            Err(StoreError::StateKeyEpochNotActive {
+                current: 1,
+                received: 2
+            })
+        ));
+        assert_eq!(
+            store.state_stats().expect("empty State stats"),
+            StateStoreStats::default()
+        );
+        assert_eq!(
+            store
+                .state_for_operation(&operation)
+                .expect("absent future operation"),
+            None
+        );
+        let (state, sealed, intent) = reserved_state(
+            &mut services.first,
+            &mut services.reader,
+            &reservation,
+            b"asset/7",
+            b"alpha",
+            false,
+            1,
+        );
+        let request =
+            StateOperationRequest::new(&operation, &intent, b"alpha").expect("operation request");
+        let inserted = store
+            .commit_reserved_state_once_with_policy(
+                &policy,
+                &request,
+                &reservation,
+                &state,
+                &sealed,
+            )
+            .expect("commit State operation");
+        assert!(matches!(inserted, StateOnceOutcome::Inserted { .. }));
+        let original = inserted.state().clone();
+
+        let activate_epoch = store.database.begin_write().expect("raw epoch activation");
+        activate_epoch
+            .open_table(CONTROL_SCOPE_EPOCHS)
+            .expect("scope epochs")
+            .insert(
+                state_scope().as_str(),
+                encode_scope_epoch_index(2, ControlTransferId::new([0x22; 32])).as_slice(),
+            )
+            .expect("activate epoch two for retry test");
+        activate_epoch.commit().expect("commit epoch activation");
+
+        let retry_reservation = store
+            .reserve_state_with_policy(
+                &policy,
+                services.first.identity(),
+                &state_topic(),
+                &state_scope(),
+            )
+            .expect("reserve retry State");
+        let (retry, retry_sealed, retry_intent) = reserved_state(
+            &mut services.first,
+            &mut services.reader,
+            &retry_reservation,
+            b"asset/7",
+            b"alpha",
+            false,
+            2,
+        );
+        let retry_request = StateOperationRequest::new(&operation, &retry_intent, b"alpha")
+            .expect("retry operation request");
+        let existing = store
+            .commit_reserved_state_once_with_policy(
+                &policy,
+                &retry_request,
+                &retry_reservation,
+                &retry,
+                &retry_sealed,
+            )
+            .expect("exact retry after epoch change");
+        assert!(matches!(existing, StateOnceOutcome::Existing { .. }));
+        assert_eq!(existing.state(), &original);
+
+        let (changed, changed_sealed, changed_intent) = reserved_state(
+            &mut services.first,
+            &mut services.reader,
+            &retry_reservation,
+            b"asset/7",
+            b"bravo",
+            false,
+            2,
+        );
+        let changed_request = StateOperationRequest::new(&operation, &changed_intent, b"bravo")
+            .expect("changed operation request");
+        assert!(matches!(
+            store.commit_reserved_state_once_with_policy(
+                &policy,
+                &changed_request,
+                &retry_reservation,
+                &changed,
+                &changed_sealed,
+            ),
+            Err(StoreError::StateOperationConflict)
+        ));
+
+        let other_reservation = store
+            .reserve_state_with_policy(
+                &policy,
+                services.second.identity(),
+                &state_topic(),
+                &state_scope(),
+            )
+            .expect("reserve other publisher");
+        let (other, other_sealed, other_intent) = reserved_state(
+            &mut services.second,
+            &mut services.reader,
+            &other_reservation,
+            b"asset/7",
+            b"alpha",
+            false,
+            2,
+        );
+        let other_request = StateOperationRequest::new(&operation, &other_intent, b"alpha")
+            .expect("other-publisher operation request");
+        assert!(matches!(
+            store.commit_reserved_state_once_with_policy(
+                &policy,
+                &other_request,
+                &other_reservation,
+                &other,
+                &other_sealed,
+            ),
+            Err(StoreError::StateOperationConflict)
+        ));
+        let cleanup_epoch = store.database.begin_write().expect("raw epoch cleanup");
+        cleanup_epoch
+            .open_table(CONTROL_SCOPE_EPOCHS)
+            .expect("scope epochs")
+            .remove(state_scope().as_str())
+            .expect("remove synthetic epoch activation");
+        cleanup_epoch.commit().expect("commit epoch cleanup");
+        drop(store);
+
+        let reopened = Store::open_for_mission(&file.0, services.authority).expect("reopen store");
+        let reopened_retry = reopened
+            .commit_reserved_state_once_with_policy(
+                &policy,
+                &request,
+                &reservation,
+                &state,
+                &sealed,
+            )
+            .expect("post-reopen exact operation retry");
+        assert!(matches!(reopened_retry, StateOnceOutcome::Existing { .. }));
+        assert_eq!(reopened_retry.state(), &original);
+
+        let revoke = reopened
+            .database
+            .begin_write()
+            .expect("raw publisher revocation");
+        revoke
+            .open_table(CONTROL_REVOCATIONS)
+            .expect("revocation table")
+            .insert(
+                services.first.identity().as_slice(),
+                encode_revocation_index(services.authority, 1, ControlTransferId::new([0x77; 32]))
+                    .as_slice(),
+            )
+            .expect("insert synthetic revocation");
+        revoke.commit().expect("commit synthetic revocation");
+        assert!(matches!(
+            reopened.commit_reserved_state_once_with_policy(
+                &policy,
+                &request,
+                &reservation,
+                &state,
+                &sealed,
+            ),
+            Err(StoreError::StatePublisherRevoked(publisher))
+                if publisher == services.first.identity()
+        ));
+        let restore = reopened
+            .database
+            .begin_write()
+            .expect("raw revocation cleanup");
+        restore
+            .open_table(CONTROL_REVOCATIONS)
+            .expect("revocation table")
+            .remove(services.first.identity().as_slice())
+            .expect("remove synthetic revocation");
+        restore.commit().expect("commit revocation cleanup");
+        assert_eq!(
+            reopened
+                .state_for_operation(&operation)
+                .expect("operation lookup"),
+            Some(original)
+        );
+        assert_eq!(
+            reopened.state_stats().expect("State stats"),
+            StateStoreStats {
+                states: 1,
+                acceptance_markers: 1,
+                total_sealed_bytes: u64::try_from(sealed.len()).expect("sealed length"),
+                last_acceptance_marker: 1,
+                operations: 1,
+                operation_bytes: u64::try_from(operation.as_bytes().len() + 65)
+                    .expect("operation bytes"),
+            }
+        );
+    }
+
+    #[test]
+    fn state_operation_caps_and_aggregate_quota_fail_atomically_on_existing_state_binding() {
+        let aggregate_file = TestFile::new("State operation aggregate quota");
+        let mut aggregate_services = state_services(0xb7);
+        let aggregate_limits =
+            StoreLimits::new(2, DEFAULT_MAX_TOTAL_PAYLOAD_BYTES).expect("aggregate limits");
+        let aggregate_store = Store::open_with_limits_for_mission(
+            &aggregate_file.0,
+            aggregate_limits,
+            aggregate_services.authority,
+        )
+        .expect("open aggregate-limited store");
+        let aggregate_policy = aggregate_store
+            .control_policy_snapshot()
+            .expect("aggregate policy");
+        let aggregate_reservation = aggregate_store
+            .reserve_state_with_policy(
+                &aggregate_policy,
+                aggregate_services.first.identity(),
+                &state_topic(),
+                &state_scope(),
+            )
+            .expect("reserve aggregate State");
+        let (aggregate_state, aggregate_sealed, aggregate_intent) = reserved_state(
+            &mut aggregate_services.first,
+            &mut aggregate_services.reader,
+            &aggregate_reservation,
+            b"aggregate/key",
+            b"value",
+            false,
+            1,
+        );
+        let first_operation =
+            StateOperationKey::new(b"aggregate/first".to_vec()).expect("first operation");
+        let first_request =
+            StateOperationRequest::new(&first_operation, &aggregate_intent, b"value")
+                .expect("first request");
+        aggregate_store
+            .commit_reserved_state_once_with_policy(
+                &aggregate_policy,
+                &first_request,
+                &aggregate_reservation,
+                &aggregate_state,
+                &aggregate_sealed,
+            )
+            .expect("fill aggregate item quota");
+        let overflow_operation =
+            StateOperationKey::new(b"aggregate/overflow".to_vec()).expect("overflow operation");
+        let overflow_request =
+            StateOperationRequest::new(&overflow_operation, &aggregate_intent, b"value")
+                .expect("overflow request");
+        assert!(matches!(
+            aggregate_store.commit_reserved_state_once_with_policy(
+                &aggregate_policy,
+                &overflow_request,
+                &aggregate_reservation,
+                &aggregate_state,
+                &aggregate_sealed,
+            ),
+            Err(StoreError::ItemLimitExceeded {
+                current: 2,
+                limit: 2
+            })
+        ));
+        assert_eq!(
+            aggregate_store
+                .state_for_operation(&overflow_operation)
+                .expect("aggregate overflow lookup"),
+            None
+        );
+        assert_eq!(
+            aggregate_store
+                .state_stats()
+                .expect("aggregate rollback stats")
+                .operations,
+            1
+        );
+        drop(aggregate_store);
+        let aggregate_reopened = Store::open_with_limits_for_mission(
+            &aggregate_file.0,
+            aggregate_limits,
+            aggregate_services.authority,
+        )
+        .expect("reopen aggregate-limited store");
+        assert_eq!(
+            aggregate_reopened
+                .state_stats()
+                .expect("reopened aggregate stats")
+                .operations,
+            1
+        );
+        assert_eq!(
+            aggregate_reopened
+                .state_for_operation(&overflow_operation)
+                .expect("reopened overflow lookup"),
+            None
+        );
+        drop(aggregate_reopened);
+
+        let cap_file = TestFile::new("State operation dedicated caps");
+        let mut cap_services = state_services(0xb8);
+        let cap_store =
+            Store::open_for_mission(&cap_file.0, cap_services.authority).expect("open cap store");
+        let cap_policy = cap_store.control_policy_snapshot().expect("cap policy");
+        let cap_reservation = cap_store
+            .reserve_state_with_policy(
+                &cap_policy,
+                cap_services.first.identity(),
+                &state_topic(),
+                &state_scope(),
+            )
+            .expect("reserve cap State");
+        let (cap_state, cap_sealed, cap_intent) = reserved_state(
+            &mut cap_services.first,
+            &mut cap_services.reader,
+            &cap_reservation,
+            b"cap/key",
+            b"value",
+            false,
+            1,
+        );
+        cap_store
+            .commit_reserved_state_with_policy(
+                &cap_policy,
+                &cap_reservation,
+                &cap_state,
+                &cap_sealed,
+            )
+            .expect("commit unbound State");
+        let transfer_id = StateTransferId::new(cap_state.envelope_id());
+        let encoded_record = encode_state_operation_record(StateOperationRecord {
+            transfer_id,
+            intent_digest: cap_intent.digest(),
+        });
+        assert_eq!(encoded_record.len(), 65);
+
+        let row_fill = cap_store
+            .database
+            .begin_write()
+            .expect("row-cap fill write");
+        let mut row_bytes = 0u64;
+        {
+            let mut operations = row_fill
+                .open_table(STATE_OPERATIONS)
+                .expect("State operations");
+            for index in 0..MAX_STATE_OPERATIONS {
+                let mut key = vec![b'r'];
+                key.extend_from_slice(&index.to_be_bytes());
+                assert_eq!(key.len(), 9);
+                operations
+                    .insert(key.as_slice(), encoded_record.as_slice())
+                    .expect("insert row-cap operation");
+                row_bytes = row_bytes
+                    .checked_add(
+                        u64::try_from(key.len() + encoded_record.len())
+                            .expect("row-cap byte length"),
+                    )
+                    .expect("row-cap byte sum");
+            }
+        }
+        {
+            let mut metadata = row_fill.open_table(METADATA).expect("metadata");
+            metadata
+                .insert(STATE_OPERATION_COUNT, MAX_STATE_OPERATIONS)
+                .expect("row-cap count");
+            metadata
+                .insert(STATE_OPERATION_TOTAL_BYTES, row_bytes)
+                .expect("row-cap bytes");
+        }
+        row_fill.commit().expect("commit row-cap fill");
+        assert!(row_bytes < MAX_STATE_OPERATION_BYTES);
+
+        let row_overflow =
+            StateOperationKey::new(b"row-cap/overflow".to_vec()).expect("row overflow key");
+        let row_overflow_request = StateOperationRequest::new(&row_overflow, &cap_intent, b"value")
+            .expect("row overflow request");
+        assert!(matches!(
+            cap_store.commit_reserved_state_once_with_policy(
+                &cap_policy,
+                &row_overflow_request,
+                &cap_reservation,
+                &cap_state,
+                &cap_sealed,
+            ),
+            Err(StoreError::StateOperationLimitExceeded {
+                current: MAX_STATE_OPERATIONS,
+                limit: MAX_STATE_OPERATIONS
+            })
+        ));
+        assert_eq!(
+            cap_store
+                .state_for_operation(&row_overflow)
+                .expect("row overflow lookup"),
+            None
+        );
+        assert_eq!(
+            cap_store.state_stats().expect("row-cap stats").operations,
+            MAX_STATE_OPERATIONS
+        );
+        drop(cap_store);
+        assert_eq!(
+            Store::inspect_existing(&cap_file.0)
+                .expect("inspect row cap")
+                .state_stats
+                .operations,
+            MAX_STATE_OPERATIONS
+        );
+        let cap_store =
+            Store::open_for_mission(&cap_file.0, cap_services.authority).expect("reopen row cap");
+
+        let byte_fill = cap_store
+            .database
+            .begin_write()
+            .expect("byte-cap fill write");
+        {
+            let mut operations = byte_fill
+                .open_table(STATE_OPERATIONS)
+                .expect("State operations");
+            let keys = operations
+                .iter()
+                .expect("iterate row-cap operations")
+                .map(|row| row.map(|(key, _)| key.value().to_vec()))
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect row-cap operation keys");
+            for key in keys {
+                operations
+                    .remove(key.as_slice())
+                    .expect("remove row-cap operation");
+            }
+        }
+        let per_byte_row = u64::try_from(MAX_STATE_OPERATION_KEY_BYTES + encoded_record.len())
+            .expect("byte row length");
+        let byte_rows = MAX_STATE_OPERATION_BYTES / per_byte_row;
+        assert!(byte_rows < MAX_STATE_OPERATIONS);
+        let mut byte_total = 0u64;
+        {
+            let mut operations = byte_fill
+                .open_table(STATE_OPERATIONS)
+                .expect("State operations");
+            for index in 0..byte_rows {
+                let mut key = vec![0x5a; MAX_STATE_OPERATION_KEY_BYTES];
+                key[0] = b'b';
+                key[1..9].copy_from_slice(&index.to_be_bytes());
+                operations
+                    .insert(key.as_slice(), encoded_record.as_slice())
+                    .expect("insert byte-cap operation");
+                byte_total = byte_total
+                    .checked_add(per_byte_row)
+                    .expect("byte-cap byte sum");
+            }
+        }
+        {
+            let mut metadata = byte_fill.open_table(METADATA).expect("metadata");
+            metadata
+                .insert(STATE_OPERATION_COUNT, byte_rows)
+                .expect("byte-cap count");
+            metadata
+                .insert(STATE_OPERATION_TOTAL_BYTES, byte_total)
+                .expect("byte-cap bytes");
+        }
+        byte_fill.commit().expect("commit byte-cap fill");
+        assert_eq!(MAX_STATE_OPERATION_BYTES - byte_total, 95);
+
+        let byte_overflow =
+            StateOperationKey::new(vec![b'o'; 31]).expect("byte overflow operation");
+        let byte_overflow_request =
+            StateOperationRequest::new(&byte_overflow, &cap_intent, b"value")
+                .expect("byte overflow request");
+        assert!(matches!(
+            cap_store.commit_reserved_state_once_with_policy(
+                &cap_policy,
+                &byte_overflow_request,
+                &cap_reservation,
+                &cap_state,
+                &cap_sealed,
+            ),
+            Err(StoreError::StateOperationByteLimitExceeded {
+                current,
+                incoming: 96,
+                limit: MAX_STATE_OPERATION_BYTES
+            }) if current == byte_total
+        ));
+        assert_eq!(
+            cap_store
+                .state_for_operation(&byte_overflow)
+                .expect("byte overflow lookup"),
+            None
+        );
+        assert_eq!(
+            cap_store
+                .state_stats()
+                .expect("byte-cap rollback stats")
+                .operation_bytes,
+            byte_total
+        );
+        drop(cap_store);
+        let inspection = Store::inspect_existing(&cap_file.0).expect("inspect byte cap");
+        assert_eq!(inspection.state_stats.operations, byte_rows);
+        assert_eq!(inspection.state_stats.operation_bytes, byte_total);
+        let reopened =
+            Store::open_for_mission(&cap_file.0, cap_services.authority).expect("reopen byte cap");
+        assert_eq!(
+            reopened
+                .state_for_operation(&byte_overflow)
+                .expect("reopened byte overflow lookup"),
+            None
+        );
+    }
+
+    #[test]
+    fn state_schema_group_migrates_only_whole_absent_and_rejects_partial_or_wrong_kind() {
+        let base = TestFile::new("State schema preflight base");
+        let mut services = event_services(0xb9);
+        let payload = b"preserved Event ledger";
+        let header = event_header(
+            services.publisher.identity(),
+            1,
+            1,
+            VersionVector::default(),
+            b"preserved/event",
+            payload,
+            None,
+        );
+        let sealed = services
+            .publisher
+            .seal_event(&header, payload)
+            .expect("seal preserved Event");
+        let verified = content_event(&mut services.reader, &sealed.bytes);
+        let event_transfer = EventTransferId::new(verified.envelope_id());
+        {
+            let store =
+                Store::open_for_mission(&base.0, services.authority).expect("open base store");
+            store
+                .apply_verified_event(&verified, &sealed.bytes)
+                .expect("commit preserved Event");
+        }
+
+        let missing_table = TestFile::new("State schema missing table");
+        std::fs::copy(&base.0, &missing_table.0).expect("copy missing-table store");
+        {
+            let database = Database::open(&missing_table.0).expect("missing-table database");
+            let write = database.begin_write().expect("missing-table write");
+            write
+                .delete_table(STATE_OPERATIONS)
+                .expect("delete State operation table");
+            write.commit().expect("commit missing State table");
+        }
+        for result in [
+            Store::inspect_existing(&missing_table.0).map(|_| ()),
+            Store::open_for_mission(&missing_table.0, services.authority).map(|_| ()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(StoreError::StateInvariant(
+                    "mission-scoped State schema group is incomplete"
+                ))
+            ));
+        }
+        {
+            let database = redb::Builder::new()
+                .open_read_only(&missing_table.0)
+                .expect("read missing-table store");
+            let read = database.begin_read().expect("missing-table read");
+            assert!(
+                !read
+                    .list_tables()
+                    .expect("list missing-table schema")
+                    .any(|table| table.name() == STATE_OPERATIONS.name())
+            );
+        }
+
+        let missing_counter = TestFile::new("State schema missing counter");
+        std::fs::copy(&base.0, &missing_counter.0).expect("copy missing-counter store");
+        {
+            let database = Database::open(&missing_counter.0).expect("missing-counter database");
+            let write = database.begin_write().expect("missing-counter write");
+            write
+                .open_table(METADATA)
+                .expect("metadata")
+                .remove(STATE_OPERATION_COUNT)
+                .expect("remove State operation counter");
+            write.commit().expect("commit missing State counter");
+        }
+        for result in [
+            Store::inspect_existing(&missing_counter.0).map(|_| ()),
+            Store::open_for_mission(&missing_counter.0, services.authority).map(|_| ()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(StoreError::StateInvariant(
+                    "mission-scoped State schema group is incomplete"
+                ))
+            ));
+        }
+        {
+            let database = redb::Builder::new()
+                .open_read_only(&missing_counter.0)
+                .expect("read missing-counter store");
+            let read = database.begin_read().expect("missing-counter read");
+            assert!(
+                read.open_table(METADATA)
+                    .expect("metadata")
+                    .get(STATE_OPERATION_COUNT)
+                    .expect("State operation counter")
+                    .is_none()
+            );
+        }
+
+        let wrong_kind = TestFile::new("State schema wrong kind");
+        std::fs::copy(&base.0, &wrong_kind.0).expect("copy wrong-kind store");
+        {
+            let database = Database::open(&wrong_kind.0).expect("wrong-kind database");
+            let write = database.begin_write().expect("wrong-kind write");
+            write
+                .delete_table(STATE_OPERATIONS)
+                .expect("delete normal State operation table");
+            let definition =
+                redb::MultimapTableDefinition::<&[u8], &[u8]>::new("aster.state-operations.v1");
+            write
+                .open_multimap_table(definition)
+                .expect("wrong-kind State operation table")
+                .insert(b"operation".as_slice(), b"record".as_slice())
+                .expect("wrong-kind State operation row");
+            write.commit().expect("commit wrong-kind State schema");
+        }
+        for result in [
+            Store::inspect_existing(&wrong_kind.0).map(|_| ()),
+            Store::open_for_mission(&wrong_kind.0, services.authority).map(|_| ()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(StoreError::StateInvariant(
+                    "mission-scoped State schema has the wrong table kind"
+                ))
+            ));
+        }
+        {
+            let database = redb::Builder::new()
+                .open_read_only(&wrong_kind.0)
+                .expect("read wrong-kind store");
+            let read = database.begin_read().expect("wrong-kind read");
+            assert!(
+                read.list_multimap_tables()
+                    .expect("list wrong-kind schema")
+                    .any(|table| table.name() == STATE_OPERATIONS.name())
+            );
+            assert!(
+                !read
+                    .list_tables()
+                    .expect("list normal State schema")
+                    .any(|table| table.name() == STATE_OPERATIONS.name())
+            );
+        }
+
+        let legacy = TestFile::new("State schema whole-absent migration");
+        std::fs::copy(&base.0, &legacy.0).expect("copy legacy store");
+        {
+            let database = Database::open(&legacy.0).expect("legacy database");
+            let write = database.begin_write().expect("legacy write");
+            write.delete_table(STATES).expect("delete State metadata");
+            write.delete_table(STATE_BYTES).expect("delete State bytes");
+            write
+                .delete_table(STATE_ACCEPTANCE_MARKERS)
+                .expect("delete State markers");
+            write
+                .delete_table(STATE_SEMANTIC_ITEMS)
+                .expect("delete State semantic index");
+            write
+                .delete_table(STATE_GROUP_VERSIONS)
+                .expect("delete State group index");
+            write
+                .delete_table(STATE_OPERATIONS)
+                .expect("delete State operations");
+            {
+                let mut metadata = write.open_table(METADATA).expect("metadata");
+                for field in [
+                    STATE_ITEM_COUNT,
+                    STATE_TOTAL_BYTES,
+                    LAST_STATE_ACCEPTANCE_MARKER,
+                    STATE_OPERATION_COUNT,
+                    STATE_OPERATION_TOTAL_BYTES,
+                ] {
+                    metadata.remove(field).expect("remove State counter");
+                }
+            }
+            write.commit().expect("commit whole-absent legacy group");
+        }
+        let before = Store::inspect_existing(&legacy.0).expect("inspect legacy Event store");
+        assert_eq!(before.event_stats.events, 1);
+        assert_eq!(before.state_stats, StateStoreStats::default());
+        {
+            let migrated = Store::open_for_mission(&legacy.0, services.authority)
+                .expect("atomically create State schema group");
+            assert_eq!(
+                migrated.state_stats().expect("migrated State stats"),
+                StateStoreStats::default()
+            );
+            assert!(
+                migrated
+                    .get_event(event_transfer)
+                    .expect("preserved Event lookup")
+                    .is_some()
+            );
+            assert_eq!(
+                migrated
+                    .event_stats()
+                    .expect("preserved Event stats")
+                    .events,
+                1
+            );
+        }
+        let after = Store::inspect_existing(&legacy.0).expect("inspect migrated store");
+        assert_eq!(after.event_stats, before.event_stats);
+        assert_eq!(after.state_stats, StateStoreStats::default());
+        {
+            let database = redb::Builder::new()
+                .open_read_only(&legacy.0)
+                .expect("read migrated store");
+            let read = database.begin_read().expect("migrated read");
+            let table_names = read
+                .list_tables()
+                .expect("list migrated tables")
+                .map(|table| table.name().to_owned())
+                .collect::<std::collections::BTreeSet<_>>();
+            for table in [
+                STATES.name(),
+                STATE_BYTES.name(),
+                STATE_ACCEPTANCE_MARKERS.name(),
+                STATE_SEMANTIC_ITEMS.name(),
+                STATE_GROUP_VERSIONS.name(),
+                STATE_OPERATIONS.name(),
+            ] {
+                assert!(table_names.contains(table));
+            }
+            let metadata = read.open_table(METADATA).expect("migrated metadata");
+            for field in [
+                STATE_ITEM_COUNT,
+                STATE_TOTAL_BYTES,
+                LAST_STATE_ACCEPTANCE_MARKER,
+                STATE_OPERATION_COUNT,
+                STATE_OPERATION_TOTAL_BYTES,
+            ] {
+                assert_eq!(
+                    metadata
+                        .get(field)
+                        .expect("migrated State counter")
+                        .expect("State counter present")
+                        .value(),
+                    0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn state_projection_retains_concurrent_superseded_and_tombstone_versions_and_rechecks_race() {
+        let file = TestFile::new("State projection");
+        let mut services = state_services(0xb2);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("open store");
+        let policy = store.control_policy_snapshot().expect("settled policy");
+
+        let first_reservation = store
+            .reserve_state_with_policy(
+                &policy,
+                services.first.identity(),
+                &state_topic(),
+                &state_scope(),
+            )
+            .expect("reserve first concurrent State");
+        let second_reservation = store
+            .reserve_state_with_policy(
+                &policy,
+                services.second.identity(),
+                &state_topic(),
+                &state_scope(),
+            )
+            .expect("reserve second concurrent State");
+        let (first, first_sealed, _) = reserved_state(
+            &mut services.first,
+            &mut services.reader,
+            &first_reservation,
+            b"asset/9",
+            b"left",
+            false,
+            1,
+        );
+        let (second, second_sealed, _) = reserved_state(
+            &mut services.second,
+            &mut services.reader,
+            &second_reservation,
+            b"asset/9",
+            b"right",
+            false,
+            1,
+        );
+        store
+            .commit_reserved_state(&first_reservation, &first, &first_sealed)
+            .expect("commit first concurrent State");
+        store
+            .commit_reserved_state(&second_reservation, &second, &second_sealed)
+            .expect("commit second concurrent State");
+
+        let raced = store
+            .prepare_state_projection_with_policy(
+                &policy,
+                &state_topic(),
+                &state_scope(),
+                b"asset/9",
+            )
+            .expect("prepare concurrent projection");
+        assert_eq!(raced.candidates().len(), 2);
+        assert_eq!(
+            raced
+                .candidates()
+                .iter()
+                .filter(|candidate| {
+                    candidate.disposition() == Some(StateVersionDisposition::Current)
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            raced
+                .candidates()
+                .iter()
+                .filter(|candidate| {
+                    candidate.disposition() == Some(StateVersionDisposition::Concurrent)
+                })
+                .count(),
+            1
+        );
+        let expected_concurrent_winner = [first.item_id(), second.item_id()]
+            .into_iter()
+            .max()
+            .expect("winner");
+        assert_eq!(
+            raced
+                .current()
+                .expect("current concurrent winner")
+                .state
+                .semantic_id,
+            StateSemanticId::new(expected_concurrent_winner)
+        );
+
+        let successor_reservation = store
+            .reserve_state_with_policy(
+                &policy,
+                services.first.identity(),
+                &state_topic(),
+                &state_scope(),
+            )
+            .expect("reserve causal successor");
+        assert!(successor_reservation.context().observes(first.dot()));
+        assert!(successor_reservation.context().observes(second.dot()));
+        let (successor, successor_sealed, _) = reserved_state(
+            &mut services.first,
+            &mut services.reader,
+            &successor_reservation,
+            b"asset/9",
+            b"joined",
+            false,
+            1,
+        );
+        store
+            .commit_reserved_state(&successor_reservation, &successor, &successor_sealed)
+            .expect("commit causal successor");
+        assert!(matches!(
+            store.require_state_projection_plan_with_policy(&policy, &raced),
+            Err(StoreError::StateProjectionPlanChanged)
+        ));
+
+        let after_successor = store
+            .prepare_state_projection_with_policy(
+                &policy,
+                &state_topic(),
+                &state_scope(),
+                b"asset/9",
+            )
+            .expect("project causal successor");
+        assert_eq!(after_successor.candidates().len(), 3);
+        assert_eq!(
+            after_successor
+                .current()
+                .expect("successor current")
+                .state
+                .semantic_id,
+            StateSemanticId::new(successor.item_id())
+        );
+        assert_eq!(
+            after_successor
+                .candidates()
+                .iter()
+                .filter(|candidate| {
+                    candidate.disposition() == Some(StateVersionDisposition::Superseded)
+                })
+                .count(),
+            2
+        );
+
+        let mut saw_live_winner = false;
+        let mut saw_tombstone_winner = false;
+        for index in 0..128u16 {
+            let logical_key = format!("asset/tie/{index}").into_bytes();
+            let live_tie_reservation = store
+                .reserve_state_with_policy(
+                    &policy,
+                    services.first.identity(),
+                    &state_topic(),
+                    &state_scope(),
+                )
+                .expect("reserve concurrent live tie");
+            let tombstone_tie_reservation = store
+                .reserve_state_with_policy(
+                    &policy,
+                    services.second.identity(),
+                    &state_topic(),
+                    &state_scope(),
+                )
+                .expect("reserve concurrent tombstone tie");
+            let (live_tie, live_tie_sealed, _) = reserved_state(
+                &mut services.first,
+                &mut services.reader,
+                &live_tie_reservation,
+                &logical_key,
+                b"live",
+                false,
+                1,
+            );
+            let (tombstone_tie, tombstone_tie_sealed, _) = reserved_state(
+                &mut services.second,
+                &mut services.reader,
+                &tombstone_tie_reservation,
+                &logical_key,
+                b"",
+                true,
+                1,
+            );
+            store
+                .commit_reserved_state(&live_tie_reservation, &live_tie, &live_tie_sealed)
+                .expect("commit concurrent live tie");
+            store
+                .commit_reserved_state(
+                    &tombstone_tie_reservation,
+                    &tombstone_tie,
+                    &tombstone_tie_sealed,
+                )
+                .expect("commit concurrent tombstone tie");
+            let tie = store
+                .prepare_state_projection_with_policy(
+                    &policy,
+                    &state_topic(),
+                    &state_scope(),
+                    &logical_key,
+                )
+                .expect("project live/tombstone tie");
+            assert_eq!(tie.candidates().len(), 2);
+            let tombstone_should_win = tombstone_tie.item_id() > live_tie.item_id();
+            saw_tombstone_winner |= tombstone_should_win;
+            saw_live_winner |= !tombstone_should_win;
+            assert_eq!(
+                tie.current().expect("tie winner").state.header.tombstone,
+                tombstone_should_win,
+                "concurrent tombstone must not receive delete-wins precedence"
+            );
+            if saw_live_winner && saw_tombstone_winner {
+                break;
+            }
+        }
+        assert!(
+            saw_live_winner && saw_tombstone_winner,
+            "deterministic fixture must exercise both semantic-ID ordering directions"
+        );
+
+        let tombstone_reservation = store
+            .reserve_state_with_policy(
+                &policy,
+                services.first.identity(),
+                &state_topic(),
+                &state_scope(),
+            )
+            .expect("reserve tombstone");
+        let (tombstone, tombstone_sealed, _) = reserved_state(
+            &mut services.first,
+            &mut services.reader,
+            &tombstone_reservation,
+            b"asset/9",
+            b"",
+            true,
+            1,
+        );
+        store
+            .commit_reserved_state(&tombstone_reservation, &tombstone, &tombstone_sealed)
+            .expect("commit tombstone");
+        let projected = store
+            .prepare_state_projection_with_policy(
+                &policy,
+                &state_topic(),
+                &state_scope(),
+                b"asset/9",
+            )
+            .expect("project tombstone");
+        assert_eq!(projected.candidates().len(), 4);
+        assert!(
+            projected
+                .current()
+                .expect("current tombstone")
+                .state
+                .header
+                .tombstone
+        );
+        for candidate in projected.candidates() {
+            let (verified, _) = content_state(&mut services.reader, &candidate.state.sealed);
+            assert_eq!(verified.item_id(), *candidate.state.semantic_id.as_bytes());
+        }
+        store
+            .require_state_projection_plan_with_policy(&policy, &projected)
+            .expect("exact projection recheck");
+
+        drop(store);
+        let reopened = Store::open_for_mission(&file.0, services.authority).expect("reopen store");
+        let reopened_policy = reopened.control_policy_snapshot().expect("reopened policy");
+        assert_eq!(
+            reopened
+                .prepare_state_projection_with_policy(
+                    &reopened_policy,
+                    &state_topic(),
+                    &state_scope(),
+                    b"asset/9",
+                )
+                .expect("reopened projection"),
+            projected
+        );
+    }
+
+    #[test]
+    fn event_and_state_share_causal_ledgers_but_keep_markers_and_inventory_disjoint() {
+        let file = TestFile::new("Event State shared ledgers");
+        let mut services = state_services(0xb3);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("open store");
+        let publisher = services.first.identity();
+        let policy = store.control_policy_snapshot().expect("settled policy");
+
+        let first_state_reservation = store
+            .reserve_state_with_policy(&policy, publisher, &state_topic(), &state_scope())
+            .expect("reserve first State");
+        let (first_state, first_state_sealed, _) = reserved_state(
+            &mut services.first,
+            &mut services.reader,
+            &first_state_reservation,
+            b"shared/key",
+            b"one",
+            false,
+            1,
+        );
+        store
+            .commit_reserved_state(&first_state_reservation, &first_state, &first_state_sealed)
+            .expect("commit first State");
+
+        let event_reservation = store
+            .reserve_event_with_policy(&policy, publisher, &state_topic(), &state_scope())
+            .expect("reserve interleaved Event");
+        assert_eq!(event_reservation.counter(), 2);
+        assert_eq!(event_reservation.event_sequence(), 1);
+        assert!(event_reservation.context().observes(first_state.dot()));
+        let event_header = event_reservation
+            .header(
+                Priority::Immediate,
+                b"shared/event".to_vec(),
+                None,
+                3,
+                false,
+                1,
+            )
+            .expect("Event header");
+        let event_sealed = services
+            .first
+            .seal_event(&event_header, b"evt")
+            .expect("seal Event");
+        let event = content_event(&mut services.reader, &event_sealed.bytes);
+        store
+            .commit_reserved_event(&event_reservation, &event, &event_sealed.bytes)
+            .expect("commit Event");
+
+        let second_state_reservation = store
+            .reserve_state_with_policy(&policy, publisher, &state_topic(), &state_scope())
+            .expect("reserve second State");
+        assert_eq!(second_state_reservation.counter(), 3);
+        assert!(second_state_reservation.context().observes(event.dot()));
+        let (second_state, second_state_sealed, _) = reserved_state(
+            &mut services.first,
+            &mut services.reader,
+            &second_state_reservation,
+            b"shared/key",
+            b"two",
+            false,
+            1,
+        );
+        store
+            .commit_reserved_state(
+                &second_state_reservation,
+                &second_state,
+                &second_state_sealed,
+            )
+            .expect("commit second State");
+
+        assert_eq!(store.event_inventory().expect("Event inventory").len(), 1);
+        assert_eq!(
+            store
+                .transfer_inventory()
+                .expect("transfer inventory")
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .events_after(0, MAX_EVENT_PAGE)
+                .expect("Event marker page")
+                .iter()
+                .map(|event| event.acceptance_marker)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(store.state_stats().expect("State stats").states, 2);
+        assert_eq!(
+            store
+                .state_stats()
+                .expect("State stats")
+                .last_acceptance_marker,
+            2
+        );
+        drop(store);
+
+        let inspection = Store::inspect_existing(&file.0).expect("read-only union audit");
+        assert_eq!(inspection.event_stats.events, 1);
+        assert_eq!(inspection.state_stats.states, 2);
+        let reopened = Store::open_for_mission(&file.0, services.authority).expect("reopen union");
+        let next_event = reopened
+            .reserve_event(publisher, &state_topic(), &state_scope())
+            .expect("reserve next Event");
+        assert_eq!(next_event.counter(), 4);
+        assert_eq!(next_event.event_sequence(), 2);
+    }
+
+    #[test]
+    fn event_state_cross_class_dot_equivocation_fails_atomically_in_both_orders() {
+        let state_first_file = TestFile::new("State then Event dot equivocation");
+        let mut state_first = state_services(0xb5);
+        let store = Store::open_for_mission(&state_first_file.0, state_first.authority)
+            .expect("open State-first store");
+        let policy = store.control_policy_snapshot().expect("State-first policy");
+        let reservation = store
+            .reserve_state_with_policy(
+                &policy,
+                state_first.first.identity(),
+                &state_topic(),
+                &state_scope(),
+            )
+            .expect("reserve State first");
+        let (state, state_sealed, _) = reserved_state(
+            &mut state_first.first,
+            &mut state_first.reader,
+            &reservation,
+            b"dot/key",
+            b"state",
+            false,
+            1,
+        );
+        store
+            .commit_reserved_state(&reservation, &state, &state_sealed)
+            .expect("commit State first");
+        let event_header = event_header(
+            state_first.first.identity(),
+            1,
+            1,
+            VersionVector::default(),
+            b"dot/event",
+            b"event",
+            None,
+        );
+        let mut event_header = event_header;
+        event_header.topic = state_topic();
+        event_header.scope = state_scope();
+        let event_sealed = state_first
+            .first
+            .seal_event(&event_header, b"event")
+            .expect("seal conflicting Event");
+        let event = content_event(&mut state_first.reader, &event_sealed.bytes);
+        assert!(matches!(
+            store.apply_verified_event(&event, &event_sealed.bytes),
+            Err(StoreError::CausalEquivocation { counter: 1, .. })
+        ));
+        assert_eq!(store.event_stats().expect("Event stats").events, 0);
+        assert_eq!(store.state_stats().expect("State stats").states, 1);
+        drop(store);
+
+        let event_first_file = TestFile::new("Event then State dot equivocation");
+        let mut event_first = state_services(0xb6);
+        let store = Store::open_for_mission(&event_first_file.0, event_first.authority)
+            .expect("open Event-first store");
+        let event_header = EnvelopeHeader {
+            class: SemanticDataClass::Event,
+            topic: state_topic(),
+            scope: state_scope(),
+            priority: Priority::Immediate,
+            stamp: CausalStamp {
+                dot: Dot {
+                    publisher: event_first.first.identity(),
+                    counter: 1,
+                },
+                context: VersionVector::default(),
+            },
+            event_sequence: Some(1),
+            logical_key: b"dot/event".to_vec(),
+            blob_route: None,
+            ttl_ms: None,
+            content_len: 5,
+            tombstone: false,
+            key_epoch: 1,
+        };
+        let event_sealed = event_first
+            .first
+            .seal_event(&event_header, b"event")
+            .expect("seal first Event");
+        let event = content_event(&mut event_first.reader, &event_sealed.bytes);
+        store
+            .apply_verified_event(&event, &event_sealed.bytes)
+            .expect("commit Event first");
+        let policy = store.control_policy_snapshot().expect("Event-first policy");
+        let forged = StateReservation {
+            control_policy: policy,
+            publisher: event_first.first.identity(),
+            topic: state_topic(),
+            scope: state_scope(),
+            previous_counter: 1,
+            counter: 1,
+            context: VersionVector::default(),
+        };
+        let (state, state_sealed, _) = reserved_state(
+            &mut event_first.first,
+            &mut event_first.reader,
+            &forged,
+            b"dot/key",
+            b"state",
+            false,
+            1,
+        );
+        assert!(matches!(
+            store.commit_reserved_state(&forged, &state, &state_sealed),
+            Err(StoreError::CausalEquivocation { counter: 1, .. })
+        ));
+        assert_eq!(store.event_stats().expect("Event stats").events, 1);
+        assert_eq!(store.state_stats().expect("State stats").states, 0);
+    }
+
+    #[test]
+    fn state_projection_never_withholds_structurally_inactive_or_corrupt_candidates() {
+        let file = TestFile::new("State projection retained inactive");
+        let mut services = state_services(0xb4);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("open store");
+        let policy = store.control_policy_snapshot().expect("settled policy");
+        let reservation = store
+            .reserve_state_with_policy(
+                &policy,
+                services.first.identity(),
+                &state_topic(),
+                &state_scope(),
+            )
+            .expect("reserve State");
+        let (state, sealed, _) = reserved_state(
+            &mut services.first,
+            &mut services.reader,
+            &reservation,
+            b"asset/corrupt",
+            b"value",
+            false,
+            1,
+        );
+        store
+            .commit_reserved_state(&reservation, &state, &sealed)
+            .expect("commit State");
+
+        let write = store.database.begin_write().expect("raw policy write");
+        write
+            .open_table(CONTROL_SCOPE_EPOCHS)
+            .expect("scope epochs")
+            .insert(
+                state_scope().as_str(),
+                encode_scope_epoch_index(2, ControlTransferId::new([0x44; 32])).as_slice(),
+            )
+            .expect("mark retained State stale");
+        let transfer_id = StateTransferId::new(state.envelope_id());
+        let mut corrupted = {
+            let states = write.open_table(STATES).expect("State metadata");
+            let encoded = states
+                .get(transfer_id.as_bytes().as_slice())
+                .expect("read State metadata")
+                .expect("State metadata row");
+            decode_state_metadata(encoded.value()).expect("decode State metadata")
+        };
+        corrupted.header.key_epoch = 0;
+        let corrupted = encode_state_metadata(
+            corrupted.transfer_id,
+            corrupted.semantic_id,
+            &corrupted.header,
+        )
+        .expect("encode corrupted structural metadata");
+        write
+            .open_table(STATES)
+            .expect("State metadata")
+            .insert(transfer_id.as_bytes().as_slice(), corrupted.as_slice())
+            .expect("persist corrupted structural metadata");
+        write.commit().expect("commit raw policy marker");
+
+        let plan = store
+            .prepare_state_projection_with_policy(
+                &policy,
+                &state_topic(),
+                &state_scope(),
+                b"asset/corrupt",
+            )
+            .expect("prepare inactive projection");
+        assert_eq!(
+            plan.candidates().len(),
+            1,
+            "inactive row must not be withheld"
+        );
+        assert_eq!(plan.candidates()[0].disposition(), None);
+        let (verified, opened) =
+            content_state(&mut services.reader, &plan.candidates()[0].state.sealed);
+        assert_eq!(opened, b"value");
+        assert_eq!(verified.header().key_epoch, 1);
+        assert_eq!(plan.candidates()[0].state.header.key_epoch, 0);
+        assert_ne!(verified.header(), &plan.candidates()[0].state.header);
+        store
+            .require_state_projection_plan_with_policy(&policy, &plan)
+            .expect("inactive complete-set recheck");
+
+        let cleanup = store.database.begin_write().expect("raw cleanup write");
+        cleanup
+            .open_table(CONTROL_SCOPE_EPOCHS)
+            .expect("scope epochs")
+            .remove(state_scope().as_str())
+            .expect("remove synthetic scope epoch");
+        cleanup.commit().expect("commit cleanup");
+        drop(store);
+
+        let database = Database::open(&file.0).expect("raw corruption store");
+        let write = database.begin_write().expect("raw corruption write");
+        let key = state_group_version_key(
+            &state_topic(),
+            &state_scope(),
+            b"asset/corrupt",
+            StateSemanticId::new(state.item_id()),
+        )
+        .expect("group key");
+        write
+            .open_table(STATE_GROUP_VERSIONS)
+            .expect("State groups")
+            .remove(key.as_slice())
+            .expect("remove group row");
+        write.commit().expect("commit group corruption");
+        drop(database);
+        assert!(matches!(
+            Store::inspect_existing(&file.0),
+            Err(StoreError::StateInvariant(_))
+        ));
+        assert!(matches!(
+            Store::open_for_mission(&file.0, services.authority),
+            Err(StoreError::StateInvariant(_))
+        ));
     }
 }
