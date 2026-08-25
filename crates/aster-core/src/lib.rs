@@ -91,6 +91,8 @@ mod runtime;
 pub mod scheduler;
 #[cfg(all(feature = "sqlite-store", not(feature = "adapter-sdk")))]
 mod scheduler;
+#[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
+mod source_blob;
 #[cfg(feature = "reference-session")]
 mod source_control;
 #[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
@@ -129,9 +131,13 @@ pub use api::{
     MergeVersion, PublishResult, Query, RekeyRecipient, RekeyRecipientAccess, ScopeRekeyResult,
 };
 #[cfg(feature = "sqlite-store")]
+pub use blob::ReferenceBlobReader;
+#[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
 pub use blob::{
-    BlobError, BlobId, BlobMetadata, BlobReadStats, BlobStoreConfig, BlobWriteProgress,
-    FinishedBlob, ReferenceBlobReader, ReferenceBlobService,
+    BlobChunkRecord, BlobError, BlobId, BlobManifest, BlobMetadata, BlobReadStats, BlobReader,
+    BlobRouteCommitment, BlobStore, BlobStoreConfig, BlobWriteProgress, FinishedBlob,
+    MAX_BLOB_CHUNK_SIZE, MAX_BLOB_CHUNKS, MAX_BLOB_MANIFEST_BYTES, MIN_BLOB_CHUNK_SIZE,
+    PreparedBlob, ReferenceBlobService, SELECTED_BLOB_CHUNK_SIZE, prepare_blob,
 };
 #[cfg(all(feature = "sqlite-store", feature = "adapter-sdk"))]
 pub use crypto::{
@@ -161,6 +167,10 @@ pub use provisioning::{
     ProtectedProvisioningError, ProvisioningProtectionError, ProvisioningProtector,
     ProvisioningUnprotector, UnprotectedProvisioning, protect_provisioning_artifact,
     unprotect_provisioning_artifact,
+};
+#[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
+pub use source_blob::{
+    BlobContentVerification, ContentVerifiedBlobEnvelope, RouteVerifiedBlobEnvelope,
 };
 #[cfg(feature = "reference-session")]
 pub use source_control::{

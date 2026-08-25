@@ -1,9 +1,10 @@
-//! High-level selected Event, State, and Record application surfaces.
+//! High-level selected Event, State, Record, and Blob application surfaces.
 //!
 //! This module deliberately exposes no source-envelope, cryptographic-provider,
-//! carrier, inventory, reconciliation, or sealed-byte operations. It composes
-//! the same mission-bound redb authority used by the selected runtime and
-//! freshly verifies every application result before returning plaintext.
+//! carrier, inventory, reconciliation, or sealed-byte operations. Blob access
+//! is synchronous and streaming; other plaintext is bounded. This module
+//! composes the same mission-bound redb authority used by the selected runtime
+//! and freshly verifies every application result before returning plaintext.
 
 use std::{
     fmt, fs,
@@ -17,12 +18,13 @@ use std::{
 use aster_mesh::{EventContentVerification, ReferenceEnvelopeSealer};
 pub use aster_mesh::{NodeId, Priority, Scope, Topic};
 use aster_redb_store::{
-    ControlPolicySnapshot, ControlTransferId, EventDeliveryAck as StoreEventDeliveryAck,
-    EventGapScanPlan, EventOperationKey, EventQueryFilter, EventReplicationPolicySnapshot,
-    EventSemanticId, EventSubscriptionId as StoreEventSubscriptionId, EventSubscriptionKey,
-    EventSubscriptionMode, EventSubscriptionPollSelection, EventSubscriptionRemoveOutcome,
-    EventSubscriptionSpec, MAX_EVENT_PAGE, MAX_EVENT_POLL_DELIVERIES, MAX_EVENT_SUBSCRIPTION_SCAN,
-    Store, StoreError, StoredEvent,
+    BlobStoreError, ControlPolicySnapshot, ControlTransferId,
+    EventDeliveryAck as StoreEventDeliveryAck, EventGapScanPlan, EventOperationKey,
+    EventQueryFilter, EventReplicationPolicySnapshot, EventSemanticId,
+    EventSubscriptionId as StoreEventSubscriptionId, EventSubscriptionKey, EventSubscriptionMode,
+    EventSubscriptionPollSelection, EventSubscriptionRemoveOutcome, EventSubscriptionSpec,
+    MAX_EVENT_PAGE, MAX_EVENT_POLL_DELIVERIES, MAX_EVENT_SUBSCRIPTION_SCAN, Store, StoreError,
+    StoredEvent,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -37,8 +39,13 @@ use crate::{
     },
 };
 
+mod blob;
 mod record;
 mod state;
+pub use blob::{
+    BlobDepotLimits, BlobId, BlobPublishRequest, BlobPublishResult, BlobReadRequest,
+    BlobReadResult, SelectedBlobNode, SelectedBlobOptions,
+};
 pub use record::{
     RecordConflict, RecordId, RecordItem, RecordProjection, RecordPublishRequest,
     RecordPublishResult, RecordQuery, RecordResolutionGuard, RecordResolveRequest,
@@ -1402,6 +1409,7 @@ pub(crate) fn runtime_application_error(
 
 fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
     match error {
+        StoreError::Blob(error) => blob_store_error_kind(error),
         StoreError::InvalidEventOperationKey { .. }
         | StoreError::InvalidStateOperationKey { .. }
         | StoreError::InvalidRecordOperationKey { .. }
@@ -1506,6 +1514,32 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         | StoreError::InvalidZeroizationDescriptor { .. }
         | StoreError::ZeroizationIntentConflict
         | StoreError::ZeroizationOrderViolation(_) => ApplicationErrorKind::Integrity,
+    }
+}
+
+fn blob_store_error_kind(error: &BlobStoreError) -> ApplicationErrorKind {
+    match error {
+        BlobStoreError::InvalidDepotLimits
+        | BlobStoreError::InvalidOperationKey { .. }
+        | BlobStoreError::InvalidPublication(_) => ApplicationErrorKind::InvalidRequest,
+        BlobStoreError::PublisherRevoked(_)
+        | BlobStoreError::KeyEpochStale { .. }
+        | BlobStoreError::KeyEpochNotActive { .. } => ApplicationErrorKind::UnauthorizedOrRevoked,
+        BlobStoreError::ReservationChanged | BlobStoreError::ReadPlanChanged => {
+            ApplicationErrorKind::PolicyUnsettled
+        }
+        BlobStoreError::OperationConflict => ApplicationErrorKind::Conflict,
+        BlobStoreError::PublicationLimitExceeded { .. }
+        | BlobStoreError::OperationLimitExceeded { .. }
+        | BlobStoreError::OperationByteLimitExceeded { .. }
+        | BlobStoreError::DepotByteLimitExceeded { .. }
+        | BlobStoreError::DepotChunkLimitExceeded { .. }
+        | BlobStoreError::DepotVariantLimitExceeded { .. } => ApplicationErrorKind::ResourceLimit,
+        BlobStoreError::Io(_) => ApplicationErrorKind::StateUnavailable,
+        BlobStoreError::Verification(_)
+        | BlobStoreError::SchemaInvariant(_)
+        | BlobStoreError::DepotIntegrity(_)
+        | BlobStoreError::CompletionMismatch => ApplicationErrorKind::Integrity,
     }
 }
 

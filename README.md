@@ -34,10 +34,14 @@ operation.
 > heads, rejects ordinary publication across an unresolved conflict, and
 > accepts only an explicit application-reviewed successor guarded by the exact
 > sibling set inspected. It does not execute registered merge policies during
-> ingest. State and Record are not yet carried by the live runtime or
+> ingest. An exclusive stopped-node Blob surface now streams immutable,
+> metadata-bound objects into a crash-resumable encrypted depot and freshly
+> verifies them into caller-owned outputs without exposing provider readers or
+> keys. State, Record, and Blob are not yet carried by the live runtime or
 > reconciliation wire. Aster is
 > still not a completed MVP, production-authorized build, or claim of FIPS
-> 140-3 validation. Live or replicated State/Record, Blob, finite-TTL custody,
+> 140-3 validation. Live or replicated State/Record/Blob, remote Blob chunk
+> transfer, finite-TTL custody,
 > atomic subscription
 > update, protected provisioning, generalized control administration, and
 > physical/multi-carrier acceptance remain open. A bounded same-UID Unix hook
@@ -128,6 +132,8 @@ and run the focused later-sync process test, the
 local causal latest-value projection and learn the authenticated deletion rule,
 the [selected Record API quickstart](docs/quickstart/selected-record-api.md) to
 see explicit conflict annotation and guarded application resolution,
+the [selected Blob API quickstart](docs/quickstart/selected-blob-api.md) to
+stream immutable local content through the encrypted depot,
 and the [selected architecture](docs/architecture.md) for the trust and
 authority boundaries.
 
@@ -154,7 +160,7 @@ demo-scoped issuing authority seed is ephemeral. Bounded Negentropy reconciles
 exact sealed-transfer IDs. Every contact authenticates the expected mission peer
 before inventory and protects later mechanics frames. Each Event independently
 authenticates its publisher and protected semantic header. This slice does
-**not** validate networked State/Record or Blob, atomic subscription update, finite-TTL
+**not** validate networked State/Record/Blob, remote Blob chunks, atomic subscription update, finite-TTL
 custody, protected provisioning at rest,
 NAT/hosted relay operation, BTLE, physical multi-system operation, or any
 production security gate. The separate selected Event quickstart and focused
@@ -265,10 +271,10 @@ service, a conventional database or broker will usually be simpler.
 | Area | Purpose |
 |---|---|
 | [`crates/aster-profile`](crates/aster-profile) | Requirements-owned reconciliation key and stable inventory ordering; exact Event transfer IDs enter by explicit conversion |
-| [`crates/aster-redb-store`](crates/aster-redb-store) | Mission-bound atomic ordered-control policy plus Event and local State/Record semantic, causal, projection, and operation persistence; bounded route-only Event cache; and disjoint opaque compatibility storage |
+| [`crates/aster-redb-store`](crates/aster-redb-store) | Mission-bound atomic ordered-control policy plus Event and local State/Record/Blob semantic, causal, projection/publication, and operation persistence; bounded route-only Event cache; exact Blob depot markers/limits; and disjoint opaque compatibility storage |
 | [`crates/aster-negentropy`](crates/aster-negentropy) | Selected bounded, clock-independent inventory set-difference mechanism |
 | [`crates/aster-iroh`](crates/aster-iroh) | Selected profile-independent direct-IP carrier; endpoint authentication is not mission or data authorization |
-| [`crates/aster-node`](crates/aster-node) | Selected composition root and CLI; enforces mission-before-inventory, control-before-Event, peer route filtering, exact control/Event transfer, live sample applications, and exclusive local State and Record facades |
+| [`crates/aster-node`](crates/aster-node) | Selected composition root and CLI; enforces mission-before-inventory, control-before-Event, peer route filtering, exact control/Event transfer, live sample applications, and exclusive local State, Record, and Blob facades |
 | [`crates/aster-core`](crates/aster-core) | Proven current semantic implementation and migration source for the data model, reducers, mission/source/control security, and synchronization behavior |
 | [`crates/aster-host`](crates/aster-host) | Current semantic/reference high-level host and carrier composition |
 | [`crates/aster-ip`](crates/aster-ip) | Current semantic/reference UDP/IP, discovery, rendezvous, and opaque-relay mechanisms |

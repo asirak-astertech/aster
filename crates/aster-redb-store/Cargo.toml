@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 aster-mesh = { package = "aster-core", path = "../aster-core", default-features = false, features = ["reference-session"] }
 aster-profile = { path = "../aster-profile" }
+getrandom.workspace = true
 redb.workspace = true
 rustix.workspace = true
 sha2.workspace = true

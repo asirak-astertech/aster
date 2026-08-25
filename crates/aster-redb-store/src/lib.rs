@@ -1,17 +1,25 @@
 //! Crash-safe storage for mission-bound Aster semantic Events and compatibility data.
 //!
-//! One redb transaction authority owns six disjoint namespaces: content-verified
-//! semantic Events; content-verified selected State versions; content-verified
-//! immutable Record revisions; a bounded, non-semantic cache of route-verified
-//! exact Event transfers; the retained caller-ID opaque compatibility API; and
-//! source-authenticated, mission-wide Flash controls. Event, State, and Record
-//! share only their causal ledgers. Opaque IDs cannot collide with or promote into a
-//! semantic or control namespace. Semantic mutation requires a live strong
-//! capability from `aster-core`, while persisted decoded metadata is only
-//! structurally audited. Configured item and byte limits apply to the aggregate
-//! usage of all five namespaces.
+//! One redb transaction authority owns disjoint logical namespaces for
+//! content-verified semantic Events, selected State versions, immutable Record
+//! revisions, and signed Blob publications; a bounded non-semantic cache of
+//! route-verified exact Event transfers; the retained caller-ID opaque
+//! compatibility API; and source-authenticated mission-wide Flash controls.
+//! Event, State, Record, and Blob share only their causal ledgers. Blob ciphertext
+//! chunks live in a paired, fixed depot whose durable markers remain inside the
+//! same redb authority. Opaque IDs cannot collide with or promote into a semantic
+//! or control namespace. Semantic mutation requires a live strong capability from
+//! `aster-core`, while persisted decoded metadata is only structurally audited.
+//! [`StoreLimits`] bound aggregate redb rows and encoded bytes across logical
+//! namespaces; [`BlobDepotLimits`] separately bound durable depot import/chunk
+//! rows and redb-marked chunk-file bytes, without claiming a bound on untracked
+//! filesystem allocation.
 
 #![forbid(unsafe_code)]
+
+mod blob;
+
+pub use blob::*;
 
 use std::error::Error;
 use std::fmt;
@@ -257,9 +265,12 @@ pub const DEFAULT_MAX_TOTAL_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
 /// Validated durable admission limits for one store.
 ///
 /// Both limits count aggregate legacy opaque rows, accepted exact source-sealed
-/// Event, State, and Record representations, durable selected-store operation mappings, route-only
-/// cache entries, exact controls, and canonical local control-publication intents.
-/// Filesystem and redb allocation overhead remain backend-specific.
+/// Event, State, Record, and signed Blob representations, durable selected-store
+/// operation mappings, route-only cache entries, exact controls, and canonical
+/// local control-publication intents. Physical Blob-depot files are governed by
+/// [`BlobDepotLimits`] instead of being double-counted here. Unmarked or hostile
+/// untracked filesystem allocation and filesystem/redb overhead remain outside
+/// these logical admission claims.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StoreLimits {
     max_items: u64,
@@ -2537,6 +2548,8 @@ pub struct StoreInspection {
     pub state_stats: StateStoreStats,
     /// Mission-bound semantic Record counts from the same read transaction.
     pub record_stats: RecordStoreStats,
+    /// Mission-bound signed Blob publication and ciphertext-depot counts.
+    pub blob_stats: BlobStoreStats,
     /// Event receive-selector and pending-delivery counts from the same transaction.
     pub event_subscription_stats: EventSubscriptionStats,
     /// Mission-wide Flash control counts from the same audited read transaction.
@@ -2576,6 +2589,8 @@ impl StoreBackingIdentity {
 pub enum StoreError {
     /// The storage engine rejected an operation.
     Backend(redb::Error),
+    /// Blob publication metadata, policy, or physical-depot failure.
+    Blob(BlobStoreError),
     /// The selected store path could not be resolved to a stable file identity.
     StorePath(std::io::Error),
     /// The exact opened backing file violates the local single-owner safety policy.
@@ -2889,6 +2904,7 @@ impl fmt::Display for StoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Backend(error) => write!(formatter, "redb storage error: {error}"),
+            Self::Blob(error) => write!(formatter, "{error}"),
             Self::StorePath(error) => write!(formatter, "store path error: {error}"),
             Self::StoreBackingInvariant(reason) => {
                 write!(formatter, "store backing-file invariant failed: {reason}")
@@ -3270,9 +3286,16 @@ impl Error for StoreError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Backend(error) => Some(error),
+            Self::Blob(error) => Some(error),
             Self::StorePath(error) => Some(error),
             _ => None,
         }
+    }
+}
+
+impl From<BlobStoreError> for StoreError {
+    fn from(error: BlobStoreError) -> Self {
+        Self::Blob(error)
     }
 }
 
@@ -3673,8 +3696,12 @@ pub struct Store {
     path: PathBuf,
     backing_identity: StoreBackingIdentity,
     limits: StoreLimits,
+    blob_depot_limits: BlobDepotLimits,
     mission_authority: Option<NodeId>,
     live: AtomicBool,
+    blob_depot_lock: std::sync::Mutex<()>,
+    blob_completion_authority: std::sync::Arc<()>,
+    blob_depot_owner_token: [u8; 32],
 }
 
 /// Exact-writer cleanup handle for a live or terminal mission-bound store.
@@ -3955,6 +3982,21 @@ impl Store {
         limits: StoreLimits,
         mission_authority: NodeId,
     ) -> Result<Self, StoreError> {
+        Self::open_with_limits_and_blob_depot_limits_for_mission(
+            path,
+            limits,
+            BlobDepotLimits::default(),
+            mission_authority,
+        )
+    }
+
+    /// Opens a mission-bound store with explicit redb and physical Blob-depot limits.
+    pub fn open_with_limits_and_blob_depot_limits_for_mission(
+        path: impl AsRef<Path>,
+        limits: StoreLimits,
+        blob_depot_limits: BlobDepotLimits,
+        mission_authority: NodeId,
+    ) -> Result<Self, StoreError> {
         let path = path.as_ref();
         let readable_preflight = if path.exists() {
             match reject_terminal_normal_open(path) {
@@ -3978,20 +4020,34 @@ impl Store {
                 Err(error) => return Err(error),
             }
         }
-        let store = Self::open_with_limits_internal(path, limits, Some(mission_authority))?;
+        let store = Self::open_with_limits_internal(
+            path,
+            limits,
+            blob_depot_limits,
+            Some(mission_authority),
+        )?;
         debug_assert_eq!(store.mission_authority, Some(mission_authority));
         Ok(store)
     }
 
     /// Opens and audits an existing store without creating, repairing, or writing it.
     ///
-    /// All v1 tables and accounting fields must already exist and agree with the
-    /// accepted-item and acceptance-marker tables. This path deliberately uses
-    /// redb's read-only database handle, so an absent or migration-era store fails
-    /// closed instead of being created or repaired as a side effect of inspection.
+    /// Every present v1 schema group must be complete, canonical, and agree with
+    /// its accepted-item and acceptance-marker tables. Wholly absent additive
+    /// State, Record, or Blob groups are reported empty without repair; partial
+    /// groups fail closed. This path deliberately uses redb's read-only handle,
+    /// so an absent store is never created as a side effect of inspection.
     pub fn inspect_existing(path: impl AsRef<Path>) -> Result<StoreInspection, StoreError> {
-        let database = redb::Builder::new().open_read_only(path)?;
-        inspect_readable(&database)
+        let path = std::path::absolute(path).map_err(StoreError::StorePath)?;
+        let before = open_existing_store_backing(&path)?.identity;
+        let database = redb::Builder::new().open_read_only(&path)?;
+        let after = open_existing_store_backing(&path)?.identity;
+        if before != after {
+            return Err(StoreError::StoreBackingInvariant(
+                "backing path changed during read-only inspection",
+            ));
+        }
+        inspect_readable(&database, &path, before)
     }
 
     /// Inspects only exact terminal-schema and mission-binding truth without writing.
@@ -4064,12 +4120,13 @@ impl Store {
         path: impl AsRef<Path>,
         limits: StoreLimits,
     ) -> Result<Self, StoreError> {
-        Self::open_with_limits_internal(path.as_ref(), limits, None)
+        Self::open_with_limits_internal(path.as_ref(), limits, BlobDepotLimits::default(), None)
     }
 
     fn open_with_limits_internal(
         path: &Path,
         limits: StoreLimits,
+        blob_depot_limits: BlobDepotLimits,
         expected_mission_authority: Option<NodeId>,
     ) -> Result<Self, StoreError> {
         let path = std::path::absolute(path).map_err(StoreError::StorePath)?;
@@ -4177,18 +4234,33 @@ impl Store {
                 }
             }
         }
-        audit_semantic_tables(&write)?;
+        // Resolve the database side of the Blob depot binding before any
+        // additive Blob migration. A foreign/pre-marker physical root blocks
+        // migration while this exact writer transaction can still roll back.
+        blob::depot::prepare_depot_owner_token_write(&write, &path)?;
+        let blob_stats = audit_semantic_tables(&write)?;
+        let blob_depot_owner_token = blob::depot::depot_owner_token_write(&write)?;
+        blob::depot::bind_depot_owner_write(
+            &write,
+            &path,
+            backing_identity,
+            blob_depot_owner_token,
+            blob_stats,
+        )?;
         audit_control_tables(&write)?;
         let mut mission_authority = read_mission_binding(&write)?;
         if mission_authority.is_none()
             && (write.open_table(EVENTS)?.len()? != 0
                 || write.open_table(STATES)?.len()? != 0
                 || write.open_table(RECORDS)?.len()? != 0
+                || write.open_table(blob::BLOB_PUBLICATIONS)?.len()? != 0
+                || write.open_table(blob::BLOB_IMPORTS)?.len()? != 0
+                || write.open_table(blob::BLOB_CHUNKS)?.len()? != 0
                 || write.open_table(ROUTE_CACHE)?.len()? != 0
                 || write.open_table(CONTROL_RECORDS)?.len()? != 0)
         {
             return Err(StoreError::SemanticInvariant(
-                "unbound store contains mission-scoped Event, State, Record, or control state",
+                "unbound store contains mission-scoped Event, State, Record, Blob, or control state",
             ));
         }
         if mission_authority.is_none()
@@ -4201,13 +4273,35 @@ impl Store {
         }
         write.commit()?;
 
+        // Persist the database-specific owner token before installing its
+        // crash-safe filesystem peer. Physical inspection and reclaim remain
+        // mission-bound effects, and the second exact writer transaction
+        // rechecks terminal and mission truth before touching the depot.
+        if let Some(authority) = mission_authority {
+            let physical = database.begin_write()?;
+            enforce_live_write(&physical)?;
+            check_expected_mission_binding(&physical, authority)?;
+            blob::depot::audit_depot_write(
+                &physical,
+                &path,
+                backing_identity,
+                blob_depot_owner_token,
+                blob_stats,
+            )?;
+            physical.commit()?;
+        }
+
         Ok(Self {
             database,
             path,
             backing_identity,
             limits,
+            blob_depot_limits,
             mission_authority,
             live: AtomicBool::new(true),
+            blob_depot_lock: std::sync::Mutex::new(()),
+            blob_completion_authority: std::sync::Arc::new(()),
+            blob_depot_owner_token,
         })
     }
 
@@ -4246,8 +4340,12 @@ impl Store {
             path,
             backing_identity,
             limits: _,
+            blob_depot_limits: _,
             mission_authority: _,
             live: _,
+            blob_depot_lock: _,
+            blob_completion_authority: _,
+            blob_depot_owner_token: _,
         } = self;
         Ok(ZeroizationStore {
             database,
@@ -5102,11 +5200,17 @@ impl Store {
     /// transaction serializes any mutation that already passed the API gate.
     /// This is a software lifecycle boundary and makes no physical-erasure claim.
     pub fn begin_zeroization(
-        &self,
+        &mut self,
         intent: &ZeroizationIntent,
     ) -> Result<BeginZeroizationOutcome, StoreError> {
         let authority = self.mission_authority.ok_or(StoreError::MissionNotBound)?;
         self.live.store(false, Ordering::SeqCst);
+        // Drain the one borrowed physical-depot adapter after closing its live
+        // gate. The terminal transaction cannot commit while ciphertext I/O is
+        // in flight, and every adapter method also observes the closed gate.
+        let _depot_guard = self.blob_depot_lock.lock().map_err(|_| {
+            StoreError::Blob(BlobStoreError::DepotIntegrity("depot lock is poisoned"))
+        })?;
         let mut write = self.database.begin_write()?;
         write.set_durability(Durability::Immediate)?;
         let outcome = begin_zeroization_write(&write, authority, intent)?;
@@ -5519,46 +5623,8 @@ impl Store {
             u64::try_from(bytes.len()).map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
         let marker = {
             let mut metadata = write.open_table(METADATA)?;
+            require_aggregate_capacity(&metadata, self.limits, 1, incoming)?;
             let current_items = metadata.get(ITEM_COUNT)?.map_or(0, |value| value.value());
-            let semantic_items = metadata
-                .get(SEMANTIC_ITEM_COUNT)?
-                .map_or(0, |value| value.value());
-            let state_items = metadata
-                .get(STATE_ITEM_COUNT)?
-                .map_or(0, |value| value.value());
-            let state_operation_items = metadata
-                .get(STATE_OPERATION_COUNT)?
-                .map_or(0, |value| value.value());
-            let record_items = metadata
-                .get(RECORD_ITEM_COUNT)?
-                .map_or(0, |value| value.value());
-            let record_operation_items = metadata
-                .get(RECORD_OPERATION_COUNT)?
-                .map_or(0, |value| value.value());
-            let route_items = metadata
-                .get(ROUTE_CACHE_ITEM_COUNT)?
-                .map_or(0, |value| value.value());
-            let control_items = metadata
-                .get(CONTROL_ITEM_COUNT)?
-                .map_or(0, |value| value.value());
-            let aggregate_items = current_items
-                .checked_add(semantic_items)
-                .and_then(|value| value.checked_add(state_items))
-                .and_then(|value| value.checked_add(state_operation_items))
-                .and_then(|value| value.checked_add(record_items))
-                .and_then(|value| value.checked_add(record_operation_items))
-                .and_then(|value| value.checked_add(route_items))
-                .and_then(|value| value.checked_add(control_items))
-                .ok_or(StoreError::ItemCountAccountingOverflow)?;
-            let next_aggregate_items = aggregate_items
-                .checked_add(1)
-                .ok_or(StoreError::ItemCountAccountingOverflow)?;
-            if next_aggregate_items > self.limits.max_items {
-                return Err(StoreError::ItemLimitExceeded {
-                    current: aggregate_items,
-                    limit: self.limits.max_items,
-                });
-            }
             let next_items = current_items
                 .checked_add(1)
                 .ok_or(StoreError::ItemCountAccountingOverflow)?;
@@ -5566,50 +5632,6 @@ impl Store {
             let current_payload_bytes = metadata
                 .get(TOTAL_PAYLOAD_BYTES)?
                 .map_or(0, |value| value.value());
-            let semantic_payload_bytes = metadata
-                .get(SEMANTIC_TOTAL_BYTES)?
-                .map_or(0, |value| value.value());
-            let state_payload_bytes = metadata
-                .get(STATE_TOTAL_BYTES)?
-                .map_or(0, |value| value.value());
-            let state_operation_bytes = metadata
-                .get(STATE_OPERATION_TOTAL_BYTES)?
-                .map_or(0, |value| value.value());
-            let record_bytes = metadata
-                .get(RECORD_TOTAL_BYTES)?
-                .map_or(0, |value| value.value());
-            let record_operation_bytes = metadata
-                .get(RECORD_OPERATION_TOTAL_BYTES)?
-                .map_or(0, |value| value.value());
-            let route_payload_bytes = metadata
-                .get(ROUTE_CACHE_TOTAL_BYTES)?
-                .map_or(0, |value| value.value());
-            let control_payload_bytes = metadata
-                .get(CONTROL_TOTAL_BYTES)?
-                .map_or(0, |value| value.value());
-            let control_intent_bytes = metadata
-                .get(CONTROL_PUBLICATION_INTENT_TOTAL_BYTES)?
-                .map_or(0, |value| value.value());
-            let aggregate_payload_bytes = current_payload_bytes
-                .checked_add(semantic_payload_bytes)
-                .and_then(|value| value.checked_add(state_payload_bytes))
-                .and_then(|value| value.checked_add(state_operation_bytes))
-                .and_then(|value| value.checked_add(record_bytes))
-                .and_then(|value| value.checked_add(record_operation_bytes))
-                .and_then(|value| value.checked_add(route_payload_bytes))
-                .and_then(|value| value.checked_add(control_payload_bytes))
-                .and_then(|value| value.checked_add(control_intent_bytes))
-                .ok_or(StoreError::PayloadByteAccountingOverflow)?;
-            let next_aggregate_payload_bytes = aggregate_payload_bytes
-                .checked_add(incoming)
-                .ok_or(StoreError::PayloadByteAccountingOverflow)?;
-            if next_aggregate_payload_bytes > self.limits.max_total_payload_bytes {
-                return Err(StoreError::PayloadByteLimitExceeded {
-                    current: aggregate_payload_bytes,
-                    incoming,
-                    limit: self.limits.max_total_payload_bytes,
-                });
-            }
             let next_payload_bytes = current_payload_bytes
                 .checked_add(incoming)
                 .ok_or(StoreError::PayloadByteAccountingOverflow)?;
@@ -6109,6 +6131,10 @@ impl Store {
                 .open_table(RECORDS)?
                 .get(transfer_id.as_bytes().as_slice())?
                 .is_some()
+            || write
+                .open_table(blob::BLOB_PUBLICATIONS)?
+                .get(transfer_id.as_bytes().as_slice())?
+                .is_some()
         {
             return Err(StoreError::TransferNamespaceCollision {
                 transfer_id: *transfer_id.as_bytes(),
@@ -6120,6 +6146,10 @@ impl Store {
             .is_some()
             || write
                 .open_table(RECORD_SEMANTIC_ITEMS)?
+                .get(semantic_claim.as_bytes().as_slice())?
+                .is_some()
+            || write
+                .open_table(blob::BLOB_SEMANTIC_ITEMS)?
                 .get(semantic_claim.as_bytes().as_slice())?
                 .is_some()
         {
@@ -6218,6 +6248,7 @@ impl Store {
             u64::try_from(sealed.len()).map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
         {
             let mut metadata = write.open_table(METADATA)?;
+            require_aggregate_capacity(&metadata, self.limits, 1, incoming)?;
             let current_items = metadata
                 .get(ROUTE_CACHE_ITEM_COUNT)?
                 .map_or(0, |value| value.value());
@@ -6228,40 +6259,6 @@ impl Store {
                 return Err(StoreError::RouteCacheItemLimitExceeded {
                     current: current_items,
                     limit: MAX_ROUTE_CACHE_ITEMS,
-                });
-            }
-            let opaque_items = metadata.get(ITEM_COUNT)?.map_or(0, |value| value.value());
-            let semantic_items = metadata
-                .get(SEMANTIC_ITEM_COUNT)?
-                .map_or(0, |value| value.value());
-            let state_items = metadata
-                .get(STATE_ITEM_COUNT)?
-                .map_or(0, |value| value.value());
-            let state_operation_items = metadata
-                .get(STATE_OPERATION_COUNT)?
-                .map_or(0, |value| value.value());
-            let record_items = metadata
-                .get(RECORD_ITEM_COUNT)?
-                .map_or(0, |value| value.value());
-            let record_operation_items = metadata
-                .get(RECORD_OPERATION_COUNT)?
-                .map_or(0, |value| value.value());
-            let control_items = metadata
-                .get(CONTROL_ITEM_COUNT)?
-                .map_or(0, |value| value.value());
-            let aggregate_items = opaque_items
-                .checked_add(semantic_items)
-                .and_then(|value| value.checked_add(state_items))
-                .and_then(|value| value.checked_add(state_operation_items))
-                .and_then(|value| value.checked_add(record_items))
-                .and_then(|value| value.checked_add(record_operation_items))
-                .and_then(|value| value.checked_add(next_items))
-                .and_then(|value| value.checked_add(control_items))
-                .ok_or(StoreError::ItemCountAccountingOverflow)?;
-            if aggregate_items > self.limits.max_items {
-                return Err(StoreError::ItemLimitExceeded {
-                    current: aggregate_items.saturating_sub(1),
-                    limit: self.limits.max_items,
                 });
             }
             let current_bytes = metadata
@@ -6275,47 +6272,6 @@ impl Store {
                     current: current_bytes,
                     incoming,
                     limit: MAX_ROUTE_CACHE_BYTES,
-                });
-            }
-            let opaque_bytes = metadata
-                .get(TOTAL_PAYLOAD_BYTES)?
-                .map_or(0, |value| value.value());
-            let semantic_bytes = metadata
-                .get(SEMANTIC_TOTAL_BYTES)?
-                .map_or(0, |value| value.value());
-            let state_bytes = metadata
-                .get(STATE_TOTAL_BYTES)?
-                .map_or(0, |value| value.value());
-            let state_operation_bytes = metadata
-                .get(STATE_OPERATION_TOTAL_BYTES)?
-                .map_or(0, |value| value.value());
-            let record_bytes = metadata
-                .get(RECORD_TOTAL_BYTES)?
-                .map_or(0, |value| value.value());
-            let record_operation_bytes = metadata
-                .get(RECORD_OPERATION_TOTAL_BYTES)?
-                .map_or(0, |value| value.value());
-            let control_bytes = metadata
-                .get(CONTROL_TOTAL_BYTES)?
-                .map_or(0, |value| value.value());
-            let control_intent_bytes = metadata
-                .get(CONTROL_PUBLICATION_INTENT_TOTAL_BYTES)?
-                .map_or(0, |value| value.value());
-            let aggregate_bytes = opaque_bytes
-                .checked_add(semantic_bytes)
-                .and_then(|value| value.checked_add(state_bytes))
-                .and_then(|value| value.checked_add(state_operation_bytes))
-                .and_then(|value| value.checked_add(record_bytes))
-                .and_then(|value| value.checked_add(record_operation_bytes))
-                .and_then(|value| value.checked_add(next_bytes))
-                .and_then(|value| value.checked_add(control_bytes))
-                .and_then(|value| value.checked_add(control_intent_bytes))
-                .ok_or(StoreError::PayloadByteAccountingOverflow)?;
-            if aggregate_bytes > self.limits.max_total_payload_bytes {
-                return Err(StoreError::PayloadByteLimitExceeded {
-                    current: aggregate_bytes.saturating_sub(incoming),
-                    incoming,
-                    limit: self.limits.max_total_payload_bytes,
                 });
             }
             metadata.insert(ROUTE_CACHE_ITEM_COUNT, next_items)?;
@@ -7113,6 +7069,10 @@ impl Store {
                 .open_table(RECORDS)?
                 .get(prepared.transfer_id.as_bytes().as_slice())?
                 .is_some()
+            || write
+                .open_table(blob::BLOB_PUBLICATIONS)?
+                .get(prepared.transfer_id.as_bytes().as_slice())?
+                .is_some()
         {
             return Err(StoreError::TransferNamespaceCollision {
                 transfer_id: *prepared.transfer_id.as_bytes(),
@@ -7189,6 +7149,10 @@ impl Store {
             .is_some()
             || write
                 .open_table(RECORD_SEMANTIC_ITEMS)?
+                .get(prepared.semantic_id.as_bytes().as_slice())?
+                .is_some()
+            || write
+                .open_table(blob::BLOB_SEMANTIC_ITEMS)?
                 .get(prepared.semantic_id.as_bytes().as_slice())?
                 .is_some()
         {
@@ -7355,89 +7319,13 @@ impl Store {
             .map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
         let marker = {
             let mut metadata = write.open_table(METADATA)?;
-            let opaque_items = metadata.get(ITEM_COUNT)?.map_or(0, |value| value.value());
+            require_aggregate_capacity(&metadata, self.limits, 1, incoming)?;
             let semantic_items = metadata
                 .get(SEMANTIC_ITEM_COUNT)?
-                .map_or(0, |value| value.value());
-            let state_items = metadata
-                .get(STATE_ITEM_COUNT)?
-                .map_or(0, |value| value.value());
-            let state_operation_items = metadata
-                .get(STATE_OPERATION_COUNT)?
-                .map_or(0, |value| value.value());
-            let record_items = metadata
-                .get(RECORD_ITEM_COUNT)?
-                .map_or(0, |value| value.value());
-            let record_operation_items = metadata
-                .get(RECORD_OPERATION_COUNT)?
-                .map_or(0, |value| value.value());
-            let route_items = metadata
-                .get(ROUTE_CACHE_ITEM_COUNT)?
-                .map_or(0, |value| value.value());
-            let control_items = metadata
-                .get(CONTROL_ITEM_COUNT)?
-                .map_or(0, |value| value.value());
-            let aggregate_items = opaque_items
-                .checked_add(semantic_items)
-                .and_then(|value| value.checked_add(state_items))
-                .and_then(|value| value.checked_add(state_operation_items))
-                .and_then(|value| value.checked_add(record_items))
-                .and_then(|value| value.checked_add(record_operation_items))
-                .and_then(|value| value.checked_add(route_items))
-                .and_then(|value| value.checked_add(control_items))
-                .and_then(|value| value.checked_add(1))
-                .ok_or(StoreError::ItemCountAccountingOverflow)?;
-            if aggregate_items > self.limits.max_items {
-                return Err(StoreError::ItemLimitExceeded {
-                    current: aggregate_items.saturating_sub(1),
-                    limit: self.limits.max_items,
-                });
-            }
-            let opaque_bytes = metadata
-                .get(TOTAL_PAYLOAD_BYTES)?
                 .map_or(0, |value| value.value());
             let semantic_bytes = metadata
                 .get(SEMANTIC_TOTAL_BYTES)?
                 .map_or(0, |value| value.value());
-            let state_bytes = metadata
-                .get(STATE_TOTAL_BYTES)?
-                .map_or(0, |value| value.value());
-            let state_operation_bytes = metadata
-                .get(STATE_OPERATION_TOTAL_BYTES)?
-                .map_or(0, |value| value.value());
-            let record_bytes = metadata
-                .get(RECORD_TOTAL_BYTES)?
-                .map_or(0, |value| value.value());
-            let record_operation_bytes = metadata
-                .get(RECORD_OPERATION_TOTAL_BYTES)?
-                .map_or(0, |value| value.value());
-            let route_bytes = metadata
-                .get(ROUTE_CACHE_TOTAL_BYTES)?
-                .map_or(0, |value| value.value());
-            let control_bytes = metadata
-                .get(CONTROL_TOTAL_BYTES)?
-                .map_or(0, |value| value.value());
-            let control_intent_bytes = metadata
-                .get(CONTROL_PUBLICATION_INTENT_TOTAL_BYTES)?
-                .map_or(0, |value| value.value());
-            let aggregate_bytes = opaque_bytes
-                .checked_add(semantic_bytes)
-                .and_then(|value| value.checked_add(state_bytes))
-                .and_then(|value| value.checked_add(state_operation_bytes))
-                .and_then(|value| value.checked_add(record_bytes))
-                .and_then(|value| value.checked_add(record_operation_bytes))
-                .and_then(|value| value.checked_add(route_bytes))
-                .and_then(|value| value.checked_add(control_bytes))
-                .and_then(|value| value.checked_add(control_intent_bytes))
-                .and_then(|value| value.checked_add(incoming))
-                .ok_or(StoreError::PayloadByteAccountingOverflow)?;
-            if aggregate_bytes > self.limits.max_total_payload_bytes {
-                return Err(StoreError::PayloadByteLimitExceeded {
-                    current: aggregate_bytes.saturating_sub(incoming),
-                    incoming,
-                    limit: self.limits.max_total_payload_bytes,
-                });
-            }
             let next_semantic_items = semantic_items
                 .checked_add(1)
                 .ok_or(StoreError::ItemCountAccountingOverflow)?;
@@ -7830,6 +7718,10 @@ impl Store {
                 .open_table(RECORDS)?
                 .get(prepared.transfer_id.as_bytes().as_slice())?
                 .is_some()
+            || write
+                .open_table(blob::BLOB_PUBLICATIONS)?
+                .get(prepared.transfer_id.as_bytes().as_slice())?
+                .is_some()
         {
             return Err(StoreError::TransferNamespaceCollision {
                 transfer_id: *prepared.transfer_id.as_bytes(),
@@ -7872,6 +7764,10 @@ impl Store {
             .is_some()
             || write
                 .open_table(RECORD_SEMANTIC_ITEMS)?
+                .get(prepared.semantic_id.as_bytes().as_slice())?
+                .is_some()
+            || write
+                .open_table(blob::BLOB_SEMANTIC_ITEMS)?
                 .get(prepared.semantic_id.as_bytes().as_slice())?
                 .is_some()
         {
@@ -8333,7 +8229,13 @@ impl Store {
         let policy = &reservation.control_policy;
         enforce_record_policy_write(&write, prepared.mission_authority, policy, &prepared.header)?;
 
-        for table in [EVENTS, STATE_BYTES, ROUTE_CACHE, CONTROL_BYTES] {
+        for table in [
+            EVENTS,
+            STATE_BYTES,
+            ROUTE_CACHE,
+            CONTROL_BYTES,
+            blob::BLOB_PUBLICATIONS,
+        ] {
             if write
                 .open_table(table)?
                 .get(prepared.transfer_id.as_bytes().as_slice())?
@@ -8419,6 +8321,10 @@ impl Store {
             .is_some()
             || write
                 .open_table(STATE_SEMANTIC_ITEMS)?
+                .get(prepared.semantic_id.as_bytes().as_slice())?
+                .is_some()
+            || write
+                .open_table(blob::BLOB_SEMANTIC_ITEMS)?
                 .get(prepared.semantic_id.as_bytes().as_slice())?
                 .is_some()
         {
@@ -8816,7 +8722,7 @@ impl ZeroizationStore {
 
     /// Returns a terminal-safe, fully audited snapshot of preserved namespaces.
     pub fn inspect_preserved(&self) -> Result<StoreInspection, StoreError> {
-        inspect_readable(&self.database)
+        inspect_readable(&self.database, &self.path, self.backing_identity)
     }
 
     /// Proves exact-path backend writer exclusion while this cleanup handle is live.
@@ -9035,6 +8941,10 @@ fn insert_control(
             .open_table(RECORDS)?
             .get(prepared.record.transfer_id.as_bytes().as_slice())?
             .is_some()
+        || write
+            .open_table(blob::BLOB_PUBLICATIONS)?
+            .get(prepared.record.transfer_id.as_bytes().as_slice())?
+            .is_some()
     {
         return Err(StoreError::TransferNamespaceCollision {
             transfer_id: *prepared.record.transfer_id.as_bytes(),
@@ -9045,6 +8955,7 @@ fn insert_control(
         .map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
     {
         let mut metadata = write.open_table(METADATA)?;
+        require_aggregate_capacity(&metadata, limits, 1, incoming)?;
         let controls = metadata
             .get(CONTROL_ITEM_COUNT)?
             .map_or(0, |value| value.value());
@@ -9077,78 +8988,6 @@ fn insert_control(
             });
         }
 
-        let opaque_items = metadata.get(ITEM_COUNT)?.map_or(0, |value| value.value());
-        let event_items = metadata
-            .get(SEMANTIC_ITEM_COUNT)?
-            .map_or(0, |value| value.value());
-        let state_items = metadata
-            .get(STATE_ITEM_COUNT)?
-            .map_or(0, |value| value.value());
-        let state_operation_items = metadata
-            .get(STATE_OPERATION_COUNT)?
-            .map_or(0, |value| value.value());
-        let record_items = metadata
-            .get(RECORD_ITEM_COUNT)?
-            .map_or(0, |value| value.value());
-        let record_operation_items = metadata
-            .get(RECORD_OPERATION_COUNT)?
-            .map_or(0, |value| value.value());
-        let cache_items = metadata
-            .get(ROUTE_CACHE_ITEM_COUNT)?
-            .map_or(0, |value| value.value());
-        let aggregate_items = opaque_items
-            .checked_add(event_items)
-            .and_then(|value| value.checked_add(state_items))
-            .and_then(|value| value.checked_add(state_operation_items))
-            .and_then(|value| value.checked_add(record_items))
-            .and_then(|value| value.checked_add(record_operation_items))
-            .and_then(|value| value.checked_add(cache_items))
-            .and_then(|value| value.checked_add(next_controls))
-            .ok_or(StoreError::ItemCountAccountingOverflow)?;
-        if aggregate_items > limits.max_items {
-            return Err(StoreError::ItemLimitExceeded {
-                current: aggregate_items.saturating_sub(1),
-                limit: limits.max_items,
-            });
-        }
-
-        let opaque_bytes = metadata
-            .get(TOTAL_PAYLOAD_BYTES)?
-            .map_or(0, |value| value.value());
-        let event_bytes = metadata
-            .get(SEMANTIC_TOTAL_BYTES)?
-            .map_or(0, |value| value.value());
-        let state_bytes = metadata
-            .get(STATE_TOTAL_BYTES)?
-            .map_or(0, |value| value.value());
-        let state_operation_bytes = metadata
-            .get(STATE_OPERATION_TOTAL_BYTES)?
-            .map_or(0, |value| value.value());
-        let record_bytes = metadata
-            .get(RECORD_TOTAL_BYTES)?
-            .map_or(0, |value| value.value());
-        let record_operation_bytes = metadata
-            .get(RECORD_OPERATION_TOTAL_BYTES)?
-            .map_or(0, |value| value.value());
-        let cache_bytes = metadata
-            .get(ROUTE_CACHE_TOTAL_BYTES)?
-            .map_or(0, |value| value.value());
-        let aggregate_bytes = opaque_bytes
-            .checked_add(event_bytes)
-            .and_then(|value| value.checked_add(state_bytes))
-            .and_then(|value| value.checked_add(state_operation_bytes))
-            .and_then(|value| value.checked_add(record_bytes))
-            .and_then(|value| value.checked_add(record_operation_bytes))
-            .and_then(|value| value.checked_add(cache_bytes))
-            .and_then(|value| value.checked_add(next_retained_control_bytes))
-            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
-        if aggregate_bytes > limits.max_total_payload_bytes {
-            return Err(StoreError::PayloadByteLimitExceeded {
-                current: aggregate_bytes.saturating_sub(incoming),
-                incoming,
-                limit: limits.max_total_payload_bytes,
-            });
-        }
         metadata.insert(CONTROL_ITEM_COUNT, next_controls)?;
         metadata.insert(CONTROL_TOTAL_BYTES, next_control_bytes)?;
     }
@@ -9180,6 +9019,7 @@ fn admit_control_publication_intent(
     let incoming =
         u64::try_from(encoded_len).map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
     let mut metadata = write.open_table(METADATA)?;
+    require_aggregate_capacity(&metadata, limits, 0, incoming)?;
     let sealed_bytes = metadata
         .get(CONTROL_TOTAL_BYTES)?
         .map_or(0, |value| value.value());
@@ -9200,43 +9040,6 @@ fn admit_control_publication_intent(
             current: current_control_bytes,
             incoming,
             limit: MAX_CONTROL_BYTES,
-        });
-    }
-    let opaque_bytes = metadata
-        .get(TOTAL_PAYLOAD_BYTES)?
-        .map_or(0, |value| value.value());
-    let event_bytes = metadata
-        .get(SEMANTIC_TOTAL_BYTES)?
-        .map_or(0, |value| value.value());
-    let state_bytes = metadata
-        .get(STATE_TOTAL_BYTES)?
-        .map_or(0, |value| value.value());
-    let state_operation_bytes = metadata
-        .get(STATE_OPERATION_TOTAL_BYTES)?
-        .map_or(0, |value| value.value());
-    let record_bytes = metadata
-        .get(RECORD_TOTAL_BYTES)?
-        .map_or(0, |value| value.value());
-    let record_operation_bytes = metadata
-        .get(RECORD_OPERATION_TOTAL_BYTES)?
-        .map_or(0, |value| value.value());
-    let cache_bytes = metadata
-        .get(ROUTE_CACHE_TOTAL_BYTES)?
-        .map_or(0, |value| value.value());
-    let aggregate_bytes = opaque_bytes
-        .checked_add(event_bytes)
-        .and_then(|value| value.checked_add(state_bytes))
-        .and_then(|value| value.checked_add(state_operation_bytes))
-        .and_then(|value| value.checked_add(record_bytes))
-        .and_then(|value| value.checked_add(record_operation_bytes))
-        .and_then(|value| value.checked_add(cache_bytes))
-        .and_then(|value| value.checked_add(next_control_bytes))
-        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
-    if aggregate_bytes > limits.max_total_payload_bytes {
-        return Err(StoreError::PayloadByteLimitExceeded {
-            current: aggregate_bytes.saturating_sub(incoming),
-            incoming,
-            limit: limits.max_total_payload_bytes,
         });
     }
     metadata.insert(CONTROL_PUBLICATION_INTENT_TOTAL_BYTES, next_intent_bytes)?;
@@ -9779,6 +9582,8 @@ fn require_aggregate_capacity(
         STATE_OPERATION_COUNT,
         RECORD_ITEM_COUNT,
         RECORD_OPERATION_COUNT,
+        blob::BLOB_ITEM_COUNT,
+        blob::BLOB_OPERATION_COUNT,
         ROUTE_CACHE_ITEM_COUNT,
         CONTROL_ITEM_COUNT,
     ]
@@ -9805,6 +9610,8 @@ fn require_aggregate_capacity(
         STATE_OPERATION_TOTAL_BYTES,
         RECORD_TOTAL_BYTES,
         RECORD_OPERATION_TOTAL_BYTES,
+        blob::BLOB_TOTAL_BYTES,
+        blob::BLOB_OPERATION_TOTAL_BYTES,
         ROUTE_CACHE_TOTAL_BYTES,
         CONTROL_TOTAL_BYTES,
         CONTROL_PUBLICATION_INTENT_TOTAL_BYTES,
@@ -11229,6 +11036,21 @@ fn inspect_mission_binding_read_only(path: &Path) -> Result<Option<NodeId>, Stor
         } else {
             0
         };
+        let blob_publication_rows = if table_names.contains(blob::BLOB_PUBLICATIONS.name()) {
+            read.open_table(blob::BLOB_PUBLICATIONS)?.len()?
+        } else {
+            0
+        };
+        let blob_import_rows = if table_names.contains(blob::BLOB_IMPORTS.name()) {
+            read.open_table(blob::BLOB_IMPORTS)?.len()?
+        } else {
+            0
+        };
+        let blob_chunk_rows = if table_names.contains(blob::BLOB_CHUNKS.name()) {
+            read.open_table(blob::BLOB_CHUNKS)?.len()?
+        } else {
+            0
+        };
         let cached_rows = if table_names.contains(ROUTE_CACHE.name()) {
             read.open_table(ROUTE_CACHE)?.len()?
         } else {
@@ -11242,11 +11064,14 @@ fn inspect_mission_binding_read_only(path: &Path) -> Result<Option<NodeId>, Stor
         if semantic_rows != 0
             || state_rows != 0
             || record_rows != 0
+            || blob_publication_rows != 0
+            || blob_import_rows != 0
+            || blob_chunk_rows != 0
             || cached_rows != 0
             || control_rows != 0
         {
             return Err(StoreError::SemanticInvariant(
-                "unbound store contains mission-scoped Event, State, Record, or control state",
+                "unbound store contains mission-scoped Event, State, Record, Blob, or control state",
             ));
         }
     }
@@ -12038,12 +11863,13 @@ fn audit_record_tables(
     Ok(())
 }
 
-fn audit_semantic_tables(write: &redb::WriteTransaction) -> Result<(), StoreError> {
+fn audit_semantic_tables(write: &redb::WriteTransaction) -> Result<BlobStoreStats, StoreError> {
     // Opening every table here is the non-destructive schema extension for old
     // stores. Existing v1 opaque item/effect bytes remain untouched and use a
     // disjoint caller-controlled key namespace.
     let mut state_audit = audit_state_tables(write)?;
     audit_record_tables(write, &mut state_audit)?;
+    let blob_audit = blob::audit_blob_tables_write(write, &mut state_audit)?;
     if write
         .list_multimap_tables()?
         .any(|table| table.name() == EVENT_ACCEPTANCE_ORDER.name())
@@ -12579,7 +12405,7 @@ fn audit_semantic_tables(write: &redb::WriteTransaction) -> Result<(), StoreErro
     drop(route_claims);
     drop(_domain);
     audit_event_subscription_tables(write)?;
-    Ok(())
+    Ok(blob_audit.stats)
 }
 
 fn parse_event_subscription_id(bytes: &[u8]) -> Result<EventSubscriptionId, StoreError> {
@@ -16320,12 +16146,14 @@ fn inspect_semantic_readable(
         EventStoreStats,
         StateStoreStats,
         RecordStoreStats,
+        BlobStoreStats,
         Option<NodeId>,
     ),
     StoreError,
 > {
     let (state_stats, mut state_audit) = inspect_state_readable(read)?;
     let record_stats = inspect_record_readable(read, &mut state_audit)?;
+    let blob_stats = blob::inspect_blob_tables_read_with_shared(read, &mut state_audit)?.stats;
     if read
         .list_multimap_tables()?
         .any(|table| table.name() == EVENT_ACCEPTANCE_ORDER.name())
@@ -16364,7 +16192,13 @@ fn inspect_semantic_readable(
                 "mission-scoped Event schema is incomplete",
             ));
         }
-        return Ok((EventStoreStats::default(), state_stats, record_stats, None));
+        return Ok((
+            EventStoreStats::default(),
+            state_stats,
+            record_stats,
+            blob_stats,
+            None,
+        ));
     }
     if present != semantic_tables.len() {
         return Err(StoreError::SemanticInvariant(
@@ -16832,10 +16666,16 @@ fn inspect_semantic_readable(
         ));
     }
     if mission_authority.is_none()
-        && (event_count != 0 || state_stats.states != 0 || route_count != 0)
+        && (event_count != 0
+            || state_stats.states != 0
+            || record_stats.records != 0
+            || blob_stats.publications != 0
+            || blob_stats.variants != 0
+            || blob_stats.committed_chunks != 0
+            || route_count != 0)
     {
         return Err(StoreError::SemanticInvariant(
-            "unbound store contains mission-scoped Event state",
+            "unbound store contains mission-scoped Event, State, Record, or Blob state",
         ));
     }
 
@@ -16869,7 +16709,13 @@ fn inspect_semantic_readable(
             });
         }
     }
-    Ok((stats, state_stats, record_stats, mission_authority))
+    Ok((
+        stats,
+        state_stats,
+        record_stats,
+        blob_stats,
+        mission_authority,
+    ))
 }
 
 fn event_subscription_stats_read(
@@ -17095,7 +16941,11 @@ fn event_subscription_stats_read(
     Ok(stats)
 }
 
-fn inspect_readable(database: &impl ReadableDatabase) -> Result<StoreInspection, StoreError> {
+fn inspect_readable(
+    database: &impl ReadableDatabase,
+    store_path: &Path,
+    backing_identity: StoreBackingIdentity,
+) -> Result<StoreInspection, StoreError> {
     let read = database.begin_read()?;
     let zeroization = inspect_zeroization_read(&read)?;
     let items = read.open_table(ITEMS)?;
@@ -17170,8 +17020,22 @@ fn inspect_readable(database: &impl ReadableDatabase) -> Result<StoreInspection,
         });
     }
 
-    let (event_stats, state_stats, record_stats, mission_authority) =
+    let (event_stats, state_stats, record_stats, blob_stats, mission_authority) =
         inspect_semantic_readable(&read)?;
+    let table_names = read
+        .list_tables()?
+        .map(|table| table.name().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    if table_names.contains(blob::BLOB_DEPOT_METADATA.name()) {
+        let owner_token = blob::depot::depot_owner_token_read(&read)?;
+        blob::depot::audit_depot_read(
+            &read,
+            store_path,
+            backing_identity,
+            owner_token,
+            blob_stats,
+        )?;
+    }
     let event_subscription_stats = event_subscription_stats_read(&read)?;
     let control_stats = inspect_control_tables(&read, mission_authority)?.unwrap_or_default();
 
@@ -17186,6 +17050,7 @@ fn inspect_readable(database: &impl ReadableDatabase) -> Result<StoreInspection,
         event_stats,
         state_stats,
         record_stats,
+        blob_stats,
         event_subscription_stats,
         control_stats,
         mission_authority,
@@ -17667,10 +17532,15 @@ mod tests {
         let file = TestFile::new("inspect-absent");
         assert!(!file.0.exists());
 
-        assert!(matches!(
-            Store::inspect_existing(&file.0),
-            Err(StoreError::Backend(_))
-        ));
+        let error = Store::inspect_existing(&file.0).expect_err("absent inspection must fail");
+        assert!(
+            matches!(&error, StoreError::Backend(_))
+                || matches!(
+                    &error,
+                    StoreError::StorePath(source)
+                        if source.kind() == std::io::ErrorKind::NotFound
+                )
+        );
         assert!(!file.0.exists());
     }
 
@@ -19323,7 +19193,7 @@ mod tests {
             EventDeliveryAck::Acknowledged
         );
         drop(store);
-        let store = Store::open_for_mission(&file.0, services.authority)
+        let mut store = Store::open_for_mission(&file.0, services.authority)
             .expect("acknowledgement receipt restart");
         let policy = store
             .control_policy_snapshot()
@@ -22175,10 +22045,8 @@ mod tests {
         assert_eq!(reopened.control_stats().expect("stable stats").controls, 1);
         drop(reopened);
 
-        let missing_intent = TestFile::new("control-rekey-intent-missing");
-        std::fs::copy(&file.0, &missing_intent.0).expect("copy intent store");
         {
-            let database = Database::open(&missing_intent.0).expect("raw intent store");
+            let database = Database::open(&file.0).expect("raw intent store");
             let write = database.begin_write().expect("intent tamper transaction");
             write
                 .open_table(CONTROL_PUBLICATION_INTENTS)
@@ -22188,11 +22056,11 @@ mod tests {
             write.commit().expect("commit intent tamper");
         }
         assert!(matches!(
-            Store::inspect_existing(&missing_intent.0),
+            Store::inspect_existing(&file.0),
             Err(StoreError::ControlInvariant(_))
         ));
         assert!(matches!(
-            Store::open_for_mission(&missing_intent.0, services.authority_id),
+            Store::open_for_mission(&file.0, services.authority_id),
             Err(StoreError::ControlInvariant(_))
         ));
     }
@@ -23126,7 +22994,7 @@ mod tests {
         let mode = std::env::var(ABRUPT_STORE_MODE).expect("abrupt store mode");
         let mut services = event_services(0xd4);
         let path = PathBuf::from(path);
-        let store = if mode == "unbound-live-missing-accounting" {
+        let mut store = if mode == "unbound-live-missing-accounting" {
             Store::open(&path).expect("abrupt unbound child store")
         } else {
             Store::open_for_mission(&path, services.authority).expect("abrupt child store")
@@ -23670,7 +23538,7 @@ mod tests {
         let replacement = TestFile::new("zeroization-convert-replacement");
         let parked_original = TestFile::new("zeroization-convert-original-parked");
         let services = event_services(0xda);
-        let store =
+        let mut store =
             Store::open_for_mission(&selected.0, services.authority).expect("original store");
         let original_identity = store.backing_identity();
         let replacement_identity = {
@@ -23902,7 +23770,7 @@ mod tests {
             hook.as_mut().expect("failure hook").action = ParentSyncTestAction::Observe;
         }
         let services = event_services(0xdd);
-        let store = Store::open_for_mission(&failed.0, services.authority)
+        let mut store = Store::open_for_mission(&failed.0, services.authority)
             .expect("existing retry after successful parent barrier");
         {
             let hook = PARENT_SYNC_TEST_HOOK
@@ -23952,7 +23820,7 @@ mod tests {
         )
         .expect("different intent");
 
-        let store = Store::open_for_mission(&file.0, events.authority).expect("bound store");
+        let mut store = Store::open_for_mission(&file.0, events.authority).expect("bound store");
         store
             .require_process_exclusive_lock()
             .expect("exact writer exclusion");
@@ -24243,7 +24111,7 @@ mod tests {
         )
         .expect("intent");
         {
-            let store = Store::open_for_mission(&file.0, services.authority).expect("store");
+            let mut store = Store::open_for_mission(&file.0, services.authority).expect("store");
             store.apply(item(0xd2), b"preserved").expect("row");
             store.begin_zeroization(&intent).expect("terminal marker");
         }
@@ -24389,7 +24257,7 @@ mod tests {
         )
         .expect("intent");
         {
-            let store = Store::open_for_mission(&base.0, services.authority).expect("store");
+            let mut store = Store::open_for_mission(&base.0, services.authority).expect("store");
             store.apply(item(0xd3), b"preserve me").expect("row");
             store.begin_zeroization(&intent).expect("begin");
         }
@@ -25132,7 +25000,6 @@ mod tests {
 
     #[test]
     fn state_schema_group_migrates_only_whole_absent_and_rejects_partial_or_wrong_kind() {
-        let base = TestFile::new("State schema preflight base");
         let mut services = event_services(0xb9);
         let payload = b"preserved Event ledger";
         let header = event_header(
@@ -25150,16 +25017,16 @@ mod tests {
             .expect("seal preserved Event");
         let verified = content_event(&mut services.reader, &sealed.bytes);
         let event_transfer = EventTransferId::new(verified.envelope_id());
-        {
-            let store =
-                Store::open_for_mission(&base.0, services.authority).expect("open base store");
+        let create_event_store = |path: &Path| {
+            let store = Store::open_for_mission(path, services.authority)
+                .expect("open native Event fixture store");
             store
                 .apply_verified_event(&verified, &sealed.bytes)
                 .expect("commit preserved Event");
-        }
+        };
 
         let missing_table = TestFile::new("State schema missing table");
-        std::fs::copy(&base.0, &missing_table.0).expect("copy missing-table store");
+        create_event_store(&missing_table.0);
         {
             let database = Database::open(&missing_table.0).expect("missing-table database");
             let write = database.begin_write().expect("missing-table write");
@@ -25193,7 +25060,7 @@ mod tests {
         }
 
         let missing_counter = TestFile::new("State schema missing counter");
-        std::fs::copy(&base.0, &missing_counter.0).expect("copy missing-counter store");
+        create_event_store(&missing_counter.0);
         {
             let database = Database::open(&missing_counter.0).expect("missing-counter database");
             let write = database.begin_write().expect("missing-counter write");
@@ -25230,7 +25097,7 @@ mod tests {
         }
 
         let wrong_kind = TestFile::new("State schema wrong kind");
-        std::fs::copy(&base.0, &wrong_kind.0).expect("copy wrong-kind store");
+        create_event_store(&wrong_kind.0);
         {
             let database = Database::open(&wrong_kind.0).expect("wrong-kind database");
             let write = database.begin_write().expect("wrong-kind write");
@@ -25276,7 +25143,7 @@ mod tests {
         }
 
         let legacy = TestFile::new("State schema whole-absent migration");
-        std::fs::copy(&base.0, &legacy.0).expect("copy legacy store");
+        create_event_store(&legacy.0);
         {
             let database = Database::open(&legacy.0).expect("legacy database");
             let write = database.begin_write().expect("legacy write");

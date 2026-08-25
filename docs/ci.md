@@ -124,7 +124,7 @@ This is current-code automated loopback evidence only: no retained PR-C
 execution root or log artifact, physical system, independent implementation,
 or release artifact is claimed.
 
-The later stopped/local State and Record gates are additive to that Event
+The later stopped/local State, Record, and Blob gates are additive to that Event
 surface and do not change its wire. Record validation covers the typed
 source-envelope seam, bounded mission-bound tables and operation ledger,
 shared Event/State/Record causal high-water, independent conflict-reducer
@@ -174,6 +174,93 @@ process acceptance result, retained execution receipt, or release artifact.
 Record has no live handle or reconciliation frames; automatic registered-policy
 merge, finite TTL, expiry/garbage collection, selected-node bindings, physical
 systems, mixed implementations, and scale remain open.
+
+The subsequent stopped/local Blob gate adds a typed source-manifest capability,
+mission-bound redb publication/operation/read-plan authority, a bounded
+encrypted sibling depot, and synchronous `SelectedBlobNode` publish/read
+streaming. Representative focused commands are:
+
+```sh
+cargo test --locked -p aster-core source_blob
+cargo test --locked -p aster-redb-store blob
+cargo test --locked -p aster-node application::blob::tests
+cargo run --locked -p aster-node --example blob_application -- \
+  STATE_DIR MISSION_BUNDLE INPUT OUTPUT
+```
+
+The core tests distinguish route-only from content authority, reject wrong
+class/mission/source/epoch/group/route root, tampered manifest or envelope,
+empty/flexible-chunk inputs, and a forged store completion whose wrong records
+and final digest are mutually consistent. Store tests cover crash boundaries,
+marked-file corruption without repair, schema migration/nonrepair, exact
+operation conflict/caps/replay, policy/revocation/epoch ordering, cross-class
+causal and identity collisions, aggregate quota rollback, terminal-before-
+depot ordering, unfinished import handling, and bounded reopen audit. Node tests
+cover multi-chunk bounded streaming, exact retry and changed-source conflict,
+same-variant no-growth, rekey variant separation, source-valid wrong key/variant
+claims, fresh inactive-candidate verification, stale read-plan rejection,
+revocation, exclusive writer ownership, depot tamper, and terminal zeroization.
+
+`BlobId` is exact object identity over plaintext bytes, the canonical chunk
+profile, and media/schema identity metadata; it is not a metadata-independent
+whole-byte identity. `BlobDepotLimits` count redb-marked ciphertext-file bytes,
+all durable per-chunk metadata rows, and all import variants. Unfinished rows
+remain charged pending explicit GC; untracked hostile filesystem entries and
+complete physical allocation are outside the counters. The public peak-buffer
+field reports the core Blob engine's capacity; generic store adapters may use
+additional independently chunk-bounded buffers, so it is not a whole-operation
+memory measurement. No test in this gate is a Blob contact, remote/any-peer
+resume, maximum-size acceptance, physical-storage result, retained execution
+receipt, or release artifact.
+
+The database is pinned to one fixed local depot owner on its first successful
+Store open, not treated as a portable backup. Redb persists a domain-separated
+commitment over a random owner token, canonical store path, and Unix
+device/inode when available; the depot marker must carry the same binding
+before any chunk/variant scan or reclaim. The first database to initialize a
+parent’s depot wins, and another cannot adopt it. Moving/copying even an empty
+bound database to another path fails on reopen. On Unix, a new inode also
+fails, moving the depot with the database does not preserve the binding, and a
+same-path replacement cannot adopt an existing depot. No supported
+depot-rebind/restore path is claimed. Non-Unix keeps token-plus-canonical-path
+binding but cannot distinguish a copied database restored over that same path,
+so equivalent inode/rollback resistance is not claimed.
+The owner-token/binding migration is all-or-none and admits missing fields only
+for canonical empty Blob rows/counters with no fixed depot root; partial
+fields, any logical Blob state, or any fixed depot root fail without repair.
+
+On the final frozen bytes, focused current-toolchain runs passed the six typed
+source-Blob tests, the dedicated core reader retry-state adversary, all 28
+selected-store Blob tests, and all seven selected-node Blob tests. The current
+tracked-Cargo-target matrix passed 576 of 576 tests: core library 351/351
+(44.68s), node library 88/88 (11.29s), node binary 6/6 (0.00s), `mesh_cli`
+13/13 (153.69s), and selected store 118/118 (12.33s). The separate exact Rust
+1.91.0 matrix passed the same 576 tests in 45.57, 28.63, 0.01, 153.99, and
+12.44 seconds respectively. The core basic example and five node examples had
+no tests. These totals count only the listed tracked Cargo targets; no
+auxiliary non-workspace scratch harness is counted.
+
+Strict workspace all-target Clippy with warnings denied passed on the current
+and Rust 1.91 toolchains in 28.36 and 34.71 seconds. Current-toolchain Rustdoc
+with warnings denied, `cargo fmt --all -- --check`, and `git diff --check`
+also passed. A loopback-enabled current-toolchain `cargo test --workspace`
+passed every runnable workspace suite; one performance experiment remained
+explicitly ignored. The process-heavy node cells required loopback permission;
+an earlier sandboxed attempt was denied by the host before those socket tests
+could run and is not counted as a test failure or success.
+
+The exact Blob source identities are pinned in the
+[requirements evidence](implementation/requirements-status.md#current-selected-blob-automated-evidence).
+A disposable provisioned fixture then ran the compiled Blob example twice over
+18,783 input bytes. The 4.792-second first run returned one chunk,
+`inserted=true`, and Blob ID
+`85c3f98504cc9e671212256c994698ce2d8c1e947aa5b3841d61a943d3660fde`;
+the 0.714-second exact rerun returned the same ID with `inserted=false`. Both
+outputs matched the input byte-for-byte at SHA-256
+`f3d9ba32b0825abfec157aadf8c16581608220f48dd2a8f0a3a39bef29bdd966`.
+The fixture is not retained, and this is local executable evidence rather than
+a Blob contact, remote-resume result, physical-storage measurement, or release
+receipt.
 
 The 57th test in that parent redb-store receipt is a Unix writable-open
 durability adversary. Every new or existing writer, including a terminal
@@ -305,9 +392,10 @@ They remain bounded to Event, one control family/scope, and loopback. The
 current code additionally has durable Event Consume/Carry selectors, live and
 stopped-state poll/ack, idempotent unsubscribe, verified gap inspection,
 bounded last-contact status, protected receiver-directed filtering, and
-separate stopped/local State and Record projections; it does not turn the
-retained parent roots into PR-B, PR-C, State, or Record receipts. The tests do
-not claim networked State/Record, Blob, global convergence, generalized control
+separate stopped/local State and Record projections plus local Blob streaming;
+it does not turn the retained parent roots into PR-B, PR-C, State, Record, or
+Blob receipts. The tests do not claim networked State/Record/Blob, remote Blob
+chunks, global convergence, generalized control
 administration, finite-TTL custody, protected provisioning, platform-complete
 zeroization assurance, admitted release cryptography, independent review, or
 physical-network acceptance.

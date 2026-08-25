@@ -97,6 +97,14 @@ RECORD_LOCAL_SLICE = (
     "crates/aster-node/examples/record_application.rs; "
     "docs/quickstart/selected-record-api.md"
 )
+BLOB_LOCAL_SLICE = (
+    "crates/aster-core/src/blob.rs; crates/aster-core/src/source_blob.rs; "
+    "crates/aster-redb-store/src/blob.rs; "
+    "crates/aster-redb-store/src/blob/depot.rs; "
+    "crates/aster-node/src/application/blob.rs; "
+    "crates/aster-node/examples/blob_application.rs; "
+    "docs/quickstart/selected-blob-api.md"
+)
 CONTROL_SLICE = (
     "crates/aster-core/src/source_control.rs; crates/aster-redb-store/src/lib.rs; "
     "crates/aster-node/src/frame.rs; crates/aster-node/src/runtime.rs; "
@@ -209,7 +217,7 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
         "implemented-uncredited",
         "aster-core + aster-redb-store + aster-node",
         f"{STATE_LOCAL_SLICE}; the stopped SelectedStateNode source-seals and durably publishes bounded State versions, then queries one exact topic/scope/logical-key projection without exposing sealed representations or provider internals",
-        "This is a stopped/local selected State surface, not live State, replication, subscription, language-binding, physical-carrier, mixed-implementation, or release evidence. Record and Blob remain open.",
+        "This is a stopped/local selected State surface, not live State, replication, subscription, language-binding, physical-carrier, mixed-implementation, or release evidence. The separate stopped/local Record and Blob slices do not close those State gaps.",
     ),
     "DM-5.1-02": selected_claim(
         "implemented-uncredited",
@@ -233,6 +241,18 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
         "aster-core + aster-redb-store + aster-node",
         f"{RECORD_LOCAL_SLICE}; independently source-authenticated publishers can create arrival-independent two-way and N-way Record heads in the mission-bound store, and the facade freshly verifies and exposes the complete exact sibling set before guarded resolution",
         "The concurrency mechanism is exercised through privileged local test ingestion only. Record has no selected wire/live ingest path, so no disconnected-process, cross-node convergence, mixed-implementation, scale, physical, or retained acceptance result is claimed.",
+    ),
+    "DM-5.1-10": selected_claim(
+        "implemented-uncredited",
+        "aster-core + aster-redb-store + aster-node",
+        f"{BLOB_LOCAL_SLICE}; the stopped SelectedBlobNode prepares a manifest-bounded digest set, commits encrypted chunks under the fixed 64-KiB profile outside redb, source-seals one canonical manifest, and streams verified plaintext into a caller-owned writer",
+        "This is a stopped/local selected Blob surface. Blob has no live/runtime reconciliation, remote chunk transfer, any-peer resume, language binding, physical acceptance, mixed-implementation evidence, or retained release receipt. The selected integration tests are modest multi-chunk fixtures, not maximum-size acceptance.",
+    ),
+    "DM-5.1-11": selected_claim(
+        "implemented-uncredited",
+        "aster-core + aster-redb-store + aster-node",
+        f"{BLOB_LOCAL_SLICE}; BlobId commits exact plaintext bytes, the canonical chunk profile, and media/schema identity metadata; source-authenticated manifest records and the epoch-specific encrypted depot variant are immutable once committed",
+        "The ID is metadata-bound object identity, not a separate pure whole-byte content ID. Metadata-independent deduplication, selected network transfer, independent interoperability, scale, and retained acceptance remain open.",
     ),
     "DM-5.1-05": selected_claim(
         "implemented-uncredited", "aster-redb-store",
@@ -375,6 +395,12 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
         "aster-redb-store + aster-node",
         f"{RECORD_LOCAL_SLICE}; causally dominated active Record revisions remain durably retained and are returned in the optional Superseded lane after fresh verification; guarded resolution turns every inspected head into recoverable superseded history",
         "The local slice rejects at its per-key bound rather than silently evicting, but explicit-policy garbage collection is not implemented. Add retention/GC policy and verify restart, replication, expiry, scale, and acceptance.",
+    ),
+    "DM-5.3-04": selected_claim(
+        "implemented-uncredited",
+        "aster-core + aster-redb-store + aster-node",
+        f"{BLOB_LOCAL_SLICE}; immutable Blob bytes and identity metadata never enter the State/Record causal merge reducers, while multiple signed source publications can reference one exact completed content variant without changing it",
+        "This is local mechanism evidence only. Selected Blob network delivery, adversarial multi-writer interoperability, retention/GC policy, scale, and acceptance remain open.",
     ),
     "DM-5.4-01": selected_claim(
         "implemented-uncredited", "aster-profile", PROFILE_EVIDENCE,
@@ -618,6 +644,18 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
         "dependency-policy owner",
         f"{DEPENDENCY_GATE}; exact CDLA trust-root packages remain unadmitted and browser-WASM target policy is unresolved",
         "Obtain exact package/version legal-policy disposition and supported-target decision, or implement an approved trust-root path; no exception has been added.",
+    ),
+    "DM-9-13": selected_claim(
+        "implemented-uncredited",
+        "aster-core + aster-redb-store + aster-node",
+        f"{BLOB_LOCAL_SLICE}; read_into freshly verifies the selected publication and completed depot variant, then reads canonical encrypted chunk files and streams independently authenticated plaintext chunks into a caller-owned writer",
+        "The selected reader is stopped/local and synchronous. Remote chunk transport, carrier switching, physical-disk acceptance, maximum-size runs, platform breadth, and retained resource evidence remain open.",
+    ),
+    "DM-9-14": selected_claim(
+        "implemented-uncredited",
+        "aster-core + aster-redb-store + aster-node",
+        f"{BLOB_LOCAL_SLICE}; preparation uses one bounded zeroizing plaintext chunk buffer and, after its first pass, retains only the one-MiB-manifest-bounded digest vector; the core streaming engine reports its peak chunk-buffer capacity, every store-adapter buffer is independently chunk-bounded, and tests compare multi-chunk output without collecting the complete Blob in the component",
+        "The public metric is the core reader's buffer, not whole-operation peak memory; the adapter may hold additional bounded chunk-sized buffers. Current evidence uses modest local fixtures. Add bracketed process resident-memory measurements on supported targets, physical storage/resource accounting, remote transfer, and retained acceptance before crediting the full resource target.",
     ),
     "DM-9-21A": selected_claim(
         "implemented-uncredited",

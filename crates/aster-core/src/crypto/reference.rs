@@ -15,7 +15,7 @@ use super::{
     SequencedCiphertext, ServerFinished, ServerHello, ZeroizeKey, client_hello_hash,
 };
 use crate::batch;
-use crate::blob::{BlobId, BlobRouteCommitment, BlobStoreConfig, ReferenceBlobService};
+use crate::blob::{BlobId, BlobRouteCommitment, BlobStore, BlobStoreConfig, ReferenceBlobService};
 use crate::bridge::{
     self, AuthorizationEnvelope, BridgeAuthorization, BridgeOuterKind, BridgeRoute,
 };
@@ -1635,7 +1635,7 @@ impl ReferenceEnvelopeSealer {
         let grant = self
             .content_grant(scope, topic, epoch)
             .ok_or_else(|| EnvelopeError("content is not granted to this node".into()))?;
-        ReferenceBlobService::open_with_config(
+        let mut service = ReferenceBlobService::open_with_config(
             store_path,
             *grant.key.expose(),
             scope,
@@ -1643,7 +1643,11 @@ impl ReferenceEnvelopeSealer {
             epoch,
             config,
         )
-        .map_err(|error| EnvelopeError(format!("Blob service open failed: {error}")))
+        .map_err(|error| EnvelopeError(format!("Blob service open failed: {error}")))?;
+        service
+            .bind_mission_authority_id(self.mission_authority_id())
+            .map_err(|error| EnvelopeError(format!("Blob service bind failed: {error}")))?;
+        Ok(service)
     }
 
     pub fn blob_service_with_defaults(
@@ -1654,6 +1658,29 @@ impl ReferenceEnvelopeSealer {
         store_path: impl AsRef<Path>,
     ) -> Result<ReferenceBlobService, EnvelopeError> {
         self.blob_service(scope, topic, epoch, store_path, BlobStoreConfig::default())
+    }
+
+    /// Binds an arbitrary durable Blob adapter to this provider's exact
+    /// scope/topic/epoch content grant without exporting key material.
+    pub fn blob_service_with_store<S: BlobStore>(
+        &self,
+        scope: &Scope,
+        topic: &Topic,
+        epoch: u64,
+        store: S,
+    ) -> Result<ReferenceBlobService<S>, EnvelopeError> {
+        self.ensure_live()?;
+        let grant = self
+            .content_grant(scope, topic, epoch)
+            .ok_or_else(|| EnvelopeError("content is not granted to this node".into()))?;
+        Ok(ReferenceBlobService::from_store(
+            store,
+            *grant.key.expose(),
+            scope,
+            topic,
+            epoch,
+            self.mission_authority_id(),
+        ))
     }
 
     /// Creates an authority-signed revocation notice. Ordinary node credentials are rejected.

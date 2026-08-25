@@ -342,6 +342,7 @@ version = "0.1.0"
 dependencies = [
  "aster-core",
  "aster-profile",
+ "getrandom 0.4.3",
  "redb",
  "rustix",
  "sha2 0.11.0",
