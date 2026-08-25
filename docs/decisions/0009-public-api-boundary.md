@@ -3,7 +3,7 @@
 - Status: accepted as an application ergonomics boundary; prior adapter
   security-boundary claim withdrawn
 - Date: 2026-08-18
-- Amended: 2026-08-20
+- Amended: 2026-08-24
 
 The default Rust library and every first-class language binding expose only
 application operations: node lifecycle, offline publish, streamed Blob I/O,
@@ -83,3 +83,25 @@ ingestion never invoke application policy. Applications inspect siblings and
 publish reviewed output through explicit `resolve()`. This prevents
 peer-triggered ingestion from creating recursive merge publications and leaves
 requirements §5.3 automatic merge partial pending a convergent design.
+
+## Selected production-lane Event foundation (2026-08-24)
+
+`aster-node::application::SelectedEventNode` is the first high-level surface
+over the selected redb/runtime security composition. It owns the exact
+mission-bound redb writer authority while the mesh process is stopped and
+exposes arbitrary policy-authorized Event publication and bounded
+marker-ordered query. Publication is durably idempotent by an application
+operation key.
+Queries return freshly source/content-verified plaintext application fields and
+semantic Event identities; they omit exact transfer IDs, sealed bytes, keys,
+provider selection, inventories, reconciliation, and carrier choice.
+
+This foundation does not replace the broader proven semantic `ApplicationNode`
+or complete the accepted boundary. It has no durable subscribe/poll/ack
+delivery, public authenticated gap inspection, subscription-aware replication
+filter, live actor handle, peer/sync status, State, Record, Blob, bindings,
+protected operational provisioning, or
+generalized control administration. Finite TTL is absent and therefore cannot
+be requested until authenticated cumulative forwarding age and expiry exist.
+The compiled example and exact claim boundary are documented in the
+[selected Event API quickstart](../quickstart/selected-event-api.md).

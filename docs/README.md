@@ -9,8 +9,9 @@ need to understand the wire format or cryptography to embed the application API.
    fastest visible result.
 2. Read [Core concepts](concepts.md) for the ten-minute mental model and the
    [selected architecture](architecture.md) for its trust boundaries.
-3. Run the full [live N-node, multi-process mesh CLI](quickstart/mesh-cli.md), or exercise the
-   current semantic application API with the [Rust](quickstart/rust.md),
+3. Run the full [live N-node, multi-process mesh CLI](quickstart/mesh-cli.md),
+   exercise the selected stopped-state [Event API](quickstart/selected-event-api.md),
+   or use the current semantic application API with the [Rust](quickstart/rust.md),
    [Python](quickstart/python.md), [Go](quickstart/go.md), or
    [C](quickstart/c.md) quickstart.
 4. Read [Carriers and contacts](transports.md) when you are ready to move data
@@ -33,6 +34,7 @@ migrated onto that composition.
 | Understand what makes Aster different | [Project overview](../README.md) and [Core concepts](concepts.md) |
 | Understand the selected components and trust boundaries | [Selected architecture](architecture.md) |
 | Run real node processes and watch Ping/Pong or captured-node control propagation cross the mesh | [Live mesh CLI](quickstart/mesh-cli.md) |
+| Publish and query through the selected Event/store/security composition | [Selected Event API](quickstart/selected-event-api.md) |
 | Choose between State, Event, Record, and Blob | [Choosing a data class](concepts.md#choosing-a-data-class) |
 | Publish and subscribe from an application | [Language quickstarts](quickstart/README.md) |
 | See commented examples for every data class and common operation | [Application recipes](application-recipes.md) |
@@ -67,7 +69,7 @@ the authority for what application code is expected to touch.
 
 | Surface | Available now | Important boundary |
 |---|---|---|
-| Selected carrier/storage composition | Exact source-sealed control/Event transfer, a durable ordered Flash-control prefix with atomic policy activation, mission-bound semantic/causal/operation state, bounded route-only cache, a durable terminal software-zeroization intent, clock-independent Negentropy difference, direct Iroh exchange, and the `aster` composition/CLI. The runtime uses the existing `aster-core` mission-session, control-envelope, recipient-filtered-rekey, and source-envelope providers. | Carrier, mission, control/source, route, and content authority remain distinct. State/Record/Blob, generalized applications/subscriptions and control administration, finite-TTL custody, protected provisioning, NAT/hosted relay, BTLE, platform-complete zeroization assurance, and release gates remain open. The selected node's normal graph contains no SQLite. |
+| Selected carrier/storage composition | Exact source-sealed control/Event transfer, a durable ordered Flash-control prefix with atomic policy activation, mission-bound semantic/causal/operation state, bounded route-only cache, a durable terminal software-zeroization intent, clock-independent Negentropy difference, direct Iroh exchange, and the `aster` composition/CLI. A stopped-state `SelectedEventNode` foundation adds arbitrary policy-authorized Event publish and bounded marker-ordered query over that same authority. The runtime uses the existing `aster-core` mission-session, control-envelope, recipient-filtered-rekey, and source-envelope providers. | Carrier, mission, control/source, route, and content authority remain distinct. Public authenticated gap inspection, durable subscribe/poll/ack, subscription-aware replication filtering, live peer/sync status, State/Record/Blob, generalized control administration, finite-TTL custody, protected provisioning, NAT/hosted relay, BTLE, platform-complete zeroization assurance, and release gates remain open. The selected node's normal graph contains no SQLite. |
 | Selected live CLI | Configurable 2–32-node Ping/Pong line, explicit four-role control scenario, addressed `init`/`inspect`/mission-provisioned `node`, stopped-state authority commands, a same-UID Unix `zeroize` hook, and isolated legacy `put`; built-in relay/Ping/Pong application roles | Current-tree N=3/13-process, default N=4/18-process, and N=8/38-process Ping/Pong receipts plus the explicit N=4/23-process control receipt passed. The generic line uses `2N+1` isolated cohorts and `5N-2` children: peerless Ping and Pong publication, one exact pre-existing Event transfer per directed edge with all control counters zero, and a final no-op with all 11 reconciliation counters zero. The control receipt separately proves control convergence, no-contact Ping publication, later relay forwarding, four causal Pong barriers, and a zero-transfer no-op; its captured node deliberately retains stale signing material because exclusion is not destruction. A separate live-child receipt exercises the local hook. Retained stderr is disclosed in the [quickstart](quickstart/mesh-cli.md). The hook preserves data rows and zero-length artifact pathnames and does not prove non-Unix behavior, inode deletion, physical sanitization, database rollback resistance, physical networking, many-node scale, or production authorization. |
 | Current semantic Rust API | Publish, query, durable subscriptions, conflicts, batches, streamed Blobs, emission policy, status, bridges, recipient-filtered rekey, hybrid-PQ handshakes, protected envelopes, and source authentication in `aster-core` | This remains the proven semantic implementation and migration source. The selected node now uses its mission-session, control-envelope/rekey, and Event source-envelope seams; the broader high-level API and other data classes are not composed yet. Event-gap inspection, process-local merge-policy ID registration, and retention-driven garbage collection are Rust-only; automatic Record merge is partial. |
 | Protected provisioning | Replaceable, bounded Rust protection boundary with a redacted, zeroizing Aster-owned plaintext container, plus an isolated age-v1 X25519 provider pilot | The pilot is Rust-only, non-production, classical rather than post-quantum, and not FIPS validated or a persistent secret store; upstream age encryption and identity-decoding intermediates are not comprehensively zeroized, and raw fixture/compatibility paths remain in Rust and all language bindings. |
@@ -132,6 +134,7 @@ decision records explain why the current design chose its major boundaries:
 ### Tutorials and integration
 
 - [Capability tour](quickstart/capability-tour.md)
+- [Selected Event API](quickstart/selected-event-api.md)
 - [Live mesh CLI](quickstart/mesh-cli.md)
 - [Selected production-lane architecture](architecture.md)
 - [Language quickstarts](quickstart/README.md)

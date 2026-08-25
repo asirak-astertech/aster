@@ -4,10 +4,18 @@ To see real Aster nodes exchange protected Events before embedding an API, run
 the one-command [capability tour](capability-tour.md). This page indexes the
 offline application and language-binding quickstarts.
 
+For the selected production-lane composition, start with the Rust
+[`SelectedEventNode` Event quickstart](selected-event-api.md). It demonstrates
+peerless publish and bounded query over the mission-bound redb authority.
+Public authenticated gap inspection, durable subscribe/poll/ack, live peer/sync
+status, other data classes, and selected-node language bindings are not part of
+that first slice.
+
 Choose the API closest to your application:
 
 | Language | API you use | Quickstart |
 |---|---|---|
+| Rust (selected Event slice) | `aster-node::application::SelectedEventNode` | [Selected Event API](selected-event-api.md) |
 | Rust | Native high-level `ApplicationNode` | [Rust](rust.md) |
 | Python | Dependency-free `ctypes` wrapper over the native library | [Python](python.md) |
 | Go | cgo wrapper over the native library | [Go](go.md) |

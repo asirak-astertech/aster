@@ -68,7 +68,9 @@ DEPENDENCY_GATE = (
 )
 EVENT_SLICE = (
     "crates/aster-core/src/source_event.rs; crates/aster-redb-store/src/lib.rs; "
-    "crates/aster-node/src/runtime.rs; crates/aster-node/tests/mesh_cli.rs"
+    "crates/aster-node/src/runtime.rs; crates/aster-node/src/application.rs; "
+    "crates/aster-node/examples/event_application.rs; "
+    "docs/quickstart/selected-event-api.md; crates/aster-node/tests/mesh_cli.rs"
 )
 CONTROL_SLICE = (
     "crates/aster-core/src/source_control.rs; crates/aster-redb-store/src/lib.rs; "
@@ -181,7 +183,7 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     "DM-5.1-04": selected_claim(
         "observed-bounded", "aster-core + aster-redb-store + aster-node",
         f"{RECEIPT}; {EVENT_SLICE}; the live sample publishes, source-seals, stores, transfers, verifies, and reacts to Event objects",
-        "The selected slice supports Event only for the bounded runtime/sample surface; a generalized publish/subscribe projection and independent wire interoperability remain open.",
+        "The selected slice supports Event publication and bounded query, but durable subscribe/poll/ack, live later-sync application evidence, other data classes, and independent wire interoperability remain open.",
     ),
     "DM-5.1-05": selected_claim(
         "implemented-uncredited", "aster-redb-store",
@@ -191,20 +193,20 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     "DM-5.1-06": selected_claim(
         "implemented-uncredited", "aster-redb-store",
         f"{EVENT_SLICE}; accepted Events carry authenticated nonzero publisher sequence and durable per-publisher/topic/scope positions",
-        "Expose and verify ordering through the selected high-level application API and at requirement scale.",
+        "Verify ordering through durable cross-process consumer delivery, independent interoperability, and at requirement scale.",
     ),
     "DM-5.1-07": selected_claim(
         "implemented-uncredited", "aster-redb-store",
         f"{EVENT_SLICE}; durable Event stream high-water and gap inspection are transactionally maintained",
-        "Expose gap inspection through the selected application surface and verify cross-process consumer behavior.",
+        "The durable store audits gaps internally; expose a freshly verified authorized application view and verify cross-process durable consumer behavior and independent interoperability.",
     ),
     "DM-5.1-17": selected_claim(
         "implemented-uncredited", "aster-core + aster-node", EVENT_SLICE,
-        "The selected source envelope authenticates Event, but State, Record, Blob and the generalized application publication boundary remain open.",
+        "The selected application boundary publishes Event, but State, Record, Blob, durable delivery, and live synchronization remain open.",
     ),
     "DM-5.1-18": selected_claim(
         "implemented-uncredited", "aster-core + aster-node", EVENT_SLICE,
-        "Event topic is source-authenticated and content access is topic-granted in this slice; generalized subscriptions and every other data class remain open.",
+        "Event topic is source-authenticated and content access is topic-granted in this slice; durable subscriptions, subscription-aware replication filtering, and every other data class remain open.",
     ),
     "DM-5.1-19": selected_claim(
         "implemented-uncredited", "aster-core + aster-node", EVENT_SLICE,
@@ -212,7 +214,7 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     ),
     "DM-5.1-20": selected_claim(
         "implemented-uncredited", "aster-core + aster-node", EVENT_SLICE,
-        "Event priority is source-authenticated, but it is not yet wired into transmission ordering, retransmission, eviction, or a generalized API.",
+        "Event priority is source-authenticated and accepted by the selected publication API, but it is not yet wired into transmission ordering, retransmission, or eviction.",
     ),
     "DM-5.1-21": selected_claim(
         "implemented-uncredited", "aster-core + aster-redb-store + aster-node", EVENT_SLICE,
@@ -221,7 +223,7 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     "DM-5.1-22": selected_claim(
         "observed-bounded", "aster-core + aster-node",
         f"{RECEIPT}; {EVENT_SLICE}; Ping and Pong carry authority-provisioned source identities authenticated independently at each endpoint",
-        "The bounded Event sample does not establish source identity for State, Record, Blob, generalized publication, or independent interoperability.",
+        "The bounded Event slice does not establish source identity for State, Record, Blob, or independent interoperability.",
     ),
     "DM-5.2-01": selected_claim(
         "observed-bounded",
@@ -245,7 +247,7 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
         "implemented-uncredited",
         "aster-redb-store",
         f"{RECEIPT}; exact transfer replay reuses durable acceptance and the equal-inventory contact transfers nothing",
-        "Verify duplicate delivery and application notification behavior through a generalized selected application boundary and cyclic topology.",
+        "The selected query boundary is present; verify duplicate delivery and application notification through durable subscribe/poll/ack and a cyclic topology.",
     ),
     "DM-5.2-08": selected_claim(
         "observed-bounded",
@@ -463,20 +465,20 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     "DM-7-16": selected_claim(
         "implemented-uncredited",
         "aster-node",
-        f"{CONTROL_RECEIPT}; crates/aster-node/src/runtime.rs; after epoch-two control convergence the surviving member reserved, source-sealed, and atomically committed Ping in a one-process cohort with peers=0 and contacts=0, while legacy put_opaque remained isolated",
-        "Expose and verify the generalized high-level publication API and policy across arbitrary topics, scopes, data classes, and offline intervals.",
+        f"{CONTROL_RECEIPT}; {EVENT_SLICE}; after epoch-two control convergence the surviving member reserved, source-sealed, and atomically committed Ping in a one-process cohort with peers=0 and contacts=0; the stopped-state API publishes arbitrary policy-authorized Events while legacy put_opaque remains isolated",
+        "Extend the selected application boundary to durable delivery, a live actor, every data class, stakeholder-set offline intervals, and selected-node bindings.",
     ),
     "DM-7-17": selected_claim(
         "observed-bounded",
         "aster-node",
         f"{RECEIPT}; a peerless origin published source-authenticated Ping, its process exited, isolated edge cohorts synchronized the exact Event onward, and a separate peerless destination published causal Pong before isolated return cohorts",
-        "The built-in Event application is not yet a generalized high-level publish API; other classes, arbitrary topics/scopes, and physical systems remain open.",
+        "The stopped-state selected Event publish/query foundation exists; durable subscription, live later-sync API evidence, other classes, and physical systems remain open.",
     ),
     "DM-7-20": selected_claim(
         "observed-bounded",
         "aster-node",
-        "docs/quickstart/mesh-cli.md; the shipped CLI runs bounded source-authenticated Event Ping/Pong across peerless publication and isolated per-edge real-process cohorts, followed by a zero-counter no-op",
-        "Generalize the sample into the selected application publish/subscribe API and add physical multi-system instructions/evidence.",
+        "docs/quickstart/mesh-cli.md; docs/quickstart/selected-event-api.md; crates/aster-node/examples/event_application.rs; the shipped CLI runs bounded source-authenticated Event Ping/Pong across peerless publication and isolated per-edge real-process cohorts, and the compiled stopped-state example publishes and queries through the selected Event authority",
+        "Add durable subscribe/poll/ack, a live peer/sync surface, other data classes, selected-node bindings, and physical multi-system instructions/evidence.",
     ),
     "DM-8-01": selected_claim(
         "observed-bounded",

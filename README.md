@@ -24,8 +24,9 @@ operation.
 > and separates content admission from payload-blind routing. It is still not a
 > completed MVP,
 > production-authorized build, or claim of FIPS 140-3 validation. State, Record,
-> Blob, finite-TTL custody, generalized applications/subscriptions, protected
-> provisioning, generalized control administration, and physical/multi-carrier
+> Blob, finite-TTL custody, durable selected subscriptions, a live selected
+> application handle, protected provisioning, generalized control
+> administration, and physical/multi-carrier
 > acceptance remain open. A bounded same-UID Unix hook now drains a selected
 > node, terminally locks its retained redb state, and software-erases its exact
 > mission-bundle and carrier-identity file contents. Non-Unix support, physical
@@ -106,7 +107,9 @@ mise run tour-control  # four roles; revocation, rekey, captured-node exclusion
 
 Each command retains its complete root and prints stopped-state inspections.
 See the [capability tour](docs/quickstart/capability-tour.md) for what to look
-for and the [selected architecture](docs/architecture.md) for the trust and
+for, the [selected Event API quickstart](docs/quickstart/selected-event-api.md)
+to publish and query through the stopped-state production-lane composition,
+and the [selected architecture](docs/architecture.md) for the trust and
 authority boundaries.
 
 ## Run the live mesh slice by hand
@@ -132,10 +135,10 @@ demo-scoped issuing authority seed is ephemeral. Bounded Negentropy reconciles
 exact sealed-transfer IDs. Every contact authenticates the expected mission peer
 before inventory and protects later mechanics frames. Each Event independently
 authenticates its publisher and protected semantic header. This slice does
-**not** validate State/Record/Blob, generalized applications or topic
-subscriptions, finite-TTL custody, protected provisioning at rest, NAT/hosted
-relay operation, BTLE, physical multi-system operation, or any production
-security gate. See the [capability tour](docs/quickstart/capability-tour.md),
+**not** validate State/Record/Blob, durable topic subscriptions, a live
+application handle, finite-TTL custody, protected provisioning at rest,
+NAT/hosted relay operation, BTLE, physical multi-system operation, or any
+production security gate. See the [capability tour](docs/quickstart/capability-tour.md),
 the [mesh CLI quickstart](docs/quickstart/mesh-cli.md),
 and the tracked [production requirements status](docs/implementation/requirements-status.md)
 for the exact observed result and open work.

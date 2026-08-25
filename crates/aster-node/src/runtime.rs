@@ -61,7 +61,7 @@ use crate::{
     parse_node_id,
 };
 
-const STORE_FILE: &str = "mesh.redb";
+pub(crate) const STORE_FILE: &str = "mesh.redb";
 const MAX_CONFIGURED_PEERS: usize = 256;
 const MAX_INBOUND_CONTACTS: usize = 16;
 const MAX_OUTBOUND_CONTACTS: usize = 16;
@@ -79,6 +79,8 @@ const DEMO_PING_LOGICAL_KEY: &[u8] = b"ping";
 const DEMO_PING_OPERATION: &[u8] = b"aster.sample.ping-pong.v1/ping";
 const DEMO_PONG_OPERATION_PREFIX: &[u8] = b"aster.sample.ping-pong.v1/pong/";
 const MAX_EVENT_PUBLISH_RETRIES: usize = 4;
+pub(crate) const EVENT_OPERATION_CONFLICT: &str =
+    "durable Event operation differs from the requested application Event";
 const MAX_CONTROL_PUBLISH_RETRIES: usize = 4;
 #[cfg(unix)]
 const LOCAL_ZEROIZATION_REQUEST_MAGIC: &[u8] = b"ASTER-ZEROIZE-LOCAL-V1\0";
@@ -1188,38 +1190,59 @@ fn pong_operation_key(ping: EventSemanticId) -> Result<EventOperationKey, NodeEr
     EventOperationKey::new(bytes).map_err(Into::into)
 }
 
-fn publish_event_once(
+pub(crate) struct SelectedEventPublish<'a> {
+    pub operation: &'a EventOperationKey,
+    pub predecessor: Option<EventSemanticId>,
+    pub topic: &'a Topic,
+    pub scope: &'a Scope,
+    pub priority: Priority,
+    pub logical_key: &'a [u8],
+    pub payload: &'a [u8],
+    pub tombstone: bool,
+}
+
+pub(crate) fn publish_selected_event_once(
     store: &Store,
     policy: &ControlPolicySnapshot,
     sealer: &mut ReferenceEnvelopeSealer,
-    operation: &EventOperationKey,
-    predecessor: Option<EventSemanticId>,
-    logical_key: Vec<u8>,
-    payload: &[u8],
+    request: SelectedEventPublish<'_>,
 ) -> Result<(StoredEvent, bool), NodeError> {
-    let topic = demo_event_topic()?;
-    let scope = demo_scope()?;
+    let SelectedEventPublish {
+        operation,
+        predecessor,
+        topic,
+        scope,
+        priority,
+        logical_key,
+        payload,
+        tombstone,
+    } = request;
+    if tombstone && !payload.is_empty() {
+        return Err(NodeError::Configuration(
+            "Event tombstones must carry an empty payload".into(),
+        ));
+    }
     let key_epoch = store
-        .active_scope_epoch(&scope)?
+        .active_scope_epoch(scope)?
         .map_or(1, |(epoch, _)| epoch);
     for _ in 0..MAX_EVENT_PUBLISH_RETRIES {
         let reservation = match predecessor {
             Some(predecessor) => store.reserve_reaction_event_with_policy(
                 policy,
                 sealer.identity(),
-                &topic,
-                &scope,
+                topic,
+                scope,
                 predecessor,
             )?,
-            None => store.reserve_event_with_policy(policy, sealer.identity(), &topic, &scope)?,
+            None => store.reserve_event_with_policy(policy, sealer.identity(), topic, scope)?,
         };
         let header = reservation.header(
-            Priority::Immediate,
-            logical_key.clone(),
+            priority,
+            logical_key.to_vec(),
             None,
             u64::try_from(payload.len())
                 .map_err(|_| NodeError::Protocol("Event payload length overflows u64".into()))?,
-            false,
+            tombstone,
             key_epoch,
         )?;
         let sealed = sealer.seal_event(&header, payload)?;
@@ -1307,18 +1330,15 @@ fn publish_event_once(
                 };
                 if reopened != payload
                     || stored.header.stamp.dot.publisher != sealer.identity()
-                    || stored.header.topic != topic
-                    || stored.header.scope != scope
-                    || stored.header.priority != Priority::Immediate
-                    || stored.header.logical_key != logical_key
+                    || &stored.header.topic != topic
+                    || &stored.header.scope != scope
+                    || stored.header.priority != priority
+                    || stored.header.logical_key.as_slice() != logical_key
                     || stored.header.ttl_ms.is_some()
-                    || stored.header.tombstone
-                    || stored.header.key_epoch != key_epoch
+                    || stored.header.tombstone != tombstone
+                    || (inserted && stored.header.key_epoch != key_epoch)
                 {
-                    return Err(NodeError::Protocol(
-                        "durable Event operation differs from the requested application Event"
-                            .into(),
-                    ));
+                    return Err(NodeError::Protocol(EVENT_OPERATION_CONFLICT.into()));
                 }
                 return Ok((stored, inserted));
             }
@@ -1329,6 +1349,32 @@ fn publish_event_once(
     Err(NodeError::Protocol(format!(
         "Event publication reservation changed {MAX_EVENT_PUBLISH_RETRIES} times"
     )))
+}
+
+fn publish_event_once(
+    store: &Store,
+    policy: &ControlPolicySnapshot,
+    sealer: &mut ReferenceEnvelopeSealer,
+    operation: &EventOperationKey,
+    predecessor: Option<EventSemanticId>,
+    logical_key: Vec<u8>,
+    payload: &[u8],
+) -> Result<(StoredEvent, bool), NodeError> {
+    publish_selected_event_once(
+        store,
+        policy,
+        sealer,
+        SelectedEventPublish {
+            operation,
+            predecessor,
+            topic: &demo_event_topic()?,
+            scope: &demo_scope()?,
+            priority: Priority::Immediate,
+            logical_key: &logical_key,
+            payload,
+            tombstone: false,
+        },
+    )
 }
 
 fn drive_sample_application(
@@ -1435,7 +1481,7 @@ fn drive_sample_application(
     }
 }
 
-fn verify_stored_claim(
+pub(crate) fn verify_stored_claim(
     verified: &RouteVerifiedEventEnvelope,
     transfer_id: EventTransferId,
     semantic_id: EventSemanticId,
@@ -1452,7 +1498,7 @@ fn verify_stored_claim(
     Ok(())
 }
 
-fn verify_content_stored_claim(
+pub(crate) fn verify_content_stored_claim(
     verified: &aster_mesh::ContentVerifiedEventEnvelope,
     stored: &StoredEvent,
 ) -> Result<(), NodeError> {
@@ -1509,7 +1555,7 @@ fn verify_stored_control_claim(
     Ok(())
 }
 
-fn ensure_principal_active(store: &Store, principal: NodeId) -> Result<(), NodeError> {
+pub(crate) fn ensure_principal_active(store: &Store, principal: NodeId) -> Result<(), NodeError> {
     if store.is_control_principal_revoked(principal)? {
         return Err(NodeError::Revoked(principal));
     }
@@ -1614,7 +1660,7 @@ fn replay_applied_controls(
     activate_committed_controls(store, verifier, &controls, None)
 }
 
-fn open_replayed_verifier(
+pub(crate) fn open_replayed_verifier(
     store: &Store,
     credentials: &UnprotectedReferenceMission,
 ) -> Result<ReferenceEnvelopeSealer, NodeError> {
@@ -1623,7 +1669,7 @@ fn open_replayed_verifier(
     Ok(verifier)
 }
 
-fn refresh_application_policy(
+pub(crate) fn refresh_application_policy(
     store: &Store,
     credentials: &UnprotectedReferenceMission,
     verifier: &mut ReferenceEnvelopeSealer,
@@ -2060,7 +2106,7 @@ fn event_source_is_revoked(
     Ok(store.is_control_principal_revoked(verified.publisher())?)
 }
 
-fn event_is_inactive(
+pub(crate) fn event_is_inactive(
     store: &Store,
     verified: &RouteVerifiedEventEnvelope,
 ) -> Result<bool, NodeError> {
@@ -8604,6 +8650,81 @@ mod tests {
                 "differs from the requested application Event"
             ))
         );
+        assert_eq!(store.event_count().expect("Event count"), 1);
+        fs::remove_dir_all(state).expect("cleanup");
+    }
+
+    #[test]
+    fn existing_application_operation_remains_exact_retry_across_authorized_rekey() {
+        let state = root("existing-application-rekey");
+        fs::create_dir_all(&state).expect("state root");
+        let services = control_test_services([0xc4; 32]);
+        let mut member = open_test_sealer(&services.member);
+        let store = Store::open_for_mission(state.join(STORE_FILE), member.mission_authority_id())
+            .expect("member store");
+        let operation =
+            EventOperationKey::new(b"application/rekey/retry".to_vec()).expect("operation key");
+        let policy = store.control_policy_snapshot().expect("epoch-one policy");
+        let request = || SelectedEventPublish {
+            operation: &operation,
+            predecessor: None,
+            topic: &services.topic,
+            scope: &services.scope,
+            priority: Priority::Priority,
+            logical_key: b"asset",
+            payload: b"ready",
+            tombstone: false,
+        };
+        let (first, inserted) =
+            publish_selected_event_once(&store, &policy, &mut member, request())
+                .expect("publish epoch-one Event");
+        assert!(inserted);
+        assert_eq!(first.header.key_epoch, 1);
+
+        let recipients = vec![
+            ScopeRekeyRecipient::member(
+                services.authority.identity(),
+                vec![services.topic.clone()],
+            )
+            .expect("authority recipient"),
+            ScopeRekeyRecipient::member(services.member.identity(), vec![services.topic.clone()])
+                .expect("member recipient"),
+        ];
+        let mut authority = open_test_sealer(&services.authority);
+        let (sealed_rekey, _) = authority
+            .seal_chained_scope_rekey_control_from_registry(
+                &services.registry,
+                0,
+                services.scope.clone(),
+                2,
+                recipients,
+                1,
+                None,
+            )
+            .expect("seal epoch-two rekey");
+        let verified_rekey = member
+            .verify_control(&sealed_rekey)
+            .expect("verify epoch-two rekey");
+        let outcome = store
+            .ingest_verified_control(&verified_rekey, &sealed_rekey)
+            .expect("commit epoch-two rekey");
+        assert_eq!(outcome.activated().len(), 1);
+        activate_committed_controls(&store, &mut member, outcome.activated(), None)
+            .expect("activate epoch-two rekey");
+        assert_eq!(
+            store
+                .active_scope_epoch(&services.scope)
+                .expect("active epoch")
+                .map(|(epoch, _)| epoch),
+            Some(2)
+        );
+
+        let policy = store.control_policy_snapshot().expect("epoch-two policy");
+        let (retried, inserted) =
+            publish_selected_event_once(&store, &policy, &mut member, request())
+                .expect("retry original operation after rekey");
+        assert!(!inserted);
+        assert_eq!(retried, first);
         assert_eq!(store.event_count().expect("Event count"), 1);
         fs::remove_dir_all(state).expect("cleanup");
     }
