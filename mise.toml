@@ -3,6 +3,7 @@ rust = "1.97.1"
 go = "1.26.7"
 python = "3.13.7"
 ripgrep = "15.2.0"
+buf = "1.72.0"
 
 [env]
 RUST_BACKTRACE = "1"
@@ -12,6 +13,7 @@ PYTHONDONTWRITEBYTECODE = "1"
 description = "Run format, lint, unit, binding, and conformance checks"
 run = [
   "cargo fmt --all -- --check",
+  "sh tools/check-agent-proto.sh",
   "python3 tools/check-project-license.py",
   "python3 tools/check-implementation-requirements.py",
   "python3 tools/check-selected-node-dependency-boundary.py",

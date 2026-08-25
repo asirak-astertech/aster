@@ -134,6 +134,9 @@ See the [capability tour](docs/quickstart/capability-tour.md) for what to look
 for, the [selected Event API quickstart](docs/quickstart/selected-event-api.md)
 to publish offline through the live actor, consume durably, inspect gaps/status,
 and run the focused later-sync process test, the
+[local ConnectRPC agent quickstart](docs/quickstart/connect-agent.md) to call
+that Event authority from Connect, gRPC, or gRPC-Web without the Buf Schema
+Registry, the
 [selected State API quickstart](docs/quickstart/selected-state-api.md) to see a
 local causal latest-value projection and learn the authenticated deletion rule,
 the [selected Record API quickstart](docs/quickstart/selected-record-api.md) to
@@ -174,6 +177,7 @@ real-process test exercise the live application handle and bounded status; the
 demo command itself continues to exercise its built-in Ping/Pong roles. See the
 [capability tour](docs/quickstart/capability-tour.md),
 the [mesh CLI quickstart](docs/quickstart/mesh-cli.md),
+the [local ConnectRPC agent quickstart](docs/quickstart/connect-agent.md),
 and the tracked [production requirements status](docs/implementation/requirements-status.md)
 for the exact observed result and open work.
 
