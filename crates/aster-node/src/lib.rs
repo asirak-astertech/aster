@@ -4,7 +4,8 @@
 //! Negentropy reconciliation, mission-bound redb state, and the existing
 //! `aster-core` source-authenticated Event semantics. Its stopped-state
 //! application boundary also composes source-authenticated latest-value State
-//! projections without putting State on the Event-only reconciliation wire.
+//! projections and explicit-conflict Record projections without putting either
+//! mutable class on the Event-only reconciliation wire.
 //! The caller-identified opaque API remains isolated for compatibility and is
 //! not advertised by the production Event reconciliation path.
 

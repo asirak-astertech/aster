@@ -316,6 +316,7 @@ dependencies = [
  "aster-profile",
  "aster-redb-store",
  "libc",
+ "redb",
  "rustix",
  "tokio",
  "zeroize",

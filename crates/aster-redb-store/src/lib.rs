@@ -1,11 +1,11 @@
 //! Crash-safe storage for mission-bound Aster semantic Events and compatibility data.
 //!
-//! One redb transaction authority owns five disjoint namespaces: content-verified
-//! semantic Events; content-verified selected State versions; a bounded,
-//! non-semantic cache of route-verified exact Event transfers; the retained
-//! caller-ID opaque API used by the legacy compatibility lane; and
-//! source-authenticated, mission-wide Flash controls. Event and State share only
-//! their causal ledgers. Opaque IDs can never collide with or promote into a
+//! One redb transaction authority owns six disjoint namespaces: content-verified
+//! semantic Events; content-verified selected State versions; content-verified
+//! immutable Record revisions; a bounded, non-semantic cache of route-verified
+//! exact Event transfers; the retained caller-ID opaque compatibility API; and
+//! source-authenticated, mission-wide Flash controls. Event, State, and Record
+//! share only their causal ledgers. Opaque IDs cannot collide with or promote into a
 //! semantic or control namespace. Semantic mutation requires a live strong
 //! capability from `aster-core`, while persisted decoded metadata is only
 //! structurally audited. Configured item and byte limits apply to the aggregate
@@ -20,10 +20,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use aster_mesh::engine::EnvelopeHeader;
 use aster_mesh::{
-    CausalStamp, ContentVerifiedEventEnvelope, ContentVerifiedStateEnvelope,
-    DataClass as SemanticDataClass, Dot, MAX_CAUSAL_CONTEXT_ENTRIES, NodeId, Priority,
-    RouteVerifiedEventEnvelope, Scope, ScopeRekeyRecipient, Topic, VerifiedControlEnvelope,
-    VerifiedControlKind, VerifiedControlPrincipal, VersionVector,
+    CausalStamp, ContentVerifiedEventEnvelope, ContentVerifiedRecordEnvelope,
+    ContentVerifiedStateEnvelope, DataClass as SemanticDataClass, Dot, MAX_CAUSAL_CONTEXT_ENTRIES,
+    NodeId, Priority, RouteVerifiedEventEnvelope, Scope, ScopeRekeyRecipient, Topic,
+    VerifiedControlEnvelope, VerifiedControlKind, VerifiedControlPrincipal, VersionVector,
 };
 use aster_profile::{InventorySnapshot, ItemId};
 use redb::{
@@ -81,6 +81,20 @@ const STATE_GROUP_VERSIONS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.semantic-state-group-versions.v1");
 const STATE_OPERATIONS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.state-operations.v1");
+// Record is a separately audited selected-store namespace. Its exact transfer,
+// semantic, key-version, and idempotent-operation indexes never alias State,
+// while its accepted dots and publisher/topic/scope causal ledgers are shared.
+const RECORDS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("aster.semantic-records.v1");
+const RECORD_BYTES: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("aster.semantic-record-bytes.v1");
+const RECORD_ACCEPTANCE_MARKERS: TableDefinition<&[u8], u64> =
+    TableDefinition::new("aster.semantic-record-markers.v1");
+const RECORD_SEMANTIC_ITEMS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("aster.semantic-record-items.v1");
+const RECORD_GROUP_VERSIONS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("aster.semantic-record-group-versions.v1");
+const RECORD_OPERATIONS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("aster.record-operations.v1");
 // Durable application selectors and pending at-least-once deliveries are a
 // single schema group. A selector is intent, never content or route authority.
 const EVENT_SUBSCRIPTIONS: TableDefinition<&[u8], &[u8]> =
@@ -104,6 +118,11 @@ const STATE_TOTAL_BYTES: &str = "semantic_state_total_bytes";
 const LAST_STATE_ACCEPTANCE_MARKER: &str = "last_semantic_state_acceptance_marker";
 const STATE_OPERATION_COUNT: &str = "semantic_state_operation_count";
 const STATE_OPERATION_TOTAL_BYTES: &str = "semantic_state_operation_total_bytes";
+const RECORD_ITEM_COUNT: &str = "semantic_record_item_count";
+const RECORD_TOTAL_BYTES: &str = "semantic_record_total_bytes";
+const LAST_RECORD_ACCEPTANCE_MARKER: &str = "last_semantic_record_acceptance_marker";
+const RECORD_OPERATION_COUNT: &str = "semantic_record_operation_count";
+const RECORD_OPERATION_TOTAL_BYTES: &str = "semantic_record_operation_total_bytes";
 const ROUTE_CACHE_ITEM_COUNT: &str = "route_event_cache_item_count";
 const ROUTE_CACHE_TOTAL_BYTES: &str = "route_event_cache_total_bytes";
 const EVENT_SUBSCRIPTION_COUNT: &str = "semantic_event_subscription_count";
@@ -167,6 +186,10 @@ const EVENT_OPERATION_VERSION: u8 = 1;
 const STATE_METADATA_VERSION: u8 = 1;
 const STATE_OPERATION_VERSION: u8 = 1;
 const STATE_PUBLICATION_INTENT_DOMAIN: &[u8] = b"aster/state-publication-intent/v1";
+const RECORD_METADATA_VERSION: u8 = 1;
+const RECORD_OPERATION_VERSION: u8 = 1;
+const RECORD_PUBLICATION_INTENT_DOMAIN: &[u8] = b"aster/record-publication-intent/v1";
+const RECORD_RESOLUTION_INTENT_DOMAIN: &[u8] = b"aster/record-resolution-intent/v1";
 const EVENT_SUBSCRIPTION_VERSION: u8 = 1;
 const EVENT_PENDING_DELIVERY_VERSION: u8 = 1;
 const EVENT_ACKNOWLEDGEMENT_VERSION: u8 = 1;
@@ -190,6 +213,16 @@ pub const MAX_STATE_VERSIONS_PER_KEY: usize = 1_024;
 pub const MAX_STATE_OPERATIONS: u64 = 4_096;
 /// Maximum aggregate key plus record bytes retained by State operation mappings.
 pub const MAX_STATE_OPERATION_BYTES: u64 = 512 * 1024;
+/// Maximum byte length of one selected-Record application operation key.
+pub const MAX_RECORD_OPERATION_KEY_BYTES: usize = 256;
+/// Maximum source-authenticated logical-key bytes for one selected Record.
+pub const MAX_RECORD_LOGICAL_KEY_BYTES: usize = 4 * 1024;
+/// Maximum retained versions freshly projected for one exact Record key.
+pub const MAX_RECORD_VERSIONS_PER_KEY: usize = 1_024;
+/// Maximum durable idempotent Record operation mappings per store.
+pub const MAX_RECORD_OPERATIONS: u64 = 4_096;
+/// Maximum aggregate key plus record bytes retained by Record operation mappings.
+pub const MAX_RECORD_OPERATION_BYTES: u64 = 512 * 1024;
 /// Maximum byte length of one durable Event subscription operation key.
 pub const MAX_EVENT_SUBSCRIPTION_KEY_BYTES: usize = 256;
 /// Maximum durable Consume plus Carry selectors in one mission-bound store.
@@ -224,7 +257,7 @@ pub const DEFAULT_MAX_TOTAL_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
 /// Validated durable admission limits for one store.
 ///
 /// Both limits count aggregate legacy opaque rows, accepted exact source-sealed
-/// Event and State representations, durable State operation mappings, route-only
+/// Event, State, and Record representations, durable selected-store operation mappings, route-only
 /// cache entries, exact controls, and canonical local control-publication intents.
 /// Filesystem and redb allocation overhead remain backend-specific.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -394,6 +427,38 @@ impl StateSemanticId {
     }
 
     /// Returns the semantic State identifier bytes.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// Exact SHA-256 identity of one stable source-sealed Record representation.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RecordTransferId([u8; 32]);
+
+impl RecordTransferId {
+    /// Constructs an exact Record transfer identifier from complete digest bytes.
+    pub const fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the exact Record transfer identifier bytes.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// Source-authenticated semantic identity of one immutable Record revision.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RecordSemanticId([u8; 32]);
+
+impl RecordSemanticId {
+    /// Constructs a semantic Record identifier from complete bytes.
+    pub const fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the semantic Record identifier bytes.
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
@@ -956,6 +1021,210 @@ impl<'a> StateOperationRequest<'a> {
     /// Returns the exact plaintext authenticated by the strong State capability.
     pub const fn payload(&self) -> &[u8] {
         self.payload
+    }
+}
+
+/// Bounded application idempotency key for one local Record publication.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RecordOperationKey(Vec<u8>);
+
+impl RecordOperationKey {
+    /// Validates a nonempty bounded operation key.
+    pub fn new(bytes: impl Into<Vec<u8>>) -> Result<Self, StoreError> {
+        let bytes = bytes.into();
+        if bytes.is_empty() || bytes.len() > MAX_RECORD_OPERATION_KEY_BYTES {
+            return Err(StoreError::InvalidRecordOperationKey {
+                length: bytes.len(),
+            });
+        }
+        Ok(Self(bytes))
+    }
+
+    /// Returns the exact durable key bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// Canonical public-request identity for one idempotent Record publication.
+///
+/// Reservation counters, causal context, and key epoch are excluded so an
+/// authorized retry after crash or rekey resolves its exact committed result.
+/// Publisher, selector, priority, logical key, payload digest, and tombstone
+/// intent are bound, so a key cannot be replayed for another public request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordPublicationIntent {
+    publisher: NodeId,
+    topic: Topic,
+    scope: Scope,
+    priority: Priority,
+    logical_key: Vec<u8>,
+    content_len: u64,
+    payload_digest: [u8; 32],
+    tombstone: bool,
+    digest: [u8; 32],
+}
+
+impl RecordPublicationIntent {
+    /// Constructs and hashes one canonical Record request.
+    pub fn new(
+        publisher: NodeId,
+        topic: Topic,
+        scope: Scope,
+        priority: Priority,
+        logical_key: Vec<u8>,
+        payload: &[u8],
+        tombstone: bool,
+    ) -> Result<Self, StoreError> {
+        validate_record_logical_key(&logical_key)?;
+        if tombstone && !payload.is_empty() {
+            return Err(StoreError::InvalidSemanticRecord(
+                "Record tombstone payload must be empty",
+            ));
+        }
+        let content_len =
+            u64::try_from(payload.len()).map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
+        let payload_digest = Sha256::digest(payload).into();
+        let mut intent = Self {
+            publisher,
+            topic,
+            scope,
+            priority,
+            logical_key,
+            content_len,
+            payload_digest,
+            tombstone,
+            digest: [0; 32],
+        };
+        intent.digest = record_publication_intent_digest(&intent)?;
+        Ok(intent)
+    }
+
+    pub const fn publisher(&self) -> NodeId {
+        self.publisher
+    }
+
+    pub const fn topic(&self) -> &Topic {
+        &self.topic
+    }
+
+    pub const fn scope(&self) -> &Scope {
+        &self.scope
+    }
+
+    pub const fn priority(&self) -> Priority {
+        self.priority
+    }
+
+    pub fn logical_key(&self) -> &[u8] {
+        &self.logical_key
+    }
+
+    pub const fn content_len(&self) -> u64 {
+        self.content_len
+    }
+
+    pub const fn tombstone(&self) -> bool {
+        self.tombstone
+    }
+
+    fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+
+    fn matches_payload(&self, payload: &[u8]) -> bool {
+        u64::try_from(payload.len()) == Ok(self.content_len)
+            && <[u8; 32]>::from(Sha256::digest(payload)) == self.payload_digest
+    }
+}
+
+/// Exact borrowed inputs for one atomic idempotent Record commit.
+pub struct RecordOperationRequest<'a> {
+    operation: &'a RecordOperationKey,
+    intent: &'a RecordPublicationIntent,
+    payload: &'a [u8],
+}
+
+impl<'a> RecordOperationRequest<'a> {
+    /// Binds an operation key to one canonical intent and exact plaintext.
+    pub fn new(
+        operation: &'a RecordOperationKey,
+        intent: &'a RecordPublicationIntent,
+        payload: &'a [u8],
+    ) -> Result<Self, StoreError> {
+        if !intent.matches_payload(payload) {
+            return Err(StoreError::RecordOperationConflict);
+        }
+        Ok(Self {
+            operation,
+            intent,
+            payload,
+        })
+    }
+
+    pub const fn operation(&self) -> &RecordOperationKey {
+        self.operation
+    }
+
+    pub const fn intent(&self) -> &RecordPublicationIntent {
+        self.intent
+    }
+
+    pub const fn payload(&self) -> &[u8] {
+        self.payload
+    }
+}
+
+/// One explicit user-authorized conflict resolution bound to an exact head plan.
+///
+/// The store never runs arbitrary merge code. The application computes bytes,
+/// signs a normal Record revision, and presents the complete freshly verified
+/// projection that it intends to supersede. Commit atomically rechecks that plan.
+pub struct RecordResolutionRequest<'a> {
+    publication: &'a RecordOperationRequest<'a>,
+    plan: &'a RecordProjectionPlan,
+}
+
+impl<'a> RecordResolutionRequest<'a> {
+    pub fn new(
+        publication: &'a RecordOperationRequest<'a>,
+        plan: &'a RecordProjectionPlan,
+    ) -> Result<Self, StoreError> {
+        if publication.intent.topic() != plan.topic()
+            || publication.intent.scope() != plan.scope()
+            || publication.intent.logical_key() != plan.logical_key()
+        {
+            return Err(StoreError::RecordOperationConflict);
+        }
+        Ok(Self { publication, plan })
+    }
+
+    pub const fn publication(&self) -> &RecordOperationRequest<'a> {
+        self.publication
+    }
+
+    pub const fn plan(&self) -> &RecordProjectionPlan {
+        self.plan
+    }
+
+    fn operation_digest(&self) -> Result<[u8; 32], StoreError> {
+        let heads = self.plan.heads().collect::<Vec<_>>();
+        if heads.len() < 2 {
+            return Err(StoreError::RecordConflictRequiresResolution);
+        }
+        let head_count =
+            u32::try_from(heads.len()).map_err(|_| StoreError::RecordProjectionLimitExceeded {
+                current: heads.len(),
+                limit: MAX_RECORD_VERSIONS_PER_KEY,
+            })?;
+        let mut digest = Sha256::new();
+        digest.update(RECORD_RESOLUTION_INTENT_DOMAIN);
+        digest.update(self.publication.intent().digest());
+        digest.update(head_count.to_be_bytes());
+        for head in heads {
+            digest.update(head.record().semantic_id.as_bytes());
+        }
+        Ok(digest.finalize().into())
     }
 }
 
@@ -1540,6 +1809,182 @@ impl StateOnceOutcome {
     }
 }
 
+/// Optimistic local Record publication reservation derived from shared causal ledgers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordReservation {
+    control_policy: ControlPolicySnapshot,
+    publisher: NodeId,
+    topic: Topic,
+    scope: Scope,
+    previous_counter: u64,
+    counter: u64,
+    context: VersionVector,
+}
+
+impl RecordReservation {
+    pub const fn control_policy(&self) -> &ControlPolicySnapshot {
+        &self.control_policy
+    }
+
+    pub const fn publisher(&self) -> NodeId {
+        self.publisher
+    }
+
+    pub const fn counter(&self) -> u64 {
+        self.counter
+    }
+
+    pub const fn context(&self) -> &VersionVector {
+        &self.context
+    }
+
+    /// Builds the exact authenticated Record header for source sealing.
+    pub fn header(
+        &self,
+        priority: Priority,
+        logical_key: Vec<u8>,
+        content_len: u64,
+        tombstone: bool,
+        key_epoch: u64,
+    ) -> Result<EnvelopeHeader, StoreError> {
+        validate_record_logical_key(&logical_key)?;
+        if tombstone && content_len != 0 {
+            return Err(StoreError::InvalidSemanticRecord(
+                "Record tombstone content length must be zero",
+            ));
+        }
+        Ok(EnvelopeHeader {
+            class: SemanticDataClass::Record,
+            topic: self.topic.clone(),
+            scope: self.scope.clone(),
+            priority,
+            stamp: CausalStamp {
+                dot: Dot {
+                    publisher: self.publisher,
+                    counter: self.counter,
+                },
+                context: self.context.clone(),
+            },
+            event_sequence: None,
+            logical_key,
+            blob_route: None,
+            ttl_ms: None,
+            content_len,
+            tombstone,
+            key_epoch,
+        })
+    }
+}
+
+/// One source-authenticated immutable Record revision and exact retained representation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredRecord {
+    pub transfer_id: RecordTransferId,
+    pub semantic_id: RecordSemanticId,
+    pub header: EnvelopeHeader,
+    pub sealed: Vec<u8>,
+    pub acceptance_marker: u64,
+}
+
+/// Deterministic structural role of one retained Record revision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecordVersionDisposition {
+    /// Greatest full semantic ID among the active causal maxima.
+    Current,
+    /// Another active causal maximum retained as a conflict sibling.
+    Concurrent,
+    /// A retained revision explicitly observed by another active revision.
+    Superseded,
+}
+
+/// One retained Record revision plus its freshly recomputed disposition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordProjectionCandidate {
+    record: StoredRecord,
+    disposition: Option<RecordVersionDisposition>,
+}
+
+impl RecordProjectionCandidate {
+    pub const fn record(&self) -> &StoredRecord {
+        &self.record
+    }
+
+    /// `None` marks a retained revision inactive under current revocation/epoch policy.
+    pub const fn disposition(&self) -> Option<RecordVersionDisposition> {
+        self.disposition
+    }
+}
+
+/// Exact policy-bound Record revision set prepared for fresh application verification.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordProjectionPlan {
+    control_policy: ControlPolicySnapshot,
+    topic: Topic,
+    scope: Scope,
+    logical_key: Vec<u8>,
+    candidates: Vec<RecordProjectionCandidate>,
+}
+
+impl RecordProjectionPlan {
+    pub const fn control_policy(&self) -> &ControlPolicySnapshot {
+        &self.control_policy
+    }
+
+    pub const fn topic(&self) -> &Topic {
+        &self.topic
+    }
+
+    pub const fn scope(&self) -> &Scope {
+        &self.scope
+    }
+
+    pub fn logical_key(&self) -> &[u8] {
+        &self.logical_key
+    }
+
+    pub fn candidates(&self) -> &[RecordProjectionCandidate] {
+        &self.candidates
+    }
+
+    pub fn current(&self) -> Option<&RecordProjectionCandidate> {
+        self.candidates
+            .iter()
+            .find(|candidate| candidate.disposition == Some(RecordVersionDisposition::Current))
+    }
+
+    /// Returns every active causal maximum in full semantic-ID order.
+    pub fn heads(&self) -> impl Iterator<Item = &RecordProjectionCandidate> {
+        self.candidates.iter().filter(|candidate| {
+            matches!(
+                candidate.disposition,
+                Some(RecordVersionDisposition::Current | RecordVersionDisposition::Concurrent)
+            )
+        })
+    }
+}
+
+/// Result of an atomic idempotent local Record publication.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RecordOnceOutcome {
+    Inserted { record: StoredRecord },
+    BoundExisting { record: StoredRecord },
+    Existing { record: StoredRecord },
+}
+
+impl RecordOnceOutcome {
+    pub const fn record(&self) -> &StoredRecord {
+        match self {
+            Self::Inserted { record }
+            | Self::BoundExisting { record }
+            | Self::Existing { record } => record,
+        }
+    }
+
+    pub const fn inserted(&self) -> bool {
+        matches!(self, Self::Inserted { .. })
+    }
+}
+
 /// One source-authenticated Event and its exact retained transfer representation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoredEvent {
@@ -1881,6 +2326,23 @@ pub struct StateStoreStats {
     pub operation_bytes: u64,
 }
 
+/// Consistent counts for the mission-bound semantic Record namespace.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RecordStoreStats {
+    /// Number of content-verified immutable Record revisions retained.
+    pub records: u64,
+    /// Number of Record-local acceptance markers.
+    pub acceptance_markers: u64,
+    /// Sum of exact retained source-sealed Record bytes.
+    pub total_sealed_bytes: u64,
+    /// Last Record-local marker, or zero when empty.
+    pub last_acceptance_marker: u64,
+    /// Durable idempotent Record operation mappings.
+    pub operations: u64,
+    /// Aggregate operation-key plus operation-record bytes.
+    pub operation_bytes: u64,
+}
+
 /// Consistent durable counts for Event selectors and application deliveries.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct EventSubscriptionStats {
@@ -2073,6 +2535,8 @@ pub struct StoreInspection {
     pub event_stats: EventStoreStats,
     /// Mission-bound semantic State counts from the same read transaction.
     pub state_stats: StateStoreStats,
+    /// Mission-bound semantic Record counts from the same read transaction.
+    pub record_stats: RecordStoreStats,
     /// Event receive-selector and pending-delivery counts from the same transaction.
     pub event_subscription_stats: EventSubscriptionStats,
     /// Mission-wide Flash control counts from the same audited read transaction.
@@ -2239,6 +2703,44 @@ pub enum StoreError {
     StateKeyEpochNotActive { current: u64, received: u64 },
     /// One semantic digest appears in both Event and State namespaces.
     SemanticNamespaceCollision { semantic_id: [u8; 32] },
+    /// A core Record capability did not match its exact sealed bytes or payload.
+    RecordVerification(String),
+    /// Source-authenticated Record metadata was internally inconsistent.
+    InvalidSemanticRecord(&'static str),
+    /// One semantic Record was replayed with a different exact representation.
+    RecordRepresentationConflict {
+        semantic_id: RecordSemanticId,
+        accepted_envelope_id: RecordTransferId,
+        received_envelope_id: RecordTransferId,
+    },
+    /// An optimistic Record publisher reservation changed before commit.
+    RecordReservationChanged,
+    /// A Record operation key was empty or exceeded its explicit bound.
+    InvalidRecordOperationKey { length: usize },
+    /// A Record operation key was replayed with another public-request intent.
+    RecordOperationConflict,
+    /// The dedicated durable Record operation row cap was reached.
+    RecordOperationLimitExceeded { current: u64, limit: u64 },
+    /// Retaining another Record operation would exceed its dedicated byte cap.
+    RecordOperationByteLimitExceeded {
+        current: u64,
+        incoming: u64,
+        limit: u64,
+    },
+    /// One exact-key Record projection exceeded its retained-version bound.
+    RecordProjectionLimitExceeded { current: usize, limit: usize },
+    /// A prepared Record projection no longer matches durable structure or policy.
+    RecordProjectionPlanChanged,
+    /// An ordinary publication would implicitly collapse multiple conflict heads.
+    RecordConflictRequiresResolution,
+    /// A durable Record table or index disagreed with its paired authority row.
+    RecordInvariant(&'static str),
+    /// A Record publisher was revoked by the applied mission-control prefix.
+    RecordPublisherRevoked(NodeId),
+    /// A Record uses a scope key epoch older than durable control policy.
+    RecordKeyEpochStale { current: u64, received: u64 },
+    /// A Record claims a provisioned future epoch that is not durably active.
+    RecordKeyEpochNotActive { current: u64, received: u64 },
     /// One Event cursor request exceeded the explicit page bound.
     EventPageLimitExceeded {
         /// Requested number of rows.
@@ -2523,8 +3025,63 @@ impl fmt::Display for StoreError {
                 formatter,
                 "State key epoch {received} is not the active scope epoch {current}"
             ),
-            Self::SemanticNamespaceCollision { .. } => formatter
-                .write_str("one semantic digest appears in both Event and State namespaces"),
+            Self::SemanticNamespaceCollision { .. } => {
+                formatter.write_str("one semantic digest appears in multiple semantic namespaces")
+            }
+            Self::RecordVerification(error) => {
+                write!(formatter, "source Record verification failed: {error}")
+            }
+            Self::InvalidSemanticRecord(reason) => {
+                write!(formatter, "invalid source-authenticated Record: {reason}")
+            }
+            Self::RecordRepresentationConflict { .. } => formatter
+                .write_str("semantic Record was replayed with another source representation"),
+            Self::RecordReservationChanged => {
+                formatter.write_str("durable Record reservation changed before commit")
+            }
+            Self::InvalidRecordOperationKey { length } => write!(
+                formatter,
+                "Record operation key length {length} is outside 1..={MAX_RECORD_OPERATION_KEY_BYTES}"
+            ),
+            Self::RecordOperationConflict => formatter
+                .write_str("Record operation retry differs from its durable request intent"),
+            Self::RecordOperationLimitExceeded { current, limit } => write!(
+                formatter,
+                "Record operation count {current} is at dedicated limit {limit}"
+            ),
+            Self::RecordOperationByteLimitExceeded {
+                current,
+                incoming,
+                limit,
+            } => write!(
+                formatter,
+                "retaining {incoming} Record operation bytes at {current} would exceed dedicated limit {limit}"
+            ),
+            Self::RecordProjectionLimitExceeded { current, limit } => write!(
+                formatter,
+                "Record key has {current} retained versions beyond projection limit {limit}"
+            ),
+            Self::RecordProjectionPlanChanged => {
+                formatter.write_str("durable Record projection changed; prepare and verify again")
+            }
+            Self::RecordConflictRequiresResolution => {
+                formatter.write_str("Record conflict requires an explicit stale-guarded resolution")
+            }
+            Self::RecordInvariant(reason) => write!(
+                formatter,
+                "durable semantic Record invariant failed: {reason}"
+            ),
+            Self::RecordPublisherRevoked(_) => {
+                formatter.write_str("Record publisher is durably revoked")
+            }
+            Self::RecordKeyEpochStale { current, received } => write!(
+                formatter,
+                "Record key epoch {received} is older than durable scope epoch {current}"
+            ),
+            Self::RecordKeyEpochNotActive { current, received } => write!(
+                formatter,
+                "Record key epoch {received} is not the active scope epoch {current}"
+            ),
             Self::EventPageLimitExceeded { requested, maximum } => write!(
                 formatter,
                 "Event page request {requested} exceeds maximum {maximum}"
@@ -2844,6 +3401,39 @@ impl PreparedState {
     }
 }
 
+struct PreparedRecord {
+    mission_authority: NodeId,
+    transfer_id: RecordTransferId,
+    semantic_id: RecordSemanticId,
+    header: EnvelopeHeader,
+    sealed: Vec<u8>,
+    encoded_metadata: Vec<u8>,
+}
+
+impl PreparedRecord {
+    fn from_verified(
+        record: &ContentVerifiedRecordEnvelope,
+        sealed: &[u8],
+    ) -> Result<Self, StoreError> {
+        record
+            .verify_exact_sealed(sealed)
+            .map_err(|error| StoreError::RecordVerification(error.to_string()))?;
+        let header = record.header().clone();
+        validate_record_header(&header)?;
+        let transfer_id = RecordTransferId::new(record.envelope_id());
+        let semantic_id = RecordSemanticId::new(record.item_id());
+        let encoded_metadata = encode_record_metadata(transfer_id, semantic_id, &header)?;
+        Ok(Self {
+            mission_authority: record.mission_authority_id(),
+            transfer_id,
+            semantic_id,
+            header,
+            sealed: sealed.to_vec(),
+            encoded_metadata,
+        })
+    }
+}
+
 struct StateCommit {
     state: StoredState,
     apply: ApplyOutcome,
@@ -2866,6 +3456,31 @@ struct StateOperationRecord {
 #[derive(Clone, Copy)]
 struct PendingStateOperation<'a> {
     key: &'a StateOperationKey,
+    intent_digest: [u8; 32],
+}
+
+struct RecordCommit {
+    record: StoredRecord,
+    apply: ApplyOutcome,
+    operation_existing: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RecordMetadata {
+    transfer_id: RecordTransferId,
+    semantic_id: RecordSemanticId,
+    header: EnvelopeHeader,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RecordOperationRecord {
+    transfer_id: RecordTransferId,
+    intent_digest: [u8; 32],
+}
+
+#[derive(Clone, Copy)]
+struct PendingRecordOperation<'a> {
+    key: &'a RecordOperationKey,
     intent_digest: [u8; 32],
 }
 
@@ -2919,6 +3534,22 @@ fn state_once_outcome(committed: StateCommit) -> StateOnceOutcome {
     } else {
         StateOnceOutcome::BoundExisting {
             state: committed.state,
+        }
+    }
+}
+
+fn record_once_outcome(committed: RecordCommit) -> RecordOnceOutcome {
+    if committed.operation_existing {
+        RecordOnceOutcome::Existing {
+            record: committed.record,
+        }
+    } else if committed.apply.inserted() {
+        RecordOnceOutcome::Inserted {
+            record: committed.record,
+        }
+    } else {
+        RecordOnceOutcome::BoundExisting {
+            record: committed.record,
         }
     }
 }
@@ -3552,11 +4183,12 @@ impl Store {
         if mission_authority.is_none()
             && (write.open_table(EVENTS)?.len()? != 0
                 || write.open_table(STATES)?.len()? != 0
+                || write.open_table(RECORDS)?.len()? != 0
                 || write.open_table(ROUTE_CACHE)?.len()? != 0
                 || write.open_table(CONTROL_RECORDS)?.len()? != 0)
         {
             return Err(StoreError::SemanticInvariant(
-                "unbound store contains mission-scoped Event, State, or control state",
+                "unbound store contains mission-scoped Event, State, Record, or control state",
             ));
         }
         if mission_authority.is_none()
@@ -4897,6 +5529,12 @@ impl Store {
             let state_operation_items = metadata
                 .get(STATE_OPERATION_COUNT)?
                 .map_or(0, |value| value.value());
+            let record_items = metadata
+                .get(RECORD_ITEM_COUNT)?
+                .map_or(0, |value| value.value());
+            let record_operation_items = metadata
+                .get(RECORD_OPERATION_COUNT)?
+                .map_or(0, |value| value.value());
             let route_items = metadata
                 .get(ROUTE_CACHE_ITEM_COUNT)?
                 .map_or(0, |value| value.value());
@@ -4907,6 +5545,8 @@ impl Store {
                 .checked_add(semantic_items)
                 .and_then(|value| value.checked_add(state_items))
                 .and_then(|value| value.checked_add(state_operation_items))
+                .and_then(|value| value.checked_add(record_items))
+                .and_then(|value| value.checked_add(record_operation_items))
                 .and_then(|value| value.checked_add(route_items))
                 .and_then(|value| value.checked_add(control_items))
                 .ok_or(StoreError::ItemCountAccountingOverflow)?;
@@ -4935,6 +5575,12 @@ impl Store {
             let state_operation_bytes = metadata
                 .get(STATE_OPERATION_TOTAL_BYTES)?
                 .map_or(0, |value| value.value());
+            let record_bytes = metadata
+                .get(RECORD_TOTAL_BYTES)?
+                .map_or(0, |value| value.value());
+            let record_operation_bytes = metadata
+                .get(RECORD_OPERATION_TOTAL_BYTES)?
+                .map_or(0, |value| value.value());
             let route_payload_bytes = metadata
                 .get(ROUTE_CACHE_TOTAL_BYTES)?
                 .map_or(0, |value| value.value());
@@ -4948,6 +5594,8 @@ impl Store {
                 .checked_add(semantic_payload_bytes)
                 .and_then(|value| value.checked_add(state_payload_bytes))
                 .and_then(|value| value.checked_add(state_operation_bytes))
+                .and_then(|value| value.checked_add(record_bytes))
+                .and_then(|value| value.checked_add(record_operation_bytes))
                 .and_then(|value| value.checked_add(route_payload_bytes))
                 .and_then(|value| value.checked_add(control_payload_bytes))
                 .and_then(|value| value.checked_add(control_intent_bytes))
@@ -5276,6 +5924,105 @@ impl Store {
         })
     }
 
+    /// Derives the next local Record dot and topic/scope context from the shared ledgers.
+    pub fn reserve_record(
+        &self,
+        publisher: NodeId,
+        topic: &Topic,
+        scope: &Scope,
+    ) -> Result<RecordReservation, StoreError> {
+        self.require_live()?;
+        self.reserve_record_internal(publisher, topic, scope, None)
+    }
+
+    /// Reserves a local Record publication under one exact settled control policy.
+    pub fn reserve_record_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        publisher: NodeId,
+        topic: &Topic,
+        scope: &Scope,
+    ) -> Result<RecordReservation, StoreError> {
+        self.require_live()?;
+        self.reserve_record_internal(publisher, topic, scope, Some(policy))
+    }
+
+    fn reserve_record_internal(
+        &self,
+        publisher: NodeId,
+        topic: &Topic,
+        scope: &Scope,
+        expected_policy: Option<&ControlPolicySnapshot>,
+    ) -> Result<RecordReservation, StoreError> {
+        let authority = self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        let control_policy = match expected_policy {
+            Some(expected) => {
+                require_control_policy_read(&read, authority, expected)?;
+                *expected
+            }
+            None => control_policy_snapshot_read(&read, authority)?,
+        };
+        if control_principal_revoked_read(&read, publisher)? {
+            return Err(StoreError::RecordPublisherRevoked(publisher));
+        }
+        let previous_counter = read
+            .open_table(PUBLISHER_HIGH_WATER)?
+            .get(publisher.as_slice())?
+            .map_or(0, |value| value.value());
+        let counter = previous_counter
+            .checked_add(1)
+            .ok_or(StoreError::InvalidSemanticRecord(
+                "publisher causal counter is exhausted",
+            ))?;
+
+        let prefix = event_domain_prefix(topic, scope)?;
+        let frontier = read.open_table(CAUSAL_FRONTIER)?;
+        let mut context = VersionVector::default();
+        let mut direct_publishers = 0usize;
+        for row in frontier.iter()? {
+            let (key, value) = row?;
+            let key = key.value();
+            if !key.starts_with(&prefix) {
+                continue;
+            }
+            if key.len() != prefix.len() + 32 || value.value() == 0 {
+                return Err(StoreError::RecordInvariant(
+                    "causal frontier contains an invalid domain row",
+                ));
+            }
+            direct_publishers = direct_publishers
+                .checked_add(1)
+                .ok_or(StoreError::ItemCountAccountingOverflow)?;
+            if direct_publishers > MAX_CAUSAL_CONTEXT_ENTRIES {
+                return Err(StoreError::RecordInvariant(
+                    "causal frontier exceeds the proven context bound",
+                ));
+            }
+            let context_publisher: NodeId = key[prefix.len()..]
+                .try_into()
+                .map_err(|_| StoreError::RecordInvariant("invalid causal frontier key"))?;
+            context.observe(Dot {
+                publisher: context_publisher,
+                counter: value.value(),
+            });
+        }
+        if context.counter(&publisher) == 0 && direct_publishers == MAX_CAUSAL_CONTEXT_ENTRIES {
+            return Err(StoreError::InvalidSemanticRecord(
+                "causal frontier publisher limit reached",
+            ));
+        }
+        Ok(RecordReservation {
+            control_policy,
+            publisher,
+            topic: topic.clone(),
+            scope: scope.clone(),
+            previous_counter,
+            counter,
+            context,
+        })
+    }
+
     /// Retains one exact route/source-metadata-verified representation without
     /// granting semantic acceptance.
     ///
@@ -5358,6 +6105,10 @@ impl Store {
                 .open_table(STATES)?
                 .get(transfer_id.as_bytes().as_slice())?
                 .is_some()
+            || write
+                .open_table(RECORDS)?
+                .get(transfer_id.as_bytes().as_slice())?
+                .is_some()
         {
             return Err(StoreError::TransferNamespaceCollision {
                 transfer_id: *transfer_id.as_bytes(),
@@ -5367,6 +6118,10 @@ impl Store {
             .open_table(STATE_SEMANTIC_ITEMS)?
             .get(semantic_claim.as_bytes().as_slice())?
             .is_some()
+            || write
+                .open_table(RECORD_SEMANTIC_ITEMS)?
+                .get(semantic_claim.as_bytes().as_slice())?
+                .is_some()
         {
             return Err(StoreError::SemanticNamespaceCollision {
                 semantic_id: *semantic_claim.as_bytes(),
@@ -5485,6 +6240,12 @@ impl Store {
             let state_operation_items = metadata
                 .get(STATE_OPERATION_COUNT)?
                 .map_or(0, |value| value.value());
+            let record_items = metadata
+                .get(RECORD_ITEM_COUNT)?
+                .map_or(0, |value| value.value());
+            let record_operation_items = metadata
+                .get(RECORD_OPERATION_COUNT)?
+                .map_or(0, |value| value.value());
             let control_items = metadata
                 .get(CONTROL_ITEM_COUNT)?
                 .map_or(0, |value| value.value());
@@ -5492,6 +6253,8 @@ impl Store {
                 .checked_add(semantic_items)
                 .and_then(|value| value.checked_add(state_items))
                 .and_then(|value| value.checked_add(state_operation_items))
+                .and_then(|value| value.checked_add(record_items))
+                .and_then(|value| value.checked_add(record_operation_items))
                 .and_then(|value| value.checked_add(next_items))
                 .and_then(|value| value.checked_add(control_items))
                 .ok_or(StoreError::ItemCountAccountingOverflow)?;
@@ -5526,6 +6289,12 @@ impl Store {
             let state_operation_bytes = metadata
                 .get(STATE_OPERATION_TOTAL_BYTES)?
                 .map_or(0, |value| value.value());
+            let record_bytes = metadata
+                .get(RECORD_TOTAL_BYTES)?
+                .map_or(0, |value| value.value());
+            let record_operation_bytes = metadata
+                .get(RECORD_OPERATION_TOTAL_BYTES)?
+                .map_or(0, |value| value.value());
             let control_bytes = metadata
                 .get(CONTROL_TOTAL_BYTES)?
                 .map_or(0, |value| value.value());
@@ -5536,6 +6305,8 @@ impl Store {
                 .checked_add(semantic_bytes)
                 .and_then(|value| value.checked_add(state_bytes))
                 .and_then(|value| value.checked_add(state_operation_bytes))
+                .and_then(|value| value.checked_add(record_bytes))
+                .and_then(|value| value.checked_add(record_operation_bytes))
                 .and_then(|value| value.checked_add(next_bytes))
                 .and_then(|value| value.checked_add(control_bytes))
                 .and_then(|value| value.checked_add(control_intent_bytes))
@@ -6338,6 +7109,10 @@ impl Store {
                 .open_table(STATES)?
                 .get(prepared.transfer_id.as_bytes().as_slice())?
                 .is_some()
+            || write
+                .open_table(RECORDS)?
+                .get(prepared.transfer_id.as_bytes().as_slice())?
+                .is_some()
         {
             return Err(StoreError::TransferNamespaceCollision {
                 transfer_id: *prepared.transfer_id.as_bytes(),
@@ -6412,6 +7187,10 @@ impl Store {
             .open_table(STATE_SEMANTIC_ITEMS)?
             .get(prepared.semantic_id.as_bytes().as_slice())?
             .is_some()
+            || write
+                .open_table(RECORD_SEMANTIC_ITEMS)?
+                .get(prepared.semantic_id.as_bytes().as_slice())?
+                .is_some()
         {
             return Err(StoreError::SemanticNamespaceCollision {
                 semantic_id: *prepared.semantic_id.as_bytes(),
@@ -6586,6 +7365,12 @@ impl Store {
             let state_operation_items = metadata
                 .get(STATE_OPERATION_COUNT)?
                 .map_or(0, |value| value.value());
+            let record_items = metadata
+                .get(RECORD_ITEM_COUNT)?
+                .map_or(0, |value| value.value());
+            let record_operation_items = metadata
+                .get(RECORD_OPERATION_COUNT)?
+                .map_or(0, |value| value.value());
             let route_items = metadata
                 .get(ROUTE_CACHE_ITEM_COUNT)?
                 .map_or(0, |value| value.value());
@@ -6596,6 +7381,8 @@ impl Store {
                 .checked_add(semantic_items)
                 .and_then(|value| value.checked_add(state_items))
                 .and_then(|value| value.checked_add(state_operation_items))
+                .and_then(|value| value.checked_add(record_items))
+                .and_then(|value| value.checked_add(record_operation_items))
                 .and_then(|value| value.checked_add(route_items))
                 .and_then(|value| value.checked_add(control_items))
                 .and_then(|value| value.checked_add(1))
@@ -6618,6 +7405,12 @@ impl Store {
             let state_operation_bytes = metadata
                 .get(STATE_OPERATION_TOTAL_BYTES)?
                 .map_or(0, |value| value.value());
+            let record_bytes = metadata
+                .get(RECORD_TOTAL_BYTES)?
+                .map_or(0, |value| value.value());
+            let record_operation_bytes = metadata
+                .get(RECORD_OPERATION_TOTAL_BYTES)?
+                .map_or(0, |value| value.value());
             let route_bytes = metadata
                 .get(ROUTE_CACHE_TOTAL_BYTES)?
                 .map_or(0, |value| value.value());
@@ -6631,6 +7424,8 @@ impl Store {
                 .checked_add(semantic_bytes)
                 .and_then(|value| value.checked_add(state_bytes))
                 .and_then(|value| value.checked_add(state_operation_bytes))
+                .and_then(|value| value.checked_add(record_bytes))
+                .and_then(|value| value.checked_add(record_operation_bytes))
                 .and_then(|value| value.checked_add(route_bytes))
                 .and_then(|value| value.checked_add(control_bytes))
                 .and_then(|value| value.checked_add(control_intent_bytes))
@@ -7031,6 +7826,10 @@ impl Store {
                 .open_table(CONTROL_RECORDS)?
                 .get(prepared.transfer_id.as_bytes().as_slice())?
                 .is_some()
+            || write
+                .open_table(RECORDS)?
+                .get(prepared.transfer_id.as_bytes().as_slice())?
+                .is_some()
         {
             return Err(StoreError::TransferNamespaceCollision {
                 transfer_id: *prepared.transfer_id.as_bytes(),
@@ -7071,6 +7870,10 @@ impl Store {
             .open_table(SEMANTIC_ITEMS)?
             .get(prepared.semantic_id.as_bytes().as_slice())?
             .is_some()
+            || write
+                .open_table(RECORD_SEMANTIC_ITEMS)?
+                .get(prepared.semantic_id.as_bytes().as_slice())?
+                .is_some()
         {
             return Err(StoreError::SemanticNamespaceCollision {
                 semantic_id: *prepared.semantic_id.as_bytes(),
@@ -7284,6 +8087,548 @@ impl Store {
 
         Ok(StateCommit {
             state: StoredState {
+                transfer_id: prepared.transfer_id,
+                semantic_id: prepared.semantic_id,
+                header: prepared.header.clone(),
+                sealed: prepared.sealed.clone(),
+                acceptance_marker: marker,
+            },
+            apply: ApplyOutcome::Inserted {
+                acceptance_marker: marker,
+            },
+            operation_existing: false,
+        })
+    }
+
+    /// Commits one locally sealed Record against its optimistic durable reservation.
+    pub fn commit_reserved_record(
+        &self,
+        reservation: &RecordReservation,
+        record: &ContentVerifiedRecordEnvelope,
+        sealed: &[u8],
+    ) -> Result<ApplyOutcome, StoreError> {
+        self.require_live()?;
+        let prepared = PreparedRecord::from_verified(record, sealed)?;
+        self.commit_prepared_record(&prepared, Some(reservation), None, None)
+            .map(|committed| committed.apply)
+    }
+
+    /// Commits one reserved Record only while its captured policy remains current.
+    pub fn commit_reserved_record_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        reservation: &RecordReservation,
+        record: &ContentVerifiedRecordEnvelope,
+        sealed: &[u8],
+    ) -> Result<ApplyOutcome, StoreError> {
+        self.require_live()?;
+        if policy != reservation.control_policy() {
+            return Err(StoreError::ControlPolicyChanged);
+        }
+        let prepared = PreparedRecord::from_verified(record, sealed)?;
+        self.commit_prepared_record(&prepared, Some(reservation), None, None)
+            .map(|committed| committed.apply)
+    }
+
+    /// Atomically commits one local Record and its canonical request intent.
+    pub fn commit_reserved_record_once(
+        &self,
+        request: &RecordOperationRequest<'_>,
+        reservation: &RecordReservation,
+        record: &ContentVerifiedRecordEnvelope,
+        sealed: &[u8],
+    ) -> Result<RecordOnceOutcome, StoreError> {
+        self.require_live()?;
+        record
+            .verify_exact_payload(request.payload())
+            .map_err(|error| StoreError::RecordVerification(error.to_string()))?;
+        validate_record_publication_intent(request.intent(), request.payload(), record.header())?;
+        let prepared = PreparedRecord::from_verified(record, sealed)?;
+        let committed = self.commit_prepared_record(
+            &prepared,
+            Some(reservation),
+            Some(PendingRecordOperation {
+                key: request.operation(),
+                intent_digest: request.intent().digest(),
+            }),
+            None,
+        )?;
+        Ok(record_once_outcome(committed))
+    }
+
+    /// Commits one idempotent local Record request under exact settled policy.
+    pub fn commit_reserved_record_once_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        request: &RecordOperationRequest<'_>,
+        reservation: &RecordReservation,
+        record: &ContentVerifiedRecordEnvelope,
+        sealed: &[u8],
+    ) -> Result<RecordOnceOutcome, StoreError> {
+        self.require_live()?;
+        if policy != reservation.control_policy() {
+            return Err(StoreError::ControlPolicyChanged);
+        }
+        record
+            .verify_exact_payload(request.payload())
+            .map_err(|error| StoreError::RecordVerification(error.to_string()))?;
+        validate_record_publication_intent(request.intent(), request.payload(), record.header())?;
+        let prepared = PreparedRecord::from_verified(record, sealed)?;
+        let committed = self.commit_prepared_record(
+            &prepared,
+            Some(reservation),
+            Some(PendingRecordOperation {
+                key: request.operation(),
+                intent_digest: request.intent().digest(),
+            }),
+            None,
+        )?;
+        Ok(record_once_outcome(committed))
+    }
+
+    /// Commits an explicit resolution only against the exact freshly verified head plan.
+    ///
+    /// A successful resolution is an ordinary signed Record revision. No merge
+    /// callback or policy code is registered or executed by replicated ingest.
+    pub fn commit_reserved_record_resolution_once_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        request: &RecordResolutionRequest<'_>,
+        reservation: &RecordReservation,
+        record: &ContentVerifiedRecordEnvelope,
+        sealed: &[u8],
+    ) -> Result<RecordOnceOutcome, StoreError> {
+        self.require_live()?;
+        if policy != reservation.control_policy() {
+            return Err(StoreError::ControlPolicyChanged);
+        }
+        let publication = request.publication();
+        record
+            .verify_exact_payload(publication.payload())
+            .map_err(|error| StoreError::RecordVerification(error.to_string()))?;
+        validate_record_publication_intent(
+            publication.intent(),
+            publication.payload(),
+            record.header(),
+        )?;
+        let prepared = PreparedRecord::from_verified(record, sealed)?;
+        let committed = self.commit_prepared_record(
+            &prepared,
+            Some(reservation),
+            Some(PendingRecordOperation {
+                key: publication.operation(),
+                intent_digest: request.operation_digest()?,
+            }),
+            Some(request.plan()),
+        )?;
+        Ok(record_once_outcome(committed))
+    }
+
+    /// Resolves one privileged idempotent Record operation to its durable revision.
+    pub fn record_for_operation(
+        &self,
+        operation: &RecordOperationKey,
+    ) -> Result<Option<StoredRecord>, StoreError> {
+        self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        let transfer = read
+            .open_table(RECORD_OPERATIONS)?
+            .get(operation.as_bytes())?
+            .map(|value| {
+                decode_record_operation_record(value.value()).map(|record| record.transfer_id)
+            })
+            .transpose()?;
+        transfer
+            .map(|transfer| load_record_from_read(&read, transfer))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    /// Reads one exact source Record by transfer identity.
+    pub fn get_record(
+        &self,
+        transfer_id: RecordTransferId,
+    ) -> Result<Option<StoredRecord>, StoreError> {
+        self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        load_record_from_read(&read, transfer_id)
+    }
+
+    /// Resolves one Record semantic identity to its exact retained representation.
+    pub fn record_by_semantic_id(
+        &self,
+        semantic_id: RecordSemanticId,
+    ) -> Result<Option<StoredRecord>, StoreError> {
+        self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        let transfer = read
+            .open_table(RECORD_SEMANTIC_ITEMS)?
+            .get(semantic_id.as_bytes().as_slice())?
+            .map(|value| parse_record_transfer_id("Record semantic item table", value.value()))
+            .transpose()?;
+        transfer
+            .map(|transfer| load_record_from_read(&read, transfer))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    /// Prepares every retained revision for one exact Record key under settled policy.
+    pub fn prepare_record_projection_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        topic: &Topic,
+        scope: &Scope,
+        logical_key: &[u8],
+    ) -> Result<RecordProjectionPlan, StoreError> {
+        let authority = self.require_bound_mission()?;
+        validate_record_logical_key(logical_key)?;
+        let read = self.database.begin_read()?;
+        require_control_policy_read(&read, authority, policy)?;
+        record_projection_plan_read(&read, *policy, topic, scope, logical_key)
+    }
+
+    /// Rechecks exact policy and the complete freshly verified Record projection set.
+    pub fn require_record_projection_plan_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        plan: &RecordProjectionPlan,
+    ) -> Result<(), StoreError> {
+        let authority = self.require_bound_mission()?;
+        if policy != plan.control_policy() {
+            return Err(StoreError::RecordProjectionPlanChanged);
+        }
+        let read = self.database.begin_read()?;
+        require_control_policy_read(&read, authority, policy)?;
+        let current = record_projection_plan_read(
+            &read,
+            *policy,
+            plan.topic(),
+            plan.scope(),
+            plan.logical_key(),
+        )?;
+        if current != *plan {
+            return Err(StoreError::RecordProjectionPlanChanged);
+        }
+        Ok(())
+    }
+
+    /// Returns structurally audited Record counts from one read snapshot.
+    pub fn record_stats(&self) -> Result<RecordStoreStats, StoreError> {
+        self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        record_stats_read(&read)
+    }
+
+    fn commit_prepared_record(
+        &self,
+        prepared: &PreparedRecord,
+        reservation: Option<&RecordReservation>,
+        operation: Option<PendingRecordOperation<'_>>,
+        resolution: Option<&RecordProjectionPlan>,
+    ) -> Result<RecordCommit, StoreError> {
+        self.require_mission_authority(prepared.mission_authority)?;
+        let write = self.database.begin_write()?;
+        enforce_live_write(&write)?;
+        let reservation = reservation.ok_or(StoreError::RecordReservationChanged)?;
+        let policy = &reservation.control_policy;
+        enforce_record_policy_write(&write, prepared.mission_authority, policy, &prepared.header)?;
+
+        for table in [EVENTS, STATE_BYTES, ROUTE_CACHE, CONTROL_BYTES] {
+            if write
+                .open_table(table)?
+                .get(prepared.transfer_id.as_bytes().as_slice())?
+                .is_some()
+            {
+                return Err(StoreError::TransferNamespaceCollision {
+                    transfer_id: *prepared.transfer_id.as_bytes(),
+                });
+            }
+        }
+
+        // Policy/revocation/active epoch are enforced before an operation replay resolves.
+        if let Some(operation) = operation {
+            let existing = write
+                .open_table(RECORD_OPERATIONS)?
+                .get(operation.key.as_bytes())?
+                .map(|value| decode_record_operation_record(value.value()))
+                .transpose()?;
+            if let Some(existing) = existing {
+                if existing.intent_digest != operation.intent_digest {
+                    return Err(StoreError::RecordOperationConflict);
+                }
+                let record = load_record_from_write(&write, existing.transfer_id)?.ok_or(
+                    StoreError::RecordInvariant(
+                        "Record operation points to a missing semantic revision",
+                    ),
+                )?;
+                return Ok(RecordCommit {
+                    apply: ApplyOutcome::Duplicate {
+                        acceptance_marker: record.acceptance_marker,
+                    },
+                    record,
+                    operation_existing: true,
+                });
+            }
+        }
+
+        validate_record_reservation(reservation, prepared)?;
+        let current = record_projection_plan_write(
+            &write,
+            *policy,
+            &prepared.header.topic,
+            &prepared.header.scope,
+            &prepared.header.logical_key,
+        )?;
+        let heads = current.heads().collect::<Vec<_>>();
+        match resolution {
+            Some(expected) => {
+                if expected.control_policy() != policy
+                    || current != *expected
+                    || heads.len() < 2
+                    || heads.iter().any(|head| {
+                        !prepared
+                            .header
+                            .stamp
+                            .context
+                            .observes(head.record().header.stamp.dot)
+                    })
+                {
+                    return Err(StoreError::RecordProjectionPlanChanged);
+                }
+            }
+            None => {
+                let observed_heads = heads
+                    .iter()
+                    .filter(|head| {
+                        prepared
+                            .header
+                            .stamp
+                            .context
+                            .observes(head.record().header.stamp.dot)
+                    })
+                    .count();
+                if observed_heads >= 2 {
+                    return Err(StoreError::RecordConflictRequiresResolution);
+                }
+            }
+        }
+
+        if write
+            .open_table(SEMANTIC_ITEMS)?
+            .get(prepared.semantic_id.as_bytes().as_slice())?
+            .is_some()
+            || write
+                .open_table(STATE_SEMANTIC_ITEMS)?
+                .get(prepared.semantic_id.as_bytes().as_slice())?
+                .is_some()
+        {
+            return Err(StoreError::SemanticNamespaceCollision {
+                semantic_id: *prepared.semantic_id.as_bytes(),
+            });
+        }
+        for row in write.open_table(ROUTE_CACHE_CLAIMS)?.iter()? {
+            let (_, claim) = row?;
+            if decode_event_metadata(claim.value())?.semantic_id.as_bytes()
+                == prepared.semantic_id.as_bytes()
+            {
+                return Err(StoreError::SemanticNamespaceCollision {
+                    semantic_id: *prepared.semantic_id.as_bytes(),
+                });
+            }
+        }
+        let accepted_representation = write
+            .open_table(RECORD_SEMANTIC_ITEMS)?
+            .get(prepared.semantic_id.as_bytes().as_slice())?
+            .map(|value| parse_record_transfer_id("Record semantic item table", value.value()))
+            .transpose()?;
+        if let Some(accepted) = accepted_representation {
+            if accepted != prepared.transfer_id {
+                return Err(StoreError::RecordRepresentationConflict {
+                    semantic_id: prepared.semantic_id,
+                    accepted_envelope_id: accepted,
+                    received_envelope_id: prepared.transfer_id,
+                });
+            }
+            let record =
+                load_record_from_write(&write, accepted)?.ok_or(StoreError::RecordInvariant(
+                    "Record semantic item index points to a missing representation",
+                ))?;
+            if record.semantic_id != prepared.semantic_id
+                || record.header != prepared.header
+                || record.sealed != prepared.sealed
+            {
+                return Err(StoreError::RecordInvariant(
+                    "accepted Record representation differs from exact replay",
+                ));
+            }
+            if let Some(operation) = operation {
+                let encoded = encode_record_operation_record(RecordOperationRecord {
+                    transfer_id: prepared.transfer_id,
+                    intent_digest: operation.intent_digest,
+                });
+                admit_record_operation(&write, self.limits, operation.key, encoded.len())?;
+                write
+                    .open_table(RECORD_OPERATIONS)?
+                    .insert(operation.key.as_bytes(), encoded.as_slice())?;
+            }
+            write.commit()?;
+            return Ok(RecordCommit {
+                apply: ApplyOutcome::Duplicate {
+                    acceptance_marker: record.acceptance_marker,
+                },
+                record,
+                operation_existing: false,
+            });
+        }
+
+        let current_counter = write
+            .open_table(PUBLISHER_HIGH_WATER)?
+            .get(reservation.publisher.as_slice())?
+            .map_or(0, |value| value.value());
+        if current_counter != reservation.previous_counter {
+            return Err(StoreError::RecordReservationChanged);
+        }
+        let dot_key = accepted_dot_key(prepared.header.stamp.dot);
+        if let Some(accepted) = write
+            .open_table(ACCEPTED_DOTS)?
+            .get(dot_key.as_slice())?
+            .map(|value| parse_digest32("accepted dot table", value.value()))
+            .transpose()?
+        {
+            if accepted != *prepared.semantic_id.as_bytes() {
+                return Err(StoreError::CausalEquivocation {
+                    publisher: prepared.header.stamp.dot.publisher,
+                    counter: prepared.header.stamp.dot.counter,
+                });
+            }
+            return Err(StoreError::RecordInvariant(
+                "accepted dot is missing its Record semantic item index",
+            ));
+        }
+        ensure_frontier_capacity(
+            &write,
+            &prepared.header.topic,
+            &prepared.header.scope,
+            prepared.header.stamp.dot.publisher,
+            SemanticDataClass::Record,
+        )?;
+        if write
+            .open_table(RECORDS)?
+            .get(prepared.transfer_id.as_bytes().as_slice())?
+            .is_some()
+            || write
+                .open_table(RECORD_BYTES)?
+                .get(prepared.transfer_id.as_bytes().as_slice())?
+                .is_some()
+            || write
+                .open_table(RECORD_ACCEPTANCE_MARKERS)?
+                .get(prepared.transfer_id.as_bytes().as_slice())?
+                .is_some()
+        {
+            return Err(StoreError::RecordInvariant(
+                "Record exact namespace contains an unindexed partial representation",
+            ));
+        }
+        let group_prefix = record_group_prefix(
+            &prepared.header.topic,
+            &prepared.header.scope,
+            &prepared.header.logical_key,
+        )?;
+        let group_versions = write.open_table(RECORD_GROUP_VERSIONS)?;
+        let mut version_count = 0usize;
+        for row in group_versions.iter()? {
+            let (key, _) = row?;
+            if key.value().starts_with(&group_prefix) {
+                version_count = version_count
+                    .checked_add(1)
+                    .ok_or(StoreError::ItemCountAccountingOverflow)?;
+                if version_count >= MAX_RECORD_VERSIONS_PER_KEY {
+                    return Err(StoreError::RecordProjectionLimitExceeded {
+                        current: version_count,
+                        limit: MAX_RECORD_VERSIONS_PER_KEY,
+                    });
+                }
+            }
+        }
+        drop(group_versions);
+
+        let incoming = u64::try_from(prepared.sealed.len())
+            .map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
+        let marker = {
+            let mut metadata = write.open_table(METADATA)?;
+            require_aggregate_capacity(&metadata, self.limits, 1, incoming)?;
+            let item_count = metadata
+                .get(RECORD_ITEM_COUNT)?
+                .map_or(0, |value| value.value());
+            let total_bytes = metadata
+                .get(RECORD_TOTAL_BYTES)?
+                .map_or(0, |value| value.value());
+            let next_count = item_count
+                .checked_add(1)
+                .ok_or(StoreError::ItemCountAccountingOverflow)?;
+            let next_bytes = total_bytes
+                .checked_add(incoming)
+                .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+            let previous_marker = metadata
+                .get(LAST_RECORD_ACCEPTANCE_MARKER)?
+                .map_or(0, |value| value.value());
+            let marker = previous_marker
+                .checked_add(1)
+                .ok_or(StoreError::AcceptanceMarkerExhausted)?;
+            metadata.insert(RECORD_ITEM_COUNT, next_count)?;
+            metadata.insert(RECORD_TOTAL_BYTES, next_bytes)?;
+            metadata.insert(LAST_RECORD_ACCEPTANCE_MARKER, marker)?;
+            marker
+        };
+        write.open_table(RECORD_BYTES)?.insert(
+            prepared.transfer_id.as_bytes().as_slice(),
+            prepared.sealed.as_slice(),
+        )?;
+        write
+            .open_table(RECORD_ACCEPTANCE_MARKERS)?
+            .insert(prepared.transfer_id.as_bytes().as_slice(), marker)?;
+        write.open_table(RECORDS)?.insert(
+            prepared.transfer_id.as_bytes().as_slice(),
+            prepared.encoded_metadata.as_slice(),
+        )?;
+        write.open_table(RECORD_SEMANTIC_ITEMS)?.insert(
+            prepared.semantic_id.as_bytes().as_slice(),
+            prepared.transfer_id.as_bytes().as_slice(),
+        )?;
+        let group_key = record_group_version_key(
+            &prepared.header.topic,
+            &prepared.header.scope,
+            &prepared.header.logical_key,
+            prepared.semantic_id,
+        )?;
+        write.open_table(RECORD_GROUP_VERSIONS)?.insert(
+            group_key.as_slice(),
+            prepared.transfer_id.as_bytes().as_slice(),
+        )?;
+        write.open_table(ACCEPTED_DOTS)?.insert(
+            dot_key.as_slice(),
+            prepared.semantic_id.as_bytes().as_slice(),
+        )?;
+        update_causal_high_water(
+            &write,
+            prepared.header.stamp.dot.publisher,
+            &prepared.header.topic,
+            &prepared.header.scope,
+            prepared.header.stamp.dot.counter,
+        )?;
+        if let Some(operation) = operation {
+            let encoded = encode_record_operation_record(RecordOperationRecord {
+                transfer_id: prepared.transfer_id,
+                intent_digest: operation.intent_digest,
+            });
+            admit_record_operation(&write, self.limits, operation.key, encoded.len())?;
+            write
+                .open_table(RECORD_OPERATIONS)?
+                .insert(operation.key.as_bytes(), encoded.as_slice())?;
+        }
+        write.commit()?;
+        Ok(RecordCommit {
+            record: StoredRecord {
                 transfer_id: prepared.transfer_id,
                 semantic_id: prepared.semantic_id,
                 header: prepared.header.clone(),
@@ -7686,6 +9031,10 @@ fn insert_control(
             .open_table(ROUTE_CACHE)?
             .get(prepared.record.transfer_id.as_bytes().as_slice())?
             .is_some()
+        || write
+            .open_table(RECORDS)?
+            .get(prepared.record.transfer_id.as_bytes().as_slice())?
+            .is_some()
     {
         return Err(StoreError::TransferNamespaceCollision {
             transfer_id: *prepared.record.transfer_id.as_bytes(),
@@ -7738,6 +9087,12 @@ fn insert_control(
         let state_operation_items = metadata
             .get(STATE_OPERATION_COUNT)?
             .map_or(0, |value| value.value());
+        let record_items = metadata
+            .get(RECORD_ITEM_COUNT)?
+            .map_or(0, |value| value.value());
+        let record_operation_items = metadata
+            .get(RECORD_OPERATION_COUNT)?
+            .map_or(0, |value| value.value());
         let cache_items = metadata
             .get(ROUTE_CACHE_ITEM_COUNT)?
             .map_or(0, |value| value.value());
@@ -7745,6 +9100,8 @@ fn insert_control(
             .checked_add(event_items)
             .and_then(|value| value.checked_add(state_items))
             .and_then(|value| value.checked_add(state_operation_items))
+            .and_then(|value| value.checked_add(record_items))
+            .and_then(|value| value.checked_add(record_operation_items))
             .and_then(|value| value.checked_add(cache_items))
             .and_then(|value| value.checked_add(next_controls))
             .ok_or(StoreError::ItemCountAccountingOverflow)?;
@@ -7767,6 +9124,12 @@ fn insert_control(
         let state_operation_bytes = metadata
             .get(STATE_OPERATION_TOTAL_BYTES)?
             .map_or(0, |value| value.value());
+        let record_bytes = metadata
+            .get(RECORD_TOTAL_BYTES)?
+            .map_or(0, |value| value.value());
+        let record_operation_bytes = metadata
+            .get(RECORD_OPERATION_TOTAL_BYTES)?
+            .map_or(0, |value| value.value());
         let cache_bytes = metadata
             .get(ROUTE_CACHE_TOTAL_BYTES)?
             .map_or(0, |value| value.value());
@@ -7774,6 +9137,8 @@ fn insert_control(
             .checked_add(event_bytes)
             .and_then(|value| value.checked_add(state_bytes))
             .and_then(|value| value.checked_add(state_operation_bytes))
+            .and_then(|value| value.checked_add(record_bytes))
+            .and_then(|value| value.checked_add(record_operation_bytes))
             .and_then(|value| value.checked_add(cache_bytes))
             .and_then(|value| value.checked_add(next_retained_control_bytes))
             .ok_or(StoreError::PayloadByteAccountingOverflow)?;
@@ -7849,6 +9214,12 @@ fn admit_control_publication_intent(
     let state_operation_bytes = metadata
         .get(STATE_OPERATION_TOTAL_BYTES)?
         .map_or(0, |value| value.value());
+    let record_bytes = metadata
+        .get(RECORD_TOTAL_BYTES)?
+        .map_or(0, |value| value.value());
+    let record_operation_bytes = metadata
+        .get(RECORD_OPERATION_TOTAL_BYTES)?
+        .map_or(0, |value| value.value());
     let cache_bytes = metadata
         .get(ROUTE_CACHE_TOTAL_BYTES)?
         .map_or(0, |value| value.value());
@@ -7856,6 +9227,8 @@ fn admit_control_publication_intent(
         .checked_add(event_bytes)
         .and_then(|value| value.checked_add(state_bytes))
         .and_then(|value| value.checked_add(state_operation_bytes))
+        .and_then(|value| value.checked_add(record_bytes))
+        .and_then(|value| value.checked_add(record_operation_bytes))
         .and_then(|value| value.checked_add(cache_bytes))
         .and_then(|value| value.checked_add(next_control_bytes))
         .ok_or(StoreError::PayloadByteAccountingOverflow)?;
@@ -8235,6 +9608,24 @@ fn validate_state_reservation(
     Ok(())
 }
 
+fn validate_record_reservation(
+    reservation: &RecordReservation,
+    prepared: &PreparedRecord,
+) -> Result<(), StoreError> {
+    let header = &prepared.header;
+    if header.stamp.dot.publisher != reservation.publisher
+        || header.stamp.dot.counter != reservation.counter
+        || header.topic != reservation.topic
+        || header.scope != reservation.scope
+        || header.stamp.context != reservation.context
+    {
+        return Err(StoreError::InvalidSemanticRecord(
+            "sealed Record does not match its durable reservation",
+        ));
+    }
+    Ok(())
+}
+
 fn purge_route_cache_semantic_claim(
     write: &redb::WriteTransaction,
     accepted_transfer_id: EventTransferId,
@@ -8386,6 +9777,8 @@ fn require_aggregate_capacity(
         SEMANTIC_ITEM_COUNT,
         STATE_ITEM_COUNT,
         STATE_OPERATION_COUNT,
+        RECORD_ITEM_COUNT,
+        RECORD_OPERATION_COUNT,
         ROUTE_CACHE_ITEM_COUNT,
         CONTROL_ITEM_COUNT,
     ]
@@ -8410,6 +9803,8 @@ fn require_aggregate_capacity(
         SEMANTIC_TOTAL_BYTES,
         STATE_TOTAL_BYTES,
         STATE_OPERATION_TOTAL_BYTES,
+        RECORD_TOTAL_BYTES,
+        RECORD_OPERATION_TOTAL_BYTES,
         ROUTE_CACHE_TOTAL_BYTES,
         CONTROL_TOTAL_BYTES,
         CONTROL_PUBLICATION_INTENT_TOTAL_BYTES,
@@ -8477,6 +9872,50 @@ fn admit_state_operation(
     Ok(())
 }
 
+fn admit_record_operation(
+    write: &redb::WriteTransaction,
+    limits: StoreLimits,
+    operation: &RecordOperationKey,
+    encoded_record_len: usize,
+) -> Result<(), StoreError> {
+    let incoming = operation
+        .as_bytes()
+        .len()
+        .checked_add(encoded_record_len)
+        .and_then(|length| u64::try_from(length).ok())
+        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    let mut metadata = write.open_table(METADATA)?;
+    let current_count = metadata
+        .get(RECORD_OPERATION_COUNT)?
+        .map_or(0, |value| value.value());
+    let next_count = current_count
+        .checked_add(1)
+        .ok_or(StoreError::ItemCountAccountingOverflow)?;
+    if next_count > MAX_RECORD_OPERATIONS {
+        return Err(StoreError::RecordOperationLimitExceeded {
+            current: current_count,
+            limit: MAX_RECORD_OPERATIONS,
+        });
+    }
+    let current_bytes = metadata
+        .get(RECORD_OPERATION_TOTAL_BYTES)?
+        .map_or(0, |value| value.value());
+    let next_bytes = current_bytes
+        .checked_add(incoming)
+        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    if next_bytes > MAX_RECORD_OPERATION_BYTES {
+        return Err(StoreError::RecordOperationByteLimitExceeded {
+            current: current_bytes,
+            incoming,
+            limit: MAX_RECORD_OPERATION_BYTES,
+        });
+    }
+    require_aggregate_capacity(&metadata, limits, 1, incoming)?;
+    metadata.insert(RECORD_OPERATION_COUNT, next_count)?;
+    metadata.insert(RECORD_OPERATION_TOTAL_BYTES, next_bytes)?;
+    Ok(())
+}
+
 fn ensure_frontier_capacity(
     write: &redb::WriteTransaction,
     topic: &Topic,
@@ -8512,10 +9951,14 @@ fn ensure_frontier_capacity(
         ));
     }
     if !incoming_present && direct_publishers == MAX_CAUSAL_CONTEXT_ENTRIES {
-        return Err(if class == SemanticDataClass::State {
-            StoreError::InvalidSemanticState("causal frontier publisher limit reached")
-        } else {
-            StoreError::InvalidSemanticEvent("causal frontier publisher limit reached")
+        return Err(match class {
+            SemanticDataClass::State => {
+                StoreError::InvalidSemanticState("causal frontier publisher limit reached")
+            }
+            SemanticDataClass::Record => {
+                StoreError::InvalidSemanticRecord("causal frontier publisher limit reached")
+            }
+            _ => StoreError::InvalidSemanticEvent("causal frontier publisher limit reached"),
         });
     }
     Ok(())
@@ -8794,6 +10237,354 @@ fn state_projection_plan_read(
         logical_key: logical_key.to_vec(),
         candidates,
     })
+}
+
+fn load_record_from_write(
+    write: &redb::WriteTransaction,
+    transfer_id: RecordTransferId,
+) -> Result<Option<StoredRecord>, StoreError> {
+    let encoded = write
+        .open_table(RECORDS)?
+        .get(transfer_id.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec());
+    let Some(encoded) = encoded else {
+        return Ok(None);
+    };
+    let sealed = write
+        .open_table(RECORD_BYTES)?
+        .get(transfer_id.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec())
+        .ok_or(StoreError::RecordInvariant(
+            "Record metadata is missing exact source bytes",
+        ))?;
+    let marker = write
+        .open_table(RECORD_ACCEPTANCE_MARKERS)?
+        .get(transfer_id.as_bytes().as_slice())?
+        .map(|value| value.value())
+        .ok_or(StoreError::RecordInvariant(
+            "Record metadata is missing its acceptance marker",
+        ))?;
+    decode_stored_record(transfer_id, &encoded, sealed, marker).map(Some)
+}
+
+fn load_record_from_read(
+    read: &redb::ReadTransaction,
+    transfer_id: RecordTransferId,
+) -> Result<Option<StoredRecord>, StoreError> {
+    let encoded = read
+        .open_table(RECORDS)?
+        .get(transfer_id.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec());
+    let Some(encoded) = encoded else {
+        return Ok(None);
+    };
+    let sealed = read
+        .open_table(RECORD_BYTES)?
+        .get(transfer_id.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec())
+        .ok_or(StoreError::RecordInvariant(
+            "Record metadata is missing exact source bytes",
+        ))?;
+    let marker = read
+        .open_table(RECORD_ACCEPTANCE_MARKERS)?
+        .get(transfer_id.as_bytes().as_slice())?
+        .map(|value| value.value())
+        .ok_or(StoreError::RecordInvariant(
+            "Record metadata is missing its acceptance marker",
+        ))?;
+    decode_stored_record(transfer_id, &encoded, sealed, marker).map(Some)
+}
+
+fn decode_stored_record(
+    transfer_id: RecordTransferId,
+    encoded: &[u8],
+    sealed: Vec<u8>,
+    acceptance_marker: u64,
+) -> Result<StoredRecord, StoreError> {
+    let metadata = decode_record_metadata(encoded)?;
+    if metadata.transfer_id != transfer_id {
+        return Err(StoreError::RecordInvariant(
+            "Record metadata transfer identity differs from its table key",
+        ));
+    }
+    if RecordTransferId::new(Sha256::digest(&sealed).into()) != transfer_id {
+        return Err(StoreError::RecordInvariant(
+            "exact source bytes differ from their Record transfer identity",
+        ));
+    }
+    Ok(StoredRecord {
+        transfer_id,
+        semantic_id: metadata.semantic_id,
+        header: metadata.header,
+        sealed,
+        acceptance_marker,
+    })
+}
+
+fn record_is_inactive_read(
+    read: &redb::ReadTransaction,
+    record: &StoredRecord,
+) -> Result<bool, StoreError> {
+    if control_principal_revoked_read(read, record.header.stamp.dot.publisher)? {
+        return Ok(true);
+    }
+    let current_epoch = read
+        .open_table(CONTROL_SCOPE_EPOCHS)?
+        .get(record.header.scope.as_str())?
+        .map(|value| decode_scope_epoch_index(value.value()))
+        .transpose()?
+        .map_or(1, |(current, _)| current);
+    Ok(record.header.key_epoch != current_epoch)
+}
+
+fn record_is_inactive_write(
+    write: &redb::WriteTransaction,
+    record: &StoredRecord,
+) -> Result<bool, StoreError> {
+    if control_principal_revoked_write(write, record.header.stamp.dot.publisher)? {
+        return Ok(true);
+    }
+    let current_epoch = write
+        .open_table(CONTROL_SCOPE_EPOCHS)?
+        .get(record.header.scope.as_str())?
+        .map(|value| decode_scope_epoch_index(value.value()))
+        .transpose()?
+        .map_or(1, |(current, _)| current);
+    Ok(record.header.key_epoch != current_epoch)
+}
+
+fn reduce_record_projection(
+    control_policy: ControlPolicySnapshot,
+    topic: &Topic,
+    scope: &Scope,
+    logical_key: &[u8],
+    mut records: Vec<(StoredRecord, bool)>,
+) -> RecordProjectionPlan {
+    records.sort_by_key(|(record, _)| record.semantic_id);
+    // Only an explicit causal-context observation dominates another revision.
+    // Dot order, arrival order, and tombstone status never imply dominance.
+    let maximal = records
+        .iter()
+        .filter(|(_, active)| *active)
+        .filter(|(candidate, _)| {
+            !records.iter().any(|(other, other_active)| {
+                *other_active
+                    && other.semantic_id != candidate.semantic_id
+                    && other
+                        .header
+                        .stamp
+                        .context
+                        .observes(candidate.header.stamp.dot)
+            })
+        })
+        .map(|(record, _)| record.semantic_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    let winner = maximal.iter().next_back().copied();
+    let candidates = records
+        .into_iter()
+        .map(|(record, active)| {
+            let disposition = if !active {
+                None
+            } else if Some(record.semantic_id) == winner {
+                Some(RecordVersionDisposition::Current)
+            } else if maximal.contains(&record.semantic_id) {
+                Some(RecordVersionDisposition::Concurrent)
+            } else {
+                Some(RecordVersionDisposition::Superseded)
+            };
+            RecordProjectionCandidate {
+                record,
+                disposition,
+            }
+        })
+        .collect();
+    RecordProjectionPlan {
+        control_policy,
+        topic: topic.clone(),
+        scope: scope.clone(),
+        logical_key: logical_key.to_vec(),
+        candidates,
+    }
+}
+
+fn record_projection_plan_read(
+    read: &redb::ReadTransaction,
+    control_policy: ControlPolicySnapshot,
+    topic: &Topic,
+    scope: &Scope,
+    logical_key: &[u8],
+) -> Result<RecordProjectionPlan, StoreError> {
+    let prefix = record_group_prefix(topic, scope, logical_key)?;
+    let groups = read.open_table(RECORD_GROUP_VERSIONS)?;
+    let mut records = Vec::new();
+    for row in groups.iter()? {
+        let (key, value) = row?;
+        if !key.value().starts_with(&prefix) {
+            continue;
+        }
+        if key.value().len() != prefix.len() + 32 {
+            return Err(StoreError::RecordInvariant(
+                "Record group index contains an invalid exact-key row",
+            ));
+        }
+        if records.len() >= MAX_RECORD_VERSIONS_PER_KEY {
+            return Err(StoreError::RecordProjectionLimitExceeded {
+                current: records.len() + 1,
+                limit: MAX_RECORD_VERSIONS_PER_KEY,
+            });
+        }
+        let semantic_id = RecordSemanticId::new(
+            key.value()[prefix.len()..]
+                .try_into()
+                .map_err(|_| StoreError::RecordInvariant("invalid Record group semantic ID"))?,
+        );
+        let transfer_id = parse_record_transfer_id("Record group index", value.value())?;
+        let record = load_record_from_read(read, transfer_id)?.ok_or(
+            StoreError::RecordInvariant("Record group index points to a missing revision"),
+        )?;
+        if record.semantic_id != semantic_id
+            || record.header.topic != *topic
+            || record.header.scope != *scope
+            || record.header.logical_key != logical_key
+        {
+            return Err(StoreError::RecordInvariant(
+                "Record group index differs from authenticated metadata",
+            ));
+        }
+        let active = !record_is_inactive_read(read, &record)?;
+        records.push((record, active));
+    }
+    Ok(reduce_record_projection(
+        control_policy,
+        topic,
+        scope,
+        logical_key,
+        records,
+    ))
+}
+
+fn record_projection_plan_write(
+    write: &redb::WriteTransaction,
+    control_policy: ControlPolicySnapshot,
+    topic: &Topic,
+    scope: &Scope,
+    logical_key: &[u8],
+) -> Result<RecordProjectionPlan, StoreError> {
+    let prefix = record_group_prefix(topic, scope, logical_key)?;
+    let groups = write.open_table(RECORD_GROUP_VERSIONS)?;
+    let mut records = Vec::new();
+    for row in groups.iter()? {
+        let (key, value) = row?;
+        if !key.value().starts_with(&prefix) {
+            continue;
+        }
+        if key.value().len() != prefix.len() + 32 {
+            return Err(StoreError::RecordInvariant(
+                "Record group index contains an invalid exact-key row",
+            ));
+        }
+        if records.len() >= MAX_RECORD_VERSIONS_PER_KEY {
+            return Err(StoreError::RecordProjectionLimitExceeded {
+                current: records.len() + 1,
+                limit: MAX_RECORD_VERSIONS_PER_KEY,
+            });
+        }
+        let semantic_id = RecordSemanticId::new(
+            key.value()[prefix.len()..]
+                .try_into()
+                .map_err(|_| StoreError::RecordInvariant("invalid Record group semantic ID"))?,
+        );
+        let transfer_id = parse_record_transfer_id("Record group index", value.value())?;
+        let record = load_record_from_write(write, transfer_id)?.ok_or(
+            StoreError::RecordInvariant("Record group index points to a missing revision"),
+        )?;
+        if record.semantic_id != semantic_id
+            || record.header.topic != *topic
+            || record.header.scope != *scope
+            || record.header.logical_key != logical_key
+        {
+            return Err(StoreError::RecordInvariant(
+                "Record group index differs from authenticated metadata",
+            ));
+        }
+        let active = !record_is_inactive_write(write, &record)?;
+        records.push((record, active));
+    }
+    Ok(reduce_record_projection(
+        control_policy,
+        topic,
+        scope,
+        logical_key,
+        records,
+    ))
+}
+
+fn record_stats_read(read: &redb::ReadTransaction) -> Result<RecordStoreStats, StoreError> {
+    let records = read.open_table(RECORDS)?;
+    let record_bytes = read.open_table(RECORD_BYTES)?;
+    let markers = read.open_table(RECORD_ACCEPTANCE_MARKERS)?;
+    let operations = read.open_table(RECORD_OPERATIONS)?;
+    let metadata = read.open_table(METADATA)?;
+    let mut total_sealed_bytes = 0u64;
+    let mut last_acceptance_marker = 0u64;
+    for row in records.iter()? {
+        let (key, _) = row?;
+        let bytes = record_bytes
+            .get(key.value())?
+            .ok_or(StoreError::RecordInvariant(
+                "Record stats row is missing exact source bytes",
+            ))?;
+        total_sealed_bytes = total_sealed_bytes
+            .checked_add(
+                u64::try_from(bytes.value().len())
+                    .map_err(|_| StoreError::PayloadByteAccountingOverflow)?,
+            )
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        let marker = markers.get(key.value())?.map(|value| value.value()).ok_or(
+            StoreError::RecordInvariant("Record stats row is missing its acceptance marker"),
+        )?;
+        last_acceptance_marker = last_acceptance_marker.max(marker);
+    }
+    let mut operation_bytes = 0u64;
+    for row in operations.iter()? {
+        let (key, value) = row?;
+        RecordOperationKey::new(key.value().to_vec())?;
+        decode_record_operation_record(value.value())?;
+        operation_bytes = operation_bytes
+            .checked_add(
+                key.value()
+                    .len()
+                    .checked_add(value.value().len())
+                    .and_then(|length| u64::try_from(length).ok())
+                    .ok_or(StoreError::PayloadByteAccountingOverflow)?,
+            )
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    }
+    let stats = RecordStoreStats {
+        records: records.len()?,
+        acceptance_markers: markers.len()?,
+        total_sealed_bytes,
+        last_acceptance_marker,
+        operations: operations.len()?,
+        operation_bytes,
+    };
+    for (field, reconstructed) in [
+        (RECORD_ITEM_COUNT, stats.records),
+        (RECORD_TOTAL_BYTES, stats.total_sealed_bytes),
+        (LAST_RECORD_ACCEPTANCE_MARKER, stats.last_acceptance_marker),
+        (RECORD_OPERATION_COUNT, stats.operations),
+        (RECORD_OPERATION_TOTAL_BYTES, stats.operation_bytes),
+    ] {
+        let durable = metadata.get(field)?.map_or(0, |value| value.value());
+        if durable != reconstructed {
+            return Err(StoreError::AccountingMismatch {
+                field,
+                durable,
+                reconstructed,
+            });
+        }
+    }
+    Ok(stats)
 }
 
 fn load_route_cached_event_read(
@@ -9433,6 +11224,11 @@ fn inspect_mission_binding_read_only(path: &Path) -> Result<Option<NodeId>, Stor
         } else {
             0
         };
+        let record_rows = if table_names.contains(RECORDS.name()) {
+            read.open_table(RECORDS)?.len()?
+        } else {
+            0
+        };
         let cached_rows = if table_names.contains(ROUTE_CACHE.name()) {
             read.open_table(ROUTE_CACHE)?.len()?
         } else {
@@ -9443,9 +11239,14 @@ fn inspect_mission_binding_read_only(path: &Path) -> Result<Option<NodeId>, Stor
         } else {
             0
         };
-        if semantic_rows != 0 || state_rows != 0 || cached_rows != 0 || control_rows != 0 {
+        if semantic_rows != 0
+            || state_rows != 0
+            || record_rows != 0
+            || cached_rows != 0
+            || control_rows != 0
+        {
             return Err(StoreError::SemanticInvariant(
-                "unbound store contains mission-scoped Event, State, or control state",
+                "unbound store contains mission-scoped Event, State, Record, or control state",
             ));
         }
     }
@@ -9896,11 +11697,353 @@ fn preflight_state_schema_group(write: &redb::WriteTransaction) -> Result<(), St
     Ok(())
 }
 
+fn preflight_record_schema_group(write: &redb::WriteTransaction) -> Result<(), StoreError> {
+    let record_tables = [
+        RECORDS.name(),
+        RECORD_BYTES.name(),
+        RECORD_ACCEPTANCE_MARKERS.name(),
+        RECORD_SEMANTIC_ITEMS.name(),
+        RECORD_GROUP_VERSIONS.name(),
+        RECORD_OPERATIONS.name(),
+    ];
+    if write
+        .list_multimap_tables()?
+        .any(|table| record_tables.contains(&table.name()))
+    {
+        return Err(StoreError::RecordInvariant(
+            "mission-scoped Record schema has the wrong table kind",
+        ));
+    }
+    let table_names = write
+        .list_tables()?
+        .map(|table| table.name().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    let present_tables = record_tables
+        .iter()
+        .filter(|name| table_names.contains(**name))
+        .count();
+    let metadata_presence = {
+        let metadata = write.open_table(METADATA)?;
+        [
+            metadata.get(RECORD_ITEM_COUNT)?.is_some(),
+            metadata.get(RECORD_TOTAL_BYTES)?.is_some(),
+            metadata.get(LAST_RECORD_ACCEPTANCE_MARKER)?.is_some(),
+            metadata.get(RECORD_OPERATION_COUNT)?.is_some(),
+            metadata.get(RECORD_OPERATION_TOTAL_BYTES)?.is_some(),
+        ]
+    };
+    let present_metadata = metadata_presence.iter().filter(|present| **present).count();
+    if present_tables == 0 && present_metadata == 0 {
+        write.open_table(RECORDS)?;
+        write.open_table(RECORD_BYTES)?;
+        write.open_table(RECORD_ACCEPTANCE_MARKERS)?;
+        write.open_table(RECORD_SEMANTIC_ITEMS)?;
+        write.open_table(RECORD_GROUP_VERSIONS)?;
+        write.open_table(RECORD_OPERATIONS)?;
+        let mut metadata = write.open_table(METADATA)?;
+        metadata.insert(RECORD_ITEM_COUNT, 0)?;
+        metadata.insert(RECORD_TOTAL_BYTES, 0)?;
+        metadata.insert(LAST_RECORD_ACCEPTANCE_MARKER, 0)?;
+        metadata.insert(RECORD_OPERATION_COUNT, 0)?;
+        metadata.insert(RECORD_OPERATION_TOTAL_BYTES, 0)?;
+        return Ok(());
+    }
+    if present_tables != record_tables.len() || present_metadata != metadata_presence.len() {
+        return Err(StoreError::RecordInvariant(
+            "mission-scoped Record schema group is incomplete",
+        ));
+    }
+    Ok(())
+}
+
+fn audit_record_tables(
+    write: &redb::WriteTransaction,
+    shared: &mut StateAuditSnapshot,
+) -> Result<(), StoreError> {
+    preflight_record_schema_group(write)?;
+    let records = write.open_table(RECORDS)?;
+    let record_bytes = write.open_table(RECORD_BYTES)?;
+    let markers = write.open_table(RECORD_ACCEPTANCE_MARKERS)?;
+    let semantic_items = write.open_table(RECORD_SEMANTIC_ITEMS)?;
+    let groups = write.open_table(RECORD_GROUP_VERSIONS)?;
+    let operations = write.open_table(RECORD_OPERATIONS)?;
+    let events = write.open_table(EVENTS)?;
+    let states = write.open_table(STATES)?;
+    let event_items = write.open_table(SEMANTIC_ITEMS)?;
+    let state_items = write.open_table(STATE_SEMANTIC_ITEMS)?;
+    let route_cache = write.open_table(ROUTE_CACHE)?;
+    let controls = write.open_table(CONTROL_RECORDS)?;
+    let accepted_dots = write.open_table(ACCEPTED_DOTS)?;
+    let publisher_high = write.open_table(PUBLISHER_HIGH_WATER)?;
+    let frontier = write.open_table(CAUSAL_FRONTIER)?;
+    let mut route_semantics = std::collections::BTreeSet::new();
+    for row in write.open_table(ROUTE_CACHE_CLAIMS)?.iter()? {
+        let (_, value) = row?;
+        route_semantics.insert(*decode_event_metadata(value.value())?.semantic_id.as_bytes());
+    }
+    let mut count = 0u64;
+    let mut total_bytes = 0u64;
+    let mut last_marker = 0u64;
+    let mut marker_values = std::collections::BTreeSet::new();
+    let mut expected_groups = std::collections::BTreeMap::<Vec<u8>, RecordTransferId>::new();
+    let mut group_counts = std::collections::BTreeMap::<Vec<u8>, usize>::new();
+    for row in records.iter()? {
+        let (key, value) = row?;
+        let transfer_id = parse_record_transfer_id("Record metadata table", key.value())?;
+        let metadata = decode_record_metadata(value.value())?;
+        if metadata.transfer_id != transfer_id {
+            return Err(StoreError::RecordInvariant(
+                "Record metadata transfer identity differs from its table key",
+            ));
+        }
+        if events.get(key.value())?.is_some()
+            || states.get(key.value())?.is_some()
+            || route_cache.get(key.value())?.is_some()
+            || controls.get(key.value())?.is_some()
+        {
+            return Err(StoreError::TransferNamespaceCollision {
+                transfer_id: *transfer_id.as_bytes(),
+            });
+        }
+        let sealed = record_bytes
+            .get(key.value())?
+            .ok_or(StoreError::RecordInvariant(
+                "Record metadata is missing exact source bytes",
+            ))?;
+        if RecordTransferId::new(Sha256::digest(sealed.value()).into()) != transfer_id {
+            return Err(StoreError::RecordInvariant(
+                "Record source bytes fail exact transfer identity audit",
+            ));
+        }
+        let marker = markers.get(key.value())?.map(|value| value.value()).ok_or(
+            StoreError::RecordInvariant("Record metadata is missing its acceptance marker"),
+        )?;
+        if marker == 0 || !marker_values.insert(marker) {
+            return Err(StoreError::RecordInvariant(
+                "Record acceptance markers must be nonzero and unique",
+            ));
+        }
+        let indexed = semantic_items
+            .get(metadata.semantic_id.as_bytes().as_slice())?
+            .map(|value| parse_record_transfer_id("Record semantic item table", value.value()))
+            .transpose()?
+            .ok_or(StoreError::RecordInvariant(
+                "Record metadata is missing its semantic item index",
+            ))?;
+        if indexed != transfer_id {
+            return Err(StoreError::RecordInvariant(
+                "Record semantic item index points to another representation",
+            ));
+        }
+        if event_items
+            .get(metadata.semantic_id.as_bytes().as_slice())?
+            .is_some()
+            || state_items
+                .get(metadata.semantic_id.as_bytes().as_slice())?
+                .is_some()
+            || route_semantics.contains(metadata.semantic_id.as_bytes())
+        {
+            return Err(StoreError::SemanticNamespaceCollision {
+                semantic_id: *metadata.semantic_id.as_bytes(),
+            });
+        }
+        let dot = metadata.header.stamp.dot;
+        let dot_key = accepted_dot_key(dot).to_vec();
+        if shared
+            .expected_dots
+            .insert(dot_key.clone(), *metadata.semantic_id.as_bytes())
+            .is_some()
+        {
+            return Err(StoreError::RecordInvariant(
+                "multiple semantic objects claim one accepted causal dot",
+            ));
+        }
+        let durable_dot = accepted_dots
+            .get(dot_key.as_slice())?
+            .map(|value| parse_digest32("accepted dot table", value.value()))
+            .transpose()?
+            .ok_or(StoreError::RecordInvariant(
+                "Record metadata is missing its accepted-dot ledger row",
+            ))?;
+        if durable_dot != *metadata.semantic_id.as_bytes() {
+            return Err(StoreError::RecordInvariant(
+                "accepted-dot ledger points to another semantic item",
+            ));
+        }
+        let group_prefix = record_group_prefix(
+            &metadata.header.topic,
+            &metadata.header.scope,
+            &metadata.header.logical_key,
+        )?;
+        let group_count = group_counts.entry(group_prefix).or_default();
+        *group_count = group_count
+            .checked_add(1)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        if *group_count > MAX_RECORD_VERSIONS_PER_KEY {
+            return Err(StoreError::RecordProjectionLimitExceeded {
+                current: *group_count,
+                limit: MAX_RECORD_VERSIONS_PER_KEY,
+            });
+        }
+        let group_key = record_group_version_key(
+            &metadata.header.topic,
+            &metadata.header.scope,
+            &metadata.header.logical_key,
+            metadata.semantic_id,
+        )?;
+        if expected_groups.insert(group_key, transfer_id).is_some() {
+            return Err(StoreError::RecordInvariant(
+                "multiple Record revisions claim one group index key",
+            ));
+        }
+        let publisher_value = publisher_high
+            .get(dot.publisher.as_slice())?
+            .map_or(0, |value| value.value());
+        if publisher_value < dot.counter {
+            return Err(StoreError::RecordInvariant(
+                "publisher high-water is behind an accepted Record dot",
+            ));
+        }
+        shared
+            .expected_publisher_high
+            .entry(dot.publisher.to_vec())
+            .and_modify(|current| *current = (*current).max(dot.counter))
+            .or_insert(dot.counter);
+        let frontier_key = causal_frontier_key(
+            &metadata.header.topic,
+            &metadata.header.scope,
+            dot.publisher,
+        )?;
+        let frontier_value = frontier
+            .get(frontier_key.as_slice())?
+            .map_or(0, |value| value.value());
+        if frontier_value < dot.counter {
+            return Err(StoreError::RecordInvariant(
+                "causal frontier is behind an accepted Record dot",
+            ));
+        }
+        shared
+            .expected_frontier
+            .entry(frontier_key)
+            .and_modify(|current| *current = (*current).max(dot.counter))
+            .or_insert(dot.counter);
+        shared
+            .domain_publishers
+            .entry(event_domain_prefix(
+                &metadata.header.topic,
+                &metadata.header.scope,
+            )?)
+            .or_default()
+            .insert(dot.publisher);
+        count = count
+            .checked_add(1)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        total_bytes = total_bytes
+            .checked_add(
+                u64::try_from(sealed.value().len())
+                    .map_err(|_| StoreError::PayloadByteAccountingOverflow)?,
+            )
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        last_marker = last_marker.max(marker);
+    }
+    if last_marker != count || marker_values.iter().copied().ne(1..=count) {
+        return Err(StoreError::RecordInvariant(
+            "Record acceptance markers are not a contiguous allocation history",
+        ));
+    }
+    if record_bytes.len()? != count
+        || markers.len()? != count
+        || semantic_items.len()? != count
+        || groups.len()? != count
+    {
+        return Err(StoreError::RecordInvariant(
+            "Record schema has missing or orphan rows",
+        ));
+    }
+    for row in record_bytes.iter()? {
+        let (key, _) = row?;
+        if records.get(key.value())?.is_none() {
+            return Err(StoreError::RecordInvariant("Record bytes are orphaned"));
+        }
+    }
+    for row in markers.iter()? {
+        let (key, _) = row?;
+        if records.get(key.value())?.is_none() {
+            return Err(StoreError::RecordInvariant("Record marker is orphaned"));
+        }
+    }
+    for row in semantic_items.iter()? {
+        let (key, value) = row?;
+        let semantic_id = parse_record_semantic_id("Record semantic item table", key.value())?;
+        let transfer_id = parse_record_transfer_id("Record semantic item table", value.value())?;
+        let encoded =
+            records
+                .get(transfer_id.as_bytes().as_slice())?
+                .ok_or(StoreError::RecordInvariant(
+                    "Record semantic item index points to a missing revision",
+                ))?;
+        if decode_record_metadata(encoded.value())?.semantic_id != semantic_id {
+            return Err(StoreError::RecordInvariant(
+                "Record semantic item index differs from metadata",
+            ));
+        }
+    }
+    for row in groups.iter()? {
+        let (key, value) = row?;
+        let transfer_id = parse_record_transfer_id("Record group index", value.value())?;
+        if expected_groups.get(key.value()) != Some(&transfer_id) {
+            return Err(StoreError::RecordInvariant(
+                "Record group index contains an orphan or mismatched row",
+            ));
+        }
+    }
+    let mut operation_count = 0u64;
+    let mut operation_bytes = 0u64;
+    for row in operations.iter()? {
+        let (key, value) = row?;
+        RecordOperationKey::new(key.value().to_vec())?;
+        let operation = decode_record_operation_record(value.value())?;
+        if records
+            .get(operation.transfer_id.as_bytes().as_slice())?
+            .is_none()
+        {
+            return Err(StoreError::RecordInvariant(
+                "Record operation points to a missing revision",
+            ));
+        }
+        operation_count = operation_count
+            .checked_add(1)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        operation_bytes = operation_bytes
+            .checked_add(
+                key.value()
+                    .len()
+                    .checked_add(value.value().len())
+                    .and_then(|length| u64::try_from(length).ok())
+                    .ok_or(StoreError::PayloadByteAccountingOverflow)?,
+            )
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    }
+    if operation_count > MAX_RECORD_OPERATIONS || operation_bytes > MAX_RECORD_OPERATION_BYTES {
+        return Err(StoreError::RecordInvariant(
+            "Record operation usage exceeds its durable safety caps",
+        ));
+    }
+    let mut metadata = write.open_table(METADATA)?;
+    audit_or_initialize_counter(&mut metadata, RECORD_ITEM_COUNT, count)?;
+    audit_or_initialize_counter(&mut metadata, RECORD_TOTAL_BYTES, total_bytes)?;
+    audit_or_initialize_counter(&mut metadata, LAST_RECORD_ACCEPTANCE_MARKER, last_marker)?;
+    audit_or_initialize_counter(&mut metadata, RECORD_OPERATION_COUNT, operation_count)?;
+    audit_or_initialize_counter(&mut metadata, RECORD_OPERATION_TOTAL_BYTES, operation_bytes)?;
+    Ok(())
+}
+
 fn audit_semantic_tables(write: &redb::WriteTransaction) -> Result<(), StoreError> {
     // Opening every table here is the non-destructive schema extension for old
     // stores. Existing v1 opaque item/effect bytes remain untouched and use a
     // disjoint caller-controlled key namespace.
-    let state_audit = audit_state_tables(write)?;
+    let mut state_audit = audit_state_tables(write)?;
+    audit_record_tables(write, &mut state_audit)?;
     if write
         .list_multimap_tables()?
         .any(|table| table.name() == EVENT_ACCEPTANCE_ORDER.name())
@@ -11328,6 +13471,62 @@ fn validate_state_header(header: &EnvelopeHeader) -> Result<(), StoreError> {
     Ok(())
 }
 
+fn validate_record_logical_key(logical_key: &[u8]) -> Result<(), StoreError> {
+    if logical_key.is_empty() || logical_key.len() > MAX_RECORD_LOGICAL_KEY_BYTES {
+        return Err(StoreError::InvalidSemanticRecord(
+            "logical key length is outside 1..=4096 bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_record_header(header: &EnvelopeHeader) -> Result<(), StoreError> {
+    if header.class != SemanticDataClass::Record {
+        return Err(StoreError::InvalidSemanticRecord(
+            "authenticated data class is not Record",
+        ));
+    }
+    if header.stamp.dot.counter == 0 {
+        return Err(StoreError::InvalidSemanticRecord(
+            "causal counter must be nonzero",
+        ));
+    }
+    if header.stamp.context.len() > MAX_CAUSAL_CONTEXT_ENTRIES
+        || header
+            .stamp
+            .context
+            .iter()
+            .any(|(_, counter)| *counter == 0)
+        || header.stamp.context.counter(&header.stamp.dot.publisher) >= header.stamp.dot.counter
+    {
+        return Err(StoreError::InvalidSemanticRecord(
+            "causal context is internally inconsistent",
+        ));
+    }
+    validate_record_logical_key(&header.logical_key)?;
+    if header.event_sequence.is_some() {
+        return Err(StoreError::InvalidSemanticRecord(
+            "Record cannot carry an Event sequence",
+        ));
+    }
+    if header.blob_route.is_some() {
+        return Err(StoreError::InvalidSemanticRecord(
+            "Record cannot carry a Blob route commitment",
+        ));
+    }
+    if header.ttl_ms.is_some() {
+        return Err(StoreError::InvalidSemanticRecord(
+            "selected Record foundation does not admit finite TTL",
+        ));
+    }
+    if header.tombstone && header.content_len != 0 {
+        return Err(StoreError::InvalidSemanticRecord(
+            "Record tombstone content length must be zero",
+        ));
+    }
+    Ok(())
+}
+
 fn event_sequence(header: &EnvelopeHeader) -> Result<u64, StoreError> {
     header
         .event_sequence
@@ -11365,6 +13564,32 @@ fn state_group_version_key(
     semantic_id: StateSemanticId,
 ) -> Result<Vec<u8>, StoreError> {
     let mut key = state_group_prefix(topic, scope, logical_key)?;
+    key.extend_from_slice(semantic_id.as_bytes());
+    Ok(key)
+}
+
+fn record_group_prefix(
+    topic: &Topic,
+    scope: &Scope,
+    logical_key: &[u8],
+) -> Result<Vec<u8>, StoreError> {
+    validate_record_logical_key(logical_key)?;
+    let mut key = event_domain_prefix(topic, scope)?;
+    let length = u32::try_from(logical_key.len()).map_err(|_| {
+        StoreError::InvalidSemanticRecord("logical key exceeds group-index encoding bound")
+    })?;
+    key.extend_from_slice(&length.to_be_bytes());
+    key.extend_from_slice(logical_key);
+    Ok(key)
+}
+
+fn record_group_version_key(
+    topic: &Topic,
+    scope: &Scope,
+    logical_key: &[u8],
+    semantic_id: RecordSemanticId,
+) -> Result<Vec<u8>, StoreError> {
+    let mut key = record_group_prefix(topic, scope, logical_key)?;
     key.extend_from_slice(semantic_id.as_bytes());
     Ok(key)
 }
@@ -11732,6 +13957,191 @@ fn decode_state_operation_record(bytes: &[u8]) -> Result<StateOperationRecord, S
     let intent_digest = cursor.array()?;
     cursor.finish()?;
     Ok(StateOperationRecord {
+        transfer_id,
+        intent_digest,
+    })
+}
+
+fn encode_record_metadata(
+    transfer_id: RecordTransferId,
+    semantic_id: RecordSemanticId,
+    header: &EnvelopeHeader,
+) -> Result<Vec<u8>, StoreError> {
+    validate_record_header(header)?;
+    let mut output = Vec::new();
+    output.push(RECORD_METADATA_VERSION);
+    output.extend_from_slice(transfer_id.as_bytes());
+    output.extend_from_slice(semantic_id.as_bytes());
+    output.push(header.priority as u8);
+    output.push(u8::from(header.tombstone));
+    output.extend_from_slice(&header.stamp.dot.publisher);
+    output.extend_from_slice(&header.stamp.dot.counter.to_be_bytes());
+    output.extend_from_slice(&header.content_len.to_be_bytes());
+    output.extend_from_slice(&header.key_epoch.to_be_bytes());
+    push_short_bytes(&mut output, header.topic.as_str().as_bytes())?;
+    push_short_bytes(&mut output, header.scope.as_str().as_bytes())?;
+    let logical_length = u32::try_from(header.logical_key.len()).map_err(|_| {
+        StoreError::InvalidSemanticRecord("logical key exceeds durable encoding bound")
+    })?;
+    output.extend_from_slice(&logical_length.to_be_bytes());
+    output.extend_from_slice(&header.logical_key);
+    let context_length = u32::try_from(header.stamp.context.len()).map_err(|_| {
+        StoreError::InvalidSemanticRecord("causal context exceeds durable encoding bound")
+    })?;
+    output.extend_from_slice(&context_length.to_be_bytes());
+    for (publisher, counter) in header.stamp.context.iter() {
+        output.extend_from_slice(publisher);
+        output.extend_from_slice(&counter.to_be_bytes());
+    }
+    Ok(output)
+}
+
+fn decode_record_metadata(bytes: &[u8]) -> Result<RecordMetadata, StoreError> {
+    let mut cursor = MetadataCursor::new(bytes);
+    if cursor.u8()? != RECORD_METADATA_VERSION {
+        return Err(StoreError::RecordInvariant(
+            "unknown Record metadata encoding version",
+        ));
+    }
+    let transfer_id = RecordTransferId::new(cursor.array()?);
+    let semantic_id = RecordSemanticId::new(cursor.array()?);
+    let priority = Priority::from_wire(cursor.u8()?).ok_or(StoreError::RecordInvariant(
+        "unknown authenticated Record priority",
+    ))?;
+    let tombstone = match cursor.u8()? {
+        0 => false,
+        1 => true,
+        _ => return Err(StoreError::RecordInvariant("invalid Record metadata flags")),
+    };
+    let publisher = cursor.array()?;
+    let counter = cursor.u64()?;
+    let content_len = cursor.u64()?;
+    let key_epoch = cursor.u64()?;
+    let topic = Topic::new(cursor.short_string()?)
+        .map_err(|_| StoreError::RecordInvariant("invalid Record topic encoding"))?;
+    let scope = Scope::new(cursor.short_string()?)
+        .map_err(|_| StoreError::RecordInvariant("invalid Record scope encoding"))?;
+    let logical_length = usize::try_from(cursor.u32()?)
+        .map_err(|_| StoreError::RecordInvariant("invalid Record logical-key length"))?;
+    if logical_length == 0 || logical_length > MAX_RECORD_LOGICAL_KEY_BYTES {
+        return Err(StoreError::RecordInvariant(
+            "Record logical key exceeds its bound",
+        ));
+    }
+    let logical_key = cursor.take(logical_length)?.to_vec();
+    let context_length = usize::try_from(cursor.u32()?)
+        .map_err(|_| StoreError::RecordInvariant("invalid Record context length"))?;
+    if context_length > MAX_CAUSAL_CONTEXT_ENTRIES {
+        return Err(StoreError::RecordInvariant(
+            "Record causal context exceeds its bound",
+        ));
+    }
+    let mut context = VersionVector::default();
+    for _ in 0..context_length {
+        let context_publisher = cursor.array()?;
+        let context_counter = cursor.u64()?;
+        if context_counter == 0 || context.counter(&context_publisher) != 0 {
+            return Err(StoreError::RecordInvariant(
+                "Record causal context is not canonical",
+            ));
+        }
+        context.observe(Dot {
+            publisher: context_publisher,
+            counter: context_counter,
+        });
+    }
+    cursor.finish()?;
+    let header = EnvelopeHeader {
+        class: SemanticDataClass::Record,
+        topic,
+        scope,
+        priority,
+        stamp: CausalStamp {
+            dot: Dot { publisher, counter },
+            context,
+        },
+        event_sequence: None,
+        logical_key,
+        blob_route: None,
+        ttl_ms: None,
+        content_len,
+        tombstone,
+        key_epoch,
+    };
+    validate_record_header(&header).map_err(|_| {
+        StoreError::RecordInvariant("decoded Record metadata is internally inconsistent")
+    })?;
+    Ok(RecordMetadata {
+        transfer_id,
+        semantic_id,
+        header,
+    })
+}
+
+fn record_publication_intent_digest(
+    intent: &RecordPublicationIntent,
+) -> Result<[u8; 32], StoreError> {
+    let topic_len = u16::try_from(intent.topic.as_str().len())
+        .map_err(|_| StoreError::InvalidSemanticRecord("topic exceeds intent encoding bound"))?;
+    let scope_len = u16::try_from(intent.scope.as_str().len())
+        .map_err(|_| StoreError::InvalidSemanticRecord("scope exceeds intent encoding bound"))?;
+    let logical_len = u32::try_from(intent.logical_key.len()).map_err(|_| {
+        StoreError::InvalidSemanticRecord("logical key exceeds intent encoding bound")
+    })?;
+    let mut digest = Sha256::new();
+    digest.update(RECORD_PUBLICATION_INTENT_DOMAIN);
+    digest.update(intent.publisher);
+    digest.update(topic_len.to_be_bytes());
+    digest.update(intent.topic.as_str().as_bytes());
+    digest.update(scope_len.to_be_bytes());
+    digest.update(intent.scope.as_str().as_bytes());
+    digest.update([intent.priority as u8]);
+    digest.update(logical_len.to_be_bytes());
+    digest.update(&intent.logical_key);
+    digest.update(intent.content_len.to_be_bytes());
+    digest.update(intent.payload_digest);
+    digest.update([u8::from(intent.tombstone)]);
+    Ok(digest.finalize().into())
+}
+
+fn validate_record_publication_intent(
+    intent: &RecordPublicationIntent,
+    payload: &[u8],
+    header: &EnvelopeHeader,
+) -> Result<(), StoreError> {
+    if !intent.matches_payload(payload)
+        || header.stamp.dot.publisher != intent.publisher
+        || header.topic != intent.topic
+        || header.scope != intent.scope
+        || header.priority != intent.priority
+        || header.logical_key != intent.logical_key
+        || header.content_len != intent.content_len
+        || header.tombstone != intent.tombstone
+    {
+        return Err(StoreError::RecordOperationConflict);
+    }
+    Ok(())
+}
+
+fn encode_record_operation_record(record: RecordOperationRecord) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(65);
+    encoded.push(RECORD_OPERATION_VERSION);
+    encoded.extend_from_slice(record.transfer_id.as_bytes());
+    encoded.extend_from_slice(&record.intent_digest);
+    encoded
+}
+
+fn decode_record_operation_record(bytes: &[u8]) -> Result<RecordOperationRecord, StoreError> {
+    let mut cursor = MetadataCursor::new(bytes);
+    if cursor.u8()? != RECORD_OPERATION_VERSION {
+        return Err(StoreError::RecordInvariant(
+            "unknown Record operation encoding version",
+        ));
+    }
+    let transfer_id = RecordTransferId::new(cursor.array()?);
+    let intent_digest = cursor.array()?;
+    cursor.finish()?;
+    Ok(RecordOperationRecord {
         transfer_id,
         intent_digest,
     })
@@ -12739,6 +15149,38 @@ fn enforce_state_policy_write(
     Ok(())
 }
 
+fn enforce_record_policy_write(
+    write: &redb::WriteTransaction,
+    authority: NodeId,
+    expected: &ControlPolicySnapshot,
+    header: &EnvelopeHeader,
+) -> Result<(), StoreError> {
+    require_control_policy_write(write, authority, expected)?;
+    let publisher = header.stamp.dot.publisher;
+    if control_principal_revoked_write(write, publisher)? {
+        return Err(StoreError::RecordPublisherRevoked(publisher));
+    }
+    let current_epoch = write
+        .open_table(CONTROL_SCOPE_EPOCHS)?
+        .get(header.scope.as_str())?
+        .map(|value| decode_scope_epoch_index(value.value()))
+        .transpose()?
+        .map_or(1, |(epoch, _)| epoch);
+    if header.key_epoch < current_epoch {
+        return Err(StoreError::RecordKeyEpochStale {
+            current: current_epoch,
+            received: header.key_epoch,
+        });
+    }
+    if header.key_epoch > current_epoch {
+        return Err(StoreError::RecordKeyEpochNotActive {
+            current: current_epoch,
+            received: header.key_epoch,
+        });
+    }
+    Ok(())
+}
+
 fn canonical_event_replication_projection(
     selectors: impl IntoIterator<Item = EventReplicationSelector>,
 ) -> Vec<EventReplicationSelector> {
@@ -12965,6 +15407,20 @@ fn parse_state_semantic_id(
     bytes: &[u8],
 ) -> Result<StateSemanticId, StoreError> {
     Ok(StateSemanticId::new(parse_digest32(table, bytes)?))
+}
+
+fn parse_record_transfer_id(
+    table: &'static str,
+    bytes: &[u8],
+) -> Result<RecordTransferId, StoreError> {
+    Ok(RecordTransferId::new(parse_digest32(table, bytes)?))
+}
+
+fn parse_record_semantic_id(
+    table: &'static str,
+    bytes: &[u8],
+) -> Result<RecordSemanticId, StoreError> {
+    Ok(RecordSemanticId::new(parse_digest32(table, bytes)?))
 }
 
 fn parse_digest32(table: &'static str, bytes: &[u8]) -> Result<[u8; 32], StoreError> {
@@ -13519,10 +15975,357 @@ fn inspect_state_readable(
     Ok((stats, snapshot))
 }
 
+fn inspect_record_readable(
+    read: &redb::ReadTransaction,
+    shared: &mut StateAuditSnapshot,
+) -> Result<RecordStoreStats, StoreError> {
+    let record_tables = [
+        RECORDS.name(),
+        RECORD_BYTES.name(),
+        RECORD_ACCEPTANCE_MARKERS.name(),
+        RECORD_SEMANTIC_ITEMS.name(),
+        RECORD_GROUP_VERSIONS.name(),
+        RECORD_OPERATIONS.name(),
+    ];
+    if read
+        .list_multimap_tables()?
+        .any(|table| record_tables.contains(&table.name()))
+    {
+        return Err(StoreError::RecordInvariant(
+            "mission-scoped Record schema has the wrong table kind",
+        ));
+    }
+    let table_names = read
+        .list_tables()?
+        .map(|table| table.name().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    let present = record_tables
+        .iter()
+        .filter(|name| table_names.contains(**name))
+        .count();
+    let metadata = read.open_table(METADATA)?;
+    let metadata_presence = [
+        metadata.get(RECORD_ITEM_COUNT)?.is_some(),
+        metadata.get(RECORD_TOTAL_BYTES)?.is_some(),
+        metadata.get(LAST_RECORD_ACCEPTANCE_MARKER)?.is_some(),
+        metadata.get(RECORD_OPERATION_COUNT)?.is_some(),
+        metadata.get(RECORD_OPERATION_TOTAL_BYTES)?.is_some(),
+    ];
+    if present == 0 && metadata_presence.iter().all(|present| !present) {
+        return Ok(RecordStoreStats::default());
+    }
+    if present != record_tables.len() || metadata_presence.iter().any(|present| !present) {
+        return Err(StoreError::RecordInvariant(
+            "mission-scoped Record schema group is incomplete",
+        ));
+    }
+    let records = read.open_table(RECORDS)?;
+    let bytes = read.open_table(RECORD_BYTES)?;
+    let markers = read.open_table(RECORD_ACCEPTANCE_MARKERS)?;
+    let semantic_items = read.open_table(RECORD_SEMANTIC_ITEMS)?;
+    let groups = read.open_table(RECORD_GROUP_VERSIONS)?;
+    let operations = read.open_table(RECORD_OPERATIONS)?;
+    let accepted_dots = read.open_table(ACCEPTED_DOTS)?;
+    let events = table_names
+        .contains(EVENTS.name())
+        .then(|| read.open_table(EVENTS))
+        .transpose()?;
+    let states = table_names
+        .contains(STATES.name())
+        .then(|| read.open_table(STATES))
+        .transpose()?;
+    let event_items = table_names
+        .contains(SEMANTIC_ITEMS.name())
+        .then(|| read.open_table(SEMANTIC_ITEMS))
+        .transpose()?;
+    let state_items = table_names
+        .contains(STATE_SEMANTIC_ITEMS.name())
+        .then(|| read.open_table(STATE_SEMANTIC_ITEMS))
+        .transpose()?;
+    let route_cache = table_names
+        .contains(ROUTE_CACHE.name())
+        .then(|| read.open_table(ROUTE_CACHE))
+        .transpose()?;
+    let controls = table_names
+        .contains(CONTROL_RECORDS.name())
+        .then(|| read.open_table(CONTROL_RECORDS))
+        .transpose()?;
+    let mut route_semantics = std::collections::BTreeSet::new();
+    if table_names.contains(ROUTE_CACHE_CLAIMS.name()) {
+        for row in read.open_table(ROUTE_CACHE_CLAIMS)?.iter()? {
+            let (_, value) = row?;
+            route_semantics.insert(*decode_event_metadata(value.value())?.semantic_id.as_bytes());
+        }
+    }
+    let mut count = 0u64;
+    let mut total_bytes = 0u64;
+    let mut last_marker = 0u64;
+    let mut marker_values = std::collections::BTreeSet::new();
+    let mut expected_groups = std::collections::BTreeMap::<Vec<u8>, RecordTransferId>::new();
+    let mut group_counts = std::collections::BTreeMap::<Vec<u8>, usize>::new();
+    for row in records.iter()? {
+        let (key, value) = row?;
+        let transfer_id = parse_record_transfer_id("Record metadata table", key.value())?;
+        let record = decode_record_metadata(value.value())?;
+        if record.transfer_id != transfer_id {
+            return Err(StoreError::RecordInvariant(
+                "Record metadata transfer identity differs from its table key",
+            ));
+        }
+        for present in [
+            events
+                .as_ref()
+                .map(|table| table.get(key.value()))
+                .transpose()?
+                .flatten()
+                .is_some(),
+            states
+                .as_ref()
+                .map(|table| table.get(key.value()))
+                .transpose()?
+                .flatten()
+                .is_some(),
+            route_cache
+                .as_ref()
+                .map(|table| table.get(key.value()))
+                .transpose()?
+                .flatten()
+                .is_some(),
+            controls
+                .as_ref()
+                .map(|table| table.get(key.value()))
+                .transpose()?
+                .flatten()
+                .is_some(),
+        ] {
+            if present {
+                return Err(StoreError::TransferNamespaceCollision {
+                    transfer_id: *transfer_id.as_bytes(),
+                });
+            }
+        }
+        let sealed = bytes.get(key.value())?.ok_or(StoreError::RecordInvariant(
+            "Record metadata is missing exact source bytes",
+        ))?;
+        if RecordTransferId::new(Sha256::digest(sealed.value()).into()) != transfer_id {
+            return Err(StoreError::RecordInvariant(
+                "Record source bytes fail exact transfer identity audit",
+            ));
+        }
+        let marker = markers.get(key.value())?.map(|value| value.value()).ok_or(
+            StoreError::RecordInvariant("Record metadata is missing its acceptance marker"),
+        )?;
+        if marker == 0 || !marker_values.insert(marker) {
+            return Err(StoreError::RecordInvariant(
+                "Record acceptance markers must be nonzero and unique",
+            ));
+        }
+        let indexed = semantic_items
+            .get(record.semantic_id.as_bytes().as_slice())?
+            .map(|value| parse_record_transfer_id("Record semantic item table", value.value()))
+            .transpose()?
+            .ok_or(StoreError::RecordInvariant(
+                "Record metadata is missing its semantic item index",
+            ))?;
+        if indexed != transfer_id {
+            return Err(StoreError::RecordInvariant(
+                "Record semantic item index points to another representation",
+            ));
+        }
+        if event_items
+            .as_ref()
+            .map(|table| table.get(record.semantic_id.as_bytes().as_slice()))
+            .transpose()?
+            .flatten()
+            .is_some()
+            || state_items
+                .as_ref()
+                .map(|table| table.get(record.semantic_id.as_bytes().as_slice()))
+                .transpose()?
+                .flatten()
+                .is_some()
+            || route_semantics.contains(record.semantic_id.as_bytes())
+        {
+            return Err(StoreError::SemanticNamespaceCollision {
+                semantic_id: *record.semantic_id.as_bytes(),
+            });
+        }
+        let dot = record.header.stamp.dot;
+        let dot_key = accepted_dot_key(dot).to_vec();
+        if shared
+            .expected_dots
+            .insert(dot_key.clone(), *record.semantic_id.as_bytes())
+            .is_some()
+        {
+            return Err(StoreError::RecordInvariant(
+                "multiple semantic objects claim one accepted causal dot",
+            ));
+        }
+        let durable_dot = accepted_dots
+            .get(dot_key.as_slice())?
+            .map(|value| parse_digest32("accepted dot table", value.value()))
+            .transpose()?
+            .ok_or(StoreError::RecordInvariant(
+                "Record metadata is missing its accepted-dot ledger row",
+            ))?;
+        if durable_dot != *record.semantic_id.as_bytes() {
+            return Err(StoreError::RecordInvariant(
+                "accepted-dot ledger points to another semantic item",
+            ));
+        }
+        let prefix = record_group_prefix(
+            &record.header.topic,
+            &record.header.scope,
+            &record.header.logical_key,
+        )?;
+        let group_count = group_counts.entry(prefix).or_default();
+        *group_count = group_count
+            .checked_add(1)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        if *group_count > MAX_RECORD_VERSIONS_PER_KEY {
+            return Err(StoreError::RecordProjectionLimitExceeded {
+                current: *group_count,
+                limit: MAX_RECORD_VERSIONS_PER_KEY,
+            });
+        }
+        let group_key = record_group_version_key(
+            &record.header.topic,
+            &record.header.scope,
+            &record.header.logical_key,
+            record.semantic_id,
+        )?;
+        expected_groups.insert(group_key, transfer_id);
+        shared
+            .expected_publisher_high
+            .entry(dot.publisher.to_vec())
+            .and_modify(|current| *current = (*current).max(dot.counter))
+            .or_insert(dot.counter);
+        shared
+            .expected_frontier
+            .entry(causal_frontier_key(
+                &record.header.topic,
+                &record.header.scope,
+                dot.publisher,
+            )?)
+            .and_modify(|current| *current = (*current).max(dot.counter))
+            .or_insert(dot.counter);
+        shared
+            .domain_publishers
+            .entry(event_domain_prefix(
+                &record.header.topic,
+                &record.header.scope,
+            )?)
+            .or_default()
+            .insert(dot.publisher);
+        count = count
+            .checked_add(1)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        total_bytes = total_bytes
+            .checked_add(
+                u64::try_from(sealed.value().len())
+                    .map_err(|_| StoreError::PayloadByteAccountingOverflow)?,
+            )
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        last_marker = last_marker.max(marker);
+    }
+    if last_marker != count || marker_values.iter().copied().ne(1..=count) {
+        return Err(StoreError::RecordInvariant(
+            "Record acceptance markers are not a contiguous allocation history",
+        ));
+    }
+    if bytes.len()? != count
+        || markers.len()? != count
+        || semantic_items.len()? != count
+        || groups.len()? != count
+    {
+        return Err(StoreError::RecordInvariant(
+            "Record schema has missing or orphan rows",
+        ));
+    }
+    for row in groups.iter()? {
+        let (key, value) = row?;
+        let transfer_id = parse_record_transfer_id("Record group index", value.value())?;
+        if expected_groups.get(key.value()) != Some(&transfer_id) {
+            return Err(StoreError::RecordInvariant(
+                "Record group index contains an orphan or mismatched row",
+            ));
+        }
+    }
+    let mut operation_count = 0u64;
+    let mut operation_bytes = 0u64;
+    for row in operations.iter()? {
+        let (key, value) = row?;
+        RecordOperationKey::new(key.value().to_vec())?;
+        let operation = decode_record_operation_record(value.value())?;
+        if records
+            .get(operation.transfer_id.as_bytes().as_slice())?
+            .is_none()
+        {
+            return Err(StoreError::RecordInvariant(
+                "Record operation points to a missing revision",
+            ));
+        }
+        operation_count = operation_count
+            .checked_add(1)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        operation_bytes = operation_bytes
+            .checked_add(
+                key.value()
+                    .len()
+                    .checked_add(value.value().len())
+                    .and_then(|length| u64::try_from(length).ok())
+                    .ok_or(StoreError::PayloadByteAccountingOverflow)?,
+            )
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    }
+    if operation_count > MAX_RECORD_OPERATIONS || operation_bytes > MAX_RECORD_OPERATION_BYTES {
+        return Err(StoreError::RecordInvariant(
+            "Record operation usage exceeds its durable safety caps",
+        ));
+    }
+    let stats = RecordStoreStats {
+        records: count,
+        acceptance_markers: markers.len()?,
+        total_sealed_bytes: total_bytes,
+        last_acceptance_marker: last_marker,
+        operations: operation_count,
+        operation_bytes,
+    };
+    for (field, reconstructed) in [
+        (RECORD_ITEM_COUNT, stats.records),
+        (RECORD_TOTAL_BYTES, stats.total_sealed_bytes),
+        (LAST_RECORD_ACCEPTANCE_MARKER, stats.last_acceptance_marker),
+        (RECORD_OPERATION_COUNT, stats.operations),
+        (RECORD_OPERATION_TOTAL_BYTES, stats.operation_bytes),
+    ] {
+        let durable = metadata
+            .get(field)?
+            .ok_or(StoreError::MissingAccountingMetadata { field })?
+            .value();
+        if durable != reconstructed {
+            return Err(StoreError::AccountingMismatch {
+                field,
+                durable,
+                reconstructed,
+            });
+        }
+    }
+    Ok(stats)
+}
+
 fn inspect_semantic_readable(
     read: &redb::ReadTransaction,
-) -> Result<(EventStoreStats, StateStoreStats, Option<NodeId>), StoreError> {
-    let (state_stats, state_audit) = inspect_state_readable(read)?;
+) -> Result<
+    (
+        EventStoreStats,
+        StateStoreStats,
+        RecordStoreStats,
+        Option<NodeId>,
+    ),
+    StoreError,
+> {
+    let (state_stats, mut state_audit) = inspect_state_readable(read)?;
+    let record_stats = inspect_record_readable(read, &mut state_audit)?;
     if read
         .list_multimap_tables()?
         .any(|table| table.name() == EVENT_ACCEPTANCE_ORDER.name())
@@ -13561,7 +16364,7 @@ fn inspect_semantic_readable(
                 "mission-scoped Event schema is incomplete",
             ));
         }
-        return Ok((EventStoreStats::default(), state_stats, None));
+        return Ok((EventStoreStats::default(), state_stats, record_stats, None));
     }
     if present != semantic_tables.len() {
         return Err(StoreError::SemanticInvariant(
@@ -14066,7 +16869,7 @@ fn inspect_semantic_readable(
             });
         }
     }
-    Ok((stats, state_stats, mission_authority))
+    Ok((stats, state_stats, record_stats, mission_authority))
 }
 
 fn event_subscription_stats_read(
@@ -14367,7 +17170,8 @@ fn inspect_readable(database: &impl ReadableDatabase) -> Result<StoreInspection,
         });
     }
 
-    let (event_stats, state_stats, mission_authority) = inspect_semantic_readable(&read)?;
+    let (event_stats, state_stats, record_stats, mission_authority) =
+        inspect_semantic_readable(&read)?;
     let event_subscription_stats = event_subscription_stats_read(&read)?;
     let control_stats = inspect_control_tables(&read, mission_authority)?.unwrap_or_default();
 
@@ -14381,6 +17185,7 @@ fn inspect_readable(database: &impl ReadableDatabase) -> Result<StoreInspection,
         },
         event_stats,
         state_stats,
+        record_stats,
         event_subscription_stats,
         control_stats,
         mission_authority,
@@ -14405,8 +17210,9 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use aster_mesh::{
-        ContentVerifiedEventEnvelope, ContentVerifiedStateEnvelope, EventContentVerification,
-        ProvisioningAccess, ProvisioningBundle, ReferenceEnvelopeSealer, ReferenceProvisioner,
+        ContentVerifiedEventEnvelope, ContentVerifiedRecordEnvelope, ContentVerifiedStateEnvelope,
+        EventContentVerification, ProvisioningAccess, ProvisioningBundle,
+        RecordContentVerification, ReferenceEnvelopeSealer, ReferenceProvisioner,
         ScopeRekeyRecipient, StateContentVerification,
     };
 
@@ -14686,6 +17492,62 @@ mod tests {
         let (state, opened) = content_state(reader, &sealed.bytes);
         assert_eq!(opened, payload);
         (state, sealed.bytes, intent)
+    }
+
+    fn content_record(
+        reader: &mut ReferenceEnvelopeSealer,
+        sealed: &[u8],
+    ) -> (ContentVerifiedRecordEnvelope, Vec<u8>) {
+        let route = reader
+            .verify_record(sealed)
+            .expect("Record route verification");
+        match reader
+            .verify_record_content(route, sealed)
+            .expect("Record content verification")
+        {
+            RecordContentVerification::ContentVerified { record, payload } => (record, payload),
+            RecordContentVerification::RouteOnly(_) => panic!("reader has a Record content grant"),
+        }
+    }
+
+    fn reserved_record(
+        publisher: &mut ReferenceEnvelopeSealer,
+        reader: &mut ReferenceEnvelopeSealer,
+        reservation: &RecordReservation,
+        logical_key: &[u8],
+        payload: &[u8],
+        tombstone: bool,
+        key_epoch: u64,
+    ) -> (
+        ContentVerifiedRecordEnvelope,
+        Vec<u8>,
+        RecordPublicationIntent,
+    ) {
+        let header = reservation
+            .header(
+                Priority::Immediate,
+                logical_key.to_vec(),
+                payload.len() as u64,
+                tombstone,
+                key_epoch,
+            )
+            .expect("reserved Record header");
+        let intent = RecordPublicationIntent::new(
+            reservation.publisher(),
+            header.topic.clone(),
+            header.scope.clone(),
+            header.priority,
+            header.logical_key.clone(),
+            payload,
+            tombstone,
+        )
+        .expect("Record publication intent");
+        let sealed = publisher
+            .seal_record(&header, payload)
+            .expect("seal reserved Record");
+        let (record, opened) = content_record(reader, &sealed.bytes);
+        assert_eq!(opened, payload);
+        (record, sealed.bytes, intent)
     }
 
     fn event_header(
@@ -23129,5 +25991,975 @@ mod tests {
             Store::open_for_mission(&file.0, services.authority),
             Err(StoreError::StateInvariant(_))
         ));
+    }
+
+    #[test]
+    fn record_operation_is_restart_idempotent_publisher_bound_and_policy_checked_before_replay() {
+        let file = TestFile::new("Record operation restart");
+        let mut services = state_services(0xc1);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("Record store");
+        let policy = store.control_policy_snapshot().expect("Record policy");
+        let operation = RecordOperationKey::new(b"record/op/1".to_vec()).expect("operation");
+        let reservation = store
+            .reserve_record_with_policy(
+                &policy,
+                services.first.identity(),
+                &state_topic(),
+                &state_scope(),
+            )
+            .expect("reserve Record");
+        let (record, sealed, intent) = reserved_record(
+            &mut services.first,
+            &mut services.reader,
+            &reservation,
+            b"asset/record",
+            b"alpha",
+            false,
+            1,
+        );
+        let request = RecordOperationRequest::new(&operation, &intent, b"alpha").expect("request");
+        let inserted = store
+            .commit_reserved_record_once_with_policy(
+                &policy,
+                &request,
+                &reservation,
+                &record,
+                &sealed,
+            )
+            .expect("commit Record");
+        assert!(matches!(inserted, RecordOnceOutcome::Inserted { .. }));
+        let expected = inserted.record().clone();
+        drop(store);
+
+        let reopened =
+            Store::open_for_mission(&file.0, services.authority).expect("reopen Record store");
+        let retry_policy = reopened.control_policy_snapshot().expect("retry policy");
+        let retry_reservation = reopened
+            .reserve_record_with_policy(
+                &retry_policy,
+                services.first.identity(),
+                &state_topic(),
+                &state_scope(),
+            )
+            .expect("reserve retry");
+        let (retry_record, retry_sealed, retry_intent) = reserved_record(
+            &mut services.first,
+            &mut services.reader,
+            &retry_reservation,
+            b"asset/record",
+            b"alpha",
+            false,
+            1,
+        );
+        let retry_request = RecordOperationRequest::new(&operation, &retry_intent, b"alpha")
+            .expect("retry request");
+        let existing = reopened
+            .commit_reserved_record_once_with_policy(
+                &retry_policy,
+                &retry_request,
+                &retry_reservation,
+                &retry_record,
+                &retry_sealed,
+            )
+            .expect("exact retry");
+        assert!(matches!(existing, RecordOnceOutcome::Existing { .. }));
+        assert_eq!(existing.record(), &expected);
+
+        let future_reservation = reopened
+            .reserve_record_with_policy(
+                &retry_policy,
+                services.first.identity(),
+                &state_topic(),
+                &state_scope(),
+            )
+            .expect("future reservation");
+        let (future, future_sealed, future_intent) = reserved_record(
+            &mut services.first,
+            &mut services.reader,
+            &future_reservation,
+            b"asset/record",
+            b"alpha",
+            false,
+            2,
+        );
+        let future_request = RecordOperationRequest::new(&operation, &future_intent, b"alpha")
+            .expect("future request");
+        assert!(matches!(
+            reopened.commit_reserved_record_once_with_policy(
+                &retry_policy,
+                &future_request,
+                &future_reservation,
+                &future,
+                &future_sealed,
+            ),
+            Err(StoreError::RecordKeyEpochNotActive {
+                current: 1,
+                received: 2
+            })
+        ));
+
+        let other_reservation = reopened
+            .reserve_record_with_policy(
+                &retry_policy,
+                services.second.identity(),
+                &state_topic(),
+                &state_scope(),
+            )
+            .expect("other publisher reservation");
+        let (other, other_sealed, other_intent) = reserved_record(
+            &mut services.second,
+            &mut services.reader,
+            &other_reservation,
+            b"asset/record",
+            b"alpha",
+            false,
+            1,
+        );
+        let other_request = RecordOperationRequest::new(&operation, &other_intent, b"alpha")
+            .expect("other request");
+        assert!(matches!(
+            reopened.commit_reserved_record_once_with_policy(
+                &retry_policy,
+                &other_request,
+                &other_reservation,
+                &other,
+                &other_sealed,
+            ),
+            Err(StoreError::RecordOperationConflict)
+        ));
+        assert_eq!(
+            reopened.record_stats().expect("Record stats"),
+            RecordStoreStats {
+                records: 1,
+                acceptance_markers: 1,
+                total_sealed_bytes: expected.sealed.len() as u64,
+                last_acceptance_marker: 1,
+                operations: 1,
+                operation_bytes: (operation.as_bytes().len() + 65) as u64,
+            }
+        );
+        drop(reopened);
+        let inspection = Store::inspect_existing(&file.0).expect("strict Record inspection");
+        assert_eq!(inspection.record_stats.records, 1);
+        assert_eq!(inspection.record_stats.operations, 1);
+    }
+
+    #[test]
+    fn record_projection_is_arrival_independent_retains_n_way_heads_and_has_no_delete_wins() {
+        let first_file = TestFile::new("Record projection order one");
+        let second_file = TestFile::new("Record projection order two");
+        let mut services = state_services(0xc2);
+        let first_store =
+            Store::open_for_mission(&first_file.0, services.authority).expect("first store");
+        let second_store =
+            Store::open_for_mission(&second_file.0, services.authority).expect("second store");
+        let policy = first_store.control_policy_snapshot().expect("policy");
+        assert_eq!(
+            second_store
+                .control_policy_snapshot()
+                .expect("second policy"),
+            policy
+        );
+        let first_reservation = first_store
+            .reserve_record_with_policy(
+                &policy,
+                services.first.identity(),
+                &state_topic(),
+                &state_scope(),
+            )
+            .expect("first reservation");
+        let second_reservation = first_store
+            .reserve_record_with_policy(
+                &policy,
+                services.second.identity(),
+                &state_topic(),
+                &state_scope(),
+            )
+            .expect("second reservation");
+        let third_reservation = first_store
+            .reserve_record_with_policy(
+                &policy,
+                services.reader.identity(),
+                &state_topic(),
+                &state_scope(),
+            )
+            .expect("third reservation");
+        let (first, first_sealed, _) = reserved_record(
+            &mut services.first,
+            &mut services.reader,
+            &first_reservation,
+            b"record/n-way",
+            b"first",
+            false,
+            1,
+        );
+        let (second, second_sealed, _) = reserved_record(
+            &mut services.second,
+            &mut services.reader,
+            &second_reservation,
+            b"record/n-way",
+            b"second",
+            false,
+            1,
+        );
+        let third_header = third_reservation
+            .header(Priority::Immediate, b"record/n-way".to_vec(), 0, true, 1)
+            .expect("tombstone header");
+        let third_sealed = services
+            .reader
+            .seal_record(&third_header, b"")
+            .expect("seal tombstone")
+            .bytes;
+        let (third, opened) = content_record(&mut services.first, &third_sealed);
+        assert!(opened.is_empty());
+
+        for (reservation, record, sealed) in [
+            (&first_reservation, &first, first_sealed.as_slice()),
+            (&second_reservation, &second, second_sealed.as_slice()),
+            (&third_reservation, &third, third_sealed.as_slice()),
+        ] {
+            first_store
+                .commit_reserved_record_with_policy(&policy, reservation, record, sealed)
+                .expect("first arrival order");
+        }
+        for (reservation, record, sealed) in [
+            (&third_reservation, &third, third_sealed.as_slice()),
+            (&first_reservation, &first, first_sealed.as_slice()),
+            (&second_reservation, &second, second_sealed.as_slice()),
+        ] {
+            second_store
+                .commit_reserved_record_with_policy(&policy, reservation, record, sealed)
+                .expect("second arrival order");
+        }
+        let first_plan = first_store
+            .prepare_record_projection_with_policy(
+                &policy,
+                &state_topic(),
+                &state_scope(),
+                b"record/n-way",
+            )
+            .expect("first projection");
+        let second_plan = second_store
+            .prepare_record_projection_with_policy(
+                &policy,
+                &state_topic(),
+                &state_scope(),
+                b"record/n-way",
+            )
+            .expect("second projection");
+        let roles = |plan: &RecordProjectionPlan| {
+            plan.candidates()
+                .iter()
+                .map(|candidate| (candidate.record().semantic_id, candidate.disposition()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(roles(&first_plan), roles(&second_plan));
+        assert_eq!(first_plan.heads().count(), 3);
+        assert_eq!(
+            first_plan
+                .current()
+                .expect("deterministic current")
+                .record()
+                .semantic_id,
+            [first.item_id(), second.item_id(), third.item_id()]
+                .into_iter()
+                .map(RecordSemanticId::new)
+                .max()
+                .expect("maximum ID")
+        );
+        let tombstone = first_plan
+            .candidates()
+            .iter()
+            .find(|candidate| candidate.record().header.tombstone)
+            .expect("retained tombstone");
+        assert!(matches!(
+            tombstone.disposition(),
+            Some(RecordVersionDisposition::Current | RecordVersionDisposition::Concurrent)
+        ));
+        assert_eq!(
+            first_plan
+                .candidates()
+                .iter()
+                .filter(|candidate| candidate.record().header.tombstone)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn record_conflicts_require_explicit_stale_guard_and_resolution_intent_binds_heads() {
+        let file = TestFile::new("Record explicit resolution");
+        let mut services = state_services(0xc3);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("Record store");
+        let policy = store.control_policy_snapshot().expect("policy");
+        let first_reservation = store
+            .reserve_record_with_policy(
+                &policy,
+                services.first.identity(),
+                &state_topic(),
+                &state_scope(),
+            )
+            .expect("first reservation");
+        let second_reservation = store
+            .reserve_record_with_policy(
+                &policy,
+                services.second.identity(),
+                &state_topic(),
+                &state_scope(),
+            )
+            .expect("second reservation");
+        let (first, first_sealed, _) = reserved_record(
+            &mut services.first,
+            &mut services.reader,
+            &first_reservation,
+            b"record/conflict",
+            b"left",
+            false,
+            1,
+        );
+        let (second, second_sealed, _) = reserved_record(
+            &mut services.second,
+            &mut services.reader,
+            &second_reservation,
+            b"record/conflict",
+            b"right",
+            false,
+            1,
+        );
+        store
+            .commit_reserved_record_with_policy(&policy, &first_reservation, &first, &first_sealed)
+            .expect("commit left");
+        store
+            .commit_reserved_record_with_policy(
+                &policy,
+                &second_reservation,
+                &second,
+                &second_sealed,
+            )
+            .expect("commit right");
+        let conflict = store
+            .prepare_record_projection_with_policy(
+                &policy,
+                &state_topic(),
+                &state_scope(),
+                b"record/conflict",
+            )
+            .expect("conflict plan");
+        assert_eq!(conflict.heads().count(), 2);
+
+        let resolution_operation =
+            RecordOperationKey::new(b"record/resolve/1".to_vec()).expect("resolution key");
+        let resolution_reservation = store
+            .reserve_record_with_policy(
+                &policy,
+                services.reader.identity(),
+                &state_topic(),
+                &state_scope(),
+            )
+            .expect("resolution reservation");
+        let resolution_header = resolution_reservation
+            .header(
+                Priority::Immediate,
+                b"record/conflict".to_vec(),
+                6,
+                false,
+                1,
+            )
+            .expect("resolution header");
+        let resolution_intent = RecordPublicationIntent::new(
+            services.reader.identity(),
+            state_topic(),
+            state_scope(),
+            Priority::Immediate,
+            b"record/conflict".to_vec(),
+            b"merged",
+            false,
+        )
+        .expect("resolution intent");
+        let resolution_sealed = services
+            .reader
+            .seal_record(&resolution_header, b"merged")
+            .expect("seal resolution")
+            .bytes;
+        let (resolution_record, opened) = content_record(&mut services.first, &resolution_sealed);
+        assert_eq!(opened, b"merged");
+        let publication =
+            RecordOperationRequest::new(&resolution_operation, &resolution_intent, b"merged")
+                .expect("resolution publication");
+
+        let before = store.record_stats().expect("stats before implicit merge");
+        assert!(matches!(
+            store.commit_reserved_record_once_with_policy(
+                &policy,
+                &publication,
+                &resolution_reservation,
+                &resolution_record,
+                &resolution_sealed,
+            ),
+            Err(StoreError::RecordConflictRequiresResolution)
+        ));
+        assert_eq!(store.record_stats().expect("rollback stats"), before);
+
+        // Reserve a branch before resolution so it can become a later sibling
+        // without implicitly observing the successful resolution revision.
+        let later_branch_reservation = store
+            .reserve_record_with_policy(
+                &policy,
+                services.first.identity(),
+                &state_topic(),
+                &state_scope(),
+            )
+            .expect("pre-resolution branch reservation");
+        let (later_branch, later_branch_sealed, _) = reserved_record(
+            &mut services.first,
+            &mut services.second,
+            &later_branch_reservation,
+            b"record/conflict",
+            b"later",
+            false,
+            1,
+        );
+        let resolution =
+            RecordResolutionRequest::new(&publication, &conflict).expect("resolution request");
+        let resolved = store
+            .commit_reserved_record_resolution_once_with_policy(
+                &policy,
+                &resolution,
+                &resolution_reservation,
+                &resolution_record,
+                &resolution_sealed,
+            )
+            .expect("explicit resolution");
+        assert!(matches!(resolved, RecordOnceOutcome::Inserted { .. }));
+        store
+            .commit_reserved_record_with_policy(
+                &policy,
+                &later_branch_reservation,
+                &later_branch,
+                &later_branch_sealed,
+            )
+            .expect("later concurrent branch");
+        let later_conflict = store
+            .prepare_record_projection_with_policy(
+                &policy,
+                &state_topic(),
+                &state_scope(),
+                b"record/conflict",
+            )
+            .expect("later conflict");
+        assert_eq!(later_conflict.heads().count(), 2);
+
+        let retry_reservation = store
+            .reserve_record_with_policy(
+                &policy,
+                services.reader.identity(),
+                &state_topic(),
+                &state_scope(),
+            )
+            .expect("retry reservation");
+        let (retry_record, retry_sealed, retry_intent) = reserved_record(
+            &mut services.reader,
+            &mut services.second,
+            &retry_reservation,
+            b"record/conflict",
+            b"merged",
+            false,
+            1,
+        );
+        let retry_publication =
+            RecordOperationRequest::new(&resolution_operation, &retry_intent, b"merged")
+                .expect("retry publication");
+        let stale_operation =
+            RecordOperationKey::new(b"record/resolve/stale".to_vec()).expect("stale key");
+        let stale_publication =
+            RecordOperationRequest::new(&stale_operation, &retry_intent, b"merged")
+                .expect("stale publication");
+        let stale_resolution = RecordResolutionRequest::new(&stale_publication, &conflict)
+            .expect("stale resolution guard");
+        let stable = store.record_stats().expect("stable stats");
+        assert!(matches!(
+            store.commit_reserved_record_resolution_once_with_policy(
+                &policy,
+                &stale_resolution,
+                &retry_reservation,
+                &retry_record,
+                &retry_sealed,
+            ),
+            Err(StoreError::RecordProjectionPlanChanged)
+        ));
+        assert_eq!(
+            store
+                .record_for_operation(&stale_operation)
+                .expect("stale operation lookup"),
+            None
+        );
+        assert_eq!(store.record_stats().expect("stale rollback"), stable);
+        let different_guard = RecordResolutionRequest::new(&retry_publication, &later_conflict)
+            .expect("different resolution guard");
+        assert!(matches!(
+            store.commit_reserved_record_resolution_once_with_policy(
+                &policy,
+                &different_guard,
+                &retry_reservation,
+                &retry_record,
+                &retry_sealed,
+            ),
+            Err(StoreError::RecordOperationConflict)
+        ));
+        assert_eq!(store.record_stats().expect("conflict rollback"), stable);
+        let original_guard = RecordResolutionRequest::new(&retry_publication, &conflict)
+            .expect("original guard retry");
+        let existing = store
+            .commit_reserved_record_resolution_once_with_policy(
+                &policy,
+                &original_guard,
+                &retry_reservation,
+                &retry_record,
+                &retry_sealed,
+            )
+            .expect("original exact guard retry");
+        assert!(matches!(existing, RecordOnceOutcome::Existing { .. }));
+        assert_eq!(existing.record(), resolved.record());
+
+        // An authorized exact retry may reseal at the current epoch while the
+        // durable result remains the original immutable revision. Current epoch
+        // is enforced before operation lookup; the old plan is used only to
+        // reproduce the same plan-bound operation digest.
+        let write = store.database.begin_write().expect("synthetic rekey write");
+        write
+            .open_table(CONTROL_SCOPE_EPOCHS)
+            .expect("scope epochs")
+            .insert(
+                state_scope().as_str(),
+                encode_scope_epoch_index(2, ControlTransferId::new([0xd2; 32])).as_slice(),
+            )
+            .expect("activate synthetic epoch");
+        write.commit().expect("commit synthetic epoch");
+        let rekey_reservation = store
+            .reserve_record_with_policy(
+                &policy,
+                services.reader.identity(),
+                &state_topic(),
+                &state_scope(),
+            )
+            .expect("post-rekey retry reservation");
+        let (rekey_record, rekey_sealed, rekey_intent) = reserved_record(
+            &mut services.reader,
+            &mut services.second,
+            &rekey_reservation,
+            b"record/conflict",
+            b"merged",
+            false,
+            2,
+        );
+        let rekey_publication =
+            RecordOperationRequest::new(&resolution_operation, &rekey_intent, b"merged")
+                .expect("post-rekey publication");
+        let rekey_resolution = RecordResolutionRequest::new(&rekey_publication, &conflict)
+            .expect("post-rekey exact guard");
+        let rekey_existing = store
+            .commit_reserved_record_resolution_once_with_policy(
+                &policy,
+                &rekey_resolution,
+                &rekey_reservation,
+                &rekey_record,
+                &rekey_sealed,
+            )
+            .expect("authorized post-rekey exact retry");
+        assert!(matches!(rekey_existing, RecordOnceOutcome::Existing { .. }));
+        assert_eq!(rekey_existing.record(), resolved.record());
+    }
+
+    #[test]
+    fn record_aggregate_and_dedicated_operation_caps_roll_back_atomically() {
+        let file = TestFile::new("Record quota rollback");
+        let mut services = state_services(0xc4);
+        let store = Store::open_with_limits_for_mission(
+            &file.0,
+            StoreLimits::new(1, DEFAULT_MAX_TOTAL_PAYLOAD_BYTES).expect("limits"),
+            services.authority,
+        )
+        .expect("limited Record store");
+        let policy = store.control_policy_snapshot().expect("policy");
+        let reservation = store
+            .reserve_record_with_policy(
+                &policy,
+                services.first.identity(),
+                &state_topic(),
+                &state_scope(),
+            )
+            .expect("reservation");
+        let (record, sealed, intent) = reserved_record(
+            &mut services.first,
+            &mut services.reader,
+            &reservation,
+            b"record/quota",
+            b"value",
+            false,
+            1,
+        );
+        let operation = RecordOperationKey::new(b"record/quota/op".to_vec()).expect("operation");
+        let request = RecordOperationRequest::new(&operation, &intent, b"value").expect("request");
+        assert!(matches!(
+            store.commit_reserved_record_once_with_policy(
+                &policy,
+                &request,
+                &reservation,
+                &record,
+                &sealed,
+            ),
+            Err(StoreError::ItemLimitExceeded { .. })
+        ));
+        assert_eq!(
+            store.record_stats().expect("rolled-back stats"),
+            RecordStoreStats::default()
+        );
+        store
+            .commit_reserved_record_with_policy(&policy, &reservation, &record, &sealed)
+            .expect("record alone fits quota");
+
+        let write = store
+            .database
+            .begin_write()
+            .expect("dedicated cap transaction");
+        write
+            .open_table(METADATA)
+            .expect("metadata")
+            .insert(RECORD_OPERATION_COUNT, MAX_RECORD_OPERATIONS)
+            .expect("set operation cap");
+        let cap_operation = RecordOperationKey::new(b"record/cap".to_vec()).expect("cap key");
+        assert!(matches!(
+            admit_record_operation(&write, store.limits, &cap_operation, 65),
+            Err(StoreError::RecordOperationLimitExceeded {
+                current: MAX_RECORD_OPERATIONS,
+                limit: MAX_RECORD_OPERATIONS
+            })
+        ));
+        drop(write);
+        assert_eq!(store.record_stats().expect("cap rollback").operations, 0);
+    }
+
+    #[test]
+    fn concurrent_record_tombstone_and_edit_cover_both_semantic_id_directions() {
+        for (seed, edit_should_be_greater) in [(0xc6, true), (0xc7, false)] {
+            let file = TestFile::new("Record tombstone ID direction");
+            let mut services = state_services(seed);
+            let store = Store::open_for_mission(&file.0, services.authority).expect("Record store");
+            let policy = store.control_policy_snapshot().expect("policy");
+            let tombstone_reservation = store
+                .reserve_record_with_policy(
+                    &policy,
+                    services.first.identity(),
+                    &state_topic(),
+                    &state_scope(),
+                )
+                .expect("tombstone reservation");
+            let edit_reservation = store
+                .reserve_record_with_policy(
+                    &policy,
+                    services.second.identity(),
+                    &state_topic(),
+                    &state_scope(),
+                )
+                .expect("edit reservation");
+            let tombstone_header = tombstone_reservation
+                .header(
+                    Priority::Immediate,
+                    b"record/tombstone-order".to_vec(),
+                    0,
+                    true,
+                    1,
+                )
+                .expect("tombstone header");
+            let tombstone_sealed = services
+                .first
+                .seal_record(&tombstone_header, b"")
+                .expect("seal tombstone")
+                .bytes;
+            let (tombstone, opened) = content_record(&mut services.reader, &tombstone_sealed);
+            assert!(opened.is_empty());
+            let tombstone_id = RecordSemanticId::new(tombstone.item_id());
+
+            let (edit, edit_sealed) = (0..4096u32)
+                .find_map(|index| {
+                    let payload = format!("edit-{index}").into_bytes();
+                    let header = edit_reservation
+                        .header(
+                            Priority::Immediate,
+                            b"record/tombstone-order".to_vec(),
+                            payload.len() as u64,
+                            false,
+                            1,
+                        )
+                        .expect("edit header");
+                    let sealed = services
+                        .second
+                        .seal_record(&header, &payload)
+                        .expect("seal edit")
+                        .bytes;
+                    let (record, opened) = content_record(&mut services.reader, &sealed);
+                    assert_eq!(opened, payload);
+                    let edit_id = RecordSemanticId::new(record.item_id());
+                    ((edit_id > tombstone_id) == edit_should_be_greater).then_some((record, sealed))
+                })
+                .expect("find requested semantic-ID direction");
+            let edit_id = RecordSemanticId::new(edit.item_id());
+            assert_eq!(edit_id > tombstone_id, edit_should_be_greater);
+            store
+                .commit_reserved_record_with_policy(
+                    &policy,
+                    &tombstone_reservation,
+                    &tombstone,
+                    &tombstone_sealed,
+                )
+                .expect("commit tombstone");
+            store
+                .commit_reserved_record_with_policy(&policy, &edit_reservation, &edit, &edit_sealed)
+                .expect("commit edit");
+            let plan = store
+                .prepare_record_projection_with_policy(
+                    &policy,
+                    &state_topic(),
+                    &state_scope(),
+                    b"record/tombstone-order",
+                )
+                .expect("projection");
+            assert_eq!(plan.heads().count(), 2);
+            let tombstone_role = plan
+                .candidates()
+                .iter()
+                .find(|candidate| candidate.record().semantic_id == tombstone_id)
+                .expect("tombstone candidate")
+                .disposition();
+            let edit_role = plan
+                .candidates()
+                .iter()
+                .find(|candidate| candidate.record().semantic_id == edit_id)
+                .expect("edit candidate")
+                .disposition();
+            if edit_should_be_greater {
+                assert_eq!(edit_role, Some(RecordVersionDisposition::Current));
+                assert_eq!(tombstone_role, Some(RecordVersionDisposition::Concurrent));
+            } else {
+                assert_eq!(tombstone_role, Some(RecordVersionDisposition::Current));
+                assert_eq!(edit_role, Some(RecordVersionDisposition::Concurrent));
+            }
+        }
+    }
+
+    #[test]
+    fn event_state_and_record_share_dot_high_water_and_frontier_but_not_markers_or_inventory() {
+        let file = TestFile::new("Event State Record shared ledgers");
+        let mut services = state_services(0xc8);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("shared store");
+        let policy = store.control_policy_snapshot().expect("policy");
+        let publisher = services.first.identity();
+
+        let record_reservation = store
+            .reserve_record_with_policy(&policy, publisher, &state_topic(), &state_scope())
+            .expect("first Record reservation");
+        assert_eq!(record_reservation.counter(), 1);
+        let (record, record_sealed, _) = reserved_record(
+            &mut services.first,
+            &mut services.reader,
+            &record_reservation,
+            b"cross/record",
+            b"record",
+            false,
+            1,
+        );
+        store
+            .commit_reserved_record_with_policy(
+                &policy,
+                &record_reservation,
+                &record,
+                &record_sealed,
+            )
+            .expect("commit Record");
+
+        let state_reservation = store
+            .reserve_state_with_policy(&policy, publisher, &state_topic(), &state_scope())
+            .expect("State reservation");
+        assert_eq!(state_reservation.counter(), 2);
+        assert!(
+            state_reservation
+                .context()
+                .observes(record.header().stamp.dot)
+        );
+        let (state, state_sealed, _) = reserved_state(
+            &mut services.first,
+            &mut services.reader,
+            &state_reservation,
+            b"cross/state",
+            b"state",
+            false,
+            1,
+        );
+        store
+            .commit_reserved_state_with_policy(&policy, &state_reservation, &state, &state_sealed)
+            .expect("commit State");
+
+        let event_reservation = store
+            .reserve_event_with_policy(&policy, publisher, &state_topic(), &state_scope())
+            .expect("Event reservation");
+        assert_eq!(event_reservation.counter(), 3);
+        assert_eq!(event_reservation.event_sequence(), 1);
+        assert!(
+            event_reservation
+                .context()
+                .observes(state.header().stamp.dot)
+        );
+        let event_header = event_reservation
+            .header(
+                Priority::Immediate,
+                b"cross/event".to_vec(),
+                None,
+                5,
+                false,
+                1,
+            )
+            .expect("Event header");
+        let event_sealed = services
+            .first
+            .seal_event(&event_header, b"event")
+            .expect("seal Event")
+            .bytes;
+        let event = content_event(&mut services.reader, &event_sealed);
+        store
+            .commit_reserved_event_with_policy(&policy, &event_reservation, &event, &event_sealed)
+            .expect("commit Event");
+
+        let next = store
+            .reserve_record_with_policy(&policy, publisher, &state_topic(), &state_scope())
+            .expect("next Record reservation");
+        assert_eq!(next.counter(), 4);
+        assert!(next.context().observes(event.header().stamp.dot));
+        assert_eq!(store.record_stats().expect("Record stats").records, 1);
+        assert_eq!(store.state_stats().expect("State stats").states, 1);
+        assert_eq!(store.event_stats().expect("Event stats").events, 1);
+        let inventory = store.event_inventory().expect("Event-only inventory");
+        assert_eq!(inventory.len(), 1);
+        assert_eq!(
+            inventory.iter().copied().collect::<Vec<_>>(),
+            vec![EventTransferId::new(event.envelope_id())]
+        );
+        drop(store);
+        let inspection = Store::inspect_existing(&file.0).expect("shared strict inspection");
+        assert_eq!(inspection.record_stats.records, 1);
+        assert_eq!(inspection.state_stats.states, 1);
+        assert_eq!(inspection.event_stats.events, 1);
+    }
+
+    #[test]
+    fn record_schema_migrates_only_whole_absent_and_corruption_fails_reopen_and_inspection() {
+        let migrated = TestFile::new("Record whole absent migration");
+        let authority = state_services(0xc5).authority;
+        let store = Store::open_for_mission(&migrated.0, authority).expect("create schema");
+        drop(store);
+        let database = Database::open(&migrated.0).expect("raw migration database");
+        let write = database.begin_write().expect("raw delete transaction");
+        write.delete_table(RECORDS).expect("delete Record metadata");
+        write
+            .delete_table(RECORD_BYTES)
+            .expect("delete Record bytes");
+        write
+            .delete_table(RECORD_ACCEPTANCE_MARKERS)
+            .expect("delete Record markers");
+        write
+            .delete_table(RECORD_SEMANTIC_ITEMS)
+            .expect("delete Record semantic index");
+        write
+            .delete_table(RECORD_GROUP_VERSIONS)
+            .expect("delete Record groups");
+        write
+            .delete_table(RECORD_OPERATIONS)
+            .expect("delete Record operations");
+        {
+            let mut metadata = write.open_table(METADATA).expect("metadata");
+            for field in [
+                RECORD_ITEM_COUNT,
+                RECORD_TOTAL_BYTES,
+                LAST_RECORD_ACCEPTANCE_MARKER,
+                RECORD_OPERATION_COUNT,
+                RECORD_OPERATION_TOTAL_BYTES,
+            ] {
+                metadata.remove(field).expect("remove Record counter");
+            }
+        }
+        write.commit().expect("commit whole-absent fixture");
+        drop(database);
+        assert_eq!(
+            Store::inspect_existing(&migrated.0)
+                .expect("legacy inspection")
+                .record_stats,
+            RecordStoreStats::default()
+        );
+        let store = Store::open_for_mission(&migrated.0, authority).expect("atomic migration");
+        assert_eq!(
+            store.record_stats().expect("migrated stats"),
+            RecordStoreStats::default()
+        );
+        drop(store);
+
+        let partial = TestFile::new("Record partial schema");
+        let store = Store::open_for_mission(&partial.0, authority).expect("partial base");
+        drop(store);
+        let database = Database::open(&partial.0).expect("raw partial database");
+        let write = database.begin_write().expect("raw partial transaction");
+        write
+            .delete_table(RECORD_OPERATIONS)
+            .expect("delete one Record table");
+        write.commit().expect("commit partial fixture");
+        drop(database);
+        assert!(matches!(
+            Store::inspect_existing(&partial.0),
+            Err(StoreError::RecordInvariant(
+                "mission-scoped Record schema group is incomplete"
+            ))
+        ));
+        assert!(matches!(
+            Store::open_for_mission(&partial.0, authority),
+            Err(StoreError::RecordInvariant(
+                "mission-scoped Record schema group is incomplete"
+            ))
+        ));
+        let database = Database::open(&partial.0).expect("verify no repair");
+        assert!(
+            !database
+                .begin_read()
+                .expect("read")
+                .list_tables()
+                .expect("tables")
+                .any(|table| table.name() == RECORD_OPERATIONS.name())
+        );
+
+        let wrong_kind = TestFile::new("Record wrong-kind schema");
+        let store = Store::open_for_mission(&wrong_kind.0, authority).expect("wrong-kind base");
+        drop(store);
+        let database = Database::open(&wrong_kind.0).expect("raw wrong-kind database");
+        let write = database.begin_write().expect("raw wrong-kind transaction");
+        write
+            .delete_table(RECORD_OPERATIONS)
+            .expect("delete normal Record operation table");
+        let definition =
+            redb::MultimapTableDefinition::<&[u8], &[u8]>::new("aster.record-operations.v1");
+        write
+            .open_multimap_table(definition)
+            .expect("wrong-kind Record operation table")
+            .insert(b"operation".as_slice(), b"record".as_slice())
+            .expect("wrong-kind Record operation row");
+        write.commit().expect("commit wrong-kind Record schema");
+        drop(database);
+        for result in [
+            Store::inspect_existing(&wrong_kind.0).map(|_| ()),
+            Store::open_for_mission(&wrong_kind.0, authority).map(|_| ()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(StoreError::RecordInvariant(
+                    "mission-scoped Record schema has the wrong table kind"
+                ))
+            ));
+        }
     }
 }

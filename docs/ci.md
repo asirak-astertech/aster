@@ -124,6 +124,57 @@ This is current-code automated loopback evidence only: no retained PR-C
 execution root or log artifact, physical system, independent implementation,
 or release artifact is claimed.
 
+The later stopped/local State and Record gates are additive to that Event
+surface and do not change its wire. Record validation covers the typed
+source-envelope seam, bounded mission-bound tables and operation ledger,
+shared Event/State/Record causal high-water, independent conflict-reducer
+recomputation, explicit exact-sibling resolution guards, and the public stopped
+facade/example. Representative focused commands are:
+
+```sh
+cargo test --locked -p aster-core source_record
+cargo test --locked -p aster-redb-store record
+cargo test --locked -p aster-node application::record::tests
+cargo run --locked -p aster-node --example record_application -- \
+  STATE_DIR MISSION_BUNDLE
+```
+
+The exact focused Record suites passed on both the pinned current toolchain and
+Rust 1.91.0: core 7/7, selected store 7/7, and selected-node 8/8. The node tests
+cover independently authenticated N-way heads, ordinary-publish conflict bypass
+rejection, stale and changed guards without mutation, exact restart/rekey retry,
+visible tombstones without delete-wins, post-rekey inactive-row verification,
+valid metadata tamper with unchanged sealed bytes, sanitized errors, and writer
+exclusion. Store tests additionally cover arrival independence, both complete-
+ID directions, shared causal ledgers with disjoint class indexes, collision,
+quota, schema/reopen, and terminal-state invariants. No test invokes a
+registered application merge policy during ingest.
+
+The final frozen-tree matrix passed 539 of 539 on each toolchain. The current
+run comprised core 349/349 (44.44s), node library 81/81 (5.19s), node binary
+6/6 (0.00s), `mesh_cli` 13/13 (135.87s), and selected store 90/90 (8.75s).
+The separate Rust 1.91.0 run comprised the same counts in 45.77, 5.42, 0.01,
+135.76, and 8.61 seconds respectively. Each run also had five zero-test targets;
+their test-harness sums were 194.25 and 195.57 seconds. The executions and
+timings are not pooled.
+
+Strict all-target/all-feature Clippy with warnings denied passed on the current
+and Rust 1.91 toolchains in 10.32 and 10.30 seconds. Formatting passed on both
+in 0.73 and 0.85 seconds, and `git diff --check` passed in 0.03 seconds. The
+complete dual-toolchain validation used 463.76 seconds wall time. After a
+27.21-second disposable two-node fixture, the compiled Record example returned
+`moving`, counter 3, one superseded revision, no concurrent head, no conflict,
+and both insert flags true in 1.26 seconds; an exact 0.84-second rerun returned
+the same semantic ID and projection with both insert flags false.
+
+The exact Record source/dependency hashes are pinned in the
+[requirements evidence](implementation/requirements-status.md#current-selected-record-automated-evidence).
+This is stopped/local automated evidence, not a Record contact, disconnected-
+process acceptance result, retained execution receipt, or release artifact.
+Record has no live handle or reconciliation frames; automatic registered-policy
+merge, finite TTL, expiry/garbage collection, selected-node bindings, physical
+systems, mixed implementations, and scale remain open.
+
 The 57th test in that parent redb-store receipt is a Unix writable-open
 durability adversary. Every new or existing writer, including a terminal
 cleanup handle, must synchronize
@@ -253,9 +304,10 @@ on every eligible line edge and the expected failure on captured-node edges.
 They remain bounded to Event, one control family/scope, and loopback. The
 current code additionally has durable Event Consume/Carry selectors, live and
 stopped-state poll/ack, idempotent unsubscribe, verified gap inspection,
-bounded last-contact status, and protected receiver-directed filtering; it
-does not turn the retained parent roots into PR-B or PR-C receipts. The tests
-do not claim State/Record/Blob, global convergence, generalized control
+bounded last-contact status, protected receiver-directed filtering, and
+separate stopped/local State and Record projections; it does not turn the
+retained parent roots into PR-B, PR-C, State, or Record receipts. The tests do
+not claim networked State/Record, Blob, global convergence, generalized control
 administration, finite-TTL custody, protected provisioning, platform-complete
 zeroization assurance, admitted release cryptography, independent review, or
 physical-network acceptance.

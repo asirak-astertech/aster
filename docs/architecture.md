@@ -1,7 +1,7 @@
 # Selected production-lane architecture
 
-This page depicts the bounded control/Event composition and local State
-projection that execute today.
+This page depicts the bounded control/Event composition and local State and
+Record projections that execute today.
 It is intentionally narrower than Aster's complete protocol and semantic
 reference implementation. The live selected Event API provides publish,
 bounded query, durable subscribe/poll/ack, idempotent unsubscribe, authenticated
@@ -9,7 +9,10 @@ gap inspection, and bounded peer/last-contact status through the running node's
 sole actor. The stopped Event handle provides the same data operations when no
 runtime owns the store. An exclusive stopped `SelectedStateNode` additionally
 provides source-authenticated State publication and exact-key causal projection.
-State has no live handle or reconciliation frames in this slice. Record, Blob,
+An exclusive stopped `SelectedRecordNode` preserves and annotates exact-key
+causal heads and accepts explicit application-reviewed resolution only through
+an exact sibling guard. State and Record have no live handles or reconciliation
+frames in this slice. Automatic registered-policy Record merge, Blob,
 atomic subscription update, finite-TTL custody, protected operational
 provisioning, additional carriers, generalized control administration, and
 release authorization remain outside this selected lane.
@@ -24,6 +27,7 @@ flowchart LR
     LiveHandle["SelectedEventHandle<br/>publish · query · subscribe · poll · ack<br/>unsubscribe · gaps · status"]
     StoppedEvent["Stopped SelectedEventNode<br/>same Event data operations<br/>without live status"]
     StoppedState["Stopped SelectedStateNode<br/>publish · exact-key query<br/>current + recoverable"]
+    StoppedRecord["Stopped SelectedRecordNode<br/>publish · exact-key query · guarded resolve<br/>current + concurrent + superseded"]
     BuiltIns["Built-in roles<br/>Ping · Pong · relay"]
     Artifacts["Retained mission bundle<br/>and carrier identity"]
 
@@ -33,7 +37,7 @@ flowchart LR
         Session["aster-core mission session<br/>four-flight hybrid authentication"]
         Profile["aster-profile<br/>canonical exact-ID ordering"]
         Diff["aster-negentropy<br/>set difference only"]
-        Store["aster-redb-store<br/>durable acceptance/effect authority<br/>Event delivery + local State projection"]
+        Store["aster-redb-store<br/>durable acceptance/effect authority<br/>Event delivery + local State/Record projection"]
         Carrier["aster-iroh<br/>direct authenticated carrier"]
     end
 
@@ -42,6 +46,7 @@ flowchart LR
     Application -->|"live Event mode"| LiveHandle -->|"bounded commands"| Node
     Application -->|"stopped Event mode"| StoppedEvent
     Application -->|"stopped State mode"| StoppedState
+    Application -->|"stopped Record mode"| StoppedRecord
     Node -->|"sanitized results"| LiveHandle
     BuiltIns -. "run inside actor" .-> Node
     StoppedEvent -->|"exclusive stopped-node Event operations"| Store
@@ -50,6 +55,9 @@ flowchart LR
     StoppedState -->|"exclusive stopped-node State operations"| Store
     Store -->|"bounded State projection plan"| StoppedState
     StoppedState -->|"fresh State source/content verification"| Core
+    StoppedRecord -->|"exclusive stopped-node Record operations"| Store
+    Store -->|"bounded Record projection plan"| StoppedRecord
+    StoppedRecord -->|"fresh Record source/content verification"| Core
     Authority -->|"control input"| Node
     Node -->|"uses control/source providers"| Core
     Node -->|"uses canonical ordering"| Profile
@@ -65,11 +73,11 @@ carrier endpoint and provides bounded direct exchange. The mission `NodeId` is
 independent from the Iroh `EndpointId`. `aster-negentropy` computes exact-ID set
 difference; it does not transfer objects, establish causality, or make policy.
 `aster-redb-store` is the selected durable authority for accepted Events and
-local State versions, their shared publisher causal frontier, ordered control
+local State and Record versions, their shared publisher causal frontier, ordered control
 effects, policy/selector snapshots, at-least-once Event delivery, route-only
-Event representations, and the terminal zeroization marker. State operation
-rows have dedicated count/byte ceilings and also participate in aggregate store
-quotas; no unbounded idempotency table is implied.
+Event representations, and the terminal zeroization marker. State and Record
+operation rows have separate dedicated count/byte ceilings and also participate
+in aggregate store quotas; no unbounded idempotency table is implied.
 
 The live handle does not open a second store. It sends commands over a bounded
 channel to the actor that already owns the mission-bound writer. Commands that
@@ -136,6 +144,59 @@ returned visibly as authenticated State with an empty payload. There is no
 delete-wins rule, and deletion is not collapsed into an unauthenticated
 `None`. Expiry, garbage collection, State subscriptions, live State commands,
 and State transfer remain unimplemented.
+
+## Local Record conflict projection and guarded resolution
+
+The selected Record facade uses the same mission, control policy,
+source-envelope provider, writer lock, and causal ledger as Event and State.
+Its tables, markers, exact/semantic indexes, and operation ledger remain
+class-disjoint, while a Record publisher cannot reuse a causal dot already used
+by either other class. Record storage is additive and does not alter the
+Event-only frame grammar or reconciliation lanes.
+
+For one exact topic/scope/logical key, every active causal maximum is a head.
+The greatest complete semantic Record ID is marked `Current`; every other head
+is returned as `Concurrent`; causally dominated active revisions are optionally
+returned as `Superseded`. That deterministic current marker is a stable
+projection, not a silent merge or discard.
+
+```mermaid
+flowchart LR
+    Q["Exact-key query"] --> P["redb bounded structural plan<br/>all retained candidates"]
+    P --> V["SelectedRecordNode<br/>fresh source/content verification<br/>independent causal recomputation"]
+    V --> H{"Active heads"}
+    H -->|one| C["Current<br/>optional superseded history"]
+    H -->|two or more| F["Current + Concurrent<br/>explicit sorted siblings<br/>opaque exact guard"]
+    F --> A["Application inspects siblings<br/>and computes reviewed payload"]
+    A --> R["resolve(operation key, guard, payload)"]
+    R --> G{"Exact plan still current<br/>and successor observes every head?"}
+    G -->|yes| S["Atomic guard-bound successor<br/>original heads become superseded"]
+    G -->|no| X["Conflict; no bytes inserted"]
+```
+
+Ordinary `publish` fails when its causal reservation observes two or more
+existing heads, so it cannot bypass the explicit resolution path. The guard
+binds the complete sorted sibling set and the policy-bound projection. The
+durable operation digest binds the publication intent and sorted guarded head
+identities: an exact retry returns the original commit, while the same operation
+key with another head set fails.
+The store requires a new resolution successor to observe every guarded head and
+atomically rejects a stale guard if the projection advanced.
+
+On query and resolution the store's rows and plan are privileged structural
+inputs, not capabilities. The facade freshly verifies every retained active or
+inactive candidate, recomputes heads and dispositions, and rechecks the exact
+plan before exposure or commit. Inactive revoked or old-epoch rows are not
+returned to the application. A current Record tombstone remains visible with an
+empty payload; a concurrent tombstone has no delete-wins priority.
+
+Registered merge policies are never run automatically by this selected slice.
+Record has no live handle, subscription, inventory, Fetch/Offer frame, relay
+cache, or network ingestion path. The local tests exercise independently
+source-authenticated publishers, N-way heads, stale guards, restart/rekey retry,
+and arrival/ID-order independence, but they are not disconnected-node or
+cross-process acceptance. Finite TTL, expiry, garbage collection, and
+retention-driven deletion remain unimplemented.
 
 ## Live application command and status flow
 
@@ -242,9 +303,10 @@ are rechecked at inventory, transfer, and commit boundaries.
 | Control | Ordered authority/delegation chain and policy effect | Event source identity or plaintext access |
 | Event source | Publisher and protected semantic header | Permission for every peer to route or read it |
 | State source | Publisher, causal stamp, exact key, protected semantic header, and payload commitment | Live replication, permission for every peer, or a special delete-wins rule |
+| Record source | Publisher, causal stamp, exact key, protected semantic header, and payload commitment | Live replication, automatic merge execution, permission for every peer, or delete-wins |
 | Receive selector | Membership-visible topic/scope intent inside the protected mission session; empty means receive-none | Route or content authority, Event-ID disclosure, or scope-private subscription metadata |
 | Route policy | Whether an exact representation may be advertised/carried | Content decryption or semantic admission |
-| Content policy | Whether protected bytes may become a semantic Event | Authority to alter source identity or control state |
+| Content policy | Whether protected bytes may become a semantic application item | Authority to alter source identity or control state |
 
 ## Bounded terminal zeroization
 
@@ -274,6 +336,8 @@ and non-Unix behavior are outside the proof.
   durable delivery, gaps, unsubscribe, and bounded status.
 - [Selected State API](quickstart/selected-state-api.md) — stopped/local
   latest-value projection, recoverable history, and visible tombstones.
+- [Selected Record API](quickstart/selected-record-api.md) — stopped/local
+  explicit conflict projection and exact-sibling guarded resolution.
 - [Carriers and contacts](transports.md) — selected and migration-source carrier boundaries.
 - [Mesh CLI guide](quickstart/mesh-cli.md) — phase-by-phase and retained receipts.
 - [Requirements status](implementation/requirements-status.md) — exact credited rows and open gaps.

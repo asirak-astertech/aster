@@ -140,7 +140,7 @@ does not claim reachability, publisher completeness, or global convergence.
 
 These Event slices do not replace the broader proven semantic `ApplicationNode`
 or complete the accepted boundary. They have no atomic subscription update,
-live State, Record, Blob, selected-node bindings, protected operational
+live State/Record, Blob, selected-node bindings, protected operational
 provisioning, or generalized control administration. Finite TTL is absent and
 therefore cannot be requested until authenticated cumulative forwarding age and
 expiry exist.
@@ -182,6 +182,56 @@ class cannot reuse an Event dot. The State tables and operation ledger have
 dedicated count/byte bounds and participate in aggregate store quotas. None of
 this changes the Event frame grammar or reconciliation lanes. Live State,
 network replication, subscriptions, TTL, expiry, garbage collection, selected-
-node bindings, Record, Blob, independent interoperability, and acceptance
+node bindings, live or replicated Record, Blob, independent interoperability, and acceptance
 evidence remain open. The compiled example and exact boundary are documented in
 the [selected State API quickstart](../quickstart/selected-state-api.md).
+
+## Selected production-lane local Record slice (2026-08-24)
+
+`aster-node::application::SelectedRecordNode` adds an exclusive stopped-node
+Record boundary over the same mission-bound writer, current control policy,
+source-envelope provider, and publisher causal ledger as Event and State. It
+publishes source-authenticated Record revisions by durable operation key,
+queries one exact topic/scope/logical key, and accepts an explicit reviewed
+successor through an opaque exact-sibling resolution guard. It has no live
+command handle, subscription, carrier, reconciliation, or language-binding
+operation.
+
+The facade exposes semantic `RecordId`, authenticated application fields, one
+deterministic `Current` head, every other active causal maximum as
+`Concurrent`, optional active `Superseded` history, and an explicit
+`RecordConflict` containing sorted sibling identities and a private guard. It
+does not expose exact transfer identities, sealed representations, keys,
+provider selection, causal vectors, redb table names, or structural plan
+tokens. A current tombstone remains a visible empty-payload `RecordItem`;
+concurrent deletion has no special delete-wins priority.
+
+The selected slice never invokes registered application merge code during
+ingest. An ordinary publication cannot silently collapse an existing conflict:
+if its reserved context observes at least two heads, the transaction fails and
+leaves the projection unchanged. An application may inspect the verified
+siblings, compute a result in its own code, and call `resolve` with the exact
+guard it received. The successor must observe every guarded head. The store
+rejects stale guards atomically, and the durable operation digest binds the
+sorted head set so the same operation key cannot resolve a different conflict.
+An exact authorized retry returns the original immutable result after restart
+or rekey; a new operation cannot reuse an old-policy guard.
+
+The stopped facade treats stored rows and projection plans as privileged,
+untrusted structural inputs. Query freshly source/content verifies every
+retained candidate, including inactive rows, independently recomputes causal
+maxima, current/concurrent/superseded dispositions, and the exact sorted head
+set, then requires the policy-bound plan to remain unchanged. Resolve repeats
+that verification for the supplied guard before the store atomically checks and
+commits it. Only active rows cross the application boundary, and all errors are
+mapped to the same fixed sanitized categories as the other selected facades.
+
+Event, State, and Record share publisher counter high-water and causal frontier
+state so Record cannot reuse another class's dot. Record exact/semantic indexes,
+acceptance markers, versions, and the bounded operation ledger remain disjoint;
+the Event inventory and frame grammar are unchanged. This is local mechanism
+evidence only. There is no automatic registered-policy merge, Record network
+ingestion, disconnected-process acceptance, live status, finite TTL, expiry,
+garbage collection, or retained execution receipt. The compiled example and
+exact boundary are documented in the
+[selected Record API quickstart](../quickstart/selected-record-api.md).
