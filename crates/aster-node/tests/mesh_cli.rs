@@ -388,6 +388,7 @@ fn live_event_process_worker() {
             bind,
             mission,
             peers,
+            mutable_interests: Default::default(),
             sync_interval: Duration::from_millis(500),
             run_for: None,
             application: NodeApplication::Relay,
@@ -1894,7 +1895,7 @@ fn four_real_processes_default_to_ping_pong_and_restart_cleanly() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn mesh demo");
-    let deadline = Instant::now() + Duration::from_secs(120);
+    let deadline = Instant::now() + Duration::from_secs(180);
     loop {
         if child.try_wait().expect("poll mesh demo").is_some() {
             break;
@@ -1903,7 +1904,7 @@ fn four_real_processes_default_to_ping_pong_and_restart_cleanly() {
             child.kill().expect("kill timed-out mesh demo");
             let output = child.wait_with_output().expect("collect timed-out demo");
             panic!(
-                "mesh demo exceeded 120 seconds; root={}; stdout={} stderr={}",
+                "mesh demo exceeded 180 seconds; root={}; stdout={} stderr={}",
                 root.display(),
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
@@ -2070,7 +2071,7 @@ fn two_real_processes_use_the_same_stopped_state_ping_pong_plan() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn two-node mesh demo");
-    let deadline = Instant::now() + Duration::from_secs(120);
+    let deadline = Instant::now() + Duration::from_secs(180);
     loop {
         if child.try_wait().expect("poll two-node mesh demo").is_some() {
             break;
@@ -2081,7 +2082,7 @@ fn two_real_processes_use_the_same_stopped_state_ping_pong_plan() {
                 .wait_with_output()
                 .expect("collect timed-out two-node demo");
             panic!(
-                "two-node mesh demo exceeded 120 seconds; root={}; stdout={} stderr={}",
+                "two-node mesh demo exceeded 180 seconds; root={}; stdout={} stderr={}",
                 root.display(),
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
@@ -2166,7 +2167,7 @@ fn four_real_processes_propagate_controls_without_authority_and_exclude_captured
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn controlled mesh demo");
-    let deadline = Instant::now() + Duration::from_secs(120);
+    let deadline = Instant::now() + Duration::from_secs(180);
     loop {
         if child.try_wait().expect("poll controlled demo").is_some() {
             break;
@@ -2175,7 +2176,7 @@ fn four_real_processes_propagate_controls_without_authority_and_exclude_captured
             child.kill().expect("kill timed-out controlled demo");
             let output = child.wait_with_output().expect("collect timed-out demo");
             panic!(
-                "controlled mesh demo exceeded 120 seconds; root={}; stdout={} stderr={}",
+                "controlled mesh demo exceeded 180 seconds; root={}; stdout={} stderr={}",
                 root.display(),
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)

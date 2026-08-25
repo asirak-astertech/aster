@@ -38,6 +38,39 @@ graph behind the boundaries in this decision. This is implementation authority,
 not release authorization: exact license, advisory, SBOM, security, physical
 carrier, interoperability, and operational acceptance gates remain binding.
 
+## License-policy update — 2026-08-25
+
+After review of the exact Iroh 1.0.3 graph, the stakeholder approved the
+package-scoped license disposition below. This is an explicit deviation from
+the frozen baseline's literal OSI-approved-only dependency rule for the two
+CDLA data packages; it does not rewrite the requirements artifact or claim an
+outside-counsel conclusion. `Unlicense` is OSI-approved, but is kept in the same
+exact-package mechanism instead of expanding the repository-wide allowlist.
+
+| Package | Exact version | Reachability | Disposition |
+|---|---:|---|---|
+| `webpki-roots` | 1.0.9 | native compiled Mozilla trust-root data through `iroh-relay` | admit `CDLA-Permissive-2.0` for this coordinate |
+| `webpki-root-certs` | 1.0.9 | all-target trust-root inventory through Iroh's HTTP/TLS graph | admit `CDLA-Permissive-2.0` for this coordinate |
+| `async_io_stream` | 0.3.3 | browser-WASM-only chain beneath `ws_stream_wasm` | admit `Unlicense` for this coordinate |
+| `pharos` | 0.5.3 | browser-WASM-only chain beneath `ws_stream_wasm` | admit `Unlicense` for this coordinate |
+| `ws_stream_wasm` | 0.7.5 | Iroh relay's browser-WASM transport | admit `Unlicense` for this coordinate |
+
+`deny.toml` encodes five name-and-exact-version exceptions; neither license is
+added to the general allowlist. Any package/version/license drift therefore
+fails closed and requires a new review. [`THIRD_PARTY_NOTICES.md`](../../THIRD_PARTY_NOTICES.md)
+records the exact crates.io archive checksums and complete CDLA and Unlicense
+texts. Distribution packaging must include that file; the project-license gate
+hash-pins it and verifies its inclusion in the shipped lab image.
+
+This disposition removes the exact dependency-license CI hold and permits the
+implementation stack to merge. It does not declare browser-WASM a supported
+release target, authorize hosted relay operation, satisfy independent
+interoperability or physical acceptance, or make the selected composition a
+production-authorized release. Requirement `DM-8-05` remains open and
+uncredited against the frozen baseline unless its owner expressly revises that
+normative rule; the deviation remains visible rather than being counted as
+requirements compliance.
+
 Iroh endpoint authentication is carrier evidence only. The hybrid-PQ session,
 protected envelopes, source authentication, data classes, causality,
 custody/TTL, scopes, and authorization already implemented and tested in

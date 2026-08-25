@@ -1,6 +1,6 @@
 use aster_mesh::{Scope, Topic};
 use aster_negentropy::MAX_FRAME_SIZE_LIMIT;
-use aster_redb_store::{ControlTransferId, EventTransferId};
+use aster_redb_store::{ControlTransferId, EventTransferId, RecordTransferId, StateTransferId};
 
 use crate::NodeError;
 
@@ -35,6 +35,22 @@ const CONTROL_OFFER: u8 = 0x53;
 const CONTROL_APPLY_RESULT: u8 = 0x54;
 const CONTROL_FINISH: u8 = 0x61;
 const CONTROL_FINISHED: u8 = 0x62;
+const MUTABLE_INTEREST: u8 = 0x69;
+const MUTABLE_INTEREST_REPLY: u8 = 0x6a;
+const MUTABLE_INVENTORY_QUERY: u8 = 0x71;
+const MUTABLE_INVENTORY_REPLY: u8 = 0x72;
+const MUTABLE_INVENTORY_COMPLETE: u8 = 0x73;
+const MUTABLE_INVENTORY_COMPLETE_ACK: u8 = 0x74;
+const MUTABLE_DIFFERENCE_QUERY: u8 = 0x75;
+const MUTABLE_DIFFERENCE_REPLY: u8 = 0x76;
+const MUTABLE_DIFFERENCE_BOUND: u8 = 0x77;
+const MUTABLE_DIFFERENCE_BOUND_ACK: u8 = 0x78;
+const MUTABLE_FETCH: u8 = 0x81;
+const MUTABLE_OBJECT: u8 = 0x82;
+const MUTABLE_OFFER: u8 = 0x83;
+const MUTABLE_APPLY_RESULT: u8 = 0x84;
+const MUTABLE_FINISH: u8 = 0x91;
+const MUTABLE_FINISHED: u8 = 0x92;
 pub(crate) const MAX_OBJECT_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_EVENT_INTEREST_SELECTORS: usize = 256;
 const MAX_EVENT_NAME_BYTES: usize = 128;
@@ -66,6 +82,55 @@ impl EventDirection {
             _ => Err(NodeError::Protocol(
                 "Event direction is unknown or missing".into(),
             )),
+        }
+    }
+}
+
+/// Mutable source-object class carried by one class-specific lane.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum MutableClass {
+    State,
+    Record,
+}
+
+impl MutableClass {
+    const fn encode(self) -> u8 {
+        match self {
+            Self::State => 1,
+            Self::Record => 2,
+        }
+    }
+
+    fn decode(value: u8) -> Result<Self, NodeError> {
+        match value {
+            1 => Ok(Self::State),
+            2 => Ok(Self::Record),
+            _ => Err(NodeError::Protocol(
+                "mutable source-object class is unknown or missing".into(),
+            )),
+        }
+    }
+}
+
+/// Typed exact transfer identity used only inside a matching mutable lane.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum MutableTransferId {
+    State(StateTransferId),
+    Record(RecordTransferId),
+}
+
+impl MutableTransferId {
+    pub(crate) const fn class(self) -> MutableClass {
+        match self {
+            Self::State(_) => MutableClass::State,
+            Self::Record(_) => MutableClass::Record,
+        }
+    }
+
+    pub(crate) const fn as_bytes(&self) -> &[u8; 32] {
+        match self {
+            Self::State(id) => id.as_bytes(),
+            Self::Record(id) => id.as_bytes(),
         }
     }
 }
@@ -229,6 +294,77 @@ pub(crate) enum Frame {
     Finished {
         direction: EventDirection,
     },
+    MutableInterest {
+        class: MutableClass,
+        interest: EventInterest,
+    },
+    MutableInterestReply {
+        class: MutableClass,
+        interest: EventInterest,
+    },
+    MutableInventoryQuery {
+        class: MutableClass,
+        direction: EventDirection,
+        bytes: Vec<u8>,
+    },
+    MutableInventoryReply {
+        class: MutableClass,
+        direction: EventDirection,
+        bytes: Vec<u8>,
+    },
+    MutableInventoryComplete {
+        class: MutableClass,
+        direction: EventDirection,
+    },
+    MutableInventoryCompleteAck {
+        class: MutableClass,
+        direction: EventDirection,
+    },
+    MutableDifferenceQuery {
+        class: MutableClass,
+        direction: EventDirection,
+        bytes: Vec<u8>,
+    },
+    MutableDifferenceReply {
+        class: MutableClass,
+        direction: EventDirection,
+        bytes: Vec<u8>,
+    },
+    MutableDifferenceBound {
+        class: MutableClass,
+        direction: EventDirection,
+    },
+    MutableDifferenceBoundAck {
+        class: MutableClass,
+        direction: EventDirection,
+    },
+    MutableFetch {
+        direction: EventDirection,
+        id: MutableTransferId,
+    },
+    MutableObject {
+        direction: EventDirection,
+        id: MutableTransferId,
+        bytes: Vec<u8>,
+    },
+    MutableOffer {
+        direction: EventDirection,
+        id: MutableTransferId,
+        bytes: Vec<u8>,
+    },
+    MutableApplyResult {
+        direction: EventDirection,
+        id: MutableTransferId,
+        inserted: bool,
+    },
+    MutableFinish {
+        class: MutableClass,
+        direction: EventDirection,
+    },
+    MutableFinished {
+        class: MutableClass,
+        direction: EventDirection,
+    },
 }
 
 impl Frame {
@@ -384,6 +520,127 @@ impl Frame {
                 output.push(FINISHED);
                 output.push(direction.encode());
             }
+            Self::MutableInterest { class, interest } => {
+                output.push(MUTABLE_INTEREST);
+                output.push(class.encode());
+                encode_event_interest(&mut output, interest)?;
+            }
+            Self::MutableInterestReply { class, interest } => {
+                output.push(MUTABLE_INTEREST_REPLY);
+                output.push(class.encode());
+                encode_event_interest(&mut output, interest)?;
+            }
+            Self::MutableInventoryQuery {
+                class,
+                direction,
+                bytes,
+            } => {
+                output.push(MUTABLE_INVENTORY_QUERY);
+                encode_mutable_lane(&mut output, *class, *direction);
+                encode_bytes(
+                    &mut output,
+                    bytes,
+                    MAX_FRAME_SIZE_LIMIT,
+                    "mutable inventory query",
+                )?;
+            }
+            Self::MutableInventoryReply {
+                class,
+                direction,
+                bytes,
+            } => {
+                output.push(MUTABLE_INVENTORY_REPLY);
+                encode_mutable_lane(&mut output, *class, *direction);
+                encode_bytes(
+                    &mut output,
+                    bytes,
+                    MAX_FRAME_SIZE_LIMIT,
+                    "mutable inventory reply",
+                )?;
+            }
+            Self::MutableInventoryComplete { class, direction } => {
+                output.push(MUTABLE_INVENTORY_COMPLETE);
+                encode_mutable_lane(&mut output, *class, *direction);
+            }
+            Self::MutableInventoryCompleteAck { class, direction } => {
+                output.push(MUTABLE_INVENTORY_COMPLETE_ACK);
+                encode_mutable_lane(&mut output, *class, *direction);
+            }
+            Self::MutableDifferenceQuery {
+                class,
+                direction,
+                bytes,
+            } => {
+                output.push(MUTABLE_DIFFERENCE_QUERY);
+                encode_mutable_lane(&mut output, *class, *direction);
+                encode_bytes(
+                    &mut output,
+                    bytes,
+                    MAX_FRAME_SIZE_LIMIT,
+                    "mutable difference query",
+                )?;
+            }
+            Self::MutableDifferenceReply {
+                class,
+                direction,
+                bytes,
+            } => {
+                output.push(MUTABLE_DIFFERENCE_REPLY);
+                encode_mutable_lane(&mut output, *class, *direction);
+                encode_bytes(
+                    &mut output,
+                    bytes,
+                    MAX_FRAME_SIZE_LIMIT,
+                    "mutable difference reply",
+                )?;
+            }
+            Self::MutableDifferenceBound { class, direction } => {
+                output.push(MUTABLE_DIFFERENCE_BOUND);
+                encode_mutable_lane(&mut output, *class, *direction);
+            }
+            Self::MutableDifferenceBoundAck { class, direction } => {
+                output.push(MUTABLE_DIFFERENCE_BOUND_ACK);
+                encode_mutable_lane(&mut output, *class, *direction);
+            }
+            Self::MutableFetch { direction, id } => {
+                output.push(MUTABLE_FETCH);
+                encode_mutable_id(&mut output, *direction, *id);
+            }
+            Self::MutableObject {
+                direction,
+                id,
+                bytes,
+            } => {
+                output.push(MUTABLE_OBJECT);
+                encode_mutable_id(&mut output, *direction, *id);
+                encode_bytes(&mut output, bytes, MAX_OBJECT_BYTES, "mutable object")?;
+            }
+            Self::MutableOffer {
+                direction,
+                id,
+                bytes,
+            } => {
+                output.push(MUTABLE_OFFER);
+                encode_mutable_id(&mut output, *direction, *id);
+                encode_bytes(&mut output, bytes, MAX_OBJECT_BYTES, "mutable offer")?;
+            }
+            Self::MutableApplyResult {
+                direction,
+                id,
+                inserted,
+            } => {
+                output.push(MUTABLE_APPLY_RESULT);
+                encode_mutable_id(&mut output, *direction, *id);
+                output.push(u8::from(*inserted));
+            }
+            Self::MutableFinish { class, direction } => {
+                output.push(MUTABLE_FINISH);
+                encode_mutable_lane(&mut output, *class, *direction);
+            }
+            Self::MutableFinished { class, direction } => {
+                output.push(MUTABLE_FINISHED);
+                encode_mutable_lane(&mut output, *class, *direction);
+            }
         }
         Ok(output)
     }
@@ -530,6 +787,113 @@ impl Frame {
             FINISHED => Ok(Self::Finished {
                 direction: decode_direction_only(body)?,
             }),
+            MUTABLE_INTEREST | MUTABLE_INTEREST_REPLY => {
+                let (class, body) = decode_mutable_class(body)?;
+                let interest = decode_event_interest(body)?;
+                if tag == MUTABLE_INTEREST {
+                    Ok(Self::MutableInterest { class, interest })
+                } else {
+                    Ok(Self::MutableInterestReply { class, interest })
+                }
+            }
+            MUTABLE_INVENTORY_QUERY | MUTABLE_INVENTORY_REPLY => {
+                let (class, direction, body) = decode_mutable_lane(body)?;
+                let bytes = decode_bytes(body, MAX_FRAME_SIZE_LIMIT, "mutable inventory")?.to_vec();
+                if tag == MUTABLE_INVENTORY_QUERY {
+                    Ok(Self::MutableInventoryQuery {
+                        class,
+                        direction,
+                        bytes,
+                    })
+                } else {
+                    Ok(Self::MutableInventoryReply {
+                        class,
+                        direction,
+                        bytes,
+                    })
+                }
+            }
+            MUTABLE_INVENTORY_COMPLETE | MUTABLE_INVENTORY_COMPLETE_ACK => {
+                let (class, direction) = decode_mutable_lane_only(body)?;
+                if tag == MUTABLE_INVENTORY_COMPLETE {
+                    Ok(Self::MutableInventoryComplete { class, direction })
+                } else {
+                    Ok(Self::MutableInventoryCompleteAck { class, direction })
+                }
+            }
+            MUTABLE_DIFFERENCE_QUERY | MUTABLE_DIFFERENCE_REPLY => {
+                let (class, direction, body) = decode_mutable_lane(body)?;
+                let bytes =
+                    decode_bytes(body, MAX_FRAME_SIZE_LIMIT, "mutable difference")?.to_vec();
+                if tag == MUTABLE_DIFFERENCE_QUERY {
+                    Ok(Self::MutableDifferenceQuery {
+                        class,
+                        direction,
+                        bytes,
+                    })
+                } else {
+                    Ok(Self::MutableDifferenceReply {
+                        class,
+                        direction,
+                        bytes,
+                    })
+                }
+            }
+            MUTABLE_DIFFERENCE_BOUND | MUTABLE_DIFFERENCE_BOUND_ACK => {
+                let (class, direction) = decode_mutable_lane_only(body)?;
+                if tag == MUTABLE_DIFFERENCE_BOUND {
+                    Ok(Self::MutableDifferenceBound { class, direction })
+                } else {
+                    Ok(Self::MutableDifferenceBoundAck { class, direction })
+                }
+            }
+            MUTABLE_FETCH => {
+                let (direction, id, body) = decode_mutable_id(body)?;
+                if !body.is_empty() {
+                    return Err(NodeError::Protocol(
+                        "mutable fetch has trailing bytes".into(),
+                    ));
+                }
+                Ok(Self::MutableFetch { direction, id })
+            }
+            MUTABLE_OBJECT | MUTABLE_OFFER => {
+                let (direction, id, body) = decode_mutable_id(body)?;
+                let bytes = decode_bytes(body, MAX_OBJECT_BYTES, "mutable object")?.to_vec();
+                if tag == MUTABLE_OBJECT {
+                    Ok(Self::MutableObject {
+                        direction,
+                        id,
+                        bytes,
+                    })
+                } else {
+                    Ok(Self::MutableOffer {
+                        direction,
+                        id,
+                        bytes,
+                    })
+                }
+            }
+            MUTABLE_APPLY_RESULT => {
+                let (direction, id, body) = decode_mutable_id(body)?;
+                if body.len() != 1 || body[0] > 1 {
+                    return Err(NodeError::Protocol(
+                        "mutable apply result frame differs".into(),
+                    ));
+                }
+                Ok(Self::MutableApplyResult {
+                    direction,
+                    id,
+                    inserted: body[0] == 1,
+                })
+            }
+            MUTABLE_FINISH | MUTABLE_FINISHED => {
+                let (class, direction) = decode_mutable_lane_only(body)?;
+                if tag == MUTABLE_FINISH {
+                    Ok(Self::MutableFinish { class, direction })
+                } else {
+                    Ok(Self::MutableFinished { class, direction })
+                }
+            }
             _ => Err(NodeError::Protocol(
                 "unknown or malformed mechanics frame".into(),
             )),
@@ -671,6 +1035,60 @@ fn take_exact<'a>(input: &mut &'a [u8], length: usize, label: &str) -> Result<&'
     Ok(head)
 }
 
+fn encode_mutable_lane(output: &mut Vec<u8>, class: MutableClass, direction: EventDirection) {
+    output.push(class.encode());
+    output.push(direction.encode());
+}
+
+fn encode_mutable_id(output: &mut Vec<u8>, direction: EventDirection, id: MutableTransferId) {
+    encode_mutable_lane(output, id.class(), direction);
+    output.extend_from_slice(id.as_bytes());
+}
+
+fn decode_mutable_class(input: &[u8]) -> Result<(MutableClass, &[u8]), NodeError> {
+    let Some((&class, body)) = input.split_first() else {
+        return Err(NodeError::Protocol(
+            "mutable source-object class is missing".into(),
+        ));
+    };
+    Ok((MutableClass::decode(class)?, body))
+}
+
+fn decode_mutable_lane(input: &[u8]) -> Result<(MutableClass, EventDirection, &[u8]), NodeError> {
+    let (class, body) = decode_mutable_class(input)?;
+    let (direction, body) = decode_direction(body)?;
+    Ok((class, direction, body))
+}
+
+fn decode_mutable_lane_only(input: &[u8]) -> Result<(MutableClass, EventDirection), NodeError> {
+    let (class, direction, body) = decode_mutable_lane(input)?;
+    if !body.is_empty() {
+        return Err(NodeError::Protocol(
+            "mutable lane control has trailing bytes".into(),
+        ));
+    }
+    Ok((class, direction))
+}
+
+fn decode_mutable_id(
+    input: &[u8],
+) -> Result<(EventDirection, MutableTransferId, &[u8]), NodeError> {
+    let (class, direction, body) = decode_mutable_lane(input)?;
+    if body.len() < 32 {
+        return Err(NodeError::Protocol(
+            "mutable transfer identifier is truncated".into(),
+        ));
+    }
+    let bytes: [u8; 32] = body[..32]
+        .try_into()
+        .map_err(|_| NodeError::Protocol("mutable transfer identifier differs".into()))?;
+    let id = match class {
+        MutableClass::State => MutableTransferId::State(StateTransferId::new(bytes)),
+        MutableClass::Record => MutableTransferId::Record(RecordTransferId::new(bytes)),
+    };
+    Ok((direction, id, &body[32..]))
+}
+
 fn decode_direction(input: &[u8]) -> Result<(EventDirection, &[u8]), NodeError> {
     let Some((&direction, body)) = input.split_first() else {
         return Err(NodeError::Protocol("Event direction is missing".into()));
@@ -769,6 +1187,8 @@ mod tests {
     fn every_frame_round_trips_and_rejects_trailing_bytes() {
         let id = EventTransferId::new([0x44; 32]);
         let control_id = ControlTransferId::new([0x55; 32]);
+        let state_id = MutableTransferId::State(StateTransferId::new([0x66; 32]));
+        let record_id = MutableTransferId::Record(RecordTransferId::new([0x77; 32]));
         let interest = EventInterest::new(vec![
             selector("zulu", "mission/bravo", true),
             selector("alpha", "mission/alpha", false),
@@ -853,6 +1273,78 @@ mod tests {
                 direction: to_responder,
             },
             Frame::Finished {
+                direction: to_initiator,
+            },
+            Frame::MutableInterest {
+                class: MutableClass::State,
+                interest: EventInterest::empty(),
+            },
+            Frame::MutableInterestReply {
+                class: MutableClass::Record,
+                interest: EventInterest::new(vec![selector("record", "mission/record", false)])
+                    .expect("mutable interest"),
+            },
+            Frame::MutableInventoryQuery {
+                class: MutableClass::State,
+                direction: to_responder,
+                bytes: vec![17, 18],
+            },
+            Frame::MutableInventoryReply {
+                class: MutableClass::Record,
+                direction: to_initiator,
+                bytes: vec![19, 20],
+            },
+            Frame::MutableInventoryComplete {
+                class: MutableClass::State,
+                direction: to_responder,
+            },
+            Frame::MutableInventoryCompleteAck {
+                class: MutableClass::State,
+                direction: to_responder,
+            },
+            Frame::MutableDifferenceQuery {
+                class: MutableClass::Record,
+                direction: to_initiator,
+                bytes: vec![21, 22],
+            },
+            Frame::MutableDifferenceReply {
+                class: MutableClass::Record,
+                direction: to_initiator,
+                bytes: vec![23, 24],
+            },
+            Frame::MutableDifferenceBound {
+                class: MutableClass::State,
+                direction: to_responder,
+            },
+            Frame::MutableDifferenceBoundAck {
+                class: MutableClass::State,
+                direction: to_responder,
+            },
+            Frame::MutableFetch {
+                direction: to_initiator,
+                id: state_id,
+            },
+            Frame::MutableObject {
+                direction: to_initiator,
+                id: state_id,
+                bytes: b"state".to_vec(),
+            },
+            Frame::MutableOffer {
+                direction: to_responder,
+                id: record_id,
+                bytes: b"record".to_vec(),
+            },
+            Frame::MutableApplyResult {
+                direction: to_responder,
+                id: record_id,
+                inserted: true,
+            },
+            Frame::MutableFinish {
+                class: MutableClass::Record,
+                direction: to_initiator,
+            },
+            Frame::MutableFinished {
+                class: MutableClass::Record,
                 direction: to_initiator,
             },
         ];

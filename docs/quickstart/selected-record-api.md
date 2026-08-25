@@ -1,19 +1,20 @@
 # Selected Record API quickstart
 
-This is the shortest path to Aster's **selected local Record conflict
+This is the shortest path to Aster's **selected Record conflict
 projection**. It opens the selected mission-bound redb store while no runtime
 owns it, publishes two source-authenticated revisions for one logical key, and
 reads the deterministic current revision plus recoverable history. Application
 code never constructs an envelope, handles cryptographic keys, reads sealed
 bytes, or runs untrusted merge code during ingest.
 
-This first Record slice is deliberately stopped and local. It does not put
-Record on the Event-only reconciliation wire and has no live handle,
-subscription, relay, or language binding. It also does not execute registered
-merge policies automatically, implement finite TTL, expiry, or garbage
-collection, or demonstrate edits crossing disconnected nodes. The example
-demonstrates durable local revision and query behavior, not Record delivery or
-mesh convergence.
+The application handle remains deliberately stopped and exclusive; there is no
+live Record publish/query handle, durable Record subscription, or language
+binding. A separately running node can now reconcile already durable revisions
+over a mission-authenticated, class-specific Negentropy lane when the receiver
+configures an exact topic/scope interest. Ingest never executes registered merge
+code, so concurrent heads remain durable and explicit. Finite TTL, expiry,
+garbage collection, automatic registered-policy merge, broader relay
+acceptance, and independent interoperability remain open.
 
 ## Run the example
 
@@ -61,8 +62,39 @@ cargo test --locked -p aster-node \
   -- --exact
 ```
 
-This is an in-process mechanism test over one mission-bound store, not a
-disconnected-process or network acceptance scenario.
+This is an in-process mechanism test over one mission-bound store. The network
+test below separately exercises disconnected publishers and a real carrier.
+
+## Reconcile disconnected Record revisions
+
+Stop `SelectedRecordNode` before starting the network actor; both deliberately
+own the same mission-bound store exclusively. On every receiving node, add one
+repeatable exact interest for each desired topic and scope:
+
+```sh
+aster node ... --record-interest reports@mission/alpha
+```
+
+An empty Record interest set means receive-none, never wildcard. Topic/scope
+interest is only desired receipt: current mission membership, route authority,
+content authority, source authentication, revocation, and scope epoch still
+have to pass. Remote finite-TTL Record is rejected until authenticated
+cumulative forwarding age exists.
+
+The current-code real-carrier acceptance test creates concurrent revisions on
+two independent stores while disconnected, makes one mission-authenticated
+direct Iroh contact, and verifies both exact revision inventories converge and
+both causal heads remain present on both stores:
+
+```sh
+cargo test --locked -p aster-node \
+  runtime::tests::real_iroh_contact_converges_state_and_disconnected_record_siblings \
+  -- --exact
+```
+
+No application merge callback runs during ingest. This is bounded
+same-implementation, one-host, two-node evidence, not a retained release
+receipt, multi-hop/partition sweep, or automatic merge implementation.
 
 ## Use the stopped API
 
@@ -116,7 +148,7 @@ and payload digest are authenticated. The selected store additionally bounds
 operation keys to 1–256 bytes, logical keys to 1–4,096 bytes, retained versions
 to 1,024 per exact key, and the dedicated durable Record operation ledger to
 4,096 rows and 512 KiB. That ledger also participates in aggregate store
-quotas. Priority is authenticated and returned, but this local slice does not
+quotas. Priority is authenticated and returned, but this selected slice does not
 schedule transmission, retry, or eviction by priority.
 
 `RecordQuery` always identifies one exact topic, scope, and logical key. All
@@ -187,8 +219,8 @@ The current example remains intentionally conflict-free because one stopped
 writer creates causally ordered successors. Selected-node tests construct
 independently source-authenticated publishers and exercise two-way, N-way,
 stale-guard, restart, rekey-retry, and both semantic-ID-order directions. That
-is automated local mechanism evidence, not a disconnected-process or network
-acceptance receipt.
+is automated local mechanism evidence. The separate real-Iroh test establishes
+only the bounded disconnected two-publisher transfer described above.
 
 ## Treat tombstones as authenticated Record revisions
 
@@ -261,9 +293,10 @@ sequenceDiagram
 ```
 
 The stopped handle takes the same process-exclusive store authority used by the
-live Event actor and the stopped State facade. Stop that actor and drop any
-other stopped facade before opening `SelectedRecordNode`; Aster does not permit
-two writers around one policy snapshot. Continue with the
+live actor and the stopped State facade. Stop that actor and drop any other
+stopped facade before opening `SelectedRecordNode`, and close this handle before
+starting the actor; Aster does not permit two writers around one policy
+snapshot. Continue with the
 [selected architecture](../architecture.md) for the full trust split, the
 [selected State API](selected-state-api.md) for causal latest-value semantics,
 the [selected Event API](selected-event-api.md) for the live networked surface,

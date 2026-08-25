@@ -40,6 +40,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         bind: SocketAddr::from(([127, 0, 0, 1], 0)),
         mission,
         peers: Vec::new(),
+        mutable_interests: Default::default(),
         sync_interval: Duration::from_millis(250),
         run_for: None,
         application: NodeApplication::Relay,

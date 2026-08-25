@@ -387,6 +387,7 @@ index\tserial\tnode_id
         paths = {item.relative_path for item in inputs}
         self.assertIn(".dockerignore", paths)
         self.assertIn("LICENSE", paths)
+        self.assertIn("THIRD_PARTY_NOTICES.md", paths)
         self.assertIn("lab/Dockerfile", paths)
         self.assertRegex(orchestrate.build_input_digest(inputs), r"^[0-9a-f]{64}$")
 

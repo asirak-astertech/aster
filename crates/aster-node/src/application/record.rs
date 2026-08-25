@@ -1,11 +1,13 @@
 //! High-level stopped-state surface for source-authenticated Record projections.
 //!
-//! This selected Record slice is deliberately local. It shares the exact
-//! mission-bound store, control policy, provider, and causal ledger with the
-//! selected Event and State surfaces, but does not put Record objects on the
-//! Event-only reconciliation wire. Ingest never executes application merge
-//! code: conflicts remain explicit until an application submits a guarded
-//! successor that observes the complete sibling set it inspected.
+//! The application handle is deliberately stopped/exclusive. It shares the
+//! exact mission-bound store, control policy, provider, and causal ledger with
+//! the selected Event and State surfaces. A separately running node can
+//! reconcile its durable Record objects through the class-specific Record lane
+//! when the receiver declares an exact source interest. Network ingest never
+//! executes application merge code: conflicts remain explicit until an
+//! application submits a guarded successor that observes the complete sibling
+//! set it inspected.
 
 use std::{fmt, fs, path::Path, sync::Arc};
 

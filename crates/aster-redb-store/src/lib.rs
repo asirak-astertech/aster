@@ -410,8 +410,8 @@ impl EventSemanticId {
 
 /// Exact SHA-256 identity of one stable source-sealed State representation.
 ///
-/// State is deliberately absent from the Event reconciliation inventory in
-/// this foundation slice, so this type has no reconciliation adapter.
+/// The explicit conversion methods are the only places a State transfer key
+/// enters or leaves the class-specific reconciliation adapter.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct StateTransferId([u8; 32]);
 
@@ -424,6 +424,16 @@ impl StateTransferId {
     /// Returns the exact State transfer identifier bytes.
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+
+    /// Adapts this exact key into the State reconciliation lane.
+    pub const fn reconciliation_item_id(self) -> ItemId {
+        ItemId::new(self.0)
+    }
+
+    /// Adapts a State-lane reconciliation key back into an exact transfer key.
+    pub const fn from_reconciliation_item_id(id: ItemId) -> Self {
+        Self(*id.as_bytes())
     }
 }
 
@@ -456,6 +466,16 @@ impl RecordTransferId {
     /// Returns the exact Record transfer identifier bytes.
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+
+    /// Adapts this exact key into the Record reconciliation lane.
+    pub const fn reconciliation_item_id(self) -> ItemId {
+        ItemId::new(self.0)
+    }
+
+    /// Adapts a Record-lane reconciliation key back into an exact transfer key.
+    pub const fn from_reconciliation_item_id(id: ItemId) -> Self {
+        Self(*id.as_bytes())
     }
 }
 
@@ -2105,6 +2125,68 @@ impl EventInventory {
                 .iter()
                 .copied()
                 .map(EventTransferId::reconciliation_item_id),
+        )
+    }
+}
+
+/// Canonically ordered exact State transfer identities for its typed lane.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StateInventory(Vec<StateTransferId>);
+
+impl StateInventory {
+    /// Returns the number of retained State representations.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Returns whether this State inventory is empty.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Iterates exact State transfer identities in canonical byte order.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &StateTransferId> {
+        self.0.iter()
+    }
+
+    /// Adapts exact State identities to the class-specific reconciliation lane.
+    pub fn reconciliation_snapshot(&self) -> InventorySnapshot {
+        InventorySnapshot::new(
+            self.0
+                .iter()
+                .copied()
+                .map(StateTransferId::reconciliation_item_id),
+        )
+    }
+}
+
+/// Canonically ordered exact Record transfer identities for its typed lane.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RecordInventory(Vec<RecordTransferId>);
+
+impl RecordInventory {
+    /// Returns the number of retained Record representations.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Returns whether this Record inventory is empty.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Iterates exact Record transfer identities in canonical byte order.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &RecordTransferId> {
+        self.0.iter()
+    }
+
+    /// Adapts exact Record identities to the class-specific reconciliation lane.
+    pub fn reconciliation_snapshot(&self) -> InventorySnapshot {
+        InventorySnapshot::new(
+            self.0
+                .iter()
+                .copied()
+                .map(RecordTransferId::reconciliation_item_id),
         )
     }
 }
@@ -7416,8 +7498,13 @@ impl Store {
     ) -> Result<ApplyOutcome, StoreError> {
         self.require_live()?;
         let prepared = PreparedState::from_verified(state, sealed)?;
-        self.commit_prepared_state(&prepared, Some(reservation), None)
-            .map(|committed| committed.apply)
+        self.commit_prepared_state(
+            &prepared,
+            &reservation.control_policy,
+            Some(reservation),
+            None,
+        )
+        .map(|committed| committed.apply)
     }
 
     /// Commits one reserved State only while its exact captured policy remains current.
@@ -7433,7 +7520,7 @@ impl Store {
             return Err(StoreError::ControlPolicyChanged);
         }
         let prepared = PreparedState::from_verified(state, sealed)?;
-        self.commit_prepared_state(&prepared, Some(reservation), None)
+        self.commit_prepared_state(&prepared, policy, Some(reservation), None)
             .map(|committed| committed.apply)
     }
 
@@ -7453,6 +7540,7 @@ impl Store {
         let prepared = PreparedState::from_verified(state, sealed)?;
         let committed = self.commit_prepared_state(
             &prepared,
+            &reservation.control_policy,
             Some(reservation),
             Some(PendingStateOperation {
                 key: request.operation,
@@ -7482,6 +7570,7 @@ impl Store {
         let prepared = PreparedState::from_verified(state, sealed)?;
         let committed = self.commit_prepared_state(
             &prepared,
+            policy,
             Some(reservation),
             Some(PendingStateOperation {
                 key: request.operation,
@@ -7524,6 +7613,47 @@ impl Store {
         self.require_bound_mission()?;
         let read = self.database.begin_read()?;
         load_state_from_read(&read, transfer_id)
+    }
+
+    /// Returns all retained State transfer keys under one exact control policy.
+    pub fn state_inventory_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+    ) -> Result<StateInventory, StoreError> {
+        let authority = self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        require_control_policy_read(&read, authority, policy)?;
+        let states = read.open_table(STATES)?;
+        let mut ids = Vec::new();
+        for row in states.iter()? {
+            let (key, _) = row?;
+            let id = parse_state_transfer_id("State inventory", key.value())?;
+            load_state_from_read(&read, id)?.ok_or(StoreError::StateInvariant(
+                "State inventory row is missing its exact representation",
+            ))?;
+            ids.push(id);
+        }
+        ids.sort_unstable();
+        Ok(StateInventory(ids))
+    }
+
+    /// Accepts one remotely content-verified State under exact settled policy.
+    ///
+    /// Finite-TTL remote State is rejected because the selected network profile
+    /// does not yet authenticate cumulative forwarding age.
+    pub fn apply_verified_state_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        state: &ContentVerifiedStateEnvelope,
+        sealed: &[u8],
+    ) -> Result<ApplyOutcome, StoreError> {
+        self.require_live()?;
+        state
+            .ensure_remote_acceptance_without_forwarding_age()
+            .map_err(|error| StoreError::StateVerification(error.to_string()))?;
+        let prepared = PreparedState::from_verified(state, sealed)?;
+        self.commit_prepared_state(&prepared, policy, None, None)
+            .map(|committed| committed.apply)
     }
 
     /// Resolves one semantic State identity to its retained exact representation.
@@ -7691,15 +7821,13 @@ impl Store {
     fn commit_prepared_state(
         &self,
         prepared: &PreparedState,
+        policy: &ControlPolicySnapshot,
         reservation: Option<&StateReservation>,
         operation: Option<PendingStateOperation<'_>>,
     ) -> Result<StateCommit, StoreError> {
         self.require_mission_authority(prepared.mission_authority)?;
         let write = self.database.begin_write()?;
         enforce_live_write(&write)?;
-        let policy = reservation
-            .map(|reservation| &reservation.control_policy)
-            .ok_or(StoreError::StateReservationChanged)?;
         enforce_state_policy_write(&write, prepared.mission_authority, policy, &prepared.header)?;
 
         if write
@@ -7755,8 +7883,12 @@ impl Store {
             }
         }
 
-        let reservation = reservation.ok_or(StoreError::StateReservationChanged)?;
-        validate_state_reservation(reservation, prepared)?;
+        if let Some(reservation) = reservation {
+            if policy != &reservation.control_policy {
+                return Err(StoreError::ControlPolicyChanged);
+            }
+            validate_state_reservation(reservation, prepared)?;
+        }
 
         if write
             .open_table(SEMANTIC_ITEMS)?
@@ -7830,12 +7962,14 @@ impl Store {
             });
         }
 
-        let current_counter = write
-            .open_table(PUBLISHER_HIGH_WATER)?
-            .get(reservation.publisher.as_slice())?
-            .map_or(0, |value| value.value());
-        if current_counter != reservation.previous_counter {
-            return Err(StoreError::StateReservationChanged);
+        if let Some(reservation) = reservation {
+            let current_counter = write
+                .open_table(PUBLISHER_HIGH_WATER)?
+                .get(reservation.publisher.as_slice())?
+                .map_or(0, |value| value.value());
+            if current_counter != reservation.previous_counter {
+                return Err(StoreError::StateReservationChanged);
+            }
         }
 
         let dot_key = accepted_dot_key(prepared.header.stamp.dot);
@@ -8005,8 +8139,14 @@ impl Store {
     ) -> Result<ApplyOutcome, StoreError> {
         self.require_live()?;
         let prepared = PreparedRecord::from_verified(record, sealed)?;
-        self.commit_prepared_record(&prepared, Some(reservation), None, None)
-            .map(|committed| committed.apply)
+        self.commit_prepared_record(
+            &prepared,
+            reservation.control_policy(),
+            Some(reservation),
+            None,
+            None,
+        )
+        .map(|committed| committed.apply)
     }
 
     /// Commits one reserved Record only while its captured policy remains current.
@@ -8022,7 +8162,7 @@ impl Store {
             return Err(StoreError::ControlPolicyChanged);
         }
         let prepared = PreparedRecord::from_verified(record, sealed)?;
-        self.commit_prepared_record(&prepared, Some(reservation), None, None)
+        self.commit_prepared_record(&prepared, policy, Some(reservation), None, None)
             .map(|committed| committed.apply)
     }
 
@@ -8042,6 +8182,7 @@ impl Store {
         let prepared = PreparedRecord::from_verified(record, sealed)?;
         let committed = self.commit_prepared_record(
             &prepared,
+            reservation.control_policy(),
             Some(reservation),
             Some(PendingRecordOperation {
                 key: request.operation(),
@@ -8072,6 +8213,7 @@ impl Store {
         let prepared = PreparedRecord::from_verified(record, sealed)?;
         let committed = self.commit_prepared_record(
             &prepared,
+            policy,
             Some(reservation),
             Some(PendingRecordOperation {
                 key: request.operation(),
@@ -8110,6 +8252,7 @@ impl Store {
         let prepared = PreparedRecord::from_verified(record, sealed)?;
         let committed = self.commit_prepared_record(
             &prepared,
+            policy,
             Some(reservation),
             Some(PendingRecordOperation {
                 key: publication.operation(),
@@ -8148,6 +8291,44 @@ impl Store {
         self.require_bound_mission()?;
         let read = self.database.begin_read()?;
         load_record_from_read(&read, transfer_id)
+    }
+
+    /// Returns all retained Record transfer keys under one exact control policy.
+    pub fn record_inventory_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+    ) -> Result<RecordInventory, StoreError> {
+        let authority = self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        require_control_policy_read(&read, authority, policy)?;
+        let records = read.open_table(RECORDS)?;
+        let mut ids = Vec::new();
+        for row in records.iter()? {
+            let (key, _) = row?;
+            let id = parse_record_transfer_id("Record inventory", key.value())?;
+            load_record_from_read(&read, id)?.ok_or(StoreError::RecordInvariant(
+                "Record inventory row is missing its exact representation",
+            ))?;
+            ids.push(id);
+        }
+        ids.sort_unstable();
+        Ok(RecordInventory(ids))
+    }
+
+    /// Accepts one remotely content-verified Record under exact settled policy.
+    ///
+    /// Replicated ingest stores the authenticated revision and recomputes the
+    /// DAG projection only; it never invokes application merge code.
+    pub fn apply_verified_record_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        record: &ContentVerifiedRecordEnvelope,
+        sealed: &[u8],
+    ) -> Result<ApplyOutcome, StoreError> {
+        self.require_live()?;
+        let prepared = PreparedRecord::from_verified(record, sealed)?;
+        self.commit_prepared_record(&prepared, policy, None, None, None)
+            .map(|committed| committed.apply)
     }
 
     /// Resolves one Record semantic identity to its exact retained representation.
@@ -8218,6 +8399,7 @@ impl Store {
     fn commit_prepared_record(
         &self,
         prepared: &PreparedRecord,
+        policy: &ControlPolicySnapshot,
         reservation: Option<&RecordReservation>,
         operation: Option<PendingRecordOperation<'_>>,
         resolution: Option<&RecordProjectionPlan>,
@@ -8225,8 +8407,6 @@ impl Store {
         self.require_mission_authority(prepared.mission_authority)?;
         let write = self.database.begin_write()?;
         enforce_live_write(&write)?;
-        let reservation = reservation.ok_or(StoreError::RecordReservationChanged)?;
-        let policy = &reservation.control_policy;
         enforce_record_policy_write(&write, prepared.mission_authority, policy, &prepared.header)?;
 
         for table in [
@@ -8273,7 +8453,12 @@ impl Store {
             }
         }
 
-        validate_record_reservation(reservation, prepared)?;
+        if let Some(reservation) = reservation {
+            if policy != reservation.control_policy() {
+                return Err(StoreError::ControlPolicyChanged);
+            }
+            validate_record_reservation(reservation, prepared)?;
+        }
         let current = record_projection_plan_write(
             &write,
             *policy,
@@ -8282,8 +8467,8 @@ impl Store {
             &prepared.header.logical_key,
         )?;
         let heads = current.heads().collect::<Vec<_>>();
-        match resolution {
-            Some(expected) => {
+        match (reservation, resolution) {
+            (Some(_), Some(expected)) => {
                 if expected.control_policy() != policy
                     || current != *expected
                     || heads.len() < 2
@@ -8298,7 +8483,7 @@ impl Store {
                     return Err(StoreError::RecordProjectionPlanChanged);
                 }
             }
-            None => {
+            (Some(_), None) => {
                 let observed_heads = heads
                     .iter()
                     .filter(|head| {
@@ -8312,6 +8497,14 @@ impl Store {
                 if observed_heads >= 2 {
                     return Err(StoreError::RecordConflictRequiresResolution);
                 }
+            }
+            // A replicated revision is already a source-authenticated immutable
+            // fact. Ingest retains it and recomputes structural heads; it does
+            // not execute or attempt to reconstruct the publisher's local merge
+            // callback/intent guard.
+            (None, None) => {}
+            (None, Some(_)) => {
+                return Err(StoreError::RecordProjectionPlanChanged);
             }
         }
 
@@ -8387,12 +8580,14 @@ impl Store {
             });
         }
 
-        let current_counter = write
-            .open_table(PUBLISHER_HIGH_WATER)?
-            .get(reservation.publisher.as_slice())?
-            .map_or(0, |value| value.value());
-        if current_counter != reservation.previous_counter {
-            return Err(StoreError::RecordReservationChanged);
+        if let Some(reservation) = reservation {
+            let current_counter = write
+                .open_table(PUBLISHER_HIGH_WATER)?
+                .get(reservation.publisher.as_slice())?
+                .map_or(0, |value| value.value());
+            if current_counter != reservation.previous_counter {
+                return Err(StoreError::RecordReservationChanged);
+            }
         }
         let dot_key = accepted_dot_key(prepared.header.stamp.dot);
         if let Some(accepted) = write
@@ -26828,5 +27023,149 @@ mod tests {
                 ))
             ));
         }
+    }
+
+    #[test]
+    fn remote_state_ingest_is_policy_bound_idempotent_and_inventory_typed() {
+        let origin_file = TestFile::new("remote State origin");
+        let receiver_file = TestFile::new("remote State receiver");
+        let mut services = state_services(0xe1);
+        let origin =
+            Store::open_for_mission(&origin_file.0, services.authority).expect("State origin");
+        let receiver =
+            Store::open_for_mission(&receiver_file.0, services.authority).expect("State receiver");
+        let origin_policy = origin.control_policy_snapshot().expect("origin policy");
+        let reservation = origin
+            .reserve_state_with_policy(
+                &origin_policy,
+                services.first.identity(),
+                &state_topic(),
+                &state_scope(),
+            )
+            .expect("origin reservation");
+        let (state, sealed, _) = reserved_state(
+            &mut services.first,
+            &mut services.reader,
+            &reservation,
+            b"asset/network-state",
+            b"ready",
+            false,
+            1,
+        );
+        origin
+            .commit_reserved_state_with_policy(&origin_policy, &reservation, &state, &sealed)
+            .expect("origin commit");
+
+        let receiver_policy = receiver.control_policy_snapshot().expect("receiver policy");
+        let inserted = receiver
+            .apply_verified_state_with_policy(&receiver_policy, &state, &sealed)
+            .expect("remote State insert");
+        assert!(inserted.inserted());
+        let duplicate = receiver
+            .apply_verified_state_with_policy(&receiver_policy, &state, &sealed)
+            .expect("remote State replay");
+        assert!(!duplicate.inserted());
+        let inventory = receiver
+            .state_inventory_with_policy(&receiver_policy)
+            .expect("State inventory");
+        assert_eq!(inventory.len(), 1);
+        assert_eq!(
+            inventory.iter().copied().collect::<Vec<_>>(),
+            vec![StateTransferId::new(state.envelope_id())]
+        );
+        assert_eq!(inventory.reconciliation_snapshot().len(), 1);
+    }
+
+    #[test]
+    fn remote_record_ingest_preserves_disconnected_siblings_without_merge_code() {
+        let first_file = TestFile::new("remote Record first origin");
+        let second_file = TestFile::new("remote Record second origin");
+        let receiver_file = TestFile::new("remote Record receiver");
+        let mut services = state_services(0xe2);
+        let first =
+            Store::open_for_mission(&first_file.0, services.authority).expect("first origin");
+        let second =
+            Store::open_for_mission(&second_file.0, services.authority).expect("second origin");
+        let receiver =
+            Store::open_for_mission(&receiver_file.0, services.authority).expect("Record receiver");
+        let first_policy = first.control_policy_snapshot().expect("first policy");
+        let second_policy = second.control_policy_snapshot().expect("second policy");
+        let first_reservation = first
+            .reserve_record_with_policy(
+                &first_policy,
+                services.first.identity(),
+                &state_topic(),
+                &state_scope(),
+            )
+            .expect("first reservation");
+        let second_reservation = second
+            .reserve_record_with_policy(
+                &second_policy,
+                services.second.identity(),
+                &state_topic(),
+                &state_scope(),
+            )
+            .expect("second reservation");
+        let (first_record, first_sealed, _) = reserved_record(
+            &mut services.first,
+            &mut services.reader,
+            &first_reservation,
+            b"asset/network-record",
+            b"alpha",
+            false,
+            1,
+        );
+        let (second_record, second_sealed, _) = reserved_record(
+            &mut services.second,
+            &mut services.reader,
+            &second_reservation,
+            b"asset/network-record",
+            b"bravo",
+            false,
+            1,
+        );
+        first
+            .commit_reserved_record_with_policy(
+                &first_policy,
+                &first_reservation,
+                &first_record,
+                &first_sealed,
+            )
+            .expect("first origin commit");
+        second
+            .commit_reserved_record_with_policy(
+                &second_policy,
+                &second_reservation,
+                &second_record,
+                &second_sealed,
+            )
+            .expect("second origin commit");
+
+        let receiver_policy = receiver.control_policy_snapshot().expect("receiver policy");
+        receiver
+            .apply_verified_record_with_policy(&receiver_policy, &second_record, &second_sealed)
+            .expect("second remote revision");
+        receiver
+            .apply_verified_record_with_policy(&receiver_policy, &first_record, &first_sealed)
+            .expect("first remote revision");
+        let duplicate = receiver
+            .apply_verified_record_with_policy(&receiver_policy, &first_record, &first_sealed)
+            .expect("remote Record replay");
+        assert!(!duplicate.inserted());
+
+        let plan = receiver
+            .prepare_record_projection_with_policy(
+                &receiver_policy,
+                &state_topic(),
+                &state_scope(),
+                b"asset/network-record",
+            )
+            .expect("Record conflict projection");
+        assert_eq!(plan.heads().count(), 2);
+        let inventory = receiver
+            .record_inventory_with_policy(&receiver_policy)
+            .expect("Record inventory");
+        assert_eq!(inventory.len(), 2);
+        assert_eq!(inventory.reconciliation_snapshot().len(), 2);
     }
 }
