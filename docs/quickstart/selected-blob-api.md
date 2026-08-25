@@ -7,7 +7,7 @@ source-authenticated publication, and streams the freshly verified bytes back
 to a caller-owned output.
 
 This first Blob slice is deliberately stopped and local. It does not put Blob
-on the Event-only reconciliation wire and has no live handle, subscription,
+on the selected Event/State/Record reconciliation wire and has no live handle, subscription,
 relay, remote chunk transfer, or language binding. The example demonstrates
 local durability, bounded-memory streaming, and exact retry—not mesh delivery,
 any-peer resume, physical sanitization, or acceptance completion.

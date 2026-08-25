@@ -24,9 +24,11 @@ use std::os::unix::{
 
 use aster_iroh::{CarrierError, Endpoint, EndpointConfig, EndpointId, ExpectedPeer};
 use aster_mesh::{
-    EventContentVerification, NodeId, Priority, ProvisioningAccess, ReferenceEnvelopeSealer,
-    ReferenceProvisioner, RouteVerifiedEventEnvelope, Scope, ScopeRekeyRecipient, Topic,
-    VerifiedControlEnvelope, VerifiedControlKind, engine::EnvelopeError,
+    EventContentVerification, NodeId, Priority, ProvisioningAccess, RecordContentVerification,
+    ReferenceEnvelopeSealer, ReferenceProvisioner, RouteVerifiedEventEnvelope,
+    RouteVerifiedRecordEnvelope, RouteVerifiedStateEnvelope, Scope, ScopeRekeyRecipient,
+    StateContentVerification, Topic, VerifiedControlEnvelope, VerifiedControlKind,
+    engine::EnvelopeError,
 };
 use aster_negentropy::{
     Difference, Initiator, InitiatorStep, ReconciliationError, ReconciliationLimits, Responder,
@@ -36,9 +38,10 @@ use aster_redb_store::{
     ControlOutcome, ControlPolicySnapshot, ControlRejectionReason, ControlTransferId,
     EventOnceOutcome, EventOperationKey, EventReplicationPolicySnapshot, EventSemanticId,
     EventSubscriptionKey, EventSubscriptionMode, EventSubscriptionSpec, EventTransferId,
-    MAX_EVENT_PAGE, RejectedControl, RouteCacheOutcome, ScopeRekeyPublicationIntent, Store,
-    StoreBackingIdentity, StoreError, StoreInspection, StoreZeroizationState, StoredControl,
-    StoredControlEffect, StoredEvent, StoredEventTransfer, ZeroizationArtifact, ZeroizationIntent,
+    MAX_EVENT_PAGE, RecordTransferId, RejectedControl, RouteCacheOutcome,
+    ScopeRekeyPublicationIntent, StateTransferId, Store, StoreBackingIdentity, StoreError,
+    StoreInspection, StoreZeroizationState, StoredControl, StoredControlEffect, StoredEvent,
+    StoredEventTransfer, StoredRecord, StoredState, ZeroizationArtifact, ZeroizationIntent,
     ZeroizationStore,
 };
 #[cfg(unix)]
@@ -61,7 +64,10 @@ use crate::{
         runtime_application_error,
     },
     format_node_id, format_path_field, format_receipt_field,
-    frame::{EventDirection, EventInterest, EventInterestSelector, Frame, MAX_OBJECT_BYTES},
+    frame::{
+        EventDirection, EventInterest, EventInterestSelector, Frame, MAX_OBJECT_BYTES,
+        MutableClass, MutableTransferId,
+    },
     mission::{
         MissionHandshakeReceipt, MissionPeerBinding, MissionProvisioningError, MissionSession,
         MissionSessionError, PreparedIdentityErasure, PreparedMissionErasure,
@@ -213,6 +219,73 @@ impl FromStr for MissionExpectedPeer {
     }
 }
 
+/// One topic/scope receive selector for a mutable source-object class.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceInterestSelector {
+    topic: Topic,
+    scope: Scope,
+    include_descendant_scopes: bool,
+}
+
+impl SourceInterestSelector {
+    /// Creates one exact topic/scope selector for State or Record replication.
+    pub const fn new(topic: Topic, scope: Scope, include_descendant_scopes: bool) -> Self {
+        Self {
+            topic,
+            scope,
+            include_descendant_scopes,
+        }
+    }
+
+    /// Returns the exact selected topic.
+    pub const fn topic(&self) -> &Topic {
+        &self.topic
+    }
+
+    /// Returns the selected scope root.
+    pub const fn scope(&self) -> &Scope {
+        &self.scope
+    }
+
+    /// Reports whether descendant scopes are included.
+    pub const fn include_descendant_scopes(&self) -> bool {
+        self.include_descendant_scopes
+    }
+}
+
+/// Explicit class-separated receive interests for mutable source objects.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MutableSourceInterests {
+    state: Vec<SourceInterestSelector>,
+    record: Vec<SourceInterestSelector>,
+}
+
+impl MutableSourceInterests {
+    /// Creates explicit State and Record selector sets. Empty means receive none.
+    pub fn new(state: Vec<SourceInterestSelector>, record: Vec<SourceInterestSelector>) -> Self {
+        Self { state, record }
+    }
+
+    fn for_class(&self, class: MutableClass) -> Result<EventInterest, NodeError> {
+        let selectors = match class {
+            MutableClass::State => &self.state,
+            MutableClass::Record => &self.record,
+        };
+        EventInterest::new(
+            selectors
+                .iter()
+                .map(|selector| {
+                    EventInterestSelector::new(
+                        selector.topic.clone(),
+                        selector.scope.clone(),
+                        selector.include_descendant_scopes,
+                    )
+                })
+                .collect(),
+        )
+    }
+}
+
 /// One selected-stack node process configuration.
 #[derive(Clone, Debug)]
 pub struct NodeConfig {
@@ -224,6 +297,8 @@ pub struct NodeConfig {
     pub mission: UnprotectedReferenceMission,
     /// Exact manually admitted carrier-to-mission peer bindings.
     pub peers: Vec<MissionExpectedPeer>,
+    /// Explicit class-separated State and Record receive interests.
+    pub mutable_interests: MutableSourceInterests,
     /// Delay between bounded contacts.
     pub sync_interval: Duration,
     /// Optional process lifetime, primarily for deterministic orchestration.
@@ -2584,6 +2659,272 @@ fn accept_received_transfer(
     }
 }
 
+fn verify_stored_state_claim(
+    verified: &RouteVerifiedStateEnvelope,
+    stored: &StoredState,
+) -> Result<(), NodeError> {
+    if StateTransferId::new(verified.envelope_id()) != stored.transfer_id
+        || verified.item_id() != *stored.semantic_id.as_bytes()
+        || verified.header() != &stored.header
+    {
+        return Err(NodeError::Protocol(
+            "persisted State claim differs from fresh source authentication".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn verify_stored_record_claim(
+    verified: &RouteVerifiedRecordEnvelope,
+    stored: &StoredRecord,
+) -> Result<(), NodeError> {
+    if RecordTransferId::new(verified.envelope_id()) != stored.transfer_id
+        || verified.item_id() != *stored.semantic_id.as_bytes()
+        || verified.header() != &stored.header
+    {
+        return Err(NodeError::Protocol(
+            "persisted Record claim differs from fresh source authentication".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_mutable_active(
+    store: &Store,
+    publisher: NodeId,
+    scope: &Scope,
+    key_epoch: u64,
+) -> Result<(), NodeError> {
+    if let Some((current, _)) = store.active_scope_epoch(scope)?
+        && key_epoch < current
+    {
+        return Err(NodeError::Protocol(format!(
+            "mutable source-object key epoch {key_epoch} is stale behind active scope epoch {current}"
+        )));
+    }
+    ensure_principal_active(store, publisher)
+}
+
+fn load_verified_mutable(
+    store: &Store,
+    _policy: &ControlPolicySnapshot,
+    verifier: &mut ReferenceEnvelopeSealer,
+    id: MutableTransferId,
+) -> Result<(Topic, Scope, NodeId, u64, Vec<u8>), NodeError> {
+    match id {
+        MutableTransferId::State(id) => {
+            let stored = store.get_state(id)?.ok_or_else(|| {
+                NodeError::Protocol("authorized State transfer is missing".into())
+            })?;
+            let verified = verifier.verify_state(&stored.sealed)?;
+            verify_stored_state_claim(&verified, &stored)?;
+            ensure_mutable_active(
+                store,
+                verified.publisher(),
+                verified.scope(),
+                verified.key_epoch(),
+            )?;
+            Ok((
+                verified.topic().clone(),
+                verified.scope().clone(),
+                verified.publisher(),
+                verified.key_epoch(),
+                stored.sealed,
+            ))
+        }
+        MutableTransferId::Record(id) => {
+            let stored = store.get_record(id)?.ok_or_else(|| {
+                NodeError::Protocol("authorized Record transfer is missing".into())
+            })?;
+            let verified = verifier.verify_record(&stored.sealed)?;
+            verify_stored_record_claim(&verified, &stored)?;
+            ensure_mutable_active(
+                store,
+                verified.publisher(),
+                verified.scope(),
+                verified.key_epoch(),
+            )?;
+            Ok((
+                verified.topic().clone(),
+                verified.scope().clone(),
+                verified.publisher(),
+                verified.key_epoch(),
+                stored.sealed,
+            ))
+        }
+    }
+}
+
+fn mutable_inventory(
+    store: &Store,
+    policy: &ControlPolicySnapshot,
+    verifier: &mut ReferenceEnvelopeSealer,
+    class: MutableClass,
+    interest: &EventInterest,
+    peer: Option<(NodeId, &[[u8; 32]])>,
+) -> Result<InventorySnapshot, NodeError> {
+    if interest.is_empty() {
+        return Ok(InventorySnapshot::default());
+    }
+    let ids = match class {
+        MutableClass::State => store
+            .state_inventory_with_policy(policy)?
+            .iter()
+            .copied()
+            .map(MutableTransferId::State)
+            .collect::<Vec<_>>(),
+        MutableClass::Record => store
+            .record_inventory_with_policy(policy)?
+            .iter()
+            .copied()
+            .map(MutableTransferId::Record)
+            .collect::<Vec<_>>(),
+    };
+    let mut authorized = Vec::new();
+    for id in ids {
+        let (topic, scope, _, epoch, sealed) = load_verified_mutable(store, policy, verifier, id)?;
+        if !interest.matches(&topic, &scope) {
+            continue;
+        }
+        if let Some((peer, commitments)) = peer {
+            if !verifier.peer_can_route(peer, commitments, &scope, epoch) {
+                continue;
+            }
+        } else {
+            let content_authorized = match id {
+                MutableTransferId::State(_) => {
+                    verifier.can_open_state_content(&scope, &topic, epoch)
+                }
+                MutableTransferId::Record(_) => {
+                    verifier.can_open_record_content(&scope, &topic, epoch)
+                }
+            };
+            if !content_authorized {
+                continue;
+            }
+        }
+        let item = match id {
+            MutableTransferId::State(id) => id.reconciliation_item_id(),
+            MutableTransferId::Record(id) => id.reconciliation_item_id(),
+        };
+        // Keep the exact sealed bytes freshly authenticated even though only
+        // the typed digest enters reconciliation.
+        if sealed.len() > MAX_OBJECT_BYTES {
+            return Err(NodeError::Protocol(
+                "mutable source object exceeds the transfer bound".into(),
+            ));
+        }
+        authorized.push(item);
+    }
+    Ok(InventorySnapshot::new(authorized))
+}
+
+fn load_verified_mutable_for_peer(
+    store: &Store,
+    policy: &ControlPolicySnapshot,
+    verifier: &mut ReferenceEnvelopeSealer,
+    id: MutableTransferId,
+    peer: NodeId,
+    commitments: &[[u8; 32]],
+    interest: &EventInterest,
+) -> Result<Vec<u8>, NodeError> {
+    let (topic, scope, _, epoch, sealed) = load_verified_mutable(store, policy, verifier, id)?;
+    if !interest.matches(&topic, &scope) {
+        return Err(NodeError::Protocol(
+            "outbound mutable source object is outside the protected receive interest".into(),
+        ));
+    }
+    if !verifier.peer_can_route(peer, commitments, &scope, epoch) {
+        return Err(NodeError::Protocol(
+            "authenticated peer lacks the mutable source-object route grant".into(),
+        ));
+    }
+    Ok(sealed)
+}
+
+#[derive(Clone, Copy)]
+struct MutablePeerAdmission<'a> {
+    peer: NodeId,
+    commitments: &'a [[u8; 32]],
+    interest: &'a EventInterest,
+}
+
+fn accept_received_mutable(
+    store: &Store,
+    policy: &ControlPolicySnapshot,
+    verifier: &mut ReferenceEnvelopeSealer,
+    admission: MutablePeerAdmission<'_>,
+    id: MutableTransferId,
+    sealed: &[u8],
+) -> Result<bool, NodeError> {
+    match id {
+        MutableTransferId::State(expected) => {
+            let route = verifier.verify_state(sealed)?;
+            if StateTransferId::new(route.envelope_id()) != expected {
+                return Err(NodeError::Protocol(
+                    "received State bytes differ from their typed transfer identity".into(),
+                ));
+            }
+            ensure_mutable_active(store, route.publisher(), route.scope(), route.key_epoch())?;
+            if !admission.interest.matches(route.topic(), route.scope()) {
+                return Err(NodeError::Protocol(
+                    "received State is outside the protected receive interest".into(),
+                ));
+            }
+            if !verifier.peer_can_route(
+                admission.peer,
+                admission.commitments,
+                route.scope(),
+                route.key_epoch(),
+            ) {
+                return Err(NodeError::Protocol(
+                    "authenticated peer lacks the received State route grant".into(),
+                ));
+            }
+            match verifier.verify_state_content(route, sealed)? {
+                StateContentVerification::ContentVerified { state, .. } => Ok(store
+                    .apply_verified_state_with_policy(policy, &state, sealed)?
+                    .inserted()),
+                StateContentVerification::RouteOnly(_) => Err(NodeError::Protocol(
+                    "State receive interest lacks a content grant".into(),
+                )),
+            }
+        }
+        MutableTransferId::Record(expected) => {
+            let route = verifier.verify_record(sealed)?;
+            if RecordTransferId::new(route.envelope_id()) != expected {
+                return Err(NodeError::Protocol(
+                    "received Record bytes differ from their typed transfer identity".into(),
+                ));
+            }
+            ensure_mutable_active(store, route.publisher(), route.scope(), route.key_epoch())?;
+            if !admission.interest.matches(route.topic(), route.scope()) {
+                return Err(NodeError::Protocol(
+                    "received Record is outside the protected receive interest".into(),
+                ));
+            }
+            if !verifier.peer_can_route(
+                admission.peer,
+                admission.commitments,
+                route.scope(),
+                route.key_epoch(),
+            ) {
+                return Err(NodeError::Protocol(
+                    "authenticated peer lacks the received Record route grant".into(),
+                ));
+            }
+            match verifier.verify_record_content(route, sealed)? {
+                RecordContentVerification::ContentVerified { record, .. } => Ok(store
+                    .apply_verified_record_with_policy(policy, &record, sealed)?
+                    .inserted()),
+                RecordContentVerification::RouteOnly(_) => Err(NodeError::Protocol(
+                    "Record receive interest lacks a content grant".into(),
+                )),
+            }
+        }
+    }
+}
+
 fn format_transfer_id(id: EventTransferId) -> String {
     format_digest(id.as_bytes())
 }
@@ -3333,6 +3674,9 @@ fn validate_node_config(config: &NodeConfig) -> Result<BTreeMap<EndpointId, Node
             config.peers.len()
         )));
     }
+    for class in [MutableClass::State, MutableClass::Record] {
+        config.mutable_interests.for_class(class)?;
+    }
     let allowed = config
         .peers
         .iter()
@@ -3573,7 +3917,7 @@ async fn run_node_actor_inner(
         .collect::<Vec<_>>()
         .join(",");
     println!(
-        "READY selected=true pid={} carrier_id={} mission_id={} mission_authority={} sockets={} state={} peers={} application={} mission_auth=hybrid-pq provisioning=unprotected-reference semantics=source-authenticated-event controls=source-authenticated-flash commit_before_activate=true content_admission=capability-gated",
+        "READY selected=true pid={} carrier_id={} mission_id={} mission_authority={} sockets={} state={} peers={} application={} mission_auth=hybrid-pq provisioning=unprotected-reference semantics=source-authenticated-event reconciliation_classes=event,state,record controls=source-authenticated-flash commit_before_activate=true content_admission=capability-gated",
         std::process::id(),
         local_id,
         format_node_id(config.mission.identity()),
@@ -3816,6 +4160,7 @@ async fn run_node_actor_inner(
                     let policy_lock = policy_lock.clone();
                     let peer = *peer;
                     let mission = config.mission.clone();
+                    let mutable_interests = config.mutable_interests.clone();
                     let task = outbound.spawn(async move {
                         (
                             peer,
@@ -3825,6 +4170,7 @@ async fn run_node_actor_inner(
                                 mission,
                                 peer,
                                 policy_lock,
+                                mutable_interests,
                             )
                             .await,
                         )
@@ -3877,6 +4223,7 @@ async fn run_node_actor_inner(
                         let store = store.clone();
                         let policy_lock = policy_lock.clone();
                         let mission = config.mission.clone();
+                        let mutable_interests = config.mutable_interests.clone();
                         let mission_peer = peer_missions
                             .get(&peer)
                             .copied()
@@ -3890,6 +4237,7 @@ async fn run_node_actor_inner(
                                     mission,
                                     MissionPeerBinding::new(peer, mission_peer),
                                     policy_lock,
+                                    mutable_interests,
                                 )
                                 .await,
                             )
@@ -3929,7 +4277,7 @@ async fn run_node_actor_inner(
                         }
                         receipt.contacts += 1;
                         println!(
-                            "CONTACT direction=in carrier_peer={} mission_peer={} rounds={} control_offered={} control_fetched={} control_retained={} control_duplicates={} control_activated={} control_remaining={} offered={} fetched={} inserted={} duplicates={} remaining={} handshake_frames={} handshake_bytes={} protected_frames={} protected_bytes={} mission_auth=hybrid-pq semantics=source-authenticated-event controls=source-authenticated-flash content_admission=capability-gated status={}",
+                            "CONTACT direction=in carrier_peer={} mission_peer={} rounds={} control_offered={} control_fetched={} control_retained={} control_duplicates={} control_activated={} control_remaining={} offered={} fetched={} inserted={} duplicates={} remaining={} handshake_frames={} handshake_bytes={} protected_frames={} protected_bytes={} mission_auth=hybrid-pq semantics=source-authenticated-event reconciliation_classes=event,state,record controls=source-authenticated-flash content_admission=capability-gated status={}",
                             peer,
                             format_node_id(server_receipt.mission_peer.expect("successful mission contact has peer identity")),
                             server_receipt.rounds,
@@ -3989,7 +4337,7 @@ async fn run_node_actor_inner(
                         }
                         receipt.contacts += 1;
                         println!(
-                            "CONTACT direction=out carrier_peer={} mission_peer={} rounds={} control_offered={} control_fetched={} control_retained={} control_duplicates={} control_activated={} control_remaining={} offered={} fetched={} inserted={} duplicates={} remaining={} handshake_frames={} handshake_bytes={} protected_frames={} protected_bytes={} mission_auth=hybrid-pq semantics=source-authenticated-event controls=source-authenticated-flash content_admission=capability-gated status={}",
+                            "CONTACT direction=out carrier_peer={} mission_peer={} rounds={} control_offered={} control_fetched={} control_retained={} control_duplicates={} control_activated={} control_remaining={} offered={} fetched={} inserted={} duplicates={} remaining={} handshake_frames={} handshake_bytes={} protected_frames={} protected_bytes={} mission_auth=hybrid-pq semantics=source-authenticated-event reconciliation_classes=event,state,record controls=source-authenticated-flash content_admission=capability-gated status={}",
                             peer.carrier.id,
                             format_node_id(peer_receipt.mission_peer.expect("successful mission contact has peer identity")),
                             peer_receipt.rounds,
@@ -4165,7 +4513,7 @@ async fn run_node_actor_inner(
         "contacts_observed"
     };
     println!(
-        "STOP lifecycle=complete sync_status={} carrier_id={} mission_id={} contacts={} contact_errors={} opaque_items={} opaque_acceptance_markers={} events={} event_acceptance_markers={} route_cached_events={} controls={} applied_controls={} pending_controls={} control_highwater={} mission_auth=hybrid-pq provisioning=unprotected-reference semantics=source-authenticated-event controls_semantics=source-authenticated-flash",
+        "STOP lifecycle=complete sync_status={} carrier_id={} mission_id={} contacts={} contact_errors={} opaque_items={} opaque_acceptance_markers={} events={} event_acceptance_markers={} route_cached_events={} controls={} applied_controls={} pending_controls={} control_highwater={} mission_auth=hybrid-pq provisioning=unprotected-reference semantics=source-authenticated-event reconciliation_classes=event,state,record controls_semantics=source-authenticated-flash",
         sync_status,
         local_id,
         format_node_id(config.mission.identity()),
@@ -4194,11 +4542,16 @@ async fn sync_once(
     mission: UnprotectedReferenceMission,
     peer: MissionExpectedPeer,
 ) -> Result<PeerReceipt, NodeError> {
-    Ok(
-        sync_once_with_policy(store, endpoint, mission, peer, Arc::new(RwLock::new(())))
-            .await?
-            .receipt,
+    Ok(sync_once_with_policy(
+        store,
+        endpoint,
+        mission,
+        peer,
+        Arc::new(RwLock::new(())),
+        MutableSourceInterests::default(),
     )
+    .await?
+    .receipt)
 }
 
 async fn sync_once_with_policy(
@@ -4207,10 +4560,18 @@ async fn sync_once_with_policy(
     mission: UnprotectedReferenceMission,
     peer: MissionExpectedPeer,
     policy_lock: Arc<RwLock<()>>,
+    mutable_interests: MutableSourceInterests,
 ) -> Result<CompletedPeerContact, NodeError> {
     timeout(
         CONTACT_DEADLINE,
-        sync_session(store, endpoint, mission, peer, policy_lock),
+        sync_session(
+            store,
+            endpoint,
+            mission,
+            peer,
+            policy_lock,
+            mutable_interests,
+        ),
     )
     .await
     .map_err(|_| NodeError::Protocol("contact exceeded its total deadline".into()))?
@@ -4222,10 +4583,18 @@ async fn sync_session(
     credentials: UnprotectedReferenceMission,
     peer: MissionExpectedPeer,
     policy_lock: Arc<RwLock<()>>,
+    mutable_interests: MutableSourceInterests,
 ) -> Result<CompletedPeerContact, NodeError> {
     let connection = endpoint.connect(peer.carrier).await?;
-    let result =
-        sync_authenticated_session(store, &connection, credentials, peer, policy_lock).await;
+    let result = sync_authenticated_session(
+        store,
+        &connection,
+        credentials,
+        peer,
+        policy_lock,
+        &mutable_interests,
+    )
+    .await;
     if result.is_err() {
         connection.close();
     }
@@ -4712,12 +5081,434 @@ async fn sync_event_transfer_lane(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct DirectedMutableLane<'a> {
+    guard: &'a EventLaneGuard,
+    receiver_interest: &'a EventInterest,
+    class: MutableClass,
+    direction: EventDirection,
+}
+
+#[derive(Clone, Copy)]
+struct MutableClassContact<'a> {
+    guard: &'a EventLaneGuard,
+    interests: &'a MutableSourceInterests,
+    class: MutableClass,
+}
+
+#[derive(Debug)]
+struct MutableDifference {
+    local_only: Vec<MutableTransferId>,
+    remote_only: Vec<MutableTransferId>,
+}
+
+impl MutableDifference {
+    fn from_reconciliation(class: MutableClass, difference: Difference) -> Self {
+        let convert = |id| match class {
+            MutableClass::State => {
+                MutableTransferId::State(StateTransferId::from_reconciliation_item_id(id))
+            }
+            MutableClass::Record => {
+                MutableTransferId::Record(RecordTransferId::from_reconciliation_item_id(id))
+            }
+        };
+        Self {
+            local_only: difference.local_only.into_iter().map(convert).collect(),
+            remote_only: difference.remote_only.into_iter().map(convert).collect(),
+        }
+    }
+}
+
+async fn sync_mutable_interests(
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    class: MutableClass,
+    local_interest: &EventInterest,
+    receipt: &mut PeerReceipt,
+) -> Result<EventInterest, NodeError> {
+    let response = request_mission_frame(
+        connection,
+        mission,
+        Frame::MutableInterest {
+            class,
+            interest: local_interest.clone(),
+        },
+        receipt,
+    )
+    .await?;
+    let Frame::MutableInterestReply {
+        class: response_class,
+        interest: peer_interest,
+    } = response
+    else {
+        return Err(NodeError::Protocol(
+            "mutable interest request received another response".into(),
+        ));
+    };
+    if response_class != class {
+        return Err(NodeError::Protocol(
+            "mutable interest reply crossed data classes".into(),
+        ));
+    }
+    Ok(peer_interest)
+}
+
+async fn sync_mutable_reconciliation_lane(
+    store: &Store,
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    verifier: &mut ReferenceEnvelopeSealer,
+    lane: DirectedMutableLane<'_>,
+    receipt: &mut PeerReceipt,
+) -> Result<MutableDifference, NodeError> {
+    let DirectedMutableLane {
+        guard,
+        receiver_interest,
+        class,
+        direction,
+    } = lane;
+    guard.check(store)?;
+    let inventory = match direction {
+        EventDirection::ToSessionResponder => mutable_inventory(
+            store,
+            guard.policy(),
+            verifier,
+            class,
+            receiver_interest,
+            Some((
+                mission.peer().mission_id(),
+                mission.peer_route_grant_commitments(),
+            )),
+        )?,
+        EventDirection::ToSessionInitiator => mutable_inventory(
+            store,
+            guard.policy(),
+            verifier,
+            class,
+            receiver_interest,
+            None,
+        )?,
+    };
+    let limits = ReconciliationLimits::default();
+    let mut initiator = Initiator::new(&inventory, limits)?;
+    let mut query = initiator.initiate()?;
+    let difference = loop {
+        guard.check(store)?;
+        let response = request_mission_frame(
+            connection,
+            mission,
+            Frame::MutableInventoryQuery {
+                class,
+                direction,
+                bytes: query,
+            },
+            receipt,
+        )
+        .await?;
+        let Frame::MutableInventoryReply {
+            class: response_class,
+            direction: response_direction,
+            bytes: response,
+        } = response
+        else {
+            return Err(NodeError::Protocol(
+                "mutable inventory query received another response".into(),
+            ));
+        };
+        if response_class != class || response_direction != direction {
+            return Err(NodeError::Protocol(
+                "mutable inventory reply crossed classes or directions".into(),
+            ));
+        }
+        match initiator.reconcile_response(&response)? {
+            InitiatorStep::Continue(next) => query = next,
+            InitiatorStep::Complete(difference) => {
+                break MutableDifference::from_reconciliation(class, difference);
+            }
+        }
+    };
+    let first_rounds = initiator.rounds();
+    guard.check(store)?;
+    if request_mission_frame(
+        connection,
+        mission,
+        Frame::MutableInventoryComplete { class, direction },
+        receipt,
+    )
+    .await?
+        != (Frame::MutableInventoryCompleteAck { class, direction })
+    {
+        return Err(NodeError::Protocol(
+            "mutable inventory completion acknowledgement differs".into(),
+        ));
+    }
+
+    let mut reverse = Responder::new(&inventory, limits)?;
+    loop {
+        guard.check(store)?;
+        let wire_budget = exchange_wire_budget(receipt)?;
+        let (complete, request_bytes, response_bytes) =
+            respond_mission_frame(connection, mission, wire_budget, |frame, _| match frame {
+                Frame::MutableDifferenceQuery {
+                    class: request_class,
+                    direction: request_direction,
+                    bytes,
+                } if request_class == class && request_direction == direction => Ok((
+                    Frame::MutableDifferenceReply {
+                        class,
+                        direction,
+                        bytes: reverse.reconcile_query(&bytes)?,
+                    },
+                    false,
+                )),
+                Frame::MutableDifferenceBound {
+                    class: request_class,
+                    direction: request_direction,
+                } if request_class == class
+                    && request_direction == direction
+                    && reverse.rounds() > 0 =>
+                {
+                    Ok((Frame::MutableDifferenceBoundAck { class, direction }, true))
+                }
+                Frame::MutableDifferenceBound { .. } => Err(NodeError::Protocol(
+                    "mutable difference bound preceded reconciliation or crossed lanes".into(),
+                )),
+                _ => Err(NodeError::Protocol(
+                    "mutable reverse reconciliation received an out-of-phase frame".into(),
+                )),
+            })
+            .await?;
+        account(receipt, request_bytes, response_bytes)?;
+        if complete {
+            break;
+        }
+    }
+    receipt.rounds = receipt
+        .rounds
+        .checked_add(first_rounds)
+        .and_then(|rounds| rounds.checked_add(reverse.rounds()))
+        .ok_or_else(|| NodeError::Protocol("combined round count overflow".into()))?;
+    Ok(difference)
+}
+
+async fn sync_mutable_transfer_lane(
+    store: &Store,
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    verifier: &mut ReferenceEnvelopeSealer,
+    lane: DirectedMutableLane<'_>,
+    difference: &MutableDifference,
+    receipt: &mut PeerReceipt,
+) -> Result<(), NodeError> {
+    let DirectedMutableLane {
+        guard,
+        receiver_interest,
+        class,
+        direction,
+    } = lane;
+    let peer = mission.peer().mission_id();
+    let commitments = mission.peer_route_grant_commitments().to_vec();
+    let capacity = event_transfer_capacity(receipt)?;
+    match direction {
+        EventDirection::ToSessionResponder => {
+            let limit = difference.local_only.len().min(capacity);
+            add_unscheduled_events(receipt, difference.local_only.len() - limit)?;
+            for id in difference.local_only.iter().take(limit).copied() {
+                if id.class() != class {
+                    return Err(NodeError::Protocol(
+                        "mutable difference contains another data class".into(),
+                    ));
+                }
+                guard.check(store)?;
+                let bytes = load_verified_mutable_for_peer(
+                    store,
+                    guard.policy(),
+                    verifier,
+                    id,
+                    peer,
+                    &commitments,
+                    receiver_interest,
+                )?;
+                let response = request_mission_frame(
+                    connection,
+                    mission,
+                    Frame::MutableOffer {
+                        direction,
+                        id,
+                        bytes,
+                    },
+                    receipt,
+                )
+                .await?;
+                let Frame::MutableApplyResult {
+                    direction: response_direction,
+                    id: applied,
+                    inserted,
+                } = response
+                else {
+                    return Err(NodeError::Protocol(
+                        "mutable offer acknowledgement differs".into(),
+                    ));
+                };
+                if response_direction != direction || applied != id {
+                    return Err(NodeError::Protocol(
+                        "mutable offer acknowledgement crossed lanes".into(),
+                    ));
+                }
+                receipt.offered += 1;
+                if !inserted {
+                    receipt.duplicates += 1;
+                }
+            }
+        }
+        EventDirection::ToSessionInitiator => {
+            let limit = difference.remote_only.len().min(capacity);
+            add_unscheduled_events(receipt, difference.remote_only.len() - limit)?;
+            for id in difference.remote_only.iter().take(limit).copied() {
+                if id.class() != class {
+                    return Err(NodeError::Protocol(
+                        "mutable difference contains another data class".into(),
+                    ));
+                }
+                guard.check(store)?;
+                let response = request_mission_frame(
+                    connection,
+                    mission,
+                    Frame::MutableFetch { direction, id },
+                    receipt,
+                )
+                .await?;
+                let Frame::MutableObject {
+                    direction: response_direction,
+                    id: received,
+                    bytes,
+                } = response
+                else {
+                    return Err(NodeError::Protocol("mutable fetch response differs".into()));
+                };
+                if response_direction != direction
+                    || received != id
+                    || bytes.len() > MAX_OBJECT_BYTES
+                {
+                    return Err(NodeError::Protocol(
+                        "fetched mutable object crossed lanes or exceeded its bound".into(),
+                    ));
+                }
+                guard.check(store)?;
+                if accept_received_mutable(
+                    store,
+                    guard.policy(),
+                    verifier,
+                    MutablePeerAdmission {
+                        peer,
+                        commitments: &commitments,
+                        interest: receiver_interest,
+                    },
+                    received,
+                    &bytes,
+                )? {
+                    receipt.inserted += 1;
+                } else {
+                    receipt.duplicates += 1;
+                }
+                receipt.fetched += 1;
+            }
+        }
+    }
+    guard.check(store)?;
+    if request_mission_frame(
+        connection,
+        mission,
+        Frame::MutableFinish { class, direction },
+        receipt,
+    )
+    .await?
+        != (Frame::MutableFinished { class, direction })
+    {
+        return Err(NodeError::Protocol(
+            "mutable finish acknowledgement differs".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn sync_mutable_class(
+    store: &Store,
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    verifier: &mut ReferenceEnvelopeSealer,
+    contact: MutableClassContact<'_>,
+    receipt: &mut PeerReceipt,
+) -> Result<(), NodeError> {
+    let MutableClassContact {
+        guard,
+        interests,
+        class,
+    } = contact;
+    guard.check(store)?;
+    let local_interest = interests.for_class(class)?;
+    let peer_interest =
+        sync_mutable_interests(connection, mission, class, &local_interest, receipt).await?;
+    let to_responder = DirectedMutableLane {
+        guard,
+        receiver_interest: &peer_interest,
+        class,
+        direction: EventDirection::ToSessionResponder,
+    };
+    let difference = sync_mutable_reconciliation_lane(
+        store,
+        connection,
+        mission,
+        verifier,
+        to_responder,
+        receipt,
+    )
+    .await?;
+    sync_mutable_transfer_lane(
+        store,
+        connection,
+        mission,
+        verifier,
+        to_responder,
+        &difference,
+        receipt,
+    )
+    .await?;
+
+    let to_initiator = DirectedMutableLane {
+        guard,
+        receiver_interest: &local_interest,
+        class,
+        direction: EventDirection::ToSessionInitiator,
+    };
+    let difference = sync_mutable_reconciliation_lane(
+        store,
+        connection,
+        mission,
+        verifier,
+        to_initiator,
+        receipt,
+    )
+    .await?;
+    sync_mutable_transfer_lane(
+        store,
+        connection,
+        mission,
+        verifier,
+        to_initiator,
+        &difference,
+        receipt,
+    )
+    .await
+}
+
 async fn sync_authenticated_session(
     store: &Store,
     connection: &aster_iroh::Connection,
     credentials: UnprotectedReferenceMission,
     peer: MissionExpectedPeer,
     policy_lock: Arc<RwLock<()>>,
+    mutable_interests: &MutableSourceInterests,
 ) -> Result<CompletedPeerContact, NodeError> {
     // Mission authentication is deliberately first. No inventory bytes or
     // object operation can reach the carrier before this returns a session.
@@ -4816,6 +5607,21 @@ async fn sync_authenticated_session(
         &mut receipt,
     )
     .await?;
+    for class in [MutableClass::State, MutableClass::Record] {
+        sync_mutable_class(
+            store,
+            connection,
+            &mut mission,
+            &mut event_verifier,
+            MutableClassContact {
+                guard: &event_guard,
+                interests: mutable_interests,
+                class,
+            },
+            &mut receipt,
+        )
+        .await?;
+    }
     event_guard.check(store)?;
     let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
     connection.close();
@@ -4831,11 +5637,19 @@ async fn serve_connection(
     credentials: UnprotectedReferenceMission,
     peer: MissionPeerBinding,
     policy_lock: Arc<RwLock<()>>,
+    mutable_interests: MutableSourceInterests,
 ) -> Result<CompletedPeerContact, NodeError> {
     let close = connection.clone();
     match timeout(
         CONTACT_DEADLINE,
-        serve_session(store, connection, credentials, peer, policy_lock),
+        serve_session(
+            store,
+            connection,
+            credentials,
+            peer,
+            policy_lock,
+            mutable_interests,
+        ),
     )
     .await
     {
@@ -5322,12 +6136,427 @@ async fn serve_event_transfer_lane(
     }
 }
 
+#[derive(Debug)]
+struct MutableTransferAuthorization {
+    offers_from_peer: BTreeSet<MutableTransferId>,
+    fetches_by_peer: BTreeSet<MutableTransferId>,
+    remaining: usize,
+}
+
+impl MutableTransferAuthorization {
+    fn for_peer(
+        difference: &MutableDifference,
+        direction: EventDirection,
+        capacity: usize,
+    ) -> Self {
+        match direction {
+            EventDirection::ToSessionResponder => {
+                let limit = difference.remote_only.len().min(capacity);
+                Self {
+                    offers_from_peer: difference.remote_only.iter().take(limit).copied().collect(),
+                    fetches_by_peer: BTreeSet::new(),
+                    remaining: difference.remote_only.len() - limit,
+                }
+            }
+            EventDirection::ToSessionInitiator => {
+                let limit = difference.local_only.len().min(capacity);
+                Self {
+                    offers_from_peer: BTreeSet::new(),
+                    fetches_by_peer: difference.local_only.iter().take(limit).copied().collect(),
+                    remaining: difference.local_only.len() - limit,
+                }
+            }
+        }
+    }
+
+    fn is_consumed(&self) -> bool {
+        self.offers_from_peer.is_empty() && self.fetches_by_peer.is_empty()
+    }
+}
+
+async fn serve_mutable_interests(
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    class: MutableClass,
+    local_interest: &EventInterest,
+    receipt: &mut PeerReceipt,
+) -> Result<EventInterest, NodeError> {
+    let wire_budget = exchange_wire_budget(receipt)?;
+    let mut peer_interest = None;
+    let (_, request_bytes, response_bytes) =
+        respond_mission_frame(connection, mission, wire_budget, |frame, _| match frame {
+            Frame::MutableInterest {
+                class: request_class,
+                interest,
+            } if request_class == class => {
+                peer_interest = Some(interest);
+                Ok((
+                    Frame::MutableInterestReply {
+                        class,
+                        interest: local_interest.clone(),
+                    },
+                    true,
+                ))
+            }
+            _ => Err(NodeError::Protocol(
+                "mutable reconciliation preceded its class interest exchange".into(),
+            )),
+        })
+        .await?;
+    account(receipt, request_bytes, response_bytes)?;
+    peer_interest.ok_or_else(|| {
+        NodeError::Protocol("mutable source-object interest request disappeared".into())
+    })
+}
+
+async fn serve_mutable_reconciliation_lane(
+    store: &Store,
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    verifier: &mut ReferenceEnvelopeSealer,
+    lane: DirectedMutableLane<'_>,
+    receipt: &mut PeerReceipt,
+) -> Result<MutableDifference, NodeError> {
+    let DirectedMutableLane {
+        guard,
+        receiver_interest,
+        class,
+        direction,
+    } = lane;
+    guard.check(store)?;
+    let inventory = match direction {
+        EventDirection::ToSessionResponder => mutable_inventory(
+            store,
+            guard.policy(),
+            verifier,
+            class,
+            receiver_interest,
+            None,
+        )?,
+        EventDirection::ToSessionInitiator => mutable_inventory(
+            store,
+            guard.policy(),
+            verifier,
+            class,
+            receiver_interest,
+            Some((
+                mission.peer().mission_id(),
+                mission.peer_route_grant_commitments(),
+            )),
+        )?,
+    };
+    let limits = ReconciliationLimits::default();
+    let mut responder = Responder::new(&inventory, limits)?;
+    loop {
+        guard.check(store)?;
+        let wire_budget = exchange_wire_budget(receipt)?;
+        let (complete, request_bytes, response_bytes) =
+            respond_mission_frame(connection, mission, wire_budget, |frame, _| match frame {
+                Frame::MutableInventoryQuery {
+                    class: request_class,
+                    direction: request_direction,
+                    bytes,
+                } if request_class == class && request_direction == direction => Ok((
+                    Frame::MutableInventoryReply {
+                        class,
+                        direction,
+                        bytes: responder.reconcile_query(&bytes)?,
+                    },
+                    false,
+                )),
+                Frame::MutableInventoryComplete {
+                    class: request_class,
+                    direction: request_direction,
+                } if request_class == class
+                    && request_direction == direction
+                    && responder.rounds() > 0 =>
+                {
+                    Ok((
+                        Frame::MutableInventoryCompleteAck { class, direction },
+                        true,
+                    ))
+                }
+                Frame::MutableInventoryComplete { .. } => Err(NodeError::Protocol(
+                    "mutable inventory completion preceded reconciliation or crossed lanes".into(),
+                )),
+                _ => Err(NodeError::Protocol(
+                    "mutable inventory responder received an out-of-phase frame".into(),
+                )),
+            })
+            .await?;
+        account(receipt, request_bytes, response_bytes)?;
+        if complete {
+            break;
+        }
+    }
+    let mut reverse = Initiator::new(&inventory, limits)?;
+    let mut query = reverse.initiate()?;
+    let difference = loop {
+        guard.check(store)?;
+        let response = request_mission_frame(
+            connection,
+            mission,
+            Frame::MutableDifferenceQuery {
+                class,
+                direction,
+                bytes: query,
+            },
+            receipt,
+        )
+        .await?;
+        let Frame::MutableDifferenceReply {
+            class: response_class,
+            direction: response_direction,
+            bytes,
+        } = response
+        else {
+            return Err(NodeError::Protocol(
+                "mutable reverse difference query received another response".into(),
+            ));
+        };
+        if response_class != class || response_direction != direction {
+            return Err(NodeError::Protocol(
+                "mutable reverse difference reply crossed lanes".into(),
+            ));
+        }
+        match reverse.reconcile_response(&bytes)? {
+            InitiatorStep::Continue(next) => query = next,
+            InitiatorStep::Complete(difference) => {
+                break MutableDifference::from_reconciliation(class, difference);
+            }
+        }
+    };
+    guard.check(store)?;
+    if request_mission_frame(
+        connection,
+        mission,
+        Frame::MutableDifferenceBound { class, direction },
+        receipt,
+    )
+    .await?
+        != (Frame::MutableDifferenceBoundAck { class, direction })
+    {
+        return Err(NodeError::Protocol(
+            "mutable difference-bound acknowledgement differs".into(),
+        ));
+    }
+    receipt.rounds = receipt
+        .rounds
+        .checked_add(responder.rounds())
+        .and_then(|rounds| rounds.checked_add(reverse.rounds()))
+        .ok_or_else(|| NodeError::Protocol("combined round count overflow".into()))?;
+    Ok(difference)
+}
+
+async fn serve_mutable_transfer_lane(
+    store: &Store,
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    verifier: &mut ReferenceEnvelopeSealer,
+    lane: DirectedMutableLane<'_>,
+    difference: &MutableDifference,
+    receipt: &mut PeerReceipt,
+) -> Result<(), NodeError> {
+    let DirectedMutableLane {
+        guard,
+        receiver_interest,
+        class,
+        direction,
+    } = lane;
+    let capacity = event_transfer_capacity(receipt)?;
+    let mut authorization = MutableTransferAuthorization::for_peer(difference, direction, capacity);
+    add_unscheduled_events(receipt, authorization.remaining)?;
+    let peer = mission.peer().mission_id();
+    let commitments = mission.peer_route_grant_commitments().to_vec();
+    loop {
+        guard.check(store)?;
+        let wire_budget = exchange_wire_budget(receipt)?;
+        let (complete, request_bytes, response_bytes) = respond_mission_frame(
+            connection,
+            mission,
+            wire_budget,
+            |frame, request_wire_len| match frame {
+                Frame::MutableOffer {
+                    direction: request_direction,
+                    id,
+                    bytes,
+                } if direction == EventDirection::ToSessionResponder
+                    && request_direction == direction
+                    && id.class() == class =>
+                {
+                    guard.check(store)?;
+                    authorize_transfer_item(
+                        authorization.offers_from_peer.remove(&id),
+                        receipt,
+                        "mutable offer",
+                    )?;
+                    if bytes.len() > MAX_OBJECT_BYTES {
+                        return Err(NodeError::Protocol(
+                            "offered mutable object exceeds its bound".into(),
+                        ));
+                    }
+                    check_account(receipt, request_wire_len, 4_096)?;
+                    let inserted = accept_received_mutable(
+                        store,
+                        guard.policy(),
+                        verifier,
+                        MutablePeerAdmission {
+                            peer,
+                            commitments: &commitments,
+                            interest: receiver_interest,
+                        },
+                        id,
+                        &bytes,
+                    )?;
+                    if inserted {
+                        receipt.inserted += 1;
+                    } else {
+                        receipt.duplicates += 1;
+                    }
+                    receipt.fetched += 1;
+                    Ok((
+                        Frame::MutableApplyResult {
+                            direction,
+                            id,
+                            inserted,
+                        },
+                        false,
+                    ))
+                }
+                Frame::MutableFetch {
+                    direction: request_direction,
+                    id,
+                } if direction == EventDirection::ToSessionInitiator
+                    && request_direction == direction
+                    && id.class() == class =>
+                {
+                    guard.check(store)?;
+                    authorize_transfer_item(
+                        authorization.fetches_by_peer.remove(&id),
+                        receipt,
+                        "mutable fetch",
+                    )?;
+                    let bytes = load_verified_mutable_for_peer(
+                        store,
+                        guard.policy(),
+                        verifier,
+                        id,
+                        peer,
+                        &commitments,
+                        receiver_interest,
+                    )?;
+                    receipt.offered += 1;
+                    Ok((
+                        Frame::MutableObject {
+                            direction,
+                            id,
+                            bytes,
+                        },
+                        false,
+                    ))
+                }
+                Frame::MutableFinish {
+                    class: request_class,
+                    direction: request_direction,
+                } if request_class == class
+                    && request_direction == direction
+                    && authorization.is_consumed() =>
+                {
+                    Ok((Frame::MutableFinished { class, direction }, true))
+                }
+                Frame::MutableFinish { .. } => Err(NodeError::Protocol(
+                    "mutable finish preceded transfer-plan consumption or crossed lanes".into(),
+                )),
+                _ => Err(NodeError::Protocol(
+                    "mutable transfer used an unauthorized phase operation".into(),
+                )),
+            },
+        )
+        .await?;
+        account(receipt, request_bytes, response_bytes)?;
+        if complete {
+            return Ok(());
+        }
+    }
+}
+
+async fn serve_mutable_class(
+    store: &Store,
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    verifier: &mut ReferenceEnvelopeSealer,
+    contact: MutableClassContact<'_>,
+    receipt: &mut PeerReceipt,
+) -> Result<(), NodeError> {
+    let MutableClassContact {
+        guard,
+        interests,
+        class,
+    } = contact;
+    guard.check(store)?;
+    let local_interest = interests.for_class(class)?;
+    let peer_interest =
+        serve_mutable_interests(connection, mission, class, &local_interest, receipt).await?;
+    let to_responder = DirectedMutableLane {
+        guard,
+        receiver_interest: &local_interest,
+        class,
+        direction: EventDirection::ToSessionResponder,
+    };
+    let difference = serve_mutable_reconciliation_lane(
+        store,
+        connection,
+        mission,
+        verifier,
+        to_responder,
+        receipt,
+    )
+    .await?;
+    serve_mutable_transfer_lane(
+        store,
+        connection,
+        mission,
+        verifier,
+        to_responder,
+        &difference,
+        receipt,
+    )
+    .await?;
+
+    let to_initiator = DirectedMutableLane {
+        guard,
+        receiver_interest: &peer_interest,
+        class,
+        direction: EventDirection::ToSessionInitiator,
+    };
+    let difference = serve_mutable_reconciliation_lane(
+        store,
+        connection,
+        mission,
+        verifier,
+        to_initiator,
+        receipt,
+    )
+    .await?;
+    serve_mutable_transfer_lane(
+        store,
+        connection,
+        mission,
+        verifier,
+        to_initiator,
+        &difference,
+        receipt,
+    )
+    .await
+}
+
 async fn serve_session(
     store: Arc<Store>,
     connection: aster_iroh::Connection,
     credentials: UnprotectedReferenceMission,
     peer: MissionPeerBinding,
     policy_lock: Arc<RwLock<()>>,
+    mutable_interests: MutableSourceInterests,
 ) -> Result<CompletedPeerContact, NodeError> {
     // No inventory is even loaded until the independent mission handshake and
     // exact configured mission NodeId check both finish.
@@ -5419,6 +6648,21 @@ async fn serve_session(
         &mut receipt,
     )
     .await?;
+    for class in [MutableClass::State, MutableClass::Record] {
+        serve_mutable_class(
+            &store,
+            &connection,
+            &mut mission,
+            &mut event_verifier,
+            MutableClassContact {
+                guard: &event_guard,
+                interests: &mutable_interests,
+                class,
+            },
+            &mut receipt,
+        )
+        .await?;
+    }
     event_guard.check(&store)?;
     let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
     connection.close();
@@ -6822,7 +8066,11 @@ fn run_demo_phase_internal(
     // orchestration watchdog, not a throughput target: leave one second per
     // active node plus two seconds for process startup and QUIC scheduling so
     // the advertised node range does not inherit the three-node deadline.
-    let run_seconds = demo_run_seconds(active.len());
+    // The child run-for budget starts before store/control replay and endpoint
+    // binding. Multi-node phases that must prove authenticated contact therefore
+    // need a separate settlement window after slower processes become ready.
+    // Denied and single-node phases do not receive that extra network budget.
+    let run_seconds = demo_phase_run_seconds(active.len(), require_successful_contacts);
     for &index in &active {
         let log_path = logs.join(format!("{phase}-node-{index}.log"));
         let error_path = logs.join(format!("{phase}-node-{index}.err"));
@@ -6937,6 +8185,16 @@ fn demo_run_seconds(active_nodes: usize) -> u64 {
         .unwrap_or(u64::MAX)
         .saturating_add(2)
         .max(3)
+}
+
+fn demo_phase_run_seconds(active_nodes: usize, require_successful_contacts: bool) -> u64 {
+    demo_run_seconds(active_nodes).saturating_add(
+        if require_successful_contacts && active_nodes > 1 {
+            3
+        } else {
+            0
+        },
+    )
 }
 
 fn verify_phase_contacts(
@@ -7118,6 +8376,252 @@ mod tests {
             .into_iter()
             .find(SocketAddr::is_ipv4)
             .expect("IPv4 loopback binding")
+    }
+
+    #[tokio::test]
+    async fn real_iroh_contact_converges_state_and_disconnected_record_siblings() {
+        let mut issued = issue_missions(2);
+        let client_mission = issued.remove(0);
+        let server_mission = issued.remove(0);
+        let topic = Topic::new("opaque").expect("mutable topic");
+        let scope = Scope::new("test/runtime-contact").expect("mutable scope");
+        let interests = MutableSourceInterests::new(
+            vec![SourceInterestSelector::new(
+                topic.clone(),
+                scope.clone(),
+                false,
+            )],
+            vec![SourceInterestSelector::new(
+                topic.clone(),
+                scope.clone(),
+                false,
+            )],
+        );
+        let client_root = root("mutable-network-client");
+        let server_root = root("mutable-network-server");
+        fs::create_dir_all(&client_root).expect("client root");
+        fs::create_dir_all(&server_root).expect("server root");
+        let authority = client_mission.credentials.mission_authority_id();
+        assert_eq!(authority, server_mission.credentials.mission_authority_id());
+        let client_store = Arc::new(
+            Store::open_for_mission(client_root.join(STORE_FILE), authority).expect("client store"),
+        );
+        let server_store = Arc::new(
+            Store::open_for_mission(server_root.join(STORE_FILE), authority).expect("server store"),
+        );
+        let client_policy = client_store
+            .control_policy_snapshot()
+            .expect("client policy");
+        let server_policy = server_store
+            .control_policy_snapshot()
+            .expect("server policy");
+        let mut client_sealer = ReferenceEnvelopeSealer::open(
+            client_mission
+                .credentials
+                .fresh_bundle()
+                .expect("client bundle"),
+        )
+        .expect("client sealer");
+        let mut server_sealer = ReferenceEnvelopeSealer::open(
+            server_mission
+                .credentials
+                .fresh_bundle()
+                .expect("server bundle"),
+        )
+        .expect("server sealer");
+
+        let state_reservation = client_store
+            .reserve_state_with_policy(&client_policy, client_sealer.identity(), &topic, &scope)
+            .expect("State reservation");
+        let state_header = state_reservation
+            .header(
+                Priority::Immediate,
+                b"asset/network-state".to_vec(),
+                5,
+                false,
+                1,
+            )
+            .expect("State header");
+        let sealed_state = client_sealer
+            .seal_state(&state_header, b"ready")
+            .expect("seal State")
+            .bytes;
+        let route = client_sealer
+            .verify_state(&sealed_state)
+            .expect("verify State route");
+        let state = match client_sealer
+            .verify_state_content(route, &sealed_state)
+            .expect("verify State content")
+        {
+            StateContentVerification::ContentVerified { state, .. } => state,
+            StateContentVerification::RouteOnly(_) => panic!("client has State content grant"),
+        };
+        client_store
+            .commit_reserved_state_with_policy(
+                &client_policy,
+                &state_reservation,
+                &state,
+                &sealed_state,
+            )
+            .expect("commit State");
+
+        let client_record_reservation = client_store
+            .reserve_record_with_policy(&client_policy, client_sealer.identity(), &topic, &scope)
+            .expect("client Record reservation");
+        let client_record_header = client_record_reservation
+            .header(
+                Priority::Immediate,
+                b"asset/network-record".to_vec(),
+                5,
+                false,
+                1,
+            )
+            .expect("client Record header");
+        let client_record_bytes = client_sealer
+            .seal_record(&client_record_header, b"alpha")
+            .expect("seal client Record")
+            .bytes;
+        let route = client_sealer
+            .verify_record(&client_record_bytes)
+            .expect("verify client Record route");
+        let client_record = match client_sealer
+            .verify_record_content(route, &client_record_bytes)
+            .expect("verify client Record content")
+        {
+            RecordContentVerification::ContentVerified { record, .. } => record,
+            RecordContentVerification::RouteOnly(_) => panic!("client has Record content grant"),
+        };
+        client_store
+            .commit_reserved_record_with_policy(
+                &client_policy,
+                &client_record_reservation,
+                &client_record,
+                &client_record_bytes,
+            )
+            .expect("commit client Record");
+
+        let server_record_reservation = server_store
+            .reserve_record_with_policy(&server_policy, server_sealer.identity(), &topic, &scope)
+            .expect("server Record reservation");
+        let server_record_header = server_record_reservation
+            .header(
+                Priority::Immediate,
+                b"asset/network-record".to_vec(),
+                5,
+                false,
+                1,
+            )
+            .expect("server Record header");
+        let server_record_bytes = server_sealer
+            .seal_record(&server_record_header, b"bravo")
+            .expect("seal server Record")
+            .bytes;
+        let route = server_sealer
+            .verify_record(&server_record_bytes)
+            .expect("verify server Record route");
+        let server_record = match server_sealer
+            .verify_record_content(route, &server_record_bytes)
+            .expect("verify server Record content")
+        {
+            RecordContentVerification::ContentVerified { record, .. } => record,
+            RecordContentVerification::RouteOnly(_) => panic!("server has Record content grant"),
+        };
+        server_store
+            .commit_reserved_record_with_policy(
+                &server_policy,
+                &server_record_reservation,
+                &server_record,
+                &server_record_bytes,
+            )
+            .expect("commit server Record");
+
+        let server = Endpoint::bind(
+            aster_iroh::SecretKey::generate(),
+            EndpointConfig::direct("127.0.0.1:0".parse().expect("server address")),
+        )
+        .await
+        .expect("server endpoint");
+        let client = Endpoint::bind(
+            aster_iroh::SecretKey::generate(),
+            EndpointConfig::direct("127.0.0.1:0".parse().expect("client address")),
+        )
+        .await
+        .expect("client endpoint");
+        let server_task = tokio::spawn({
+            let server = server.clone();
+            let store = server_store.clone();
+            let credentials = server_mission.credentials.clone();
+            let allowed = BTreeSet::from([client.id()]);
+            let peer = MissionPeerBinding::new(client.id(), client_mission.identity);
+            let interests = interests.clone();
+            async move {
+                let connection = server.accept(&allowed).await.expect("accept carrier");
+                serve_connection(
+                    store,
+                    connection,
+                    credentials,
+                    peer,
+                    Arc::new(RwLock::new(())),
+                    interests,
+                )
+                .await
+            }
+        });
+        let client_contact = sync_once_with_policy(
+            &client_store,
+            &client,
+            client_mission.credentials.clone(),
+            MissionExpectedPeer {
+                carrier: ExpectedPeer {
+                    id: server.id(),
+                    address: loopback(&server),
+                },
+                mission: server_mission.identity,
+            },
+            Arc::new(RwLock::new(())),
+            interests,
+        )
+        .await
+        .expect("real Iroh mutable contact");
+        let server_contact = server_task
+            .await
+            .expect("server task")
+            .expect("server mutable contact");
+        assert_eq!(contact_status(&client_contact.receipt), "pass");
+        assert_eq!(contact_status(&server_contact.receipt), "pass");
+
+        assert_eq!(
+            server_store
+                .state_inventory_with_policy(&server_policy)
+                .expect("server State inventory")
+                .len(),
+            1
+        );
+        for (store, policy) in [
+            (&*client_store, &client_policy),
+            (&*server_store, &server_policy),
+        ] {
+            assert_eq!(
+                store
+                    .record_inventory_with_policy(policy)
+                    .expect("converged Record inventory")
+                    .len(),
+                2
+            );
+            let plan = store
+                .prepare_record_projection_with_policy(
+                    policy,
+                    &topic,
+                    &scope,
+                    b"asset/network-record",
+                )
+                .expect("converged Record projection");
+            assert_eq!(plan.heads().count(), 2);
+        }
+        drop(client_store);
+        drop(server_store);
+        fs::remove_dir_all(client_root).expect("remove client root");
+        fs::remove_dir_all(server_root).expect("remove server root");
     }
 
     async fn finish_equal_difference(
@@ -7419,6 +8923,7 @@ mod tests {
                     credentials,
                     peer,
                     Arc::new(RwLock::new(())),
+                    MutableSourceInterests::default(),
                 )
                 .await
             }
@@ -7749,6 +9254,7 @@ mod tests {
             bind: SocketAddr::from(([127, 0, 0, 1], 0)),
             mission,
             peers: Vec::new(),
+            mutable_interests: Default::default(),
             sync_interval: Duration::from_millis(10),
             run_for: Some(Duration::from_millis(10)),
             application: NodeApplication::Relay,
@@ -7949,6 +9455,7 @@ mod tests {
             bind: SocketAddr::from(([127, 0, 0, 1], 0)),
             mission,
             peers: Vec::new(),
+            mutable_interests: Default::default(),
             sync_interval: Duration::from_millis(10),
             run_for: None,
             application: NodeApplication::Relay,
@@ -8046,6 +9553,7 @@ mod tests {
                 bind: SocketAddr::from(([127, 0, 0, 1], 0)),
                 mission,
                 peers: Vec::new(),
+                mutable_interests: Default::default(),
                 sync_interval: Duration::from_secs(60),
                 run_for: Some(run_for),
                 application: NodeApplication::Relay,
@@ -8385,6 +9893,7 @@ mod tests {
                 bind: SocketAddr::from(([127, 0, 0, 1], 0)),
                 mission: test_mission(),
                 peers: Vec::new(),
+                mutable_interests: Default::default(),
                 sync_interval: Duration::from_secs(60),
                 run_for: Some(Duration::MAX),
                 application: NodeApplication::Relay,
@@ -8443,6 +9952,7 @@ mod tests {
                 bind: SocketAddr::from(([127, 0, 0, 1], 0)),
                 mission,
                 peers: Vec::new(),
+                mutable_interests: Default::default(),
                 sync_interval: Duration::from_secs(60),
                 run_for: Some(Duration::from_millis(250)),
                 application: NodeApplication::Relay,
@@ -8573,6 +10083,7 @@ mod tests {
                         },
                         mission: right_mission_id,
                     }],
+                    mutable_interests: Default::default(),
                     sync_interval: Duration::from_nanos(1),
                     run_for: None,
                     application: NodeApplication::Relay,
@@ -8601,6 +10112,7 @@ mod tests {
                         },
                         mission: left_mission_id,
                     }],
+                    mutable_interests: Default::default(),
                     sync_interval: Duration::from_nanos(1),
                     run_for: None,
                     application: NodeApplication::Relay,
@@ -8628,6 +10140,7 @@ mod tests {
                         },
                         mission: left_mission_id,
                     }],
+                    mutable_interests: Default::default(),
                     sync_interval: Duration::from_nanos(1),
                     run_for: None,
                     application: NodeApplication::Relay,
@@ -8656,6 +10169,7 @@ mod tests {
                         },
                         mission: right_mission_id,
                     }],
+                    mutable_interests: Default::default(),
                     sync_interval: Duration::from_nanos(1),
                     run_for: None,
                     application: NodeApplication::Relay,
@@ -8758,6 +10272,7 @@ mod tests {
             bind: SocketAddr::from(([127, 0, 0, 1], 0)),
             mission: test_mission(),
             peers: Vec::new(),
+            mutable_interests: Default::default(),
             sync_interval: Duration::from_millis(10),
             run_for: None,
             application: NodeApplication::Relay,
@@ -9122,6 +10637,7 @@ mod tests {
                     credentials,
                     peer,
                     Arc::new(RwLock::new(())),
+                    MutableSourceInterests::default(),
                 )
                 .await
             }
@@ -10547,6 +12063,7 @@ mod tests {
             bind: SocketAddr::from(([127, 0, 0, 1], 0)),
             mission: services.member.clone(),
             peers: Vec::new(),
+            mutable_interests: Default::default(),
             sync_interval: Duration::from_millis(10),
             run_for: Some(Duration::from_millis(1)),
             application: NodeApplication::Relay,
@@ -10867,6 +12384,7 @@ mod tests {
                     credentials,
                     peer,
                     Arc::new(RwLock::new(())),
+                    MutableSourceInterests::default(),
                 )
                 .await
             }
@@ -11026,6 +12544,7 @@ mod tests {
                     credentials,
                     wrong_binding,
                     Arc::new(RwLock::new(())),
+                    MutableSourceInterests::default(),
                 )
                 .await
             }
@@ -11079,6 +12598,7 @@ mod tests {
             bind: SocketAddr::from(([127, 0, 0, 1], 0)),
             mission: test_mission(),
             peers,
+            mutable_interests: Default::default(),
             sync_interval,
             run_for: Some(Duration::from_millis(1)),
             application: NodeApplication::Relay,
@@ -11196,6 +12716,7 @@ mod tests {
             bind: "127.0.0.1:0".parse().expect("bind address"),
             mission: other_mission,
             peers: Vec::new(),
+            mutable_interests: Default::default(),
             sync_interval: Duration::from_millis(1),
             run_for: Some(Duration::from_millis(1)),
             application: NodeApplication::Relay,
@@ -11373,6 +12894,9 @@ mod tests {
         assert_eq!(demo_run_seconds(3), 5);
         assert_eq!(demo_run_seconds(8), 10);
         assert_eq!(demo_run_seconds(32), 34);
+        assert_eq!(demo_phase_run_seconds(3, true), 8);
+        assert_eq!(demo_phase_run_seconds(3, false), 5);
+        assert_eq!(demo_phase_run_seconds(1, true), 3);
     }
 
     #[test]

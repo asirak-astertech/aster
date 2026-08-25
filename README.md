@@ -34,14 +34,20 @@ operation.
 > heads, rejects ordinary publication across an unresolved conflict, and
 > accepts only an explicit application-reviewed successor guarded by the exact
 > sibling set inspected. It does not execute registered merge policies during
-> ingest. An exclusive stopped-node Blob surface now streams immutable,
+> ingest. The live runtime now reconciles already durable State and Record
+> objects through separate typed Negentropy/fetch lanes under explicit
+> receiver topic/scope interests. A real-Iroh two-node test covers State
+> delivery and two disconnected Record publishers converging without losing
+> either causal head. The application-facing State and Record handles remain
+> stopped/exclusive, and network ingest never invokes application merge code.
+> An exclusive stopped-node Blob surface now streams immutable,
 > metadata-bound objects into a crash-resumable encrypted depot and freshly
 > verifies them into caller-owned outputs without exposing provider readers or
-> keys. State, Record, and Blob are not yet carried by the live runtime or
-> reconciliation wire. Aster is
+> keys. Blob is not yet carried by the live runtime or reconciliation wire.
+> Aster is
 > still not a completed MVP, production-authorized build, or claim of FIPS
-> 140-3 validation. Live or replicated State/Record/Blob, remote Blob chunk
-> transfer, finite-TTL custody,
+> 140-3 validation. Live State/Record application handles, replicated Blob,
+> remote Blob chunk transfer, finite-TTL custody,
 > atomic subscription
 > update, protected provisioning, generalized control administration, and
 > physical/multi-carrier acceptance remain open. A bounded same-UID Unix hook
@@ -159,8 +165,8 @@ random mission bundles persisted as unprotected-reference files. Only the
 demo-scoped issuing authority seed is ephemeral. Bounded Negentropy reconciles
 exact sealed-transfer IDs. Every contact authenticates the expected mission peer
 before inventory and protects later mechanics frames. Each Event independently
-authenticates its publisher and protected semantic header. This slice does
-**not** validate networked State/Record/Blob, remote Blob chunks, atomic subscription update, finite-TTL
+authenticates its publisher and protected semantic header. This demo command does
+**not** validate State/Record/Blob networking, remote Blob chunks, atomic subscription update, finite-TTL
 custody, protected provisioning at rest,
 NAT/hosted relay operation, BTLE, physical multi-system operation, or any
 production security gate. The separate selected Event quickstart and focused
@@ -324,4 +330,6 @@ experimental artifact-provider interoperability evidence explicit. See
 
 ## License
 
-Licensed under the Apache License, Version 2.0. See `LICENSE`.
+Licensed under the Apache License, Version 2.0. See `LICENSE`. Exact dependency
+license texts that must accompany distributions are in
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).

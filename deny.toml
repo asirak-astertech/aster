@@ -26,6 +26,35 @@ allow = [
   "Zlib",
 ]
 
+# Stakeholder-approved exact-package deviations recorded by Decision 0028.
+# CDLA-Permissive-2.0 applies to Mozilla trust-root data, and Unlicense is
+# OSI-approved but remains outside the general allowlist. Version drift fails
+# closed instead of extending either exception to another package or release.
+[[licenses.exceptions]]
+allow = ["CDLA-Permissive-2.0"]
+name = "webpki-root-certs"
+version = "=1.0.9"
+
+[[licenses.exceptions]]
+allow = ["CDLA-Permissive-2.0"]
+name = "webpki-roots"
+version = "=1.0.9"
+
+[[licenses.exceptions]]
+allow = ["Unlicense"]
+name = "async_io_stream"
+version = "=0.3.3"
+
+[[licenses.exceptions]]
+allow = ["Unlicense"]
+name = "pharos"
+version = "=0.5.3"
+
+[[licenses.exceptions]]
+allow = ["Unlicense"]
+name = "ws_stream_wasm"
+version = "=0.7.5"
+
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"

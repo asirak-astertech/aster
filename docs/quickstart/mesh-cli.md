@@ -312,8 +312,18 @@ target/debug/aster node --state ./aster-state --bind 0.0.0.0:49100 \
 target/debug/aster node --state ./aster-state --bind 0.0.0.0:49100 \
   --mission-bundle-unprotected-reference "$SYSTEM_B_MISSION_BUNDLE" \
   --peer "$SYSTEM_A_ID@$SYSTEM_A_IP:49100=$SYSTEM_A_MISSION_ID" \
+  --state-interest sensors@mission/alpha \
+  --record-interest reports@mission/alpha \
   --sync-ms 500 --application pong-responder
 ```
+
+`--state-interest TOPIC@SCOPE` and `--record-interest TOPIC@SCOPE` are
+repeatable, class-separated receive interests for already durable source
+objects. Empty means receive-none. They do not grant route or content access;
+the mission bundle must independently authorize the exact source, topic,
+scope, and current epoch. The stopped State/Record application handle must be
+closed before the runtime owns the same store. Record network ingest retains
+concurrent revisions and never executes application merge code.
 
 The built-in application roles require bundles granting scope `demo/mesh`, key
 epoch 1, and topic `mesh.ping-pong` to the endpoint applications. A relay role
@@ -324,10 +334,11 @@ The Iroh handshake binds the expected endpoint and rejects an unlisted carrier
 before an application frame. The node then runs the hybrid reference session,
 checks the configured mission `NodeId`, reconciles and activates the contiguous
 source-authenticated control prefix, and only then constructs the peer-filtered
-Event inventory. A pending control gap defers the Event lane. Every later
+Event inventory. A pending control gap defers all data lanes. Every later
 mechanics frame is protected and replay-checked. An authenticated peer without
-the current Event scope/epoch route grant learns no matching Event ID and cannot
-Fetch or Offer it; a durably revoked mission principal is rejected.
+the current scope/epoch route grant learns no matching Event, State, or Record
+ID and cannot Fetch or Offer it; a durably revoked mission principal is
+rejected.
 
 Hosted discovery, Iroh relays, and port mapping are disabled. Direct IP
 reachability and firewalls are operator responsibilities. Manual mission bundle
@@ -453,16 +464,17 @@ reconciliation. Do not use `put` as evidence for the source-authenticated mesh.
 
 | Component | Sole responsibility in the selected lane |
 |---|---|
-| `aster-profile` | Stable complete reconciliation keys and canonical inventory ordering; exact Event transfer IDs enter by explicit conversion |
-| `aster-redb-store` | Mission-bound audited control chain and atomic policy snapshots plus semantic Event/causal/operation state, bounded route-only cache, a durable terminal software-zeroization intent/phase receipt, and a disjoint retained opaque compatibility namespace |
+| `aster-profile` | Stable complete reconciliation keys and canonical inventory ordering; class-specific exact Event/State/Record transfer IDs enter by explicit conversion |
+| `aster-redb-store` | Mission-bound audited control chain and atomic policy snapshots plus semantic Event/State/Record/Blob causal/operation state, bounded Event route-only cache, a durable terminal software-zeroization intent/phase receipt, and a disjoint retained opaque compatibility namespace |
 | `aster-negentropy` | Bounded, clock-independent set difference over exact transfer IDs |
 | `aster-iroh` | Direct endpoint lifecycle, carrier identity, and bounded exchange |
-| `aster-node` | Composition, mission-before-inventory and control-before-Event ordering, peer route filtering, exact control/Event transfer, authority commands, sample applications, bounded same-UID Unix local zeroization lifecycle, receipts, and CLI |
-| `aster-core` | Existing spec-verified hybrid mission session, control envelope, recipient-filtered rekey, and source-envelope Event semantics, used rather than rewritten |
+| `aster-node` | Composition, mission-before-inventory and control-before-data ordering, peer route/interest filtering, exact control/Event/State/Record transfer, authority commands, sample applications, bounded same-UID Unix local zeroization lifecycle, receipts, and CLI |
+| `aster-core` | Existing spec-verified hybrid mission session, control envelope, recipient-filtered rekey, and typed source-envelope Event/State/Record/Blob semantics, used rather than rewritten |
 
 No old path is removed until its replacement passes equivalent tests. Current
-open work includes State/Record/Blob, generalized publish/subscribe and topic
-filtering, finite-TTL authenticated custody age, protected provisioning,
+open work includes live State/Record application operations, broader
+State/Record partition/relay acceptance, networked Blob, generalized
+publish/subscribe and topic filtering, finite-TTL authenticated custody age, protected provisioning,
 generalized control administration and repeated multi-scope rekey,
 platform-complete zeroization assurance, physical/multi-carrier acceptance, and
 release gates. The tracked

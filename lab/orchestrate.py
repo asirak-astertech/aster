@@ -71,6 +71,7 @@ EXPECTED_DOCKERIGNORE = """**
 !Cargo.toml
 !Cargo.lock
 !LICENSE
+!THIRD_PARTY_NOTICES.md
 !crates/
 !crates/**
 !lab/
@@ -1001,6 +1002,7 @@ def collect_build_inputs() -> list[BuildInput]:
         WORKSPACE / "Cargo.toml",
         WORKSPACE / "Cargo.lock",
         WORKSPACE / "LICENSE",
+        WORKSPACE / "THIRD_PARTY_NOTICES.md",
         WORKSPACE / "lab" / "Dockerfile",
         dockerfile_ignore,
         WORKSPACE / "lab" / "debian.sources",

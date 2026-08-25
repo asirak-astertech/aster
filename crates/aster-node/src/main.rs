@@ -10,11 +10,11 @@ use std::{
 
 use aster_mesh::{Scope, ScopeRekeyRecipient, Topic};
 use aster_node::{
-    DemoScenario, MissionExpectedPeer, NodeApplication, NodeConfig, NodeIdentity,
-    ensure_state_accepts_normal_operation, format_control_transfer_id, format_path_field,
-    format_receipt_field, inspect_store, mission::UnprotectedReferenceMission, parse_item_id,
-    parse_node_id, publish_revocation_control, publish_scope_rekey_control, put_opaque,
-    run_demo_scenario, run_node, zeroize_node,
+    DemoScenario, MissionExpectedPeer, MutableSourceInterests, NodeApplication, NodeConfig,
+    NodeIdentity, SourceInterestSelector, ensure_state_accepts_normal_operation,
+    format_control_transfer_id, format_path_field, format_receipt_field, inspect_store,
+    mission::UnprotectedReferenceMission, parse_item_id, parse_node_id, publish_revocation_control,
+    publish_scope_rekey_control, put_opaque, run_demo_scenario, run_node, zeroize_node,
 };
 
 const MAX_PUT_BYTES: u64 = 1024 * 1024;
@@ -174,6 +174,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .iter()
                 .map(|peer| peer.parse::<MissionExpectedPeer>())
                 .collect::<Result<Vec<_>, _>>()?;
+            let state_interests = arguments
+                .repeated("--state-interest")?
+                .iter()
+                .map(|value| parse_source_interest(value, "State"))
+                .collect::<Result<Vec<_>, _>>()?;
+            let record_interests = arguments
+                .repeated("--record-interest")?
+                .iter()
+                .map(|value| parse_source_interest(value, "Record"))
+                .collect::<Result<Vec<_>, _>>()?;
             let run_for = arguments
                 .optional("--run-for")?
                 .map(|seconds| seconds.parse::<u64>())
@@ -195,6 +205,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 bind,
                 mission,
                 peers,
+                mutable_interests: MutableSourceInterests::new(state_interests, record_interests),
                 sync_interval: interval,
                 run_for,
                 application,
@@ -372,6 +383,23 @@ fn parse_rekey_recipients(
     Ok(recipients)
 }
 
+fn parse_source_interest(
+    value: &str,
+    class: &str,
+) -> Result<SourceInterestSelector, Box<dyn std::error::Error>> {
+    let (topic, scope) = value
+        .split_once('@')
+        .ok_or_else(|| format!("{class} interest must use exact TOPIC@SCOPE syntax"))?;
+    if scope.contains('@') {
+        return Err(format!("{class} interest contains more than one separator").into());
+    }
+    Ok(SourceInterestSelector::new(
+        Topic::new(topic)?,
+        Scope::new(scope)?,
+        false,
+    ))
+}
+
 fn print_help() {
     println!(
         "Aster selected-stack mesh CLI\n\n\
@@ -393,6 +421,7 @@ fn print_help() {
            aster node --state DIR --bind IP:PORT \\
              --mission-bundle-unprotected-reference FILE \\
              [--peer CARRIER_ID@IP:PORT=MISSION_NODE_ID_HEX64 ...] \\
+             [--state-interest TOPIC@SCOPE ...] [--record-interest TOPIC@SCOPE ...] \\
              [--sync-ms N] [--run-for SEC] \
              [--application relay|ping-emitter|epoch2-ping-emitter|pong-responder]\n\
            aster demo --nodes N --root DIR [--base-port PORT] \
@@ -405,7 +434,11 @@ fn print_help() {
          Authority commands use the existing recipient-filtered aster-core control format and\n\
          reserve/seal/verify/commit controls idempotently before provider activation. Node/demo\n\
          contacts reconcile those mission-wide Flash controls in a distinct lane before carrying\n\
-         exact source-sealed Aster Events. The demo defaults to the N-instance ping-pong scenario;\n\
+         exact source-sealed Aster objects. Events follow durable application Consume/Carry\n\
+         selectors. Repeatable --state-interest and --record-interest values opt the receiver into\n\
+         exact topic/scope State and Record lanes; an empty class interest means receive-none.\n\
+         Record ingest retains concurrent revisions and never executes application merge code.\n\
+         The demo defaults to the N-instance ping-pong scenario;\n\
          the explicit control scenario requires exactly four role-bound nodes. Concurrent demos\n\
          must use disjoint explicit --base-port blocks; automatic selection is a single-demo\n\
          convenience. Semantic admission\n\
@@ -563,6 +596,18 @@ mod tests {
             io::ErrorKind::InvalidData | io::ErrorKind::IsADirectory
         ));
         fs::remove_dir(source.path()).expect("remove source directory");
+    }
+
+    #[test]
+    fn mutable_interest_requires_one_exact_topic_scope_pair() {
+        let selector = parse_source_interest("sensors@mission/alpha", "State")
+            .expect("parse exact State interest");
+        assert_eq!(selector.topic().as_str(), "sensors");
+        assert_eq!(selector.scope().as_str(), "mission/alpha");
+        assert!(!selector.include_descendant_scopes());
+
+        assert!(parse_source_interest("sensors", "Record").is_err());
+        assert!(parse_source_interest("sensors@mission@alpha", "Record").is_err());
     }
 
     #[cfg(unix)]

@@ -1,7 +1,7 @@
 # Selected production-lane architecture
 
-This page depicts the bounded control/Event composition and local State,
-Record, and Blob surfaces that execute today.
+This page depicts the bounded control/Event composition, networked State and
+Record reconciliation, and local Blob surface that execute today.
 It is intentionally narrower than Aster's complete protocol and semantic
 reference implementation. The live selected Event API provides publish,
 bounded query, durable subscribe/poll/ack, idempotent unsubscribe, authenticated
@@ -11,8 +11,9 @@ runtime owns the store. An exclusive stopped `SelectedStateNode` additionally
 provides source-authenticated State publication and exact-key causal projection.
 An exclusive stopped `SelectedRecordNode` preserves and annotates exact-key
 causal heads and accepts explicit application-reviewed resolution only through
-an exact sibling guard. State and Record have no live handles or reconciliation
-frames in this slice. An exclusive stopped `SelectedBlobNode` streams one
+an exact sibling guard. State and Record have no live application handles, but
+their durable source objects use class-specific reconciliation frames under
+explicit receiver interests. An exclusive stopped `SelectedBlobNode` streams one
 source-authenticated immutable object through a bounded encrypted local depot
 without returning provider readers or key material. Blob likewise has no live
 handle or reconciliation frames. Automatic registered-policy Record merge,
@@ -41,7 +42,7 @@ flowchart LR
         Session["aster-core mission session<br/>four-flight hybrid authentication"]
         Profile["aster-profile<br/>canonical exact-ID ordering"]
         Diff["aster-negentropy<br/>set difference only"]
-        Store["aster-redb-store<br/>durable acceptance/effect authority<br/>Event delivery + local State/Record/Blob"]
+        Store["aster-redb-store<br/>durable acceptance/effect authority<br/>Event delivery + State/Record + local Blob"]
         Depot["private Blob depot<br/>bounded encrypted chunk files"]
         Carrier["aster-iroh<br/>direct authenticated carrier"]
     end
@@ -73,7 +74,7 @@ flowchart LR
     Node -->|"uses control/source providers"| Core
     Node -->|"uses canonical ordering"| Profile
     Node -->|"reconciles exact-ID sets"| Diff
-    Node -->|"commits accepted Event/control state"| Store
+    Node -->|"commits accepted Event/State/Record/control state"| Store
     Node -->|"runs mission session"| Session --> Carrier <--> Peer
     Operator -. "local zeroize" .-> Node
     Artifacts -. "exact retained files" .-> Node
@@ -83,8 +84,8 @@ flowchart LR
 carrier endpoint and provides bounded direct exchange. The mission `NodeId` is
 independent from the Iroh `EndpointId`. `aster-negentropy` computes exact-ID set
 difference; it does not transfer objects, establish causality, or make policy.
-`aster-redb-store` is the selected durable authority for accepted Events and
-local State, Record, and Blob publications, their shared publisher causal
+`aster-redb-store` is the selected durable authority for accepted Events,
+State, Record, and local Blob publications, their shared publisher causal
 frontier, ordered control effects, policy/selector snapshots, at-least-once Event delivery, route-only
 Event representations, and the terminal zeroization marker. State, Record, and
 Blob operation rows have separate dedicated count/byte ceilings and also
@@ -109,14 +110,27 @@ insert or remove selectors take the actor's policy write lease; other
 application operations and contacts use a policy read lease. Shutdown or
 zeroization closes admission and rejects queued commands before the authority
 is released. The stopped handle can acquire that authority only after the live
-actor has exited.
+actor has exited. Conversely, State and Record publication/query handles must
+close before the actor starts reconciling their durable rows.
 
-## Local State publication and projection
+Each mission-authenticated contact runs class-separated State and Record
+Negentropy/fetch lanes after its control and Event lanes. A receiver supplies
+canonical topic/scope interests independently for each class; empty means
+receive-none. Interest never grants authority. Inventory and every offered or
+fetched object are filtered and freshly checked against current mission, route,
+content, revocation, scope-epoch, source, class, topic, and scope constraints.
+The contact holds one control-policy read lease, so inventory and admission use
+one policy generation. Exact transfer identities make repeated receipt
+idempotent. Remote finite-TTL mutable objects fail closed until authenticated
+cumulative forwarding age exists.
+
+## Stopped State publication, projection, and network reconciliation
 
 The selected State facade uses the same mission, control policy, source-envelope
 provider, writer lock, and causal ledger as Event. A State publisher counter
 therefore cannot restart at one or reuse an Event dot. State storage is additive
-and does not alter the Event frame grammar or either Event reconciliation lane.
+and uses its own typed transfer identity and reconciliation frames; it cannot be
+confused with either Event or Record traffic.
 
 ```mermaid
 sequenceDiagram
@@ -166,17 +180,19 @@ freshly verified so they cannot hide structural corruption, but they are not
 returned as application current or recoverable values. A current tombstone is
 returned visibly as authenticated State with an empty payload. There is no
 delete-wins rule, and deletion is not collapsed into an unauthenticated
-`None`. Expiry, garbage collection, State subscriptions, live State commands,
-and State transfer remain unimplemented.
+`None`. A real-Iroh two-node test transfers one durable State under an explicit
+interest and verifies the independent destination inventory. Expiry, garbage
+collection, durable State subscriptions, live State commands, multi-hop
+acceptance, and independent interoperability remain unimplemented.
 
-## Local Record conflict projection and guarded resolution
+## Stopped Record projection, guarded resolution, and network reconciliation
 
 The selected Record facade uses the same mission, control policy,
 source-envelope provider, writer lock, and causal ledger as Event and State.
 Its tables, markers, exact/semantic indexes, and operation ledger remain
 class-disjoint, while a Record publisher cannot reuse a causal dot already used
-by either other class. Record storage is additive and does not alter the
-Event-only frame grammar or reconciliation lanes.
+by either other class. Record storage is additive and uses its own typed
+transfer identity and reconciliation frames.
 
 For one exact topic/scope/logical key, every active causal maximum is a head.
 The greatest complete semantic Record ID is marked `Current`; every other head
@@ -215,12 +231,14 @@ returned to the application. A current Record tombstone remains visible with an
 empty payload; a concurrent tombstone has no delete-wins priority.
 
 Registered merge policies are never run automatically by this selected slice.
-Record has no live handle, subscription, inventory, Fetch/Offer frame, relay
-cache, or network ingestion path. The local tests exercise independently
-source-authenticated publishers, N-way heads, stale guards, restart/rekey retry,
-and arrival/ID-order independence, but they are not disconnected-node or
-cross-process acceptance. Finite TTL, expiry, garbage collection, and
-retention-driven deletion remain unimplemented.
+Remote ingest stores an immutable, already source-authenticated revision and
+recomputes structural causal heads without invoking application code. A
+real-Iroh two-node test publishes one revision on each independent store while
+disconnected, reconciles both directions under an explicit Record interest,
+and verifies that both stores retain the same two heads. Record still has no
+live application handle, durable application subscription, or selected relay
+cache. Multi-hop/partition sweeps, independent interoperability, finite TTL,
+expiry, garbage collection, and retention-driven deletion remain unimplemented.
 
 ## Local Blob streaming and depot authority
 

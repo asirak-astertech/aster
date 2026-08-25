@@ -14,8 +14,12 @@ EXPECTED_LICENSE = "Apache-2.0"
 EXPECTED_LICENSE_SHA256 = (
     "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
 )
+EXPECTED_THIRD_PARTY_NOTICES_SHA256 = (
+    "872744211edba1498edfcb89d13996ecdb46c111772ee7be78c58faf86c61aa4"
+)
 ROOT = Path(__file__).resolve().parents[1]
 LICENSE = ROOT / "LICENSE"
+THIRD_PARTY_NOTICES = ROOT / "THIRD_PARTY_NOTICES.md"
 DISTRIBUTION_ROOTS = (
     ROOT / "bindings" / "c",
     ROOT / "bindings" / "go",
@@ -117,6 +121,10 @@ def main() -> None:
     if actual_hash != EXPECTED_LICENSE_SHA256:
         fail("LICENSE is not the canonical Apache License 2.0 text")
 
+    notices_hash = hashlib.sha256(THIRD_PARTY_NOTICES.read_bytes()).hexdigest()
+    if notices_hash != EXPECTED_THIRD_PARTY_NOTICES_SHA256:
+        fail("THIRD_PARTY_NOTICES.md differs from the reviewed exact-package text")
+
     package_count = validate_packages(metadata())
     package_count += validate_packages(
         metadata("fuzz/Cargo.toml"), "fuzz/Cargo.toml"
@@ -133,6 +141,11 @@ def main() -> None:
     dockerfile = (ROOT / "lab" / "Dockerfile").read_text(encoding="utf-8")
     if "COPY LICENSE /usr/share/licenses/aster/LICENSE" not in dockerfile:
         fail("the lab runtime image does not include LICENSE")
+    if (
+        "COPY THIRD_PARTY_NOTICES.md /usr/share/licenses/aster/THIRD_PARTY_NOTICES.md"
+        not in dockerfile
+    ):
+        fail("the lab runtime image does not include third-party notices")
     docker_ignore_files = (
         ROOT / ".dockerignore",
         ROOT / "lab" / "Dockerfile.dockerignore",
@@ -140,6 +153,10 @@ def main() -> None:
     for ignore_file in docker_ignore_files:
         if "!LICENSE" not in ignore_file.read_text(encoding="utf-8").splitlines():
             fail(f"{ignore_file.relative_to(ROOT)} excludes LICENSE")
+        if "!THIRD_PARTY_NOTICES.md" not in ignore_file.read_text(
+            encoding="utf-8"
+        ).splitlines():
+            fail(f"{ignore_file.relative_to(ROOT)} excludes third-party notices")
 
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     if "Licensed under the Apache License, Version 2.0. See `LICENSE`." not in readme:
@@ -147,7 +164,7 @@ def main() -> None:
 
     print(
         f"project-license policy passed for {package_count} packages: "
-        f"{EXPECTED_LICENSE}, canonical LICENSE, distribution text present"
+        f"{EXPECTED_LICENSE}, canonical LICENSE and reviewed third-party notices present"
     )
 
 

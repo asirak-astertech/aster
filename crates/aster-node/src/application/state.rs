@@ -1,9 +1,10 @@
 //! High-level stopped-state surface for source-authenticated State projections.
 //!
-//! This first selected State slice is intentionally local. It shares the
+//! The application handle is intentionally stopped/exclusive. It shares the
 //! mission-bound store, control policy, source-envelope provider, and causal
-//! ledger with the selected Event surface, but it does not put State objects on
-//! the Event-only reconciliation wire.
+//! ledger with the selected Event surface. A separately running node can
+//! reconcile its durable State objects through the class-specific State lane
+//! when the receiver declares an exact source interest.
 
 use std::{fmt, fs, path::Path, sync::Arc};
 
@@ -145,8 +146,9 @@ struct VerifiedStateCandidate {
 ///
 /// The handle takes the same process-exclusive mission-bound redb writer as
 /// the Event facade and live runtime. It therefore cannot observe or mutate
-/// around their policy snapshots. State reconciliation is deliberately absent
-/// from this first slice.
+/// around their policy snapshots. Stop this handle before running the network
+/// actor; the actor can then reconcile these durable State objects without
+/// exposing a live State application handle.
 pub struct SelectedStateNode {
     mission: UnprotectedReferenceMission,
     store: Arc<Store>,

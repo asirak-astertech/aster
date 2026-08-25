@@ -33,4 +33,5 @@ RUN apt-get update \
 COPY --from=build /work/target/release/candidate-aster-lab /usr/local/bin/aster-lab
 COPY --from=build /work/target/release/aster-relay /usr/local/bin/aster-relay
 COPY LICENSE /usr/share/licenses/aster/LICENSE
+COPY THIRD_PARTY_NOTICES.md /usr/share/licenses/aster/THIRD_PARTY_NOTICES.md
 ENTRYPOINT ["/usr/local/bin/aster-lab"]

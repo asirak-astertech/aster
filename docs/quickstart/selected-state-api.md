@@ -1,17 +1,20 @@
 # Selected State API quickstart
 
-This is the shortest path to Aster's **selected local State projection**. It
+This is the shortest path to Aster's **selected State projection**. It
 opens the selected mission-bound redb store while no runtime owns it, publishes
 two source-authenticated versions for one logical key, and reads the
 deterministic latest value plus recoverable history. Application code never
 constructs an envelope, handles cryptographic keys, reads sealed bytes, or runs
 a reducer.
 
-This first State slice is deliberately stopped and local. It does not put State
-on the Event-only reconciliation wire and has no live handle, subscription,
-relay, or language binding. It also does not implement finite TTL, expiry, or
-garbage collection. The example demonstrates durable local behavior, not State
-delivery or mesh convergence.
+The application handle remains deliberately stopped and exclusive; there is no
+live State publish/query handle, durable State subscription, or language
+binding. A separately running node can now reconcile already durable State
+objects over a mission-authenticated, class-specific Negentropy lane when the
+receiver configures an exact topic/scope interest. Finite TTL, expiry, garbage
+collection, broader relay acceptance, and independent interoperability remain
+open. The local example below demonstrates the projection, while the focused
+runtime test exercises one real-Iroh delivery.
 
 ## Run the example
 
@@ -46,6 +49,36 @@ frontier.
 The fixture persists explicitly unprotected reference mission material. It is
 appropriate for this disposable demonstration, not operational provisioning.
 Remove the temporary directory when you no longer need it.
+
+## Reconcile durable State over a contact
+
+Stop `SelectedStateNode` before starting the network actor; both deliberately
+own the same mission-bound store exclusively. On every receiving node, add one
+repeatable exact interest for each desired topic and scope:
+
+```sh
+aster node ... --state-interest sensors@mission/alpha
+```
+
+An empty State interest set means receive-none, never wildcard. Topic/scope
+interest is only desired receipt: current mission membership, route authority,
+content authority, source authentication, revocation, and scope epoch still
+have to pass. Remote finite-TTL State is rejected until authenticated cumulative
+forwarding age exists.
+
+The current-code real-carrier acceptance test creates a durable State on one
+store, makes a mission-authenticated direct Iroh contact, and verifies the other
+independent redb store receives it:
+
+```sh
+cargo test --locked -p aster-node \
+  runtime::tests::real_iroh_contact_converges_state_and_disconnected_record_siblings \
+  -- --exact
+```
+
+This is bounded same-implementation, one-host, two-node evidence. It is not a
+retained release receipt, a multi-hop/partition sweep, or proof of convergence
+for every reachable subscriber.
 
 ## Use the stopped API
 
@@ -189,8 +222,9 @@ sequenceDiagram
 ```
 
 The stopped handle takes the same process-exclusive store authority used by the
-live Event actor. Stop that actor before opening `SelectedStateNode`; Aster does
-not permit two writers around one policy snapshot. Continue with the
+live actor. Stop that actor before opening `SelectedStateNode`, and close this
+handle before starting the actor; Aster does not permit two writers around one
+policy snapshot. Continue with the
 [selected architecture](../architecture.md) for the full trust split, the
 [selected Event API](selected-event-api.md) for the live networked surface, and
 the [requirements status](../implementation/requirements-status.md) for the
