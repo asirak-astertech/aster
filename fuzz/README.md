@@ -17,8 +17,9 @@ isolated `fuzz/` workspace. `wire_decode`, `fragment_decode`, and
 canonical encoding. The selected-frame target reaches the exact production
 decoder through an opt-in, doc-hidden fuzz seam that is absent from normal
 `aster-node` builds; each case exercises both the raw hostile input and one
-structured candidate distributed across all 28 current mechanics-frame variants,
-including the object-class-distinct Event and Flash control lanes.
+structured candidate distributed across all 30 current mechanics-frame variants,
+including both protected Event-interest variants and the object-class-distinct
+Event and Flash control lanes.
 `selected_negentropy` drives both arbitrary hostile frames and valid stateful
 exchanges while asserting the selected wrapper's byte, cardinality, and round
 limits. These mechanics-only targets earn no mission semantics or security

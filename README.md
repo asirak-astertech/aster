@@ -21,10 +21,13 @@ operation.
 > ordered Flash revocation/rekey controls and Events through the existing
 > `aster-core` providers, activates a durable contiguous control prefix before
 > Event transfer, keeps exact transfer identity distinct from semantic identity,
-> and separates content admission from payload-blind routing. It is still not a
+> separates content admission from payload-blind routing, and now exchanges
+> protected Consume/Carry interests through two receiver-directed Event lanes.
+> The stopped-state selected API provides durable at-least-once
+> subscribe/poll/ack. It is still not a
 > completed MVP,
 > production-authorized build, or claim of FIPS 140-3 validation. State, Record,
-> Blob, finite-TTL custody, durable selected subscriptions, a live selected
+> Blob, finite-TTL custody, subscription update/delete, a live selected
 > application handle, protected provisioning, generalized control
 > administration, and physical/multi-carrier
 > acceptance remain open. A bounded same-UID Unix hook now drains a selected
@@ -108,7 +111,8 @@ mise run tour-control  # four roles; revocation, rekey, captured-node exclusion
 Each command retains its complete root and prints stopped-state inspections.
 See the [capability tour](docs/quickstart/capability-tour.md) for what to look
 for, the [selected Event API quickstart](docs/quickstart/selected-event-api.md)
-to publish and query through the stopped-state production-lane composition,
+to publish, query, subscribe, poll, and acknowledge through the stopped-state
+production-lane composition,
 and the [selected architecture](docs/architecture.md) for the trust and
 authority boundaries.
 
@@ -135,8 +139,8 @@ demo-scoped issuing authority seed is ephemeral. Bounded Negentropy reconciles
 exact sealed-transfer IDs. Every contact authenticates the expected mission peer
 before inventory and protects later mechanics frames. Each Event independently
 authenticates its publisher and protected semantic header. This slice does
-**not** validate State/Record/Blob, durable topic subscriptions, a live
-application handle, finite-TTL custody, protected provisioning at rest,
+**not** validate State/Record/Blob, subscription update/delete, a live
+application handle or peer/sync status, finite-TTL custody, protected provisioning at rest,
 NAT/hosted relay operation, BTLE, physical multi-system operation, or any
 production security gate. See the [capability tour](docs/quickstart/capability-tour.md),
 the [mesh CLI quickstart](docs/quickstart/mesh-cli.md),
@@ -179,7 +183,7 @@ later restored. This is bounded software erasure, not inode deletion or a claim
 about physical media, filesystem copies, snapshots, swap, backups, or a restored
 pre-marker database. There is no network zeroization trigger.
 
-The frozen-tree receipts cover three-node/13-process, default
+The retained parent PR-A/pre-subscription frozen-tree receipts cover three-node/13-process, default
 four-node/18-process, and eight-node/38-process Ping/Pong runs plus the explicit
 four-node/23-process control run. The generic line isolates Ping publication,
 each forward edge, Pong publication, each return edge, and the final no-op into
@@ -196,7 +200,7 @@ control-run stderr lines arose inside the two required captured-node denial
 cohorts; every successful cohort retained zero stderr. Corresponding required
 contacts and all terminal invariants passed. These are not zero-error, physical,
 or scale claims; eight nodes are not many-node scale.
-In a separate live-child receipt, the zeroize CLI completed bounded local
+In a separate parent-snapshot live-child receipt, the zeroize CLI completed bounded local
 software zeroization in 0.074759 seconds while preserving the audited rows and
 terminal redb marker.
 

@@ -6,7 +6,8 @@
 use std::{env, error::Error, path::PathBuf};
 
 use aster_node::application::{
-    EventPublishRequest, EventQuery, Priority, Scope, SelectedEventNode, Topic,
+    EventPollRequest, EventPublishRequest, EventQuery, EventSubscriptionRequest, Priority, Scope,
+    SelectedEventNode, Topic,
 };
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -44,8 +45,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
 
     let page = node.query(EventQuery {
-        topic: Some(topic),
-        scope: Some(scope),
+        topic: Some(topic.clone()),
+        scope: Some(scope.clone()),
         logical_key: Some(b"asset-7".to_vec()),
         ..EventQuery::default()
     })?;
@@ -58,5 +59,32 @@ fn main() -> Result<(), Box<dyn Error>> {
             String::from_utf8_lossy(&item.payload),
         );
     }
+
+    let subscription = node.subscribe(EventSubscriptionRequest {
+        operation_key: b"example/mesh-ping-pong/consume".to_vec(),
+        topic,
+        scope,
+        include_descendant_scopes: false,
+    })?;
+    let deliveries = node.poll(EventPollRequest {
+        subscription: subscription.id,
+        delivery_limit: 128,
+        scan_limit: 128,
+    })?;
+    let mut published_delivery = None;
+    for delivery in deliveries.deliveries {
+        if delivery.event.id == published.id {
+            published_delivery = Some(delivery.attempt);
+        }
+        node.acknowledge(subscription.id, delivery.event.id)?;
+    }
+    let disposition = match published_delivery {
+        Some(attempt) => format!("delivered-attempt-{attempt}"),
+        None => format!("{:?}", node.acknowledge(subscription.id, published.id)?),
+    };
+    println!(
+        "subscription id={} inserted={} published_event={disposition}",
+        subscription.id, subscription.inserted
+    );
     Ok(())
 }

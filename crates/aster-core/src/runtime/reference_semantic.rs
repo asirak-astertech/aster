@@ -1975,9 +1975,9 @@ impl ReferenceSemanticRuntimeBackend {
             return Err(missing("batch proof identity mismatch"));
         }
         if forwarding.is_empty() {
-            if !existing
+            if existing
                 .as_ref()
-                .is_some_and(|stored| stored.exact_bytes == bytes)
+                .is_none_or(|stored| stored.exact_bytes != bytes)
             {
                 return Err(missing(
                     "first-time batch proof omitted authenticated forwarding metadata",

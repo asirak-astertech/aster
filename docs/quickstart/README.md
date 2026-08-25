@@ -6,10 +6,11 @@ offline application and language-binding quickstarts.
 
 For the selected production-lane composition, start with the Rust
 [`SelectedEventNode` Event quickstart](selected-event-api.md). It demonstrates
-peerless publish and bounded query over the mission-bound redb authority.
-Public authenticated gap inspection, durable subscribe/poll/ack, live peer/sync
-status, other data classes, and selected-node language bindings are not part of
-that first slice.
+peerless publish, bounded query, and durable at-least-once subscribe/poll/ack
+over the mission-bound redb authority. Its live runtime uses protected
+Consume/Carry interests to narrow Event replication. Public authenticated gap
+inspection, subscription update/delete, live peer/sync status, other data
+classes, and selected-node language bindings remain open.
 
 Choose the API closest to your application:
 

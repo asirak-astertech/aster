@@ -14,19 +14,24 @@ exercises source-authenticated control and Event paths:
 ```mermaid
 flowchart LR
     App["Live Event application<br/>Ping emitter · Pong responder"]
+    Facade["Stopped-state Event facade<br/>publish · query · subscribe · poll · ack"]
+    Intent["Durable receive intent<br/>Consume · Carry · empty = receive-none"]
     Authority["Stopped-state authority CLI<br/>revoke · recipient-filtered rekey"]
     Operator["Same-UID Unix operator"]
     Artifacts["Retained mission bundle<br/>and carrier identity"]
     Control["aster-core control envelope<br/>authority · chain · effect"]
     Source["aster-core source envelope<br/>publisher · protected header · content"]
-    Node["aster-node<br/>mission-before-inventory · control-before-Event · local zeroize · receipts"]
-    Store["aster-redb-store<br/>control policy · Events · terminal intent · route-only cache"]
+    Node["aster-node<br/>protected receiver interest · direction-separated filtering · local zeroize · receipts"]
+    Store["aster-redb-store<br/>control policy · Events · selectors · pending attempts · route-only cache"]
     Profile["aster-profile<br/>canonical exact-ID ordering"]
     Diff["aster-negentropy<br/>bounded set difference"]
     Mission["aster-core reference session<br/>hybrid mission auth · frame protection"]
     Iroh["aster-iroh<br/>direct authenticated carrier · bounded exchange"]
     Peer["Peer aster-node<br/>independent identity and store"]
     App --> Source
+    Facade --> Source
+    Facade --> Intent --> Store
+    Store -->|"atomic policy + selector snapshot"| Node
     Authority --> Control
     Control --> Node
     Source --> Node
@@ -42,7 +47,9 @@ flowchart LR
 `aster-negentropy` knows only exact-transfer-ID set difference.
 `aster-redb-store` is the mission-bound transaction authority for the audited
 contiguous control prefix, active policy snapshots, accepted Events,
-causal/operation ledgers, and bounded route-only representations.
+causal/operation ledgers, durable Consume/Carry selector revisions, Event
+delivery cursors/pending attempts/acknowledgements, and bounded route-only
+representations.
 `aster-profile` owns the canonical full-ID vocabulary and ordering, not policy
 or semantic identity. `aster-node` is the only selected composition root. This
 diagram is the selected control/Event lane only; broader semantic/reference
@@ -65,7 +72,7 @@ tests.
 | Carrier path | Current capability | What is not yet claimed |
 |---|---|---|
 | Selected direct Iroh | Manually admitted exact endpoint ID and socket, direct authenticated QUIC, bounded exchange, hosted discovery/relay/port mapping disabled | Carrier authentication is not mission or control/source authorization; NAT, hosted relay, physical-network acceptance, and multi-carrier failover remain open |
-| Selected virtual mesh CLI | Real 2–32-node Ping/Pong line plus explicit four-role control scenario; independent identities/stores, mission auth before inventory, ordered Flash controls before source-sealed Event transfer, current scope/epoch route filtering, payload-blind relay cache, restart/idempotency, no-op verification, and a same-UID Unix local software-zeroization hook | Current-tree N=3/13-process, default N=4/18-process, and N=8/38-process Ping/Pong plus explicit N=4/23-process control passed with disclosed transient/denial stderr. The generic line has `2N+1` cohorts and `5N-2` children, isolates both publications and every directed-edge transfer, moves exactly one pre-existing Event per transfer edge with all control counters zero, and finishes with all 11 reconciliation counters zero. The control receipt separately proves converged controls, no-contact Ping publication, later Event forwarding, and four causal Pong barriers before its no-op. A separate real-child zeroization receipt passed. Provisioning is unprotected-reference; non-Unix and physical/copy-on-write/snapshot/swap/backup sanitization, database rollback resistance, generalized/repeated control management, finite TTL, general apps/subscriptions, other data classes, the full range, many-node scale, and physical multi-system acceptance remain open. |
+| Selected virtual mesh CLI | Real 2–32-node Ping/Pong line plus explicit four-role control scenario; independent identities/stores, mission auth before inventory, ordered Flash controls before source-sealed Event transfer, current scope/epoch route filtering, payload-blind relay cache, restart/idempotency, no-op verification, and a same-UID Unix local software-zeroization hook | The retained parent PR-A/pre-subscription N=3/13-process, default N=4/18-process, and N=8/38-process Ping/Pong plus explicit N=4/23-process control receipts passed with disclosed transient/denial stderr. The generic line has `2N+1` cohorts and `5N-2` children, isolates both publications and every directed-edge transfer, moves exactly one pre-existing Event per transfer edge with all control counters zero, and finishes with all 11 reconciliation counters zero. The control receipt separately proves converged controls, no-contact Ping publication, later Event forwarding, and four causal Pong barriers before its no-op. A separate parent-slice real-child zeroization receipt passed. PR B adds code/test evidence for durable Event Consume/Carry selectors, poll/ack, and protected receiver filtering; it does not relabel those retained roots. Provisioning is unprotected-reference; non-Unix and physical/copy-on-write/snapshot/swap/backup sanitization, database rollback resistance, live application/status integration, generalized/repeated control management, finite TTL, other data classes, the full range, many-node scale, and physical multi-system acceptance remain open. |
 | Current semantic in-memory link | Full high-level host contact, authentication, reconciliation, resume, and failure tests | It is a test carrier and is not wired to the selected composition |
 | Current semantic UDP/IP | Nonblocking link, manual endpoint mapping, protected local discovery, rendezvous helpers, opaque relay components | Migration onto the selected node; full host acceptance on physical or operational networks |
 | Current semantic NAT/rendezvous and relay | Bounded rendezvous, endpoint-punching, and opaque-relay helpers with local software tests | Selected-node integration and a two-device representative-NAT direct/fallback result |
@@ -127,10 +134,13 @@ four-flight hybrid session over that carrier, binds mission `NodeId`
 independently from Iroh `EndpointId`, and gates inventory on success. Event then
 uses the existing source-protected envelope after the existing ordered control
 provider has reconciled and activated a gap-free prefix: current peer scope/epoch
-route grants filter inventory and Offer; content grants gate semantic acceptance
-and reaction; revoked mission principals fail closed. State/Record/Blob,
-generalized topic subscriptions/control administration, repeated multi-scope
-rekey, finite-TTL custody, and protected provisioning remain to be composed.
+route grants remain an upper bound on inventory and Offer; the receiver's
+mission-protected canonical Consume/Carry interest narrows each direction
+further, and empty interest means receive-none. Content grants gate semantic
+acceptance and reaction; revoked mission principals fail closed.
+State/Record/Blob, live application/status integration, generalized control
+administration, repeated multi-scope lifecycle, finite-TTL custody, and
+protected provisioning remain to be composed.
 The mission bundle is owner-only on Unix but explicitly unprotected-reference
 at rest; other platforms fail closed because that owner-only contract cannot be
 verified.
@@ -150,7 +160,11 @@ sequenceDiagram
     P->>L: source-authenticated control suffix
     L->>S: commit and activate contiguous control prefix
     L->>S: capture fresh policy snapshot
-    L->>P: Negentropy query over locally route-filtered exact IDs
+    L->>S: capture selector revision and canonical Consume + Carry union
+    L->>P: protected Event interest (empty means receive-none)
+    P->>L: protected peer Event interest
+    Note over L,P: each direction = receiver interest ∩ current route authority
+    L->>P: Negentropy query over filtered exact IDs
     P->>L: reply lets local derive one exact set difference
     P->>L: reverse query over peer-filtered exact IDs
     L->>P: reply lets peer derive the reverse difference
@@ -167,7 +181,10 @@ sequenceDiagram
 
 This is the manual direct-Iroh, Event-only selected slice with
 unprotected-reference provisioning. Carrier authentication does not grant
-mission membership, and route authority does not grant content access.
+mission membership, route authority does not grant content access, and a
+subscription cannot expand either authority. Consume selectors also drive
+local poll delivery; Carry selectors drive receipt/forwarding without local
+poll delivery. Both modes project to the same protected wire interest.
 
 On Unix, a same-UID operator can invoke `aster zeroize` against the exact state
 and mission-bundle paths. A live node accepts the request only through an
