@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod application;
 mod frame;
 mod identity;
 pub mod mission;

@@ -49,6 +49,10 @@ const EVENT_BYTES: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.semantic-event-bytes.v1");
 const EVENT_ACCEPTANCE_MARKERS: TableDefinition<&[u8], u64> =
     TableDefinition::new("aster.semantic-event-markers.v1");
+// Marker order is an inverse of EVENT_ACCEPTANCE_MARKERS. It exists only to
+// bound application scans; neither direction confers cryptographic authority.
+const EVENT_ACCEPTANCE_ORDER: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("aster.semantic-event-acceptance-order.v1");
 const SEMANTIC_ITEMS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.semantic-items.v1");
 const ACCEPTED_DOTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("aster.accepted-dots.v1");
@@ -795,6 +799,73 @@ pub struct StoredEvent {
     pub sealed: Vec<u8>,
     /// Durable marker allocated when this representation was first accepted.
     pub acceptance_marker: u64,
+}
+
+/// Bounded structural filter for accepted Event candidates.
+///
+/// Matching uses metadata retained only after content-verified admission. The
+/// returned rows are still durable structure rather than live cryptographic
+/// capabilities; callers must freshly authenticate their exact sealed bytes
+/// before exposing content or taking an application effect.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct EventQueryFilter {
+    /// Exact source-authenticated publisher, or every publisher when absent.
+    pub publisher: Option<NodeId>,
+    /// Exact source-authenticated topic, or every topic when absent.
+    pub topic: Option<Topic>,
+    /// Exact or ancestor source-authenticated scope, or every scope when absent.
+    pub scope: Option<Scope>,
+    /// Exact source-authenticated logical key, or every key when absent.
+    pub logical_key: Option<Vec<u8>>,
+    /// Includes descendants of `scope`; ignored when `scope` is absent.
+    pub include_descendant_scopes: bool,
+}
+
+impl EventQueryFilter {
+    fn matches(&self, event: &StoredEvent) -> bool {
+        if self
+            .publisher
+            .is_some_and(|publisher| event.header.stamp.dot.publisher != publisher)
+        {
+            return false;
+        }
+        if self
+            .topic
+            .as_ref()
+            .is_some_and(|topic| event.header.topic != *topic)
+        {
+            return false;
+        }
+        if let Some(scope) = &self.scope {
+            let matches = if self.include_descendant_scopes {
+                scope.contains(&event.header.scope)
+            } else {
+                event.header.scope == *scope
+            };
+            if !matches {
+                return false;
+            }
+        }
+        if self
+            .logical_key
+            .as_ref()
+            .is_some_and(|logical_key| event.header.logical_key != *logical_key)
+        {
+            return false;
+        }
+        true
+    }
+}
+
+/// One bounded marker-ordered scan of structurally accepted Event rows.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct EventCandidatePage {
+    /// Matching accepted Events in durable acceptance order.
+    pub events: Vec<StoredEvent>,
+    /// Last acceptance marker examined, or the input marker when no row was examined.
+    pub scanned_through: u64,
+    /// Whether an accepted row exists after `scanned_through`, independent of matches.
+    pub has_more: bool,
 }
 
 /// Canonically ordered exact Event transfer identities for reconciliation.
@@ -3789,6 +3860,83 @@ impl Store {
         Ok(stats)
     }
 
+    /// Returns one bounded acceptance-ordered page of matching Event candidates.
+    ///
+    /// At most `scan_limit` accepted rows after `after_acceptance_marker` are
+    /// examined, even when the filter matches none of them. `scanned_through`
+    /// therefore advances by examined rows rather than returned rows, and
+    /// `has_more` reports continuation independently of match count.
+    ///
+    /// The exact control-policy snapshot is checked in the same redb read
+    /// transaction as the index and Event rows. Success does not keep that
+    /// policy leased after return, and persisted Event metadata is not a live
+    /// source/content capability. Callers must freshly authenticate every
+    /// returned `sealed` representation before application use.
+    pub fn query_event_candidates_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        filter: &EventQueryFilter,
+        after_acceptance_marker: u64,
+        scan_limit: usize,
+    ) -> Result<EventCandidatePage, StoreError> {
+        let authority = self.require_bound_mission()?;
+        if scan_limit == 0 || scan_limit > MAX_EVENT_PAGE {
+            return Err(StoreError::EventPageLimitExceeded {
+                requested: scan_limit,
+                maximum: MAX_EVENT_PAGE,
+            });
+        }
+        let read = self.database.begin_read()?;
+        require_control_policy_read(&read, authority, policy)?;
+        let acceptance_order = read.open_table(EVENT_ACCEPTANCE_ORDER)?;
+        let metadata = read.open_table(METADATA)?;
+        let last_acceptance_marker = metadata
+            .get(LAST_SEMANTIC_ACCEPTANCE_MARKER)?
+            .map_or(0, |value| value.value());
+        let mut page = EventCandidatePage {
+            scanned_through: after_acceptance_marker,
+            ..EventCandidatePage::default()
+        };
+        let mut expected_marker = after_acceptance_marker.checked_add(1);
+        let mut visited = 0usize;
+        let range = (
+            std::ops::Bound::Excluded(after_acceptance_marker),
+            std::ops::Bound::Unbounded,
+        );
+        for row in acceptance_order.range(range)?.take(scan_limit) {
+            let (marker, transfer) = row?;
+            let marker = marker.value();
+            if expected_marker != Some(marker) {
+                return Err(StoreError::SemanticInvariant(
+                    "Event acceptance-order query encountered a nonconsecutive marker",
+                ));
+            }
+            let transfer_id = parse_transfer_id("Event acceptance-order table", transfer.value())?;
+            let event =
+                load_event_from_read(&read, transfer_id)?.ok_or(StoreError::SemanticInvariant(
+                    "Event acceptance-order index points to a missing accepted Event",
+                ))?;
+            if event.acceptance_marker != marker {
+                return Err(StoreError::SemanticInvariant(
+                    "Event acceptance-order index differs from its forward marker",
+                ));
+            }
+            visited += 1;
+            page.scanned_through = marker;
+            expected_marker = marker.checked_add(1);
+            if filter.matches(&event) {
+                page.events.push(event);
+            }
+        }
+        if visited < scan_limit && page.scanned_through < last_acceptance_marker {
+            return Err(StoreError::SemanticInvariant(
+                "Event acceptance-order query ended before durable acceptance high-water",
+            ));
+        }
+        page.has_more = page.scanned_through < last_acceptance_marker;
+        Ok(page)
+    }
+
     /// Returns a bounded marker-ordered page of semantic Events.
     pub fn events_after(
         &self,
@@ -4224,6 +4372,15 @@ impl Store {
         write
             .open_table(EVENT_ACCEPTANCE_MARKERS)?
             .insert(prepared.transfer_id.as_bytes().as_slice(), marker)?;
+        if write
+            .open_table(EVENT_ACCEPTANCE_ORDER)?
+            .insert(marker, prepared.transfer_id.as_bytes().as_slice())?
+            .is_some()
+        {
+            return Err(StoreError::SemanticInvariant(
+                "Event acceptance marker is already indexed to another transfer",
+            ));
+        }
 
         write.open_table(EVENTS)?.insert(
             prepared.transfer_id.as_bytes().as_slice(),
@@ -6046,9 +6203,21 @@ fn audit_semantic_tables(write: &redb::WriteTransaction) -> Result<(), StoreErro
     // Opening every table here is the non-destructive schema extension for old
     // stores. Existing v1 opaque item/effect bytes remain untouched and use a
     // disjoint caller-controlled key namespace.
+    if write
+        .list_multimap_tables()?
+        .any(|table| table.name() == EVENT_ACCEPTANCE_ORDER.name())
+    {
+        return Err(StoreError::SemanticInvariant(
+            "Event acceptance-order index has the wrong table kind",
+        ));
+    }
+    let acceptance_order_existed = write
+        .list_tables()?
+        .any(|table| table.name() == EVENT_ACCEPTANCE_ORDER.name());
     let events = write.open_table(EVENTS)?;
     let event_bytes = write.open_table(EVENT_BYTES)?;
     let event_markers = write.open_table(EVENT_ACCEPTANCE_MARKERS)?;
+    let mut event_acceptance_order = write.open_table(EVENT_ACCEPTANCE_ORDER)?;
     let semantic_items = write.open_table(SEMANTIC_ITEMS)?;
     let accepted_dots = write.open_table(ACCEPTED_DOTS)?;
     let accepted_events = write.open_table(ACCEPTED_EVENTS)?;
@@ -6102,6 +6271,35 @@ fn audit_semantic_tables(write: &redb::WriteTransaction) -> Result<(), StoreErro
             return Err(StoreError::SemanticInvariant(
                 "semantic acceptance markers must be nonzero and unique",
             ));
+        }
+        let ordered_transfer = event_acceptance_order
+            .get(marker)?
+            .map(|value| value.value().to_vec());
+        match ordered_transfer {
+            Some(ordered_transfer) => {
+                let ordered_transfer =
+                    parse_transfer_id("Event acceptance-order table", &ordered_transfer)?;
+                if ordered_transfer != transfer_id {
+                    return Err(StoreError::SemanticInvariant(
+                        "Event acceptance-order index differs from its forward marker",
+                    ));
+                }
+            }
+            None if acceptance_order_existed => {
+                return Err(StoreError::SemanticInvariant(
+                    "Event acceptance-order index is missing an accepted Event",
+                ));
+            }
+            None => {
+                if event_acceptance_order
+                    .insert(marker, transfer_id.as_bytes().as_slice())?
+                    .is_some()
+                {
+                    return Err(StoreError::SemanticInvariant(
+                        "Event acceptance marker is already indexed to another transfer",
+                    ));
+                }
+            }
         }
         reconstructed_event_count = reconstructed_event_count
             .checked_add(1)
@@ -6263,6 +6461,35 @@ fn audit_semantic_tables(write: &redb::WriteTransaction) -> Result<(), StoreErro
         if events.get(key.value())?.is_none() {
             return Err(StoreError::SemanticInvariant(
                 "semantic Event marker is missing metadata",
+            ));
+        }
+    }
+    if event_acceptance_order.len()? != reconstructed_event_count {
+        return Err(StoreError::SemanticInvariant(
+            "Event acceptance-order index has missing or orphan rows",
+        ));
+    }
+    for row in event_acceptance_order.iter()? {
+        let (marker, transfer) = row?;
+        let marker = marker.value();
+        if marker == 0 {
+            return Err(StoreError::SemanticInvariant(
+                "Event acceptance-order index contains a zero marker",
+            ));
+        }
+        let transfer_id = parse_transfer_id("Event acceptance-order table", transfer.value())?;
+        if events.get(transfer_id.as_bytes().as_slice())?.is_none() {
+            return Err(StoreError::SemanticInvariant(
+                "Event acceptance-order index points to a missing accepted Event",
+            ));
+        }
+        if event_markers
+            .get(transfer_id.as_bytes().as_slice())?
+            .map(|value| value.value())
+            != Some(marker)
+        {
+            return Err(StoreError::SemanticInvariant(
+                "Event acceptance-order index differs from its forward marker",
             ));
         }
     }
@@ -8177,10 +8404,19 @@ fn inspect_control_tables(
 fn inspect_semantic_readable(
     read: &redb::ReadTransaction,
 ) -> Result<(EventStoreStats, Option<NodeId>), StoreError> {
+    if read
+        .list_multimap_tables()?
+        .any(|table| table.name() == EVENT_ACCEPTANCE_ORDER.name())
+    {
+        return Err(StoreError::SemanticInvariant(
+            "Event acceptance-order index has the wrong table kind",
+        ));
+    }
     let table_names = read
         .list_tables()?
         .map(|table| table.name().to_owned())
         .collect::<std::collections::BTreeSet<_>>();
+    let acceptance_order_present = table_names.contains(EVENT_ACCEPTANCE_ORDER.name());
     let semantic_tables = [
         EVENTS.name(),
         EVENT_BYTES.name(),
@@ -8201,6 +8437,11 @@ fn inspect_semantic_readable(
         .filter(|name| table_names.contains(**name))
         .count();
     if present == 0 {
+        if acceptance_order_present {
+            return Err(StoreError::SemanticInvariant(
+                "mission-scoped Event schema is incomplete",
+            ));
+        }
         return Ok((EventStoreStats::default(), None));
     }
     if present != semantic_tables.len() {
@@ -8212,6 +8453,9 @@ fn inspect_semantic_readable(
     let events = read.open_table(EVENTS)?;
     let event_bytes = read.open_table(EVENT_BYTES)?;
     let event_markers = read.open_table(EVENT_ACCEPTANCE_MARKERS)?;
+    let event_acceptance_order = acceptance_order_present
+        .then(|| read.open_table(EVENT_ACCEPTANCE_ORDER))
+        .transpose()?;
     let semantic_items = read.open_table(SEMANTIC_ITEMS)?;
     let accepted_dots = read.open_table(ACCEPTED_DOTS)?;
     let accepted_events = read.open_table(ACCEPTED_EVENTS)?;
@@ -8268,6 +8512,20 @@ fn inspect_semantic_readable(
             return Err(StoreError::SemanticInvariant(
                 "semantic acceptance markers must be nonzero and unique",
             ));
+        }
+        if let Some(event_acceptance_order) = &event_acceptance_order {
+            let ordered_transfer = event_acceptance_order
+                .get(marker)?
+                .map(|value| parse_transfer_id("Event acceptance-order table", value.value()))
+                .transpose()?
+                .ok_or(StoreError::SemanticInvariant(
+                    "Event acceptance-order index is missing an accepted Event",
+                ))?;
+            if ordered_transfer != transfer_id {
+                return Err(StoreError::SemanticInvariant(
+                    "Event acceptance-order index differs from its forward marker",
+                ));
+            }
         }
         let indexed = semantic_items
             .get(event.semantic_id.as_bytes().as_slice())?
@@ -8392,6 +8650,37 @@ fn inspect_semantic_readable(
             return Err(StoreError::SemanticInvariant(
                 "semantic Event marker is missing metadata",
             ));
+        }
+    }
+    if let Some(event_acceptance_order) = &event_acceptance_order {
+        if event_acceptance_order.len()? != event_count {
+            return Err(StoreError::SemanticInvariant(
+                "Event acceptance-order index has missing or orphan rows",
+            ));
+        }
+        for row in event_acceptance_order.iter()? {
+            let (marker, transfer) = row?;
+            let marker = marker.value();
+            if marker == 0 {
+                return Err(StoreError::SemanticInvariant(
+                    "Event acceptance-order index contains a zero marker",
+                ));
+            }
+            let transfer_id = parse_transfer_id("Event acceptance-order table", transfer.value())?;
+            if events.get(transfer_id.as_bytes().as_slice())?.is_none() {
+                return Err(StoreError::SemanticInvariant(
+                    "Event acceptance-order index points to a missing accepted Event",
+                ));
+            }
+            if event_markers
+                .get(transfer_id.as_bytes().as_slice())?
+                .map(|value| value.value())
+                != Some(marker)
+            {
+                return Err(StoreError::SemanticInvariant(
+                    "Event acceptance-order index differs from its forward marker",
+                ));
+            }
         }
     }
     for row in semantic_items.iter()? {
@@ -8825,6 +9114,10 @@ mod tests {
         Scope::new("mission/events").expect("scope")
     }
 
+    fn child_event_scope() -> Scope {
+        Scope::new("mission/events/child").expect("child scope")
+    }
+
     fn event_services(seed: u8) -> EventServices {
         let mut provisioner = ReferenceProvisioner::from_seed([seed; 32]).expect("provisioner");
         let member = ProvisioningAccess::member(
@@ -8840,6 +9133,35 @@ mod tests {
             .expect("publisher");
         let reader = provisioner
             .issue_node(2, &[member])
+            .and_then(ReferenceEnvelopeSealer::open)
+            .expect("reader");
+        let relay = provisioner
+            .issue_node(3, &[relay])
+            .and_then(ReferenceEnvelopeSealer::open)
+            .expect("relay");
+        let authority = publisher.mission_authority_id();
+        EventServices {
+            publisher,
+            reader,
+            relay,
+            authority,
+        }
+    }
+
+    fn event_services_with_child_scope(seed: u8) -> EventServices {
+        let mut provisioner = ReferenceProvisioner::from_seed([seed; 32]).expect("provisioner");
+        let topics = vec![event_topic(), reaction_topic()];
+        let parent = ProvisioningAccess::member(event_scope(), vec![1], topics.clone())
+            .expect("parent member access");
+        let child = ProvisioningAccess::member(child_event_scope(), vec![1], topics)
+            .expect("child member access");
+        let relay = ProvisioningAccess::relay(event_scope(), vec![1]).expect("relay access");
+        let publisher = provisioner
+            .issue_node(1, &[parent.clone(), child.clone()])
+            .and_then(ReferenceEnvelopeSealer::open)
+            .expect("publisher");
+        let reader = provisioner
+            .issue_node(2, &[parent, child])
             .and_then(ReferenceEnvelopeSealer::open)
             .expect("reader");
         let relay = provisioner
@@ -8934,6 +9256,27 @@ mod tests {
             tombstone: false,
             key_epoch: 1,
         }
+    }
+
+    fn accept_event(
+        store: &Store,
+        services: &mut EventServices,
+        header: EnvelopeHeader,
+        payload: &[u8],
+    ) -> StoredEvent {
+        let sealed = services
+            .publisher
+            .seal_event(&header, payload)
+            .expect("seal accepted Event");
+        let event = content_event(&mut services.reader, &sealed.bytes);
+        let transfer_id = EventTransferId::new(event.envelope_id());
+        store
+            .apply_verified_event(&event, &sealed.bytes)
+            .expect("accept Event");
+        store
+            .get_event(transfer_id)
+            .expect("read accepted Event")
+            .expect("accepted Event row")
     }
 
     fn write_metadata(path: &std::path::Path, key: &'static str, value: u64) {
@@ -9670,6 +10013,480 @@ mod tests {
         assert_eq!(store.event_inventory().expect("Event inventory").len(), 1);
         assert_eq!(store.stats().expect("legacy stats").items, 1);
         assert_eq!(store.event_stats().expect("Event stats").events, 1);
+    }
+
+    #[test]
+    fn fresh_event_candidate_query_is_bounded_ordered_filtered_and_route_separated() {
+        let file = TestFile::new("event-candidate-query");
+        let mut services = event_services_with_child_scope(0x42);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("fresh store");
+        let publisher = services.publisher.identity();
+
+        let first_payload = b"first accepted Event";
+        let first = accept_event(
+            &store,
+            &mut services,
+            event_header(
+                publisher,
+                1,
+                1,
+                VersionVector::default(),
+                b"alpha",
+                first_payload,
+                None,
+            ),
+            first_payload,
+        );
+        let second_payload = b"second accepted Event";
+        let mut second_header = event_header(
+            publisher,
+            2,
+            1,
+            VersionVector::default(),
+            b"beta",
+            second_payload,
+            None,
+        );
+        second_header.topic = reaction_topic();
+        let second = accept_event(&store, &mut services, second_header, second_payload);
+        let third_payload = b"third accepted Event";
+        let mut third_header = event_header(
+            publisher,
+            3,
+            1,
+            VersionVector::default(),
+            b"alpha",
+            third_payload,
+            None,
+        );
+        third_header.scope = child_event_scope();
+        let third = accept_event(&store, &mut services, third_header, third_payload);
+        let fourth_payload = b"fourth accepted Event";
+        let fourth = accept_event(
+            &store,
+            &mut services,
+            event_header(
+                publisher,
+                4,
+                2,
+                VersionVector::default(),
+                b"gamma",
+                fourth_payload,
+                None,
+            ),
+            fourth_payload,
+        );
+
+        let route_payload = b"route cache is not an accepted Event";
+        let route_header = event_header(
+            publisher,
+            5,
+            3,
+            VersionVector::default(),
+            b"route-only",
+            route_payload,
+            None,
+        );
+        let route_sealed = services
+            .publisher
+            .seal_event(&route_header, route_payload)
+            .expect("seal route-only Event");
+        let route = services
+            .relay
+            .verify_event(&route_sealed.bytes)
+            .expect("route verification");
+        store
+            .cache_route_verified_event(&route, &route_sealed.bytes)
+            .expect("cache route-only representation");
+
+        let policy = store.control_policy_snapshot().expect("query policy");
+        let unmatched = store
+            .query_event_candidates_with_policy(
+                &policy,
+                &EventQueryFilter {
+                    publisher: Some([0xee; 32]),
+                    ..EventQueryFilter::default()
+                },
+                0,
+                2,
+            )
+            .expect("bounded unmatched scan");
+        assert!(unmatched.events.is_empty());
+        assert_eq!(unmatched.scanned_through, 2);
+        assert!(unmatched.has_more, "continuation is independent of matches");
+
+        let first_page = store
+            .query_event_candidates_with_policy(&policy, &EventQueryFilter::default(), 0, 2)
+            .expect("first page");
+        assert_eq!(
+            first_page
+                .events
+                .iter()
+                .map(|event| event.transfer_id)
+                .collect::<Vec<_>>(),
+            vec![first.transfer_id, second.transfer_id]
+        );
+        assert_eq!(first_page.scanned_through, 2);
+        assert!(first_page.has_more);
+        let second_page = store
+            .query_event_candidates_with_policy(
+                &policy,
+                &EventQueryFilter::default(),
+                first_page.scanned_through,
+                2,
+            )
+            .expect("second page");
+        assert_eq!(
+            second_page
+                .events
+                .iter()
+                .map(|event| event.transfer_id)
+                .collect::<Vec<_>>(),
+            vec![third.transfer_id, fourth.transfer_id]
+        );
+        assert_eq!(second_page.scanned_through, 4);
+        assert!(!second_page.has_more);
+        assert_eq!(
+            store
+                .event_stats()
+                .expect("separate route stats")
+                .route_cached,
+            1
+        );
+
+        let descendant_match = store
+            .query_event_candidates_with_policy(
+                &policy,
+                &EventQueryFilter {
+                    publisher: Some(publisher),
+                    topic: Some(event_topic()),
+                    scope: Some(event_scope()),
+                    logical_key: Some(b"alpha".to_vec()),
+                    include_descendant_scopes: true,
+                },
+                0,
+                MAX_EVENT_PAGE,
+            )
+            .expect("combined descendant filter");
+        assert_eq!(
+            descendant_match
+                .events
+                .iter()
+                .map(|event| event.transfer_id)
+                .collect::<Vec<_>>(),
+            vec![first.transfer_id, third.transfer_id]
+        );
+        assert_eq!(descendant_match.scanned_through, 4);
+        assert!(!descendant_match.has_more);
+
+        let exact_scope_match = store
+            .query_event_candidates_with_policy(
+                &policy,
+                &EventQueryFilter {
+                    scope: Some(event_scope()),
+                    logical_key: Some(b"alpha".to_vec()),
+                    ..EventQueryFilter::default()
+                },
+                0,
+                MAX_EVENT_PAGE,
+            )
+            .expect("exact scope filter");
+        assert_eq!(exact_scope_match.events, vec![first.clone()]);
+        let topic_match = store
+            .query_event_candidates_with_policy(
+                &policy,
+                &EventQueryFilter {
+                    topic: Some(reaction_topic()),
+                    ..EventQueryFilter::default()
+                },
+                0,
+                MAX_EVENT_PAGE,
+            )
+            .expect("topic filter");
+        assert_eq!(topic_match.events, vec![second.clone()]);
+        let key_match = store
+            .query_event_candidates_with_policy(
+                &policy,
+                &EventQueryFilter {
+                    logical_key: Some(b"gamma".to_vec()),
+                    ..EventQueryFilter::default()
+                },
+                0,
+                MAX_EVENT_PAGE,
+            )
+            .expect("logical-key filter");
+        assert_eq!(key_match.events, vec![fourth.clone()]);
+
+        for requested in [0, MAX_EVENT_PAGE + 1] {
+            assert!(matches!(
+                store.query_event_candidates_with_policy(
+                    &policy,
+                    &EventQueryFilter::default(),
+                    0,
+                    requested,
+                ),
+                Err(StoreError::EventPageLimitExceeded { maximum, .. })
+                    if maximum == MAX_EVENT_PAGE
+            ));
+        }
+        let wrong_policy = ControlPolicySnapshot {
+            authority: [0xed; 32],
+            head: policy.head,
+        };
+        assert!(matches!(
+            store.query_event_candidates_with_policy(
+                &wrong_policy,
+                &EventQueryFilter::default(),
+                0,
+                1,
+            ),
+            Err(StoreError::MissionAuthorityMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn event_candidate_query_rejects_inverse_gaps_and_truncated_high_water() {
+        let file = TestFile::new("event-candidate-query-corruption");
+        let mut services = event_services(0x44);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("bound store");
+        let publisher = services.publisher.identity();
+        let mut accepted = Vec::new();
+        for marker in 1..=3u64 {
+            let payload = format!("accepted Event {marker}").into_bytes();
+            accepted.push(accept_event(
+                &store,
+                &mut services,
+                event_header(
+                    publisher,
+                    marker,
+                    marker,
+                    VersionVector::default(),
+                    &[marker as u8],
+                    &payload,
+                    None,
+                ),
+                &payload,
+            ));
+        }
+        let policy = store.control_policy_snapshot().expect("query policy");
+
+        {
+            let write = store.database.begin_write().expect("gap corruption write");
+            {
+                let mut order = write
+                    .open_table(EVENT_ACCEPTANCE_ORDER)
+                    .expect("acceptance order");
+                assert!(order.remove(2).expect("remove middle marker").is_some());
+            }
+            write.commit().expect("commit middle gap");
+        }
+        assert!(matches!(
+            store.query_event_candidates_with_policy(&policy, &EventQueryFilter::default(), 0, 3,),
+            Err(StoreError::SemanticInvariant(
+                "Event acceptance-order query encountered a nonconsecutive marker"
+            ))
+        ));
+
+        {
+            let write = store.database.begin_write().expect("tail corruption write");
+            {
+                let mut order = write
+                    .open_table(EVENT_ACCEPTANCE_ORDER)
+                    .expect("acceptance order");
+                order
+                    .insert(2, accepted[1].transfer_id.as_bytes().as_slice())
+                    .expect("restore middle marker");
+                assert!(order.remove(3).expect("remove tail marker").is_some());
+            }
+            write.commit().expect("commit truncated tail");
+        }
+        assert!(matches!(
+            store.query_event_candidates_with_policy(&policy, &EventQueryFilter::default(), 0, 3,),
+            Err(StoreError::SemanticInvariant(
+                "Event acceptance-order query ended before durable acceptance high-water"
+            ))
+        ));
+    }
+
+    #[test]
+    fn acceptance_order_migrates_legacy_live_store_reopens_and_rejects_corruption() {
+        let file = TestFile::new("event-acceptance-order-migration");
+        let mut services = event_services(0x43);
+        let publisher = services.publisher.identity();
+        let (first, second) = {
+            let store =
+                Store::open_for_mission(&file.0, services.authority).expect("fresh bound store");
+            let first_payload = b"legacy first Event";
+            let first = accept_event(
+                &store,
+                &mut services,
+                event_header(
+                    publisher,
+                    1,
+                    1,
+                    VersionVector::default(),
+                    b"first",
+                    first_payload,
+                    None,
+                ),
+                first_payload,
+            );
+            let second_payload = b"legacy second Event";
+            let second = accept_event(
+                &store,
+                &mut services,
+                event_header(
+                    publisher,
+                    2,
+                    2,
+                    VersionVector::default(),
+                    b"second",
+                    second_payload,
+                    None,
+                ),
+                second_payload,
+            );
+            (first, second)
+        };
+
+        {
+            let database = Database::open(&file.0).expect("open legacy simulation");
+            let write = database.begin_write().expect("legacy simulation write");
+            write
+                .delete_table(EVENT_ACCEPTANCE_ORDER)
+                .expect("remove post-legacy index");
+            write.commit().expect("commit legacy simulation");
+        }
+        assert_eq!(
+            Store::inspect_existing(&file.0)
+                .expect("legacy store remains read-only inspectable")
+                .event_stats
+                .events,
+            2
+        );
+
+        {
+            let migrated = Store::open_for_mission(&file.0, services.authority)
+                .expect("live open backfills acceptance order");
+            let policy = migrated.control_policy_snapshot().expect("migrated policy");
+            let page = migrated
+                .query_event_candidates_with_policy(
+                    &policy,
+                    &EventQueryFilter::default(),
+                    0,
+                    MAX_EVENT_PAGE,
+                )
+                .expect("query migrated order");
+            assert_eq!(page.events, vec![first.clone(), second.clone()]);
+            assert_eq!(page.scanned_through, 2);
+            assert!(!page.has_more);
+        }
+        assert_eq!(
+            Store::inspect_existing(&file.0)
+                .expect("persisted backfill reopens read-only")
+                .event_stats
+                .events,
+            2
+        );
+
+        {
+            let database = Database::open(&file.0).expect("open corrupt index");
+            let write = database.begin_write().expect("corrupt index write");
+            {
+                let mut order = write
+                    .open_table(EVENT_ACCEPTANCE_ORDER)
+                    .expect("acceptance order");
+                order
+                    .insert(1, second.transfer_id.as_bytes().as_slice())
+                    .expect("misindex first marker");
+            }
+            write.commit().expect("commit corrupt index");
+        }
+        assert!(matches!(
+            Store::inspect_existing(&file.0),
+            Err(StoreError::SemanticInvariant(
+                "Event acceptance-order index differs from its forward marker"
+            ))
+        ));
+        assert!(matches!(
+            Store::open_for_mission(&file.0, services.authority),
+            Err(StoreError::SemanticInvariant(
+                "Event acceptance-order index differs from its forward marker"
+            ))
+        ));
+    }
+
+    #[test]
+    fn wrong_kind_acceptance_order_fails_closed_without_unrelated_migration() {
+        let file = TestFile::new("event-acceptance-order-wrong-kind");
+        let services = event_services(0x45);
+        {
+            let store =
+                Store::open_for_mission(&file.0, services.authority).expect("initialized store");
+            assert_eq!(
+                store.control_stats().expect("initialized control stats"),
+                ControlStoreStats::default()
+            );
+        }
+        {
+            let database = Database::open(&file.0).expect("open wrong-kind store");
+            let write = database.begin_write().expect("wrong-kind write");
+            write
+                .open_table(METADATA)
+                .expect("metadata")
+                .remove(SEMANTIC_ITEM_COUNT)
+                .expect("remove unrelated migration target");
+            write
+                .delete_table(EVENT_ACCEPTANCE_ORDER)
+                .expect("remove regular acceptance order");
+            let definition =
+                redb::MultimapTableDefinition::<u64, &[u8]>::new(EVENT_ACCEPTANCE_ORDER.name());
+            write
+                .open_multimap_table(definition)
+                .expect("wrong-kind acceptance order")
+                .insert(1, b"wrong-kind".as_slice())
+                .expect("wrong-kind row");
+            write.commit().expect("commit wrong-kind schema");
+        }
+
+        for result in [
+            Store::inspect_existing(&file.0).map(|_| ()),
+            Store::open_for_mission(&file.0, services.authority).map(|_| ()),
+        ] {
+            assert!(
+                matches!(
+                    &result,
+                    Err(StoreError::SemanticInvariant(
+                        "Event acceptance-order index has the wrong table kind"
+                    ))
+                ),
+                "unexpected wrong-kind result: {result:?}"
+            );
+        }
+
+        let database = redb::Builder::new()
+            .open_read_only(&file.0)
+            .expect("read wrong-kind store");
+        let read = database.begin_read().expect("read transaction");
+        assert!(
+            read.open_table(METADATA)
+                .expect("metadata")
+                .get(SEMANTIC_ITEM_COUNT)
+                .expect("unrelated migration target")
+                .is_none(),
+            "wrong-kind rejection must not repair unrelated Event accounting"
+        );
+        assert!(
+            !read
+                .list_tables()
+                .expect("regular tables")
+                .any(|table| table.name() == EVENT_ACCEPTANCE_ORDER.name())
+        );
+        assert!(
+            read.list_multimap_tables()
+                .expect("multimap tables")
+                .any(|table| table.name() == EVENT_ACCEPTANCE_ORDER.name())
+        );
     }
 
     #[test]
@@ -12777,6 +13594,21 @@ mod tests {
             .ingest_verified_control(&verified_control, &sealed_control)
             .expect("control row");
 
+        let event_query_policy = store
+            .control_policy_snapshot()
+            .expect("terminal test Event query policy");
+        let event_candidates = store
+            .query_event_candidates_with_policy(
+                &event_query_policy,
+                &EventQueryFilter::default(),
+                0,
+                1,
+            )
+            .expect("Event candidate before terminal transition");
+        assert_eq!(event_candidates.events.len(), 1);
+        assert_eq!(event_candidates.scanned_through, 1);
+        assert!(!event_candidates.has_more);
+
         let opaque_before = store.stats().expect("opaque stats");
         let events_before = store.event_stats().expect("Event stats");
         let controls_before = store.control_stats().expect("control stats");
@@ -12796,6 +13628,17 @@ mod tests {
         ));
         assert!(matches!(
             store.event_count(),
+            Err(StoreError::StoreZeroized(
+                StoreZeroizationState::CleanupPending
+            ))
+        ));
+        assert!(matches!(
+            store.query_event_candidates_with_policy(
+                &event_query_policy,
+                &EventQueryFilter::default(),
+                0,
+                1,
+            ),
             Err(StoreError::StoreZeroized(
                 StoreZeroizationState::CleanupPending
             ))

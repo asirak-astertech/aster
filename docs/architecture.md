@@ -2,8 +2,10 @@
 
 This page depicts the bounded control/Event composition that executes today.
 It is intentionally narrower than Aster's complete protocol and semantic
-reference implementation. State, Record, Blob, generalized applications and
-subscriptions, finite-TTL custody, protected operational provisioning,
+reference implementation. The stopped-state selected Event API now provides a
+foundation for publish and bounded query. Public authenticated gap inspection,
+State, Record, Blob, durable subscriptions, a live application handle with
+peer/sync status, finite-TTL custody, protected operational provisioning,
 additional carriers, and release authorization remain outside this selected
 lane.
 
@@ -13,7 +15,7 @@ lane.
 flowchart LR
     Operator["Same-UID Unix operator"]
     Authority["Stopped authority CLI"]
-    App["Built-in Event application"]
+    App["Built-in or stopped-state<br/>Event application"]
     Artifacts["Retained mission bundle<br/>and carrier identity"]
 
     subgraph Local["Selected aster-node composition"]
@@ -120,6 +122,7 @@ and non-Unix behavior are outside the proof.
 ## Follow the evidence
 
 - [Capability tour](quickstart/capability-tour.md) — fastest visible behavior.
+- [Selected Event API](quickstart/selected-event-api.md) — stopped-state publish/query foundation.
 - [Carriers and contacts](transports.md) — selected and migration-source carrier boundaries.
 - [Mesh CLI guide](quickstart/mesh-cli.md) — phase-by-phase and retained receipts.
 - [Requirements status](implementation/requirements-status.md) — exact credited rows and open gaps.
