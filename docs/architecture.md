@@ -2,13 +2,14 @@
 
 This page depicts the bounded control/Event composition that executes today.
 It is intentionally narrower than Aster's complete protocol and semantic
-reference implementation. The stopped-state selected Event API now provides
-publish, bounded query, and durable subscribe/poll/ack; the live runtime
-exchanges protected receive interests and reconciles only selected Events.
-Public authenticated gap inspection, subscription update/delete, State,
-Record, Blob, a live application handle with peer/sync status, finite-TTL
-custody, protected operational provisioning, additional carriers, and release
-authorization remain outside this selected lane.
+reference implementation. The live selected Event API provides publish,
+bounded query, durable subscribe/poll/ack, idempotent unsubscribe, authenticated
+gap inspection, and bounded peer/last-contact status through the running node's
+sole actor. The stopped-state handle provides the same data operations when no
+runtime owns the store. State, Record, Blob, atomic subscription update,
+finite-TTL custody, protected operational provisioning, additional carriers,
+generalized control administration, and release authorization remain outside
+this selected lane.
 
 ## Components and trust boundaries
 
@@ -16,8 +17,10 @@ authorization remain outside this selected lane.
 flowchart LR
     Operator["Same-UID Unix operator"]
     Authority["Stopped authority CLI"]
-    LiveApp["Live built-in roles<br/>Ping · Pong · relay"]
-    StoppedApp["Stopped SelectedEventNode<br/>publish · query · subscribe · poll · ack"]
+    Application["Application"]
+    LiveHandle["SelectedEventHandle<br/>publish · query · subscribe · poll · ack<br/>unsubscribe · gaps · status"]
+    StoppedApp["Stopped SelectedEventNode<br/>same Event data operations<br/>without live status"]
+    BuiltIns["Built-in roles<br/>Ping · Pong · relay"]
     Artifacts["Retained mission bundle<br/>and carrier identity"]
 
     subgraph Local["Selected aster-node composition"]
@@ -32,9 +35,12 @@ flowchart LR
 
     Peer["Peer aster-node<br/>independent identity and store"]
 
-    LiveApp -. "runs inside actor" .-> Node
-    StoppedApp -->|"application operations"| Node
-    Node -->|"verified results and receipts"| StoppedApp
+    Application --> LiveHandle -->|"bounded commands"| Node
+    Node -->|"sanitized results"| LiveHandle
+    BuiltIns -. "run inside actor" .-> Node
+    StoppedApp -->|"exclusive stopped-state operations"| Store
+    Store -->|"bounded structural candidates and durable receipts"| StoppedApp
+    StoppedApp -->|"fresh source/content verification"| Core
     Authority -->|"control input"| Node
     Node -->|"uses control/source providers"| Core
     Node -->|"uses canonical ordering"| Profile
@@ -53,6 +59,67 @@ difference; it does not transfer objects, establish causality, or make policy.
 ordered control effects, policy/selector snapshots, at-least-once application
 delivery, route-only representations, and the terminal zeroization marker.
 
+The live handle does not open a second store. It sends commands over a bounded
+channel to the actor that already owns the mission-bound writer. Commands that
+insert or remove selectors take the actor's policy write lease; other
+application operations and contacts use a policy read lease. Shutdown or
+zeroization closes admission and rejects queued commands before the authority
+is released. The stopped handle can acquire that authority only after the live
+actor has exited.
+
+## Live application command and status flow
+
+```mermaid
+sequenceDiagram
+    participant A as Application
+    participant H as SelectedEventHandle
+    participant N as RunningNode actor
+    participant L as Policy lease
+    participant S as Mission-bound redb
+    participant C as Contact task
+
+    A->>H: high-level Event operation
+    H->>N: bounded command + one-shot reply
+    alt subscribe or unsubscribe
+        N->>L: acquire write lease
+        N->>S: atomically update selector generation and delivery ledger
+        S-->>N: durable selector receipt
+    else publish
+        N->>L: acquire read lease
+        N->>N: validate request and source-seal Event
+        N->>S: policy-bound idempotent commit
+        S-->>N: durable publication result
+    else query, poll, or gaps
+        N->>L: acquire read lease
+        N->>S: request bounded structural candidates or plan
+        S-->>N: untrusted candidate page or plan
+        N->>N: freshly verify source; verify content for returned data
+        N->>S: recheck exact poll/gap plan when applicable
+    else acknowledge or status
+        N->>L: acquire read lease
+        N->>S: check current policy, delivery ledger, or selector snapshot
+        S-->>N: durable acknowledgement or local policy state
+    end
+    N-->>H: sanitized application result
+    H-->>A: typed result
+
+    C->>N: completed authenticated contact receipt
+    N->>N: record peer, bounded remainder, and exact contact policy
+    A->>H: status()
+    H->>N: status command
+    N->>S: current control and selector policy
+    N-->>H: local last-contact snapshot
+    H-->>A: typed status
+    Note over A,N: LastContactComplete is not global convergence
+```
+
+Gap results follow the same trust rule. The store prepares a bounded structural
+plan, the selected node freshly verifies every observed source position, and
+the store rechecks the exact policy-bound plan before a half-open gap interval
+is exposed. Absence of a returned gap says only that the locally observed,
+verified positions in that page are contiguous; it is not publisher
+completeness or mesh convergence.
+
 ## One authenticated contact
 
 ```mermaid
@@ -70,7 +137,7 @@ sequenceDiagram
     L->>P: control reconciliation query
     P->>L: source-authenticated control suffix
     L->>S: commit and activate contiguous control prefix
-    L->>S: atomically capture policy + selector revision
+    L->>S: atomically capture policy + selector generation
     L->>P: protected canonical receive interest
     P->>L: protected canonical receive interest
     Note over L,P: empty interest means receive-none
@@ -132,7 +199,8 @@ and non-Unix behavior are outside the proof.
 ## Follow the evidence
 
 - [Capability tour](quickstart/capability-tour.md) — fastest visible behavior.
-- [Selected Event API](quickstart/selected-event-api.md) — publish/query plus durable subscribe/poll/ack.
+- [Selected Event API](quickstart/selected-event-api.md) — live publish/query,
+  durable delivery, gaps, unsubscribe, and bounded status.
 - [Carriers and contacts](transports.md) — selected and migration-source carrier boundaries.
 - [Mesh CLI guide](quickstart/mesh-cli.md) — phase-by-phase and retained receipts.
 - [Requirements status](implementation/requirements-status.md) — exact credited rows and open gaps.

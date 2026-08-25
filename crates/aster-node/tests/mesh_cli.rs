@@ -13,7 +13,15 @@ use std::{
 
 use aster_mesh::{ProvisioningAccess, ReferenceEnvelopeSealer, ReferenceProvisioner, Scope, Topic};
 #[cfg(unix)]
-use aster_node::{NodeIdentity, mission::UnprotectedReferenceMission};
+use aster_node::{
+    MissionExpectedPeer, NodeApplication, NodeConfig, NodeIdentity,
+    application::{
+        EventAcknowledgement, EventPollRequest, EventPublishRequest, EventSubscriptionRequest,
+        EventSyncStatus, PeerAuthorization, Priority,
+    },
+    mission::UnprotectedReferenceMission,
+    start_node,
+};
 #[cfg(unix)]
 use aster_redb_store::{Store, ZeroizationIntent};
 
@@ -22,6 +30,8 @@ static ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 // binds them. Serialize this binary's process tests so parallel harness workers
 // cannot select overlapping blocks and authenticate the wrong test mission.
 static PROCESS_TEST_LOCK: Mutex<()> = Mutex::new(());
+#[cfg(unix)]
+const LIVE_EVENT_PROCESS_STARTUP_TIMEOUT: Duration = Duration::from_secs(40);
 
 fn serialize_process_test() -> MutexGuard<'static, ()> {
     PROCESS_TEST_LOCK
@@ -228,6 +238,534 @@ fn wait_for_protected_contact(
         }
     }
     panic!("node did not emit a completed hybrid/protected contact before deadline");
+}
+
+#[cfg(unix)]
+fn live_event_worker_command(
+    role: &str,
+    state: &std::path::Path,
+    mission: &std::path::Path,
+    bind: &str,
+    peer: Option<&str>,
+) -> Command {
+    let mut command = Command::new(std::env::current_exe().expect("current integration test"));
+    command
+        .args(["--exact", "live_event_process_worker", "--nocapture"])
+        .env("ASTER_LIVE_EVENT_WORKER", role)
+        .env("ASTER_LIVE_EVENT_STATE", state)
+        .env("ASTER_LIVE_EVENT_MISSION", mission)
+        .env("ASTER_LIVE_EVENT_BIND", bind)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(peer) = peer {
+        command.env("ASTER_LIVE_EVENT_PEER", peer);
+    }
+    command
+}
+
+#[cfg(unix)]
+fn assert_live_event_worker(output: std::process::Output, marker: &str) {
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 worker stdout");
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 worker stderr");
+    assert!(
+        output.status.success(),
+        "live Event worker failed: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stdout.contains(marker),
+        "worker omitted {marker:?}: stdout={stdout} stderr={stderr}"
+    );
+}
+
+#[cfg(unix)]
+fn live_event_worker_bind_collision(output: &std::process::Output) -> bool {
+    if output.status.success() {
+        return false;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    [stdout.as_ref(), stderr.as_ref()].iter().any(|stream| {
+        stream.contains("AddrInUse")
+            || stream.contains("Address already in use")
+            || stream.contains("EADDRINUSE")
+    })
+}
+
+#[cfg(unix)]
+fn wait_for_live_event_workers(
+    mut receiver: std::process::Child,
+    mut publisher: std::process::Child,
+) -> (std::process::Output, std::process::Output) {
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let mut receiver_status = None;
+    let mut publisher_status = None;
+    let mut timed_out = false;
+    loop {
+        if receiver_status.is_none() {
+            receiver_status = receiver
+                .try_wait()
+                .expect("poll live Event receiver")
+                .map(|status| status.success());
+        }
+        if publisher_status.is_none() {
+            publisher_status = publisher
+                .try_wait()
+                .expect("poll live Event publisher")
+                .map(|status| status.success());
+        }
+        if receiver_status == Some(false) || publisher_status == Some(false) {
+            if receiver_status.is_none() {
+                let _ = receiver.kill();
+            }
+            if publisher_status.is_none() {
+                let _ = publisher.kill();
+            }
+            break;
+        }
+        if receiver_status.is_some() && publisher_status.is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            timed_out = true;
+            if receiver_status.is_none() {
+                let _ = receiver.kill();
+            }
+            if publisher_status.is_none() {
+                let _ = publisher.kill();
+            }
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let receiver = receiver
+        .wait_with_output()
+        .expect("collect live Event receiver");
+    let publisher = publisher
+        .wait_with_output()
+        .expect("collect live Event publisher");
+    if timed_out {
+        panic!(
+            "live Event workers exceeded their runtime-valid deadline: receiver_stdout={} receiver_stderr={} publisher_stdout={} publisher_stderr={}",
+            String::from_utf8_lossy(&receiver.stdout),
+            String::from_utf8_lossy(&receiver.stderr),
+            String::from_utf8_lossy(&publisher.stdout),
+            String::from_utf8_lossy(&publisher.stderr),
+        );
+    }
+    (receiver, publisher)
+}
+
+#[cfg(unix)]
+#[test]
+fn live_event_process_worker() {
+    let Ok(role) = std::env::var("ASTER_LIVE_EVENT_WORKER") else {
+        return;
+    };
+    let state = PathBuf::from(
+        std::env::var_os("ASTER_LIVE_EVENT_STATE").expect("worker state environment"),
+    );
+    let mission_path = PathBuf::from(
+        std::env::var_os("ASTER_LIVE_EVENT_MISSION").expect("worker mission environment"),
+    );
+    let bind = std::env::var("ASTER_LIVE_EVENT_BIND")
+        .expect("worker bind environment")
+        .parse()
+        .expect("worker bind address");
+    let peers = std::env::var("ASTER_LIVE_EVENT_PEER")
+        .ok()
+        .map(|peer| peer.parse::<MissionExpectedPeer>().expect("worker peer"))
+        .into_iter()
+        .collect::<Vec<_>>();
+    let expected_peer = peers.first().map(|peer| peer.mission);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("worker Tokio runtime");
+    runtime.block_on(async move {
+        let mission = UnprotectedReferenceMission::load(&mission_path).expect("worker mission");
+        let running = start_node(NodeConfig {
+            state,
+            bind,
+            mission,
+            peers,
+            sync_interval: Duration::from_millis(500),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("start worker node");
+        let events = running.selected_events();
+        let scope = Scope::new("test/process-live-event").expect("worker scope");
+        let topic = Topic::new("offline-later-sync").expect("worker topic");
+
+        match role.as_str() {
+            "offline-publisher" => {
+                let published = events
+                    .publish(EventPublishRequest {
+                        operation_key: b"process-offline-publish".to_vec(),
+                        predecessor: None,
+                        topic,
+                        scope,
+                        priority: Priority::Priority,
+                        logical_key: b"process-offline-key".to_vec(),
+                        payload: b"published before either peer was online".to_vec(),
+                        tombstone: false,
+                    })
+                    .await
+                    .expect("offline publish");
+                let status = events.status().await.expect("offline status");
+                assert_eq!(status.sync, EventSyncStatus::Offline);
+                assert_eq!(status.authenticated_contacts, 0);
+                running.shutdown().await.expect("offline shutdown");
+                println!("WORKER_OFFLINE_PUBLISHED id={}", published.id);
+            }
+            "sync-publisher" => {
+                let mut observed = None;
+                let contact_deadline = Instant::now() + Duration::from_secs(40);
+                while Instant::now() < contact_deadline {
+                    let status = events.status().await.expect("publisher live status");
+                    if status.authenticated_contacts > 0 {
+                        observed = Some(status);
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                let status = observed.expect("publisher authenticated later contact");
+                assert_eq!(status.peers.len(), 1);
+                assert_eq!(
+                    status.peers[0].peer,
+                    expected_peer.expect("configured peer")
+                );
+                assert_eq!(status.peers[0].authorization, PeerAuthorization::Active);
+                assert_eq!(status.sync, EventSyncStatus::LastContactComplete);
+                running.shutdown().await.expect("publisher shutdown");
+                println!(
+                    "WORKER_PUBLISHER_SYNC contacts={} sync={:?}",
+                    status.authenticated_contacts, status.sync
+                );
+            }
+            "sync-receiver" => {
+                let subscription = events
+                    .subscribe(EventSubscriptionRequest {
+                        operation_key: b"process-later-sync-subscription".to_vec(),
+                        topic,
+                        scope,
+                        include_descendant_scopes: false,
+                    })
+                    .await
+                    .expect("receiver subscription");
+                if let Some(ready) = std::env::var_os("ASTER_LIVE_EVENT_READY") {
+                    std::fs::write(ready, b"subscription-durable")
+                        .expect("publish receiver readiness");
+                }
+                let receiver_deadline = Instant::now() + Duration::from_secs(40);
+                let mut delivery = None;
+                while Instant::now() < receiver_deadline {
+                    let page = events
+                        .poll(EventPollRequest {
+                            subscription: subscription.id,
+                            delivery_limit: 8,
+                            scan_limit: 8,
+                        })
+                        .await
+                        .expect("receiver poll");
+                    if let Some(found) = page.deliveries.into_iter().next() {
+                        delivery = Some(found);
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                let delivery = delivery.expect("later sync delivered offline Event");
+                assert_eq!(
+                    delivery.event.payload,
+                    b"published before either peer was online"
+                );
+                assert_eq!(
+                    events
+                        .acknowledge(subscription.id, delivery.event.id)
+                        .await
+                        .expect("receiver acknowledge"),
+                    EventAcknowledgement::Acknowledged
+                );
+                assert!(
+                    events
+                        .poll(EventPollRequest {
+                            subscription: subscription.id,
+                            delivery_limit: 8,
+                            scan_limit: 8,
+                        })
+                        .await
+                        .expect("poll after acknowledgement")
+                        .deliveries
+                        .is_empty()
+                );
+                let mut observed = None;
+                while Instant::now() < receiver_deadline {
+                    let status = events.status().await.expect("receiver live status");
+                    if status.authenticated_contacts > 0 {
+                        observed = Some(status);
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                let status = observed.expect("receiver authenticated later contact");
+                assert_eq!(status.peers.len(), 1);
+                assert_eq!(
+                    status.peers[0].peer,
+                    expected_peer.expect("configured peer")
+                );
+                assert_eq!(status.peers[0].authorization, PeerAuthorization::Active);
+                running.shutdown().await.expect("receiver shutdown");
+                println!(
+                    "WORKER_RECEIVED id={} attempt={} contacts={} sync={:?}",
+                    delivery.event.id, delivery.attempt, status.authenticated_contacts, status.sync
+                );
+            }
+            "restart-receiver" => {
+                let subscription = events
+                    .subscribe(EventSubscriptionRequest {
+                        operation_key: b"process-later-sync-subscription".to_vec(),
+                        topic,
+                        scope,
+                        include_descendant_scopes: false,
+                    })
+                    .await
+                    .expect("restart subscription");
+                assert!(!subscription.inserted);
+                assert!(
+                    events
+                        .poll(EventPollRequest {
+                            subscription: subscription.id,
+                            delivery_limit: 8,
+                            scan_limit: 8,
+                        })
+                        .await
+                        .expect("restart poll")
+                        .deliveries
+                        .is_empty()
+                );
+                assert_eq!(
+                    events.status().await.expect("restart status").sync,
+                    EventSyncStatus::Offline
+                );
+                running.shutdown().await.expect("restart shutdown");
+                println!("WORKER_RESTART_ACK_DURABLE");
+            }
+            _ => panic!("unknown live Event worker role {role:?}"),
+        }
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn offline_publish_later_real_process_sync_poll_ack_and_restart() {
+    use std::{net::UdpSocket, os::unix::fs::PermissionsExt as _};
+
+    let _process_test = serialize_process_test();
+    let root = fresh_root("offline-later-live-event");
+    let publisher_state = root.join("publisher-state");
+    let receiver_state = root.join("receiver-state");
+    let publisher_mission_path = root.join("publisher.bundle");
+    let receiver_mission_path = root.join("receiver.bundle");
+    std::fs::create_dir_all(&root).expect("process root");
+    let scope = Scope::new("test/process-live-event").expect("scope");
+    let topic = Topic::new("offline-later-sync").expect("topic");
+    let access = ProvisioningAccess::member(scope, vec![1], vec![topic]).expect("access");
+    let mut provisioner = ReferenceProvisioner::from_seed([0xe2; 32]).expect("process provisioner");
+    let publisher_bytes = provisioner
+        .issue_node(1, std::slice::from_ref(&access))
+        .expect("publisher mission")
+        .to_bytes()
+        .expect("publisher bytes");
+    let receiver_bytes = provisioner
+        .issue_node(2, std::slice::from_ref(&access))
+        .expect("receiver mission")
+        .to_bytes()
+        .expect("receiver bytes");
+    let publisher_mission =
+        UnprotectedReferenceMission::persist(&publisher_mission_path, publisher_bytes)
+            .expect("persist publisher mission");
+    let publisher_mission_id = publisher_mission.identity();
+    drop(publisher_mission);
+    let receiver_mission =
+        UnprotectedReferenceMission::persist(&receiver_mission_path, receiver_bytes)
+            .expect("persist receiver mission");
+    let receiver_mission_id = receiver_mission.identity();
+    drop(receiver_mission);
+    std::fs::set_permissions(
+        &publisher_mission_path,
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .expect("publisher mission permissions");
+    std::fs::set_permissions(
+        &receiver_mission_path,
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .expect("receiver mission permissions");
+
+    let publisher_identity =
+        NodeIdentity::load_or_create(&publisher_state).expect("publisher identity");
+    let publisher_carrier = publisher_identity.id();
+    drop(publisher_identity);
+    let receiver_identity =
+        NodeIdentity::load_or_create(&receiver_state).expect("receiver identity");
+    let receiver_carrier = receiver_identity.id();
+    drop(receiver_identity);
+
+    let offline = live_event_worker_command(
+        "offline-publisher",
+        &publisher_state,
+        &publisher_mission_path,
+        "127.0.0.1:0",
+        None,
+    )
+    .output()
+    .expect("offline publisher process");
+    assert_live_event_worker(offline, "WORKER_OFFLINE_PUBLISHED");
+
+    let receiver_ready = root.join("receiver-subscription-ready");
+    // One absolute budget covers cold store initialization and every bounded
+    // bind-collision retry. Do not reset it per attempt and multiply a hang.
+    let readiness_deadline = Instant::now() + LIVE_EVENT_PROCESS_STARTUP_TIMEOUT;
+    let mut bind_attempt = 0usize;
+    let mut last_bind_collision = None;
+    let (receiver_output, publisher_output) = loop {
+        bind_attempt += 1;
+        if bind_attempt > 4 {
+            panic!(
+                "live Event workers exhausted bind-collision retries: {}",
+                last_bind_collision.unwrap_or_else(|| "no collision details".into())
+            );
+        }
+        match std::fs::remove_file(&receiver_ready) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("clear receiver readiness sentinel: {error}"),
+        }
+
+        let publisher_socket = UdpSocket::bind("127.0.0.1:0").expect("publisher port");
+        let publisher_address = publisher_socket.local_addr().expect("publisher address");
+        let receiver_socket = UdpSocket::bind("127.0.0.1:0").expect("receiver port");
+        let receiver_address = receiver_socket.local_addr().expect("receiver address");
+        let publisher_peer = format!(
+            "{receiver_carrier}@{receiver_address}={}",
+            aster_node::format_node_id(receiver_mission_id)
+        );
+        let receiver_peer = format!(
+            "{publisher_carrier}@{publisher_address}={}",
+            aster_node::format_node_id(publisher_mission_id)
+        );
+        drop(receiver_socket);
+
+        let mut receiver_command = live_event_worker_command(
+            "sync-receiver",
+            &receiver_state,
+            &receiver_mission_path,
+            &receiver_address.to_string(),
+            Some(&receiver_peer),
+        );
+        receiver_command.env("ASTER_LIVE_EVENT_READY", &receiver_ready);
+        let mut receiver = Some(receiver_command.spawn().expect("spawn later receiver"));
+        let receiver_start_failure = loop {
+            if receiver_ready.exists() {
+                break None;
+            }
+            if receiver
+                .as_mut()
+                .expect("receiver remains owned before readiness")
+                .try_wait()
+                .expect("poll receiver readiness")
+                .is_some()
+            {
+                break Some(
+                    receiver
+                        .take()
+                        .expect("take failed receiver")
+                        .wait_with_output()
+                        .expect("collect failed receiver startup"),
+                );
+            }
+            if Instant::now() >= readiness_deadline {
+                let mut receiver = receiver.take().expect("take timed-out receiver");
+                let _ = receiver.kill();
+                let output = receiver
+                    .wait_with_output()
+                    .expect("collect timed-out receiver startup");
+                panic!(
+                    "receiver did not durably subscribe within the shared {}s startup deadline: stdout={} stderr={}",
+                    LIVE_EVENT_PROCESS_STARTUP_TIMEOUT.as_secs(),
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        if let Some(output) = receiver_start_failure {
+            if live_event_worker_bind_collision(&output) {
+                last_bind_collision = Some(format!(
+                    "attempt {bind_attempt} receiver: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+                continue;
+            }
+            assert_live_event_worker(output, "WORKER_RECEIVED");
+            unreachable!("failed receiver assertion returns only by panicking");
+        }
+        let receiver = receiver.expect("ready receiver remains owned");
+
+        // Keep the publisher port reserved until the receiver has durably
+        // subscribed, then narrow the unavoidable release-to-child-bind gap.
+        drop(publisher_socket);
+        let publisher = match live_event_worker_command(
+            "sync-publisher",
+            &publisher_state,
+            &publisher_mission_path,
+            &publisher_address.to_string(),
+            Some(&publisher_peer),
+        )
+        .spawn()
+        {
+            Ok(publisher) => publisher,
+            Err(error) => {
+                let mut receiver = receiver;
+                let _ = receiver.kill();
+                let output = receiver
+                    .wait_with_output()
+                    .expect("collect receiver after publisher spawn failure");
+                panic!(
+                    "spawn restarted publisher: {error}; receiver_stdout={} receiver_stderr={}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+            }
+        };
+        let (receiver_output, publisher_output) = wait_for_live_event_workers(receiver, publisher);
+        if live_event_worker_bind_collision(&receiver_output)
+            || live_event_worker_bind_collision(&publisher_output)
+        {
+            last_bind_collision = Some(format!(
+                "attempt {bind_attempt}: receiver={} publisher={}",
+                String::from_utf8_lossy(&receiver_output.stderr),
+                String::from_utf8_lossy(&publisher_output.stderr),
+            ));
+            continue;
+        }
+        break (receiver_output, publisher_output);
+    };
+    assert_live_event_worker(receiver_output, "WORKER_RECEIVED");
+    assert_live_event_worker(publisher_output, "WORKER_PUBLISHER_SYNC");
+
+    let restart = live_event_worker_command(
+        "restart-receiver",
+        &receiver_state,
+        &receiver_mission_path,
+        "127.0.0.1:0",
+        None,
+    )
+    .output()
+    .expect("restart receiver process");
+    assert_live_event_worker(restart, "WORKER_RESTART_ACK_DURABLE");
+    std::fs::remove_dir_all(root).expect("cleanup process evidence");
 }
 
 #[test]

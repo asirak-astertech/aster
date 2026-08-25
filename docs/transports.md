@@ -13,8 +13,10 @@ exercises source-authenticated control and Event paths:
 
 ```mermaid
 flowchart LR
-    App["Live Event application<br/>Ping emitter · Pong responder"]
-    Facade["Stopped-state Event facade<br/>publish · query · subscribe · poll · ack"]
+    App["Application"]
+    BuiltIns["Built-in live roles<br/>Ping emitter · Pong responder · relay"]
+    LiveFacade["Live SelectedEventHandle<br/>publish · query · subscribe · poll · ack<br/>unsubscribe · gaps · status"]
+    StoppedFacade["Stopped SelectedEventNode<br/>same Event data operations<br/>without live status"]
     Intent["Durable receive intent<br/>Consume · Carry · empty = receive-none"]
     Authority["Stopped-state authority CLI<br/>revoke · recipient-filtered rekey"]
     Operator["Same-UID Unix operator"]
@@ -28,9 +30,14 @@ flowchart LR
     Mission["aster-core reference session<br/>hybrid mission auth · frame protection"]
     Iroh["aster-iroh<br/>direct authenticated carrier · bounded exchange"]
     Peer["Peer aster-node<br/>independent identity and store"]
-    App --> Source
-    Facade --> Source
-    Facade --> Intent --> Store
+    App --> LiveFacade -->|"bounded actor commands"| Node
+    Node -->|"sanitized results"| LiveFacade
+    App --> StoppedFacade
+    StoppedFacade -->|"source seal and verification"| Source
+    StoppedFacade -->|"exclusive stopped-state operations"| Store
+    StoppedFacade --> Intent
+    BuiltIns --> Source
+    Node --> Intent --> Store
     Store -->|"atomic policy + selector snapshot"| Node
     Authority --> Control
     Control --> Node
@@ -47,7 +54,7 @@ flowchart LR
 `aster-negentropy` knows only exact-transfer-ID set difference.
 `aster-redb-store` is the mission-bound transaction authority for the audited
 contiguous control prefix, active policy snapshots, accepted Events,
-causal/operation ledgers, durable Consume/Carry selector revisions, Event
+causal/operation ledgers, durable Consume/Carry selector generations, Event
 delivery cursors/pending attempts/acknowledgements, and bounded route-only
 representations.
 `aster-profile` owns the canonical full-ID vocabulary and ordering, not policy
@@ -72,7 +79,7 @@ tests.
 | Carrier path | Current capability | What is not yet claimed |
 |---|---|---|
 | Selected direct Iroh | Manually admitted exact endpoint ID and socket, direct authenticated QUIC, bounded exchange, hosted discovery/relay/port mapping disabled | Carrier authentication is not mission or control/source authorization; NAT, hosted relay, physical-network acceptance, and multi-carrier failover remain open |
-| Selected virtual mesh CLI | Real 2–32-node Ping/Pong line plus explicit four-role control scenario; independent identities/stores, mission auth before inventory, ordered Flash controls before source-sealed Event transfer, current scope/epoch route filtering, payload-blind relay cache, restart/idempotency, no-op verification, and a same-UID Unix local software-zeroization hook | The retained parent PR-A/pre-subscription N=3/13-process, default N=4/18-process, and N=8/38-process Ping/Pong plus explicit N=4/23-process control receipts passed with disclosed transient/denial stderr. The generic line has `2N+1` cohorts and `5N-2` children, isolates both publications and every directed-edge transfer, moves exactly one pre-existing Event per transfer edge with all control counters zero, and finishes with all 11 reconciliation counters zero. The control receipt separately proves converged controls, no-contact Ping publication, later Event forwarding, and four causal Pong barriers before its no-op. A separate parent-slice real-child zeroization receipt passed. PR B adds code/test evidence for durable Event Consume/Carry selectors, poll/ack, and protected receiver filtering; it does not relabel those retained roots. Provisioning is unprotected-reference; non-Unix and physical/copy-on-write/snapshot/swap/backup sanitization, database rollback resistance, live application/status integration, generalized/repeated control management, finite TTL, other data classes, the full range, many-node scale, and physical multi-system acceptance remain open. |
+| Selected virtual mesh CLI and live Event actor | Real 2–32-node Ping/Pong line plus explicit four-role control scenario; independent identities/stores, mission auth before inventory, ordered Flash controls before source-sealed Event transfer, current scope/epoch route filtering, payload-blind relay cache, restart/idempotency, no-op verification, a live high-level Event handle, and a same-UID Unix local software-zeroization hook | The retained parent PR-A/pre-subscription N=3/13-process, default N=4/18-process, and N=8/38-process Ping/Pong plus explicit N=4/23-process control receipts passed with disclosed transient/denial stderr. The generic line has `2N+1` cohorts and `5N-2` children, isolates both publications and every directed-edge transfer, moves exactly one pre-existing Event per transfer edge with all control counters zero, and finishes with all 11 reconciliation counters zero. The control receipt separately proves converged controls, no-contact Ping publication, later Event forwarding, and four causal Pong barriers before its no-op. A separate parent-slice real-child zeroization receipt passed. PR B adds durable Event Consume/Carry selectors and protected receiver filtering; PR C adds current-code automated evidence for live publish/query/delivery, unsubscribe, authenticated gap inspection, last-contact status, and one real-process offline-publish/later-sync flow. Neither relabels the retained parent roots. Provisioning is unprotected-reference; status is not global convergence; non-Unix and physical/copy-on-write/snapshot/swap/backup sanitization, database rollback resistance, generalized/repeated control management, finite TTL, other data classes, the full range, many-node scale, and physical multi-system acceptance remain open. |
 | Current semantic in-memory link | Full high-level host contact, authentication, reconciliation, resume, and failure tests | It is a test carrier and is not wired to the selected composition |
 | Current semantic UDP/IP | Nonblocking link, manual endpoint mapping, protected local discovery, rendezvous helpers, opaque relay components | Migration onto the selected node; full host acceptance on physical or operational networks |
 | Current semantic NAT/rendezvous and relay | Bounded rendezvous, endpoint-punching, and opaque-relay helpers with local software tests | Selected-node integration and a two-device representative-NAT direct/fallback result |
@@ -138,7 +145,10 @@ route grants remain an upper bound on inventory and Offer; the receiver's
 mission-protected canonical Consume/Carry interest narrows each direction
 further, and empty interest means receive-none. Content grants gate semantic
 acceptance and reaction; revoked mission principals fail closed.
-State/Record/Blob, live application/status integration, generalized control
+The live selected Event handle now composes high-level operations and bounded
+authenticated last-contact status with this path. `LastContactComplete` reports
+only the most recent bounded negotiation with each active configured peer; it
+does not assert global convergence. State/Record/Blob, generalized control
 administration, repeated multi-scope lifecycle, finite-TTL custody, and
 protected provisioning remain to be composed.
 The mission bundle is owner-only on Unix but explicitly unprotected-reference
@@ -160,7 +170,7 @@ sequenceDiagram
     P->>L: source-authenticated control suffix
     L->>S: commit and activate contiguous control prefix
     L->>S: capture fresh policy snapshot
-    L->>S: capture selector revision and canonical Consume + Carry union
+    L->>S: capture selector generation and canonical Consume + Carry union
     L->>P: protected Event interest (empty means receive-none)
     P->>L: protected peer Event interest
     Note over L,P: each direction = receiver interest ∩ current route authority

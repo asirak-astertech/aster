@@ -8,7 +8,10 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     str::FromStr,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -44,14 +47,20 @@ use tokio::{
     net::{UnixListener, UnixStream},
 };
 use tokio::{
-    sync::{OwnedRwLockReadGuard, RwLock, mpsc},
-    task::{Id as TaskId, JoinSet},
+    sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, mpsc, oneshot},
+    task::{Id as TaskId, JoinHandle, JoinSet},
     time::{MissedTickBehavior, sleep, timeout},
 };
 use zeroize::Zeroize as _;
 
 use crate::{
-    NodeIdentity, format_node_id, format_path_field, format_receipt_field,
+    NodeIdentity,
+    application::{
+        AuthenticatedPeerStatus, ContactSyncStatus, EventSyncStatus, PeerAuthorization,
+        SelectedEventCommand, SelectedEventHandle, SelectedEventNode, SelectedEventStatus,
+        runtime_application_error,
+    },
+    format_node_id, format_path_field, format_receipt_field,
     frame::{EventDirection, EventInterest, EventInterestSelector, Frame, MAX_OBJECT_BYTES},
     mission::{
         MissionHandshakeReceipt, MissionPeerBinding, MissionProvisioningError, MissionSession,
@@ -67,6 +76,9 @@ pub(crate) const STORE_FILE: &str = "mesh.redb";
 const MAX_CONFIGURED_PEERS: usize = 256;
 const MAX_INBOUND_CONTACTS: usize = 16;
 const MAX_OUTBOUND_CONTACTS: usize = 16;
+const APPLICATION_COMMAND_CAPACITY: usize = 32;
+const APPLICATION_COMMAND_BUDGET: usize = 8;
+const NETWORK_EVENT_BUDGET: usize = 8;
 const MAX_CONTACT_ITEMS: usize = 3_500;
 const MAX_CONTACT_FRAMES: usize = 8_192;
 const MAX_CONTACT_BYTES: usize = 64 * 1024 * 1024;
@@ -261,6 +273,35 @@ pub struct PeerReceipt {
     pub protected_bytes: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ContactEventPolicy {
+    control_head: Option<(u64, ControlTransferId)>,
+    selector_generation: u64,
+}
+
+impl ContactEventPolicy {
+    fn capture(policy: &EventReplicationPolicySnapshot) -> Self {
+        Self {
+            control_head: policy.control_policy().head(),
+            selector_generation: policy.selector_generation(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CompletedPeerContact {
+    receipt: PeerReceipt,
+    event_policy: ContactEventPolicy,
+}
+
+impl std::ops::Deref for CompletedPeerContact {
+    type Target = PeerReceipt;
+
+    fn deref(&self) -> &Self::Target {
+        &self.receipt
+    }
+}
+
 /// Terminal node-process summary.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct NodeReceipt {
@@ -286,6 +327,206 @@ pub struct NodeReceipt {
     pub pending_controls: u64,
     /// Durable mission-control chain highwater.
     pub control_highwater: u64,
+}
+
+/// Owned lifecycle for one running selected-stack node actor.
+pub struct RunningNode {
+    selected_events: SelectedEventHandle,
+    application_admission: Arc<AtomicBool>,
+    shutdown: Option<mpsc::Sender<()>>,
+    task: Option<JoinHandle<Result<NodeReceipt, NodeError>>>,
+}
+
+impl RunningNode {
+    /// Returns a cloneable, bounded live selected-Event application handle.
+    pub fn selected_events(&self) -> SelectedEventHandle {
+        self.selected_events.clone()
+    }
+
+    /// Requests graceful shutdown, closes command admission, and waits for cleanup.
+    pub async fn shutdown(mut self) -> Result<NodeReceipt, NodeError> {
+        self.application_admission.store(false, Ordering::Release);
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(()).await;
+        }
+        self.await_task().await
+    }
+
+    /// Waits for the configured deadline, signal, zeroization, or fatal failure.
+    pub async fn wait(mut self) -> Result<NodeReceipt, NodeError> {
+        self.await_task().await
+    }
+
+    async fn await_task(&mut self) -> Result<NodeReceipt, NodeError> {
+        let task = self
+            .task
+            .take()
+            .ok_or_else(|| NodeError::Protocol("running node task was already consumed".into()))?;
+        task.await.map_err(node_actor_join_error)?
+    }
+}
+
+impl Drop for RunningNode {
+    fn drop(&mut self) {
+        self.application_admission.store(false, Ordering::Release);
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.try_send(());
+        }
+    }
+}
+
+fn node_actor_join_error(error: tokio::task::JoinError) -> NodeError {
+    NodeError::Protocol(format!("running node actor stopped unexpectedly: {error}"))
+}
+
+#[derive(Default)]
+struct SelectedEventStatusTracker {
+    configured_peers: BTreeSet<NodeId>,
+    authenticated: BTreeMap<NodeId, AuthenticatedContactObservation>,
+}
+
+#[derive(Clone, Copy)]
+struct AuthenticatedContactObservation {
+    contacts: u64,
+    complete: bool,
+    policy: ContactEventPolicy,
+}
+
+enum ApplicationPolicyLease {
+    Read { _guard: OwnedRwLockReadGuard<()> },
+    Write { _guard: OwnedRwLockWriteGuard<()> },
+}
+
+async fn acquire_application_policy_lease(
+    policy_lock: Arc<RwLock<()>>,
+    write: bool,
+) -> ApplicationPolicyLease {
+    if write {
+        ApplicationPolicyLease::Write {
+            _guard: policy_lock.write_owned().await,
+        }
+    } else {
+        ApplicationPolicyLease::Read {
+            _guard: policy_lock.read_owned().await,
+        }
+    }
+}
+
+fn account_network_event(counter: &mut usize) -> bool {
+    *counter = counter.saturating_add(1).min(NETWORK_EVENT_BUDGET);
+    *counter >= NETWORK_EVENT_BUDGET
+}
+
+impl SelectedEventStatusTracker {
+    fn new(configured_peers: BTreeSet<NodeId>) -> Self {
+        Self {
+            configured_peers,
+            authenticated: BTreeMap::new(),
+        }
+    }
+
+    fn record(&mut self, contact: &CompletedPeerContact) -> Result<(), NodeError> {
+        let receipt = &contact.receipt;
+        let peer = receipt.mission_peer.ok_or_else(|| {
+            NodeError::Protocol("successful contact omitted its authenticated mission peer".into())
+        })?;
+        if !self.configured_peers.contains(&peer) {
+            return Err(NodeError::Protocol(
+                "successful contact identified an unconfigured mission peer".into(),
+            ));
+        }
+        let next_contacts = self.authenticated.get(&peer).map_or(Ok(1), |observation| {
+            observation
+                .contacts
+                .checked_add(1)
+                .ok_or_else(|| NodeError::Protocol("authenticated contact count overflow".into()))
+        })?;
+        self.authenticated.insert(
+            peer,
+            AuthenticatedContactObservation {
+                contacts: next_contacts,
+                complete: receipt.remaining == 0 && receipt.controls_remaining == 0,
+                policy: contact.event_policy,
+            },
+        );
+        Ok(())
+    }
+
+    fn snapshot(
+        &self,
+        store: &Store,
+        current: &EventReplicationPolicySnapshot,
+        failed_contact_attempts: usize,
+    ) -> Result<SelectedEventStatus, NodeError> {
+        let current_policy = ContactEventPolicy::capture(current);
+        let mut peers = Vec::with_capacity(self.authenticated.len());
+        let mut authenticated_contacts = 0u64;
+        for (peer, observation) in &self.authenticated {
+            authenticated_contacts = authenticated_contacts
+                .checked_add(observation.contacts)
+                .ok_or_else(|| {
+                    NodeError::Protocol("authenticated contact count overflow".into())
+                })?;
+            let revoked = store.is_control_principal_revoked(*peer)?;
+            let last_contact = if revoked || observation.policy != current_policy {
+                ContactSyncStatus::PolicyChangedSinceContact
+            } else if observation.complete {
+                ContactSyncStatus::CompleteForLastNegotiatedContact
+            } else {
+                ContactSyncStatus::WorkRemained
+            };
+            peers.push(AuthenticatedPeerStatus {
+                peer: *peer,
+                contacts: observation.contacts,
+                authorization: if revoked {
+                    PeerAuthorization::Revoked
+                } else {
+                    PeerAuthorization::Active
+                },
+                last_contact,
+            });
+        }
+
+        let mut active_configured = 0usize;
+        let mut active_without_contact = false;
+        let mut active_policy_changed = false;
+        let mut active_work_remained = false;
+        for peer in &self.configured_peers {
+            if store.is_control_principal_revoked(*peer)? {
+                continue;
+            }
+            active_configured += 1;
+            match self.authenticated.get(peer) {
+                None => active_without_contact = true,
+                Some(observation) if observation.policy != current_policy => {
+                    active_policy_changed = true;
+                }
+                Some(observation) if !observation.complete => active_work_remained = true,
+                Some(_) => {}
+            }
+        }
+        let sync = if self.configured_peers.is_empty() {
+            EventSyncStatus::Offline
+        } else if active_configured == 0 {
+            EventSyncStatus::NoActiveConfiguredPeers
+        } else if active_without_contact {
+            EventSyncStatus::AwaitingAuthenticatedContact
+        } else if active_policy_changed {
+            EventSyncStatus::PolicyChangedSinceContact
+        } else if active_work_remained {
+            EventSyncStatus::WorkRemained
+        } else {
+            EventSyncStatus::LastContactComplete
+        };
+        let failed_contact_attempts = u64::try_from(failed_contact_attempts)
+            .map_err(|_| NodeError::Protocol("failed contact count exceeds u64".into()))?;
+        Ok(SelectedEventStatus {
+            sync,
+            authenticated_contacts,
+            failed_contact_attempts,
+            peers,
+        })
+    }
 }
 
 /// Read-only logical store receipt.
@@ -2563,13 +2804,21 @@ impl LocalZeroizationControl {
 async fn run_local_zeroization_accept_loop(
     control: LocalZeroizationControl,
     sender: mpsc::Sender<Result<LocalZeroizationRequest, LocalZeroizationAcceptError>>,
+    #[cfg(test)] mut queued: Option<oneshot::Sender<()>>,
 ) {
     loop {
         let request = control.accept().await;
         let integrity_failure = request
             .as_ref()
             .is_err_and(LocalZeroizationAcceptError::is_integrity_failure);
-        if sender.send(request).await.is_err() || integrity_failure {
+        if sender.send(request).await.is_err() {
+            break;
+        }
+        #[cfg(test)]
+        if let Some(queued) = queued.take() {
+            let _ = queued.send(());
+        }
+        if integrity_failure {
             break;
         }
     }
@@ -3122,8 +3371,154 @@ fn validate_node_config(config: &NodeConfig) -> Result<BTreeMap<EndpointId, Node
     Ok(allowed)
 }
 
-/// Runs one readiness-driven selected-stack node until its deadline or signal.
+fn execute_selected_event_command(
+    application: &mut SelectedEventNode,
+    store: &Store,
+    status: &SelectedEventStatusTracker,
+    receipt: &NodeReceipt,
+    command: SelectedEventCommand,
+) {
+    match command {
+        SelectedEventCommand::Publish { request, response } => {
+            let result = application.publish(request);
+            let _ = response.send(result);
+        }
+        SelectedEventCommand::Query { query, response } => {
+            let result = application.query(query);
+            let _ = response.send(result);
+        }
+        SelectedEventCommand::Subscribe { request, response } => {
+            let result = application.subscribe(request);
+            let _ = response.send(result);
+        }
+        SelectedEventCommand::Poll { request, response } => {
+            let result = application.poll(request);
+            let _ = response.send(result);
+        }
+        SelectedEventCommand::Acknowledge {
+            subscription,
+            event,
+            response,
+        } => {
+            let result = application.acknowledge(subscription, event);
+            let _ = response.send(result);
+        }
+        SelectedEventCommand::Unsubscribe {
+            subscription,
+            response,
+        } => {
+            let result = application.unsubscribe(subscription);
+            let _ = response.send(result);
+        }
+        SelectedEventCommand::Gaps { query, response } => {
+            let result = application.gaps(query);
+            let _ = response.send(result);
+        }
+        SelectedEventCommand::Status { response } => {
+            let result = application.runtime_policy_for_status().and_then(|current| {
+                status
+                    .snapshot(store, &current, receipt.contact_errors)
+                    .map_err(|error| runtime_application_error("status", error))
+            });
+            let _ = response.send(result);
+        }
+    }
+}
+
+/// Starts one readiness-driven selected-stack node and its bounded application actor.
+pub async fn start_node(config: NodeConfig) -> Result<RunningNode, NodeError> {
+    let identity = config.mission.identity();
+    let mission_authority = config.mission.mission_authority_id();
+    let (application_sender, application_receiver) = mpsc::channel(APPLICATION_COMMAND_CAPACITY);
+    let application_admission = Arc::new(AtomicBool::new(true));
+    let selected_events = SelectedEventHandle::new(
+        application_sender,
+        application_admission.clone(),
+        identity,
+        mission_authority,
+    );
+    let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
+    let (ready_sender, ready_receiver) = oneshot::channel();
+    let task = tokio::spawn(run_node_actor(
+        config,
+        application_receiver,
+        application_admission.clone(),
+        shutdown_receiver,
+        ready_sender,
+    ));
+    if ready_receiver.await.is_err() {
+        return match task.await.map_err(node_actor_join_error)? {
+            Err(error) => Err(error),
+            Ok(_) => Err(NodeError::Protocol(
+                "running node stopped before readiness".into(),
+            )),
+        };
+    }
+    Ok(RunningNode {
+        selected_events,
+        application_admission,
+        shutdown: Some(shutdown_sender),
+        task: Some(task),
+    })
+}
+
+/// Runs one selected-stack node until its deadline or signal.
 pub async fn run_node(config: NodeConfig) -> Result<NodeReceipt, NodeError> {
+    start_node(config).await?.wait().await
+}
+
+#[cfg(all(test, unix))]
+struct RunNodeActorTestControl {
+    before_loop_ready: oneshot::Sender<()>,
+    before_loop_release: oneshot::Receiver<()>,
+    zeroization_queued: oneshot::Sender<()>,
+}
+
+async fn run_node_actor(
+    config: NodeConfig,
+    application_receiver: mpsc::Receiver<SelectedEventCommand>,
+    application_admission: Arc<AtomicBool>,
+    shutdown_receiver: mpsc::Receiver<()>,
+    ready: oneshot::Sender<Vec<SocketAddr>>,
+) -> Result<NodeReceipt, NodeError> {
+    #[cfg(all(test, unix))]
+    let result = run_node_actor_inner(
+        config,
+        application_receiver,
+        application_admission,
+        shutdown_receiver,
+        ready,
+        None,
+    )
+    .await;
+    #[cfg(not(all(test, unix)))]
+    let result = run_node_actor_inner(
+        config,
+        application_receiver,
+        application_admission,
+        shutdown_receiver,
+        ready,
+    )
+    .await;
+    result
+}
+
+async fn run_node_actor_inner(
+    config: NodeConfig,
+    mut application_receiver: mpsc::Receiver<SelectedEventCommand>,
+    application_admission: Arc<AtomicBool>,
+    mut shutdown_receiver: mpsc::Receiver<()>,
+    ready: oneshot::Sender<Vec<SocketAddr>>,
+    #[cfg(all(test, unix))] mut test_control: Option<RunNodeActorTestControl>,
+) -> Result<NodeReceipt, NodeError> {
+    let stop_deadline = config
+        .run_for
+        .map(|duration| {
+            Instant::now().checked_add(duration).ok_or_else(|| {
+                NodeError::Configuration("node run_for exceeds the monotonic clock".into())
+            })
+        })
+        .transpose()?;
     let peer_missions = validate_node_config(&config)?;
     let allowed = peer_missions.keys().copied().collect::<BTreeSet<_>>();
     let mission_authority = config.mission.mission_authority_id();
@@ -3153,7 +3548,13 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeReceipt, NodeError> {
     // before any persisted carrier identity is created or any socket is bound.
     replay_applied_controls(&store, &mut application_sealer)?;
     ensure_principal_active(&store, application_sealer.identity())?;
-    let mut application_control_head = store.control_head()?;
+    let application_control_head = store.control_head()?;
+    let mut application = SelectedEventNode::from_runtime(
+        config.mission.clone(),
+        store.clone(),
+        application_sealer,
+        application_control_head,
+    );
     let identity = NodeIdentity::load_or_create(&config.state)?;
     let local_id = identity.id();
     if allowed.contains(&local_id) {
@@ -3165,17 +3566,8 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeReceipt, NodeError> {
     let zeroization_control = LocalZeroizationControl::bind(&config.state, &store_path)?;
     let endpoint = Endpoint::bind(identity.secret()?, EndpointConfig::direct(config.bind)).await?;
     let (zeroization_sender, mut zeroization_receiver) = mpsc::channel(1);
-    #[cfg(unix)]
-    let mut zeroization_task = Some(tokio::spawn(run_local_zeroization_accept_loop(
-        zeroization_control,
-        zeroization_sender,
-    )));
-    #[cfg(not(unix))]
-    let _zeroization_sender_guard = zeroization_sender;
-    #[cfg(not(unix))]
-    let mut zeroization_task = None::<tokio::task::JoinHandle<()>>;
-    let sockets = endpoint
-        .bound_sockets()
+    let bound_sockets = endpoint.bound_sockets();
+    let sockets = bound_sockets
         .iter()
         .map(ToString::to_string)
         .collect::<Vec<_>>()
@@ -3191,22 +3583,66 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeReceipt, NodeError> {
         allowed.len(),
         config.application.as_str()
     );
+    // Cancellation before the readiness handoff skips all operational work but
+    // still follows the single task/endpoint cleanup path below.
+    let owner_ready = ready.send(bound_sockets).is_ok();
+    #[cfg(all(test, unix))]
+    let (before_loop_ready, before_loop_release, zeroization_queued) = match test_control.take() {
+        Some(control) => (
+            Some(control.before_loop_ready),
+            Some(control.before_loop_release),
+            Some(control.zeroization_queued),
+        ),
+        None => (None, None, None),
+    };
+    #[cfg(all(test, unix))]
+    let mut zeroization_task = if owner_ready {
+        Some(tokio::spawn(run_local_zeroization_accept_loop(
+            zeroization_control,
+            zeroization_sender,
+            zeroization_queued,
+        )))
+    } else {
+        None
+    };
+    #[cfg(all(not(test), unix))]
+    let mut zeroization_task = if owner_ready {
+        Some(tokio::spawn(run_local_zeroization_accept_loop(
+            zeroization_control,
+            zeroization_sender,
+        )))
+    } else {
+        None
+    };
+    #[cfg(not(unix))]
+    let _zeroization_sender_guard = zeroization_sender;
+    #[cfg(not(unix))]
+    let mut zeroization_task = None::<tokio::task::JoinHandle<()>>;
 
     let mut ticker = tokio::time::interval(config.sync_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let stop = async {
-        if let Some(duration) = config.run_for {
-            sleep(duration).await;
+    let stop = async move {
+        if let Some(deadline) = stop_deadline {
+            sleep(deadline.saturating_duration_since(Instant::now())).await;
         } else {
             let _ = tokio::signal::ctrl_c().await;
         }
     };
     tokio::pin!(stop);
     let mut receipt = NodeReceipt::default();
-    let mut inbound: JoinSet<(EndpointId, Result<PeerReceipt, NodeError>)> = JoinSet::new();
+    let mut selected_event_status =
+        SelectedEventStatusTracker::new(config.peers.iter().map(|peer| peer.mission).collect());
+    let mut application_commands_open = true;
+    let mut pending_application_command = None::<SelectedEventCommand>;
+    let mut application_tick_pending = false;
+    let mut application_tick_yield_required = false;
+    let mut application_commands_since_yield = 0usize;
+    let mut network_events_since_application = 0usize;
+    let mut inbound: JoinSet<(EndpointId, Result<CompletedPeerContact, NodeError>)> =
+        JoinSet::new();
     let mut inbound_peers = BTreeSet::new();
     let mut inbound_tasks = BTreeMap::<TaskId, EndpointId>::new();
-    let mut outbound: JoinSet<(MissionExpectedPeer, Result<PeerReceipt, NodeError>)> =
+    let mut outbound: JoinSet<(MissionExpectedPeer, Result<CompletedPeerContact, NodeError>)> =
         JoinSet::new();
     let mut outbound_peers = BTreeSet::new();
     let mut outbound_tasks = BTreeMap::<TaskId, MissionExpectedPeer>::new();
@@ -3219,7 +3655,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeReceipt, NodeError> {
     // Reconstructing `Endpoint::accept` on every 100 ms tick can cancel a
     // handshake indefinitely on an accept-only node.
     let (accepted_sender, mut accepted_receiver) = mpsc::channel(1);
-    let mut accept_task = if allowed.is_empty() {
+    let mut accept_task = if !owner_ready || allowed.is_empty() {
         None
     } else {
         let endpoint = endpoint.clone();
@@ -3243,8 +3679,35 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeReceipt, NodeError> {
         }))
     };
 
-    loop {
-        tokio::select! {
+    #[cfg(all(test, unix))]
+    if owner_ready {
+        if let Some(ready) = before_loop_ready {
+            let _ = ready.send(());
+        }
+        if let Some(release) = before_loop_release {
+            let _ = release.await;
+        }
+    }
+
+    if owner_ready {
+        loop {
+            if network_events_since_application >= NETWORK_EVENT_BUDGET
+                && pending_application_command.is_none()
+                && application_commands_open
+            {
+                match application_receiver.try_recv() {
+                    Ok(command) => pending_application_command = Some(command),
+                    Err(mpsc::error::TryRecvError::Empty) => {
+                        network_events_since_application = 0;
+                    }
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        application_commands_open = false;
+                        network_events_since_application = 0;
+                    }
+                }
+            }
+            tokio::select! {
+            biased;
             zeroization = zeroization_receiver.recv() => {
                 match zeroization {
                     Some(Ok(request)) => match prepare_live_zeroization(
@@ -3253,6 +3716,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeReceipt, NodeError> {
                         &request,
                     ) {
                         Ok(plan) => {
+                            application_admission.store(false, Ordering::Release);
                             live_zeroization = Some((request, plan));
                             break;
                         }
@@ -3297,8 +3761,107 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeReceipt, NodeError> {
                     }
                 }
             }
+            _ = shutdown_receiver.recv() => break,
             _ = &mut stop => break,
+            _ = ticker.tick(), if !application_tick_pending => {
+                application_tick_pending = true;
+            }
+            _policy_read = policy_lock.clone().read_owned(),
+                if application_tick_pending
+                    && !application_tick_yield_required
+                    && pending_application_command.is_none() => {
+                application_tick_pending = false;
+                let application_policy = match application.refresh_runtime_policy() {
+                    Ok(policy) => policy,
+                    Err(error) => {
+                        fatal_error = Some(error);
+                        break;
+                    }
+                };
+                if let Some(application_policy) = application_policy
+                    && let Err(error) = drive_sample_application(
+                        config.application,
+                        &store,
+                        &application_policy,
+                        application.runtime_verifier_mut(),
+                        &mut application_cursor,
+                        &mut initial_application_receipt_emitted,
+                    )
+                {
+                    fatal_error = Some(error);
+                    break;
+                }
+                // A continuously overdue ticker gets one operational turn
+                // before it may run again. The bottom select arm clears this
+                // after one scheduler turn when no lower-class work is ready.
+                application_tick_yield_required = true;
+                let peer_count = config.peers.len();
+                if peer_count == 0 {
+                    continue;
+                }
+                let start = next_outbound_peer % peer_count;
+                next_outbound_peer = (start + 1) % peer_count;
+                for offset in 0..peer_count {
+                    if outbound.len() >= MAX_OUTBOUND_CONTACTS {
+                        break;
+                    }
+                    let peer = &config.peers[(start + offset) % peer_count];
+                    // Exactly one endpoint initiates each configured edge. This avoids
+                    // symmetric connect/accept deadlocks without assigning topology meaning.
+                    if local_id >= peer.carrier.id || !outbound_peers.insert(peer.carrier.id) {
+                        continue;
+                    }
+                    let store = store.clone();
+                    let endpoint = endpoint.clone();
+                    let policy_lock = policy_lock.clone();
+                    let peer = *peer;
+                    let mission = config.mission.clone();
+                    let task = outbound.spawn(async move {
+                        (
+                            peer,
+                            sync_once_with_policy(
+                                &store,
+                                &endpoint,
+                                mission,
+                                peer,
+                                policy_lock,
+                            )
+                            .await,
+                        )
+                    });
+                    outbound_tasks.insert(task.id(), peer);
+                }
+            }
+            lease = acquire_application_policy_lease(
+                policy_lock.clone(),
+                pending_application_command
+                    .as_ref()
+                    .is_some_and(SelectedEventCommand::mutates_selectors),
+            ), if pending_application_command.is_some()
+                && network_events_since_application >= NETWORK_EVENT_BUDGET => {
+                let _lease = lease;
+                let command = pending_application_command
+                    .take()
+                    .expect("application policy lease requires a pending command");
+                execute_selected_event_command(
+                    &mut application,
+                    &store,
+                    &selected_event_status,
+                    &receipt,
+                    command,
+                );
+                application_tick_yield_required = false;
+                network_events_since_application = 0;
+                application_commands_since_yield += 1;
+                if application_commands_since_yield >= APPLICATION_COMMAND_BUDGET {
+                    application_commands_since_yield = 0;
+                    tokio::task::yield_now().await;
+                }
+            }
             accepted = accepted_receiver.recv(), if accept_task.is_some() && inbound.len() < MAX_INBOUND_CONTACTS => {
+                application_tick_yield_required = false;
+                let yield_for_network =
+                    account_network_event(&mut network_events_since_application);
                 match accepted {
                     Some(Ok(connection)) => {
                         let peer = connection.remote_id();
@@ -3306,6 +3869,9 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeReceipt, NodeError> {
                             connection.close();
                             receipt.contact_errors += 1;
                             eprintln!("CONTACT direction=in carrier_peer={peer} status=error error=duplicate_concurrent_carrier_contact");
+                            if yield_for_network {
+                                tokio::task::yield_now().await;
+                            }
                             continue;
                         }
                         let store = store.clone();
@@ -3345,12 +3911,22 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeReceipt, NodeError> {
                         eprintln!("CONTACT direction=in status=error error=accept_task_stopped");
                     }
                 }
+                if yield_for_network {
+                    tokio::task::yield_now().await;
+                }
             }
             completed = inbound.join_next_with_id(), if !inbound.is_empty() => {
+                application_tick_yield_required = false;
+                let yield_for_network =
+                    account_network_event(&mut network_events_since_application);
                 match completed {
                     Some(Ok((task, (peer, Ok(server_receipt))))) => {
                         inbound_tasks.remove(&task);
                         inbound_peers.remove(&peer);
+                        if let Err(error) = selected_event_status.record(&server_receipt) {
+                            fatal_error = Some(error);
+                            break;
+                        }
                         receipt.contacts += 1;
                         println!(
                             "CONTACT direction=in carrier_peer={} mission_peer={} rounds={} control_offered={} control_fetched={} control_retained={} control_duplicates={} control_activated={} control_remaining={} offered={} fetched={} inserted={} duplicates={} remaining={} handshake_frames={} handshake_bytes={} protected_frames={} protected_bytes={} mission_auth=hybrid-pq semantics=source-authenticated-event controls=source-authenticated-flash content_admission=capability-gated status={}",
@@ -3395,12 +3971,22 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeReceipt, NodeError> {
                     }
                     None => {}
                 }
+                if yield_for_network {
+                    tokio::task::yield_now().await;
+                }
             }
             completed = outbound.join_next_with_id(), if !outbound.is_empty() => {
+                application_tick_yield_required = false;
+                let yield_for_network =
+                    account_network_event(&mut network_events_since_application);
                 match completed {
                     Some(Ok((task, (peer, Ok(peer_receipt))))) => {
                         outbound_tasks.remove(&task);
                         outbound_peers.remove(&peer.carrier.id);
+                        if let Err(error) = selected_event_status.record(&peer_receipt) {
+                            fatal_error = Some(error);
+                            break;
+                        }
                         receipt.contacts += 1;
                         println!(
                             "CONTACT direction=out carrier_peer={} mission_peer={} rounds={} control_offered={} control_fetched={} control_retained={} control_duplicates={} control_activated={} control_remaining={} offered={} fetched={} inserted={} duplicates={} remaining={} handshake_frames={} handshake_bytes={} protected_frames={} protected_bytes={} mission_auth=hybrid-pq semantics=source-authenticated-event controls=source-authenticated-flash content_admission=capability-gated status={}",
@@ -3445,74 +4031,61 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeReceipt, NodeError> {
                     }
                     None => {}
                 }
+                if yield_for_network {
+                    tokio::task::yield_now().await;
+                }
             }
-            _ = ticker.tick() => {
-                let _policy_read = policy_lock.clone().read_owned().await;
-                let application_policy = match refresh_application_policy(
+            command = application_receiver.recv(),
+                if application_commands_open
+                    && pending_application_command.is_none()
+                    && network_events_since_application < NETWORK_EVENT_BUDGET => {
+                match command {
+                    Some(command) => pending_application_command = Some(command),
+                    None => application_commands_open = false,
+                }
+            }
+            lease = acquire_application_policy_lease(
+                policy_lock.clone(),
+                pending_application_command
+                    .as_ref()
+                    .is_some_and(SelectedEventCommand::mutates_selectors),
+            ), if pending_application_command.is_some()
+                && network_events_since_application < NETWORK_EVENT_BUDGET => {
+                let _lease = lease;
+                let command = pending_application_command
+                    .take()
+                    .expect("application policy lease requires a pending command");
+                execute_selected_event_command(
+                    &mut application,
                     &store,
-                    &config.mission,
-                    &mut application_sealer,
-                    &mut application_control_head,
-                ) {
-                    Ok(policy) => policy,
-                    Err(error) => {
-                        fatal_error = Some(error);
-                        break;
-                    }
-                };
-                if let Some(application_policy) = application_policy
-                    && let Err(error) = drive_sample_application(
-                        config.application,
-                        &store,
-                        &application_policy,
-                        &mut application_sealer,
-                        &mut application_cursor,
-                        &mut initial_application_receipt_emitted,
-                    )
-                {
-                    fatal_error = Some(error);
-                    break;
+                    &selected_event_status,
+                    &receipt,
+                    command,
+                );
+                application_tick_yield_required = false;
+                network_events_since_application = 0;
+                application_commands_since_yield += 1;
+                if application_commands_since_yield >= APPLICATION_COMMAND_BUDGET {
+                    application_commands_since_yield = 0;
+                    tokio::task::yield_now().await;
                 }
-                let peer_count = config.peers.len();
-                if peer_count == 0 {
-                    continue;
-                }
-                let start = next_outbound_peer % peer_count;
-                next_outbound_peer = (start + 1) % peer_count;
-                for offset in 0..peer_count {
-                    if outbound.len() >= MAX_OUTBOUND_CONTACTS {
-                        break;
-                    }
-                    let peer = &config.peers[(start + offset) % peer_count];
-                    // Exactly one endpoint initiates each configured edge. This avoids
-                    // symmetric connect/accept deadlocks without assigning topology meaning.
-                    if local_id >= peer.carrier.id || !outbound_peers.insert(peer.carrier.id) {
-                        continue;
-                    }
-                    let store = store.clone();
-                    let endpoint = endpoint.clone();
-                    let policy_lock = policy_lock.clone();
-                    let peer = *peer;
-                    let mission = config.mission.clone();
-                    let task = outbound.spawn(async move {
-                        (
-                            peer,
-                            sync_once_with_policy(
-                                &store,
-                                &endpoint,
-                                mission,
-                                peer,
-                                policy_lock,
-                            )
-                            .await,
-                        )
-                    });
-                    outbound_tasks.insert(task.id(), peer);
-                }
+            }
+            _ = tokio::task::yield_now(),
+                if application_tick_pending && application_tick_yield_required => {
+                application_tick_yield_required = false;
+            }
             }
         }
     }
 
+    application_admission.store(false, Ordering::Release);
+    application_receiver.close();
+    if let Some(command) = pending_application_command.take() {
+        command.reject();
+    }
+    while let Ok(command) = application_receiver.try_recv() {
+        command.reject();
+    }
     if let Some(task) = zeroization_task.take() {
         task.abort();
         let _ = task.await;
@@ -3527,12 +4100,12 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeReceipt, NodeError> {
     outbound.shutdown().await;
     endpoint.close().await;
     drop(endpoint);
+    drop(application);
     if let Some(error) = fatal_error {
         return Err(error);
     }
     if let Some((request, plan)) = live_zeroization {
         let mission_path = plan.mission.target().path().to_path_buf();
-        drop(application_sealer);
         let result = finish_live_zeroization(store, plan, &config.state, &mission_path);
         match result {
             Ok(completed) => {
@@ -3621,7 +4194,11 @@ async fn sync_once(
     mission: UnprotectedReferenceMission,
     peer: MissionExpectedPeer,
 ) -> Result<PeerReceipt, NodeError> {
-    sync_once_with_policy(store, endpoint, mission, peer, Arc::new(RwLock::new(()))).await
+    Ok(
+        sync_once_with_policy(store, endpoint, mission, peer, Arc::new(RwLock::new(())))
+            .await?
+            .receipt,
+    )
 }
 
 async fn sync_once_with_policy(
@@ -3630,7 +4207,7 @@ async fn sync_once_with_policy(
     mission: UnprotectedReferenceMission,
     peer: MissionExpectedPeer,
     policy_lock: Arc<RwLock<()>>,
-) -> Result<PeerReceipt, NodeError> {
+) -> Result<CompletedPeerContact, NodeError> {
     timeout(
         CONTACT_DEADLINE,
         sync_session(store, endpoint, mission, peer, policy_lock),
@@ -3645,7 +4222,7 @@ async fn sync_session(
     credentials: UnprotectedReferenceMission,
     peer: MissionExpectedPeer,
     policy_lock: Arc<RwLock<()>>,
-) -> Result<PeerReceipt, NodeError> {
+) -> Result<CompletedPeerContact, NodeError> {
     let connection = endpoint.connect(peer.carrier).await?;
     let result =
         sync_authenticated_session(store, &connection, credentials, peer, policy_lock).await;
@@ -4141,7 +4718,7 @@ async fn sync_authenticated_session(
     credentials: UnprotectedReferenceMission,
     peer: MissionExpectedPeer,
     policy_lock: Arc<RwLock<()>>,
-) -> Result<PeerReceipt, NodeError> {
+) -> Result<CompletedPeerContact, NodeError> {
     // Mission authentication is deliberately first. No inventory bytes or
     // object operation can reach the carrier before this returns a session.
     let (mut mission, handshake) = initiate_over_iroh_metered(
@@ -4239,8 +4816,13 @@ async fn sync_authenticated_session(
         &mut receipt,
     )
     .await?;
+    event_guard.check(store)?;
+    let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
     connection.close();
-    Ok(receipt)
+    Ok(CompletedPeerContact {
+        receipt,
+        event_policy,
+    })
 }
 
 async fn serve_connection(
@@ -4249,7 +4831,7 @@ async fn serve_connection(
     credentials: UnprotectedReferenceMission,
     peer: MissionPeerBinding,
     policy_lock: Arc<RwLock<()>>,
-) -> Result<PeerReceipt, NodeError> {
+) -> Result<CompletedPeerContact, NodeError> {
     let close = connection.clone();
     match timeout(
         CONTACT_DEADLINE,
@@ -4746,7 +5328,7 @@ async fn serve_session(
     credentials: UnprotectedReferenceMission,
     peer: MissionPeerBinding,
     policy_lock: Arc<RwLock<()>>,
-) -> Result<PeerReceipt, NodeError> {
+) -> Result<CompletedPeerContact, NodeError> {
     // No inventory is even loaded until the independent mission handshake and
     // exact configured mission NodeId check both finish.
     let (mut mission, handshake) =
@@ -4837,8 +5419,13 @@ async fn serve_session(
         &mut receipt,
     )
     .await?;
+    event_guard.check(&store)?;
+    let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
     connection.close();
-    Ok(receipt)
+    Ok(CompletedPeerContact {
+        receipt,
+        event_policy,
+    })
 }
 
 #[derive(Debug)]
@@ -6944,7 +7531,7 @@ mod tests {
         let displaced_socket = socket_path.with_extension("sock.displaced");
 
         let (sender, mut receiver) = mpsc::channel(1);
-        let task = tokio::spawn(run_local_zeroization_accept_loop(control, sender));
+        let task = tokio::spawn(run_local_zeroization_accept_loop(control, sender, None));
         sleep(LOCAL_ZEROIZATION_INTEGRITY_INTERVAL + Duration::from_millis(50)).await;
         fs::rename(&socket_path, &displaced_socket).expect("displace socket after accept began");
         let failure = timeout(Duration::from_secs(2), receiver.recv())
@@ -6998,7 +7585,7 @@ mod tests {
         let _restore_mode = RestoreOwnerOnlyMode(directory_path.clone());
 
         let (sender, mut receiver) = mpsc::channel(1);
-        let task = tokio::spawn(run_local_zeroization_accept_loop(control, sender));
+        let task = tokio::spawn(run_local_zeroization_accept_loop(control, sender, None));
         sleep(LOCAL_ZEROIZATION_INTEGRITY_INTERVAL + Duration::from_millis(50)).await;
         fs::set_permissions(&directory_path, fs::Permissions::from_mode(0o750))
             .expect("make control directory unsafe after accept began");
@@ -7348,6 +7935,203 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn live_zeroization_closes_selected_event_admission_before_erasure() {
+        use crate::application::{ApplicationErrorKind, EventPublishRequest};
+
+        let root = root("zeroize-live-selected-event-actor");
+        let state = root.join("state");
+        let mission_path = root.join("mission.bundle");
+        fs::create_dir_all(&state).expect("state");
+        persist_zeroization_test_mission(&mission_path, 0xbd);
+        let mission = UnprotectedReferenceMission::load(&mission_path).expect("mission");
+        let running = start_node(NodeConfig {
+            state: state.clone(),
+            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            mission,
+            peers: Vec::new(),
+            sync_interval: Duration::from_millis(10),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("start live node");
+        let selected = running.selected_events();
+        selected
+            .publish(EventPublishRequest {
+                operation_key: b"zeroization-live-event".to_vec(),
+                predecessor: None,
+                topic: Topic::new("zeroization").expect("topic"),
+                scope: Scope::new("test/zeroization").expect("scope"),
+                priority: Priority::Priority,
+                logical_key: b"preserved".to_vec(),
+                payload: b"preserved through terminal cleanup".to_vec(),
+                tombstone: false,
+            })
+            .await
+            .expect("publish before zeroization");
+
+        let zeroized = zeroize_node(&state, &mission_path, Duration::from_secs(5))
+            .await
+            .expect("live zeroization");
+        assert_eq!(zeroized.state, SoftwareZeroizationState::Complete);
+        let receipt = running.wait().await.expect("zeroized actor completion");
+        assert_eq!(receipt.events, 1);
+        assert_eq!(
+            selected
+                .status()
+                .await
+                .expect_err("terminal actor rejects retained application handle")
+                .kind(),
+            ApplicationErrorKind::StateUnavailable
+        );
+        assert_eq!(
+            Store::inspect_zeroization_state(state.join(STORE_FILE))
+                .expect("terminal state")
+                .state(),
+            StoreZeroizationState::Complete
+        );
+        fs::remove_dir_all(root).expect("cleanup terminal live actor state");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn queued_live_zeroization_outranks_an_elapsed_run_for_deadline() {
+        use crate::application::ApplicationErrorKind;
+
+        struct ReleaseOnDrop(Option<oneshot::Sender<()>>);
+
+        impl ReleaseOnDrop {
+            fn release(mut self) {
+                if let Some(release) = self.0.take() {
+                    let _ = release.send(());
+                }
+            }
+        }
+
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                if let Some(release) = self.0.take() {
+                    let _ = release.send(());
+                }
+            }
+        }
+
+        let root = root("queued-zeroization-outranks-run-for");
+        let state = root.join("state");
+        let mission_path = root.join("mission.bundle");
+        fs::create_dir_all(&state).expect("state");
+        persist_zeroization_test_mission(&mission_path, 0xbe);
+        let mission = UnprotectedReferenceMission::load(&mission_path).expect("mission");
+        let identity = mission.identity();
+        let mission_authority = mission.mission_authority_id();
+        let (application_sender, application_receiver) =
+            mpsc::channel(APPLICATION_COMMAND_CAPACITY);
+        let application_admission = Arc::new(AtomicBool::new(true));
+        let selected = SelectedEventHandle::new(
+            application_sender.clone(),
+            application_admission.clone(),
+            identity,
+            mission_authority,
+        );
+        let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
+        let (ready_sender, ready_receiver) = oneshot::channel();
+        let (before_loop_ready_sender, before_loop_ready_receiver) = oneshot::channel();
+        let (before_loop_release_sender, before_loop_release_receiver) = oneshot::channel();
+        let release = ReleaseOnDrop(Some(before_loop_release_sender));
+        let (zeroization_queued_sender, zeroization_queued_receiver) = oneshot::channel();
+        let run_for = Duration::from_millis(50);
+        let actor = tokio::spawn(run_node_actor_inner(
+            NodeConfig {
+                state: state.clone(),
+                bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                mission,
+                peers: Vec::new(),
+                sync_interval: Duration::from_secs(60),
+                run_for: Some(run_for),
+                application: NodeApplication::Relay,
+            },
+            application_receiver,
+            application_admission.clone(),
+            shutdown_receiver,
+            ready_sender,
+            Some(RunNodeActorTestControl {
+                before_loop_ready: before_loop_ready_sender,
+                before_loop_release: before_loop_release_receiver,
+                zeroization_queued: zeroization_queued_sender,
+            }),
+        ));
+        timeout(Duration::from_secs(5), ready_receiver)
+            .await
+            .expect("actor readiness deadline")
+            .expect("actor readiness");
+        timeout(Duration::from_secs(5), before_loop_ready_receiver)
+            .await
+            .expect("pre-select gate deadline")
+            .expect("pre-select gate readiness");
+
+        let zeroize_state = state.clone();
+        let zeroize_mission = mission_path.clone();
+        let zeroization = tokio::spawn(async move {
+            zeroize_node(&zeroize_state, &zeroize_mission, Duration::from_secs(5)).await
+        });
+        timeout(Duration::from_secs(5), zeroization_queued_receiver)
+            .await
+            .expect("zeroization queue deadline")
+            .expect("zeroization entered the actor queue");
+        sleep(run_for + Duration::from_millis(100)).await;
+        release.release();
+
+        let zeroized = timeout(Duration::from_secs(5), zeroization)
+            .await
+            .expect("live zeroization response deadline")
+            .expect("zeroization task")
+            .expect("queued live zeroization receives explicit success");
+        assert!(zeroized.live_request);
+        assert_eq!(zeroized.state, SoftwareZeroizationState::Complete);
+        assert!(zeroized.mission_destroyed && zeroized.identity_destroyed);
+        assert_eq!(
+            zeroized.mission_pathname,
+            SoftwareZeroizationPathState::RetainedZeroLength
+        );
+        assert_eq!(
+            zeroized.identity_pathname,
+            SoftwareZeroizationPathState::RetainedZeroLength
+        );
+        let receipt = timeout(Duration::from_secs(5), actor)
+            .await
+            .expect("zeroized actor completion deadline")
+            .expect("actor task")
+            .expect("actor takes its zeroized terminal path");
+        assert_eq!(receipt.contacts, 0);
+        assert_eq!(receipt.contact_errors, 0);
+        assert!(!application_admission.load(Ordering::Acquire));
+        let closed = selected
+            .status()
+            .await
+            .expect_err("zeroized actor closes retained application admission");
+        assert_eq!(closed.kind(), ApplicationErrorKind::StateUnavailable);
+        assert_eq!(closed.operation(), "status");
+        assert_eq!(
+            Store::inspect_zeroization_state(state.join(STORE_FILE))
+                .expect("terminal store state")
+                .state(),
+            StoreZeroizationState::Complete
+        );
+        assert_eq!(
+            fs::metadata(&mission_path)
+                .expect("mission tombstone")
+                .len(),
+            0
+        );
+
+        drop(selected);
+        drop(application_sender);
+        drop(shutdown_sender);
+        fs::remove_dir_all(root).expect("cleanup zeroization/deadline race state");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn init_only_state_is_bound_terminally_before_secret_erasure() {
         let state = root("zeroize-init-only");
         fs::create_dir_all(&state).expect("state");
@@ -7500,6 +8284,613 @@ mod tests {
             .expect("issue local mission");
         UnprotectedReferenceMission::from_bytes(bundle.to_bytes().expect("encode bundle"))
             .expect("parse local mission")
+    }
+
+    fn prefill_status_commands(
+        sender: &mpsc::Sender<SelectedEventCommand>,
+    ) -> Vec<oneshot::Receiver<Result<SelectedEventStatus, crate::application::ApplicationError>>>
+    {
+        let mut responses = Vec::with_capacity(APPLICATION_COMMAND_CAPACITY);
+        for _ in 0..APPLICATION_COMMAND_CAPACITY {
+            let (response, received) = oneshot::channel();
+            assert!(
+                sender
+                    .try_send(SelectedEventCommand::Status { response })
+                    .is_ok(),
+                "pre-fill bounded application queue"
+            );
+            responses.push(received);
+        }
+        assert_eq!(sender.capacity(), 0);
+        responses
+    }
+
+    async fn assert_explicit_status_responses(
+        responses: Vec<
+            oneshot::Receiver<Result<SelectedEventStatus, crate::application::ApplicationError>>,
+        >,
+    ) -> (usize, usize) {
+        use crate::application::{ApplicationErrorKind, EventSyncStatus};
+
+        let mut successes = 0usize;
+        let mut unavailable = 0usize;
+        for response in responses {
+            match response
+                .await
+                .expect("queued caller receives an explicit result")
+            {
+                Ok(status) => {
+                    successes += 1;
+                    assert!(matches!(
+                        status.sync,
+                        EventSyncStatus::Offline
+                            | EventSyncStatus::AwaitingAuthenticatedContact
+                            | EventSyncStatus::LastContactComplete
+                            | EventSyncStatus::WorkRemained
+                            | EventSyncStatus::PolicyChangedSinceContact
+                    ));
+                }
+                Err(error) => {
+                    unavailable += 1;
+                    assert_eq!(error.kind(), ApplicationErrorKind::StateUnavailable);
+                    assert_eq!(error.operation(), "status");
+                }
+            }
+        }
+        (successes, unavailable)
+    }
+
+    fn spawn_saturated_status_callers(
+        callers: &mut JoinSet<usize>,
+        selected: &SelectedEventHandle,
+        authenticated_contact_observed: Arc<AtomicBool>,
+    ) {
+        use crate::application::ApplicationErrorKind;
+
+        for _ in 0..APPLICATION_COMMAND_CAPACITY * 2 {
+            let selected = selected.clone();
+            let authenticated_contact_observed = authenticated_contact_observed.clone();
+            callers.spawn(async move {
+                let mut successes = 0usize;
+                loop {
+                    match selected.status().await {
+                        Ok(status) => {
+                            successes = successes.saturating_add(1);
+                            if status.authenticated_contacts > 0 {
+                                authenticated_contact_observed.store(true, Ordering::Release);
+                            }
+                        }
+                        Err(error) => {
+                            assert_eq!(error.kind(), ApplicationErrorKind::StateUnavailable);
+                            assert_eq!(error.operation(), "status");
+                            return successes;
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_run_for_is_rejected_before_readiness_or_state_mutation() {
+        let state = root("oversized-run-for");
+        let (application_sender, application_receiver) =
+            mpsc::channel(APPLICATION_COMMAND_CAPACITY);
+        let application_admission = Arc::new(AtomicBool::new(true));
+        let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
+        let (ready_sender, ready_receiver) = oneshot::channel();
+        let actor = tokio::spawn(run_node_actor(
+            NodeConfig {
+                state: state.clone(),
+                bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                mission: test_mission(),
+                peers: Vec::new(),
+                sync_interval: Duration::from_secs(60),
+                run_for: Some(Duration::MAX),
+                application: NodeApplication::Relay,
+            },
+            application_receiver,
+            application_admission,
+            shutdown_receiver,
+            ready_sender,
+        ));
+        let error = timeout(Duration::from_secs(5), actor)
+            .await
+            .expect("oversized run_for rejection deadline")
+            .expect("actor must return an error rather than panic")
+            .expect_err("oversized run_for must fail");
+        assert!(
+            matches!(&error, NodeError::Configuration(message) if message.contains("run_for exceeds the monotonic clock")),
+            "unexpected oversized run_for error: {error}"
+        );
+        assert!(
+            ready_receiver.await.is_err(),
+            "oversized run_for must fail before readiness"
+        );
+        assert!(
+            !state.exists(),
+            "oversized run_for must fail before state mutation"
+        );
+
+        drop(application_sender);
+        drop(shutdown_sender);
+    }
+
+    #[tokio::test]
+    async fn run_for_preempts_a_saturated_application_queue_and_closes_every_caller() {
+        use crate::application::ApplicationErrorKind;
+
+        let state = root("run-for-saturated-application-queue");
+        let mission = test_mission();
+        let identity = mission.identity();
+        let mission_authority = mission.mission_authority_id();
+        let (application_sender, application_receiver) =
+            mpsc::channel(APPLICATION_COMMAND_CAPACITY);
+        let application_admission = Arc::new(AtomicBool::new(true));
+        let selected = SelectedEventHandle::new(
+            application_sender.clone(),
+            application_admission.clone(),
+            identity,
+            mission_authority,
+        );
+        let responses = prefill_status_commands(&application_sender);
+
+        let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
+        let (ready_sender, ready_receiver) = oneshot::channel();
+        let actor = tokio::spawn(run_node_actor(
+            NodeConfig {
+                state: state.clone(),
+                bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                mission,
+                peers: Vec::new(),
+                sync_interval: Duration::from_secs(60),
+                run_for: Some(Duration::from_millis(250)),
+                application: NodeApplication::Relay,
+            },
+            application_receiver,
+            application_admission.clone(),
+            shutdown_receiver,
+            ready_sender,
+        ));
+        let mut callers = JoinSet::new();
+        spawn_saturated_status_callers(&mut callers, &selected, Arc::new(AtomicBool::new(false)));
+        ready_receiver.await.expect("actor readiness");
+        let receipt = timeout(Duration::from_secs(5), actor)
+            .await
+            .expect("run_for must not be starved by saturated commands")
+            .expect("actor task")
+            .expect("actor completion");
+        assert_eq!(receipt.contacts, 0);
+        assert_eq!(receipt.contact_errors, 0);
+        assert!(!application_admission.load(Ordering::Acquire));
+
+        let (successes, unavailable) = assert_explicit_status_responses(responses).await;
+        assert_eq!(successes + unavailable, APPLICATION_COMMAND_CAPACITY);
+        let expected_callers = APPLICATION_COMMAND_CAPACITY * 2;
+        let (completed_callers, pressure_successes) = timeout(Duration::from_secs(5), async {
+            let mut completed = 0usize;
+            let mut successes = 0usize;
+            while let Some(result) = callers.join_next().await {
+                completed += 1;
+                successes = successes.saturating_add(result.expect("status pressure task"));
+            }
+            (completed, successes)
+        })
+        .await
+        .expect("every saturated status caller closes explicitly");
+        assert_eq!(completed_callers, expected_callers);
+        assert!(
+            successes + pressure_successes > 0,
+            "the nonzero run_for interval must admit work before its deadline"
+        );
+        assert!(
+            unavailable + completed_callers > 0,
+            "the run_for deadline must close callers with StateUnavailable"
+        );
+        let closed = selected
+            .status()
+            .await
+            .expect_err("retained handle closes with the actor");
+        assert_eq!(closed.kind(), ApplicationErrorKind::StateUnavailable);
+        assert_eq!(closed.operation(), "status");
+
+        drop(selected);
+        drop(application_sender);
+        drop(shutdown_sender);
+        fs::remove_dir_all(state).expect("cleanup saturated application state");
+    }
+
+    #[tokio::test]
+    async fn authenticated_contact_status_progresses_with_saturated_application_queues() {
+        let root = root("authenticated-contact-saturated-application-queues");
+        let left_state = root.join("left");
+        let right_state = root.join("right");
+        let mut issued = issue_missions(2);
+        let right_mission = issued.pop().expect("right mission");
+        let left_mission = issued.pop().expect("left mission");
+        let left_mission_id = left_mission.identity;
+        let right_mission_id = right_mission.identity;
+        let left_mission_authority = left_mission.credentials.mission_authority_id();
+        let right_mission_authority = right_mission.credentials.mission_authority_id();
+        let left_carrier = {
+            let identity =
+                NodeIdentity::load_or_create(&left_state).expect("left carrier identity");
+            let carrier = identity.id();
+            drop(identity);
+            carrier
+        };
+        let right_carrier = {
+            let identity =
+                NodeIdentity::load_or_create(&right_state).expect("right carrier identity");
+            let carrier = identity.id();
+            drop(identity);
+            carrier
+        };
+        let (left_sender, left_receiver) = mpsc::channel(APPLICATION_COMMAND_CAPACITY);
+        let left_admission = Arc::new(AtomicBool::new(true));
+        let left_selected = SelectedEventHandle::new(
+            left_sender.clone(),
+            left_admission.clone(),
+            left_mission_id,
+            left_mission_authority,
+        );
+        let left_prefilled = prefill_status_commands(&left_sender);
+        let (left_shutdown, left_shutdown_receiver) = mpsc::channel(1);
+        let (left_ready, left_readiness) = oneshot::channel();
+
+        let (right_sender, right_receiver) = mpsc::channel(APPLICATION_COMMAND_CAPACITY);
+        let right_admission = Arc::new(AtomicBool::new(true));
+        let right_selected = SelectedEventHandle::new(
+            right_sender.clone(),
+            right_admission.clone(),
+            right_mission_id,
+            right_mission_authority,
+        );
+        let right_prefilled = prefill_status_commands(&right_sender);
+        let (right_shutdown, right_shutdown_receiver) = mpsc::channel(1);
+        let (right_ready, right_readiness) = oneshot::channel();
+
+        let left_contact_observed = Arc::new(AtomicBool::new(false));
+        let right_contact_observed = Arc::new(AtomicBool::new(false));
+        let mut callers = JoinSet::new();
+        spawn_saturated_status_callers(&mut callers, &left_selected, left_contact_observed.clone());
+        spawn_saturated_status_callers(
+            &mut callers,
+            &right_selected,
+            right_contact_observed.clone(),
+        );
+        let placeholder = SocketAddr::from(([127, 0, 0, 1], 9));
+        let (left_actor, right_actor) = if left_carrier > right_carrier {
+            let left_actor = tokio::spawn(run_node_actor(
+                NodeConfig {
+                    state: left_state,
+                    bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                    mission: left_mission.credentials,
+                    peers: vec![MissionExpectedPeer {
+                        carrier: ExpectedPeer {
+                            id: right_carrier,
+                            address: placeholder,
+                        },
+                        mission: right_mission_id,
+                    }],
+                    sync_interval: Duration::from_nanos(1),
+                    run_for: None,
+                    application: NodeApplication::Relay,
+                },
+                left_receiver,
+                left_admission.clone(),
+                left_shutdown_receiver,
+                left_ready,
+            ));
+            let left_address = timeout(Duration::from_secs(10), left_readiness)
+                .await
+                .expect("left responder becomes ready")
+                .expect("left responder readiness")
+                .into_iter()
+                .find(SocketAddr::is_ipv4)
+                .expect("left responder IPv4 endpoint");
+            let right_actor = tokio::spawn(run_node_actor(
+                NodeConfig {
+                    state: right_state,
+                    bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                    mission: right_mission.credentials,
+                    peers: vec![MissionExpectedPeer {
+                        carrier: ExpectedPeer {
+                            id: left_carrier,
+                            address: left_address,
+                        },
+                        mission: left_mission_id,
+                    }],
+                    sync_interval: Duration::from_nanos(1),
+                    run_for: None,
+                    application: NodeApplication::Relay,
+                },
+                right_receiver,
+                right_admission.clone(),
+                right_shutdown_receiver,
+                right_ready,
+            ));
+            timeout(Duration::from_secs(10), right_readiness)
+                .await
+                .expect("right initiator becomes ready")
+                .expect("right initiator readiness");
+            (left_actor, right_actor)
+        } else {
+            let right_actor = tokio::spawn(run_node_actor(
+                NodeConfig {
+                    state: right_state,
+                    bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                    mission: right_mission.credentials,
+                    peers: vec![MissionExpectedPeer {
+                        carrier: ExpectedPeer {
+                            id: left_carrier,
+                            address: placeholder,
+                        },
+                        mission: left_mission_id,
+                    }],
+                    sync_interval: Duration::from_nanos(1),
+                    run_for: None,
+                    application: NodeApplication::Relay,
+                },
+                right_receiver,
+                right_admission.clone(),
+                right_shutdown_receiver,
+                right_ready,
+            ));
+            let right_address = timeout(Duration::from_secs(10), right_readiness)
+                .await
+                .expect("right responder becomes ready")
+                .expect("right responder readiness")
+                .into_iter()
+                .find(SocketAddr::is_ipv4)
+                .expect("right responder IPv4 endpoint");
+            let left_actor = tokio::spawn(run_node_actor(
+                NodeConfig {
+                    state: left_state,
+                    bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                    mission: left_mission.credentials,
+                    peers: vec![MissionExpectedPeer {
+                        carrier: ExpectedPeer {
+                            id: right_carrier,
+                            address: right_address,
+                        },
+                        mission: right_mission_id,
+                    }],
+                    sync_interval: Duration::from_nanos(1),
+                    run_for: None,
+                    application: NodeApplication::Relay,
+                },
+                left_receiver,
+                left_admission.clone(),
+                left_shutdown_receiver,
+                left_ready,
+            ));
+            timeout(Duration::from_secs(10), left_readiness)
+                .await
+                .expect("left initiator becomes ready")
+                .expect("left initiator readiness");
+            (left_actor, right_actor)
+        };
+
+        timeout(Duration::from_secs(35), async {
+            loop {
+                if left_contact_observed.load(Ordering::Acquire)
+                    && right_contact_observed.load(Ordering::Acquire)
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("authenticated completion and status must outrank saturated commands");
+
+        left_admission.store(false, Ordering::Release);
+        right_admission.store(false, Ordering::Release);
+        let (left_shutdown_result, right_shutdown_result) =
+            tokio::join!(left_shutdown.send(()), right_shutdown.send(()));
+        assert!(left_shutdown_result.is_ok());
+        assert!(right_shutdown_result.is_ok());
+        let (left_receipt, right_receipt) = timeout(Duration::from_secs(10), async {
+            let (left, right) = tokio::join!(left_actor, right_actor);
+            (
+                left.expect("left actor task")
+                    .expect("left actor completion"),
+                right
+                    .expect("right actor task")
+                    .expect("right actor completion"),
+            )
+        })
+        .await
+        .expect("saturated actors shut down promptly");
+        assert!(left_receipt.contacts > 0);
+        assert!(right_receipt.contacts > 0);
+        let (left_successes, left_unavailable) =
+            assert_explicit_status_responses(left_prefilled).await;
+        let (right_successes, right_unavailable) =
+            assert_explicit_status_responses(right_prefilled).await;
+        assert_eq!(
+            left_successes + left_unavailable,
+            APPLICATION_COMMAND_CAPACITY
+        );
+        assert_eq!(
+            right_successes + right_unavailable,
+            APPLICATION_COMMAND_CAPACITY
+        );
+
+        let expected_callers = APPLICATION_COMMAND_CAPACITY * 4;
+        let (completed_callers, successful_statuses) = timeout(Duration::from_secs(5), async {
+            let mut completed = 0usize;
+            let mut successes = 0usize;
+            while let Some(result) = callers.join_next().await {
+                completed += 1;
+                successes = successes.saturating_add(result.expect("status pressure task"));
+            }
+            (completed, successes)
+        })
+        .await
+        .expect("all saturated status callers close explicitly");
+        assert_eq!(completed_callers, expected_callers);
+        assert!(successful_statuses > 0);
+
+        drop(left_selected);
+        drop(right_selected);
+        drop(left_sender);
+        drop(right_sender);
+        drop(left_shutdown);
+        drop(right_shutdown);
+        fs::remove_dir_all(root).expect("cleanup saturated contact state");
+    }
+
+    #[tokio::test]
+    async fn live_selected_event_actor_is_peerless_durable_and_closes_admission() {
+        use crate::application::{
+            ApplicationErrorKind, EventAcknowledgement, EventGapQuery, EventPollRequest,
+            EventPublishRequest, EventQuery, EventSubscriptionRequest, EventSyncStatus,
+            EventUnsubscribe,
+        };
+
+        let state = root("live-selected-event-actor");
+        let scope = Scope::new("test/runtime").expect("scope");
+        let topic = Topic::new("opaque").expect("topic");
+        let running = start_node(NodeConfig {
+            state: state.clone(),
+            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            mission: test_mission(),
+            peers: Vec::new(),
+            sync_interval: Duration::from_millis(10),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("start live selected Event actor");
+        let selected = running.selected_events();
+        assert_eq!(
+            selected.status().await.expect("peerless status").sync,
+            EventSyncStatus::Offline
+        );
+
+        let subscription = selected
+            .subscribe(EventSubscriptionRequest {
+                operation_key: b"runtime-live-subscription".to_vec(),
+                topic: topic.clone(),
+                scope: scope.clone(),
+                include_descendant_scopes: false,
+            })
+            .await
+            .expect("subscribe while live");
+        let published = selected
+            .publish(EventPublishRequest {
+                operation_key: b"runtime-live-publish".to_vec(),
+                predecessor: None,
+                topic: topic.clone(),
+                scope: scope.clone(),
+                priority: Priority::Priority,
+                logical_key: b"runtime-live-key".to_vec(),
+                payload: b"published while peerless".to_vec(),
+                tombstone: false,
+            })
+            .await
+            .expect("publish while live");
+        let queried = selected
+            .query(EventQuery {
+                after_acceptance_marker: 0,
+                limit: 8,
+                topic: Some(topic.clone()),
+                scope: Some(scope.clone()),
+                ..EventQuery::default()
+            })
+            .await
+            .expect("query while live");
+        assert_eq!(queried.items.len(), 1);
+        assert_eq!(queried.items[0].id, published.id);
+
+        let delivered = selected
+            .poll(EventPollRequest {
+                subscription: subscription.id,
+                delivery_limit: 8,
+                scan_limit: 8,
+            })
+            .await
+            .expect("poll while live");
+        assert_eq!(delivered.deliveries.len(), 1);
+        assert_eq!(delivered.deliveries[0].event.id, published.id);
+        assert_eq!(delivered.deliveries[0].attempt, 1);
+        assert_eq!(
+            selected
+                .acknowledge(subscription.id, published.id)
+                .await
+                .expect("acknowledge while live"),
+            EventAcknowledgement::Acknowledged
+        );
+        assert!(
+            selected
+                .poll(EventPollRequest {
+                    subscription: subscription.id,
+                    delivery_limit: 8,
+                    scan_limit: 8,
+                })
+                .await
+                .expect("poll after acknowledgement")
+                .deliveries
+                .is_empty()
+        );
+
+        let gaps = selected
+            .gaps(EventGapQuery {
+                publisher: selected.identity(),
+                topic: topic.clone(),
+                scope: scope.clone(),
+                after_sequence: 0,
+                scan_limit: 8,
+            })
+            .await
+            .expect("authenticated gap projection");
+        assert!(gaps.gaps.is_empty());
+        assert_eq!(gaps.scanned_through_sequence, published.event_sequence);
+        assert!(!gaps.has_more);
+        let beyond_high_water = selected
+            .gaps(EventGapQuery {
+                publisher: selected.identity(),
+                topic,
+                scope,
+                after_sequence: published.event_sequence + 10,
+                scan_limit: 8,
+            })
+            .await
+            .expect("empty gap scan beyond high-water");
+        assert!(beyond_high_water.gaps.is_empty());
+        assert_eq!(
+            beyond_high_water.scanned_through_sequence,
+            published.event_sequence + 10
+        );
+        assert_eq!(
+            selected
+                .unsubscribe(subscription.id)
+                .await
+                .expect("unsubscribe while live"),
+            EventUnsubscribe::Removed
+        );
+        assert_eq!(
+            selected
+                .unsubscribe(subscription.id)
+                .await
+                .expect("idempotent unsubscribe while live"),
+            EventUnsubscribe::AlreadyAbsent
+        );
+
+        let retained = selected.clone();
+        let receipt = running.shutdown().await.expect("graceful shutdown");
+        assert_eq!(receipt.events, 1);
+        assert_eq!(
+            retained
+                .status()
+                .await
+                .expect_err("closed actor rejects retained handle")
+                .kind(),
+            ApplicationErrorKind::StateUnavailable
+        );
+        fs::remove_dir_all(state).expect("cleanup live actor state");
     }
 
     fn demo_member_mission() -> UnprotectedReferenceMission {
@@ -7755,7 +9146,7 @@ mod tests {
             .expect("server contact");
         client.close().await;
         server.close().await;
-        (client_receipt, server_receipt)
+        (client_receipt, server_receipt.receipt)
     }
 
     fn expected_peer(seed: u64, port: u16) -> MissionExpectedPeer {

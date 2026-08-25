@@ -86,7 +86,7 @@ requirements §5.3 automatic merge partial pending a convergent design.
 
 ## Selected production-lane Event slices (2026-08-24)
 
-`aster-node::application::SelectedEventNode` is the first high-level surface
+`aster-node::application::SelectedEventNode` was the first high-level surface
 over the selected redb/runtime security composition. It owns the exact
 mission-bound redb writer authority while the mesh process is stopped and
 exposes arbitrary policy-authorized Event publication and bounded
@@ -124,15 +124,25 @@ two-phase poll plan and commit-selection types carry trusted classifications
 from the selected node; they do not mint or prove cryptographic authority on
 their own. Calling those methods directly is inside Aster's in-process trusted
 computing base, just like the broader `adapter-sdk` seams above. The supported
-application boundary is `SelectedEventNode`, which freshly authenticates every
-planned row, opens content only for authorized Consume deliveries, and returns
-only sanitized application records and errors.
+application boundaries are stopped `SelectedEventNode` and live
+`SelectedEventHandle`. Both freshly authenticate planned rows, open content only
+for authorized Consume deliveries, and return only sanitized application
+records and errors.
+
+The live handle is a cloneable command capability for the running node's sole
+actor; it does not open another store. It adds idempotent unsubscribe, bounded
+authenticated gap inspection, and peer/last-contact status. Selector insertion
+and removal serialize against contact policy capture. A replacement selector is
+an explicit unsubscribe followed by subscribe, not an atomic update. Gap
+intervals are anchored only by freshly source/content-verified positions already
+observed in the mission-bound store. Last-contact status is process-local and
+does not claim reachability, publisher completeness, or global convergence.
 
 These slices do not replace the broader proven semantic `ApplicationNode` or
-complete the accepted boundary. They have no subscription update/delete,
-public authenticated gap inspection, live actor handle, peer/sync status,
-State, Record, Blob, bindings, protected operational provisioning, or
-generalized control administration. Finite TTL is absent and therefore cannot
-be requested until authenticated cumulative forwarding age and expiry exist.
+complete the accepted boundary. They have no atomic subscription update,
+State, Record, Blob, selected-node bindings, protected operational provisioning,
+or generalized control administration. Finite TTL is absent and therefore
+cannot be requested until authenticated cumulative forwarding age and expiry
+exist.
 The compiled example and exact claim boundary are documented in the
 [selected Event API quickstart](../quickstart/selected-event-api.md).

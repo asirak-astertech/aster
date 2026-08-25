@@ -23,12 +23,15 @@ operation.
 > Event transfer, keeps exact transfer identity distinct from semantic identity,
 > separates content admission from payload-blind routing, and now exchanges
 > protected Consume/Carry interests through two receiver-directed Event lanes.
-> The stopped-state selected API provides durable at-least-once
-> subscribe/poll/ack. It is still not a
+> The selected API now exposes live and stopped-state Event publish/query,
+> durable subscribe/poll/ack, idempotent unsubscribe, and authenticated gap
+> inspection. Its live handle reports bounded authenticated peer and
+> last-contact status without exposing carrier or reconciliation internals. It
+> is still not a
 > completed MVP,
 > production-authorized build, or claim of FIPS 140-3 validation. State, Record,
-> Blob, finite-TTL custody, subscription update/delete, a live selected
-> application handle, protected provisioning, generalized control
+> Blob, finite-TTL custody, atomic subscription update, protected provisioning,
+> generalized control
 > administration, and physical/multi-carrier
 > acceptance remain open. A bounded same-UID Unix hook now drains a selected
 > node, terminally locks its retained redb state, and software-erases its exact
@@ -111,8 +114,8 @@ mise run tour-control  # four roles; revocation, rekey, captured-node exclusion
 Each command retains its complete root and prints stopped-state inspections.
 See the [capability tour](docs/quickstart/capability-tour.md) for what to look
 for, the [selected Event API quickstart](docs/quickstart/selected-event-api.md)
-to publish, query, subscribe, poll, and acknowledge through the stopped-state
-production-lane composition,
+to publish offline through the live actor, consume durably, inspect gaps/status,
+and run the focused later-sync process test,
 and the [selected architecture](docs/architecture.md) for the trust and
 authority boundaries.
 
@@ -139,10 +142,13 @@ demo-scoped issuing authority seed is ephemeral. Bounded Negentropy reconciles
 exact sealed-transfer IDs. Every contact authenticates the expected mission peer
 before inventory and protects later mechanics frames. Each Event independently
 authenticates its publisher and protected semantic header. This slice does
-**not** validate State/Record/Blob, subscription update/delete, a live
-application handle or peer/sync status, finite-TTL custody, protected provisioning at rest,
+**not** validate State/Record/Blob, atomic subscription update, finite-TTL
+custody, protected provisioning at rest,
 NAT/hosted relay operation, BTLE, physical multi-system operation, or any
-production security gate. See the [capability tour](docs/quickstart/capability-tour.md),
+production security gate. The separate selected Event quickstart and focused
+real-process test exercise the live application handle and bounded status; the
+demo command itself continues to exercise its built-in Ping/Pong roles. See the
+[capability tour](docs/quickstart/capability-tour.md),
 the [mesh CLI quickstart](docs/quickstart/mesh-cli.md),
 and the tracked [production requirements status](docs/implementation/requirements-status.md)
 for the exact observed result and open work.
