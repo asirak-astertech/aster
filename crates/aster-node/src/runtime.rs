@@ -1060,7 +1060,7 @@ fn zeroize_stopped_node(
         // `aster init` and an opaque-only compatibility store have no mission
         // binding yet. Reuse the normal binding path, then immediately enter
         // terminal state before either exact artifact is destroyed.
-        let store = Store::open_for_mission(&store_path, plan.mission_authority)?;
+        let mut store = Store::open_for_mission(&store_path, plan.mission_authority)?;
         store.require_process_exclusive_lock()?;
         let opened_store = local_store_identity(&store_path)?;
         let expected_store = expected_store.unwrap_or(opened_store);
@@ -1241,7 +1241,7 @@ fn finish_live_zeroization(
     let expected_store = plan.store_identity.ok_or_else(|| {
         NodeError::Configuration("live zeroization plan lacks an exact store identity".into())
     })?;
-    let store = Arc::try_unwrap(store).map_err(|_| {
+    let mut store = Arc::try_unwrap(store).map_err(|_| {
         NodeError::Configuration(
             "live zeroization could not obtain sole ownership after draining store tasks".into(),
         )

@@ -9,8 +9,8 @@ node, topic, or scope are new.
 
 Application semantics, mission authentication, control/source authorization,
 and carrier mechanics have separate owners. The selected composition now
-exercises source-authenticated control and Event paths plus stopped/local State
-and Record projections:
+exercises source-authenticated control and Event paths plus stopped/local State,
+Record, and Blob surfaces:
 
 ```mermaid
 flowchart LR
@@ -20,6 +20,7 @@ flowchart LR
     StoppedFacade["Stopped SelectedEventNode<br/>same Event data operations<br/>without live status"]
     StoppedState["Stopped SelectedStateNode<br/>local publish · exact-key projection"]
     StoppedRecord["Stopped SelectedRecordNode<br/>local publish · conflict query · guarded resolve"]
+    StoppedBlob["Stopped SelectedBlobNode<br/>local stream publish · verified read_into"]
     Intent["Durable receive intent<br/>Consume · Carry · empty = receive-none"]
     Authority["Stopped-state authority CLI<br/>revoke · recipient-filtered rekey"]
     Operator["Same-UID Unix operator"]
@@ -27,7 +28,8 @@ flowchart LR
     Control["aster-core control envelope<br/>authority · chain · effect"]
     Source["aster-core source envelope<br/>publisher · protected header · content"]
     Node["aster-node<br/>protected receiver interest · direction-separated filtering · local zeroize · receipts"]
-    Store["aster-redb-store<br/>control policy · Event delivery/cache<br/>local State/Record projection"]
+    Store["aster-redb-store<br/>control policy · Event delivery/cache<br/>local State/Record/Blob authority"]
+    Depot["private encrypted Blob depot<br/>committed chunk files"]
     Profile["aster-profile<br/>canonical exact-ID ordering"]
     Diff["aster-negentropy<br/>bounded set difference"]
     Mission["aster-core reference session<br/>hybrid mission auth · frame protection"]
@@ -45,6 +47,11 @@ flowchart LR
     App --> StoppedRecord
     StoppedRecord -->|"fresh Record verification"| Source
     StoppedRecord -->|"exclusive local projection + guard"| Store
+    App --> StoppedBlob
+    StoppedBlob -->|"fresh manifest/source/content verification"| Source
+    StoppedBlob -->|"exclusive local publication plan"| Store
+    StoppedBlob -->|"bounded encrypted chunks"| Depot
+    Store -->|"exact durable markers"| Depot
     BuiltIns --> Source
     Node --> Intent --> Store
     Store -->|"atomic policy + selector snapshot"| Node
@@ -65,9 +72,11 @@ flowchart LR
 contiguous control prefix, active policy snapshots, accepted Events,
 causal/operation ledgers, durable Consume/Carry selector generations, Event
 delivery cursors/pending attempts/acknowledgements, and bounded route-only
-representations. It also holds disjoint local State and Record versions,
-operations, and exact-key projection plans on the same causal frontier; those
-classes never enter the carrier diagram's Event reconciliation lanes.
+representations. It also holds disjoint local State and Record versions and
+local Blob publications, operations, and structural plans on the same causal
+frontier; those classes never enter the carrier diagram's Event reconciliation
+lanes. A sibling bounded depot holds Blob ciphertext files, while redb owns the
+exact committed-file markers and publication authority.
 `aster-profile` owns the canonical full-ID vocabulary and ordering, not policy
 or semantic identity. `aster-node` is the only selected composition root. This
 diagram is the selected control/Event lane only; broader semantic/reference
@@ -79,9 +88,11 @@ for the hybrid-PQ handshake, protected control/source envelopes,
 recipient-filtered rekey, source authentication, data classes, causality,
 custody/TTL, scopes, and policy. Those mechanisms are ported, not rewritten.
 The selected node now uses the existing reference session before inventory, the
-existing control provider before Event, and the existing source envelope for
-Event. It freshly verifies exact sealed bytes before admission, serving,
-restart, and application reaction. This is bounded control/Event credit only;
+existing control provider before Event, the existing source envelope for Event,
+and typed local State, Record, and Blob source capabilities behind stopped
+facades. It freshly verifies exact sealed bytes before admission, serving,
+restart, and application exposure. This is bounded control/Event transfer plus
+local-only State/Record/Blob credit;
 the old implementation is not removed until each replacement passes equivalent
 tests.
 
@@ -90,7 +101,7 @@ tests.
 | Carrier path | Current capability | What is not yet claimed |
 |---|---|---|
 | Selected direct Iroh | Manually admitted exact endpoint ID and socket, direct authenticated QUIC, bounded exchange, hosted discovery/relay/port mapping disabled | Carrier authentication is not mission or control/source authorization; NAT, hosted relay, physical-network acceptance, and multi-carrier failover remain open |
-| Selected virtual mesh CLI and live Event actor | Real 2–32-node Ping/Pong line plus explicit four-role control scenario; independent identities/stores, mission auth before inventory, ordered Flash controls before source-sealed Event transfer, current scope/epoch route filtering, payload-blind relay cache, restart/idempotency, no-op verification, a live high-level Event handle, stopped/local State and Record facades, and a same-UID Unix local software-zeroization hook | The retained parent PR-A/pre-subscription N=3/13-process, default N=4/18-process, and N=8/38-process Ping/Pong plus explicit N=4/23-process control receipts passed with disclosed transient/denial stderr. The generic line has `2N+1` cohorts and `5N-2` children, isolates both publications and every directed-edge transfer, moves exactly one pre-existing Event per transfer edge with all control counters zero, and finishes with all 11 reconciliation counters zero. The control receipt separately proves converged controls, no-contact Ping publication, later Event forwarding, and four causal Pong barriers before its no-op. A separate parent-slice real-child zeroization receipt passed. PR B adds durable Event Consume/Carry selectors and protected receiver filtering; PR C adds current-code automated evidence for live publish/query/delivery, unsubscribe, authenticated gap inspection, last-contact status, and one real-process offline-publish/later-sync flow. Local State and Record add current-code source/test evidence only; neither enters a contact. No slice relabels the retained parent roots. Provisioning is unprotected-reference; status is not global convergence; non-Unix and physical/copy-on-write/snapshot/swap/backup sanitization, database rollback resistance, generalized/repeated control management, finite TTL, networked State/Record, Blob, the full range, many-node scale, and physical multi-system acceptance remain open. |
+| Selected virtual mesh CLI and live Event actor | Real 2–32-node Ping/Pong line plus explicit four-role control scenario; independent identities/stores, mission auth before inventory, ordered Flash controls before source-sealed Event transfer, current scope/epoch route filtering, payload-blind relay cache, restart/idempotency, no-op verification, a live high-level Event handle, stopped/local State, Record, and Blob facades, and a same-UID Unix local software-zeroization hook | The retained parent PR-A/pre-subscription N=3/13-process, default N=4/18-process, and N=8/38-process Ping/Pong plus explicit N=4/23-process control receipts passed with disclosed transient/denial stderr. The generic line has `2N+1` cohorts and `5N-2` children, isolates both publications and every directed-edge Event transfer, and finishes with zero-difference no-ops. The control receipt separately proves converged controls, no-contact Ping publication, later Event forwarding, and four causal Pong barriers before its no-op. A separate parent-slice real-child zeroization receipt passed. PR B adds durable Event Consume/Carry selectors and protected receiver filtering; PR C adds current-code live Event evidence. Local State, Record, and Blob add current-code local source/test evidence only; none enters a contact. Blob streams fixed-profile encrypted chunks only through its local depot; no remote chunk transfer or any-peer resume is claimed. No slice relabels the retained parent roots. Provisioning is unprotected-reference; status is not global convergence; non-Unix and physical/copy-on-write/snapshot/swap/backup sanitization, database rollback resistance, generalized/repeated control management, finite TTL, networked State/Record/Blob, the full range, many-node scale, and physical multi-system acceptance remain open. |
 | Current semantic in-memory link | Full high-level host contact, authentication, reconciliation, resume, and failure tests | It is a test carrier and is not wired to the selected composition |
 | Current semantic UDP/IP | Nonblocking link, manual endpoint mapping, protected local discovery, rendezvous helpers, opaque relay components | Migration onto the selected node; full host acceptance on physical or operational networks |
 | Current semantic NAT/rendezvous and relay | Bounded rendezvous, endpoint-punching, and opaque-relay helpers with local software tests | Selected-node integration and a two-device representative-NAT direct/fallback result |
@@ -159,7 +170,8 @@ acceptance and reaction; revoked mission principals fail closed.
 The live selected Event handle now composes high-level operations and bounded
 authenticated last-contact status with this path. `LastContactComplete` reports
 only the most recent bounded negotiation with each active configured peer; it
-does not assert global convergence. Networked State/Record, Blob, generalized control
+does not assert global convergence. Networked State/Record/Blob, remote Blob
+chunk transfer, generalized control
 administration, repeated multi-scope lifecycle, finite-TTL custody, and
 protected provisioning remain to be composed.
 The mission bundle is owner-only on Unix but explicitly unprotected-reference

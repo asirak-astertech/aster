@@ -1,7 +1,7 @@
 # Selected production-lane architecture
 
-This page depicts the bounded control/Event composition and local State and
-Record projections that execute today.
+This page depicts the bounded control/Event composition and local State,
+Record, and Blob surfaces that execute today.
 It is intentionally narrower than Aster's complete protocol and semantic
 reference implementation. The live selected Event API provides publish,
 bounded query, durable subscribe/poll/ack, idempotent unsubscribe, authenticated
@@ -12,10 +12,13 @@ provides source-authenticated State publication and exact-key causal projection.
 An exclusive stopped `SelectedRecordNode` preserves and annotates exact-key
 causal heads and accepts explicit application-reviewed resolution only through
 an exact sibling guard. State and Record have no live handles or reconciliation
-frames in this slice. Automatic registered-policy Record merge, Blob,
-atomic subscription update, finite-TTL custody, protected operational
-provisioning, additional carriers, generalized control administration, and
-release authorization remain outside this selected lane.
+frames in this slice. An exclusive stopped `SelectedBlobNode` streams one
+source-authenticated immutable object through a bounded encrypted local depot
+without returning provider readers or key material. Blob likewise has no live
+handle or reconciliation frames. Automatic registered-policy Record merge,
+remote Blob chunk transfer, atomic subscription update, finite-TTL custody,
+protected operational provisioning, additional carriers, generalized control
+administration, and release authorization remain outside this selected lane.
 
 ## Components and trust boundaries
 
@@ -28,6 +31,7 @@ flowchart LR
     StoppedEvent["Stopped SelectedEventNode<br/>same Event data operations<br/>without live status"]
     StoppedState["Stopped SelectedStateNode<br/>publish · exact-key query<br/>current + recoverable"]
     StoppedRecord["Stopped SelectedRecordNode<br/>publish · exact-key query · guarded resolve<br/>current + concurrent + superseded"]
+    StoppedBlob["Stopped SelectedBlobNode<br/>stream publish · verified read_into<br/>bounded encrypted depot"]
     BuiltIns["Built-in roles<br/>Ping · Pong · relay"]
     Artifacts["Retained mission bundle<br/>and carrier identity"]
 
@@ -37,7 +41,8 @@ flowchart LR
         Session["aster-core mission session<br/>four-flight hybrid authentication"]
         Profile["aster-profile<br/>canonical exact-ID ordering"]
         Diff["aster-negentropy<br/>set difference only"]
-        Store["aster-redb-store<br/>durable acceptance/effect authority<br/>Event delivery + local State/Record projection"]
+        Store["aster-redb-store<br/>durable acceptance/effect authority<br/>Event delivery + local State/Record/Blob"]
+        Depot["private Blob depot<br/>bounded encrypted chunk files"]
         Carrier["aster-iroh<br/>direct authenticated carrier"]
     end
 
@@ -47,6 +52,7 @@ flowchart LR
     Application -->|"stopped Event mode"| StoppedEvent
     Application -->|"stopped State mode"| StoppedState
     Application -->|"stopped Record mode"| StoppedRecord
+    Application -->|"stopped Blob mode"| StoppedBlob
     Node -->|"sanitized results"| LiveHandle
     BuiltIns -. "run inside actor" .-> Node
     StoppedEvent -->|"exclusive stopped-node Event operations"| Store
@@ -58,6 +64,11 @@ flowchart LR
     StoppedRecord -->|"exclusive stopped-node Record operations"| Store
     Store -->|"bounded Record projection plan"| StoppedRecord
     StoppedRecord -->|"fresh Record source/content verification"| Core
+    StoppedBlob -->|"exclusive stopped-node Blob operations"| Store
+    Store -->|"bounded Blob publication plan"| StoppedBlob
+    StoppedBlob -->|"fresh manifest/source/content verification"| Core
+    StoppedBlob -->|"bounded encrypted chunks"| Depot
+    Store -->|"exact committed-chunk markers"| Depot
     Authority -->|"control input"| Node
     Node -->|"uses control/source providers"| Core
     Node -->|"uses canonical ordering"| Profile
@@ -73,11 +84,24 @@ carrier endpoint and provides bounded direct exchange. The mission `NodeId` is
 independent from the Iroh `EndpointId`. `aster-negentropy` computes exact-ID set
 difference; it does not transfer objects, establish causality, or make policy.
 `aster-redb-store` is the selected durable authority for accepted Events and
-local State and Record versions, their shared publisher causal frontier, ordered control
-effects, policy/selector snapshots, at-least-once Event delivery, route-only
-Event representations, and the terminal zeroization marker. State and Record
-operation rows have separate dedicated count/byte ceilings and also participate
-in aggregate store quotas; no unbounded idempotency table is implied.
+local State, Record, and Blob publications, their shared publisher causal
+frontier, ordered control effects, policy/selector snapshots, at-least-once Event delivery, route-only
+Event representations, and the terminal zeroization marker. State, Record, and
+Blob operation rows have separate dedicated count/byte ceilings and also
+participate in aggregate store quotas; no unbounded idempotency table is
+implied. Blob ciphertext is stored outside redb under separate committed-byte,
+chunk, and variant ceilings, while redb remains the authority for exact
+publication and committed-file markers. On its first successful open, redb
+persists a domain-separated commitment over a random owner token, canonical
+database path, and Unix device/inode when available. The fixed sibling depot’s
+private marker must carry the same binding before any chunk/variant scan or
+reclaim. The first database to initialize a parent’s depot wins; another cannot
+adopt it. Moving/copying even an empty bound database to another path fails on
+reopen. On Unix, a new inode also fails, moving the depot with the database does
+not preserve the binding, and a same-path replacement cannot adopt an existing
+depot. Non-Unix does not prove copied-database replacement/rollback resistance
+at the same canonical path. No supported rebind/restore migration is provided
+in this slice.
 
 The live handle does not open a second store. It sends commands over a bounded
 channel to the actor that already owns the mission-bound writer. Commands that
@@ -198,6 +222,88 @@ and arrival/ID-order independence, but they are not disconnected-node or
 cross-process acceptance. Finite TTL, expiry, garbage collection, and
 retention-driven deletion remain unimplemented.
 
+## Local Blob streaming and depot authority
+
+The selected Blob facade uses the same mission, current control policy,
+source-envelope provider, process-exclusive writer, and shared causal ledger as
+Event, State, and Record. It adds no Blob frame or inventory identifier to the
+selected wire. The selected profile is nonempty and fixes chunking at 64 KiB;
+its `BlobId` commits the exact plaintext bytes, canonical chunk profile, and
+media/schema identity metadata. It is not a metadata-independent whole-byte
+content identifier.
+
+```mermaid
+sequenceDiagram
+    participant A as Application
+    participant N as SelectedBlobNode
+    participant C as Source-envelope and Blob provider
+    participant S as Mission-bound redb
+    participant D as Encrypted Blob depot
+
+    A->>N: publish(operation key, metadata, seekable source)
+    N->>S: current policy + exact operation preflight
+    N->>C: bounded preparation pass
+    N->>D: encrypt, sync, rename, then mark each chunk
+    N->>C: source-seal and freshly verify canonical manifest
+    N->>D: prove every authenticated record and final digest
+    N->>S: atomic publication + operation commit
+    N->>C: freshly verify durable publication result
+    N-->>A: sanitized BlobPublishResult
+
+    A->>N: read_into(topic, scope, BlobId, caller output)
+    N->>S: bounded structural publication plan
+    S-->>N: every retained source publication
+    N->>C: freshly verify each manifest and source/content capability
+    N->>N: select greatest active semantic publication ID
+    N->>S: require exact policy-bound plan unchanged
+    N->>D: prove selected completion once and stream verified chunks
+    N-->>A: BlobReadResult
+```
+
+The first publish pass uses one bounded, zeroizing plaintext chunk buffer and,
+after completion, retains only a manifest-bounded digest vector and no
+plaintext; the second uses bounded buffers to encrypt chunks. A chunk becomes
+durable only after private temporary-file write and synchronization,
+same-directory rename, directory synchronization, and an exact redb
+committed-chunk marker. Unmarked
+temporary or final files are not authority and are reclaimed on a writable
+mission-bound reopen. A marker whose file is missing, truncated, or different
+fails integrity and is never reconstructed from a filename or header claim.
+A source publication is committed only after the exact authenticated manifest
+equals every expected and committed depot record and the finalized manifest
+digest.
+
+The read plan is structural, not authorization. The facade freshly verifies
+every retained active or inactive source publication, checks the exact topic,
+scope, Blob ID, content group, epoch-specific depot variant, and source, then
+independently recomputes the active deterministic selection. Only after an exact
+plan recheck does it verify the selected depot completion and synchronously
+stream plaintext into caller-owned output. No provider reader or copied epoch
+key escapes the stopped handle. A late integrity failure can leave an already
+verified prefix in caller-owned output, so applications needing all-or-none
+replacement use their own temporary destination.
+
+Exact operation retry rehashes the source, passes current policy and revocation
+checks, and freshly verifies the historical publication and variant before
+returning the original counter and marker. A different operation may commit a
+new signed publication while reusing the same immutable completed variant in
+one content group and epoch. Rekey creates a distinct encrypted variant even
+when object identity is unchanged.
+
+`BlobDepotLimits` bound canonical committed ciphertext-file bytes, durable
+per-chunk metadata rows, and epoch-specific import variants. Chunk rows and
+variants include unfinished resumable imports, which continue to consume
+admission until a future explicit-GC policy exists. The limits do not claim to
+measure redb allocation, directory blocks, snapshots, backups, swap, unrelated
+attacker-created directory entries, or every filesystem overhead. Unix
+depot operations use owner-controlled directory descriptors, no-follow checks,
+and private modes; the non-Unix fallback is not credited with equivalent
+filesystem hardening. Terminal software zeroization destroys the retained
+mission and identity secrets and locks the store, but it does not erase Blob
+ciphertext or establish physical sanitization. Live Blob commands, remote
+chunk transfer/resume, carrier-neutral partials, subscription, finite TTL,
+retention/GC, physical acceptance, and network reconciliation remain open.
+
 ## Live application command and status flow
 
 ```mermaid
@@ -304,6 +410,7 @@ are rechecked at inventory, transfer, and commit boundaries.
 | Event source | Publisher and protected semantic header | Permission for every peer to route or read it |
 | State source | Publisher, causal stamp, exact key, protected semantic header, and payload commitment | Live replication, permission for every peer, or a special delete-wins rule |
 | Record source | Publisher, causal stamp, exact key, protected semantic header, and payload commitment | Live replication, automatic merge execution, permission for every peer, or delete-wins |
+| Blob source/depot | Publisher, causal stamp, immutable object identity, canonical manifest, exact encrypted chunk records, content group, and key epoch | Live or remote transfer, metadata-independent content identity, physical sanitization, or permission for every peer |
 | Receive selector | Membership-visible topic/scope intent inside the protected mission session; empty means receive-none | Route or content authority, Event-ID disclosure, or scope-private subscription metadata |
 | Route policy | Whether an exact representation may be advertised/carried | Content decryption or semantic admission |
 | Content policy | Whether protected bytes may become a semantic application item | Authority to alter source identity or control state |
@@ -338,6 +445,8 @@ and non-Unix behavior are outside the proof.
   latest-value projection, recoverable history, and visible tombstones.
 - [Selected Record API](quickstart/selected-record-api.md) — stopped/local
   explicit conflict projection and exact-sibling guarded resolution.
+- [Selected Blob API](quickstart/selected-blob-api.md) — stopped/local bounded
+  encrypted publication and freshly verified streaming read.
 - [Carriers and contacts](transports.md) — selected and migration-source carrier boundaries.
 - [Mesh CLI guide](quickstart/mesh-cli.md) — phase-by-phase and retained receipts.
 - [Requirements status](implementation/requirements-status.md) — exact credited rows and open gaps.

@@ -1734,7 +1734,7 @@ fn zeroization_marker_child_process() {
         prepared_identity.target().to_bytes(),
     )
     .expect("zeroization intent");
-    let store = Store::open_for_mission(
+    let mut store = Store::open_for_mission(
         state.join("mesh.redb"),
         prepared_mission.mission_authority_id(),
     )

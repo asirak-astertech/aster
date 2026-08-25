@@ -3,9 +3,9 @@
 //! The selected runtime composes a mission-authenticated Iroh carrier, bounded
 //! Negentropy reconciliation, mission-bound redb state, and the existing
 //! `aster-core` source-authenticated Event semantics. Its stopped-state
-//! application boundary also composes source-authenticated latest-value State
-//! projections and explicit-conflict Record projections without putting either
-//! mutable class on the Event-only reconciliation wire.
+//! application boundary also composes source-authenticated latest-value State,
+//! explicit-conflict Record, and streaming immutable Blob operations without
+//! putting those stopped-state classes on the Event-only reconciliation wire.
 //! The caller-identified opaque API remains isolated for compatibility and is
 //! not advertised by the production Event reconciliation path.
 
