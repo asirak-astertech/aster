@@ -91,6 +91,12 @@ STATE_LOCAL_SLICE = (
     "crates/aster-node/examples/state_application.rs; "
     "docs/quickstart/selected-state-api.md"
 )
+RECORD_LOCAL_SLICE = (
+    "crates/aster-core/src/source_record.rs; crates/aster-redb-store/src/lib.rs; "
+    "crates/aster-node/src/application/record.rs; "
+    "crates/aster-node/examples/record_application.rs; "
+    "docs/quickstart/selected-record-api.md"
+)
 CONTROL_SLICE = (
     "crates/aster-core/src/source_control.rs; crates/aster-redb-store/src/lib.rs; "
     "crates/aster-node/src/frame.rs; crates/aster-node/src/runtime.rs; "
@@ -216,6 +222,18 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
         f"{RECEIPT}; {EVENT_SLICE}; {EVENT_LIVE_SLICE}; the built-in sample and high-level live handle publish, source-seal, store, transfer, freshly verify, query, and durably deliver Event objects",
         "The retained receipt covers the built-in Event sample; the generalized live-handle later-sync path has current-code automated loopback evidence only. Other data classes and independent wire interoperability remain open.",
     ),
+    "DM-5.1-08": selected_claim(
+        "implemented-uncredited",
+        "aster-core + aster-redb-store + aster-node",
+        f"{RECORD_LOCAL_SLICE}; the stopped SelectedRecordNode source-seals and durably publishes bounded Record revisions, queries one exact-key current/concurrent/superseded projection, and accepts only exact-sibling guarded application resolution",
+        "This is a stopped/local selected Record surface. Live/runtime Record, reconciliation, subscription, language bindings, automatic registered-policy merge, finite TTL/GC, physical carriers, mixed implementations, and retained acceptance remain open.",
+    ),
+    "DM-5.1-09": selected_claim(
+        "implemented-uncredited",
+        "aster-core + aster-redb-store + aster-node",
+        f"{RECORD_LOCAL_SLICE}; independently source-authenticated publishers can create arrival-independent two-way and N-way Record heads in the mission-bound store, and the facade freshly verifies and exposes the complete exact sibling set before guarded resolution",
+        "The concurrency mechanism is exercised through privileged local test ingestion only. Record has no selected wire/live ingest path, so no disconnected-process, cross-node convergence, mixed-implementation, scale, physical, or retained acceptance result is claimed.",
+    ),
     "DM-5.1-05": selected_claim(
         "implemented-uncredited", "aster-redb-store",
         f"{EVENT_SLICE}; exact transfer and semantic indexes reject conflicting Event representations or dot reuse",
@@ -327,6 +345,36 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
         "aster-core + aster-redb-store + aster-node",
         f"{STATE_LOCAL_SLICE}; when active State maxima are concurrent, the greatest complete source-authenticated semantic State ID is current and the other maxima remain explicitly Concurrent; a current tombstone remains visible as authenticated State rather than becoming an unauthenticated absence",
         "The deterministic tie-break has current-code local tests only. No delete-wins rule is inferred, and mixed-implementation, cross-node, adversarial-scale, and retained acceptance evidence remain open.",
+    ),
+    "DM-5.3-06": selected_claim(
+        "implemented-uncredited",
+        "aster-core + aster-redb-store + aster-node",
+        f"{RECORD_LOCAL_SLICE}; all active causal Record maxima are retained as heads when no automatic merge executes, including two-way and N-way conflicts and concurrent edit/tombstone cases in both semantic-ID directions",
+        "The selected slice deliberately executes no registered merge policy. Add a convergent registered-policy design separately, then verify network replication, retention/GC interaction, mixed implementations, scale, and acceptance.",
+    ),
+    "DM-5.3-07": selected_claim(
+        "implemented-uncredited",
+        "aster-redb-store + aster-node",
+        f"{RECORD_LOCAL_SLICE}; exact-key query returns an explicit RecordConflict whenever more than one active causal head exists, with every sorted sibling semantic ID and an opaque exact projection guard",
+        "Conflict annotation has stopped/local Rust source/tests only; selected live/network delivery, language bindings, independent interoperability, and retained acceptance remain open.",
+    ),
+    "DM-5.3-08": selected_claim(
+        "implemented-uncredited",
+        "aster-node",
+        f"{RECORD_LOCAL_SLICE}; the high-level RecordProjection exposes Current, Concurrent, optional Superseded, and RecordConflict application fields while omitting sealed bytes, exact transfer identities, causal vectors, provider internals, and store plan tokens",
+        "Only the exclusive stopped Rust facade exposes this API. Live Record, selected-node C/Go/Python bindings, independent usability evidence, and retained acceptance remain open.",
+    ),
+    "DM-5.3-09": selected_claim(
+        "implemented-uncredited",
+        "aster-redb-store + aster-node",
+        f"{RECORD_LOCAL_SLICE}; ordinary publish fails atomically when its context observes multiple heads, every conflicting head remains query-visible, and guarded resolution must observe the exact complete sibling set or insert nothing",
+        "Current evidence is local source/tests. Verify the invariant across selected Record reconciliation, crashes at external boundaries, automatic merge if later added, mixed implementations, and adversarial scale.",
+    ),
+    "DM-5.3-10": selected_claim(
+        "implemented-uncredited",
+        "aster-redb-store + aster-node",
+        f"{RECORD_LOCAL_SLICE}; causally dominated active Record revisions remain durably retained and are returned in the optional Superseded lane after fresh verification; guarded resolution turns every inspected head into recoverable superseded history",
+        "The local slice rejects at its per-key bound rather than silently evicting, but explicit-policy garbage collection is not implemented. Add retention/GC policy and verify restart, replication, expiry, scale, and acceptance.",
     ),
     "DM-5.4-01": selected_claim(
         "implemented-uncredited", "aster-profile", PROFILE_EVIDENCE,

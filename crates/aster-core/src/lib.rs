@@ -96,6 +96,8 @@ mod source_control;
 #[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
 mod source_event;
 #[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
+mod source_record;
+#[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
 mod source_state;
 #[cfg(all(feature = "sqlite-store", feature = "adapter-sdk"))]
 pub mod store;
@@ -168,6 +170,10 @@ pub use source_control::{
 #[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
 pub use source_event::{
     ContentVerifiedEventEnvelope, EventContentVerification, RouteVerifiedEventEnvelope,
+};
+#[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
+pub use source_record::{
+    ContentVerifiedRecordEnvelope, RecordContentVerification, RouteVerifiedRecordEnvelope,
 };
 #[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
 pub use source_state::{

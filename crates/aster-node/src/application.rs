@@ -1,4 +1,4 @@
-//! High-level selected Event and State application surfaces.
+//! High-level selected Event, State, and Record application surfaces.
 //!
 //! This module deliberately exposes no source-envelope, cryptographic-provider,
 //! carrier, inventory, reconciliation, or sealed-byte operations. It composes
@@ -37,7 +37,13 @@ use crate::{
     },
 };
 
+mod record;
 mod state;
+pub use record::{
+    RecordConflict, RecordId, RecordItem, RecordProjection, RecordPublishRequest,
+    RecordPublishResult, RecordQuery, RecordResolutionGuard, RecordResolveRequest,
+    RecordVersionDisposition, SelectedRecordNode,
+};
 pub use state::{
     SelectedStateNode, StateId, StateItem, StateProjection, StatePublishRequest,
     StatePublishResult, StateQuery, StateVersionDisposition,
@@ -1398,6 +1404,7 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
     match error {
         StoreError::InvalidEventOperationKey { .. }
         | StoreError::InvalidStateOperationKey { .. }
+        | StoreError::InvalidRecordOperationKey { .. }
         | StoreError::InvalidEventSubscriptionKey { .. }
         | StoreError::EventPageLimitExceeded { .. }
         | StoreError::EventSubscriptionNotFound
@@ -1408,12 +1415,16 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         | StoreError::EventReplicationNotConsumable
         | StoreError::InvalidSemanticEvent(_)
         | StoreError::InvalidSemanticState(_)
+        | StoreError::InvalidSemanticRecord(_)
         | StoreError::AuthenticatedCustodyAgeRequired => ApplicationErrorKind::InvalidRequest,
         StoreError::EventPublisherRevoked(_)
         | StoreError::StatePublisherRevoked(_)
+        | StoreError::RecordPublisherRevoked(_)
         | StoreError::EventKeyEpochStale { .. }
         | StoreError::StateKeyEpochStale { .. }
         | StoreError::StateKeyEpochNotActive { .. }
+        | StoreError::RecordKeyEpochStale { .. }
+        | StoreError::RecordKeyEpochNotActive { .. }
         | StoreError::MissionAuthorityMismatch { .. }
         | StoreError::ControlSignerRevoked(_)
         | StoreError::ControlAuthorityRevoked(_) => ApplicationErrorKind::UnauthorizedOrRevoked,
@@ -1421,6 +1432,7 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         | StoreError::ControlPolicyChanged
         | StoreError::ReservationChanged
         | StoreError::StateReservationChanged
+        | StoreError::RecordReservationChanged
         | StoreError::StateProjectionPlanChanged
         | StoreError::EventSubscriptionPlanChanged
         | StoreError::EventGapScanPlanChanged
@@ -1428,17 +1440,24 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         StoreError::IdentityConflict { .. }
         | StoreError::SemanticRepresentationConflict { .. }
         | StoreError::StateRepresentationConflict { .. }
+        | StoreError::RecordRepresentationConflict { .. }
         | StoreError::CausalEquivocation { .. }
         | StoreError::EventEquivocation { .. }
         | StoreError::MissingReactionPredecessor { .. }
         | StoreError::ReactionContextMissing { .. }
         | StoreError::OperationPredecessorMismatch
         | StoreError::StateOperationConflict
+        | StoreError::RecordOperationConflict
+        | StoreError::RecordConflictRequiresResolution
+        | StoreError::RecordProjectionPlanChanged
         | StoreError::EventSubscriptionConflict => ApplicationErrorKind::Conflict,
         StoreError::ItemLimitExceeded { .. }
         | StoreError::StateProjectionLimitExceeded { .. }
         | StoreError::StateOperationLimitExceeded { .. }
         | StoreError::StateOperationByteLimitExceeded { .. }
+        | StoreError::RecordProjectionLimitExceeded { .. }
+        | StoreError::RecordOperationLimitExceeded { .. }
+        | StoreError::RecordOperationByteLimitExceeded { .. }
         | StoreError::EventSubscriptionLimitExceeded { .. }
         | StoreError::EventPendingDeliveryLimitExceeded { .. }
         | StoreError::EventAcknowledgementReceiptLimitExceeded { .. }
@@ -1462,6 +1481,7 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         | StoreError::StoreZeroized(_) => ApplicationErrorKind::StateUnavailable,
         StoreError::SemanticVerification(_)
         | StoreError::StateVerification(_)
+        | StoreError::RecordVerification(_)
         | StoreError::MissingAcceptanceMarker { .. }
         | StoreError::OrphanedAcceptanceMarker { .. }
         | StoreError::InvalidStoredIdLength { .. }
@@ -1469,6 +1489,7 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         | StoreError::MissingAccountingMetadata { .. }
         | StoreError::SemanticInvariant(_)
         | StoreError::StateInvariant(_)
+        | StoreError::RecordInvariant(_)
         | StoreError::SemanticNamespaceCollision { .. }
         | StoreError::ControlVerification(_)
         | StoreError::InvalidControl(_)
