@@ -8,8 +8,10 @@
 - Matrix SHA-256: `57518c2aaeb7341f0d2ef7169a30a1666e337def2bb6a34f9225fad6e438e5b2`
 - Retained receipt baseline (parent PR-A/pre-subscription): signed commit `ee57c0f1a0ff67b9a301220b63bb009593ef626b`
 - PR-B code baseline: signed commit `e5feff0b03bff70018825212cab905cebeefadcb`
-- Current PR-C source freeze: exact SHA-256 identities in
+- PR-C source freeze: exact SHA-256 identities in
   [Current PR-C automated evidence](#current-pr-c-automated-evidence)
+- Current selected State source freeze: exact SHA-256 identities in
+  [Current selected State automated evidence](#current-selected-state-automated-evidence)
 - Release status: **not production-authorized**
 
 This is the tracked implementation ledger for the active production lane. It
@@ -47,27 +49,30 @@ mission authentication, and neither is source or control authorization:
    mission authority, delegated signer, exact sequence/predecessor chain, and
    revocation or recipient-filtered scope-epoch effect. Flash controls reconcile
    and activate from a durable contiguous prefix before the Event lane opens.
-4. The unchanged `aster-core` source-envelope provider authenticates each Event's
-   publisher and protected header. Content authorization is separate from route
-   authorization.
+4. The unchanged `aster-core` source-envelope provider authenticates each
+   Event's publisher and protected header. A typed State seam now applies the
+   same source/content capability split to stopped/local State. State does not
+   enter the Event reconciliation wire. Content authorization remains separate
+   from route authorization.
 
 | Component | Selected responsibility | Deliberately excluded |
 |---|---|---|
 | `aster-profile` | Requirements-owned complete reconciliation key and canonical inventory ordering | Semantic identity, source security, policy, or a competing product object model |
-| `aster-redb-store` | One mission-bound transaction authority for an audited ordered control prefix, exact policy snapshots, content-verified Events, durable causal/acceptance/operation ledgers, canonical Consume/Carry selectors, Event delivery cursors/pending attempts/acknowledgements, a bounded route-only cache, and a terminal software-zeroization intent/phase receipt; retained opaque compatibility data has a disjoint namespace | Deriving identity from unverified bytes, activating controls before commit, promoting route-only data into semantics, live application policy, physical sanitization, or a second reconciliation authority |
+| `aster-redb-store` | One mission-bound transaction authority for an audited ordered control prefix, exact policy snapshots, content-verified Events and local State, their shared publisher causal frontier, bounded per-class operation ledgers, canonical Consume/Carry selectors, Event delivery cursors/pending attempts/acknowledgements, exact-key State projection plans, a bounded route-only Event cache, and a terminal software-zeroization intent/phase receipt; retained opaque compatibility data has a disjoint namespace | Deriving identity from unverified bytes, activating controls before commit, promoting route-only data into semantics, live application policy, State replication/garbage collection, physical sanitization, or a second reconciliation authority |
 | `aster-negentropy` | Sole bounded set-difference mechanism over exact Event transfer identities, with timestamp zero | Object transfer, semantic identity, policy, or durable contact progress |
 | `aster-iroh` | Direct endpoint lifecycle, exact carrier identity, allowlist admission, and bounded exchange | Mission identity, item/source authorization, hosted discovery, relays, port mapping, or NAT acceptance |
-| `aster-node` | Sole composition root, mission-before-inventory and control-before-Event ordering, exact control/Event transfer, current route-grant plus protected receiver-interest filtering, authority commands, live sample applications, live/stopped selected Event publish/query/subscribe/poll/ack, idempotent unsubscribe, freshly verified gap inspection, bounded authenticated peer/last-contact status, a same-UID Unix local software-zeroization lifecycle, receipts, and CLI | Global convergence or publisher-completeness claims from status/gap absence, atomic subscription update, generalized control management, all other data classes, finite-TTL custody, platform-complete zeroization assurance, or release authorization |
-| `aster-core` | Spec-verified mission session, control-envelope, recipient-filtered rekey, and source-envelope security/semantics used by the selected slices | A replaceable legacy subsystem; it remains authoritative migration source and is not deleted while replacements lack equivalent tests |
+| `aster-node` | Sole composition root, mission-before-inventory and control-before-Event ordering, exact control/Event transfer, current route-grant plus protected receiver-interest filtering, authority commands, live sample applications, live/stopped selected Event operations, exclusive stopped/local State publish and exact-key causal query, bounded authenticated Event peer/last-contact status, a same-UID Unix local software-zeroization lifecycle, receipts, and CLI | Global convergence or publisher-completeness claims from status/gap absence, live or replicated State, atomic subscription update, generalized control management, Record/Blob, finite-TTL custody, platform-complete zeroization assurance, or release authorization |
+| `aster-core` | Spec-verified mission session, control-envelope, recipient-filtered rekey, and typed Event/State source-envelope security capabilities used by the selected slices | A replaceable legacy subsystem; it remains authoritative migration source and is not deleted while replacements lack equivalent tests |
 
 Each control transfer ID is the exact envelope digest authenticated against its
 mission authority, delegated signer, chain sequence, predecessor, and effect.
-The Event transfer ID is the SHA-256 digest of one exact randomized sealed
-representation. It is intentionally distinct from the semantic `ItemId` derived
-by the source-envelope profile. Negentropy and Fetch/Offer use the exact transfer
-ID; redb maintains the semantic identity, authenticated publisher dot, Event
-stream position, causal frontier, acceptance marker, and application operation
-key in the same transaction authority.
+Event and State transfer IDs are SHA-256 digests of exact randomized sealed
+representations. Each is intentionally distinct from the semantic `ItemId`
+derived by the source-envelope profile. Negentropy and Fetch/Offer use only
+exact Event transfer IDs in this slice; redb maintains disjoint semantic
+indexes plus one authenticated publisher-dot and causal-frontier authority
+across Event and State. State transfer identities remain local and never enter
+the Event frame grammar.
 
 The selected node's normal dependency graph contains neither SQLite nor
 `rusqlite`. The old caller-ID opaque `put` path remains isolated for compatibility
@@ -85,18 +90,21 @@ phase, class, and final-stack flag.
 unique rows, valid selected states, exact selected-status containment, and the
 conservative generated claim boundary.
 
-The current generated totals are 34 `implemented-uncredited`, 37
-`observed-bounded`, and 277 `open` rows across 72 exact selected mappings.
-PR C moves `DM-7-11`, `DM-7-14`, `DM-7-15`, and `DM-7-18` from `open` to
-`implemented-uncredited`. Those movements are based on the typed live Event
-surface, sanitized boundary, compiled example, shipped instructions, and
-repeatable automated tests—not documentation presence alone. They remain
-partial because the selected boundary is Event-only, lacks conflict
-annotations and bindings, and has no independent developer-usability study.
-No row moves to `observed-bounded`: PR C has current-code automated evidence,
-not a retained acceptance artifact. The preceding PR-B movement was
-`DM-5.5-02` to `implemented-uncredited`; the most recent retained-receipt
-movement remains `DM-6-22` to `observed-bounded`.
+The current generated totals are 38 `implemented-uncredited`, 37
+`observed-bounded`, and 273 `open` rows across 76 exact selected mappings. The
+selected State slice moves `DM-5.1-01`, `DM-5.1-02`, `DM-5.3-01`, and
+`DM-5.3-02` from `open` to `implemented-uncredited`. Those movements are based
+on the typed State source capabilities, bounded transactional reducer and
+operation ledger, freshly verified stopped facade, compiled example, shipped
+instructions, and repeatable automated tests—not documentation presence alone.
+They remain partial because State is stopped/local and absent from the live
+runtime, reconciliation wire, subscriptions, selected-node bindings, and
+acceptance receipts. No row moves to `observed-bounded`.
+
+PR C previously moved `DM-7-11`, `DM-7-14`, `DM-7-15`, and `DM-7-18` to
+`implemented-uncredited` for the live Event boundary. The preceding PR-B
+movement was `DM-5.5-02`; the most recent retained-receipt movement remains
+`DM-6-22` to `observed-bounded`.
 
 ### Where the selected lane stands
 
@@ -105,7 +113,7 @@ not completion percentages: `implemented-uncredited` means a partial mechanism
 exists, and `observed-bounded` means only the stated environment and claim
 boundary passed.
 
-All 57 rows with an external gate are included within the 277 `open` rows:
+All 57 rows with an external gate are included within the 273 `open` rows:
 `gate_kind` is an independent ownership dimension, not a fourth selected status.
 The generator validates the trace totals; this family roll-up is the human
 summary of that same CSV.
@@ -115,7 +123,7 @@ summary of that same CSV.
 | DM-1 Project brief | 0 | 3 | 4 | 7 |
 | DM-2 Scope | 1 | 0 | 13 | 14 |
 | DM-3 Operating environment | 0 | 1 | 12 | 13 |
-| DM-5 Functional requirements | 23 | 10 | 89 | 122 |
+| DM-5 Functional requirements | 27 | 10 | 85 | 122 |
 | DM-6 Security requirements | 3 | 18 | 15 | 36 |
 | DM-7 Developer experience | 5 | 2 | 14 | 21 |
 | DM-8 Implementation constraints | 0 | 2 | 17 | 19 |
@@ -125,17 +133,18 @@ summary of that same CSV.
 | DM-12 Acceptance criteria | 0 | 1 | 10 | 11 |
 | DM-13 Deliverables | 0 | 0 | 11 | 11 |
 | DM-14 Open design items | 0 | 0 | 23 | 23 |
-| **Total** | **34** | **37** | **277** | **348** |
+| **Total** | **38** | **37** | **273** | **348** |
 
 The selected lane is strongest today in bounded Event synchronization and
 security ordering: real-process direct contacts, temporal payload-blind relay,
 source authentication, mission-before-inventory, control-before-Event,
 durable Consume/Carry receive intent, protected receiver-directed filtering,
 live high-level Event operations and last-contact status, freshly verified gap
-inspection, recipient-filtered rekey, captured-node exclusion, restart/no-op
-behavior, and same-UID Unix terminal software zeroization. The largest
-remaining blocks are the other data classes, selected-node bindings and
-conflict workflows, finite-TTL custody and
+inspection, stopped/local source-authenticated State causal projection,
+recipient-filtered rekey, captured-node exclusion, restart/no-op behavior, and
+same-UID Unix terminal software zeroization. The largest remaining blocks are
+live/replicated State, Record/Blob, selected-node bindings and broader conflict
+workflows, finite-TTL custody and
 constrained-operation controls, protected provisioning/control administration,
 physical and mixed-implementation carrier acceptance, scale/resource evidence,
 language bindings onto the selected node, independent interoperability/review,
@@ -149,7 +158,11 @@ Against the six-item high-leverage closure sequence:
    real-process test publishes offline and delivers later. There is no retained
    PR-C acceptance artifact, and status/gap absence does not prove convergence
    or publisher completeness.
-2. **State, Record, and Blob — open in the selected composition.** Their proven
+2. **State, Record, and Blob — State local slice implemented; composition still
+   incomplete.** Stopped `SelectedStateNode` now source-seals and durably
+   publishes State, shares causal counters/frontier with Event, and returns a
+   freshly verified exact-key current/recoverable projection. State has no live
+   or network path, and Record and Blob remain open. Their broader proven
    semantic implementation remains the migration source.
 3. **Finite TTL, forwarding age, expiry, quotas, priority, and receive-only —
    open in the selected composition.** Existing lower-level primitives do not
@@ -163,8 +176,9 @@ Against the six-item high-leverage closure sequence:
    signed release — open external/release gates.** No production authorization
    follows from the implementation slices.
 
-The next implementation sequence therefore starts with item 2 while retaining
-a separate acceptance task for item 1.
+The next implementation sequence continues item 2 with live/replicated State,
+Record, and Blob while retaining separate acceptance tasks for item 1 and this
+local State slice.
 
 ### First selected Event API stack
 
@@ -204,12 +218,46 @@ MVP. `LastContactComplete` is only the most recent bounded authenticated
 negotiation with active configured peers. A gap-free page is anchored only by
 freshly verified positions already observed by the local store. Subscription
 replacement is unsubscribe followed by subscribe, not an atomic update.
-Finite TTL, State/Record/Blob, selected-node bindings/local-agent integration,
-protected provisioning/control administration, physical and mixed-implementation
-acceptance, N=32/resource brackets, and dependency/cryptographic/review/SBOM/
-signed-release gates all remain open. Stakeholder-owned supported targets and
-resource values also remain external decisions rather than values inferred by
-this implementation.
+At the PR-C boundary, finite TTL, State/Record/Blob, selected-node
+bindings/local-agent integration, protected provisioning/control
+administration, physical and mixed-implementation acceptance, N=32/resource
+brackets, and dependency/cryptographic/review/SBOM/signed-release gates all
+remained open. The local State slice below changes only the explicitly mapped
+State rows. Stakeholder-owned supported targets and resource values remain
+external decisions rather than values inferred by this implementation.
+
+### First selected State API slice
+
+The next stack begins State without changing the Event wire:
+
+1. **Typed source capabilities:** `aster-core::source_state` constrains the
+   existing source-envelope provider to State and distinguishes route-verified
+   metadata from content-verified semantic acceptance. Exact payload, class,
+   publisher, topic, scope, priority, causal stamp, logical key, tombstone,
+   content length, key epoch, and durable no-TTL decisions are verified.
+2. **Bounded transactional projection:** `aster-redb-store` adds disjoint State
+   semantic/exact/operation/projection tables while sharing the authenticated
+   publisher-dot and causal-frontier authority with Event. It rejects
+   cross-class namespace and dot reuse, retains bounded exact-key history,
+   marks dominated versions `Superseded`, preserves all active causal maxima,
+   and selects the greatest complete semantic ID as current. The dedicated
+   operation ledger is capped at 4,096 rows and 512 KiB and participates in the
+   aggregate store limits.
+3. **Stopped high-level facade:** `SelectedStateNode` owns the exclusive stopped
+   writer, publishes by durable application operation key, and queries one exact
+   topic/scope/logical key. It freshly verifies every active and inactive plan
+   candidate, independently recomputes the reducer, and race-rechecks the exact
+   policy-bound plan. Only active versions are exposed; an authenticated current
+   tombstone remains visible, and optional active concurrent/superseded versions
+   remain recoverable.
+
+This source/store/facade composition provides current-code automated evidence,
+not a retained acceptance artifact. State has no live handle, subscription,
+inventory, Fetch/Offer frame, relay cache, or reconciliation identity in this
+slice. Old-epoch exact operation replay still requires current authorization;
+future-epoch State is rejected. No TTL, expiry, garbage collection, delete-wins,
+State convergence across nodes, independent interoperability, or physical
+acceptance is claimed. Record and Blob remain open.
 
 No row below means that an entire source requirement passes. Credit is limited
 to the production-lane mechanism and evidence boundary named in the final
@@ -219,14 +267,16 @@ column.
 |---|---|---|---|
 | `DM-1-03`, `DM-1-04`, `DM-1-05` peer flow, temporal relay, and resynchronization | `observed-bounded` | `aster-node` + source Event seam + redb + Negentropy + Iroh | Peerless publication committed Ping before isolated per-edge forwarding; peerless destination publication then committed a causally observing Pong before isolated per-edge return. Every directed-edge cohort moved one pre-existing Event and the final no-op moved none. Physical systems, longer custody, all data classes, generalized policy, mixed implementations, and scale remain open. |
 | `DM-2-14` adopting-program key policy | `implemented-uncredited` | Existing `aster-core` control formats plus authority CLI and atomic redb publication intent | Authority inputs choose the revoked subject/generation and exact route-only/member recipient set for one rekey. Protected administration, a generalized adopter-facing API, policy governance, and additional key-management mechanisms remain open. |
+| `DM-5.1-01`, `DM-5.1-02` State class and convergence | `implemented-uncredited` | Typed source-authenticated State capabilities, bounded local redb versions/operations, shared Event-State causal frontier, and stopped `SelectedStateNode` exact-key projection | Local sequential, concurrent, restart, tombstone, idempotency, and shared-counter tests exercise the deterministic projection. State has no live or reconciliation path, so multi-node convergence, independent interoperability, scale, bindings, and retained acceptance remain open. |
 | `DM-5.1-04` Event support | `observed-bounded` | Existing `aster-core` Event envelope ported through selected redb/runtime, with live and stopped high-level projections | The retained sample seals, persists, reconciles, verifies, and reacts to Event. Current-code live-handle tests publish, query, consume, and later synchronize arbitrary authorized Events, but they are not a retained PR-C acceptance receipt. Other data classes and independent wire interoperability remain open. |
 | `DM-5.1-05` through `DM-5.1-07` Event immutability, order, and gaps | `implemented-uncredited` | Authenticated Event sequence/dot, semantic and exact-transfer indexes, publisher/topic/scope positions, and a public bounded verified gap view | Gap pages freshly verify every observed anchor and race-recheck their exact policy-bound store plan. No gap means only that locally observed verified positions are contiguous; it does not prove publisher completeness or convergence. Cross-process missing-position and independent interoperability evidence remain open. |
-| `DM-5.1-17` through `DM-5.1-22` common item fields | `implemented-uncredited` / `observed-bounded` | The Event header authenticates class, topic, scope, priority, TTL, publisher, causal stamp, logical key, tombstone, and key epoch; the facade accepts and verifies the implemented Event fields for publish/query/poll without exposing finite TTL | This credit is Event-only. State, Record, Blob, transmission/eviction use of priority, and finite-TTL custody remain open. |
+| `DM-5.1-17` through `DM-5.1-22` common item fields | `implemented-uncredited` / `observed-bounded` | The Event header authenticates class, topic, scope, priority, TTL, publisher, causal stamp, logical key, tombstone, and key epoch; the facade accepts and verifies the implemented Event fields for publish/query/poll without exposing finite TTL | These exact row statuses remain Event-derived. The local State slice authenticates its corresponding fields but adds no live/replication or acceptance evidence; Record, Blob, transmission/eviction use of priority, and finite-TTL custody remain open. |
 | `DM-5.2-01` eventual convergence | `observed-bounded` | Negentropy difference over exact Event transfer IDs plus mission-bound redb | Three and eight loopback stores reached the same two transfers after temporal forwarding, live reaction, and restart. Event now has bounded topic/scope receive selectors; multiple-scope lifecycle, physical links, other classes, mixed implementations, and requirement scale remain open. |
 | `DM-5.2-02` subscribed in-scope convergence | `implemented-uncredited` | Durable canonical Consume/Carry selectors projected as protected receiver interests and intersected with route authority | An in-process test withholds authorized-unsubscribed `alpha`, and a current-code real-process test delivers one offline Event to a later subscribed receiver. One two-node observation is not all-reachable-node or global convergence; repeated multi-scope lifecycle, other classes, physical peers, scale, mixed implementations, and a retained PR-C receipt remain open. |
 | `DM-5.2-06` through `DM-5.2-08` delivery, duplicate suppression, and idempotent outcome | `implemented-uncredited` / `observed-bounded` | Exact transfer acceptance, durable operation-keyed publication, and an at-least-once Event pending ledger with attempt-before-return and semantic-ID idempotent acknowledgement | Live and stopped poll freshly re-verify source/content authorization. Current-code real processes synchronize, poll, ack, and preserve the ack across receiver restart. The retained receipt still covers the built-in reaction only; unacknowledged process-crash retry, every external crash point, other classes, bindings, and independent implementations remain open. |
-| `DM-5.2-09`, `DM-5.2-10`, `DM-5.2-13`, `DM-5.2-14` causality and clock-independent correctness | `observed-bounded` / `implemented-uncredited` | Authenticated dots/context, atomic causal frontier/high-water, Pong observation of Ping, and Negentropy timestamp zero | Pong publication is isolated after Ping is durable at the destination, and its authenticated context observes Ping before any return-edge process starts. Event causality is real in this slice. State/Record conflict behavior, tombstones, finite TTL, long-running operation, and independent interoperability remain open. |
+| `DM-5.2-09`, `DM-5.2-10`, `DM-5.2-13`, `DM-5.2-14` causality and clock-independent correctness | `observed-bounded` / `implemented-uncredited` | Authenticated dots/context, atomic Event-State causal frontier/high-water, Pong observation of Ping, and Negentropy timestamp zero | Pong publication is isolated after Ping is durable at the destination, and its authenticated context observes Ping before any return-edge process starts. Event causality has retained bounded evidence; local State causal projection has current-code tests only. Record conflicts, replicated State, finite TTL, long-running operation, and independent interoperability remain open. |
 | `DM-5.2-18` difference-proportional synchronization | `implemented-uncredited` | Bounded Negentropy exact-ID reconciliation | Equal inventory transferred nothing, but total-size-versus-difference cost evidence at requirement scale remains open. |
+| `DM-5.3-01`, `DM-5.3-02` State causal resolution and concurrent tie-break | `implemented-uncredited` | Freshly verified exact-key causal maxima; authenticated context dominance; greatest complete semantic State ID current; retained `Concurrent`/`Superseded` history | The facade independently recomputes store dispositions and plan identity. A current tombstone remains visible and has no special delete-wins priority. Network replication, mixed implementations, expiry/GC, adversarial scale, and acceptance evidence remain open. |
 | `DM-5.5-01` through `DM-5.5-03`, `DM-5.5-05` through `DM-5.5-07` topic/scope and payload-blind relay boundary | `implemented-uncredited` / `observed-bounded` | Authenticated topic/scope; durable Consume/Carry selectors; protected receiver interest; current peer scope/epoch route commitments; bounded route-only cache | Canonical selectors bound desired receipt while route authority remains an independent upper bound; empty means receive-none. Unsubscribe removes one selector and its delivery ledger; replacement is a later subscribe, not an atomic update. Dynamic multi-scope lifecycle, quotas/priority, bridges, other classes, physical/mixed implementations, and scale remain open. |
 | `DM-5.6-01` through `DM-5.6-03`, `DM-5.6-05` direct, infrastructure-free, intermediate, and duplicate-bounded transfer | `implemented-uncredited` / `observed-bounded` | Direct Iroh line with hosted discovery/relay/port mapping disabled | Exact Events moved through payload-blind intermediates and restart no-op. Physical transport, independent conformance, cycles/broadcast, NAT, alternate carriers, and generalized custody remain open. |
 | `DM-6-01` through `DM-6-07`, `DM-6-09` through `DM-6-12` source/route protection | `observed-bounded` / `implemented-uncredited` | Existing `aster-core` source envelope, exact-byte re-verification, separate route/content capabilities, and mission-protected mechanics | Event endpoints verified source and content while relays verified protected route metadata without plaintext content. This is Event-only loopback, not packet-capture acceptance, complete class coverage, key lifecycle completion, or independent cryptographic review. |
@@ -236,18 +286,18 @@ column.
 | `DM-6-22` local zeroization | `observed-bounded` | Same-UID Unix `aster zeroize`, retained-inode secret handles, live drain, and durable terminal redb cleanup phases | A live child drained and destroyed its exact mission-bundle and carrier-identity contents; another child exited immediately after the terminal marker and a later CLI resumed cleanup. Data rows and zero-length pathnames were preserved, and restored credential bytes could not reopen the retained database. This does not prove inode deletion, deterministic remote observation of mid-flight teardown, physical/copy-on-write/snapshot/swap/backup sanitization, redb rollback/replacement resistance, non-Unix behavior, remote triggering, or independent platform assurance. |
 | `DM-6-23` freshness and replay rejection | `observed-bounded` | Protected session replay checks, exact chained controls, policy-bound Event transactions, and durable/idempotent publication, selector, delivery-attempt, acknowledgement, and live-admission operations | Control rollback/fork, stale epoch, revoked-source traffic, stale plans, and commands after shutdown/zeroization fail closed in bounded tests; acknowledgement survives receiver restart. Physical capture replay, abrupt interruption at every live command/contact boundary, every data class, long retention/eviction, and independent implementations remain open. |
 | `DM-11-20` MVP revocation | `implemented-uncredited` | Durable revocation is present in the selected production lane | One real-process captured-leaf scenario passed, but the complete MVP, protected administration, platform-complete zeroization assurance, generalized control management, and release gates remain incomplete. |
-| `DM-7-11`, `DM-7-14`, `DM-7-15`, `DM-7-18` high-level documented boundary | `implemented-uncredited` | Typed live Event operations, sanitized errors/status, no transport or reconciliation types in the application handle, and compiled shipped examples | This is an Event-only partial boundary. Conflict annotations, State/Record/Blob, selected-node bindings, operational provisioning, and an independent developer-usability study remain open. |
+| `DM-7-11`, `DM-7-14`, `DM-7-15`, `DM-7-18` high-level documented boundary | `implemented-uncredited` | Typed live Event operations, sanitized errors/status, no transport or reconciliation types in the application handle, and compiled shipped examples | These row movements remain based on PR C's live Event boundary. The stopped State facade is additive, but live State, Record/Blob, broader conflict workflows, selected-node bindings, operational provisioning, and an independent developer-usability study remain open. |
 | `DM-7-16`, `DM-7-17`, `DM-7-20` offline publication/later sync/sample | `implemented-uncredited` / `observed-bounded` | Built-in applications plus compiled live/stopped selected Event examples | Retained built-in receipts publish peerless and forward later. Current-code real processes also publish through the live handle with no peer, restart into later contact, poll/ack, and preserve the ack across receiver restart. This does not establish the supported offline interval, no-loss acceptance, other classes, physical systems, or independent interoperability. |
-| `DM-8-01`, `DM-8-02` Rust implementation | `observed-bounded` | Rust 1.91 workspace and current selected-lane checks/tests | The retained locked/offline Darwin arm64 artifact identified below belongs to the parent PR-A/pre-subscription freeze. PR B and PR C have source/test evidence only until a new release receipt is produced; supported-target and release acceptance remain open. |
+| `DM-8-01`, `DM-8-02` Rust implementation | `observed-bounded` | Rust 1.91 workspace and current selected-lane checks/tests | The retained locked/offline Darwin arm64 artifact identified below belongs to the parent PR-A/pre-subscription freeze. PR B, PR C, and the selected State slice have source/test evidence only until a new release receipt is produced; supported-target and release acceptance remain open. |
 | `DM-9-21A` many-node operation | `implemented-uncredited` | Demo accepts `--nodes 2..=32`; its deterministic schedule is `2N+1` cohorts and `5N-2` children | Parent PR-A/pre-subscription N=3/13-process and N=8/38-process receipts passed. N=32 would schedule 65 cohorts and 158 children, but no N=32 execution is claimed. Neither receipt proves the full range, bracketed many-node target, physical scale, or resource targets. |
 
-State, Record, and Blob continue to exist in the proven semantic implementation
-and specification, but receive no selected-composition credit from this Event
-slice.
+The broader replicated State behavior plus Record and Blob continue to exist in
+the proven semantic implementation and specification. Only the bounded local
+State mechanisms named above receive new selected-composition credit.
 
 ## Current PR-C automated evidence
 
-PR C is pinned to these exact current source identities:
+PR C was pinned to these exact source identities at its own stack freeze:
 
 ```text
 2ad1b080bfed2ba654b0d29c0cd6eab5f1eb6f4799dbb09203dc18a085b713d0  crates/aster-node/src/application.rs
@@ -258,11 +308,11 @@ e31a456a98950d5439b3b6ecd6492f0cbdfb50ad827856c97041b9645d278f82  crates/aster-n
 364e5a1d8d7f7b24ab75afe8ec2791023db83b11997bd07722c7d107a16a6a00  crates/aster-redb-store/src/lib.rs
 ```
 
-The exact-byte current-code gates include every-target `cargo check`, Clippy
-with warnings denied, Rust formatting, and `git diff --check`. The application
-module has seven passing tests. Focused runtime tests cover the peerless live
-Event lifecycle, shutdown and live-zeroization admission closure, rejection of
-an overflowing `run_for` before readiness or state mutation, queued
+At that PR-C freeze, the exact-byte gates included every-target `cargo check`,
+Clippy with warnings denied, Rust formatting, and `git diff --check`. The
+application module had seven passing tests. Focused runtime tests cover the
+peerless live Event lifecycle, shutdown and live-zeroization admission closure,
+rejection of an overflowing `run_for` before readiness or state mutation, queued
 zeroization ahead of an already elapsed deadline, a nonzero operational window
 under saturated application callers, and authenticated contact/status progress
 under saturated callers plus continuously overdue one-nanosecond ticks. The
@@ -296,15 +346,77 @@ only a process-local report about each active configured peer's most recent
 bounded authenticated negotiation. Gap absence remains limited to freshly
 verified positions already observed by the local store. Selector replacement
 remains unsubscribe followed by subscribe, not an atomic update. These checks
-do not close State/Record/Blob or any later item in the six-step sequence.
+alone do not close State/Record/Blob or any later item in the six-step sequence.
+
+## Current selected State automated evidence
+
+The stopped/local selected State slice is pinned to these exact frozen Rust
+source identities:
+
+```text
+1b33111f631ed417205849a7ec031ff7068f6b7f816d09392d146b0b8f3d57ea  crates/aster-core/src/source_state.rs
+5da5c9bd7e36995e6315f29b7354a78d863ed97c94b33c10f5f7d9946d6a7a6b  crates/aster-core/src/lib.rs
+835a508f56a4b07b6aa9301f6bbf2a9f3bb01717fff0bc218f02b58bc22e245c  crates/aster-node/src/application.rs
+4f0d04afa2b5fe2b78ed1fdd88bd0a5e4007a05915e11bc08fedba9ba70e2982  crates/aster-node/src/application/state.rs
+c45a02fdfe159a2da57f42145b0fbb0fcba25a71d2d722c0359ec9485d59d6b3  crates/aster-node/src/lib.rs
+0151703349198128867f1751fbd33ca0a3e134a93d83ee5ed36c99869e811e1d  crates/aster-node/examples/state_application.rs
+b973dc98bbde2d04555358f88c3b00a99180d059711bca7e2114c47749905424  crates/aster-redb-store/src/lib.rs
+```
+
+The documented two-node fixture and State example passed end to end on these
+final bytes in a disposable root. The first run returned:
+
+```text
+STATE current=96e109dccac01630a0263cb00d8cfb97e0cc391c20ad6c9b759bc47bc26ff820 value=moving counter=3 ready_inserted=true moving_inserted=true recoverable=1
+```
+
+The immediate exact rerun returned the same semantic identity, value, publisher
+counter, and recoverable count with both `ready_inserted` and `moving_inserted`
+set to `false`. That is local executable evidence for durable operation replay
+and causal projection, not State transfer or acceptance. The temporary root is
+not retained as an execution receipt.
+
+The final current-toolchain selected-code matrix passed 517 of 517 tests: core
+library 342/342 (44.69s), node library 73/73 (4.64s), node binary 6/6 (0.01s),
+`mesh_cli` 13/13 (136.20s), and selected store 83/83 (8.48s). The core basic
+example and the Event, live Event, and State examples had no tests.
+
+The separate exact Rust 1.91.0 matrix also passed 517 of 517: core library
+342/342 (45.83s), node library 73/73 (4.70s), node binary 6/6 (0.01s),
+`mesh_cli` 13/13 (135.07s), and selected store 83/83 (8.62s); the same examples
+had no tests. Strict all-target/all-feature Clippy with warnings denied passed
+on both toolchains. Rust formatting and `git diff --check` passed on the frozen
+tree. These are separate executions; their timings and counts are not pooled.
+
+Within those totals, five selected-node State tests exercise independent
+reducer recomputation, restart-stable idempotent publication/query, visible
+tombstones, Event-State shared counters with disjoint Event sequence positions,
+and exact writer exclusion. The selected-store tests cover State operation
+conflict and quotas, semantic/representation/cross-class collision, sequential
+and concurrent reduction, deterministic full-ID tie-break, inactive-row
+retention, stale/future epoch behavior, projection-plan races, schema/reopen
+audit, and fail-closed aggregate invariant rejection.
+
+Raw State operation lookup, stored rows, and projection plans remain privileged
+structural data. Only the selected node's fresh source/content verification,
+full request/header/payload/identity comparison, current-policy checks,
+independent reducer recomputation, and exact plan recheck form the application
+exposure boundary.
+
+This slice has no State reconciliation frame, carrier path, live handle, or
+retained execution root. It moves only `DM-5.1-01`, `DM-5.1-02`, `DM-5.3-01`,
+and `DM-5.3-02` to `implemented-uncredited`; it adds no `observed-bounded`
+credit and closes no replication, Record, Blob, TTL/expiry/garbage-collection,
+physical, mixed-implementation, scale, or release gate.
 
 ## Reproducible receipt
 
 Every retained root, binary identity, and source hash below belongs to the
-parent PR-A/pre-subscription snapshot. PR B and PR C change store, frame,
-runtime, application, example, and integration-test bytes; their credit in this
-ledger is limited to the exact current code and tests mapped above. No fresh
-retained real-process PR-B or PR-C receipt is claimed.
+parent PR-A/pre-subscription snapshot. PR B, PR C, and the selected State slice
+change store, frame, runtime, application, core, example, or integration-test
+bytes; their credit in this ledger is limited to the exact current code and
+tests mapped above. No fresh retained real-process receipt for those slices is
+claimed.
 
 The source-level invocation is:
 
@@ -717,7 +829,7 @@ workspace check passed; every target and feature also checked on Rust 1.91.
 Five fuzz campaigns completed 10,000 iterations each (50,000 total) over wire,
 fragment, envelope, selected-frame, and selected-Negentropy decode paths with no
 finding. Those counts and retained roots are historical parent evidence, not
-current PR-B or PR-C execution receipts.
+current PR-B, PR-C, or selected State execution receipts.
 
 The signed PR-B code baseline above passed the same current and exact
 Rust 1.91.0 matrix with 336 `aster-core` tests, 73 redb-store tests, 62
@@ -771,14 +883,14 @@ different technical trust-root path.
 
 | Requirement class | Current state | What must be delivered before complete credit |
 |---|---|---|
-| Remaining data model | `open` | State, Record, and Blob semantics in the selected composition; deterministic independent wire interoperability; conflict/deletion behavior beyond immutable Event |
+| Remaining data model | `implemented-uncredited` / `open` | Carry selected State through the live/runtime reconciliation composition and verify multi-node convergence; add Record and Blob; deliver deterministic independent wire interoperability, State retention/GC, and broader conflict/deletion behavior |
 | Source and mission security | `implemented-uncredited` / `observed-bounded` / `open` / `external-gate` | Generalized and protected control administration; multi-scope, repeated, longer-partition, and physical revocation/rekey propagation; non-Unix and physical/copy-on-write/snapshot/swap/backup zeroization assurance; database rollback/replacement resistance; protected operational provisioning; all data classes; admitted FIPS boundary where required; packet-capture acceptance; and independent cryptographic review |
 | Custody and constrained operation | `open` | Authenticated cumulative forwarding age for finite TTL, expiry/garbage collection, priority scheduling/retry/eviction, emission thresholds, receive-only mode, and operator quota controls |
-| Scope and application policy | `open` | Multi-class selectors, atomic subscription update, multi-scope join/leave, bridges, dynamic peer policy, and equivalent live status/gap semantics beyond the selected Event surface |
+| Scope and application policy | `open` | Multi-class selectors, State receive/delivery behavior, atomic subscription update, multi-scope join/leave, bridges, dynamic peer policy, and equivalent live status/gap semantics beyond the selected Event surface |
 | Blob behavior | `open` | Authenticated chunking, streaming, resume across contacts/peers/carriers, content-addressed deduplication, and hundreds-of-MB acceptance |
 | Carrier portfolio | `open` / `external-gate` | Physical IP, NAT traversal and relay fallback, discovery, BTLE platform driver, smallest-MTU framing, link characteristics, and future-carrier proof |
 | DDIL resilience | `open` / `external-gate` | Loss/bandwidth floors, long custody/offline interval, crash/corruption recovery, partial-contact durable progress, alternate-peer/carrier continuation, mobility, and power/emission measurements |
-| Developer surface | `implemented-uncredited` / `open` | Extend the live Event boundary to State/Record/Blob and conflict annotations; add atomic subscription update if required, C FFI and at least two selected-node bindings, broader multi-class examples, protected operational provisioning, an independent usability study, and a decision on the optional local agent |
+| Developer surface | `implemented-uncredited` / `open` | Extend the stopped State and live Event boundaries into live State/Record/Blob plus broader conflict annotations; add atomic subscription update if required, C FFI and at least two selected-node bindings, broader multi-class examples, protected operational provisioning, an independent usability study, and a decision on the optional local agent |
 | Scale and resources | `open` / `external-gate` | Stakeholder-confirmed bracketed targets plus repeatable node count, inventory size, memory, CPU, binary, bandwidth, and energy evidence on target tiers |
 | Interoperability and release assurance | `open` / `external-gate` | Independent conformant implementation, mixed-version/downgrade evidence, completed hostile-peer campaigns, admitted dependency/license/SBOM graph, physical acceptance, and signed release disposition |
 

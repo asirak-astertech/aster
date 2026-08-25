@@ -85,6 +85,12 @@ EVENT_LIVE_SLICE = (
     "offline_publish_later_real_process_sync_poll_ack_and_restart; "
     "docs/quickstart/selected-event-api.md"
 )
+STATE_LOCAL_SLICE = (
+    "crates/aster-core/src/source_state.rs; crates/aster-redb-store/src/lib.rs; "
+    "crates/aster-node/src/application/state.rs; "
+    "crates/aster-node/examples/state_application.rs; "
+    "docs/quickstart/selected-state-api.md"
+)
 CONTROL_SLICE = (
     "crates/aster-core/src/source_control.rs; crates/aster-redb-store/src/lib.rs; "
     "crates/aster-node/src/frame.rs; crates/aster-node/src/runtime.rs; "
@@ -193,6 +199,18 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
         f"{CONTROL_RECEIPT}; a four-node real-process line durably revoked the captured leaf, denied two later contact attempts, withheld epoch-two content, and accepted no stale publication at an eligible peer",
         "One captured leaf was excluded on one-host direct loopback; physical capture, larger and non-line topologies, authority/signer handoff and recovery, all data classes, and independent implementations remain open.",
     ),
+    "DM-5.1-01": selected_claim(
+        "implemented-uncredited",
+        "aster-core + aster-redb-store + aster-node",
+        f"{STATE_LOCAL_SLICE}; the stopped SelectedStateNode source-seals and durably publishes bounded State versions, then queries one exact topic/scope/logical-key projection without exposing sealed representations or provider internals",
+        "This is a stopped/local selected State surface, not live State, replication, subscription, language-binding, physical-carrier, mixed-implementation, or release evidence. Record and Blob remain open.",
+    ),
+    "DM-5.1-02": selected_claim(
+        "implemented-uncredited",
+        "aster-core + aster-redb-store + aster-node",
+        f"{STATE_LOCAL_SLICE}; authenticated State dots and causal context share the selected Event publisher frontier, the store retains causal maxima and dominated versions, and the facade independently recomputes the exact-key projection before a policy-bound plan recheck",
+        "Current tests cover local sequential, concurrent, tombstone, restart, and shared-counter behavior only. State is absent from the reconciliation wire, so cross-node convergence, independent interoperability, scale, and acceptance remain open.",
+    ),
     "DM-5.1-04": selected_claim(
         "observed-bounded", "aster-core + aster-redb-store + aster-node",
         f"{RECEIPT}; {EVENT_SLICE}; {EVENT_LIVE_SLICE}; the built-in sample and high-level live handle publish, source-seal, store, transfer, freshly verify, query, and durably deliver Event objects",
@@ -297,6 +315,18 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
         "aster-negentropy",
         f"{RECEIPT}; bounded identifier-set reconciliation computes differences over exact Event transfer identities and equal inventory transfers nothing",
         "Publish total-size-versus-difference cost evidence at requirement scale.",
+    ),
+    "DM-5.3-01": selected_claim(
+        "implemented-uncredited",
+        "aster-core + aster-redb-store + aster-node",
+        f"{STATE_LOCAL_SLICE}; an active version whose authenticated context observes another version's dot dominates it, causal maxima remain active, and exact-key query returns the deterministic current while optionally exposing retained concurrent and superseded versions",
+        "The reducer is integrated only for stopped/local selected State. Network replication, multi-node convergence, expiry/garbage collection, independent interoperability, and retained acceptance evidence remain open.",
+    ),
+    "DM-5.3-02": selected_claim(
+        "implemented-uncredited",
+        "aster-core + aster-redb-store + aster-node",
+        f"{STATE_LOCAL_SLICE}; when active State maxima are concurrent, the greatest complete source-authenticated semantic State ID is current and the other maxima remain explicitly Concurrent; a current tombstone remains visible as authenticated State rather than becoming an unauthenticated absence",
+        "The deterministic tie-break has current-code local tests only. No delete-wins rule is inferred, and mixed-implementation, cross-node, adversarial-scale, and retained acceptance evidence remain open.",
     ),
     "DM-5.4-01": selected_claim(
         "implemented-uncredited", "aster-profile", PROFILE_EVIDENCE,

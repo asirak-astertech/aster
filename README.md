@@ -15,8 +15,8 @@ operation.
 
 > **Project status:** Aster 0.1 now has an executable production-implementation
 > lane for bounded source-authenticated Event and mission-control meshes over
-> direct IP. Iroh
-> carrier authentication remains separate from the ported `aster-core` hybrid
+> direct IP. Iroh carrier authentication remains separate from the ported
+> `aster-core` hybrid
 > mission session, which completes before inventory. The runtime source-seals
 > ordered Flash revocation/rekey controls and Events through the existing
 > `aster-core` providers, activates a durable contiguous control prefix before
@@ -27,14 +27,17 @@ operation.
 > durable subscribe/poll/ack, idempotent unsubscribe, and authenticated gap
 > inspection. Its live handle reports bounded authenticated peer and
 > last-contact status without exposing carrier or reconciliation internals. It
-> is still not a
-> completed MVP,
-> production-authorized build, or claim of FIPS 140-3 validation. State, Record,
-> Blob, finite-TTL custody, atomic subscription update, protected provisioning,
-> generalized control
-> administration, and physical/multi-carrier
-> acceptance remain open. A bounded same-UID Unix hook now drains a selected
-> node, terminally locks its retained redb state, and software-erases its exact
+> now also has an exclusive stopped-node State surface for source-authenticated
+> publication and exact-key causal projection. Current tombstones remain
+> visible, while active concurrent and superseded versions are recoverable.
+> State is not yet carried by the live runtime or reconciliation wire. Aster is
+> still not a completed MVP, production-authorized build, or claim of FIPS
+> 140-3 validation. Live or replicated State, Record, Blob, finite-TTL custody,
+> atomic subscription
+> update, protected provisioning, generalized control administration, and
+> physical/multi-carrier acceptance remain open. A bounded same-UID Unix hook
+> now drains a selected node, terminally locks its retained redb state, and
+> software-erases its exact
 > mission-bundle and carrier-identity file contents. Non-Unix support, physical
 > media/copy-on-write/snapshot/swap/backup sanitization, and database
 > rollback/replacement resistance remain open. The broader
@@ -115,7 +118,9 @@ Each command retains its complete root and prints stopped-state inspections.
 See the [capability tour](docs/quickstart/capability-tour.md) for what to look
 for, the [selected Event API quickstart](docs/quickstart/selected-event-api.md)
 to publish offline through the live actor, consume durably, inspect gaps/status,
-and run the focused later-sync process test,
+and run the focused later-sync process test, the
+[selected State API quickstart](docs/quickstart/selected-state-api.md) to see a
+local causal latest-value projection and learn the authenticated deletion rule,
 and the [selected architecture](docs/architecture.md) for the trust and
 authority boundaries.
 
@@ -253,10 +258,10 @@ service, a conventional database or broker will usually be simpler.
 | Area | Purpose |
 |---|---|
 | [`crates/aster-profile`](crates/aster-profile) | Requirements-owned reconciliation key and stable inventory ordering; exact Event transfer IDs enter by explicit conversion |
-| [`crates/aster-redb-store`](crates/aster-redb-store) | Mission-bound atomic ordered-control policy plus Event/causal/operation persistence, bounded route-only cache, and disjoint opaque compatibility storage |
+| [`crates/aster-redb-store`](crates/aster-redb-store) | Mission-bound atomic ordered-control policy plus Event and local State semantic/causal/operation persistence, bounded route-only cache, and disjoint opaque compatibility storage |
 | [`crates/aster-negentropy`](crates/aster-negentropy) | Selected bounded, clock-independent inventory set-difference mechanism |
 | [`crates/aster-iroh`](crates/aster-iroh) | Selected profile-independent direct-IP carrier; endpoint authentication is not mission or data authorization |
-| [`crates/aster-node`](crates/aster-node) | Selected composition root and CLI; enforces mission-before-inventory, control-before-Event, peer route filtering, exact control/Event transfer, and live sample applications |
+| [`crates/aster-node`](crates/aster-node) | Selected composition root and CLI; enforces mission-before-inventory, control-before-Event, peer route filtering, exact control/Event transfer, live sample applications, and the exclusive local State facade |
 | [`crates/aster-core`](crates/aster-core) | Proven current semantic implementation and migration source for the data model, reducers, mission/source/control security, and synchronization behavior |
 | [`crates/aster-host`](crates/aster-host) | Current semantic/reference high-level host and carrier composition |
 | [`crates/aster-ip`](crates/aster-ip) | Current semantic/reference UDP/IP, discovery, rendezvous, and opaque-relay mechanisms |
@@ -273,6 +278,7 @@ service, a conventional database or broker will usually be simpler.
 
 - **New to Aster:** [Documentation home](docs/README.md) →
   [live mesh CLI](docs/quickstart/mesh-cli.md) or a
+  [selected State projection](docs/quickstart/selected-state-api.md) or a
   [current semantic API language quickstart](docs/quickstart/README.md) →
   [Application recipes](docs/application-recipes.md)
 - **Integrating a deployment:** [Carriers and contacts](docs/transports.md) →

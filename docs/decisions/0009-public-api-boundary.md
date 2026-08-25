@@ -138,11 +138,50 @@ intervals are anchored only by freshly source/content-verified positions already
 observed in the mission-bound store. Last-contact status is process-local and
 does not claim reachability, publisher completeness, or global convergence.
 
-These slices do not replace the broader proven semantic `ApplicationNode` or
-complete the accepted boundary. They have no atomic subscription update,
-State, Record, Blob, selected-node bindings, protected operational provisioning,
-or generalized control administration. Finite TTL is absent and therefore
-cannot be requested until authenticated cumulative forwarding age and expiry
-exist.
+These Event slices do not replace the broader proven semantic `ApplicationNode`
+or complete the accepted boundary. They have no atomic subscription update,
+live State, Record, Blob, selected-node bindings, protected operational
+provisioning, or generalized control administration. Finite TTL is absent and
+therefore cannot be requested until authenticated cumulative forwarding age and
+expiry exist.
 The compiled example and exact claim boundary are documented in the
 [selected Event API quickstart](../quickstart/selected-event-api.md).
+
+## Selected production-lane local State slice (2026-08-24)
+
+`aster-node::application::SelectedStateNode` adds a second high-level boundary
+over the same selected mission-bound writer, control policy, source-envelope
+provider, and causal ledger. It is intentionally an exclusive stopped-node
+surface: application callers can publish one source-authenticated State version
+idempotently and query the deterministic projection for one exact
+topic/scope/logical key. It has no live command handle, subscription, carrier,
+or reconciliation operation.
+
+The facade returns semantic `StateId`, authenticated application fields, one
+`Current` value, and optionally retained active `Concurrent` and `Superseded`
+versions. It omits transfer identities, sealed representations, keys, provider
+selection, causal vectors, redb table names, and structural plan tokens. A
+current tombstone remains a visible `StateItem` with an empty payload; it is not
+collapsed into an unauthenticated absence. Concurrent tombstones and edits use
+the same deterministic semantic-ID tie-break as every other State maximum;
+there is no special delete-wins rule.
+
+The stopped facade treats redb results as untrusted structural candidates. On
+publish it freshly verifies the full authenticated header, semantic and exact
+identities, and exact plaintext against the caller's request after the atomic
+commit or idempotent replay. On query it freshly source/content verifies all
+retained candidates, including inactive revoked or old-epoch rows, recomputes
+causal dominance and the complete-semantic-ID tie-break independently, and
+requires the exact policy-bound projection plan to remain unchanged. Only active
+versions are exposed. The operation mapping remains a privileged store
+mechanism, not a capability; current authority and revocation checks precede an
+exact replay.
+
+Event and State share publisher counters and the causal frontier, so the new
+class cannot reuse an Event dot. The State tables and operation ledger have
+dedicated count/byte bounds and participate in aggregate store quotas. None of
+this changes the Event frame grammar or reconciliation lanes. Live State,
+network replication, subscriptions, TTL, expiry, garbage collection, selected-
+node bindings, Record, Blob, independent interoperability, and acceptance
+evidence remain open. The compiled example and exact boundary are documented in
+the [selected State API quickstart](../quickstart/selected-state-api.md).

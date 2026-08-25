@@ -9,7 +9,10 @@ For the selected production-lane composition, start with the Rust
 bounded query, durable at-least-once subscribe/poll/ack, idempotent unsubscribe,
 freshly verified gap inspection, and bounded peer/last-contact status through
 the running actor's sole authority. A focused real-process test publishes
-offline and synchronizes later. Atomic subscription update, other data classes,
+offline and synchronizes later. The separate [selected State
+quickstart](selected-state-api.md) demonstrates stopped/local latest-value
+publication, causal projection, recoverable versions, and visible authenticated
+tombstones. Live or replicated State, atomic subscription update, Record, Blob,
 and selected-node language bindings remain open.
 
 Choose the API closest to your application:
@@ -18,6 +21,7 @@ Choose the API closest to your application:
 |---|---|---|
 | Rust (selected live Event slice) | `aster_node::start_node` + `SelectedEventHandle` | [Selected Event API](selected-event-api.md) |
 | Rust (selected stopped Event slice) | `aster-node::application::SelectedEventNode` | [Selected Event API](selected-event-api.md#one-authority-two-application-modes) |
+| Rust (selected stopped State slice) | `aster-node::application::SelectedStateNode` | [Selected State API](selected-state-api.md) |
 | Rust | Native high-level `ApplicationNode` | [Rust](rust.md) |
 | Python | Dependency-free `ctypes` wrapper over the native library | [Python](python.md) |
 | Go | cgo wrapper over the native library | [Go](go.md) |
@@ -31,9 +35,10 @@ The four broader semantic language quickstarts perform the same State flow:
 4. Poll the local subscription and acknowledge delivery.
 5. Close the node cleanly.
 
-The selected Rust Event guide instead uses Event and adds a live actor plus a
-focused later-sync process test. The language examples remain intentionally
-offline exercises. After one works, continue with
+The selected Rust Event guide instead adds a live actor and a focused later-sync
+process test. The selected Rust State guide uses the production-lane store and
+security composition but remains stopped and local. The language examples
+remain intentionally offline exercises. After one works, continue with
 [Carriers and contacts](../transports.md) to understand live synchronization.
 The fixture path is unprotected compatibility/test ingestion. Rust now exposes
 a provider-owned protection boundary, but no operational provider or protected
@@ -55,10 +60,11 @@ them:
 - a **scope** says where it is allowed to propagate;
 - a **logical key** identifies the thing within State or Record data;
 - a **data class** selects convergence behavior;
-- **priority** expresses scheduling and pressure intent; selected Event
-  priority-aware transmission, retry, and eviction remain open;
-- **TTL** controls how long an item remains useful; the selected Event surface
-  omits finite TTL until authenticated forwarding age and expiry exist; and
+- **priority** expresses scheduling and pressure intent; selected Event and
+  State priority-aware transmission, retry, and eviction remain open;
+- **TTL** controls how long an item remains useful; the selected Event and State
+  surfaces omit finite TTL until authenticated forwarding age and expiry exist;
+  and
 - a **publish result** identifies a durable local commit.
 
 Read [Core concepts](../concepts.md) before adapting the example to operational
