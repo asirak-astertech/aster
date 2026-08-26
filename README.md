@@ -104,10 +104,12 @@ provisioning remain open work.
 | **Event** | Source-authenticated direct-Iroh reconciliation; live Rust and local ConnectRPC APIs; durable consume/carry selectors and at-least-once delivery | Atomic subscription update, hosted discovery/relay, and broader physical-network acceptance |
 | **State** | Source-authenticated publication, causal projection, and direct-Iroh reconciliation under explicit interests | Live application handle, subscriptions, relay cache, expiry, and garbage collection |
 | **Record** | Conflict-preserving projection, exact-sibling guarded resolution, and direct-Iroh reconciliation | Live application handle, automatic merge execution, expiry, and garbage collection |
-| **Blob** | Authenticated immutable publication and verified streaming through an encrypted local depot | Network reconciliation, remote chunk transfer/resume, retention, and garbage collection |
+| **Blob** | Authenticated immutable publication, verified encrypted-depot streaming, and direct semantic-v5 source/carrier range transfer with durable resume state | Live application API, route-only relay/custody, representative remote evidence, retention, and garbage collection |
 | **Operations** | Manually admitted direct addresses, reference mission provisioning, and bounded same-UID Unix software zeroization | Protected operational provisioning, NAT/hosted relay, BTLE platform integration, physical sanitization, and release authorization |
 
-The [requirements status](docs/implementation/requirements-status.md) is the
+The [capability roadmap](docs/implementation/capability-roadmap.md) is the
+planning and merge-review view. The
+[requirements status](docs/implementation/requirements-status.md) remains the
 authority for exact evidence and open acceptance gates.
 
 ## When Aster fits
@@ -135,7 +137,7 @@ conventional database or broker will usually be simpler.
 | Understand trust and component boundaries | [Selected architecture](docs/architecture.md) |
 | Connect nodes or evaluate carriers | [Carriers and contacts](docs/transports.md) |
 | Implement compatible protocol bytes | [Protocol](docs/protocol.md), [wire grammar](docs/wire.cddl), and [security objects](docs/envelope.md) |
-| Assess readiness | [Requirements status](docs/implementation/requirements-status.md), [conformance](docs/conformance.md), and [security](docs/security.md) |
+| Assess progress or readiness | [Capability roadmap](docs/implementation/capability-roadmap.md), [requirements status](docs/implementation/requirements-status.md), [conformance](docs/conformance.md), and [security](docs/security.md) |
 | Browse all project records | [Documentation index](docs/README.md) |
 
 ## Repository map

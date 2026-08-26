@@ -3,6 +3,7 @@
 - Status date: 2026-08-26
 - Requirements authority: [`data-mesh-requirements.md`](../../data-mesh-requirements.md)
 - Requirements SHA-256: `e88bcc6c717a5175a460205fdc084aaa2e1f020a142a84087f9881677da02987`
+- Planning view: [`capability-roadmap.md`](capability-roadmap.md)
 - Atomic requirements index: [`requirements-matrix.csv`](../evaluations/0005/requirements-matrix.csv)
 - Exhaustive cross-lane trace: [`requirements-implementation.csv`](requirements-implementation.csv)
 - Matrix SHA-256: `57518c2aaeb7341f0d2ef7169a30a1666e337def2bb6a34f9225fad6e438e5b2`
@@ -44,6 +45,9 @@ release evidence. Update it only when reviewed reproducible evidence changes
 the status of a requirement. `implemented-uncredited` may be supported by reviewed
 source plus repeatable automated tests; `observed-bounded` additionally requires
 the stated retained execution receipt. Neither class implies release evidence.
+Use the capability roadmap for planning and merge review. The rows below are an
+exhaustive evidence trace, not a flat backlog, a completion denominator, or a
+release score.
 
 ## Trace vocabulary
 
@@ -120,7 +124,10 @@ The machine-readable trace contains exactly one row for every one of the 348
 atomic matrix requirements. It keeps selected-production status independent
 from proven migration sources, non-credit artifacts, research pointers,
 disposition, and external-gate ownership. It also carries the matrix level,
-phase, class, and final-stack flag.
+phase, class, and final-stack flag. Atomization deliberately retains repeated
+phase, acceptance, and deliverable statements, so row totals must not be used as
+product progress percentages or as a count of independently ratified work
+items.
 `python3 tools/check-implementation-requirements.py` verifies complete ID parity,
 unique rows, valid selected states, exact selected-status containment, and the
 conservative generated claim boundary.

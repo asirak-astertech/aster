@@ -33,7 +33,7 @@ understand Aster's wire format or cryptography before building an application.
 | Handle conflicts, deletion, priority, or expiry | [Framework mechanisms](concepts.md#framework-mechanisms) |
 | Design a binding | [Binding pattern](bindings/pattern.md) |
 | Implement an independent compatible node | [Protocol](protocol.md), [wire grammar](wire.cddl), and [security objects](envelope.md) |
-| Assess security and production blockers | [Security](security.md), [Conformance](conformance.md), and [requirements status](implementation/requirements-status.md) |
+| Assess progress, security, or production blockers | [Capability roadmap](implementation/capability-roadmap.md), [Security](security.md), [Conformance](conformance.md), and [requirements status](implementation/requirements-status.md) |
 | Run validation or interpret evidence | [CI](ci.md), [Conformance](conformance.md), and the [lab guide](../lab/README.md) |
 
 ## Know which kind of document you are reading
@@ -50,7 +50,9 @@ understand Aster's wire format or cryptography before building an application.
 If a tutorial and a specification appear to disagree, the specification is
 authoritative for interoperability. The
 [requirements status](implementation/requirements-status.md) is authoritative
-for which production requirements the selected composition has reached.
+for which production requirements the selected composition has reached. The
+[capability roadmap](implementation/capability-roadmap.md) groups those details
+into outcomes for planning and PR review.
 
 ## Capability snapshot
 
@@ -59,8 +61,9 @@ The selected implementation deliberately exposes different maturity levels:
 - **Event** has direct-Iroh networking plus live Rust and local ConnectRPC APIs.
 - **State and Record** reconcile between selected nodes, while their application
   APIs require exclusive stopped-node access.
-- **Blob** supports authenticated local publication and verified streaming; it
-  does not yet have selected network transfer.
+- **Blob** supports authenticated local publication, verified streaming, and
+  selected direct range transfer with durable resume state; its live API,
+  route-only relay/custody, and representative remote evidence remain open.
 - The broader semantic Rust implementation and language bindings remain the
   proven migration source for behavior not yet composed into the selected node.
 
@@ -76,8 +79,9 @@ boundary; [requirements status](implementation/requirements-status.md),
   references, validation records, proposals, and architecture decisions.
 - [Proposal index](proposals/README.md) — experiment lifecycle and results.
 - [Wire grammar](wire.cddl) — compact CDDL definition.
-- [Source requirements](../data-mesh-requirements.md) — frozen grounding
-  requirements for the project implementation.
+- [Source requirements](../data-mesh-requirements.md) — frozen target-state
+  grounding requirements; use the [capability roadmap](implementation/capability-roadmap.md)
+  for delivery planning and PR review.
 
 ## Contributing
 
