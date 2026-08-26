@@ -4,10 +4,10 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Aster is an Apache-2.0 offline-first data mesh implementation and reference framework for intermittent, untrusted networks.">
+  <meta name="description" content="Aster is an open-source, offline-first data mesh for applications that must keep working across unreliable, intermittent, and untrusted networks.">
   <meta name="theme-color" content="#0d133d">
   <meta name="color-scheme" content="dark">
-  <title>Aster Mesh — Offline-first data synchronization</title>
+  <title>Aster — Offline-first data for unreliable networks</title>
   <style>
     :root {
       color-scheme: dark;
@@ -302,8 +302,8 @@
       </a>
       <nav class="navlinks" aria-label="Primary navigation" style="display: flex; align-items: center; gap: 32px;">
         <a class="navlink" href="#how">How it works</a>
-        <a class="navlink" href="#classes">Data classes</a>
-        <a class="navlink" href="#start">Get started</a>
+        <a class="navlink" href="#classes">Data model</a>
+        <a class="navlink" href="#start">Quickstart</a>
         <a class="navlink" href="https://github.com/defenseunicorns-partnerships/aster/tree/main/docs">Docs</a>
       </nav>
       <a class="btn btn-secondary" href="https://github.com/defenseunicorns-partnerships/aster" style="height: 42px; padding: 0 18px; font-size: 13px;">
@@ -349,35 +349,30 @@
         </g>
       </svg>
       <div class="wrap" style="position: relative; display: flex; flex-direction: column; align-items: center; gap: 28px;">
-        <div class="eyebrow">Apache-2.0 · Offline-first · Transport-neutral</div>
-        <h1 id="hero-title" style="font-size: clamp(36px, 6vw, 64px); font-weight: 500; max-width: 900px;">Data sync for the edge, where the network is the last thing you can trust</h1>
-        <p style="font-size: 21px; max-width: 780px; color: #d4d6e2;">Aster is a free, open-source synchronization protocol and framework. Its selected implementation now runs source-authenticated control and Event paths across real Rust processes over direct Iroh, authenticates a separate hybrid-PQ mission identity before inventory, activates an ordered control prefix before Event, applies durable receiver-directed Event interest inside that protected session, keeps payload-blind relays outside the content boundary, exposes stopped/local source-authenticated State and explicit-conflict Record projections, and provides a bounded same-UID Unix local software-zeroization hook.</p>
+        <div class="eyebrow">Open source · Offline first · Source-authenticated</div>
+        <h1 id="hero-title" style="font-size: clamp(36px, 6vw, 64px); font-weight: 500; max-width: 900px;">Keep data moving when the network disappears.</h1>
+        <p style="font-size: 21px; max-width: 780px; color: #d4d6e2;">Aster is an offline-first data mesh for applications that cannot depend on continuous connectivity or trusted infrastructure. Publish to a local node, carry protected data across direct peers or payload-blind relays, and reconcile it according to explicit data-class semantics.</p>
         <div style="display: flex; gap: 16px; flex-wrap: wrap; justify-content: center; margin-top: 8px;">
-          <a class="btn btn-primary" href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/quickstart/capability-tour.md">Try Aster</a>
-          <a class="btn btn-secondary" href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/architecture.md">View architecture</a>
-          <a class="btn btn-secondary" href="https://github.com/defenseunicorns-partnerships/aster">View on GitHub</a>
+          <a class="btn btn-primary" href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/quickstart/connect-agent.md">Connect your app</a>
+          <a class="btn btn-secondary" href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/quickstart/capability-tour.md">Run the tour</a>
+          <a class="btn btn-secondary" href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/architecture.md">Explore architecture</a>
         </div>
         <div style="display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; font: 13px ui-monospace, Menlo, monospace;">
-          <span style="padding: 6px 12px; border-radius: 999px; border: 1px solid #ffffff24;">v0.1 reference candidate</span>
-          <span style="padding: 6px 12px; border-radius: 999px; border: 1px solid #ffffff24;">Not production-authorized</span>
-          <span style="padding: 6px 12px; border-radius: 999px; border: 1px solid #ffffff24;">Selected CLI: Rust · semantic APIs: C/Go/Python</span>
+          <span style="padding: 6px 12px; border-radius: 999px; border: 1px solid #ffffff24;">Apache-2.0</span>
+          <span style="padding: 6px 12px; border-radius: 999px; border: 1px solid #ffffff24;">Rust reference implementation</span>
+          <span style="padding: 6px 12px; border-radius: 999px; border: 1px solid #ffffff24;">Connect · gRPC · gRPC-Web</span>
+          <span style="padding: 6px 12px; border-radius: 999px; border: 1px solid #ffffff24;">Evaluation-stage project</span>
         </div>
         <div class="codecard">
-          <div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="t">three-node Ping/Pong — real processes</span></div>
-          <pre>ASTER_DEMO_PARENT="$(mktemp -d)"
-cargo run --locked -p aster-node --bin aster -- \
-  demo --nodes 3 --root "$ASTER_DEMO_PARENT/mesh"
+          <div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="t">payload-blind relay capability tour</span></div>
+          <pre>mise install
+mise run tour-relay
 
-<span class="out">PING status=received emitted_by=origin-process producer_state=node-0 destination_state=node-2 source_authenticated=true</span>
-<span class="out">RELAY status=pass exact_forward=true content_access=denied semantic_acceptance=none</span>
-<span class="out">PONG status=received emitted_by=destination-process producer_state=node-2 destination_state=node-0 causal_observation=verified</span>
-<span class="out">DEMO_RESULT status=pass scenario=ping-pong nodes=3 processes=13 mission_auth=hybrid-pq atomic_reaction=pass semantics=source-authenticated-event</span>
-
-<span class="cmt"># Explicit four-role revocation/rekey path; plain N=4 remains Ping/Pong</span>
-ASTER_CONTROL_PARENT="$(mktemp -d)"
-cargo run --locked -p aster-node --bin aster -- \
-  demo --nodes 4 --scenario control --root "$ASTER_CONTROL_PARENT/mesh"
-<span class="out">Selected invariants: CONTROL_RESULT status=pass · controls=2 · captured_sync=denied · captured_local_signing=stale-only</span></pre>
+<span class="cm"># abridged receipt</span>
+<span class="out">PING  status=received · source_authenticated=true</span>
+<span class="out">RELAY status=pass · content_access=denied</span>
+<span class="out">PONG  status=received · causal_observation=verified</span>
+<span class="out">DEMO_RESULT status=pass · nodes=3 · processes=13</span></pre>
         </div>
       </div>
     </section>
@@ -385,25 +380,25 @@ cargo run --locked -p aster-node --bin aster -- \
     <section class="section" style="padding-top: 72px;">
       <div class="wrap">
         <div class="section-head">
-          <div class="eyebrow">Requirements target</div>
-          <h2>Most sync assumes a client can reach a service. Aster assumes the opposite.</h2>
-          <p>Contacts are brief, links are slow, nodes disappear for days, and every carrier may be observed or manipulated. The current semantic implementation proves substantial behavior; the selected composition does not receive that credit until each mechanism is migrated and retested.</p>
+          <div class="eyebrow">Built for disconnected systems</div>
+          <h2>The network should accelerate delivery—not decide whether your app works.</h2>
+          <p>Field teams, vehicles, sensors, and edge services move in and out of reach. Aster makes local durability the success condition, then synchronizes when an authenticated contact becomes available.</p>
         </div>
         <div class="grid-3">
           <article class="card">
             <div class="icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v11"></path><path d="m8 10 4 4 4-4"></path><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"></path></svg></div>
-            <h3>Publish with nothing connected</h3>
-            <p>A publish succeeds when the item is durably committed on the device—not when a server answers. The same application operations remain available online or offline.</p>
+            <h3>Keep working offline</h3>
+            <p>A publish succeeds when the item is durably committed on the device—not when a server answers. Applications keep the same data model through short outages and long partitions.</p>
           </article>
           <article class="card">
             <div class="icon"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="4" cy="12" r="2"></circle><circle cx="20" cy="12" r="2"></circle><rect x="9" y="9" width="6" height="6" rx="1.5"></rect><path d="M6 12h3M15 12h3"></path><path d="M12 9V7.5"></path></svg></div>
-            <h3>Move data through nodes that cannot read it</h3>
-            <p>Route-only relays store and forward protected items without content keys. Authorized consumers verify source authenticity before ordinary items reach the application.</p>
+            <h3>Trust the data, not the path</h3>
+            <p>Route-only relays can store and forward protected Events without content keys. Authorized recipients verify the source, scope, epoch, and content before accepting an item.</p>
           </article>
           <article class="card">
             <div class="icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 0 1 15.5-6.2L21 8"></path><path d="M21 3v5h-5"></path><path d="M21 12a9 9 0 0 1-15.5 6.2L3 16"></path><path d="M3 21v-5h5"></path></svg></div>
-            <h3>Resume through a different peer</h3>
-            <p>Durable Blob ranges are peer- and carrier-neutral. Controlled reference tests resume through an alternate peer; physical cross-carrier and large-Blob acceptance remain open.</p>
+            <h3>Keep conflicts honest</h3>
+            <p>Aster preserves causality across partitions. State converges deterministically, Records keep concurrent siblings for explicit resolution, and Events expose authenticated sequence gaps.</p>
           </article>
         </div>
       </div>
@@ -412,35 +407,35 @@ cargo run --locked -p aster-node --bin aster -- \
     <section id="how" class="section" style="background: var(--bg-section); border-top: 1px solid #ffffff0a; border-bottom: 1px solid #ffffff0a;">
       <div class="wrap">
         <div class="section-head">
-          <div class="eyebrow">Semantic target being migrated</div>
-          <h2>Publish locally. Deliver during configured contacts.</h2>
-          <p>The proven semantic implementation defines this behavior without a central coordinator or synchronized wall clock. The selected composition now uses its hybrid reference session before inventory, its ordered control/rekey provider before Event, typed source-envelope profiles for Event and local State/Record/Blob, durable Event Consume/Carry receive intent, a live high-level Event handle, stopped local State/Record facades, a stopped bounded Blob streaming/depot facade, and a tested local Unix destruction hook for two retained secret artifacts. Live or replicated State/Record/Blob, automatic registered-policy Record merge, remote Blob chunk transfer, generalized control policy, finite-TTL custody, protected provisioning, and platform-complete zeroization assurance still require equivalent migration tests.</p>
+          <div class="eyebrow">How Aster works</div>
+          <h2>A durable path from publisher to application</h2>
+          <p>Aster separates application semantics, mission identity, and carrier connectivity. Each layer can evolve without handing correctness to a central service or synchronized wall clock.</p>
         </div>
         <div class="flow">
           <div class="flow-step">
             <div class="flow-num">1</div>
             <h3>Publish</h3>
-            <p>Your app publishes a typed item. Aster protects it at the source and commits it to the local store. That durable commit is what “success” means.</p>
+            <p>Your application publishes a typed item. Aster protects it at the source and commits it locally. That durable commit is what success means.</p>
           </div>
           <div class="flow-step">
             <div class="flow-num">2</div>
-            <h3>Contact</h3>
-            <p>The selected node carries the existing hybrid post-quantum reference session over real Iroh, checks carrier ID and mission NodeId independently, reconciles and atomically activates a gap-free source-authenticated control prefix, and only then opens Event. Event source identity and protected semantics are verified independently through the existing source envelope.</p>
+            <h3>Authenticate</h3>
+            <p>Before inventory is exchanged, peers authenticate both the carrier endpoint and the mission identity. Ordered control and rekey state activates before application data.</p>
           </div>
           <div class="flow-step">
             <div class="flow-num">3</div>
-            <h3>Difference</h3>
-            <p>The selected node uses bounded Negentropy for exact sealed-transfer-ID difference. Each direction intersects the receiver's mission-protected canonical Event interest with current scope/epoch route authority before inventory and again before Offer/Fetch. Empty interest means receive-none. Priority scheduling, other classes, and resumable Blob chunks remain to migrate.</p>
+            <h3>Reconcile</h3>
+            <p>Nodes compare compact inventories for the network-enabled data classes and scopes the receiver requested, transferring differences instead of full datasets.</p>
           </div>
           <div class="flow-step">
             <div class="flow-num">4</div>
             <h3>Relay</h3>
-            <p>The selected node has demonstrated exact Flash-control and Event forwarding through payload-blind intermediates, including while the authority processes are offline: route metadata verifies, content access is denied, and no semantic Event row is admitted. General relay policy, bridges, finite custody, and physical carriers remain open.</p>
+            <p>Direct peers move data when they meet. Route-only intermediates can store and forward sealed Events without decrypting them or presenting them to an application.</p>
           </div>
           <div class="flow-step">
             <div class="flow-num">5</div>
             <h3>Deliver</h3>
-            <p>The selected store atomically commits content-verified Events with acceptance, causal, stream-position, and durable application-operation indexes. Durable Consume subscriptions provide bounded at-least-once poll, attempt-before-return, and semantic-ID idempotent acknowledgement; Carry expresses receive/forward without local polling. The high-level Event surface now provides live and stopped publish, query, subscribe, poll, acknowledge, unsubscribe, freshly verified gap inspection, and bounded authenticated peer status. Separate stopped/local State and Record surfaces provide verified exact-key projections, while the stopped Blob surface streams fixed-profile immutable content through a bounded encrypted local depot. Only Event currently crosses contacts.</p>
+            <p>Recipients verify source, scope, epoch, and content before commit. Applications consume durable Events at least once, query State and Record projections, and resolve Record conflicts explicitly.</p>
           </div>
         </div>
       </div>
@@ -449,34 +444,34 @@ cargo run --locked -p aster-node --bin aster -- \
     <section id="classes" class="section">
       <div class="wrap">
         <div class="section-head">
-          <div class="eyebrow">Proven semantic implementation</div>
-          <h2>The class tells every node how your data should converge</h2>
-          <p>Pick by how disconnected updates should behave, not by payload size. All four classes and their clock-independent behavior exist in the semantic implementation and specification. Event now has a bounded live selected-node publish/query/subscribe/poll/ack, unsubscribe, authenticated gap, last-contact status, and receiver-interest slice. State and Record have stopped/local source-authenticated projections. Blob has stopped/local authenticated streaming through a bounded encrypted depot. None of those three classes has a live or network path.</p>
+          <div class="eyebrow">Four data classes</div>
+          <h2>Choose behavior, not a storage primitive</h2>
+          <p>The class is part of the protocol contract. It tells every implementation what may converge automatically, what must stay ordered, and where the application must decide.</p>
         </div>
         <div class="classes">
           <article class="klass">
-            <div class="q">What is true now?</div>
+            <div class="q">Convergent value</div>
             <h3>State</h3>
             <div class="for">Position, device health, active settings</div>
-            <p>One current value per logical key. Concurrent updates converge deterministically; losing heads remain recoverable only while retained under configured history and quota policy.</p>
+            <p>One current value per logical key. Causality chooses successors; concurrent updates converge deterministically while retained history remains inspectable.</p>
           </article>
           <article class="klass">
-            <div class="q">What happened?</div>
+            <div class="q">Ordered fact</div>
             <h3>Event</h3>
             <div class="for">Messages, observations, audit entries</div>
-            <p>Immutable and ordered per publisher, with detectable gaps. The selected Rust API reports only gaps anchored by freshly verified positions already observed in its local store; absence is not publisher completeness or global convergence.</p>
+            <p>Immutable items ordered per publisher. Consumers can detect authenticated sequence gaps and acknowledge durable, at-least-once delivery.</p>
           </article>
           <article class="klass">
-            <div class="q">What are we editing?</div>
+            <div class="q">Application-owned conflict</div>
             <h3>Record</h3>
             <div class="for">Plans, forms, annotations, workflows</div>
-            <p>The selected stopped Rust facade preserves every causal head, returns sorted sibling IDs plus an opaque exact guard, rejects ordinary publication across a conflict, and commits only an explicit application-reviewed successor that observes all guarded siblings. It runs no registered merge policy automatically and makes no disconnected-node acceptance claim.</p>
+            <p>Mutable documents with every concurrent head preserved. Aster refuses silent last-write-wins and requires an application-reviewed, guard-protected resolution.</p>
           </article>
           <article class="klass">
-            <div class="q">What large content is this?</div>
+            <div class="q">Immutable content</div>
             <h3>Blob</h3>
             <div class="for">Imagery, maps, attachments, model files</div>
-            <p>The selected stopped facade uses fixed 64-KiB chunks, an authenticated canonical manifest, crash-resumable local encrypted staging, and synchronous verified output. Its ID commits bytes, chunk profile, and media/schema identity metadata. Remote chunk transfer and any-peer resume remain open.</p>
+            <p>Immutable chunks are bound to an authenticated manifest and stored through crash-resumable encrypted local staging. Network transfer is the remaining data-class integration.</p>
           </article>
         </div>
       </div>
@@ -485,39 +480,40 @@ cargo run --locked -p aster-node --bin aster -- \
     <section class="section" style="padding-top: 0;">
       <div class="wrap">
         <div class="section-head">
-          <div class="eyebrow">Semantic mechanisms to migrate</div>
-          <h2>Make unreliable-network tradeoffs explicit</h2>
+          <div class="eyebrow">Designed for integration</div>
+          <h2>A mesh engine that stays behind your application boundary</h2>
+          <p>Bring Aster into an existing stack without making the application understand peers, carriers, or reconciliation.</p>
         </div>
         <div class="grid-3">
           <article class="card">
             <div class="icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20v-8"></path><circle cx="12" cy="12" r="2"></circle><path d="M7.8 7.8a6 6 0 0 0 0 8.4M16.2 7.8a6 6 0 0 1 0 8.4"></path><path d="M4.9 4.9a10 10 0 0 0 0 14.2M19.1 4.9a10 10 0 0 1 0 14.2"></path></svg></div>
-            <h3>Carrier boundary in motion</h3>
-            <p>Direct Iroh is selected and running. UDP discovery/NAT/relay and the BTLE <code>BleRadio</code> seam remain proven semantic/reference migration sources; no selected multi-carrier composition or platform BTLE driver ships yet.</p>
+            <h3>Separate carrier from protocol</h3>
+            <p>The IP runtime uses direct Iroh, while mission identity, source authenticity, and data semantics remain independent. The boundary is designed for additional carriers without changing the application model.</p>
           </article>
           <article class="card">
             <div class="icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 5 6v5c0 4.4 3 8.3 7 9.5 4-1.2 7-5.1 7-9.5V6l-7-3z"></path><path d="m9.5 12 1.8 1.8 3.4-3.6"></path></svg></div>
-            <h3>Zero-trust remains mandatory</h3>
-            <p>The runtime enforces the existing hybrid-PQ mission session before inventory, source-authenticated ordered revocation/rekey before Event, and typed source-envelope verification for Event plus stopped/local State, Record, and Blob. One bounded captured-node exclusion passed, but Iroh endpoint authentication alone remains insufficient. A separate same-UID Unix hook now drains a node, terminally locks retained redb state, and overwrites, synchronizes, and truncates the exact mission-bundle and carrier-identity inodes while preserving zero-length pathnames and audited rows; Blob ciphertext is not physically erased. Protected control administration/provisioning, non-Unix and physical/copy-on-write/snapshot/swap/backup sanitization, database rollback resistance, repeated multi-scope rekey, complete networked data-class coverage, independent review, and any required FIPS validation remain open.</p>
+            <h3>Protect data end to end</h3>
+            <p>Peers authenticate mission membership before inventory. Every accepted item is checked against source, scope, epoch, and content commitments; route-only relays do not receive content keys.</p>
           </article>
           <article class="card">
             <div class="icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h10M18 7h2"></path><circle cx="16" cy="7" r="2"></circle><path d="M4 17h4M12 17h8"></path><circle cx="10" cy="17" r="2"></circle><path d="M4 12h14M20 12h0"></path></svg></div>
-            <h3>Deliberate resource policy</h3>
-            <p>Priority, TTL, quotas, and receive-only policy constrain protocol work. Selected Event Carry now expresses receive/forward without local application polling; priority scheduling, finite TTL, operator quotas, and equivalent behavior for other classes remain open. Receive-only is not a promise of RF silence; links may still emit mandatory control traffic.</p>
+            <h3>Bound work on constrained nodes</h3>
+            <p>Receiver interests, route authority, capped pages, and class-separated reconciliation limit what a contact can request. Priority, finite-TTL custody, and operator quota enforcement remain tracked roadmap gates.</p>
           </article>
           <article class="card">
             <div class="icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 9 5-9 5-9-5 9-5z"></path><path d="m3 13 9 5 9-5"></path></svg></div>
-            <h3>Scoped by design</h3>
-            <p>Topics say what data means. Scopes bound where it may travel. Signed bridge authorizations constrain topic, priority, and hop count.</p>
+            <h3>Share by topic and scope</h3>
+            <p>Topics describe what data means. Scopes bound where it may travel. Signed bridge authorizations constrain topic, priority, and hop count.</p>
           </article>
           <article class="card">
             <div class="icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 8 4.5v9L12 21l-8-4.5v-9L12 3z"></path><path d="M12 12 20 7.5M12 12v9M12 12 4 7.5"></path></svg></div>
-            <h3>Embeddable boundaries</h3>
-            <p>The semantic implementation exposes offline operations through Rust, C, Go, and Python. The selected Rust live handle publishes, queries, subscribes, polls, acknowledges, unsubscribes, inspects authenticated gaps, and reports bounded peer/last-contact status through the running actor's sole store authority. Exclusive stopped Rust facades add local State projection, Record conflict inspection/resolution, and Blob publish/read streaming. Last-contact completion is not global convergence; live/networked State/Record/Blob, remote Blob chunks, and selected-node bindings are not wired yet.</p>
+            <h3>Integrate through ConnectRPC</h3>
+            <p>The loopback agent exposes Event and status operations through checked-in Protobuf for Connect, gRPC, and gRPC-Web—no hosted schema registry required. Rust, C, Go, and Python APIs support linked deployments.</p>
           </article>
           <article class="card">
             <div class="icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4h10a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V9"></path><path d="m4 6 2 2 4-4"></path><path d="M9 12h7M9 16h7"></path></svg></div>
-            <h3>Specified and testable</h3>
-            <p>A versioned wire specification, CDDL grammar, conformance vectors, and five bounded hostile-input fuzz campaigns ship with the reference. No independently authored implementation has passed interoperability yet.</p>
+            <h3>Package for Kubernetes, Zarf, and UDS</h3>
+            <p>Run one agent as a same-Pod sidecar, keep RPC on loopback, and give it exclusive ownership of durable state. A Zarf package can carry the images, local schema, policy, and storage, then compose into UDS.</p>
           </article>
         </div>
       </div>
@@ -526,19 +522,18 @@ cargo run --locked -p aster-node --bin aster -- \
     <section id="start" class="section" style="background: var(--bg-section); border-top: 1px solid #ffffff0a; border-bottom: 1px solid #ffffff0a;">
       <div class="wrap start-grid">
         <div style="display: flex; flex-direction: column; gap: 16px;">
-          <div class="eyebrow">Get started</div>
-          <h2 style="font-size: clamp(28px, 4.5vw, 40px); font-weight: 500;">Watch data cross real node processes</h2>
-          <p style="font-size: 18px;">The selected CLI creates independent identities and redb stores. Its configurable Ping/Pong line isolates both publications and every directed-edge transfer, exact-forwards one pre-existing source-sealed Event per transfer cohort through payload-blind relays, and proves a zero-counter no-op. An explicit four-role control path also forwards one ordered revocation/rekey suffix while the authority processes are offline, excludes the captured leaf, and exchanges epoch-two Ping/Pong among eligible members.</p>
+          <div class="eyebrow">Try the mesh</div>
+          <h2 style="font-size: clamp(28px, 4.5vw, 40px); font-weight: 500;">See offline-first delivery in one command</h2>
+          <p style="font-size: 18px;">The relay tour launches three independent nodes, publishes before a contact exists, carries a sealed Event through a relay that cannot read it, and verifies the source and causal reply at the destination.</p>
           <div style="display: flex; gap: 16px; flex-wrap: wrap; margin-top: 8px;">
-            <a class="btn btn-primary" href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/quickstart/capability-tour.md">Capability tour</a>
-            <a class="btn btn-secondary" href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/quickstart/selected-record-api.md">Record conflict API</a>
-            <a class="btn btn-secondary" href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/quickstart/selected-blob-api.md">Blob streaming API</a>
-            <a class="btn btn-secondary" href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/implementation/requirements-status.md">Requirements status</a>
+            <a class="btn btn-primary" href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/quickstart/capability-tour.md">Run the tour</a>
+            <a class="btn btn-secondary" href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/quickstart/connect-agent.md">Connect an app</a>
+            <a class="btn btn-secondary" href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/concepts.md">Explore the data model</a>
           </div>
         </div>
         <div style="display: flex; flex-direction: column; gap: 22px;">
           <div class="cmd">
-            <div style="display: flex; align-items: center; gap: 12px; color: #fff; font-weight: 600;"><span class="flow-num" style="width: 30px; height: 30px; font-size: 14px;">1</span> Clone the repository and install the pinned tools</div>
+            <div style="display: flex; align-items: center; gap: 12px; color: #fff; font-weight: 600;"><span class="flow-num" style="width: 30px; height: 30px; font-size: 14px;">1</span> Clone Aster and install its pinned tools</div>
             <pre>git clone https://github.com/defenseunicorns-partnerships/aster
 cd aster
 mise install</pre>
@@ -548,12 +543,12 @@ mise install</pre>
             <pre>mise run tour-relay</pre>
           </div>
           <div class="cmd">
-            <div style="display: flex; align-items: center; gap: 12px; color: #fff; font-weight: 600;"><span class="flow-num" style="width: 30px; height: 30px; font-size: 14px;">3</span> Verify the bounded receipt</div>
-            <pre><span class="out">PING status=received emitted_by=origin-process producer_state=node-0 destination_state=node-2 source_authenticated=true</span>
-<span class="out">RELAY status=pass exact_forward=true content_access=denied semantic_acceptance=none</span>
-<span class="out">PONG status=received emitted_by=destination-process producer_state=node-2 destination_state=node-0 causal_observation=verified</span>
-<span class="out">DEMO_RESULT status=pass scenario=ping-pong nodes=3 processes=13 atomic_reaction=pass equal_inventory_noop=pass</span>
-<span class="cmt"># carrier ≠ mission ≠ control/source; exact transfer ID ≠ semantic ID</span></pre>
+            <div style="display: flex; align-items: center; gap: 12px; color: #fff; font-weight: 600;"><span class="flow-num" style="width: 30px; height: 30px; font-size: 14px;">3</span> Read the key fields in the receipt</div>
+            <pre><span class="cmt"># abridged</span>
+<span class="out">PING  ... source_authenticated=true</span>
+<span class="out">RELAY ... content_access=denied</span>
+<span class="out">PONG  ... causal_observation=verified</span>
+<span class="out">DEMO_RESULT status=pass ... nodes=3 processes=13</span></pre>
           </div>
         </div>
       </div>
@@ -564,14 +559,14 @@ mise install</pre>
         <div class="status">
           <div class="icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 9v4"></path><path d="M12 17h.01"></path><path d="M10.3 3.9 2.6 17a2 2 0 0 0 1.7 3h15.4a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"></path></svg></div>
           <div style="display: flex; flex-direction: column; gap: 10px;">
-            <h3>Real implementation progress—not production authorization</h3>
-            <p>The selected Iroh/redb/Negentropy composition has bounded one-host real-process evidence for Event/control behavior, including peerless publication, later forwarding, payload-blind relay, causal return, restart/no-op, and captured-node exclusion. Event has a live application handle; State and Record now use separate authenticated reconciliation lanes over the same real Iroh runtime. The bounded State observation transfers a non-divergent value, while the Record observation preserves disconnected siblings without inventing an application merge policy. Blob remains a local fixed-profile encrypted streaming surface and does not yet enter the mesh path. <code>LastContactComplete</code> is not global convergence, and a gap-free page covers only freshly verified positions already observed by the local store. The retained Unix zeroization evidence covers bounded software erasure of exact secret files and terminal database lockout, not Blob-ciphertext erasure, physical sanitization, inode deletion, database rollback protection, non-Unix support, or remote zeroization. Live State/Record application handles, automatic Record merge, networked Blob, finite-TTL custody, generalized control administration, repeated multi-scope lifecycle, NAT/hosted relay, BTLE, independent interoperability/review, physical acceptance, supported targets, and any required FIPS boundary remain open. Five exact Iroh CDLA/Unlicense package exceptions are stakeholder-approved, fail closed on coordinate drift, and carry hash-pinned distribution notices under Decision 0028; the CDLA treatment remains a visible deviation from the frozen OSI-only requirement and does not itself authorize a release.</p>
+            <h3>Built for evaluation. Explicit about what is left.</h3>
+            <p>Aster is an early reference implementation for protocol evaluation, application integration, and controlled capability testing—not production deployment. Applications can publish and consume Events through live Rust and ConnectRPC APIs. State and Record synchronize over direct Iroh contacts, but their application APIs require the node to be stopped. Blob supports local authenticated streaming; mesh transfer remains open. Production authorization depends on the tracked security, interoperability, platform, operations, and acceptance gates.</p>
             <div style="display: flex; gap: 24px; flex-wrap: wrap; font-weight: 600;">
-              <a href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/implementation/requirements-status.md">Production requirements status →</a>
-              <a href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/architecture.md">Selected architecture →</a>
-              <a href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/conformance.md">Conformance and acceptance →</a>
+              <a href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/implementation/requirements-status.md">Project status →</a>
+              <a href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/quickstart/connect-agent.md">ConnectRPC guide →</a>
+              <a href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/architecture.md">Architecture →</a>
               <a href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/security.md">Security model →</a>
-              <a href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/protocol.md">Protocol specification →</a>
+              <a href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/conformance.md">Conformance →</a>
             </div>
           </div>
         </div>
