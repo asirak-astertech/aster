@@ -5,103 +5,59 @@ from the proven semantic implementation whose protocol and carrier behavior is
 being migrated onto it. Read [Core concepts](concepts.md) first if terms such as
 node, topic, or scope are new.
 
+## Choose your path
+
+| Goal | Start at |
+|---|---|
+| Run the selected networked implementation | [Selected direct-Iroh contact](#selected-direct-iroh-contact) |
+| Embed the broader semantic host | [Current semantic host lifecycle](#current-semantic-host-lifecycle) |
+| Configure UDP/IP | [Current semantic IP example](#current-semantic-ip-example) |
+| Implement a platform BTLE adapter | [Current semantic BTLE integration seam](#current-semantic-btle-integration-seam) |
+| Add another carrier | [Carrier migration and extension](#carrier-migration-and-extension) |
+| Plan an operational deployment | [Before a real deployment](#before-a-real-deployment) |
+
 ## The important separation
 
 Application semantics, mission authentication, control/source authorization,
-and carrier mechanics have separate owners. The selected composition now
-exercises source-authenticated control and Event paths plus stopped/local State,
-Record, and Blob surfaces:
+durable state, reconciliation, and carrier mechanics have separate owners.
 
 ```mermaid
 flowchart LR
-    App["Application"]
-    BuiltIns["Built-in live roles<br/>Ping emitter · Pong responder · relay"]
-    LiveFacade["Live SelectedEventHandle<br/>publish · query · subscribe · poll · ack<br/>unsubscribe · gaps · status"]
-    StoppedFacade["Stopped SelectedEventNode<br/>same Event data operations<br/>without live status"]
-    StoppedState["Stopped SelectedStateNode<br/>local publish · exact-key projection"]
-    StoppedRecord["Stopped SelectedRecordNode<br/>local publish · conflict query · guarded resolve"]
-    StoppedBlob["Stopped SelectedBlobNode<br/>local stream publish · verified read_into"]
-    Intent["Durable receive intent<br/>Consume · Carry · empty = receive-none"]
-    Authority["Stopped-state authority CLI<br/>revoke · recipient-filtered rekey"]
-    Operator["Same-UID Unix operator"]
-    Artifacts["Retained mission bundle<br/>and carrier identity"]
-    Control["aster-core control envelope<br/>authority · chain · effect"]
-    Source["aster-core source envelope<br/>publisher · protected header · content"]
-    Node["aster-node<br/>protected receiver interest · direction-separated filtering · local zeroize · receipts"]
-    Store["aster-redb-store<br/>control policy · Event delivery/cache<br/>local State/Record/Blob authority"]
-    Depot["private encrypted Blob depot<br/>committed chunk files"]
-    Profile["aster-profile<br/>canonical exact-ID ordering"]
-    Diff["aster-negentropy<br/>bounded set difference"]
-    Mission["aster-core reference session<br/>hybrid mission auth · frame protection"]
-    Iroh["aster-iroh<br/>direct authenticated carrier · bounded exchange"]
-    Peer["Peer aster-node<br/>independent identity and store"]
-    App --> LiveFacade -->|"bounded actor commands"| Node
-    Node -->|"sanitized results"| LiveFacade
-    App --> StoppedFacade
-    StoppedFacade -->|"source seal and verification"| Source
-    StoppedFacade -->|"exclusive stopped-state operations"| Store
-    StoppedFacade --> Intent
-    App --> StoppedState
-    StoppedState -->|"fresh State verification"| Source
-    StoppedState -->|"exclusive local projection"| Store
-    App --> StoppedRecord
-    StoppedRecord -->|"fresh Record verification"| Source
-    StoppedRecord -->|"exclusive local projection + guard"| Store
-    App --> StoppedBlob
-    StoppedBlob -->|"fresh manifest/source/content verification"| Source
-    StoppedBlob -->|"exclusive local publication plan"| Store
-    StoppedBlob -->|"bounded encrypted chunks"| Depot
-    Store -->|"exact durable markers"| Depot
-    BuiltIns --> Source
-    Node --> Intent --> Store
-    Store -->|"atomic policy + selector snapshot"| Node
-    Authority --> Control
-    Control --> Node
-    Source --> Node
-    Node --> Store
-    Node --> Profile --> Diff
-    Node --> Mission
-    Mission --> Iroh <--> Peer
-    Operator -. "local zeroize" .-> Node
-    Artifacts -. "exact retained files" .-> Node
+    App["Application"] --> API["Live Event or stopped data API"]
+    API --> Node["aster-node<br/>composition and lifecycle"]
+    Authority["Authority input"] --> Node
+    Node --> Security["Mission, control, and source verification"]
+    Node --> Store["Durable policy and data authority"]
+    Store --> Depot["Encrypted local Blob depot"]
+    Node --> Reconcile["Canonical IDs and bounded set difference"]
+    Node --> Carrier["Direct Iroh carrier"]
+    Carrier <--> Peer["Peer aster-node"]
 ```
 
-`aster-iroh` knows only endpoint lifecycle and bounded exchange.
-`aster-negentropy` knows only exact-transfer-ID set difference.
-`aster-redb-store` is the mission-bound transaction authority for the audited
-contiguous control prefix, active policy snapshots, accepted Events,
-causal/operation ledgers, durable Consume/Carry selector generations, Event
-delivery cursors/pending attempts/acknowledgements, and bounded route-only
-representations. It also holds disjoint local State and Record versions and
-local Blob publications, operations, and structural plans on the same causal
-frontier; those classes never enter the carrier diagram's Event reconciliation
-lanes. A sibling bounded depot holds Blob ciphertext files, while redb owns the
-exact committed-file markers and publication authority.
-`aster-profile` owns the canonical full-ID vocabulary and ordering, not policy
-or semantic identity. `aster-node` is the only selected composition root. This
-diagram is the selected control/Event lane only; broader semantic/reference
-components are migration sources, not co-running authorities.
+`aster-iroh` owns endpoint lifecycle and bounded exchange; its endpoint
+identity is not mission membership or data authorization. `aster-core` owns
+the hybrid mission session and protected control/source objects.
+`aster-profile` and `aster-negentropy` own canonical transfer ordering and
+set difference, not policy or causality.
 
-The requirements still demand transport-neutral, source-authenticated items.
-The proven `aster-core` semantic implementation supplies the migration source
-for the hybrid-PQ handshake, protected control/source envelopes,
-recipient-filtered rekey, source authentication, data classes, causality,
-custody/TTL, scopes, and policy. Those mechanisms are ported, not rewritten.
-The selected node now uses the existing reference session before inventory, the
-existing control provider before Event, the existing source envelope for Event,
-and typed local State, Record, and Blob source capabilities behind stopped
-facades. It freshly verifies exact sealed bytes before admission, serving,
-restart, and application exposure. This is bounded control/Event transfer plus
-local-only State/Record/Blob credit;
-the old implementation is not removed until each replacement passes equivalent
-tests.
+`aster-redb-store` is the mission-bound transaction authority for ordered
+control effects, active policy and selector snapshots, accepted objects,
+at-least-once Event delivery, route-only Event representations, and local
+State, Record, and Blob state. The sibling depot stores bounded Blob
+ciphertext; redb owns its committed-file markers and publication authority.
+`aster-node` is the only selected composition root.
 
-## What is implemented today
+The selected runtime networks Event, State, and Record. Blob remains local. The
+broader semantic implementation remains the migration source for behavior that
+has not yet moved into this composition, and it is retained until replacements
+pass equivalent tests.
 
-| Carrier path | Current capability | What is not yet claimed |
+## Capability boundary
+
+| Path | Implemented | Boundary |
 |---|---|---|
-| Selected direct Iroh | Manually admitted exact endpoint ID and socket, direct authenticated QUIC, bounded exchange, hosted discovery/relay/port mapping disabled | Carrier authentication is not mission or control/source authorization; NAT, hosted relay, physical-network acceptance, and multi-carrier failover remain open |
-| Selected virtual mesh CLI and live actor | Real 2–32-node Event Ping/Pong line plus explicit four-role control scenario; independent identities/stores, mission auth before inventory, ordered Flash controls before source-sealed data transfer, current scope/epoch route filtering, Event payload-blind relay cache, restart/idempotency, no-op verification, a live high-level Event handle, stopped State/Record/Blob facades, class-specific State/Record reconciliation interests, and a same-UID Unix local software-zeroization hook | The retained parent PR-A/pre-subscription N=3/13-process, default N=4/18-process, and N=8/38-process Ping/Pong plus explicit N=4/23-process control receipts passed with disclosed transient/denial stderr. The generic line has `2N+1` cohorts and `5N-2` children, isolates both publications and every directed-edge Event transfer, and finishes with zero-difference no-ops. The control receipt separately proves converged controls, no-contact Ping publication, later Event forwarding, and four causal Pong barriers before its no-op. A separate parent-slice real-child zeroization receipt passed. PR B adds durable Event Consume/Carry selectors and protected receiver filtering; PR C adds current-code live Event evidence. Current-code tests now add one real-Iroh State transfer and two disconnected Record publishers converging on both retained heads. Blob streams fixed-profile encrypted chunks only through its local depot; no remote chunk transfer or any-peer resume is claimed. No slice relabels the retained parent roots. Provisioning is unprotected-reference; status is not global convergence; non-Unix and physical/copy-on-write/snapshot/swap/backup sanitization, database rollback resistance, generalized/repeated control management, finite TTL, networked Blob, broader State/Record partition and relay acceptance, the full range, many-node scale, and physical multi-system acceptance remain open. |
+| Selected direct Iroh | Manually admitted endpoint ID and socket, authenticated direct QUIC, bounded exchange | No hosted discovery, relay, port mapping, NAT acceptance, physical-network acceptance, or multi-carrier failover |
+| Selected node and CLI | Networked Event plus State/Record reconciliation, live Event API, stopped State/Record/Blob APIs, payload-blind Event relay, restart/idempotency, and bounded Unix zeroization | Reference provisioning, local-only Blob, no live State/Record/Blob APIs, finite-TTL custody, generalized control administration, or production authorization |
 | Current semantic in-memory link | Full high-level host contact, authentication, reconciliation, resume, and failure tests | It is a test carrier and is not wired to the selected composition |
 | Current semantic UDP/IP | Nonblocking link, manual endpoint mapping, protected local discovery, rendezvous helpers, opaque relay components | Migration onto the selected node; full host acceptance on physical or operational networks |
 | Current semantic NAT/rendezvous and relay | Bounded rendezvous, endpoint-punching, and opaque-relay helpers with local software tests | Selected-node integration and a two-device representative-NAT direct/fallback result |
@@ -110,7 +66,8 @@ tests.
 
 Code presence is not deployment credit. See the tracked
 [production requirements status](implementation/requirements-status.md) and
-[Conformance](conformance.md) for the current evidence and open gates.
+[Conformance](conformance.md) for exact retained receipts, evidence, and open
+gates.
 
 ## Selected direct-Iroh contact
 
@@ -167,11 +124,11 @@ route grants remain an upper bound on inventory and Offer; the receiver's
 mission-protected canonical Consume/Carry interest narrows each direction
 further, and empty interest means receive-none. Content grants gate semantic
 acceptance and reaction; revoked mission principals fail closed.
-The live selected Event handle now composes high-level operations and bounded
+The live selected Event handle composes high-level operations and bounded
 authenticated last-contact status with this path. `LastContactComplete` reports
 only the most recent bounded negotiation with each active configured peer; it
-does not assert global convergence. Networked State/Record/Blob, remote Blob
-chunk transfer, generalized control
+does not assert global convergence. Live State/Record application handles,
+networked Blob and remote Blob chunk transfer, generalized control
 administration, repeated multi-scope lifecycle, finite-TTL custody, and
 protected provisioning remain to be composed.
 The mission bundle is owner-only on Unix but explicitly unprotected-reference
@@ -179,42 +136,19 @@ at rest; other platforms fail closed because that owner-only contract cannot be
 verified.
 
 ```mermaid
-sequenceDiagram
-    participant L as Local node
-    participant C as Direct Iroh carrier
-    participant P as Peer node
-    participant S as redb store
-    L->>C: exact EndpointId and direct address
-    C->>P: authenticated carrier connection
-    L->>P: hybrid mission flights 1 and 3
-    P->>L: hybrid mission flights 2 and 4
-    Note over L,P: independently verify exact mission NodeId
-    L->>P: control reconciliation query
-    P->>L: source-authenticated control suffix
-    L->>S: commit and activate contiguous control prefix
-    L->>S: capture fresh policy snapshot
-    L->>S: capture selector generation and canonical Consume + Carry union
-    L->>P: protected Event interest (empty means receive-none)
-    P->>L: protected peer Event interest
-    Note over L,P: each direction = receiver interest ∩ current route authority
-    L->>P: Negentropy query over filtered exact IDs
-    P->>L: reply lets local derive one exact set difference
-    P->>L: reverse query over peer-filtered exact IDs
-    L->>P: reply lets peer derive the reverse difference
-    L->>P: protected bytes offered for peer-missing IDs
-    P->>L: protected bytes fetched for local-missing IDs
-    alt content grant
-        L->>S: verify source and admit semantic Event
-        L->>L: application reaction may run
-    else route-only grant
-        L->>S: retain bounded exact bytes only
-        Note over L,S: no content open or semantic Event row
-    end
+flowchart LR
+    Carrier["1. Authenticate<br/>carrier endpoint"] --> Mission["2. Authenticate<br/>mission identity"]
+    Mission --> Control["3. Reconcile and commit<br/>ordered controls"]
+    Control --> Interest["4. Exchange protected<br/>receive interests"]
+    Interest --> Diff["5. Reconcile IDs inside<br/>each receiver's universe"]
+    Diff --> Grant{"6. Current grant"}
+    Grant -->|"content"| Admit["Verify source and<br/>admit semantic data"]
+    Grant -->|"route only"| Carry["Retain bounded<br/>opaque bytes"]
 ```
 
-The sequence above is the Event lane of the manual direct-Iroh selected slice
-with unprotected-reference provisioning. The same mission contact now follows
-it with class-specific State and Record difference/fetch lanes under explicit
+The phases above describe the Event lane of the manual direct-Iroh selected slice
+with unprotected-reference provisioning. The same mission contact also runs
+class-specific State and Record difference/fetch lanes under explicit
 receiver topic/scope interests; Blob remains absent. Carrier authentication does not grant
 mission membership, route authority does not grant content access, and a
 subscription cannot expand either authority. Consume selectors also drive
@@ -247,7 +181,7 @@ The repository also retains the current semantic application and host surfaces:
 - `MeshService` composes that application surface with authenticated sync, Blob
   transfer state, and configured `Link` implementations.
 - `IpLink` and `BleLink` implement the same opaque-fragment contract.
-- The maintained [capability-boundary table](README.md#current-capability-boundary)
+- The maintained [implementation-boundary table](../README.md#current-implementation-boundary)
   records which operations each Rust and language-binding surface exposes.
 
 ## Current semantic host lifecycle
@@ -267,7 +201,7 @@ The high-level host has a small, nonblocking lifecycle:
 The current bounded profile services one authenticated contact at a time. The
 caller chooses the peer for that contact with `begin_sync(peer)`. If several
 carriers are configured for that peer, `MeshService` chooses among them in
-per-peer round-robin order; it does not currently score reachability,
+per-peer round-robin order; it does not score reachability,
 bandwidth, cost, or emission characteristics, and a failed contact does not
 automatically fail over to the next carrier. Pausing destroys session keys but
 retains verified objects and partial Blob ranges. A later `begin_sync(peer)`
@@ -465,7 +399,7 @@ removed; verified object progress remains in the core store. The current
 shape but does not use it internally, so callers must not rely on the adapter to
 check or bind the local identity.
 
-BTLE advertisement support is currently a carrier primitive. It is not a claim
+BTLE advertisement support is a carrier primitive. It is not a claim
 that the complete authenticated replication exchange has a one-to-many broadcast
 profile.
 

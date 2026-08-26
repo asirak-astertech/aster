@@ -118,7 +118,7 @@ The fixture's grants and regeneration procedure are documented in
 ## Next steps
 
 - Learn when to use each [data class and framework mechanism](../concepts.md).
-- Review the [current live-synchronization boundary](../README.md#current-capability-boundary),
+- Review the [selected implementation boundary](../../README.md#current-implementation-boundary),
   then [connect nodes over IP or BTLE](../transports.md).
 - For large immutable content, search the API for `open_blob_service`,
   `publish_finished_blob`, and `open_blob_reader`.

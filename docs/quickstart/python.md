@@ -112,7 +112,7 @@ The fixture's grants and regeneration procedure are documented in
 - Read the [Python binding reference](../../bindings/python/README.md).
 - Live synchronization currently requires application logic to run inside a
   Rust process using `MeshService`; an out-of-process local agent is post-MVP.
-  See the [current capability boundary](../README.md#current-capability-boundary)
+  See the [selected implementation boundary](../../README.md#current-implementation-boundary)
   and [Carriers and contacts](../transports.md).
 - Run the binding tests:
 

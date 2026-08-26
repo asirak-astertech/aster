@@ -106,6 +106,6 @@ The fixture's grants and regeneration procedure are documented in
 
 - Read the full [C ABI reference](../../bindings/c/README.md).
 - Read [Core concepts](../concepts.md) for the application model.
-- Review the [current live-synchronization boundary](../README.md#current-capability-boundary),
+- Review the [selected implementation boundary](../../README.md#current-implementation-boundary),
   then read [Carriers and contacts](../transports.md).
 - Run the FFI tests with `cargo test -p aster-ffi`.

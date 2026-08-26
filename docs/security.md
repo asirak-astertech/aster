@@ -3,6 +3,17 @@
 - Version: 0.1.0
 - Status: reference design; production security and integration gates unsatisfied
 
+## Find a section
+
+| Question | Read |
+|---|---|
+| What is protected, and from whom? | [Assets and adversary](#assets-and-adversary) and [trust boundaries](#trust-boundaries) |
+| How are provisioning artifacts and persistent keys handled? | [Provisioning artifact and persistent-key custody](#provisioning-artifact-and-persistent-key-custody) |
+| Which controls are mandatory? | [Mandatory controls](#mandatory-controls) and [key access matrix](#key-access-matrix) |
+| What do revocation and zeroization mean? | [Authority custody](#authority-custody-and-control-continuity) and [revocation meaning](#revocation-meaning) |
+| How is availability bounded? | [Causal evidence](#causal-evidence-and-bounded-state) and [availability controls](#availability-controls) |
+| What blocks production authorization? | [Mesh cryptographic provider status](#mesh-cryptographic-provider-status) and [security test gates](#security-test-gates) |
+
 ## Assets and adversary
 
 Protected assets are item plaintext, protected routing metadata, publisher
