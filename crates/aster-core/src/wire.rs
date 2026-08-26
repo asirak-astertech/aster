@@ -114,6 +114,9 @@ impl ObjectKind {
 
 pub(crate) const SEMANTIC_PROTOCOL_V1: u16 = 1;
 pub(crate) const SEMANTIC_PROTOCOL_V2: u16 = 2;
+pub(crate) const SEMANTIC_PROTOCOL_V3: u16 = 3;
+pub(crate) const SEMANTIC_PROTOCOL_V4: u16 = 4;
+pub(crate) const SEMANTIC_PROTOCOL_V5: u16 = 5;
 
 /// Typed identity in the reconciliation and ranged-transfer namespace.
 ///
@@ -1382,7 +1385,8 @@ pub(crate) fn validate_interest_work(
 
 pub(crate) fn validate_semantic_version(semantic_version: u16) -> Result<(), WireError> {
     match semantic_version {
-        SEMANTIC_PROTOCOL_V1 | SEMANTIC_PROTOCOL_V2 => Ok(()),
+        SEMANTIC_PROTOCOL_V1 | SEMANTIC_PROTOCOL_V2 | SEMANTIC_PROTOCOL_V3
+        | SEMANTIC_PROTOCOL_V4 | SEMANTIC_PROTOCOL_V5 => Ok(()),
         _ => Err(WireError::UnsupportedSemanticVersion(semantic_version)),
     }
 }
@@ -1884,12 +1888,27 @@ mod tests {
                         .unwrap(),
                     message
                 );
+                assert_eq!(
+                    decode_message_for_semantic_version(&encoded, SEMANTIC_PROTOCOL_V3, limits(),)
+                        .unwrap(),
+                    message
+                );
+                assert_eq!(
+                    decode_message_for_semantic_version(&encoded, SEMANTIC_PROTOCOL_V4, limits(),)
+                        .unwrap(),
+                    message
+                );
+                assert_eq!(
+                    decode_message_for_semantic_version(&encoded, SEMANTIC_PROTOCOL_V5, limits(),)
+                        .unwrap(),
+                    message
+                );
             }
         }
     }
 
     #[test]
-    fn source_and_blob_messages_are_byte_identical_on_v1_and_v2() {
+    fn source_and_blob_messages_are_byte_identical_on_v1_through_v5() {
         for id in [
             ObjectId::for_envelope(EnvelopeId::from_bytes([0x41; 32])),
             ObjectId::for_blob_chunk_digest([0x42; 32]),
@@ -1899,10 +1918,37 @@ mod tests {
                 let v2 =
                     encode_message_for_semantic_version(&message, SEMANTIC_PROTOCOL_V2, limits())
                         .unwrap();
+                let v3 =
+                    encode_message_for_semantic_version(&message, SEMANTIC_PROTOCOL_V3, limits())
+                        .unwrap();
+                let v4 =
+                    encode_message_for_semantic_version(&message, SEMANTIC_PROTOCOL_V4, limits())
+                        .unwrap();
+                let v5 =
+                    encode_message_for_semantic_version(&message, SEMANTIC_PROTOCOL_V5, limits())
+                        .unwrap();
                 assert_eq!(v2, v1);
+                assert_eq!(v3, v1);
+                assert_eq!(v4, v1);
+                assert_eq!(v5, v1);
                 assert_eq!(decode_message(&v1, limits()).unwrap(), message);
                 assert_eq!(
                     decode_message_for_semantic_version(&v2, SEMANTIC_PROTOCOL_V2, limits())
+                        .unwrap(),
+                    message
+                );
+                assert_eq!(
+                    decode_message_for_semantic_version(&v3, SEMANTIC_PROTOCOL_V3, limits())
+                        .unwrap(),
+                    message
+                );
+                assert_eq!(
+                    decode_message_for_semantic_version(&v4, SEMANTIC_PROTOCOL_V4, limits())
+                        .unwrap(),
+                    message
+                );
+                assert_eq!(
+                    decode_message_for_semantic_version(&v5, SEMANTIC_PROTOCOL_V5, limits())
                         .unwrap(),
                     message
                 );

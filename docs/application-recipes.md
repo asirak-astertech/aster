@@ -26,6 +26,39 @@ The snippets use the disposable fixture's authorized scope and topic names. In
 a real application, those names and the payload schema are part of your
 deployment contract.
 
+## Selected production-lane boundary
+
+The recipes below use the broader semantic language bindings. The selected
+`aster-node` application boundary is deliberately different: Event has live and
+stopped Rust handles; State and Record have exclusive stopped Rust handles but
+their already durable objects reconcile over protected semantic-v4/v5 contacts;
+Blob also has a stopped Rust facade, while semantic v5 separately transfers its
+already-durable objects directly between current content-capable peers. The
+selected handshake offers `[5, 4, 3, 2, 1]`. Event keeps v1-v5 compatibility;
+v1-v3 contain no State/Record mechanics and v1-v4 emit zero Blob frames.
+
+Selected State/Record lanes are separated by class and receiver direction. They
+use Offer `MutableApplyResult`, Fetch `MutableFetchResult` plus required
+`MutableFetchResultAck`, exact finish remainders, typed
+capacity deferral, and durable peer/class/local Offer/Fetch rotation. Each
+object is at most 1 MiB; each class is capped at 4,096 rows and 16 MiB. Current
+source route lineage is required. After a same-epoch replacement, historical
+lineage is withheld from ordinary current projection/query and network
+inventory/transfer, although an exact idempotent State publish or Record
+publish/resolution retry may recover its committed result only through strict
+cached/projection/historical verification. Selected finite State
+and Record TTL is rejected and remains open.
+
+Normal and `AtLeast` run those mutable lanes and the v5 Blob lane because
+`AtLeast` is an Event threshold only. `ReceiveOnly` initiates and discloses no
+mutable or Blob lane. Event last-contact status is not State/Record/Blob
+convergence. The Blob network slice is 16-KiB peer-neutral resume with
+completion-gated visibility. Terminal/stale cleanup retains one bounded,
+non-public unfinished physical-lineage fence after reclaiming chunk and byte
+authority, so a different same-epoch lineage still requires epoch advance. It
+adds no live Blob handle, route-only relay, TTL/GC, pure-byte deduplication, or
+retained release receipt.
+
 ## Publish each data class
 
 ### State: replaceable current value
@@ -211,7 +244,7 @@ batch_result = node.publish_batch([
 An explicit batch has 2–64 ordered members with the same publisher, class,
 topic, scope, and active epoch. Either every item commits or none does. The
 default retained-dual policy keeps unchanged format-2 singleton envelopes
-alongside the semantic-v2 compact batch representation, preserving delivery to
+alongside the semantic-v2/v3/v4/v5 compact batch representation, preserving delivery to
 semantic-v1 contacts. At the maximum 64 items with 128-byte scope and topic and
 256 group entries, the compact representation is 39,414 serialized bytes versus
 1,207,414 bytes for retained-dual publication (about 30.6×). Those figures are
@@ -297,12 +330,12 @@ merge in requirements §5.3 remains partial.
 ## Enter a constrained-emission mode
 
 ```python
-# Emit only Immediate and Flash data. Inbound sync remains allowed, and active
-# discovery is suppressed at every threshold above Routine.
+# Emit only Immediate and Flash data. Inbound sync, configured contacts, and
+# their required protocol/control work remain allowed.
 node.emission_threshold = EmissionThreshold.IMMEDIATE
 
-# Suppress discovery, inventory, and item transmission while continuing to
-# receive. A connection-oriented contact may still send mandatory
+# Suppress contact initiation, discovery, inventory, and item transmission while
+# continuing to receive. A connection-oriented contact may still send mandatory
 # authentication or link acknowledgements needed for ingestion.
 node.emission_threshold = EmissionThreshold.RECEIVE_ONLY
 
@@ -313,7 +346,9 @@ node.emission_threshold = EmissionThreshold.ROUTINE
 Emission policy affects what the node may send. It does not change item
 priority, delete queued data, or broaden provisioning and bridge policy.
 `RECEIVE_ONLY` is not a guarantee of RF silence, and the high-level application
-APIs do not expose the separate `PassiveOnly` scheduler mode.
+APIs do not expose the separate `PassiveOnly` scheduler mode. In the selected
+semantic-v4/v5 node, `AtLeast` filters Event only and does not suppress State,
+Record, or v5 Blob work; `ReceiveOnly` discloses no State/Record/Blob lane.
 
 ## Operation names across bindings
 

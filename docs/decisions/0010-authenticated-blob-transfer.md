@@ -1,6 +1,6 @@
 # Decision 0010: Source-bound encrypted Blob carriers
 
-- Status: accepted for reference; stopped/local selected subset implemented
+- Status: accepted for reference; stopped/local plus semantic-v5 direct-content selected subset implemented
 - Date: 2026-08-18
 
 ## Decision
@@ -102,3 +102,78 @@ complete filesystem allocation accounting or physical sanitization. The
 selected slice has no Blob frame, remote chunk request, any-peer resume, live
 handle, subscription, carrier-neutral partial staging, or acceptance result;
 the network portion of this decision remains a migration target.
+
+## Selected semantic-v5 direct-content amendment (2026-08-25)
+
+This amendment supersedes only the final stopped/local network-boundary
+paragraph above. It does not relabel the broader route-only reference design as
+selected behavior.
+
+The selected handshake now offers semantic versions `[5, 4, 3, 2, 1]`.
+Semantic v5 inherits Event v1-v4 and State/Record v4 behavior and allocates the
+direct Blob source/carrier mechanics. Semantic v1-v4 contacts emit and accept
+zero Blob frames. Stable wire/ABI version 1, handshake framing, source-envelope
+formats, `ASTRBT01` bytes, Blob manifests, typed ObjectIDs, and the suite remain
+unchanged.
+
+The selected lane is direct between current content-capable peers. An exact
+topic/scope/epoch interest includes a 32-byte provider-minted peer proof bound
+to mission authority, authenticated NodeID, and the current content grant. The
+sender requires that proof, the peer's current route grant, and durable
+nonrevocation at source inventory, source send, and every range send. Route-only
+authority is insufficient, so selected route-only Blob relay/custody remains
+open.
+
+The complete authenticated source and manifest plan is installed before any
+carrier work. Carrier ranges extend one durable contiguous prefix by at most 16
+KiB. The prefix is keyed by exact source and kind-2 carrier ID rather than peer
+or session, so a later eligible content peer can continue the exact complement.
+Per-peer cursor state provides bounded scheduling fairness only. The requester's
+carrier Finish remaining count is echoed for sequencing; exact per-range
+Result/Ack binds accepted prefix progress and the responder does not independently
+attest the requester's disk truth.
+
+Network admission caps plaintext at 64 MiB and 1,024 chunks. Pending source,
+manifest-record, and prefix state is capped at 10,000 rows and 64 MiB; each
+requested extension is at most 16 KiB. Pending state is not a Blob publication.
+Ordinary visibility is installed atomically only after every canonical carrier,
+the depot completion marker, a freshly streamed provider content-completion
+proof, and a fresh current route/physical-lineage proof all agree with the exact
+plan. Before that transaction, query, inventory, read, and carrier serving do
+not expose the pending Blob.
+
+Every redb open path cross-audits that pending plan against its manifest route,
+carrier set, depot expected plan, and completed namespace; a changed/missing
+plan or pending/completed collision fails without repair. Writable migration
+adds the four v5 network tables to the predecessor nine-table Blob group only
+when the group is wholly absent and the owner-token/binding rules pass.
+Read-only and partial-group opens never migrate or repair it.
+
+Same-epoch replacement is deliberately conservative. Replacing the content key
+invalidates peer proofs and current-lineage checks and withholds old rows. Redb
+also rejects a new physical lineage for the same `(BlobID, content group,
+numeric epoch)` with `PhysicalLineageConflict`; republishing or resuming that
+Blob requires advancing the numeric epoch.
+
+Terminal and stale cleanup preserve that decision after the pending source is
+gone. Unshared chunks, files, finalized digest, and reserved/committed byte
+authority are retired, but the exact unfinished `BLOB_IMPORTS` row remains a
+non-public, owner/backing-bound physical-lineage fence under the existing
+variant cap. Exact-lineage retry may refill the row; a different same-epoch
+lineage still conflicts, and a missing lineage fails audit. This adds no table,
+schema, quota, or visibility surface.
+
+The node serializes every durable Blob-source transition with its authenticated
+cache transition under one local lifecycle lock. Abort reconciliation removes
+the old claim, rereads the durable projection, and freshly authenticates any
+concurrent exact restage before reinsertion. Terminal scheduling for a
+multi-carrier source advances to its lexicographically greatest canonical
+carrier ID rather than assuming manifest-last is greatest.
+
+Normal and AtLeast run selected Blob work because AtLeast filters Event only.
+ReceiveOnly emits, requests, stages, promotes, and counts zero Blob work. The
+application Blob facade remains stopped; this amendment adds no live handle or
+subscription, TTL/expiry/custody/garbage collection, pure whole-byte identity
+or metadata-independent deduplication, selected route-only relay, large-file or
+resource acceptance, physical carrier, mixed-implementation, or release
+acceptance claim.

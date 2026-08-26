@@ -151,7 +151,9 @@ dependencies = [
 name = "aster-iroh"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "iroh",
+ "rustls",
  "tokio",
 ]
 
@@ -172,8 +174,10 @@ dependencies = [
  "aster-negentropy",
  "aster-profile",
  "aster-redb-store",
+ "getrandom 0.4.3",
  "libc",
  "rustix",
+ "sha2",
  "tokio",
  "zeroize",
 ]

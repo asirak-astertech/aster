@@ -51,6 +51,8 @@ pub mod causal;
 mod causal;
 #[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
 mod crypto;
+#[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
+mod custody;
 #[cfg(all(
     feature = "sqlite-store",
     any(feature = "adapter-sdk", feature = "reference-session")
@@ -134,10 +136,12 @@ pub use api::{
 pub use blob::ReferenceBlobReader;
 #[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
 pub use blob::{
-    BlobChunkRecord, BlobError, BlobId, BlobManifest, BlobMetadata, BlobReadStats, BlobReader,
-    BlobRouteCommitment, BlobStore, BlobStoreConfig, BlobWriteProgress, FinishedBlob,
-    MAX_BLOB_CHUNK_SIZE, MAX_BLOB_CHUNKS, MAX_BLOB_MANIFEST_BYTES, MIN_BLOB_CHUNK_SIZE,
-    PreparedBlob, ReferenceBlobService, SELECTED_BLOB_CHUNK_SIZE, prepare_blob,
+    BlobCarrierId, BlobChunkRecord, BlobError, BlobId, BlobManifest, BlobMetadata,
+    BlobPhysicalLineage, BlobReadStats, BlobReader, BlobRouteCommitment, BlobStore,
+    BlobStoreConfig, BlobWriteProgress, BuiltBlobTransferObject, FinishedBlob, MAX_BLOB_CHUNK_SIZE,
+    MAX_BLOB_CHUNKS, MAX_BLOB_MANIFEST_BYTES, MAX_BLOB_TRANSFER_OBJECT_BYTES, MIN_BLOB_CHUNK_SIZE,
+    PreparedBlob, ReferenceBlobService, SELECTED_BLOB_CHUNK_SIZE, VerifiedBlobContentCompletion,
+    VerifiedBlobTransferObject, VerifiedBlobTransferPlan, prepare_blob,
 };
 #[cfg(all(feature = "sqlite-store", feature = "adapter-sdk"))]
 pub use crypto::{
@@ -152,6 +156,14 @@ pub use crypto::{
     ReferenceProvisioner, ReferenceSessionAwaitingFinished, ReferenceSessionInitiator,
     ReferenceSessionResponder, ReferenceSessionResponderPending, ScopeRekeyRecipient,
 };
+#[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
+pub use custody::{
+    CUSTODY_CLAIMS_ENCODED_LEN, CustodyAge, CustodyClaims, CustodyContinuity, CustodyDisposition,
+    CustodyError, CustodyExpectation, CustodyHop, CustodySample, CustodyTransferClaims,
+    CustodyTransferId, MAX_CUSTODY_WRAPPER_BYTES, MIN_CUSTODY_SEMANTIC_VERSION,
+    TransmissionOrderKey, VerifiedCustodyClaims, checked_forwarding_age, evaluate_custody,
+    retry_delay_ms,
+};
 #[cfg(all(feature = "sqlite-store", feature = "adapter-sdk"))]
 pub use engine::{
     ApplicationItem, Delivery as EngineDelivery, PublishReceipt, RecordMergePolicy, RecordVersion,
@@ -163,23 +175,32 @@ pub use model::{
     PeerStatus, Priority, Scope, SyncStatus, Topic, VersionVector,
 };
 pub use provisioning::{
-    MAX_PROTECTED_PROVISIONING_BYTES, MAX_UNPROTECTED_PROVISIONING_BYTES,
-    ProtectedProvisioningError, ProvisioningProtectionError, ProvisioningProtector,
-    ProvisioningUnprotector, UnprotectedProvisioning, protect_provisioning_artifact,
-    unprotect_provisioning_artifact,
+    MAX_PROTECTED_PROVISIONING_BYTES, MAX_PROVISIONING_SECRET_REF_BYTES,
+    MAX_UNPROTECTED_PROVISIONING_BYTES, PROVISIONING_SECRET_OPERATION_ID_BYTES,
+    ProtectedProvisioningError, ProvisioningDestroyDisposition, ProvisioningDestroyId,
+    ProvisioningDestroyReceipt, ProvisioningInstallDisposition, ProvisioningInstallId,
+    ProvisioningInstallReceipt, ProvisioningLoadId, ProvisioningLoadReceipt,
+    ProvisioningProtectionError, ProvisioningProtector, ProvisioningSecretDestroyer,
+    ProvisioningSecretInstaller, ProvisioningSecretLoader, ProvisioningSecretRef,
+    ProvisioningSecretStoreError, ProvisioningUnprotector, UnprotectedProvisioning,
+    destroy_provisioning_secret, install_provisioning_secret, load_provisioning_secret,
+    protect_provisioning_artifact, unprotect_provisioning_artifact,
 };
 #[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
 pub use source_blob::{
-    BlobContentVerification, ContentVerifiedBlobEnvelope, RouteVerifiedBlobEnvelope,
+    BlobContentVerification, BlobPeerContentProof, ContentVerifiedBlobEnvelope, CurrentBlobLineage,
+    RouteVerifiedBlobEnvelope,
 };
 #[cfg(feature = "reference-session")]
 pub use source_control::{
-    ActivationReadyControlEnvelope, VerifiedControlEnvelope, VerifiedControlKind,
+    ActivationReadyControlEnvelope, RegistryAuthenticatedScopeRekeyPlan,
+    ScopeRekeyPublicationCapability, VerifiedControlEnvelope, VerifiedControlKind,
     VerifiedControlPrincipal,
 };
 #[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
 pub use source_event::{
-    ContentVerifiedEventEnvelope, EventContentVerification, RouteVerifiedEventEnvelope,
+    ContentVerifiedEventEnvelope, EventContentVerification, EventRouteLineage,
+    RouteVerifiedEventEnvelope, SourceRouteLineage,
 };
 #[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
 pub use source_record::{
@@ -203,10 +224,10 @@ pub const REPLICATION_WIRE_VERSION: u16 = 1;
 pub const PROTOCOL_VERSION: u16 = REPLICATION_WIRE_VERSION;
 
 /// Semantic replication version offered first by a default initiator.
-pub const DEFAULT_SEMANTIC_VERSION: u16 = 2;
+pub const DEFAULT_SEMANTIC_VERSION: u16 = 5;
 
 /// Highest semantic replication version implemented by this build.
-pub const HIGHEST_SUPPORTED_SEMANTIC_VERSION: u16 = 2;
+pub const HIGHEST_SUPPORTED_SEMANTIC_VERSION: u16 = 5;
 
 #[cfg(feature = "sqlite-store")]
 const _: () = assert!(batch::DATA_CLASS_EVENT == model::DataClass::Event as u8);
@@ -221,7 +242,7 @@ mod version_surface_tests {
         #[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
         assert_eq!(
             crypto::SUPPORTED_SEMANTIC_PROTOCOL_VERSIONS,
-            &[DEFAULT_SEMANTIC_VERSION, 1]
+            &[DEFAULT_SEMANTIC_VERSION, 4, 3, 2, 1]
         );
         assert_eq!(HIGHEST_SUPPORTED_SEMANTIC_VERSION, DEFAULT_SEMANTIC_VERSION);
         #[cfg(feature = "sqlite-store")]
@@ -280,12 +301,60 @@ mod reference_session_feature_tests {
 
         assert_eq!(initiator.peer_identity(), responder_id);
         assert_eq!(responder.peer_identity(), initiator_id);
+        assert_eq!(initiator.semantic_version(), DEFAULT_SEMANTIC_VERSION);
+        assert_eq!(responder.semantic_version(), DEFAULT_SEMANTIC_VERSION);
         let frame = initiator.seal_frame(b"mesh-ping").expect("seal frame");
         assert_eq!(
             responder.open_frame(&frame).expect("open frame"),
             b"mesh-ping"
         );
         assert!(responder.open_frame(&frame).is_err());
+
+        let transfer = CustodyTransferClaims::new(
+            CustodyTransferId::from_exact_hash([0x51; 32]),
+            4_096,
+            Some(1_000),
+            Priority::Immediate,
+        )
+        .expect("nonempty transfer");
+        let claims = CustodyClaims::new(
+            transfer,
+            7,
+            3,
+            CustodyHop::new(
+                100,
+                CustodySample {
+                    clock_id: [0x61; 16],
+                    tick_ms: 500,
+                },
+                20,
+            )
+            .expect("custody hop"),
+        )
+        .expect("nonzero policy revision");
+        let expected = CustodyExpectation::new(transfer, 7);
+        let wrapper = initiator
+            .seal_custody_wrapper(&claims)
+            .expect("seal custody wrapper");
+        assert!(wrapper.len() <= MAX_CUSTODY_WRAPPER_BYTES);
+        let outer = initiator.seal_frame(&wrapper).expect("seal outer frame");
+        let opened_wrapper = responder.open_frame(&outer).expect("open outer frame");
+        let verified = responder
+            .open_custody_wrapper(&opened_wrapper, expected)
+            .expect("open custody wrapper");
+        assert_eq!(verified.transfer_id(), transfer.transfer_id());
+        assert_eq!(verified.exact_len(), transfer.exact_len());
+        assert_eq!(verified.forwarding_age_ms(), 120);
+        assert!(
+            responder
+                .open_custody_wrapper(&opened_wrapper, expected)
+                .is_err()
+        );
+        let later = initiator.seal_frame(b"after-custody").expect("later seal");
+        assert_eq!(
+            responder.open_frame(&later).expect("later open"),
+            b"after-custody"
+        );
     }
 
     #[test]

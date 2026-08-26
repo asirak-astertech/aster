@@ -141,3 +141,164 @@ Before any selected mechanism becomes the default, a later decision must bind:
   until the real redb and Iroh implementations exist; mocks must not freeze
   invented production seams.
 - Existing behavior and public APIs remain unchanged in this phase.
+
+## Semantic-v4 State/Record cutover amendment (2026-08-25)
+
+This amendment supersedes the earlier phase statement that existing selected
+behavior remains unchanged. That statement remains above as the historical
+boundary of the dependency-free implementation phase.
+
+The selected stack now composes one semantic-v4-only State/Record
+reconciliation authority behind the existing redb writer and hybrid mission
+session. Event remains compatible across semantic versions 1 through 4; v1-v3
+contacts contain no mutable frames. Stable wire/profile, handshake framing,
+source-object formats, and suite remain version 1.
+
+The mutable cutover preserves the one-authority rule. State and Record and both
+receiver directions have independent protected lanes, while one contact policy
+lease binds interest, inventory, serving, admission, exact result/
+acknowledgement, finish remainder, and cursor advancement. The selected store
+caps each object at 1 MiB and each class at 4,096 rows/16 MiB. Valid saturation,
+including the bounded causal frontier, defers without pruning; malformed,
+unauthorized, wrong-lineage, and integrity failures remain fatal.
+
+Repeated partial contacts rotate after a durable authenticated peer/class/local
+Offer/Fetch cursor. Reserved cursor metadata is capped at 256 configured peers
+and 1,024 rows and is pruned before sockets after mandatory source proof. Normal
+and AtLeast run mutable lanes; AtLeast is Event-only. ReceiveOnly initiates and
+discloses no mutable lane. Event status is not mutable convergence.
+
+Current route lineage is required. Same-epoch historical lineage is withheld
+from ordinary current projection/query and network inventory/transfer, while
+an exact idempotent State publish or Record publish/resolution retry may recover
+its committed result only through strict cached/projection/historical
+verification. Selected finite State/Record TTL is rejected. Blob networking,
+physical carriers/NAT/relay,
+BTLE, mixed implementations, N=32/resource brackets, and every release gate are
+still outside this amendment.
+
+## Semantic-v5 direct Blob continuation amendment (2026-08-25)
+
+This amendment advances only the bounded direct-content Blob slice. The
+semantic-v4 amendment above remains the historical State/Record cutover and its
+formats and behavior are inherited unchanged.
+
+The selected default offer is now `[5, 4, 3, 2, 1]`. Event remains compatible
+across v1-v5; State/Record run in v4 and v5; only v5 allocates selected Blob
+source and carrier frames. V1-v4 contacts emit and accept zero Blob frames.
+Stable wire/ABI version 1, session framing, source envelopes, manifests,
+`ASTRBT01` carriers, typed ObjectIDs, and cryptographic suite do not change.
+
+The redb writer remains the sole visibility authority. V5 first reconciles and
+atomically stages a fully authenticated Blob source and exact manifest plan,
+then transfers at most 16-KiB contiguous carrier-prefix extensions. Pending
+progress is keyed by source and carrier, not peer or session, so another
+eligible authenticated content peer may resume the exact complement. The
+requester's finish count is echoed only for sequencing; exact Result/Ack tuples
+record accepted prefix progress.
+
+Every inventory, source, and range send requires current route authorization,
+durable nonrevocation, and an opaque peer/mission/selector/current-content-grant
+proof. Selected route-only Blob relay is not enabled. Source route lineage and
+a distinct physical content lineage are rechecked before service and promotion.
+After same-epoch key replacement, old rows and proofs are withheld; a new
+physical lineage for the same `(BlobID, content group, numeric epoch)` is also
+rejected with `PhysicalLineageConflict`, so retry requires an epoch advance.
+Terminal or stale source retirement preserves an exact unfinished, non-public
+`BLOB_IMPORTS` physical-lineage fence while reclaiming its chunks, finalized
+digest, files, and reserved/committed bytes. The fence consumes one existing
+bounded variant slot, remains owner/backing-bound and open-path audited, permits
+only exact-lineage refill at that epoch, and introduces no table or schema.
+
+The selected network bounds are 64 MiB plaintext, 1,024 chunks, 10,000 pending
+rows, 64 MiB of pending prefix bytes, and 16 KiB per range. No pending source or
+carrier is ordinarily visible. Atomic promotion requires every canonical
+carrier, depot completion, a fresh full-content proof, and a fresh current-
+lineage proof to agree with the exact plan.
+
+Read-only, writable, and terminal-preservation opens cross-audit pending source,
+manifest route, carrier set, depot plan, and the completed namespace; mismatch
+or pending/completed collision fails without repair. The predecessor nine-table
+Blob schema gains the four v5 network tables only as one wholly absent group on
+a writable owner-attributed migration. Read-only or partial-group open does not
+migrate or repair state.
+
+Durable source transitions and authenticated-cache transitions share one local
+lifecycle lock, including staging, repair, retirement, and reconciliation. The
+lock crosses no await or network work. Post-abort reconciliation rereads and
+freshly authenticates any exact concurrent restage before restoring its cache
+claim. A terminal multi-carrier source advances its scheduler cursor to the
+lexicographically greatest carrier ID in the source, not manifest-last.
+
+Normal and AtLeast run the lane; AtLeast remains Event-only. ReceiveOnly runs
+zero Blob work. Live Blob application access/subscription, route-only relay or
+custody, TTL/expiry/GC, pure-byte identity/deduplication, large-file and resource
+acceptance, physical/multicarrier execution, mixed implementations, and release
+authorization remain outside this amendment.
+
+## Controlled Iroh connectivity-relay amendment (2026-08-25)
+
+This amendment advances only the bounded selected carrier route beneath the
+existing peer QUIC and hybrid mission session. A node may use its exact initial
+direct locator with exactly one operator-pinned relay, or enter an explicit
+relay-only mode. The relay is connectivity infrastructure: it owns no Aster
+store, route grant, custody, semantic reconciliation, or application
+authority. It is distinct from an Aster mission node performing payload-blind
+Event route-only custody. Selected route-only Blob relay/custody remains
+unimplemented.
+
+The relay locator must be one HTTPS root origin with a host and no user
+information, non-root path, query, or fragment, and is capped at 2 KiB. Trust
+is explicit: either embedded WebPKI roots or one to eight operator-supplied DER
+CA roots, each at most 64 KiB and at most 256 KiB combined. Explicit roots
+replace WebPKI. There is no insecure TLS mode, WebPKI fallback from explicit
+roots, public/default relay substitution, hosted lookup, or port mapping.
+
+The carrier `PeerRoute` accepts at most eight sorted unique operator-supplied
+initial direct candidates and at most 3,072 serialized bytes. The current node
+CLI deliberately supplies one initial socket for each legacy `--peer` value. In
+direct-plus-controlled-relay mode the node binds direct UDP/IP and does not
+wait for relay readiness, so a dead relay does not block the exact direct
+candidate. Relay-only mode waits for the pinned relay before reporting ready,
+clears all IP transports, and supplies no direct candidate.
+
+These are initial route hints, not lifetime address pins. Iroh may probe direct
+and relay paths in parallel and, after authenticating the exact endpoint ID,
+may derive later direct paths through its NAT negotiation. The endpoint ID and
+sole relay origin remain exact; there is no direct-first chronology or temporal
+fallback guarantee. Representative NAT behavior is not accepted by this
+amendment.
+
+The runtime reports only the most recently observed Direct, Relay, or Unknown
+path plus a coalesced transition count capped at 1,024 and a saturation marker.
+Ordinary close retains the last observation; event loss or continuity failure
+produces Unknown and saturation. This witness is bounded diagnostic state only
+and never establishes identity, mission membership, authorization, admission,
+receipt validity, transfer success, or convergence.
+
+The implementation is bound to signed code commit
+`b0a1203f4f24c05edd31e5ce1ea0f3b7f9bd2f52`. Focused carrier, CLI, and
+real-process tests cover exact route/trust bounds, pinned TLS and no trust
+fallback, direct and relay selection, dead-relay direct operation, identity
+failure, bounded relay loss, flag redaction/fail-closed parsing, one-host Event
+transfer over Relay, equal-inventory no-op, and unavailable-relay direct
+operation. The final serialized repository gate passed 170 node-library, 12
+node-binary, 20 `mesh_cli`, and 13 carrier tests plus workspace/doctests,
+language, conformance, license, and dependency-boundary checks. A fresh
+all-feature Rustdoc build also passed with warnings denied.
+
+This is current-code software evidence and creates no retained receipt or new
+`observed-bounded` credit. Physical systems, representative NAT, BTLE and
+cross-transport operation, mixed implementations, N=32, resource brackets,
+payload-blind Aster-relay behavior, capture/privacy acceptance, State/Record
+or Blob over the controlled relay, route-only Blob custody, and every release
+gate remain open. No
+wire/profile, semantic, source-object, ABI, cryptographic-suite, or
+`aster-carrier/1` framing version changes.
+
+The normal node graph already contains Iroh's client-side `iroh-relay`
+dependency without enabling `iroh-relay/server` or `test-utils`; only the
+dev/all-feature `aster-iroh/test-utils` fixture adds that server/test graph and
+its server/ACME packages. The direct `rustls` 0.23.43 edge adds no new locked
+package/version. Exact graph/license, advisory, SBOM, supported-target,
+security-process, support-owner, and release-admission gates remain binding.

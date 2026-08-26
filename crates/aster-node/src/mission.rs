@@ -12,16 +12,20 @@
 
 use aster_iroh::{CarrierError, Connection, EndpointId, SecretKey};
 use aster_mesh::{
-    MAX_UNPROTECTED_PROVISIONING_BYTES, NodeId, ProvisioningBundle, ProvisioningProtectionError,
-    ReferenceAuthenticatedSession, ReferenceEnvelopeSealer, ReferenceSessionAwaitingFinished,
-    ReferenceSessionInitiator, ReferenceSessionResponder, ReferenceSessionResponderPending,
-    UnprotectedProvisioning, engine::EnvelopeError,
+    CustodyClaims, CustodyExpectation, MAX_PROTECTED_PROVISIONING_BYTES,
+    MAX_UNPROTECTED_PROVISIONING_BYTES, NodeId, ProvisioningBundle, ProvisioningLoadId,
+    ProvisioningProtectionError, ProvisioningSecretLoader, ProvisioningSecretRef,
+    ProvisioningSecretStoreError, ProvisioningUnprotector, ReferenceAuthenticatedSession,
+    ReferenceEnvelopeSealer, ReferenceSessionAwaitingFinished, ReferenceSessionInitiator,
+    ReferenceSessionResponder, ReferenceSessionResponderPending, UnprotectedProvisioning,
+    VerifiedCustodyClaims, engine::EnvelopeError, load_provisioning_secret,
+    unprotect_provisioning_artifact,
 };
 use std::{
     error::Error,
     fmt,
     fs::File,
-    io,
+    io::{self, Read},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -29,7 +33,7 @@ use std::{
 use std::{
     ffi::OsString,
     fs::OpenOptions,
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Seek, SeekFrom, Write},
     os::unix::{ffi::OsStringExt as _, fs::MetadataExt as _},
 };
 use zeroize::Zeroize as _;
@@ -636,25 +640,126 @@ fn absolute_artifact_path(path: &Path) -> io::Result<PathBuf> {
     }
 }
 
+/// Coarse, non-identifying source of one authenticated mission provision.
+///
+/// These variants deliberately do not retain a provider name, path, operation
+/// identifier, or opaque reference in operator-facing receipts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum MissionProvisioningOrigin {
+    /// Explicit plaintext compatibility path or caller-supplied plaintext bytes.
+    UnprotectedReference,
+    /// Provider-authenticated artifact, whether supplied by path or as bytes.
+    ProtectedArtifact,
+    /// Provider-persisted opaque secret reference.
+    SecretReference,
+}
+
+impl MissionProvisioningOrigin {
+    /// Stable, non-identifying spelling for operator receipts.
+    pub const fn receipt_label(self) -> &'static str {
+        match self {
+            Self::UnprotectedReference => "unprotected-reference",
+            Self::ProtectedArtifact => "provider-protected-artifact",
+            Self::SecretReference => "provider-secret-reference",
+        }
+    }
+}
+
 /// Parsed mission credentials retained as zeroizing plaintext reference bytes.
 ///
-/// This is intentionally named `UnprotectedReferenceMission` because it is not
-/// an operational at-rest protection mechanism. Runtime callers must not
-/// confuse owner-only file permissions with an admitted
-/// `ProvisioningUnprotector`. The selected runtime requires this bounded
-/// reference seam today and receipts that limitation explicitly.
+/// This is intentionally named `UnprotectedReferenceMission` because recovered
+/// canonical bytes remain in zeroizing process memory even when their source
+/// artifact was provider-protected. The source origin distinguishes that
+/// custody boundary without exposing provider or artifact identifiers.
 #[derive(Clone)]
 pub struct UnprotectedReferenceMission {
     encoded: Arc<Mutex<UnprotectedProvisioning>>,
     identity: NodeId,
     mission_authority: NodeId,
     artifact: Option<Arc<Mutex<RetainedSecretArtifact>>>,
+    secret_ref: Option<ProvisioningSecretRef>,
+    provisioning_origin: MissionProvisioningOrigin,
+    protected_state_witness: Option<PathBuf>,
 }
 
 impl UnprotectedReferenceMission {
     /// Validates and owns canonical unprotected reference bundle bytes.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, MissionProvisioningError> {
         let encoded = UnprotectedProvisioning::new(bytes)?;
+        Self::from_unprotected(encoded)
+    }
+
+    /// Authenticates one bounded provider-protected artifact and owns its
+    /// recovered canonical bundle in zeroizing process memory.
+    ///
+    /// Empty, oversized, or raw `ASTRPB03` input is rejected before provider
+    /// invocation. Passing preflight invokes `unprotector` exactly once and
+    /// never falls back to interpreting the outer bytes as plaintext. This is
+    /// a protected bootstrap seam, not persistent secret custody: the provider
+    /// identity remains caller-owned and this value has no destroyable
+    /// provider handle for the selected software-zeroization workflow.
+    pub(crate) fn from_protected_bytes<P>(
+        protected: &[u8],
+        unprotector: &mut P,
+    ) -> Result<Self, MissionProvisioningError>
+    where
+        P: ProvisioningUnprotector + ?Sized,
+    {
+        let encoded = unprotect_provisioning_artifact(protected, unprotector)?;
+        let mut mission = Self::from_unprotected(encoded)?;
+        mission.provisioning_origin = MissionProvisioningOrigin::ProtectedArtifact;
+        Ok(mission)
+    }
+
+    /// Loads and authenticates one bounded regular protected artifact.
+    ///
+    /// Local file-kind and size checks finish before the provider is invoked.
+    /// The protected file need not be owner-only because it contains only the
+    /// provider's authenticated ciphertext. An observed symlink or non-regular
+    /// file is rejected; Unix additionally binds the no-follow opened inode to
+    /// preflight metadata, while non-Unix path-swap assurance remains open.
+    /// Recovered plaintext is retained only in this zeroizing value; deleting
+    /// the ciphertext is explicitly not a key-destruction receipt.
+    pub(crate) fn load_protected<P>(
+        path: impl AsRef<Path>,
+        unprotector: &mut P,
+    ) -> Result<Self, MissionProvisioningError>
+    where
+        P: ProvisioningUnprotector + ?Sized,
+    {
+        let mut protected = read_bounded_protected_artifact(path.as_ref())?;
+        let result = Self::from_protected_bytes(&protected, unprotector);
+        protected.zeroize();
+        result
+    }
+
+    /// Loads one authenticated, provider-persisted provisioning reference.
+    ///
+    /// The exact caller-chosen operation and opaque reference are rechecked on
+    /// the returned receipt before its zeroizing plaintext is parsed. The
+    /// caller retains the provider and reference needed for later coordinated
+    /// destruction; this method alone makes no runtime-drain or physical-media
+    /// erasure claim.
+    pub(crate) fn load_from_secret_store<L>(
+        secret_ref: &ProvisioningSecretRef,
+        operation: ProvisioningLoadId,
+        loader: &mut L,
+    ) -> Result<Self, MissionProvisioningError>
+    where
+        L: ProvisioningSecretLoader + ?Sized,
+    {
+        let receipt = load_provisioning_secret(operation, secret_ref, loader)
+            .map_err(secret_store_provisioning_error)?;
+        let mut mission = Self::from_unprotected(receipt.into_plaintext())?;
+        mission.secret_ref = Some(secret_ref.clone());
+        mission.provisioning_origin = MissionProvisioningOrigin::SecretReference;
+        Ok(mission)
+    }
+
+    fn from_unprotected(
+        encoded: UnprotectedProvisioning,
+    ) -> Result<Self, MissionProvisioningError> {
         let bundle = ProvisioningBundle::from_bytes(encoded.expose())?;
         let sealer = ReferenceEnvelopeSealer::open(bundle)?;
         let identity = sealer.identity();
@@ -664,6 +769,9 @@ impl UnprotectedReferenceMission {
             identity,
             mission_authority,
             artifact: None,
+            secret_ref: None,
+            provisioning_origin: MissionProvisioningOrigin::UnprotectedReference,
+            protected_state_witness: None,
         })
     }
 
@@ -692,6 +800,39 @@ impl UnprotectedReferenceMission {
     /// Stable authority identity authenticated by this validated mission bundle.
     pub const fn mission_authority_id(&self) -> NodeId {
         self.mission_authority
+    }
+
+    /// Coarse provisioning source suitable for operator-visible receipts.
+    ///
+    /// This value never identifies a path, provider, operation, or opaque
+    /// secret reference. Protected in-memory bytes and protected files share
+    /// one origin because both cross the same authenticated provider boundary.
+    pub const fn provisioning_origin(&self) -> MissionProvisioningOrigin {
+        self.provisioning_origin
+    }
+
+    /// Opaque provider-persisted reference used to load this mission, if any.
+    ///
+    /// The reference contains no credential plaintext but remains redacted in
+    /// Debug output and should be handed only to the configured backend.
+    pub const fn persistent_secret_ref(&self) -> Option<&ProvisioningSecretRef> {
+        self.secret_ref.as_ref()
+    }
+
+    /// Binds the lexical state root checked before protected provisioning.
+    ///
+    /// The selected runtime uses this crate-private witness to reject a later
+    /// mutation of public `NodeConfig::state` without invoking the provider a
+    /// second time. Callers must supply the already-normalized path checked
+    /// before the protected credential source was accessed.
+    pub(crate) fn with_protected_state_witness(mut self, state: PathBuf) -> Self {
+        self.protected_state_witness = Some(state);
+        self
+    }
+
+    /// Lexical state root checked before protected provisioning, if retained.
+    pub(crate) fn protected_state_witness(&self) -> Option<&Path> {
+        self.protected_state_witness.as_deref()
     }
 
     /// Side-effect-free validation and retention before terminal zeroization commit.
@@ -727,6 +868,70 @@ impl UnprotectedReferenceMission {
         }
         ProvisioningBundle::from_bytes(encoded.expose()).map_err(Into::into)
     }
+}
+
+fn read_bounded_protected_artifact(path: &Path) -> Result<Vec<u8>, MissionProvisioningError> {
+    let path_metadata = std::fs::symlink_metadata(path)?;
+    if !path_metadata.file_type().is_file() {
+        return Err(MissionProvisioningError::NotRegular(path.to_path_buf()));
+    }
+    let maximum = u64::try_from(MAX_PROTECTED_PROVISIONING_BYTES)
+        .expect("protected provisioning bound fits in u64");
+    if path_metadata.len() > maximum {
+        return Err(MissionProvisioningError::TooLarge {
+            path: path.to_path_buf(),
+            actual: path_metadata.len(),
+            maximum,
+        });
+    }
+
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let mut options = OpenOptions::new();
+        options.read(true);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        options.open(path)?
+    };
+    #[cfg(not(unix))]
+    let file = File::open(path)?;
+
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(MissionProvisioningError::NotRegular(path.to_path_buf()));
+    }
+    #[cfg(unix)]
+    if path_metadata.dev() != metadata.dev() || path_metadata.ino() != metadata.ino() {
+        return Err(MissionProvisioningError::Changed(path.to_path_buf()));
+    }
+    if metadata.len() > maximum {
+        return Err(MissionProvisioningError::TooLarge {
+            path: path.to_path_buf(),
+            actual: metadata.len(),
+            maximum,
+        });
+    }
+
+    let capacity = usize::try_from(metadata.len()).unwrap_or(0);
+    let mut protected = Vec::with_capacity(capacity);
+    if let Err(error) = file
+        .take(maximum.saturating_add(1))
+        .read_to_end(&mut protected)
+    {
+        protected.zeroize();
+        return Err(error.into());
+    }
+    let actual = u64::try_from(protected.len()).expect("vector length fits in u64");
+    if actual > maximum {
+        protected.zeroize();
+        return Err(MissionProvisioningError::TooLarge {
+            path: path.to_path_buf(),
+            actual,
+            maximum,
+        });
+    }
+    Ok(protected)
 }
 
 #[cfg(unix)]
@@ -844,6 +1049,12 @@ impl fmt::Debug for UnprotectedReferenceMission {
             .field("mission_authority", &self.mission_authority)
             .field("encoded_len", &encoded_len)
             .field("persisted", &self.artifact.is_some())
+            .field("provider_persisted", &self.secret_ref.is_some())
+            .field("provisioning_origin", &self.provisioning_origin)
+            .field(
+                "protected_state_witness_present",
+                &self.protected_state_witness.is_some(),
+            )
             .field("provisioning", &"[UNPROTECTED REFERENCE BYTES REDACTED]")
             .finish()
     }
@@ -882,12 +1093,12 @@ impl fmt::Display for MissionProvisioningError {
             Self::Io(error) => write!(formatter, "mission provisioning I/O: {error}"),
             Self::NotRegular(path) => write!(
                 formatter,
-                "unprotected reference mission bundle is not a regular file: {}",
+                "mission provisioning artifact is not a regular file: {}",
                 path.display()
             ),
             Self::Changed(path) => write!(
                 formatter,
-                "unprotected reference mission bundle changed while opening: {}",
+                "mission provisioning artifact changed while opening: {}",
                 path.display()
             ),
             Self::UnsafePermissions(path) => write!(
@@ -906,7 +1117,7 @@ impl fmt::Display for MissionProvisioningError {
                 maximum,
             } => write!(
                 formatter,
-                "unprotected reference mission bundle {} is {actual} bytes; maximum is {maximum}",
+                "mission provisioning artifact {} is {actual} bytes; maximum is {maximum}",
                 path.display()
             ),
             Self::Protection(error) => write!(formatter, "mission provisioning: {error}"),
@@ -954,6 +1165,17 @@ impl From<SoftwareErasureError> for MissionProvisioningError {
     fn from(error: SoftwareErasureError) -> Self {
         Self::Artifact(error)
     }
+}
+
+fn secret_store_provisioning_error(
+    error: ProvisioningSecretStoreError,
+) -> MissionProvisioningError {
+    let error = match error {
+        ProvisioningSecretStoreError::Unavailable => ProvisioningProtectionError::Unavailable,
+        ProvisioningSecretStoreError::TooLarge => ProvisioningProtectionError::TooLarge,
+        _ => ProvisioningProtectionError::Rejected,
+    };
+    MissionProvisioningError::Protection(error)
 }
 
 impl MissionProvisioningError {
@@ -1463,6 +1685,25 @@ impl MissionSession {
         self.inner.open_frame(frame).map_err(Into::into)
     }
 
+    /// Protects one exact semantic-v3 custody claim in its dedicated record domain.
+    pub fn seal_custody_wrapper(
+        &mut self,
+        claims: &CustodyClaims,
+    ) -> Result<Vec<u8>, MissionSessionError> {
+        self.inner.seal_custody_wrapper(claims).map_err(Into::into)
+    }
+
+    /// Opens and exact-context-checks one semantic-v3 custody claim.
+    pub fn open_custody_wrapper(
+        &mut self,
+        wrapper: &[u8],
+        expected: CustodyExpectation,
+    ) -> Result<VerifiedCustodyClaims, MissionSessionError> {
+        self.inner
+            .open_custody_wrapper(wrapper, expected)
+            .map_err(Into::into)
+    }
+
     /// Rapidly erases the directional traffic keys.
     pub fn zeroize(&mut self) {
         self.inner.zeroize();
@@ -1486,7 +1727,8 @@ mod tests {
     use crate::frame::{EventDirection, Frame};
     use aster_iroh::{Endpoint, EndpointConfig, ExpectedPeer, SecretKey};
     use aster_mesh::{
-        ProvisioningAccess, ReferenceEnvelopeSealer, ReferenceProvisioner, Scope, Topic,
+        ProvisioningAccess, ProvisioningLoadReceipt, ReferenceEnvelopeSealer, ReferenceProvisioner,
+        Scope, Topic,
     };
     use std::{collections::BTreeSet, net::SocketAddr};
 
@@ -1499,6 +1741,70 @@ mod tests {
     impl IssuedNode {
         fn bundle(&self) -> ProvisioningBundle {
             ProvisioningBundle::from_bytes(&self.bundle).expect("parse issued bundle")
+        }
+    }
+
+    struct TestProvisioningUnprotector {
+        calls: usize,
+        maximum_plaintext_len: Option<usize>,
+        plaintext: Option<Vec<u8>>,
+    }
+
+    impl TestProvisioningUnprotector {
+        fn new(plaintext: Vec<u8>) -> Self {
+            Self {
+                calls: 0,
+                maximum_plaintext_len: None,
+                plaintext: Some(plaintext),
+            }
+        }
+    }
+
+    impl ProvisioningUnprotector for TestProvisioningUnprotector {
+        fn unprotect(
+            &mut self,
+            _protected: &[u8],
+            maximum_plaintext_len: usize,
+        ) -> Result<UnprotectedProvisioning, ProvisioningProtectionError> {
+            self.calls += 1;
+            self.maximum_plaintext_len = Some(maximum_plaintext_len);
+            UnprotectedProvisioning::new(
+                self.plaintext
+                    .take()
+                    .ok_or(ProvisioningProtectionError::Unavailable)?,
+            )
+        }
+    }
+
+    struct TestProvisioningSecretLoader {
+        calls: usize,
+        expected_operation: ProvisioningLoadId,
+        expected_ref: ProvisioningSecretRef,
+        returned_operation: ProvisioningLoadId,
+        returned_ref: ProvisioningSecretRef,
+        plaintext: Option<Vec<u8>>,
+    }
+
+    impl ProvisioningSecretLoader for TestProvisioningSecretLoader {
+        fn load(
+            &mut self,
+            operation: ProvisioningLoadId,
+            secret_ref: &ProvisioningSecretRef,
+        ) -> Result<ProvisioningLoadReceipt, ProvisioningSecretStoreError> {
+            self.calls += 1;
+            assert_eq!(operation, self.expected_operation);
+            assert_eq!(secret_ref, &self.expected_ref);
+            let plaintext = UnprotectedProvisioning::new(
+                self.plaintext
+                    .take()
+                    .ok_or(ProvisioningSecretStoreError::Unavailable)?,
+            )
+            .map_err(|_| ProvisioningSecretStoreError::Rejected)?;
+            Ok(ProvisioningLoadReceipt::new(
+                self.returned_operation,
+                self.returned_ref.clone(),
+                plaintext,
+            ))
         }
     }
 
@@ -1530,6 +1836,44 @@ mod tests {
 
     fn binding(peer: &IssuedNode) -> MissionPeerBinding {
         MissionPeerBinding::new(peer.carrier, peer.identity)
+    }
+
+    #[test]
+    fn provisioning_origins_have_stable_nonidentifying_receipt_labels() {
+        assert_eq!(
+            MissionProvisioningOrigin::UnprotectedReference.receipt_label(),
+            "unprotected-reference"
+        );
+        assert_eq!(
+            MissionProvisioningOrigin::ProtectedArtifact.receipt_label(),
+            "provider-protected-artifact"
+        );
+        assert_eq!(
+            MissionProvisioningOrigin::SecretReference.receipt_label(),
+            "provider-secret-reference"
+        );
+    }
+
+    #[test]
+    fn protected_state_witness_is_lexical_and_clone_local() {
+        let mut provisioner = ReferenceProvisioner::from_seed([0x63; 32]).expect("provisioner");
+        let issued = issue(&mut provisioner, 1);
+        let mission = UnprotectedReferenceMission::from_bytes(issued.bundle)
+            .expect("parse unprotected reference mission");
+        let witnessed = mission
+            .clone()
+            .with_protected_state_witness(PathBuf::from("/exact/lexical/state"));
+
+        assert_eq!(
+            mission.provisioning_origin(),
+            MissionProvisioningOrigin::UnprotectedReference
+        );
+        assert_eq!(mission.protected_state_witness(), None);
+        assert_eq!(
+            witnessed.protected_state_witness(),
+            Some(Path::new("/exact/lexical/state"))
+        );
+        assert!(Arc::ptr_eq(&mission.encoded, &witnessed.encoded));
     }
 
     fn establish(
@@ -1856,6 +2200,188 @@ mod tests {
             responder_state.receive_client(&damaged),
             Err(MissionSessionError::Authentication(_))
         ));
+    }
+
+    #[test]
+    fn protected_reference_bundle_invokes_provider_once_without_plaintext_fallback() {
+        let mut provisioner = ReferenceProvisioner::from_seed([0x66; 32]).expect("provisioner");
+        let issued = issue(&mut provisioner, 1);
+        let expected_identity = issued.identity;
+        let mut unprotector = TestProvisioningUnprotector::new(issued.bundle.clone());
+
+        let mission = UnprotectedReferenceMission::from_protected_bytes(
+            b"provider-authenticated-envelope",
+            &mut unprotector,
+        )
+        .expect("open protected reference bundle");
+        assert_eq!(mission.identity(), expected_identity);
+        assert_eq!(
+            mission.provisioning_origin(),
+            MissionProvisioningOrigin::ProtectedArtifact
+        );
+        assert_eq!(unprotector.calls, 1);
+        assert_eq!(
+            unprotector.maximum_plaintext_len,
+            Some(MAX_UNPROTECTED_PROVISIONING_BYTES)
+        );
+        assert!(matches!(
+            mission.prepare_software_erasure(),
+            Err(MissionProvisioningError::Artifact(
+                SoftwareErasureError::NoPersistedArtifact
+            ))
+        ));
+
+        let mut rejected = TestProvisioningUnprotector::new(issued.bundle.clone());
+        assert!(matches!(
+            UnprotectedReferenceMission::from_protected_bytes(&[], &mut rejected),
+            Err(MissionProvisioningError::Protection(
+                ProvisioningProtectionError::Rejected
+            ))
+        ));
+        assert_eq!(rejected.calls, 0);
+        assert!(matches!(
+            UnprotectedReferenceMission::from_protected_bytes(&issued.bundle, &mut rejected),
+            Err(MissionProvisioningError::Protection(
+                ProvisioningProtectionError::Rejected
+            ))
+        ));
+        assert_eq!(rejected.calls, 0);
+        assert!(matches!(
+            UnprotectedReferenceMission::from_protected_bytes(
+                &vec![0x55; MAX_PROTECTED_PROVISIONING_BYTES + 1],
+                &mut rejected,
+            ),
+            Err(MissionProvisioningError::Protection(
+                ProvisioningProtectionError::TooLarge
+            ))
+        ));
+        assert_eq!(rejected.calls, 0);
+    }
+
+    #[test]
+    fn persistent_secret_reference_is_exactly_bound_and_not_software_erasure() {
+        let mut provisioner = ReferenceProvisioner::from_seed([0x69; 32]).expect("provisioner");
+        let issued = issue(&mut provisioner, 1);
+        let operation = ProvisioningLoadId::new([0x6a; 32]);
+        let secret_ref =
+            ProvisioningSecretRef::from_opaque(b"provider-secret-handle-canary".to_vec())
+                .expect("secret ref");
+        let mut loader = TestProvisioningSecretLoader {
+            calls: 0,
+            expected_operation: operation,
+            expected_ref: secret_ref.clone(),
+            returned_operation: operation,
+            returned_ref: secret_ref.clone(),
+            plaintext: Some(issued.bundle.clone()),
+        };
+
+        let mission = UnprotectedReferenceMission::load_from_secret_store(
+            &secret_ref,
+            operation,
+            &mut loader,
+        )
+        .expect("load exact persistent secret");
+        assert_eq!(loader.calls, 1);
+        assert_eq!(mission.identity(), issued.identity);
+        assert_eq!(mission.persistent_secret_ref(), Some(&secret_ref));
+        assert_eq!(
+            mission.provisioning_origin(),
+            MissionProvisioningOrigin::SecretReference
+        );
+        let clone = mission.clone();
+        assert_eq!(clone.persistent_secret_ref(), Some(&secret_ref));
+        assert!(Arc::ptr_eq(&mission.encoded, &clone.encoded));
+        drop(clone);
+        assert_eq!(mission.persistent_secret_ref(), Some(&secret_ref));
+        assert!(!format!("{mission:?}").contains("provider-secret-handle-canary"));
+        assert!(matches!(
+            mission.prepare_software_erasure(),
+            Err(MissionProvisioningError::Artifact(
+                SoftwareErasureError::NoPersistedArtifact
+            ))
+        ));
+
+        let other_ref =
+            ProvisioningSecretRef::from_opaque(b"another-handle".to_vec()).expect("other ref");
+        let mut mismatched = TestProvisioningSecretLoader {
+            calls: 0,
+            expected_operation: operation,
+            expected_ref: secret_ref.clone(),
+            returned_operation: operation,
+            returned_ref: other_ref,
+            plaintext: Some(issued.bundle),
+        };
+        assert!(matches!(
+            UnprotectedReferenceMission::load_from_secret_store(
+                &secret_ref,
+                operation,
+                &mut mismatched,
+            ),
+            Err(MissionProvisioningError::Protection(
+                ProvisioningProtectionError::Rejected
+            ))
+        ));
+        assert_eq!(mismatched.calls, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_reference_file_preflight_is_bounded_regular_and_provider_first() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let root = std::env::temp_dir().join(format!(
+            "aster-protected-mission-provisioning-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create root");
+
+        let mut provisioner = ReferenceProvisioner::from_seed([0x67; 32]).expect("provisioner");
+        let issued = issue(&mut provisioner, 1);
+        let mut unprotector = TestProvisioningUnprotector::new(issued.bundle.clone());
+
+        assert!(matches!(
+            UnprotectedReferenceMission::load_protected(&root, &mut unprotector),
+            Err(MissionProvisioningError::NotRegular(path)) if path == root
+        ));
+        assert_eq!(unprotector.calls, 0);
+
+        let oversized = root.join("oversized.protected");
+        std::fs::write(&oversized, vec![0x55; MAX_PROTECTED_PROVISIONING_BYTES + 1])
+            .expect("write oversized protected artifact");
+        assert!(matches!(
+            UnprotectedReferenceMission::load_protected(&oversized, &mut unprotector),
+            Err(MissionProvisioningError::TooLarge { .. })
+        ));
+        assert_eq!(unprotector.calls, 0);
+
+        let protected = root.join("mission.protected");
+        std::fs::write(&protected, b"provider-authenticated-envelope")
+            .expect("write protected artifact");
+        std::fs::set_permissions(&protected, std::fs::Permissions::from_mode(0o644))
+            .expect("set ciphertext permissions");
+        let symlink_path = root.join("mission-link.protected");
+        symlink(&protected, &symlink_path).expect("create protected artifact symlink");
+        assert!(matches!(
+            UnprotectedReferenceMission::load_protected(&symlink_path, &mut unprotector),
+            Err(MissionProvisioningError::NotRegular(path)) if path == symlink_path
+        ));
+        assert_eq!(unprotector.calls, 0);
+
+        let expected_identity = issued.identity;
+        let mission = UnprotectedReferenceMission::load_protected(&protected, &mut unprotector)
+            .expect("load protected artifact");
+        assert_eq!(mission.identity(), expected_identity);
+        assert_eq!(unprotector.calls, 1);
+        assert!(matches!(
+            mission.prepare_software_erasure(),
+            Err(MissionProvisioningError::Artifact(
+                SoftwareErasureError::NoPersistedArtifact
+            ))
+        ));
+
+        drop(mission);
+        std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[cfg(unix)]

@@ -10,11 +10,13 @@ a reducer.
 The application handle remains deliberately stopped and exclusive; there is no
 live State publish/query handle, durable State subscription, or language
 binding. A separately running node can now reconcile already durable State
-objects over a mission-authenticated, class-specific Negentropy lane when the
+objects over a semantic-v4/v5 mission-authenticated, class- and direction-specific
+Negentropy lane when the
 receiver configures an exact topic/scope interest. Finite TTL, expiry, garbage
 collection, broader relay acceptance, and independent interoperability remain
-open. The local example below demonstrates the projection, while the focused
-runtime test exercises one real-Iroh delivery.
+open. The selected store rejects every finite-TTL State object; there is no
+forwarding-age path to enable yet. The local example below demonstrates the
+projection, while focused runtime automation exercises direct-Iroh delivery.
 
 ## Run the example
 
@@ -63,10 +65,20 @@ aster node ... --state-interest sensors@mission/alpha
 An empty State interest set means receive-none, never wildcard. Topic/scope
 interest is only desired receipt: current mission membership, route authority,
 content authority, source authentication, revocation, and scope epoch still
-have to pass. Remote finite-TTL State is rejected until authenticated cumulative
-forwarding age exists.
+have to pass. Remote finite-TTL State is rejected. Semantic versions 1 through
+3 run their Event compatibility lanes but contain no State interest, inventory,
+fetch, offer, result, or finish frames.
 
-The current-code real-carrier acceptance test creates a durable State on one
+On semantic v4 or v5, Normal and every `AtLeast` Event threshold still run the State
+lane; the threshold does not filter State. `ReceiveOnly` initiates and discloses
+no State lane. An object is limited to 1 MiB, and selected State storage is
+capped at 4,096 rows and 16 MiB of encoded source bytes. Capacity saturation is
+an authenticated deferred outcome, not a duplicate or integrity success.
+Fetch result and acknowledgement must match exactly, as must both finish
+remainders. A durable cursor rotates the authenticated peer/class/local-mode
+starting point so bounded contacts do not permanently prefer the same ID.
+
+The current-code real-carrier automation test creates a durable State on one
 store, makes a mission-authenticated direct Iroh contact, and verifies the other
 independent redb store receives it:
 
@@ -76,9 +88,14 @@ cargo test --locked -p aster-node \
   -- --exact
 ```
 
-This is bounded same-implementation, one-host, two-node evidence. It is not a
-retained release receipt, a multi-hop/partition sweep, or proof of convergence
-for every reachable subscriber.
+This is current-code bounded same-implementation, one-host, two-node evidence.
+Additional current-code regressions cover exact result/acknowledgement,
+capacity deferral, fair rotation, and restart. Same-epoch old lineage is
+withheld from ordinary current projection/query and network inventory/transfer;
+only an exact idempotent publish retry may recover its committed result through
+strict cached/projection/historical verification. This is not a retained
+release receipt, a multi-hop/partition sweep, or proof of convergence for every
+reachable subscriber.
 
 ## Use the stopped API
 

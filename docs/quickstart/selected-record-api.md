@@ -10,11 +10,14 @@ bytes, or runs untrusted merge code during ingest.
 The application handle remains deliberately stopped and exclusive; there is no
 live Record publish/query handle, durable Record subscription, or language
 binding. A separately running node can now reconcile already durable revisions
-over a mission-authenticated, class-specific Negentropy lane when the receiver
+over a semantic-v4/v5 mission-authenticated, class- and direction-specific
+Negentropy lane when the receiver
 configures an exact topic/scope interest. Ingest never executes registered merge
 code, so concurrent heads remain durable and explicit. Finite TTL, expiry,
 garbage collection, automatic registered-policy merge, broader relay
-acceptance, and independent interoperability remain open.
+acceptance, and independent interoperability remain open. The selected store
+rejects every finite-TTL Record object; there is no forwarding-age path to
+enable yet.
 
 ## Run the example
 
@@ -78,10 +81,21 @@ aster node ... --record-interest reports@mission/alpha
 An empty Record interest set means receive-none, never wildcard. Topic/scope
 interest is only desired receipt: current mission membership, route authority,
 content authority, source authentication, revocation, and scope epoch still
-have to pass. Remote finite-TTL Record is rejected until authenticated
-cumulative forwarding age exists.
+have to pass. Remote finite-TTL Record is rejected. Semantic versions 1 through
+3 retain Event compatibility but contain no Record interest, inventory, fetch,
+offer, result, or finish frames.
 
-The current-code real-carrier acceptance test creates concurrent revisions on
+On semantic v4 or v5, Normal and every `AtLeast` Event threshold still run the Record
+lane; the threshold does not filter Record. `ReceiveOnly` initiates and
+discloses no Record lane. An object is limited to 1 MiB, and selected Record
+storage is capped at 4,096 rows and 16 MiB of encoded source bytes. Capacity
+saturation is an authenticated deferred outcome, not a duplicate or integrity
+success. Fetch result and acknowledgement must match exactly, as must both
+finish remainders. A durable cursor rotates the authenticated
+peer/class/local-mode starting point so bounded contacts do not permanently
+prefer the same revision.
+
+The current-code real-carrier automation test creates concurrent revisions on
 two independent stores while disconnected, makes one mission-authenticated
 direct Iroh contact, and verifies both exact revision inventories converge and
 both causal heads remain present on both stores:
@@ -92,9 +106,14 @@ cargo test --locked -p aster-node \
   -- --exact
 ```
 
-No application merge callback runs during ingest. This is bounded
-same-implementation, one-host, two-node evidence, not a retained release
-receipt, multi-hop/partition sweep, or automatic merge implementation.
+No application merge callback runs during ingest. Current-code regressions also
+cover exact result/acknowledgement, capacity deferral, fair rotation,
+and restart. Same-epoch old lineage is withheld from ordinary current
+projection/query and network inventory/transfer; only an exact idempotent
+publish/resolution retry may recover its committed result through strict
+cached/projection/historical verification. This is bounded same-implementation,
+one-host, two-node evidence, not a retained release receipt,
+multi-hop/partition sweep, or automatic merge implementation.
 
 ## Use the stopped API
 

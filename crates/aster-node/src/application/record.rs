@@ -12,20 +12,24 @@
 use std::{fmt, fs, path::Path, sync::Arc};
 
 use aster_mesh::{
-    CausalStamp, NodeId, Priority, RecordContentVerification, ReferenceEnvelopeSealer, Scope, Topic,
+    CausalStamp, NodeId, Priority, RecordContentVerification, ReferenceEnvelopeSealer,
+    RouteVerifiedRecordEnvelope, Scope, Topic,
 };
 use aster_redb_store::{
     ControlPolicySnapshot, ControlTransferId, RecordOperationKey, RecordOperationRequest,
     RecordProjectionPlan, RecordPublicationIntent, RecordResolutionRequest as StoreResolution,
-    RecordSemanticId, RecordVersionDisposition as StoreRecordDisposition, Store, StoredRecord,
+    RecordSemanticId, RecordSenderProjection, RecordVersionDisposition as StoreRecordDisposition,
+    Store, StoredRecord,
 };
 
 use super::{ApplicationError, ApplicationErrorKind, application_error};
 use crate::{
+    frame::MAX_OBJECT_BYTES,
     mission::UnprotectedReferenceMission,
     runtime::{
-        STORE_FILE, ensure_principal_active, ensure_state_accepts_normal_operation,
-        open_replayed_verifier, refresh_application_policy,
+        AuthenticatedEventRouteCache, STORE_FILE, StartupEventVerification,
+        ensure_principal_active, ensure_state_accepts_normal_operation,
+        open_startup_event_verifier_and_cache, refresh_application_policy,
     },
 };
 
@@ -106,8 +110,10 @@ pub struct RecordQuery {
     pub logical_key: Vec<u8>,
     /// Include active causally dominated versions in `superseded`.
     ///
-    /// Every retained candidate is freshly verified regardless. Concurrent
-    /// heads can never be hidden by this option.
+    /// Every current-lineage candidate is freshly opened; a retained candidate
+    /// whose route key was replaced at the same epoch is withheld only after
+    /// its exact startup-authenticated cache claim matches the current Store
+    /// projection. Concurrent active heads can never be hidden by this option.
     pub include_superseded_versions: bool,
 }
 
@@ -140,7 +146,12 @@ pub struct RecordResolutionGuard {
 }
 
 impl RecordResolutionGuard {
-    /// Exact active causal heads, sorted by complete semantic identity.
+    /// Exact numeric-policy causal heads, sorted by complete semantic identity.
+    ///
+    /// A head whose same-epoch route lineage was replaced can appear here even
+    /// though its plaintext is withheld from the projection. The opaque ID is
+    /// still bound to a startup-authenticated exact source and is necessary to
+    /// authorize a successor that closes the durable Store conflict.
     pub fn siblings(&self) -> &[RecordId] {
         &self.siblings
     }
@@ -175,9 +186,11 @@ impl fmt::Debug for RecordResolutionGuard {
 
 /// Explicit application-visible Record conflict annotation.
 ///
-/// No merge policy is run by Aster. Applications may inspect the siblings,
-/// compute a deterministic result in their own code, then submit the embedded
-/// guard through [`SelectedRecordNode::resolve`].
+/// No merge policy is run by Aster. Applications may inspect the authenticated
+/// sibling identities, compute a deterministic result from any visible values
+/// and their own policy, then submit the embedded guard through
+/// [`SelectedRecordNode::resolve`]. A conflict can contain only opaque IDs when
+/// every numeric-policy head has a superseded route lineage.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecordConflict {
     pub siblings: Vec<RecordId>,
@@ -187,8 +200,11 @@ pub struct RecordConflict {
 /// Deterministic Record projection with explicit conflict and history lanes.
 ///
 /// A current tombstone remains visible; deletion never wins a concurrent tie
-/// merely because it is a tombstone. Inactive retained rows are freshly
-/// verified but not exposed.
+/// merely because it is a tombstone. The numeric Store reduction is checked
+/// before the stricter route-lineage reduction; inactive and cache-proven
+/// superseded-lineage rows are not exposed as [`RecordItem`] plaintext. Their
+/// authenticated IDs remain in `conflict` when required to resolve an exact
+/// durable multi-head plan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecordProjection {
     pub current: Option<RecordItem>,
@@ -212,9 +228,11 @@ pub struct RecordResolveRequest {
 }
 
 struct VerifiedRecordCandidate {
-    item: RecordItem,
+    id: RecordId,
+    item: Option<RecordItem>,
     stamp: CausalStamp,
     store_disposition: Option<StoreRecordDisposition>,
+    policy_active: bool,
     active: bool,
 }
 
@@ -227,15 +245,18 @@ pub struct SelectedRecordNode {
     mission: UnprotectedReferenceMission,
     store: Arc<Store>,
     verifier: ReferenceEnvelopeSealer,
+    historical_verifier: ReferenceEnvelopeSealer,
     verifier_head: Option<(u64, ControlTransferId)>,
+    source_route_cache: Arc<AuthenticatedEventRouteCache>,
 }
 
 impl SelectedRecordNode {
     /// Opens the explicitly unprotected reference provisioning path.
     ///
     /// Terminal state is rejected before mission bytes are loaded. The exact
-    /// store is mission-bound and process-locked, then committed control is
-    /// replayed before any Record operation becomes available.
+    /// store is mission-bound and process-locked, every retained exact source
+    /// is proved across ordered control replay, then the current verifier and
+    /// bounded route-lineage cache become available to Record operations.
     pub fn open_unprotected_reference(
         state: impl AsRef<Path>,
         mission_bundle: impl AsRef<Path>,
@@ -252,7 +273,12 @@ impl SelectedRecordNode {
         store
             .require_process_exclusive_lock()
             .map_err(|error| application_error("record open", error.into()))?;
-        let verifier = open_replayed_verifier(&store, &mission)
+        let StartupEventVerification {
+            verifier,
+            historical_verifier,
+            cache: source_route_cache,
+            policy: _,
+        } = open_startup_event_verifier_and_cache(&store, &mission)
             .map_err(|error| application_error("record open", error))?;
         ensure_principal_active(&store, verifier.identity())
             .map_err(|error| application_error("record open", error))?;
@@ -263,7 +289,9 @@ impl SelectedRecordNode {
             mission,
             store: Arc::new(store),
             verifier,
+            historical_verifier,
             verifier_head,
+            source_route_cache,
         };
         selected.current_policy("record open")?;
         Ok(selected)
@@ -293,6 +321,12 @@ impl SelectedRecordNode {
             payload,
             tombstone,
         } = request;
+        if payload.len() > MAX_OBJECT_BYTES {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::ResourceLimit,
+                "record publish",
+            ));
+        }
         let operation = RecordOperationKey::new(operation_key)
             .map_err(|error| application_error("record publish", error.into()))?;
         let intent = RecordPublicationIntent::new(
@@ -324,6 +358,12 @@ impl SelectedRecordNode {
             .verifier
             .seal_record(&header, &payload)
             .map_err(|error| application_error("record publish", error.into()))?;
+        if sealed.bytes.len() > MAX_OBJECT_BYTES {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::ResourceLimit,
+                "record publish",
+            ));
+        }
         let verified = self.open_published_record(&sealed.bytes, &payload, "record publish")?;
         let outcome = self
             .store
@@ -336,7 +376,14 @@ impl SelectedRecordNode {
             )
             .map_err(|error| application_error("record publish", error.into()))?;
         let record = outcome.record();
-        self.verify_publication_result(&intent, &payload, record, "record publish")?;
+        self.verify_publication_result(
+            &policy,
+            &intent,
+            &payload,
+            record,
+            outcome.inserted(),
+            "record publish",
+        )?;
         Ok(record_result(record, outcome.inserted()))
     }
 
@@ -384,6 +431,12 @@ impl SelectedRecordNode {
                 "record resolve",
             ));
         }
+        if payload.len() > MAX_OBJECT_BYTES {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::ResourceLimit,
+                "record resolve",
+            ));
+        }
         let RecordResolutionGuard { plan, siblings } = resolution_guard;
         let policy = self.current_policy("record resolve")?;
         let epoch = self.active_epoch(plan.scope(), "record resolve")?;
@@ -418,7 +471,7 @@ impl SelectedRecordNode {
             // discrimination to the store's guard-bound operation digest. A
             // new operation cannot commit against the stale policy; an exact
             // authorized retry may resolve its original durable result.
-            self.verify_historical_resolution_guard(&plan, &siblings)?;
+            self.verify_historical_resolution_guard(&policy, &plan, &siblings)?;
         }
 
         let operation = RecordOperationKey::new(operation_key)
@@ -469,6 +522,12 @@ impl SelectedRecordNode {
             .verifier
             .seal_record(&header, &payload)
             .map_err(|error| application_error("record resolve", error.into()))?;
+        if sealed.bytes.len() > MAX_OBJECT_BYTES {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::ResourceLimit,
+                "record resolve",
+            ));
+        }
         let verified = self.open_published_record(&sealed.bytes, &payload, "record resolve")?;
         let outcome = self
             .store
@@ -481,7 +540,14 @@ impl SelectedRecordNode {
             )
             .map_err(|error| application_error("record resolve", error.into()))?;
         let record = outcome.record();
-        self.verify_publication_result(&intent, &payload, record, "record resolve")?;
+        self.verify_publication_result(
+            &policy,
+            &intent,
+            &payload,
+            record,
+            outcome.inserted(),
+            "record resolve",
+        )?;
         if !context_observes_all(
             &record.header.stamp.context,
             plan.heads().map(|head| head.record().header.stamp.dot),
@@ -528,15 +594,102 @@ impl SelectedRecordNode {
 
     fn verify_publication_result(
         &mut self,
+        policy: &ControlPolicySnapshot,
+        intent: &RecordPublicationIntent,
+        payload: &[u8],
+        stored: &StoredRecord,
+        inserted: bool,
+        operation: &'static str,
+    ) -> Result<(), ApplicationError> {
+        let route = match self.verifier.verify_record(&stored.sealed) {
+            Ok(route) => route,
+            Err(error) if inserted => return Err(application_error(operation, error.into())),
+            Err(_) => {
+                return self.verify_historical_publication_result(
+                    policy, intent, payload, stored, operation,
+                );
+            }
+        };
+        Self::verify_publication_route(
+            &self.store,
+            &mut self.verifier,
+            intent,
+            payload,
+            stored,
+            route,
+            operation,
+        )
+    }
+
+    fn verify_historical_publication_result(
+        &mut self,
+        policy: &ControlPolicySnapshot,
         intent: &RecordPublicationIntent,
         payload: &[u8],
         stored: &StoredRecord,
         operation: &'static str,
     ) -> Result<(), ApplicationError> {
+        let projection = self
+            .store
+            .retained_record_sender_inventory_with_policy(policy)
+            .map_err(|error| application_error(operation, error.into()))?
+            .into_iter()
+            .find(|projection| projection.transfer_id() == stored.transfer_id)
+            .ok_or_else(|| ApplicationError::new(ApplicationErrorKind::Integrity, operation))?;
+        if projection.semantic_id() != stored.semantic_id
+            || projection.publisher() != stored.header.stamp.dot.publisher
+            || projection.topic() != &stored.header.topic
+            || projection.scope() != &stored.header.scope
+            || projection.key_epoch() != stored.header.key_epoch
+            || projection.exact_len()
+                != u64::try_from(stored.sealed.len()).map_err(|_| {
+                    ApplicationError::new(ApplicationErrorKind::Integrity, operation)
+                })?
+            || projection.acceptance_marker() != stored.acceptance_marker
+            || self
+                .source_route_cache
+                .is_current_record_sender_projection(&self.verifier, &projection)
+                .map_err(|error| application_error(operation, error))?
+        {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::Integrity,
+                operation,
+            ));
+        }
         let route = self
-            .verifier
+            .historical_verifier
             .verify_record(&stored.sealed)
             .map_err(|error| application_error(operation, error.into()))?;
+        if self.verifier.is_current_source_route_lineage(
+            route.scope(),
+            route.key_epoch(),
+            route.route_lineage(),
+        ) {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::Integrity,
+                operation,
+            ));
+        }
+        Self::verify_publication_route(
+            &self.store,
+            &mut self.historical_verifier,
+            intent,
+            payload,
+            stored,
+            route,
+            operation,
+        )
+    }
+
+    fn verify_publication_route(
+        store: &Store,
+        verifier: &mut ReferenceEnvelopeSealer,
+        intent: &RecordPublicationIntent,
+        payload: &[u8],
+        stored: &StoredRecord,
+        route: RouteVerifiedRecordEnvelope,
+        operation: &'static str,
+    ) -> Result<(), ApplicationError> {
         if route.envelope_id() != *stored.transfer_id.as_bytes()
             || route.item_id() != *stored.semantic_id.as_bytes()
             || route.header() != &stored.header
@@ -554,8 +707,7 @@ impl SelectedRecordNode {
                 operation,
             ));
         }
-        if self
-            .store
+        if store
             .is_control_principal_revoked(route.publisher())
             .map_err(|error| application_error(operation, error.into()))?
         {
@@ -564,29 +716,25 @@ impl SelectedRecordNode {
                 operation,
             ));
         }
-        let current_epoch = self.active_epoch(route.scope(), operation)?;
+        let current_epoch = store
+            .active_scope_epoch(route.scope())
+            .map(|epoch| epoch.map_or(1, |(epoch, _)| epoch))
+            .map_err(|error| application_error(operation, error.into()))?;
         if route.key_epoch() > current_epoch {
             return Err(ApplicationError::new(
                 ApplicationErrorKind::Integrity,
                 operation,
             ));
         }
-        if !self
-            .verifier
-            .can_route_record(route.scope(), route.key_epoch())
-            || !self.verifier.can_open_record_content(
-                route.scope(),
-                route.topic(),
-                route.key_epoch(),
-            )
+        if !verifier.can_route_record(route.scope(), route.key_epoch())
+            || !verifier.can_open_record_content(route.scope(), route.topic(), route.key_epoch())
         {
             return Err(ApplicationError::new(
                 ApplicationErrorKind::Integrity,
                 operation,
             ));
         }
-        match self
-            .verifier
+        match verifier
             .verify_record_content(route, &stored.sealed)
             .map_err(|error| application_error(operation, error.into()))?
         {
@@ -621,6 +769,10 @@ impl SelectedRecordNode {
         }
 
         let mut candidates = Vec::with_capacity(plan.candidates().len());
+        let retained_projections = self
+            .store
+            .retained_record_sender_inventory_with_policy(plan.control_policy())
+            .map_err(|error| application_error(operation, error.into()))?;
         let mut previous = None;
         for candidate in plan.candidates() {
             let record = candidate.record();
@@ -632,25 +784,33 @@ impl SelectedRecordNode {
                 ));
             }
             previous = Some(id);
-            let (item, active) = self.open_record_candidate(query, record, operation)?;
+            let sender_projection = retained_projections
+                .iter()
+                .find(|projection| projection.transfer_id() == record.transfer_id)
+                .ok_or_else(|| ApplicationError::new(ApplicationErrorKind::Integrity, operation))?;
+            let (item, policy_active, active) =
+                self.open_record_candidate(query, record, sender_projection, operation)?;
             candidates.push(VerifiedRecordCandidate {
+                id,
                 stamp: record.header.stamp.clone(),
                 item,
                 store_disposition: candidate.disposition(),
+                policy_active,
                 active,
             });
         }
 
-        let causal = candidates
+        let policy_causal = candidates
             .iter()
-            .map(|candidate| (candidate.item.id, &candidate.stamp, candidate.active))
+            .map(|candidate| (candidate.id, &candidate.stamp, candidate.policy_active))
             .collect::<Vec<_>>();
-        let (current_index, dispositions, head_indices) = recompute_record_dispositions(&causal);
+        let (policy_current_index, policy_dispositions, policy_head_indices) =
+            recompute_record_dispositions(&policy_causal);
         let plan_current = plan
             .current()
             .map(|candidate| RecordId::from_store(candidate.record().semantic_id));
-        let verified_current = current_index.map(|index| candidates[index].item.id);
-        if plan_current != verified_current {
+        let verified_policy_current = policy_current_index.map(|index| candidates[index].id);
+        if plan_current != verified_policy_current {
             return Err(ApplicationError::new(
                 ApplicationErrorKind::Integrity,
                 operation,
@@ -660,18 +820,18 @@ impl SelectedRecordNode {
             .heads()
             .map(|candidate| RecordId::from_store(candidate.record().semantic_id))
             .collect::<Vec<_>>();
-        let verified_heads = head_indices
+        let verified_policy_heads = policy_head_indices
             .iter()
-            .map(|index| candidates[*index].item.id)
+            .map(|index| candidates[*index].id)
             .collect::<Vec<_>>();
-        if plan_heads != verified_heads {
+        if plan_heads != verified_policy_heads {
             return Err(ApplicationError::new(
                 ApplicationErrorKind::Integrity,
                 operation,
             ));
         }
 
-        for (candidate, disposition) in candidates.iter_mut().zip(dispositions) {
+        for (candidate, disposition) in candidates.iter().zip(policy_dispositions) {
             if candidate.store_disposition != disposition.map(RecordVersionDisposition::into_store)
             {
                 return Err(ApplicationError::new(
@@ -679,37 +839,64 @@ impl SelectedRecordNode {
                     operation,
                 ));
             }
+        }
+
+        let current_causal = candidates
+            .iter()
+            .map(|candidate| (candidate.id, &candidate.stamp, candidate.active))
+            .collect::<Vec<_>>();
+        let (current_index, dispositions, head_indices) =
+            recompute_record_dispositions(&current_causal);
+        for (candidate, disposition) in candidates.iter_mut().zip(dispositions) {
             if let Some(disposition) = disposition {
-                candidate.item.disposition = disposition;
+                candidate
+                    .item
+                    .as_mut()
+                    .ok_or_else(|| {
+                        ApplicationError::new(ApplicationErrorKind::Integrity, operation)
+                    })?
+                    .disposition = disposition;
             }
         }
 
-        let current = current_index.map(|index| candidates[index].item.clone());
+        let current = current_index
+            .map(|index| {
+                candidates[index].item.clone().ok_or_else(|| {
+                    ApplicationError::new(ApplicationErrorKind::Integrity, operation)
+                })
+            })
+            .transpose()?;
         let concurrent = head_indices
             .iter()
             .copied()
             .filter(|index| Some(*index) != current_index)
-            .map(|index| candidates[index].item.clone())
-            .collect::<Vec<_>>();
+            .map(|index| {
+                candidates[index].item.clone().ok_or_else(|| {
+                    ApplicationError::new(ApplicationErrorKind::Integrity, operation)
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let superseded = if query.include_superseded_versions {
             candidates
                 .iter()
                 .filter(|candidate| {
                     candidate.active
-                        && candidate.item.disposition == RecordVersionDisposition::Superseded
+                        && candidate.item.as_ref().is_some_and(|item| {
+                            item.disposition == RecordVersionDisposition::Superseded
+                        })
                 })
-                .map(|candidate| candidate.item.clone())
+                .filter_map(|candidate| candidate.item.clone())
                 .collect()
         } else {
             Vec::new()
         };
-        let conflict = (verified_heads.len() > 1).then(|| {
+        let conflict = (verified_policy_heads.len() > 1).then(|| {
             let resolution_guard = RecordResolutionGuard {
                 plan: plan.clone(),
-                siblings: verified_heads.clone(),
+                siblings: verified_policy_heads.clone(),
             };
             RecordConflict {
-                siblings: verified_heads,
+                siblings: verified_policy_heads,
                 resolution_guard,
             }
         });
@@ -723,6 +910,7 @@ impl SelectedRecordNode {
 
     fn verify_historical_resolution_guard(
         &mut self,
+        policy: &ControlPolicySnapshot,
         plan: &RecordProjectionPlan,
         expected_siblings: &[RecordId],
     ) -> Result<(), ApplicationError> {
@@ -732,6 +920,10 @@ impl SelectedRecordNode {
             logical_key: plan.logical_key().to_vec(),
             include_superseded_versions: true,
         };
+        let retained_projections = self
+            .store
+            .retained_record_sender_inventory_with_policy(policy)
+            .map_err(|error| application_error("record resolve", error.into()))?;
         let mut previous = None;
         for candidate in plan.candidates() {
             let record = candidate.record();
@@ -743,7 +935,14 @@ impl SelectedRecordNode {
                 ));
             }
             previous = Some(id);
-            let _ = self.open_record_candidate(&query, record, "record resolve")?;
+            let sender_projection = retained_projections
+                .iter()
+                .find(|projection| projection.transfer_id() == record.transfer_id)
+                .ok_or_else(|| {
+                    ApplicationError::new(ApplicationErrorKind::Integrity, "record resolve")
+                })?;
+            let _ =
+                self.open_record_candidate(&query, record, sender_projection, "record resolve")?;
         }
         let plan_siblings = plan
             .heads()
@@ -762,12 +961,63 @@ impl SelectedRecordNode {
         &mut self,
         query: &RecordQuery,
         stored: &StoredRecord,
+        projection: &RecordSenderProjection,
         operation: &'static str,
-    ) -> Result<(RecordItem, bool), ApplicationError> {
-        let route = self
-            .verifier
-            .verify_record(&stored.sealed)
-            .map_err(|error| application_error(operation, error.into()))?;
+    ) -> Result<(Option<RecordItem>, bool, bool), ApplicationError> {
+        let route = match self.verifier.verify_record(&stored.sealed) {
+            Ok(route) => route,
+            Err(_) => {
+                if stored.header.topic != query.topic
+                    || stored.header.scope != query.scope
+                    || stored.header.logical_key != query.logical_key
+                    || stored.header.ttl_ms.is_some()
+                {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::Integrity,
+                        operation,
+                    ));
+                }
+                if projection.semantic_id() != stored.semantic_id
+                    || projection.publisher() != stored.header.stamp.dot.publisher
+                    || projection.topic() != &stored.header.topic
+                    || projection.scope() != &stored.header.scope
+                    || projection.key_epoch() != stored.header.key_epoch
+                    || projection.exact_len()
+                        != u64::try_from(stored.sealed.len()).map_err(|_| {
+                            ApplicationError::new(ApplicationErrorKind::Integrity, operation)
+                        })?
+                    || projection.acceptance_marker() != stored.acceptance_marker
+                {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::Integrity,
+                        operation,
+                    ));
+                }
+                let revoked = self
+                    .store
+                    .is_control_principal_revoked(projection.publisher())
+                    .map_err(|error| application_error(operation, error.into()))?;
+                let current_epoch = self.active_epoch(projection.scope(), operation)?;
+                if projection.key_epoch() > current_epoch {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::Integrity,
+                        operation,
+                    ));
+                }
+                let policy_active = !revoked && projection.key_epoch() == current_epoch;
+                let current = self
+                    .source_route_cache
+                    .is_current_record_sender_projection(&self.verifier, projection)
+                    .map_err(|error| application_error(operation, error))?;
+                if current {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::Integrity,
+                        operation,
+                    ));
+                }
+                return Ok((None, policy_active, false));
+            }
+        };
         if route.envelope_id() != *stored.transfer_id.as_bytes()
             || route.item_id() != *stored.semantic_id.as_bytes()
             || route.header() != &stored.header
@@ -792,7 +1042,13 @@ impl SelectedRecordNode {
                 operation,
             ));
         }
-        let active = !revoked && route.key_epoch() == current_epoch;
+        let policy_active = !revoked && route.key_epoch() == current_epoch;
+        let active = policy_active
+            && self.verifier.is_current_source_route_lineage(
+                route.scope(),
+                route.key_epoch(),
+                route.route_lineage(),
+            );
         if !self
             .verifier
             .can_route_record(route.scope(), route.key_epoch())
@@ -826,7 +1082,7 @@ impl SelectedRecordNode {
             }
         };
         Ok((
-            RecordItem {
+            Some(RecordItem {
                 id: RecordId::from_store(stored.semantic_id),
                 publisher: stored.header.stamp.dot.publisher,
                 publisher_counter: stored.header.stamp.dot.counter,
@@ -838,7 +1094,8 @@ impl SelectedRecordNode {
                 tombstone: stored.header.tombstone,
                 acceptance_marker: stored.acceptance_marker,
                 disposition: RecordVersionDisposition::Superseded,
-            },
+            }),
+            policy_active,
             active,
         ))
     }
@@ -1054,6 +1311,97 @@ mod tests {
         );
     }
 
+    struct RecordRekeyServices {
+        control_authority: ReferenceEnvelopeSealer,
+        registry: Vec<u8>,
+        authority: NodeId,
+        selected_identity: NodeId,
+    }
+
+    fn persist_rekeyable_mission(root: &TestRoot) -> RecordRekeyServices {
+        let access = ProvisioningAccess::member(
+            record_scope(),
+            vec![1],
+            vec![
+                record_topic(),
+                Topic::new("ops.state").expect("State topic"),
+            ],
+        )
+        .expect("member access");
+        let mut provisioner =
+            ReferenceProvisioner::from_seed([0x83; 32]).expect("rekey provisioner");
+        let control_authority = provisioner
+            .issue_control_authority(60, std::slice::from_ref(&access))
+            .and_then(ReferenceEnvelopeSealer::open)
+            .expect("control authority");
+        let selected_bytes = provisioner
+            .issue_node(1, std::slice::from_ref(&access))
+            .expect("issue selected node")
+            .to_bytes()
+            .expect("encode selected mission");
+        let selected_mission = UnprotectedReferenceMission::from_bytes(selected_bytes.clone())
+            .expect("parse selected mission");
+        let selected_identity = ReferenceEnvelopeSealer::open(
+            selected_mission
+                .fresh_bundle()
+                .expect("fresh selected bundle"),
+        )
+        .expect("inspect selected identity")
+        .identity();
+        let registry = provisioner.export_rekey_registry().expect("rekey registry");
+        drop(
+            UnprotectedReferenceMission::persist(root.mission_path(), selected_bytes)
+                .expect("persist rekeyable mission"),
+        );
+        RecordRekeyServices {
+            authority: control_authority.mission_authority_id(),
+            control_authority,
+            registry,
+            selected_identity,
+        }
+    }
+
+    fn apply_same_epoch_rekey(root: &TestRoot, services: &mut RecordRekeyServices) {
+        let recipients = vec![
+            ScopeRekeyRecipient::member(
+                services.control_authority.identity(),
+                vec![record_topic()],
+            )
+            .expect("authority recipient"),
+            ScopeRekeyRecipient::member(services.selected_identity, vec![record_topic()])
+                .expect("selected recipient"),
+        ];
+        let (sealed, _) = services
+            .control_authority
+            .seal_chained_scope_rekey_control_from_registry(
+                &services.registry,
+                0,
+                record_scope(),
+                1,
+                recipients,
+                1,
+                None,
+            )
+            .expect("seal same-epoch rekey");
+        let verified = services
+            .control_authority
+            .verify_control(&sealed)
+            .expect("verify same-epoch rekey");
+        let store = Store::open_for_mission(root.path().join(STORE_FILE), services.authority)
+            .expect("open store for rekey");
+        let outcome = store
+            .ingest_verified_control(&verified, &sealed)
+            .expect("commit same-epoch rekey");
+        assert_eq!(outcome.activated().len(), 1);
+        assert_eq!(
+            store
+                .active_scope_epoch(&record_scope())
+                .expect("active epoch")
+                .map(|(epoch, _)| epoch),
+            Some(1)
+        );
+    }
+
     fn selected_node(root: &TestRoot) -> SelectedRecordNode {
         if !root.mission_path().exists() {
             persist_mission(root);
@@ -1081,6 +1429,50 @@ mod tests {
             logical_key: b"asset-7".to_vec(),
             include_superseded_versions,
         }
+    }
+
+    fn payload_for_exact_sealed_size(
+        node: &mut SelectedRecordNode,
+        topic: &Topic,
+        scope: &Scope,
+        logical_key: &[u8],
+        priority: Priority,
+        target: usize,
+    ) -> Vec<u8> {
+        let policy = node.current_policy("record size probe").expect("policy");
+        let epoch = node
+            .active_epoch(scope, "record size probe")
+            .expect("active epoch");
+        let reservation = node
+            .store
+            .reserve_record_with_policy(&policy, node.identity(), topic, scope)
+            .expect("Record size-probe reservation");
+        let probe_header = reservation
+            .header(priority, logical_key.to_vec(), 0, false, epoch)
+            .expect("Record size-probe header");
+        let probe = node
+            .verifier
+            .seal_record(&probe_header, b"")
+            .expect("seal Record size probe");
+        let payload_len = target
+            .checked_sub(probe.bytes.len())
+            .expect("target exceeds Record envelope overhead");
+        let payload = vec![0xa5; payload_len];
+        let header = reservation
+            .header(
+                priority,
+                logical_key.to_vec(),
+                u64::try_from(payload.len()).expect("payload length"),
+                false,
+                epoch,
+            )
+            .expect("Record boundary header");
+        let sealed = node
+            .verifier
+            .seal_record(&header, &payload)
+            .expect("seal Record boundary payload");
+        assert_eq!(sealed.bytes.len(), target);
+        payload
     }
 
     fn stamp(publisher: u8, counter: u64, observed: &[Dot]) -> CausalStamp {
@@ -1276,6 +1668,97 @@ mod tests {
                 .expect("active epoch")
                 .map(|(epoch, _)| epoch),
             Some(2)
+        );
+    }
+
+    fn apply_direct_same_epoch_rekey(
+        root: &TestRoot,
+        services: &mut DirectRecordServices,
+    ) -> [u8; 32] {
+        let recipients = vec![
+            ScopeRekeyRecipient::member(
+                services.control_authority.identity(),
+                vec![record_topic()],
+            )
+            .expect("authority recipient"),
+            ScopeRekeyRecipient::member(services.reader.identity(), vec![record_topic()])
+                .expect("reader recipient"),
+            ScopeRekeyRecipient::member(services.selected_identity, vec![record_topic()])
+                .expect("selected recipient"),
+        ];
+        let (rekey, _) = services
+            .control_authority
+            .seal_chained_scope_rekey_control_from_registry(
+                &services.registry,
+                0,
+                record_scope(),
+                1,
+                recipients,
+                1,
+                None,
+            )
+            .expect("seal same-epoch rekey");
+        let verified_rekey = services
+            .reader
+            .verify_control(&rekey)
+            .expect("verify same-epoch rekey");
+        let rekey_id = verified_rekey.envelope_id();
+        let store = Store::open_for_mission(root.path().join(STORE_FILE), services.authority)
+            .expect("open store for same-epoch rekey");
+        assert_eq!(
+            store
+                .ingest_verified_control(&verified_rekey, &rekey)
+                .expect("commit same-epoch rekey")
+                .activated()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .active_scope_epoch(&record_scope())
+                .expect("active epoch")
+                .map(|(epoch, _)| epoch),
+            Some(1)
+        );
+        rekey_id
+    }
+
+    fn apply_same_epoch_rekey_and_revoke_one(root: &TestRoot, services: &mut DirectRecordServices) {
+        let subject = {
+            let store = Store::open_for_mission(root.path().join(STORE_FILE), services.authority)
+                .expect("open store for revocation subject");
+            let policy = store.control_policy_snapshot().expect("settled policy");
+            store
+                .retained_record_sender_inventory_with_policy(&policy)
+                .expect("retained Record senders")
+                .first()
+                .expect("remote Record publisher")
+                .publisher()
+        };
+        assert_ne!(subject, services.selected_identity);
+        let rekey_id = apply_direct_same_epoch_rekey(root, services);
+        let store = Store::open_for_mission(root.path().join(STORE_FILE), services.authority)
+            .expect("open store for mixed controls");
+        let revocation = services
+            .control_authority
+            .seal_chained_revocation_control(subject, 1, 2, Some(rekey_id))
+            .expect("seal publisher revocation");
+        let verified_revocation = services
+            .reader
+            .verify_control(&revocation)
+            .expect("verify publisher revocation");
+        assert_eq!(
+            store
+                .ingest_verified_control(&verified_revocation, &revocation)
+                .expect("commit publisher revocation")
+                .activated()
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .is_control_principal_revoked(subject)
+                .expect("publisher revocation state")
         );
     }
 
@@ -1531,6 +2014,453 @@ mod tests {
     }
 
     #[test]
+    fn same_epoch_rekey_withholds_old_record_and_replacement_is_restart_stable() {
+        let root = TestRoot::new("same-epoch-lineage");
+        let mut services = persist_rekeyable_mission(&root);
+        let old_request = request(b"record/pre-rekey", b"old route");
+        let old = {
+            let mut node = selected_node(&root);
+            node.publish(old_request.clone())
+                .expect("publish pre-rekey Record")
+        };
+
+        apply_same_epoch_rekey(&root, &mut services);
+        let replacement = {
+            let mut reopened = selected_node(&root);
+            let hidden = reopened
+                .query(query(true))
+                .expect("cache-proven old Record is safely withheld");
+            assert!(hidden.current.is_none());
+            assert!(hidden.concurrent.is_empty());
+            assert!(hidden.superseded.is_empty());
+            assert!(hidden.conflict.is_none());
+
+            let replay = reopened
+                .publish(old_request)
+                .expect("exact Record retry survives same-epoch rekey");
+            assert!(!replay.inserted);
+            assert_eq!(replay.id, old.id);
+            assert_eq!(replay.publisher_counter, old.publisher_counter);
+            assert_eq!(replay.acceptance_marker, old.acceptance_marker);
+
+            let replacement = reopened
+                .publish(request(b"record/post-rekey", b"current route"))
+                .expect("publish post-rekey Record");
+            assert_ne!(replacement.id, old.id);
+            let projection = reopened.query(query(true)).expect("current projection");
+            assert_eq!(
+                projection.current.as_ref().map(|item| item.id),
+                Some(replacement.id)
+            );
+            assert_eq!(
+                projection
+                    .current
+                    .as_ref()
+                    .map(|item| item.payload.as_slice()),
+                Some(b"current route".as_slice())
+            );
+            assert!(projection.concurrent.is_empty());
+            assert!(projection.superseded.is_empty());
+            assert!(projection.conflict.is_none());
+            replacement
+        };
+
+        let mut restarted = selected_node(&root);
+        let projection = restarted
+            .query(query(true))
+            .expect("restart-stable lineage filtering");
+        assert_eq!(
+            projection.current.as_ref().map(|item| item.id),
+            Some(replacement.id)
+        );
+        assert!(projection.concurrent.is_empty());
+        assert!(projection.superseded.is_empty());
+        assert!(projection.conflict.is_none());
+    }
+
+    #[test]
+    fn same_epoch_hidden_record_heads_expose_opaque_guard_and_resolve_across_restart() {
+        let root = TestRoot::new("same-epoch-hidden-conflict");
+        let mut services = persist_concurrent_records(&root, 2);
+        let _ = apply_direct_same_epoch_rekey(&root, &mut services);
+
+        let resolved = {
+            let mut node = selected_node(&root);
+            let projection = node
+                .query(query(true))
+                .expect("source-proven hidden conflict projection");
+            assert!(projection.current.is_none());
+            assert!(projection.concurrent.is_empty());
+            assert!(projection.superseded.is_empty());
+            let conflict = projection
+                .conflict
+                .expect("numeric heads retain an opaque resolution guard");
+            assert_eq!(conflict.siblings.len(), 2);
+            assert!(conflict.siblings.windows(2).all(|pair| pair[0] < pair[1]));
+            assert_eq!(
+                conflict.resolution_guard.siblings(),
+                conflict.siblings.as_slice()
+            );
+
+            let resolved = node
+                .resolve(RecordResolveRequest {
+                    operation_key: b"record/resolve/hidden-lineage".to_vec(),
+                    resolution_guard: conflict.resolution_guard,
+                    priority: Priority::Immediate,
+                    payload: b"current-lineage resolution".to_vec(),
+                    tombstone: false,
+                })
+                .expect("resolve source-proven hidden heads");
+            assert!(resolved.inserted);
+            let projection = node.query(query(true)).expect("resolved projection");
+            assert_eq!(
+                projection.current.as_ref().map(|item| item.id),
+                Some(resolved.id)
+            );
+            assert_eq!(
+                projection
+                    .current
+                    .as_ref()
+                    .map(|item| item.payload.as_slice()),
+                Some(b"current-lineage resolution".as_slice())
+            );
+            assert!(projection.concurrent.is_empty());
+            assert!(projection.superseded.is_empty());
+            assert!(projection.conflict.is_none());
+            resolved
+        };
+
+        let mut restarted = selected_node(&root);
+        let projection = restarted
+            .query(query(true))
+            .expect("reopened resolved hidden-head projection");
+        assert_eq!(
+            projection.current.as_ref().map(|item| item.id),
+            Some(resolved.id)
+        );
+        assert_eq!(
+            projection
+                .current
+                .as_ref()
+                .map(|item| item.payload.as_slice()),
+            Some(b"current-lineage resolution".as_slice())
+        );
+        assert!(projection.concurrent.is_empty());
+        assert!(projection.superseded.is_empty());
+        assert!(projection.conflict.is_none());
+    }
+
+    #[test]
+    fn exact_resolution_retry_survives_same_epoch_route_replacement() {
+        let root = TestRoot::new("resolution-same-epoch-retry");
+        let mut services = persist_concurrent_records(&root, 2);
+        let (request, resolved) = {
+            let mut node = selected_node(&root);
+            let conflict = node
+                .query(query(true))
+                .expect("pre-rekey conflict")
+                .conflict
+                .expect("explicit conflict");
+            let request = RecordResolveRequest {
+                operation_key: b"record/resolve/same-epoch-retry".to_vec(),
+                resolution_guard: conflict.resolution_guard,
+                priority: Priority::Immediate,
+                payload: b"pre-rekey resolution".to_vec(),
+                tombstone: false,
+            };
+            let resolved = node.resolve(request.clone()).expect("pre-rekey resolution");
+            assert!(resolved.inserted);
+            (request, resolved)
+        };
+
+        let _ = apply_direct_same_epoch_rekey(&root, &mut services);
+        let mut reopened = selected_node(&root);
+        let hidden = reopened
+            .query(query(true))
+            .expect("historical resolution remains withheld");
+        assert!(hidden.current.is_none());
+        assert!(hidden.concurrent.is_empty());
+        assert!(hidden.superseded.is_empty());
+        assert!(hidden.conflict.is_none());
+
+        let replay = reopened
+            .resolve(request)
+            .expect("exact resolution retry survives same-epoch rekey");
+        assert!(!replay.inserted);
+        assert_eq!(replay.id, resolved.id);
+        assert_eq!(replay.publisher_counter, resolved.publisher_counter);
+        assert_eq!(replay.acceptance_marker, resolved.acceptance_marker);
+    }
+
+    #[test]
+    fn same_epoch_rekey_plus_revocation_preserves_record_plan_and_withholds_history() {
+        let root = TestRoot::new("same-epoch-revocation");
+        let mut services = persist_concurrent_records(&root, 2);
+        apply_same_epoch_rekey_and_revoke_one(&root, &mut services);
+
+        for pass in 0..2 {
+            let mut node = selected_node(&root);
+            let projection = node
+                .query(query(true))
+                .expect("mixed inactive and stale-lineage Record plan remains valid");
+            assert!(projection.current.is_none(), "pass {pass}");
+            assert!(projection.concurrent.is_empty(), "pass {pass}");
+            assert!(projection.superseded.is_empty(), "pass {pass}");
+            assert!(projection.conflict.is_none(), "pass {pass}");
+        }
+    }
+
+    #[test]
+    fn record_publish_sealed_wire_boundary_is_inclusive_and_restart_atomic() {
+        let root = TestRoot::new("publish-wire-boundary");
+        let exact;
+        let exact_payload;
+        {
+            let mut node = selected_node(&root);
+            let payload_over_wire = vec![0x42; MAX_OBJECT_BYTES + 1];
+            let error = node
+                .publish(request(
+                    b"record/payload-over-wire-limit",
+                    &payload_over_wire,
+                ))
+                .expect_err("payload larger than the wire object bound");
+            assert_eq!(error.kind(), ApplicationErrorKind::ResourceLimit);
+
+            exact_payload = payload_for_exact_sealed_size(
+                &mut node,
+                &record_topic(),
+                &record_scope(),
+                b"asset-7",
+                Priority::Priority,
+                MAX_OBJECT_BYTES,
+            );
+            exact = node
+                .publish(request(b"record/exact-wire-limit", &exact_payload))
+                .expect("exact-bound Record");
+            assert!(exact.inserted);
+            assert_eq!(exact.publisher_counter, 1);
+
+            let oversized = payload_for_exact_sealed_size(
+                &mut node,
+                &record_topic(),
+                &record_scope(),
+                b"asset-7",
+                Priority::Priority,
+                MAX_OBJECT_BYTES + 1,
+            );
+            let error = node
+                .publish(request(b"record/oversized-wire-limit", &oversized))
+                .expect_err("oversized sealed Record");
+            assert_eq!(error.kind(), ApplicationErrorKind::ResourceLimit);
+            assert_eq!(error.operation(), "record publish");
+            assert_eq!(
+                error.to_string(),
+                "selected application record publish failed: selected data resource limit reached"
+            );
+
+            let projection = node.query(query(true)).expect("unchanged projection");
+            assert_eq!(
+                projection.current.as_ref().map(|item| item.id),
+                Some(exact.id)
+            );
+            assert_eq!(
+                projection
+                    .current
+                    .as_ref()
+                    .map(|item| item.payload.as_slice()),
+                Some(exact_payload.as_slice())
+            );
+            assert!(projection.concurrent.is_empty());
+            assert!(projection.superseded.is_empty());
+            assert!(projection.conflict.is_none());
+        }
+
+        let mut reopened = selected_node(&root);
+        let projection = reopened.query(query(true)).expect("reopened projection");
+        assert_eq!(
+            projection.current.as_ref().map(|item| item.id),
+            Some(exact.id)
+        );
+        assert_eq!(
+            projection
+                .current
+                .as_ref()
+                .map(|item| item.payload.as_slice()),
+            Some(exact_payload.as_slice())
+        );
+        assert!(projection.concurrent.is_empty());
+        assert!(projection.superseded.is_empty());
+        assert!(projection.conflict.is_none());
+
+        let replacement = reopened
+            .publish(request(
+                b"record/oversized-wire-limit",
+                b"small replacement",
+            ))
+            .expect("rejected operation key remains unbound");
+        assert!(replacement.inserted);
+        assert_eq!(replacement.publisher_counter, 2);
+        let preflight_replacement = reopened
+            .publish(request(
+                b"record/payload-over-wire-limit",
+                b"small preflight replacement",
+            ))
+            .expect("preflight-rejected operation key remains unbound");
+        assert!(preflight_replacement.inserted);
+        assert_eq!(preflight_replacement.publisher_counter, 3);
+    }
+
+    #[test]
+    fn record_resolution_accepts_exact_sealed_wire_boundary_across_restart() {
+        let root = TestRoot::new("resolve-exact-wire-boundary");
+        let _services = persist_concurrent_records(&root, 2);
+        let resolved;
+        let exact_payload;
+        {
+            let mut node = selected_node(&root);
+            let conflict = node
+                .query(query(true))
+                .expect("conflict projection")
+                .conflict
+                .expect("explicit conflict");
+            let guard = conflict.resolution_guard;
+            exact_payload = payload_for_exact_sealed_size(
+                &mut node,
+                guard.topic(),
+                guard.scope(),
+                guard.logical_key(),
+                Priority::Immediate,
+                MAX_OBJECT_BYTES,
+            );
+            resolved = node
+                .resolve(RecordResolveRequest {
+                    operation_key: b"record/resolve/exact-wire-limit".to_vec(),
+                    resolution_guard: guard,
+                    priority: Priority::Immediate,
+                    payload: exact_payload.clone(),
+                    tombstone: false,
+                })
+                .expect("exact-bound Record resolution");
+            assert!(resolved.inserted);
+            let projection = node.query(query(true)).expect("resolved projection");
+            assert_eq!(
+                projection.current.as_ref().map(|item| item.id),
+                Some(resolved.id)
+            );
+            assert_eq!(
+                projection
+                    .current
+                    .as_ref()
+                    .map(|item| item.payload.as_slice()),
+                Some(exact_payload.as_slice())
+            );
+            assert!(projection.concurrent.is_empty());
+            assert!(projection.conflict.is_none());
+            assert_eq!(projection.superseded.len(), 2);
+        }
+
+        let mut reopened = selected_node(&root);
+        let projection = reopened.query(query(true)).expect("reopened resolution");
+        assert_eq!(
+            projection.current.as_ref().map(|item| item.id),
+            Some(resolved.id)
+        );
+        assert_eq!(
+            projection
+                .current
+                .as_ref()
+                .map(|item| item.payload.as_slice()),
+            Some(exact_payload.as_slice())
+        );
+        assert!(projection.concurrent.is_empty());
+        assert!(projection.conflict.is_none());
+        assert_eq!(projection.superseded.len(), 2);
+    }
+
+    #[test]
+    fn oversized_record_resolution_is_atomic_and_operation_key_survives_restart() {
+        let root = TestRoot::new("resolve-oversized-wire-boundary");
+        let _services = persist_concurrent_records(&root, 2);
+        let siblings;
+        {
+            let mut node = selected_node(&root);
+            let conflict = node
+                .query(query(true))
+                .expect("conflict projection")
+                .conflict
+                .expect("explicit conflict");
+            let guard = conflict.resolution_guard;
+            siblings = guard.siblings().to_vec();
+            let preflight_error = node
+                .resolve(RecordResolveRequest {
+                    operation_key: b"record/resolve/oversized-wire-limit".to_vec(),
+                    resolution_guard: guard.clone(),
+                    priority: Priority::Immediate,
+                    payload: vec![0x43; MAX_OBJECT_BYTES + 1],
+                    tombstone: false,
+                })
+                .expect_err("resolution payload larger than the wire object bound");
+            assert_eq!(preflight_error.kind(), ApplicationErrorKind::ResourceLimit);
+
+            let oversized = payload_for_exact_sealed_size(
+                &mut node,
+                guard.topic(),
+                guard.scope(),
+                guard.logical_key(),
+                Priority::Immediate,
+                MAX_OBJECT_BYTES + 1,
+            );
+            let error = node
+                .resolve(RecordResolveRequest {
+                    operation_key: b"record/resolve/oversized-wire-limit".to_vec(),
+                    resolution_guard: guard,
+                    priority: Priority::Immediate,
+                    payload: oversized,
+                    tombstone: false,
+                })
+                .expect_err("oversized sealed Record resolution");
+            assert_eq!(error.kind(), ApplicationErrorKind::ResourceLimit);
+            assert_eq!(error.operation(), "record resolve");
+            assert_eq!(
+                error.to_string(),
+                "selected application record resolve failed: selected data resource limit reached"
+            );
+            let unchanged = node.query(query(true)).expect("unchanged conflict");
+            assert_eq!(
+                unchanged.conflict.expect("conflict remains").siblings,
+                siblings
+            );
+            assert!(unchanged.superseded.is_empty());
+        }
+
+        let mut reopened = selected_node(&root);
+        let conflict = reopened
+            .query(query(true))
+            .expect("reopened conflict")
+            .conflict
+            .expect("conflict remains after restart");
+        assert_eq!(conflict.siblings, siblings);
+        let resolved = reopened
+            .resolve(RecordResolveRequest {
+                operation_key: b"record/resolve/oversized-wire-limit".to_vec(),
+                resolution_guard: conflict.resolution_guard,
+                priority: Priority::Immediate,
+                payload: b"small replacement".to_vec(),
+                tombstone: false,
+            })
+            .expect("rejected resolution operation key remains unbound");
+        assert!(resolved.inserted);
+        let projection = reopened.query(query(true)).expect("resolved projection");
+        assert_eq!(
+            projection.current.as_ref().map(|item| item.id),
+            Some(resolved.id)
+        );
+        assert!(projection.concurrent.is_empty());
+        assert!(projection.conflict.is_none());
+        assert_eq!(projection.superseded.len(), 2);
+    }
+
+    #[test]
     fn n_way_conflict_requires_explicit_guarded_resolution_and_retry_is_stable() {
         let root = TestRoot::new("n-way-resolution");
         let mut services = persist_concurrent_records(&root, 3);
@@ -1777,15 +2707,18 @@ mod tests {
         };
         tamper_persisted_record_priority(&root, &transfer_id, &sealed);
 
-        let mut reopened = selected_node(&root);
-        let error = reopened
-            .query(query(true))
-            .expect_err("tampered metadata cannot be hidden or exposed");
+        let error = match SelectedRecordNode::open_unprotected_reference(
+            root.path(),
+            root.mission_path(),
+        ) {
+            Ok(_) => panic!("tampered metadata cannot cross startup source verification"),
+            Err(error) => error,
+        };
         assert_eq!(error.kind(), ApplicationErrorKind::Integrity);
-        assert_eq!(error.operation(), "record query");
+        assert_eq!(error.operation(), "record open");
         assert_eq!(
             error.to_string(),
-            "selected application record query failed: selected data integrity check failed"
+            "selected application record open failed: selected data integrity check failed"
         );
         for private_detail in ["priority", "semantic-records", "sealed", "transfer"] {
             assert!(!error.to_string().contains(private_detail));

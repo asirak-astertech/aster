@@ -11,16 +11,18 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(unix)]
+use aster_iroh::PinnedRelay;
 use aster_mesh::{ProvisioningAccess, ReferenceEnvelopeSealer, ReferenceProvisioner, Scope, Topic};
 #[cfg(unix)]
 use aster_node::{
-    MissionExpectedPeer, NodeApplication, NodeConfig, NodeIdentity,
+    MissionExpectedPeer, NodeApplication, NodeConfig, NodeIdentity, SelectedForwardingConfig,
     application::{
         EventAcknowledgement, EventPollRequest, EventPublishRequest, EventSubscriptionRequest,
         EventSyncStatus, PeerAuthorization, Priority,
     },
     mission::UnprotectedReferenceMission,
-    start_node,
+    start_node, start_node_with_forwarding,
 };
 #[cfg(unix)]
 use aster_redb_store::{Store, ZeroizationIntent};
@@ -31,7 +33,13 @@ static ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 // cannot select overlapping blocks and authenticate the wrong test mission.
 static PROCESS_TEST_LOCK: Mutex<()> = Mutex::new(());
 #[cfg(unix)]
-const LIVE_EVENT_PROCESS_STARTUP_TIMEOUT: Duration = Duration::from_secs(40);
+const PROCESS_READY_TIMEOUT: Duration = Duration::from_secs(40);
+#[cfg(unix)]
+const LIVE_EVENT_PROCESS_STARTUP_TIMEOUT: Duration = Duration::from_secs(90);
+#[cfg(unix)]
+const LIVE_EVENT_PROCESS_COMPLETION_TIMEOUT: Duration = Duration::from_secs(150);
+#[cfg(unix)]
+const LIVE_EVENT_CONTACT_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn serialize_process_test() -> MutexGuard<'static, ()> {
     PROCESS_TEST_LOCK
@@ -201,7 +209,7 @@ fn bytes_hex(bytes: &[u8]) -> String {
 }
 
 fn wait_for_ready(child: &mut std::process::Child, lines: &mpsc::Receiver<String>) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + PROCESS_READY_TIMEOUT;
     while Instant::now() < deadline {
         if let Ok(line) = lines.recv_timeout(Duration::from_millis(100))
             && line.starts_with("READY selected=true ")
@@ -213,6 +221,11 @@ fn wait_for_ready(child: &mut std::process::Child, lines: &mpsc::Receiver<String
         }
     }
     panic!("live node did not emit READY before deadline");
+}
+
+#[cfg(unix)]
+fn has_selected_ready_marker(line: &str) -> bool {
+    line.starts_with("READY selected=true ") || line.contains(" READY selected=true ")
 }
 
 fn wait_for_protected_contact(
@@ -249,6 +262,16 @@ fn live_event_worker_command(
     peer: Option<&str>,
 ) -> Command {
     let mut command = Command::new(std::env::current_exe().expect("current integration test"));
+    for name in [
+        "ASTER_LIVE_EVENT_PEER",
+        "ASTER_LIVE_EVENT_RELAY_URL",
+        "ASTER_LIVE_EVENT_RELAY_CA_DER",
+        "ASTER_LIVE_EVENT_RELAY_ONLY",
+        "ASTER_LIVE_EVENT_MIN_CONTACTS",
+        "ASTER_LIVE_EVENT_READY",
+    ] {
+        command.env_remove(name);
+    }
     command
         .args(["--exact", "live_event_process_worker", "--nocapture"])
         .env("ASTER_LIVE_EVENT_WORKER", role)
@@ -261,6 +284,25 @@ fn live_event_worker_command(
         command.env("ASTER_LIVE_EVENT_PEER", peer);
     }
     command
+}
+
+#[cfg(unix)]
+fn configure_live_event_controlled_relay(
+    command: &mut Command,
+    relay_url: &str,
+    ca_paths: &[PathBuf],
+    minimum_contacts: u64,
+) {
+    command
+        .env("ASTER_LIVE_EVENT_RELAY_URL", relay_url)
+        .env(
+            "ASTER_LIVE_EVENT_RELAY_CA_DER",
+            std::env::join_paths(ca_paths).expect("join relay CA paths"),
+        )
+        .env(
+            "ASTER_LIVE_EVENT_MIN_CONTACTS",
+            minimum_contacts.to_string(),
+        );
 }
 
 #[cfg(unix)]
@@ -284,11 +326,50 @@ fn live_event_worker_bind_collision(output: &std::process::Output) -> bool {
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    [stdout.as_ref(), stderr.as_ref()].iter().any(|stream| {
-        stream.contains("AddrInUse")
-            || stream.contains("Address already in use")
-            || stream.contains("EADDRINUSE")
-    })
+    [stdout.as_ref(), stderr.as_ref()]
+        .iter()
+        .any(|stream| live_event_bind_collision_text(stream))
+}
+
+#[cfg(unix)]
+fn live_event_bind_collision_text(stream: &str) -> bool {
+    stream.contains("AddrInUse")
+        || stream.contains("Address already in use")
+        || stream.contains("EADDRINUSE")
+        || stream.contains("Failed to bind sockets")
+        || stream.contains("Failed%20to%20bind%20sockets")
+}
+
+#[cfg(unix)]
+#[test]
+fn bind_collision_detector_accepts_top_level_raw_and_encoded_iroh_errors() {
+    assert!(live_event_bind_collision_text(
+        "transport error: Failed to bind sockets"
+    ));
+    assert!(live_event_bind_collision_text(
+        "ERROR error=transport%20error%3A%20Failed%20to%20bind%20sockets"
+    ));
+    assert!(live_event_bind_collision_text("error=EADDRINUSE"));
+    assert!(!live_event_bind_collision_text(
+        "transport error: relay unavailable"
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn selected_ready_marker_accepts_a_libtest_prefix_at_a_record_boundary() {
+    assert!(has_selected_ready_marker(
+        "READY selected=true carrier_route=direct"
+    ));
+    assert!(has_selected_ready_marker(
+        "test live_event_process_worker ... READY selected=true carrier_route=direct"
+    ));
+    assert!(!has_selected_ready_marker(
+        "NOTREADY selected=true carrier_route=direct"
+    ));
+    assert!(!has_selected_ready_marker(
+        "READY selected=false carrier_route=direct"
+    ));
 }
 
 #[cfg(unix)]
@@ -296,7 +377,7 @@ fn wait_for_live_event_workers(
     mut receiver: std::process::Child,
     mut publisher: std::process::Child,
 ) -> (std::process::Output, std::process::Output) {
-    let deadline = Instant::now() + Duration::from_secs(45);
+    let deadline = Instant::now() + LIVE_EVENT_PROCESS_COMPLETION_TIMEOUT;
     let mut receiver_status = None;
     let mut publisher_status = None;
     let mut timed_out = false;
@@ -377,13 +458,34 @@ fn live_event_process_worker() {
         .into_iter()
         .collect::<Vec<_>>();
     let expected_peer = peers.first().map(|peer| peer.mission);
+    let controlled_relay = std::env::var("ASTER_LIVE_EVENT_RELAY_URL").ok().map(|url| {
+        let roots = std::env::var_os("ASTER_LIVE_EVENT_RELAY_CA_DER")
+            .map(|paths| {
+                std::env::split_paths(&paths)
+                    .map(|path| std::fs::read(path).expect("worker relay CA root"))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let url = url.parse().expect("worker relay URL");
+        if roots.is_empty() {
+            PinnedRelay::new(url).expect("worker WebPKI relay")
+        } else {
+            PinnedRelay::with_ca_roots(url, roots).expect("worker pinned relay roots")
+        }
+    });
+    let relay_only = std::env::var_os("ASTER_LIVE_EVENT_RELAY_ONLY").is_some();
+    let minimum_contacts = std::env::var("ASTER_LIVE_EVENT_MIN_CONTACTS")
+        .ok()
+        .map(|value| value.parse::<u64>().expect("minimum contact count"))
+        .unwrap_or(1);
+    let relay_enabled = controlled_relay.is_some();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("worker Tokio runtime");
     runtime.block_on(async move {
         let mission = UnprotectedReferenceMission::load(&mission_path).expect("worker mission");
-        let running = start_node(NodeConfig {
+        let config = NodeConfig {
             state,
             bind,
             mission,
@@ -392,8 +494,24 @@ fn live_event_process_worker() {
             sync_interval: Duration::from_millis(500),
             run_for: None,
             application: NodeApplication::Relay,
-        })
-        .await
+        };
+        let running = match controlled_relay {
+            Some(relay) if relay_only => {
+                start_node_with_forwarding(
+                    config,
+                    SelectedForwardingConfig::default().with_controlled_relay_only(relay),
+                )
+                .await
+            }
+            Some(relay) => {
+                start_node_with_forwarding(
+                    config,
+                    SelectedForwardingConfig::default().with_controlled_relay(relay),
+                )
+                .await
+            }
+            None => start_node(config).await,
+        }
         .expect("start worker node");
         let events = running.selected_events();
         let scope = Scope::new("test/process-live-event").expect("worker scope");
@@ -417,15 +535,16 @@ fn live_event_process_worker() {
                 let status = events.status().await.expect("offline status");
                 assert_eq!(status.sync, EventSyncStatus::Offline);
                 assert_eq!(status.authenticated_contacts, 0);
-                running.shutdown().await.expect("offline shutdown");
+                let receipt = running.shutdown().await.expect("offline shutdown");
+                assert!(!relay_enabled || receipt.contacts == receipt.relay_contacts);
                 println!("WORKER_OFFLINE_PUBLISHED id={}", published.id);
             }
             "sync-publisher" => {
                 let mut observed = None;
-                let contact_deadline = Instant::now() + Duration::from_secs(40);
+                let contact_deadline = Instant::now() + LIVE_EVENT_CONTACT_TIMEOUT;
                 while Instant::now() < contact_deadline {
                     let status = events.status().await.expect("publisher live status");
-                    if status.authenticated_contacts > 0 {
+                    if status.authenticated_contacts >= minimum_contacts {
                         observed = Some(status);
                         break;
                     }
@@ -439,10 +558,18 @@ fn live_event_process_worker() {
                 );
                 assert_eq!(status.peers[0].authorization, PeerAuthorization::Active);
                 assert_eq!(status.sync, EventSyncStatus::LastContactComplete);
-                running.shutdown().await.expect("publisher shutdown");
+                let receipt = running.shutdown().await.expect("publisher shutdown");
+                if relay_enabled {
+                    assert_eq!(receipt.direct_contacts, 0);
+                    assert_eq!(receipt.unknown_path_contacts, 0);
+                    assert_eq!(receipt.relay_contacts, receipt.contacts);
+                }
                 println!(
-                    "WORKER_PUBLISHER_SYNC contacts={} sync={:?}",
-                    status.authenticated_contacts, status.sync
+                    "WORKER_PUBLISHER_SYNC contacts={} sync={:?} direct_contacts={} relay_contacts={}",
+                    status.authenticated_contacts,
+                    status.sync,
+                    receipt.direct_contacts,
+                    receipt.relay_contacts
                 );
             }
             "sync-receiver" => {
@@ -459,7 +586,7 @@ fn live_event_process_worker() {
                     std::fs::write(ready, b"subscription-durable")
                         .expect("publish receiver readiness");
                 }
-                let receiver_deadline = Instant::now() + Duration::from_secs(40);
+                let receiver_deadline = Instant::now() + LIVE_EVENT_CONTACT_TIMEOUT;
                 let mut delivery = None;
                 while Instant::now() < receiver_deadline {
                     let page = events
@@ -501,9 +628,10 @@ fn live_event_process_worker() {
                         .is_empty()
                 );
                 let mut observed = None;
-                while Instant::now() < receiver_deadline {
+                let status_deadline = Instant::now() + LIVE_EVENT_CONTACT_TIMEOUT;
+                while Instant::now() < status_deadline {
                     let status = events.status().await.expect("receiver live status");
-                    if status.authenticated_contacts > 0 {
+                    if status.authenticated_contacts >= minimum_contacts {
                         observed = Some(status);
                         break;
                     }
@@ -516,10 +644,20 @@ fn live_event_process_worker() {
                     expected_peer.expect("configured peer")
                 );
                 assert_eq!(status.peers[0].authorization, PeerAuthorization::Active);
-                running.shutdown().await.expect("receiver shutdown");
+                let receipt = running.shutdown().await.expect("receiver shutdown");
+                if relay_enabled {
+                    assert_eq!(receipt.direct_contacts, 0);
+                    assert_eq!(receipt.unknown_path_contacts, 0);
+                    assert_eq!(receipt.relay_contacts, receipt.contacts);
+                }
                 println!(
-                    "WORKER_RECEIVED id={} attempt={} contacts={} sync={:?}",
-                    delivery.event.id, delivery.attempt, status.authenticated_contacts, status.sync
+                    "WORKER_RECEIVED id={} attempt={} contacts={} sync={:?} direct_contacts={} relay_contacts={}",
+                    delivery.event.id,
+                    delivery.attempt,
+                    status.authenticated_contacts,
+                    status.sync,
+                    receipt.direct_contacts,
+                    receipt.relay_contacts
                 );
             }
             "restart-receiver" => {
@@ -549,7 +687,8 @@ fn live_event_process_worker() {
                     events.status().await.expect("restart status").sync,
                     EventSyncStatus::Offline
                 );
-                running.shutdown().await.expect("restart shutdown");
+                let receipt = running.shutdown().await.expect("restart shutdown");
+                assert!(!relay_enabled || receipt.contacts == receipt.relay_contacts);
                 println!("WORKER_RESTART_ACK_DURABLE");
             }
             _ => panic!("unknown live Event worker role {role:?}"),
@@ -769,6 +908,644 @@ fn offline_publish_later_real_process_sync_poll_ack_and_restart() {
     std::fs::remove_dir_all(root).expect("cleanup process evidence");
 }
 
+#[cfg(unix)]
+#[test]
+fn controlled_relay_selected_when_direct_candidate_unusable_then_noops() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let _process_test = serialize_process_test();
+    let relay_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("controlled relay runtime");
+    let fixture = relay_runtime
+        .block_on(aster_iroh::test_utils::RelayFixture::spawn())
+        .expect("self-hosted controlled relay");
+
+    let root = fresh_root("controlled-relay-live-event");
+    let publisher_state = root.join("publisher-state");
+    let receiver_state = root.join("receiver-state");
+    let publisher_mission_path = root.join("publisher.bundle");
+    let receiver_mission_path = root.join("receiver.bundle");
+    std::fs::create_dir_all(&root).expect("relay process root");
+    let scope = Scope::new("test/process-live-event").expect("relay scope");
+    let topic = Topic::new("offline-later-sync").expect("relay topic");
+    let access =
+        ProvisioningAccess::member(scope, vec![1], vec![topic]).expect("relay mission access");
+    let mut provisioner =
+        ReferenceProvisioner::from_seed([0xe3; 32]).expect("relay process provisioner");
+    let publisher_bytes = provisioner
+        .issue_node(1, std::slice::from_ref(&access))
+        .expect("relay publisher mission")
+        .to_bytes()
+        .expect("relay publisher bytes");
+    let receiver_bytes = provisioner
+        .issue_node(2, std::slice::from_ref(&access))
+        .expect("relay receiver mission")
+        .to_bytes()
+        .expect("relay receiver bytes");
+    let publisher_mission =
+        UnprotectedReferenceMission::persist(&publisher_mission_path, publisher_bytes)
+            .expect("persist relay publisher mission");
+    let publisher_mission_id = publisher_mission.identity();
+    drop(publisher_mission);
+    let receiver_mission =
+        UnprotectedReferenceMission::persist(&receiver_mission_path, receiver_bytes)
+            .expect("persist relay receiver mission");
+    let receiver_mission_id = receiver_mission.identity();
+    drop(receiver_mission);
+    for path in [&publisher_mission_path, &receiver_mission_path] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .expect("owner-only relay mission permissions");
+    }
+
+    let publisher_identity =
+        NodeIdentity::load_or_create(&publisher_state).expect("relay publisher identity");
+    let publisher_carrier = publisher_identity.id();
+    drop(publisher_identity);
+    let receiver_identity =
+        NodeIdentity::load_or_create(&receiver_state).expect("relay receiver identity");
+    let receiver_carrier = receiver_identity.id();
+    drop(receiver_identity);
+    let publisher_initiates = publisher_carrier < receiver_carrier;
+
+    let relay_ca_paths = fixture
+        .ca_roots_der()
+        .iter()
+        .enumerate()
+        .map(|(index, root_der)| {
+            let path = root.join(format!("relay-ca-{index}.der"));
+            std::fs::write(&path, root_der).expect("write exact relay CA root");
+            path
+        })
+        .collect::<Vec<_>>();
+    assert!(!relay_ca_paths.is_empty());
+    let relay_url = fixture.relay_url().to_string();
+
+    let offline = live_event_worker_command(
+        "offline-publisher",
+        &publisher_state,
+        &publisher_mission_path,
+        "127.0.0.1:0",
+        None,
+    )
+    .output()
+    .expect("offline relay publisher process");
+    assert_live_event_worker(offline, "WORKER_OFFLINE_PUBLISHED");
+
+    // These exact direct candidates are intentionally unreachable. The
+    // lower-carrier-ID initiator offers that candidate alongside the pinned
+    // relay while the responder's IP transport is disabled below. Its
+    // successful Relay witness therefore proves the controlled relay was
+    // selected when the exact direct candidate could not reach the responder.
+    let publisher_peer = format!(
+        "{receiver_carrier}@127.0.0.1:9={}",
+        aster_node::format_node_id(receiver_mission_id)
+    );
+    let receiver_peer = format!(
+        "{publisher_carrier}@127.0.0.1:9={}",
+        aster_node::format_node_id(publisher_mission_id)
+    );
+    let receiver_ready = root.join("relay-receiver-subscription-ready");
+    let mut receiver_command = live_event_worker_command(
+        "sync-receiver",
+        &receiver_state,
+        &receiver_mission_path,
+        "127.0.0.1:0",
+        Some(&receiver_peer),
+    );
+    receiver_command.env("ASTER_LIVE_EVENT_READY", &receiver_ready);
+    configure_live_event_controlled_relay(&mut receiver_command, &relay_url, &relay_ca_paths, 2);
+    if publisher_initiates {
+        // Disable the responder's IP transport. The lower-ID publisher still
+        // offers the unreachable exact direct candidate alongside the relay,
+        // so a successful Relay witness is deterministic selection evidence.
+        receiver_command.env("ASTER_LIVE_EVENT_RELAY_ONLY", "1");
+    }
+    let mut receiver = receiver_command
+        .spawn()
+        .expect("spawn controlled-relay receiver");
+    let ready_deadline = Instant::now() + LIVE_EVENT_PROCESS_STARTUP_TIMEOUT;
+    while !receiver_ready.exists() {
+        if let Some(status) = receiver
+            .try_wait()
+            .expect("poll controlled-relay receiver readiness")
+        {
+            let output = receiver
+                .wait_with_output()
+                .expect("collect failed controlled-relay receiver");
+            panic!(
+                "controlled-relay receiver exited before subscription readiness with {status}: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+        if Instant::now() >= ready_deadline {
+            let _ = receiver.kill();
+            let output = receiver
+                .wait_with_output()
+                .expect("reap timed-out controlled-relay receiver");
+            panic!(
+                "controlled-relay receiver did not publish subscription readiness: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let mut publisher_command = live_event_worker_command(
+        "sync-publisher",
+        &publisher_state,
+        &publisher_mission_path,
+        "127.0.0.1:0",
+        Some(&publisher_peer),
+    );
+    configure_live_event_controlled_relay(&mut publisher_command, &relay_url, &relay_ca_paths, 2);
+    if !publisher_initiates {
+        publisher_command.env("ASTER_LIVE_EVENT_RELAY_ONLY", "1");
+    }
+    let publisher = match publisher_command.spawn() {
+        Ok(publisher) => publisher,
+        Err(error) => {
+            let _ = receiver.kill();
+            let receiver_output = receiver
+                .wait_with_output()
+                .expect("reap receiver after publisher spawn failure");
+            panic!(
+                "spawn controlled-relay publisher: {error}; receiver_stdout={} receiver_stderr={}",
+                String::from_utf8_lossy(&receiver_output.stdout),
+                String::from_utf8_lossy(&receiver_output.stderr),
+            );
+        }
+    };
+    let (receiver_output, publisher_output) = wait_for_live_event_workers(receiver, publisher);
+    let receiver_stdout =
+        String::from_utf8(receiver_output.stdout).expect("UTF-8 relay receiver stdout");
+    let receiver_stderr =
+        String::from_utf8(receiver_output.stderr).expect("UTF-8 relay receiver stderr");
+    let publisher_stdout =
+        String::from_utf8(publisher_output.stdout).expect("UTF-8 relay publisher stdout");
+    let publisher_stderr =
+        String::from_utf8(publisher_output.stderr).expect("UTF-8 relay publisher stderr");
+    assert!(
+        receiver_output.status.success() && publisher_output.status.success(),
+        "controlled-relay Event workers failed: receiver_stdout={receiver_stdout} receiver_stderr={receiver_stderr} publisher_stdout={publisher_stdout} publisher_stderr={publisher_stderr}"
+    );
+    assert!(receiver_stdout.contains("WORKER_RECEIVED "));
+    assert!(publisher_stdout.contains("WORKER_PUBLISHER_SYNC "));
+    let relay_log = format!("{receiver_stdout}\n{publisher_stdout}");
+    assert!(
+        relay_log.lines().any(|line| {
+            has_selected_ready_marker(line)
+                && line.contains(" carrier_route=direct-plus-controlled-relay ")
+                && line.contains(" controlled_relay_readiness=deferred ")
+                && line.contains(" controlled_relay_trust=explicit-der-roots ")
+                && line.contains(" public_relay_fallback=false ")
+                && line.contains(" hosted_discovery=false ")
+        }),
+        "direct-plus-controlled-relay READY receipt missing: {relay_log}"
+    );
+    assert!(
+        relay_log.lines().any(|line| {
+            has_selected_ready_marker(line)
+                && line.contains(" carrier_route=controlled-relay-only ")
+                && line.contains(" controlled_relay_readiness=required-ready ")
+        }),
+        "controlled-relay-only READY receipt missing: {relay_log}"
+    );
+    let successful_contacts = relay_log
+        .lines()
+        .filter(|line| {
+            line.starts_with("CONTACT ")
+                && line.ends_with("status=pass")
+                && line.contains(" carrier_path=relay ")
+                && line.contains(" path_observation=not-authorization ")
+                && line.contains(" mission_auth=hybrid-pq ")
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        successful_contacts.len() >= 4,
+        "two authenticated relay contacts must complete at both endpoints: {relay_log}"
+    );
+    assert!(
+        successful_contacts
+            .iter()
+            .all(|line| { line.contains(" carrier_path_transitions_saturated=false ") })
+    );
+    assert!(
+        successful_contacts.iter().any(|line| {
+            receipt_counter(line, "offered") == Some(0)
+                && receipt_counter(line, "fetched") == Some(0)
+                && receipt_counter(line, "inserted") == Some(0)
+                && receipt_counter(line, "duplicates") == Some(0)
+                && receipt_counter(line, "remaining") == Some(0)
+        }),
+        "second equal-inventory relay contact transferred work: {relay_log}"
+    );
+    assert!(!relay_log.contains(" carrier_path=direct "));
+    let relay_stops = relay_log
+        .lines()
+        .filter(|line| line.starts_with("STOP "))
+        .collect::<Vec<_>>();
+    assert_eq!(relay_stops.len(), 2);
+    assert!(relay_stops.iter().all(|line| {
+        receipt_counter(line, "direct_contacts") == Some(0)
+            && receipt_counter(line, "unknown_path_contacts") == Some(0)
+            && receipt_counter(line, "relay_contacts") == receipt_counter(line, "contacts")
+    }));
+    assert!(relay_stops.iter().all(|line| {
+        receipt_counter(line, "relay_contacts").is_some_and(|contacts| contacts >= 2)
+    }));
+
+    let dead_relay_state = root.join("dead-relay-direct-state");
+    let dead_relay = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["node", "--state"])
+        .arg(&dead_relay_state)
+        .args([
+            "--bind",
+            "127.0.0.1:0",
+            "--mission-bundle-unprotected-reference",
+        ])
+        .arg(&receiver_mission_path)
+        .args([
+            "--controlled-relay-url",
+            "https://127.0.0.1:1/",
+            "--controlled-relay-trust",
+            "webpki",
+            "--run-for",
+            "1",
+        ])
+        .output()
+        .expect("run direct-capable node with unavailable controlled relay");
+    let dead_relay_stdout = String::from_utf8(dead_relay.stdout).expect("UTF-8 dead-relay stdout");
+    let dead_relay_stderr = String::from_utf8(dead_relay.stderr).expect("UTF-8 dead-relay stderr");
+    assert!(
+        dead_relay.status.success(),
+        "unavailable optional relay blocked direct-capable startup: stdout={dead_relay_stdout} stderr={dead_relay_stderr}"
+    );
+    assert!(dead_relay_stdout.lines().any(|line| {
+        line.starts_with("READY ")
+            && line.contains(" carrier_route=direct-plus-controlled-relay ")
+            && line.contains(" controlled_relay_readiness=deferred ")
+    }));
+
+    let cli_state = root.join("relay-cli-state");
+    let mut cli = Command::new(env!("CARGO_BIN_EXE_aster"));
+    cli.args(["node", "--state"])
+        .arg(&cli_state)
+        .args([
+            "--bind",
+            "127.0.0.1:0",
+            "--mission-bundle-unprotected-reference",
+        ])
+        .arg(&receiver_mission_path)
+        .args([
+            "--controlled-relay-url",
+            &relay_url,
+            "--controlled-relay-trust",
+            "der-roots",
+            "--controlled-relay-only",
+            "--run-for",
+            "1",
+        ]);
+    for ca_path in &relay_ca_paths {
+        cli.arg("--controlled-relay-ca-der").arg(ca_path);
+    }
+    let cli_output = cli.output().expect("run valid controlled-relay CLI");
+    let cli_stdout =
+        String::from_utf8(cli_output.stdout).expect("UTF-8 controlled-relay CLI stdout");
+    let cli_stderr =
+        String::from_utf8(cli_output.stderr).expect("UTF-8 controlled-relay CLI stderr");
+    assert!(
+        cli_output.status.success(),
+        "valid controlled-relay CLI failed: stdout={cli_stdout} stderr={cli_stderr}"
+    );
+    assert!(cli_stdout.lines().any(|line| {
+        line.starts_with("READY ")
+            && line.contains(" carrier_route=controlled-relay-only ")
+            && line.contains(" controlled_relay_trust=explicit-der-roots ")
+            && line.contains(" public_relay_fallback=false ")
+    }));
+    assert!(cli_stdout.lines().any(|line| {
+        line.starts_with("STOP ")
+            && receipt_counter(line, "contacts") == Some(0)
+            && receipt_counter(line, "relay_contacts") == Some(0)
+    }));
+
+    relay_runtime
+        .block_on(fixture.shutdown())
+        .expect("stop controlled relay fixture");
+    std::fs::remove_dir_all(root).expect("cleanup controlled relay evidence");
+}
+
+#[cfg(unix)]
+#[test]
+fn unavailable_controlled_relay_does_not_block_exact_direct_sync() {
+    use std::{net::UdpSocket, os::unix::fs::PermissionsExt as _};
+
+    let _process_test = serialize_process_test();
+    let root = fresh_root("dead-relay-exact-direct");
+    let first_state = root.join("first-state");
+    let second_state = root.join("second-state");
+    let first_mission_path = root.join("first.bundle");
+    let second_mission_path = root.join("second.bundle");
+    std::fs::create_dir_all(&root).expect("dead relay direct root");
+    let scope = Scope::new("test/dead-relay-direct").expect("dead relay direct scope");
+    let topic = Topic::new("exact-direct").expect("dead relay direct topic");
+    let access =
+        ProvisioningAccess::member(scope, vec![1], vec![topic]).expect("dead relay direct access");
+    let mut provisioner =
+        ReferenceProvisioner::from_seed([0xe4; 32]).expect("dead relay provisioner");
+    let first_bytes = provisioner
+        .issue_node(1, std::slice::from_ref(&access))
+        .expect("first dead relay mission")
+        .to_bytes()
+        .expect("first dead relay mission bytes");
+    let second_bytes = provisioner
+        .issue_node(2, std::slice::from_ref(&access))
+        .expect("second dead relay mission")
+        .to_bytes()
+        .expect("second dead relay mission bytes");
+    let first_mission = UnprotectedReferenceMission::persist(&first_mission_path, first_bytes)
+        .expect("persist first dead relay mission");
+    let first_mission_id = first_mission.identity();
+    drop(first_mission);
+    let second_mission = UnprotectedReferenceMission::persist(&second_mission_path, second_bytes)
+        .expect("persist second dead relay mission");
+    let second_mission_id = second_mission.identity();
+    drop(second_mission);
+    for path in [&first_mission_path, &second_mission_path] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .expect("owner-only dead relay mission permissions");
+    }
+    let first_carrier = NodeIdentity::load_or_create(&first_state)
+        .expect("first dead relay identity")
+        .id();
+    let second_carrier = NodeIdentity::load_or_create(&second_state)
+        .expect("second dead relay identity")
+        .id();
+
+    let mut bind_attempt = 0usize;
+    let mut collision = None;
+    let (first_output, second_output) = loop {
+        bind_attempt += 1;
+        let first_socket = UdpSocket::bind("127.0.0.1:0").expect("reserve first direct socket");
+        let first_address = first_socket.local_addr().expect("first direct address");
+        let second_socket = UdpSocket::bind("127.0.0.1:0").expect("reserve second direct socket");
+        let second_address = second_socket.local_addr().expect("second direct address");
+        drop(first_socket);
+        drop(second_socket);
+        let first_peer = format!(
+            "{second_carrier}@{second_address}={}",
+            aster_node::format_node_id(second_mission_id)
+        );
+        let second_peer = format!(
+            "{first_carrier}@{first_address}={}",
+            aster_node::format_node_id(first_mission_id)
+        );
+        let mut first = Command::new(env!("CARGO_BIN_EXE_aster"));
+        first
+            .args(["node", "--state"])
+            .arg(&first_state)
+            .args(["--bind", &first_address.to_string()])
+            .args(["--mission-bundle-unprotected-reference"])
+            .arg(&first_mission_path)
+            .args([
+                "--peer",
+                &first_peer,
+                "--controlled-relay-url",
+                "https://127.0.0.1:1/",
+                "--controlled-relay-trust",
+                "webpki",
+                "--sync-ms",
+                "1000",
+                "--run-for",
+                "5",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut second = Command::new(env!("CARGO_BIN_EXE_aster"));
+        second
+            .args(["node", "--state"])
+            .arg(&second_state)
+            .args(["--bind", &second_address.to_string()])
+            .args(["--mission-bundle-unprotected-reference"])
+            .arg(&second_mission_path)
+            .args([
+                "--peer",
+                &second_peer,
+                "--controlled-relay-url",
+                "https://127.0.0.1:1/",
+                "--controlled-relay-trust",
+                "webpki",
+                "--sync-ms",
+                "1000",
+                "--run-for",
+                "5",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut first = first.spawn().expect("spawn first dead relay direct node");
+        let second = match second.spawn() {
+            Ok(second) => second,
+            Err(error) => {
+                let _ = first.kill();
+                let first_output = first
+                    .wait_with_output()
+                    .expect("reap first direct node after second spawn failure");
+                panic!(
+                    "spawn second dead relay direct node: {error}; first_stdout={} first_stderr={}",
+                    String::from_utf8_lossy(&first_output.stdout),
+                    String::from_utf8_lossy(&first_output.stderr),
+                );
+            }
+        };
+        let outputs = wait_for_live_event_workers(first, second);
+        if live_event_worker_bind_collision(&outputs.0)
+            || live_event_worker_bind_collision(&outputs.1)
+        {
+            collision = Some(format!(
+                "first={} second={}",
+                String::from_utf8_lossy(&outputs.0.stderr),
+                String::from_utf8_lossy(&outputs.1.stderr)
+            ));
+            if bind_attempt < 4 {
+                continue;
+            }
+            panic!(
+                "dead relay direct nodes exhausted bind-collision retries: {}",
+                collision.expect("recorded bind collision")
+            );
+        }
+        break outputs;
+    };
+    let first_stdout = String::from_utf8(first_output.stdout).expect("UTF-8 first direct stdout");
+    let first_stderr = String::from_utf8(first_output.stderr).expect("UTF-8 first direct stderr");
+    let second_stdout =
+        String::from_utf8(second_output.stdout).expect("UTF-8 second direct stdout");
+    let second_stderr =
+        String::from_utf8(second_output.stderr).expect("UTF-8 second direct stderr");
+    assert!(
+        first_output.status.success() && second_output.status.success(),
+        "unavailable relay blocked exact direct sync: first_stdout={first_stdout} first_stderr={first_stderr} second_stdout={second_stdout} second_stderr={second_stderr} collision={collision:?}"
+    );
+    let direct_log = format!("{first_stdout}\n{second_stdout}");
+    assert_eq!(
+        direct_log
+            .lines()
+            .filter(|line| {
+                line.starts_with("READY ")
+                    && line.contains(" carrier_route=direct-plus-controlled-relay ")
+                    && line.contains(" controlled_relay_readiness=deferred ")
+            })
+            .count(),
+        2,
+        "both direct-capable nodes must become ready with the relay unavailable: {direct_log}"
+    );
+    let contacts = direct_log
+        .lines()
+        .filter(|line| line.starts_with("CONTACT ") && line.ends_with("status=pass"))
+        .collect::<Vec<_>>();
+    assert!(
+        contacts.len() >= 2,
+        "exact direct contact was not synchronized: {direct_log}"
+    );
+    assert!(
+        contacts.iter().all(|line| {
+            line.contains(" carrier_path=direct ")
+                && line.contains(" carrier_path_transitions_saturated=false ")
+                && line.contains(" path_observation=not-authorization ")
+                && receipt_counter(line, "offered") == Some(0)
+                && receipt_counter(line, "fetched") == Some(0)
+                && receipt_counter(line, "inserted") == Some(0)
+        }),
+        "exact direct no-op receipts were not stable: {direct_log}"
+    );
+    assert!(!direct_log.contains(" carrier_path=relay "));
+    let direct_stops = direct_log
+        .lines()
+        .filter(|line| line.starts_with("STOP "))
+        .collect::<Vec<_>>();
+    assert_eq!(direct_stops.len(), 2);
+    assert!(direct_stops.iter().all(|line| {
+        receipt_counter(line, "relay_contacts") == Some(0)
+            && receipt_counter(line, "unknown_path_contacts") == Some(0)
+            && receipt_counter(line, "direct_contacts") == receipt_counter(line, "contacts")
+    }));
+    assert!(
+        direct_stops.iter().all(|line| {
+            receipt_counter(line, "direct_contacts").is_some_and(|count| count > 0)
+        })
+    );
+    std::fs::remove_dir_all(root).expect("cleanup dead relay exact direct evidence");
+}
+
+#[test]
+fn manual_node_rejects_partial_controlled_relay_before_state_or_mission_access() {
+    let _process_test = serialize_process_test();
+    let state = fresh_root("partial-controlled-relay");
+    let missing_mission = state.with_extension("missing-bundle");
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args([
+            "node",
+            "--state",
+            state.to_str().expect("UTF-8 state"),
+            "--bind",
+            "127.0.0.1:0",
+            "--mission-bundle-unprotected-reference",
+            missing_mission.to_str().expect("UTF-8 mission path"),
+            "--controlled-relay-url",
+            "https://relay.example.invalid",
+            "--run-for",
+            "1",
+        ])
+        .output()
+        .expect("run partial controlled relay node");
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 relay config stderr");
+    assert!(!output.status.success());
+    assert!(stderr.contains("--controlled-relay-trust"));
+    assert!(!state.exists(), "invalid relay config created node state");
+    assert!(!missing_mission.exists());
+}
+
+#[test]
+fn manual_node_rejects_malformed_relay_root_before_state_or_mission_access() {
+    let _process_test = serialize_process_test();
+    let root = fresh_root("malformed-controlled-relay-root");
+    let state = root.join("node-state");
+    let missing_mission = root.join("missing.bundle");
+    let malformed_root = root.join("malformed.der");
+    std::fs::create_dir_all(&root).expect("create malformed relay root fixture");
+    std::fs::write(&malformed_root, b"not a DER certificate").expect("write malformed relay root");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["node", "--state"])
+        .arg(&state)
+        .args([
+            "--bind",
+            "127.0.0.1:0",
+            "--mission-bundle-unprotected-reference",
+        ])
+        .arg(&missing_mission)
+        .args([
+            "--controlled-relay-url",
+            "https://relay.example.invalid",
+            "--controlled-relay-trust",
+            "der-roots",
+            "--controlled-relay-ca-der",
+        ])
+        .arg(&malformed_root)
+        .args(["--run-for", "1"])
+        .output()
+        .expect("run malformed controlled relay node");
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 malformed relay stderr");
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("invalid%20relay%20CA%20root%20DER%20certificate"),
+        "unexpected malformed relay error: {stderr}"
+    );
+    assert!(!state.exists(), "malformed relay root created node state");
+    assert!(!missing_mission.exists());
+    std::fs::remove_dir_all(root).expect("cleanup malformed relay root fixture");
+}
+
+#[test]
+fn manual_node_redacts_duplicate_token_bearing_relay_url_before_state_access() {
+    let _process_test = serialize_process_test();
+    let root = fresh_root("duplicate-secret-relay-url");
+    let state = root.join("node-state");
+    let missing_mission = root.join("missing.bundle");
+    let secret = "relay-url-secret-must-not-appear";
+    let malicious_url = format!("https://user:{secret}@relay.invalid/?token={secret}");
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["node", "--state"])
+        .arg(&state)
+        .args([
+            "--bind",
+            "127.0.0.1:0",
+            "--mission-bundle-unprotected-reference",
+        ])
+        .arg(&missing_mission)
+        .args([
+            "--controlled-relay-url",
+            "https://relay.example.invalid",
+            "--controlled-relay-url",
+        ])
+        .arg(&malicious_url)
+        .args(["--controlled-relay-trust", "webpki", "--run-for", "1"])
+        .output()
+        .expect("run duplicate token-bearing relay URL node");
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 duplicate relay stdout");
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 duplicate relay stderr");
+    assert!(!output.status.success());
+    assert!(stderr.contains("--controlled-relay-url%20may%20be%20specified%20at%20most%20once"));
+    assert!(!stdout.contains(secret));
+    assert!(!stderr.contains(secret));
+    assert!(!root.exists(), "duplicate relay URL accessed node state");
+}
+
 #[test]
 fn manual_node_requires_explicit_unprotected_reference_mission_bundle_before_state() {
     let _process_test = serialize_process_test();
@@ -856,7 +1633,7 @@ fn live_node_excludes_a_second_authority_process_on_the_exact_store_path() {
         }
         lines
     });
-    let ready_deadline = Instant::now() + Duration::from_secs(10);
+    let ready_deadline = Instant::now() + PROCESS_READY_TIMEOUT;
     let mut ready = false;
     while Instant::now() < ready_deadline {
         if let Ok(line) = line_receiver.recv_timeout(Duration::from_millis(100))
@@ -888,10 +1665,9 @@ fn live_node_excludes_a_second_authority_process_on_the_exact_store_path() {
     );
     let competing_error = String::from_utf8(competing.stderr).expect("UTF-8 competing stderr");
     assert!(
-        competing_error.contains("already open")
-            || competing_error.contains("exclusive")
-            || competing_error.contains("lock")
-            || competing_error.contains("writable%20owner"),
+        competing_error.contains(
+            "control%20administration%20open%20unprotected%20reference:%20selected%20state%20unavailable"
+        ),
         "unexpected second-writer rejection: {competing_error}"
     );
 
@@ -920,7 +1696,7 @@ fn live_node_excludes_a_second_authority_process_on_the_exact_store_path() {
     assert!(
         String::from_utf8(stopped.stdout)
             .expect("UTF-8 stopped stdout")
-            .contains("emitted_by=authority-process")
+            .contains("publication_disposition=committed-this-call")
     );
     std::fs::remove_dir_all(root).expect("cleanup process-lock root");
 }
@@ -2225,7 +3001,10 @@ fn four_real_processes_propagate_controls_without_authority_and_exclude_captured
         .expect("authority revoke log");
     let rekey = std::fs::read_to_string(root.join("logs/authority-rekey.log"))
         .expect("authority rekey log");
-    assert!(revoke.contains("status=emitted") && revoke.contains("emitted_by=authority-process"));
+    assert!(
+        revoke.contains("status=emitted")
+            && revoke.contains("publication_disposition=committed-this-call")
+    );
     assert!(rekey.contains("status=emitted") && rekey.contains("recipient_filtered=true"));
     assert!(
         !root

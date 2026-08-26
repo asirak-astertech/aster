@@ -7,14 +7,17 @@
 
 use crate::{
     blob::{
-        BlobError, BlobId, BlobManifest, BlobReader, BlobRouteCommitment, BlobStore,
-        InspectedBlobManifest, MAX_BLOB_MANIFEST_BYTES, ReferenceBlobService, VerifiedBlobManifest,
-        content_group_id, inspect_selected_blob_manifest,
+        AuthenticatedBlobRoute, BlobError, BlobId, BlobManifest, BlobPhysicalLineage, BlobReader,
+        BlobRouteCommitment, BlobStore, InspectedBlobManifest, MAX_BLOB_MANIFEST_BYTES,
+        ReferenceBlobService, VerifiedBlobContentCompletion, VerifiedBlobManifest,
+        VerifiedBlobTransferPlan, content_group_id, inspect_selected_blob_manifest,
         verify_source_authenticated_store_completion,
     },
     crypto::ReferenceEnvelopeSealer,
     envelope::{EnvelopeError, EnvelopeHeader, EnvelopeSealer, SealRequest, SealedEnvelope},
     model::{DataClass, Dot, ItemId, NodeId, Priority, Scope, Topic, VersionVector},
+    source_event::SourceRouteLineage,
+    wire::EnvelopeId,
 };
 use sha2::{Digest, Sha256};
 use std::io;
@@ -30,6 +33,7 @@ pub struct RouteVerifiedBlobEnvelope {
     envelope: crate::envelope::VerifiedEnvelope,
     envelope_id: [u8; 32],
     mission_authority_id: NodeId,
+    route_lineage: SourceRouteLineage,
 }
 
 impl RouteVerifiedBlobEnvelope {
@@ -37,12 +41,14 @@ impl RouteVerifiedBlobEnvelope {
         envelope: crate::envelope::VerifiedEnvelope,
         sealed: &[u8],
         mission_authority_id: NodeId,
+        route_lineage: SourceRouteLineage,
     ) -> Result<Self, EnvelopeError> {
         validate_selected_blob_header(&envelope.header)?;
         Ok(Self {
             envelope,
             envelope_id: Sha256::digest(sealed).into(),
             mission_authority_id,
+            route_lineage,
         })
     }
 
@@ -64,6 +70,12 @@ impl RouteVerifiedBlobEnvelope {
     /// Alias for [`Self::mission_authority_id`].
     pub const fn authority_id(&self) -> NodeId {
         self.mission_authority_id()
+    }
+
+    /// Opaque identity of the exact provider route grant which authenticated
+    /// this source envelope.
+    pub const fn route_lineage(&self) -> SourceRouteLineage {
+        self.route_lineage
     }
 
     /// Complete provider-authenticated selected Blob metadata.
@@ -159,6 +171,7 @@ pub struct ContentVerifiedBlobEnvelope {
     route: RouteVerifiedBlobEnvelope,
     inspected: InspectedBlobManifest,
     manifest_sha256: [u8; 32],
+    physical_lineage: BlobPhysicalLineage,
 }
 
 impl std::fmt::Debug for ContentVerifiedBlobEnvelope {
@@ -171,6 +184,7 @@ impl std::fmt::Debug for ContentVerifiedBlobEnvelope {
             .field("publisher", &self.publisher())
             .field("manifest_len", &self.content_len())
             .field("manifest_digest", &"[REDACTED]")
+            .field("physical_lineage", &self.physical_lineage)
             .finish()
     }
 }
@@ -179,6 +193,7 @@ impl ContentVerifiedBlobEnvelope {
     fn from_opened(
         route: RouteVerifiedBlobEnvelope,
         manifest_bytes: &[u8],
+        physical_lineage: BlobPhysicalLineage,
     ) -> Result<Self, EnvelopeError> {
         let (inspected, computed_route) = inspect_selected_blob_manifest(manifest_bytes)
             .map_err(|_| invalid_selected_blob_manifest())?;
@@ -197,6 +212,7 @@ impl ContentVerifiedBlobEnvelope {
             route,
             inspected,
             manifest_sha256: Sha256::digest(manifest_bytes).into(),
+            physical_lineage,
         })
     }
 
@@ -218,6 +234,17 @@ impl ContentVerifiedBlobEnvelope {
     /// Alias for [`Self::mission_authority_id`].
     pub const fn authority_id(&self) -> NodeId {
         self.mission_authority_id()
+    }
+
+    /// Opaque identity of the exact route grant which authenticated the source.
+    pub const fn route_lineage(&self) -> SourceRouteLineage {
+        self.route.route_lineage()
+    }
+
+    /// Provider-owned one-way identity of the exact content grant which opened
+    /// this physical encrypted variant.
+    pub const fn physical_lineage(&self) -> BlobPhysicalLineage {
+        self.physical_lineage
     }
 
     /// Complete source- and content-authenticated Blob metadata.
@@ -320,6 +347,25 @@ impl ContentVerifiedBlobEnvelope {
         self.verify_exact_manifest(payload)
     }
 
+    /// Derives the complete nonconstructible carrier plan from the exact
+    /// source-authenticated canonical manifest bytes.
+    pub fn transfer_plan(
+        &self,
+        manifest_bytes: &[u8],
+    ) -> Result<VerifiedBlobTransferPlan, BlobError> {
+        self.verify_exact_manifest(manifest_bytes)
+            .map_err(|_| BlobError::AuthenticationFailed)?;
+        VerifiedBlobTransferPlan::from_authenticated_manifest(
+            AuthenticatedBlobRoute::new(
+                EnvelopeId::from_bytes(self.envelope_id()),
+                self.route_commitment(),
+            ),
+            self.physical_lineage,
+            manifest_bytes,
+            &self.inspected,
+        )
+    }
+
     /// Proves that a durable adapter completed the exact authenticated manifest.
     ///
     /// Every expected and committed chunk record, plus the finalization digest,
@@ -342,6 +388,90 @@ impl ContentVerifiedBlobEnvelope {
 
     pub(crate) const fn inspected_manifest(&self) -> &InspectedBlobManifest {
         &self.inspected
+    }
+}
+
+/// Provider-minted evidence that both route and physical content lineages are
+/// still current for one exact content-verified Blob source.
+///
+/// Durable promotion should compare this proof with the pending source in the
+/// same transaction. Construction remains private so a persisted binding or a
+/// coordinate-only check cannot mint currentness.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct CurrentBlobLineage {
+    mission_authority_id: NodeId,
+    source_envelope: EnvelopeId,
+    route_lineage: SourceRouteLineage,
+    physical_lineage: BlobPhysicalLineage,
+    blob_id: BlobId,
+    manifest_digest: [u8; 32],
+}
+
+/// Fixed provider-owned proof that one authenticated peer possesses the exact
+/// current content grant for a Blob selector.
+///
+/// The bytes carry no content key. They are bound to mission authority,
+/// scope/topic/epoch, and claimant NodeID, so another authenticated identity
+/// cannot replay a copied proof. Same-epoch key replacement invalidates it.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct BlobPeerContentProof([u8; 32]);
+
+impl BlobPeerContentProof {
+    pub const WIRE_LEN: usize = 32;
+
+    /// Fixed proof bytes for a semantic-v5 Blob request.
+    pub const fn wire_bytes(self) -> [u8; Self::WIRE_LEN] {
+        self.0
+    }
+
+    pub const fn as_wire_bytes(&self) -> &[u8; Self::WIRE_LEN] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for BlobPeerContentProof {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("BlobPeerContentProof([PROVIDER-OWNED])")
+    }
+}
+
+impl std::fmt::Debug for CurrentBlobLineage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CurrentBlobLineage")
+            .field("mission_authority_id", &self.mission_authority_id)
+            .field("source_envelope", &self.source_envelope)
+            .field("route_lineage", &self.route_lineage)
+            .field("physical_lineage", &self.physical_lineage)
+            .field("blob_id", &self.blob_id)
+            .field("manifest_digest", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl CurrentBlobLineage {
+    pub const fn mission_authority_id(&self) -> NodeId {
+        self.mission_authority_id
+    }
+
+    pub const fn source_envelope(&self) -> EnvelopeId {
+        self.source_envelope
+    }
+
+    pub const fn route_lineage(&self) -> SourceRouteLineage {
+        self.route_lineage
+    }
+
+    pub const fn physical_lineage(&self) -> BlobPhysicalLineage {
+        self.physical_lineage
+    }
+
+    pub const fn blob_id(&self) -> BlobId {
+        self.blob_id
+    }
+
+    pub const fn manifest_digest(&self) -> &[u8; 32] {
+        &self.manifest_digest
     }
 }
 
@@ -393,6 +523,65 @@ impl ReferenceEnvelopeSealer {
         self.can_open_event_content(scope, topic, epoch)
     }
 
+    /// Tests whether an exact provider-minted physical Blob lineage remains
+    /// current at its scope/topic/epoch coordinates.
+    pub fn is_current_blob_physical_lineage(
+        &self,
+        scope: &Scope,
+        topic: &Topic,
+        epoch: u64,
+        lineage: BlobPhysicalLineage,
+    ) -> bool {
+        self.current_blob_physical_lineage(scope, topic, epoch) == Some(lineage)
+    }
+
+    /// Mints the semantic-v5 request proof for this node's exact current Blob
+    /// content grant. Content-only nodes can mint a proof, but a serving peer's
+    /// verification also requires exact route authorization.
+    pub fn mint_blob_peer_content_proof(
+        &self,
+        scope: &Scope,
+        topic: &Topic,
+        epoch: u64,
+    ) -> Result<BlobPeerContentProof, EnvelopeError> {
+        self.blob_peer_content_proof_bytes(self.identity(), scope, topic, epoch)
+            .map(BlobPeerContentProof)
+            .ok_or_else(|| {
+                EnvelopeError("no current Blob content grant for requested selector".into())
+            })
+    }
+
+    /// Authenticates a semantic-v5 peer's exact Blob-content entitlement.
+    ///
+    /// `peer` and `peer_route_commitments` must come from the same completed
+    /// authenticated session. Callers must separately enforce current control
+    /// revocation policy. This predicate always requires both exact route
+    /// authorization and content-key possession and never infers content access
+    /// from a route commitment alone.
+    pub fn peer_can_open_blob_content(
+        &self,
+        peer: NodeId,
+        peer_route_commitments: &[[u8; 32]],
+        scope: &Scope,
+        topic: &Topic,
+        epoch: u64,
+        proof: &[u8; BlobPeerContentProof::WIRE_LEN],
+    ) -> bool {
+        if !self.peer_can_route(peer, peer_route_commitments, scope, epoch) {
+            return false;
+        }
+        let Some(expected) = self.blob_peer_content_proof_bytes(peer, scope, topic, epoch) else {
+            return false;
+        };
+        expected
+            .iter()
+            .zip(proof.iter())
+            .fold(0_u8, |difference, (left, right)| {
+                difference | (left ^ right)
+            })
+            == 0
+    }
+
     /// Seals an exact canonical selected Blob manifest through the source provider.
     pub fn seal_blob_manifest(
         &mut self,
@@ -422,8 +611,13 @@ impl ReferenceEnvelopeSealer {
         &mut self,
         sealed: &[u8],
     ) -> Result<RouteVerifiedBlobEnvelope, EnvelopeError> {
-        let verified = <Self as EnvelopeSealer>::inspect(self, sealed)?;
-        RouteVerifiedBlobEnvelope::from_verified(verified, sealed, self.mission_authority_id())
+        let (verified, route_lineage) = self.inspect_source_route_with_lineage(sealed)?;
+        RouteVerifiedBlobEnvelope::from_verified(
+            verified,
+            sealed,
+            self.mission_authority_id(),
+            SourceRouteLineage::from_commitment(route_lineage),
+        )
     }
 
     /// Authenticates a Blob and requires its source to equal `expected`.
@@ -461,13 +655,54 @@ impl ReferenceEnvelopeSealer {
                         "source Blob manifest length differs from authenticated metadata".into(),
                     ));
                 }
-                let verified = ContentVerifiedBlobEnvelope::from_opened(blob, &manifest_bytes)?;
+                let physical_lineage = self
+                    .current_blob_physical_lineage(blob.scope(), blob.topic(), blob.key_epoch())
+                    .ok_or_else(|| {
+                        EnvelopeError(
+                            "source Blob content grant is not current for authenticated metadata"
+                                .into(),
+                        )
+                    })?;
+                let verified = ContentVerifiedBlobEnvelope::from_opened(
+                    blob,
+                    &manifest_bytes,
+                    physical_lineage,
+                )?;
                 Ok(BlobContentVerification::ContentVerified {
                     blob: verified,
                     manifest_bytes,
                 })
             }
         }
+    }
+
+    /// Mints currentness evidence only while both exact provider-owned
+    /// lineages remain installed at the source-authenticated coordinates.
+    pub fn verify_current_blob_lineage(
+        &self,
+        blob: &ContentVerifiedBlobEnvelope,
+    ) -> Result<CurrentBlobLineage, EnvelopeError> {
+        if blob.mission_authority_id() != self.mission_authority_id()
+            || !self.is_current_source_route_lineage(
+                blob.scope(),
+                blob.key_epoch(),
+                blob.route_lineage(),
+            )
+            || self.current_blob_physical_lineage(blob.scope(), blob.topic(), blob.key_epoch())
+                != Some(blob.physical_lineage())
+        {
+            return Err(EnvelopeError(
+                "source Blob route or content lineage is no longer current".into(),
+            ));
+        }
+        Ok(CurrentBlobLineage {
+            mission_authority_id: blob.mission_authority_id(),
+            source_envelope: EnvelopeId::from_bytes(blob.envelope_id()),
+            route_lineage: blob.route_lineage(),
+            physical_lineage: blob.physical_lineage(),
+            blob_id: blob.blob_id(),
+            manifest_digest: *blob.manifest_digest(),
+        })
     }
 }
 
@@ -495,6 +730,41 @@ impl<S: BlobStore> ReferenceBlobService<S> {
         self.reader(VerifiedBlobManifest::new(blob.manifest().clone()))
     }
 
+    /// Freshly streams and authenticates every exact manifest chunk, including
+    /// ciphertext digests, AEAD tags, plaintext digests, total length, and the
+    /// whole-Blob digest, before minting a publication-grade content proof.
+    pub fn verify_blob_content_completion(
+        &mut self,
+        blob: &ContentVerifiedBlobEnvelope,
+        manifest_bytes: &[u8],
+    ) -> Result<VerifiedBlobContentCompletion, BlobError> {
+        blob.verify_exact_manifest(manifest_bytes)
+            .map_err(|_| BlobError::AuthenticationFailed)?;
+        self.validate_verified_blob_binding(blob)?;
+        blob.verify_store_completion(manifest_bytes, self.store_mut())?;
+        let stats = {
+            let mut reader = self.reader_for_verified(blob)?;
+            reader.stream_into(&mut io::sink())?
+        };
+        if stats.verified_chunks != blob.manifest().chunk_count()
+            || stats.plaintext_bytes != blob.manifest().total_len()
+        {
+            return Err(BlobError::AuthenticationFailed);
+        }
+        let mission_authority_id = self
+            .bound_mission_authority_id()
+            .ok_or(BlobError::AuthenticationFailed)?;
+        Ok(VerifiedBlobContentCompletion::new(
+            mission_authority_id,
+            EnvelopeId::from_bytes(blob.envelope_id()),
+            blob.blob_id(),
+            *blob.manifest_digest(),
+            blob.physical_lineage(),
+            stats.verified_chunks,
+            stats.plaintext_bytes,
+        ))
+    }
+
     fn validate_verified_blob_binding(
         &self,
         blob: &ContentVerifiedBlobEnvelope,
@@ -504,6 +774,7 @@ impl<S: BlobStore> ReferenceBlobService<S> {
             .is_some_and(|authority| authority != blob.mission_authority_id())
             || self.bound_content_group() != blob.manifest().content_group()
             || self.bound_epoch() != blob.manifest().content_epoch()
+            || self.physical_lineage() != blob.physical_lineage()
         {
             return Err(BlobError::AuthenticationFailed);
         }
@@ -558,7 +829,7 @@ mod tests {
     use super::*;
     use crate::{
         BlobChunkRecord, BlobMetadata, BlobStore, CausalStamp, SELECTED_BLOB_CHUNK_SIZE,
-        crypto::{ProvisioningAccess, ReferenceProvisioner},
+        crypto::{ProvisioningAccess, ReferenceProvisioner, ScopeRekeyRecipient},
         prepare_blob,
     };
     use std::io::{self, Cursor, Read, Seek, SeekFrom};
@@ -966,6 +1237,89 @@ mod tests {
             .service
             .install_verified_manifest(&blob, &manifest_bytes)
             .expect("install verified manifest");
+        let current_lineage = reader
+            .verify_current_blob_lineage(&blob)
+            .expect("current Blob lineage");
+        assert_eq!(
+            current_lineage.mission_authority_id(),
+            blob.mission_authority_id()
+        );
+        assert_eq!(
+            current_lineage.source_envelope().as_bytes(),
+            &blob.envelope_id()
+        );
+        assert_eq!(current_lineage.route_lineage(), blob.route_lineage());
+        assert_eq!(current_lineage.physical_lineage(), blob.physical_lineage());
+        assert_eq!(current_lineage.blob_id(), blob.blob_id());
+        assert_eq!(current_lineage.manifest_digest(), blob.manifest_digest());
+
+        let plan = blob
+            .transfer_plan(&manifest_bytes)
+            .expect("verified transfer plan");
+        assert_eq!(plan.manifest(), blob.manifest());
+        assert_eq!(plan.manifest_bytes(), manifest_bytes);
+        assert_eq!(plan.manifest_digest(), blob.manifest_digest());
+        assert_eq!(plan.physical_lineage(), blob.physical_lineage());
+        assert_eq!(
+            plan.chunk_records().len(),
+            usize::try_from(blob.manifest().chunk_count()).expect("chunk count")
+        );
+        let first_id = plan.carrier_id(0).expect("first carrier ID");
+        assert_eq!(first_id.wire_bytes()[0], 2);
+        assert_eq!(
+            plan.carrier_index(&first_id.wire_bytes())
+                .expect("carrier index"),
+            0
+        );
+        let built = plan
+            .build_carrier(fixture.service.store_mut(), 0)
+            .expect("canonical first carrier");
+        assert_eq!(built.object_id(), first_id);
+        assert!(built.bytes().len() <= crate::MAX_BLOB_TRANSFER_OBJECT_BYTES);
+        assert_eq!(
+            plan.carrier_total_len(&first_id.wire_bytes())
+                .expect("carrier total length"),
+            built.bytes().len() as u64
+        );
+        let (total, first_range) = plan
+            .read_carrier_range(fixture.service.store_mut(), &first_id.wire_bytes(), 0, 137)
+            .expect("bounded carrier range");
+        assert_eq!(total, built.bytes().len() as u64);
+        assert_eq!(first_range, built.bytes()[..137]);
+        let verified_carrier = plan
+            .verify_carrier(&first_id.wire_bytes(), built.bytes())
+            .expect("verify canonical carrier");
+        assert_eq!(verified_carrier.object_id(), first_id);
+        assert_eq!(verified_carrier.index(), 0);
+        assert_eq!(verified_carrier.record(), plan.chunk_records()[0]);
+        let mut tampered_carrier = built.bytes().to_vec();
+        *tampered_carrier.last_mut().expect("carrier byte") ^= 1;
+        assert!(
+            plan.verify_carrier(&first_id.wire_bytes(), &tampered_carrier)
+                .is_err()
+        );
+        let mut imported = TestBlobStore::default();
+        imported
+            .begin_blob_with_lineage(plan.manifest(), plan.physical_lineage())
+            .expect("begin imported physical variant");
+        plan.install_verified_carrier(&mut imported, &verified_carrier)
+            .expect("install verified carrier");
+        assert_eq!(imported.records[0], Some(plan.chunk_records()[0]));
+
+        let completion = fixture
+            .service
+            .verify_blob_content_completion(&blob, &manifest_bytes)
+            .expect("fresh full-content completion");
+        assert_eq!(
+            completion.mission_authority_id(),
+            blob.mission_authority_id()
+        );
+        assert_eq!(completion.source_envelope().as_bytes(), &blob.envelope_id());
+        assert_eq!(completion.blob_id(), blob.blob_id());
+        assert_eq!(completion.manifest_digest(), blob.manifest_digest());
+        assert_eq!(completion.physical_lineage(), blob.physical_lineage());
+        assert_eq!(completion.chunk_count(), blob.manifest().chunk_count());
+        assert_eq!(completion.plaintext_bytes(), blob.manifest().total_len());
         let mut output = Vec::new();
         let stats = fixture
             .service
@@ -1342,6 +1696,206 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn blob_peer_content_proof_is_exact_current_and_identity_bound() {
+        let mut provisioner =
+            ReferenceProvisioner::from_seed([0x6d; 32]).expect("proof provisioner");
+        let authority_bundle = provisioner
+            .issue_control_authority(1, &[full_access()])
+            .expect("proof authority bundle");
+        let reader_bundle = provisioner
+            .issue_node(2, &[full_access()])
+            .expect("proof reader bundle");
+        let relay_bundle = provisioner
+            .issue_node(3, &[relay_access()])
+            .expect("proof relay bundle");
+        let mut authority =
+            ReferenceEnvelopeSealer::open(authority_bundle).expect("proof authority");
+        let mut reader = ReferenceEnvelopeSealer::open(reader_bundle).expect("proof reader");
+        let mut relay = ReferenceEnvelopeSealer::open(relay_bundle).expect("proof relay");
+        let authority_id = authority.identity();
+        let reader_id = reader.identity();
+        let relay_id = relay.identity();
+
+        let old_fixture = fixture(
+            &authority,
+            &topic(),
+            1,
+            b"same logical Blob across a same-epoch rekey".to_vec(),
+            BlobMetadata::new(Some("application/octet-stream".into()), vec![6, 1])
+                .expect("old lineage metadata"),
+        );
+        let old_header = header(authority_id, &old_fixture.finished, topic(), 1, 1);
+        let old_sealed = authority
+            .seal_blob_manifest(&old_header, old_fixture.finished.manifest_bytes())
+            .expect("old lineage source");
+        let (old_blob, _) = content_verified(&mut reader, &old_sealed.bytes);
+        assert!(reader.verify_current_blob_lineage(&old_blob).is_ok());
+
+        let stale = reader
+            .mint_blob_peer_content_proof(&scope(), &topic(), 1)
+            .expect("pre-rekey proof");
+        let plan = provisioner
+            .plan_scope_rekey(
+                scope(),
+                1,
+                vec![
+                    ScopeRekeyRecipient::member(authority_id, vec![topic()])
+                        .expect("authority proof recipient"),
+                    ScopeRekeyRecipient::member(reader_id, vec![topic()])
+                        .expect("reader proof recipient"),
+                    ScopeRekeyRecipient::route_only(relay_id),
+                ],
+            )
+            .expect("proof rekey plan");
+        let control = authority
+            .seal_scope_rekey_chained(&plan, 1, None)
+            .expect("proof rekey control");
+        for provider in [&mut authority, &mut reader, &mut relay] {
+            <ReferenceEnvelopeSealer as EnvelopeSealer>::inspect_control(provider, &control)
+                .expect("verify proof rekey");
+            <ReferenceEnvelopeSealer as EnvelopeSealer>::activate_control(
+                provider, &control, false,
+            )
+            .expect("activate proof rekey");
+        }
+
+        let current = reader
+            .mint_blob_peer_content_proof(&scope(), &topic(), 1)
+            .expect("current reader proof");
+        assert_ne!(stale.wire_bytes(), current.wire_bytes());
+        assert_eq!(
+            format!("{current:?}"),
+            "BlobPeerContentProof([PROVIDER-OWNED])"
+        );
+        assert!(authority.peer_can_open_blob_content(
+            reader_id,
+            &[],
+            &scope(),
+            &topic(),
+            1,
+            current.as_wire_bytes(),
+        ));
+
+        assert!(reader.verify_current_blob_lineage(&old_blob).is_err());
+        assert!(!reader.is_current_source_route_lineage(
+            old_blob.scope(),
+            old_blob.key_epoch(),
+            old_blob.route_lineage(),
+        ));
+        assert!(!reader.is_current_blob_physical_lineage(
+            old_blob.scope(),
+            old_blob.topic(),
+            old_blob.key_epoch(),
+            old_blob.physical_lineage(),
+        ));
+        assert!(reader.verify_blob(&old_sealed.bytes).is_err());
+
+        let new_fixture = fixture(
+            &authority,
+            &topic(),
+            1,
+            b"same logical Blob across a same-epoch rekey".to_vec(),
+            BlobMetadata::new(Some("application/octet-stream".into()), vec![6, 1])
+                .expect("new lineage metadata"),
+        );
+        assert_eq!(new_fixture.finished.id(), old_fixture.finished.id());
+        let new_header = header(authority_id, &new_fixture.finished, topic(), 1, 2);
+        let new_sealed = authority
+            .seal_blob_manifest(&new_header, new_fixture.finished.manifest_bytes())
+            .expect("new lineage source");
+        let (new_blob, _) = content_verified(&mut reader, &new_sealed.bytes);
+        assert_ne!(new_blob.route_lineage(), old_blob.route_lineage());
+        assert_ne!(new_blob.physical_lineage(), old_blob.physical_lineage());
+        assert_ne!(
+            new_blob.route_lineage().binding(),
+            old_blob.route_lineage().binding()
+        );
+        assert_ne!(
+            new_blob.physical_lineage().binding(),
+            old_blob.physical_lineage().binding()
+        );
+        reader
+            .verify_current_blob_lineage(&new_blob)
+            .expect("replacement lineage is current");
+
+        // A same-epoch key replacement invalidates the superseded proof even
+        // though the numeric route coordinate remains authorized.
+        assert!(!authority.peer_can_open_blob_content(
+            reader_id,
+            &[],
+            &scope(),
+            &topic(),
+            1,
+            stale.as_wire_bytes(),
+        ));
+        assert!(
+            relay
+                .mint_blob_peer_content_proof(&scope(), &topic(), 1)
+                .is_err()
+        );
+        assert!(!authority.peer_can_open_blob_content(
+            relay_id,
+            &[],
+            &scope(),
+            &topic(),
+            1,
+            current.as_wire_bytes(),
+        ));
+
+        assert!(!authority.peer_can_open_blob_content(
+            authority_id,
+            &[],
+            &scope(),
+            &topic(),
+            1,
+            current.as_wire_bytes(),
+        ));
+        assert!(!authority.peer_can_open_blob_content(
+            reader_id,
+            &[],
+            &Scope::new("test/other-scope").expect("other scope"),
+            &topic(),
+            1,
+            current.as_wire_bytes(),
+        ));
+        assert!(!authority.peer_can_open_blob_content(
+            reader_id,
+            &[],
+            &scope(),
+            &other_topic(),
+            1,
+            current.as_wire_bytes(),
+        ));
+        assert!(!authority.peer_can_open_blob_content(
+            reader_id,
+            &[],
+            &scope(),
+            &topic(),
+            2,
+            current.as_wire_bytes(),
+        ));
+        let foreign = wrong_mission_reader();
+        assert!(!foreign.peer_can_open_blob_content(
+            reader_id,
+            &[],
+            &scope(),
+            &topic(),
+            1,
+            current.as_wire_bytes(),
+        ));
+        let mut tampered = current.wire_bytes();
+        tampered[17] ^= 0x80;
+        assert!(!authority.peer_can_open_blob_content(
+            reader_id,
+            &[],
+            &scope(),
+            &topic(),
+            1,
+            &tampered,
+        ));
     }
 
     struct FailingSource {

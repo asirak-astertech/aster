@@ -21,7 +21,7 @@ func TestVersionSurfacesDistinguishWireFromSemantics(t *testing.T) {
 	if ProtocolVersion() != 1 || ReplicationWireVersion() != 1 {
 		t.Fatalf("wire versions legacy=%d explicit=%d", ProtocolVersion(), ReplicationWireVersion())
 	}
-	if DefaultSemanticVersion() != 2 || HighestSupportedSemanticVersion() != 2 {
+	if DefaultSemanticVersion() != 5 || HighestSupportedSemanticVersion() != 5 {
 		t.Fatalf("semantic versions default=%d highest=%d", DefaultSemanticVersion(), HighestSupportedSemanticVersion())
 	}
 }

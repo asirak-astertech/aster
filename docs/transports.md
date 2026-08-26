@@ -64,6 +64,19 @@ pass equivalent tests.
 | Current semantic BTLE | MTU-aware link, unicast plus an advertisement primitive, disconnect handling, platform `BleRadio` seam | Selected-node integration; a shipped Android, iOS, Linux, or controller-specific radio driver; complete one-to-many profile |
 | LoRa, serial, file | The requirements and semantic design do not preclude them | No selected adapters ship |
 
+Separately from the parent and controlled-relay evidence summarized in the
+table, an operator-attested Cargo release-profile binary run for the signed
+current-tree source passed one selected Event N=32 direct-loopback line on one
+macOS arm64 host. Its 65 exact cohorts used 158 exact-named executions with
+distinct READY PIDs and 32 distinct mission identities/stores; the 62
+directed data-motion cohorts remained serial two-process edges, while the final
+equal-inventory no-op recorded 32 distinct READY PIDs. No overlap timing or OS
+sampler proves simultaneity. This bounded
+same-build, same-implementation, one-scope/authority/topic, line-topology
+receipt is not the full 2–32 range, the separate at-least-100-node target,
+distributed/physical scale, NAT, controlled-relay, BTLE/cross-transport,
+mixed-implementation, resource-threshold, or release acceptance.
+
 Code presence is not deployment credit. See the tracked
 [production requirements status](implementation/requirements-status.md) and
 [Conformance](conformance.md) for exact retained receipts, evidence, and open

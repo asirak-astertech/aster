@@ -1,6 +1,5 @@
 # Decision 0024: Refactor durable node ownership before selecting an IP provider
 
-> ****
 
 - Status: accepted — no provider selected
 - Date: 2026-08-21
@@ -11,8 +10,8 @@
   [`data-mesh-requirements.md`](../../data-mesh-requirements.md), SHA-256
   `e88bcc6c717a5175a460205fdc084aaa2e1f020a142a84087f9881677da02987`
 - Preserves: Decisions [0002](0002-dependency-admission.md),
-  [0014](0014-total-assurance-build-vs-buy.md),
-  [0015](0015-library-backed-mechanism-reduction.md),
+  0014 (“Build versus buy is governed by total assurance cost”;  not part of this repository artifact),
+  0015 (“Delete custom mechanism behind narrow library-backed seams”; not part of this repository artifact),
   [0022](0022-ip-mesh-experiment-no-selection.md), and
   [0023](0023-mesh-host-contract-no-libp2p-selection.md)
 

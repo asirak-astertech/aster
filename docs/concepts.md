@@ -146,6 +146,18 @@ also require the exact authenticated manifest and route commitment; Blob ID
 equality alone is insufficient. The current profile does not support a zero-byte
 Blob.
 
+In the selected semantic-v5 lane, the authenticated source and exact manifest
+arrive before carrier ranges. Each durable contiguous prefix advances by at
+most 16 KiB and is keyed by source/carrier identity rather than peer, so another
+eligible current content peer can resume it after reopen. Pending bytes are not
+an application-visible Blob; redb promotes only after exact depot,
+full-content, and current-lineage completion. V1-v4 emit zero Blob frames. The
+selected lane is direct content-capable only, not route-only relay/custody.
+Terminal or stale cleanup reclaims pending chunks and bytes but retains one
+bounded, non-public unfinished physical-lineage fence. Exact-lineage retry may
+refill it; a different lineage for the same Blob/content-group/numeric epoch
+requires an epoch advance.
+
 Use State, Event, or Record to publish small metadata that refers to a Blob ID.
 That lets consumers decide whether and when to fetch the large content.
 
@@ -216,36 +228,80 @@ Priority and time-to-live answer independent questions:
 
 - **Priority** says how urgently an item should be scheduled and how strongly it
   should survive storage pressure: Routine, Priority, Immediate, or Flash.
-- **TTL** says how long the item remains useful. An absent TTL means durable;
-  zero means already expired. An item with known `age >= TTL` MUST NOT be
-  offered, requested, retransmitted, or sent and MUST enter garbage collection.
-  If finite-TTL age cannot be bounded after a reboot or power loss, the item is
-  non-forwardable until a trusted time source proves it unexpired; it may remain
-  local with indeterminate age. See the normative [TTL
+- **TTL** says how long a non-tombstone item remains useful. An absent TTL means
+  durable; for non-tombstone data, zero means already expired. A non-tombstone
+  item with known `age >= TTL` MUST NOT be offered, requested, retransmitted, or
+  sent and MUST enter garbage collection. Tombstones are durable retained
+  markers regardless of an optional TTL value.
+  A profile may define a trusted-time proof after reboot or power loss. The
+  selected Event implementation does not: continuity loss is sticky, the item
+  remains non-forwardable, and recovery requires an application-specific
+  replacement or new source revision. See the normative [TTL
   rules](protocol.md#10-ttl-and-freshness-without-synchronized-clocks).
 
 A Flash item can still have a ten-second TTL. A Routine item can be durable.
 Applications should set both deliberately rather than deriving one from the
 other.
 
+The selected Event runtime implements this with semantic-v3/v4/v5 authenticated
+cumulative custody. Finite publication is Linux-only because the selected
+clock must include suspend time; other targets fail closed for finite TTL and
+continue to support durable Events. Selected State and Record reject every
+finite TTL and have no forwarding-age path; Blob remains durable-only. Its
+semantic-v5 direct transfer has no selected TTL/custody/expiry/GC path.
+
 ### Emission policy
 
-A node can set a minimum emitted priority or enter receive-only mode. Any
-threshold above Routine suppresses discovery as well as lower-priority
-application and supporting traffic. ReceiveOnly suppresses discovery, inventory,
-and item transmission, but mandatory authentication and link acknowledgements
-may still be emitted to ingest data on a connection-oriented transport. It is
-not a physical radio-silence claim. The protocol also defines PassiveOnly, in
-which the framework originates no bytes, but current application and language-
-binding APIs do not expose that mode. Emission policy is local: it can restrict
-use of a signed authorization, never broaden one.
+A node can set a minimum emitted priority or enter receive-only mode.
+`AtLeast(p)` withholds selected Event objects below `p`, but it still initiates
+configured contacts and permits the protocol/control work needed to authenticate
+and complete them. On semantic-v4/v5 contacts, Normal and every `AtLeast(p)` also
+run State and Record reconciliation; under v5 they run direct Blob work because
+the threshold is Event-only.
+ReceiveOnly cannot initiate a contact and suppresses
+discovery, inventory disclosure, and item transmission, but mandatory
+authentication, acknowledgements, and bounded apply results may still be
+emitted while ingesting Event data on a connection-oriented transport; it
+initiates and discloses no State/Record/Blob lane. The selected
+direct-Iroh endpoint has hosted discovery disabled in every mode, independently
+of this policy. ReceiveOnly is not a physical radio-silence claim. The protocol
+protects an opaque selector generation so a prior custody receipt cannot hide a
+later Carry-to-Consume change; the generation reveals a change, not the mode.
+The receiver-relative result hides Carry versus successful Consume and exposes
+`ContentAcceptancePending` only for an offered object that still needs content
+acceptance. The protocol
+also defines PassiveOnly, in which the framework originates no bytes, but
+current application and language-binding APIs do not expose that mode. Emission
+policy is local: it can restrict use of a signed authorization, never broaden
+one.
 
 ### Bounded storage and backpressure
 
-Node options bound item count, stored bytes, and retention. Lower-priority data
-is the first candidate under configured pressure. Blob storage and incomplete
+Node options bound item count, stored bytes, and retention. The complete
+protocol expects priority-aware pressure. The selected Event custody slice fixes
+its candidate partition once at admission start. If the exact scope is short,
+every same-scope candidate ranks ahead of every off-scope candidate for that
+transaction; otherwise all candidates form one aggregate cohort. It removes
+expired rows first within each cohort, so a simultaneous aggregate shortage can
+consume a same-scope live row before an off-scope expired row. For ordinary
+Event/RouteEvent admission, a live row is a victim only when its priority is
+strictly lower than the incoming demand; those eligible victims rank route-only
+before accepted, then lower priority, nearer expiry, older acceptance, and exact
+identity. Emergency aggregate authority/control or selected-tombstone admission
+may bypass only that priority cutoff. Protected live rows remain withheld from
+pressure, while absolute expiry may still retire them. Because State, Record,
+and Blob have no selected custody retirement
+path, generic cross-class
+lowest-priority-first eviction remains open. Blob storage and incomplete
 transfer staging are separately bounded so unauthenticated partial data cannot
 evict committed application data.
+
+Selected semantic-v4/v5 State and Record use fixed per-class caps instead of Event
+custody eviction: 1 MiB per object, 4,096 rows, and 16 MiB of encoded source
+bytes. A full class or causal frontier defers the authenticated object for a
+later contact without deleting an existing mutable row. Durable rotation keyed
+by peer, class, and local offer/fetch mode keeps bounded contacts from always
+starting at the same identity.
 
 Applications should monitor quota usage and treat quota errors as policy or
 capacity signals, not transient network failures.

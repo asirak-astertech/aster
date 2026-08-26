@@ -7,9 +7,19 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+default = []
+test-utils = ["dep:iroh-relay"]
+
 [dependencies]
+futures.workspace = true
 iroh.workspace = true
+iroh-relay = { version = "=1.0.3", default-features = false, features = ["server", "test-utils", "tls-ring"], optional = true }
+rustls.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+rcgen = { version = "=0.14.9", default-features = false, features = ["crypto", "ring"] }
 
 [lints]
 workspace = true

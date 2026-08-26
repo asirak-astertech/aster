@@ -15,9 +15,16 @@ use super::{
     SequencedCiphertext, ServerFinished, ServerHello, ZeroizeKey, client_hello_hash,
 };
 use crate::batch;
-use crate::blob::{BlobId, BlobRouteCommitment, BlobStore, BlobStoreConfig, ReferenceBlobService};
+use crate::blob::{
+    BlobId, BlobPhysicalLineage, BlobRouteCommitment, BlobStore, BlobStoreConfig,
+    ReferenceBlobService,
+};
 use crate::bridge::{
     self, AuthorizationEnvelope, BridgeAuthorization, BridgeOuterKind, BridgeRoute,
+};
+use crate::custody::{
+    CustodyClaims, CustodyExpectation, MAX_CUSTODY_WRAPPER_BYTES, MIN_CUSTODY_SEMANTIC_VERSION,
+    VerifiedCustodyClaims, decode_claims, encode_claims,
 };
 #[cfg(feature = "sqlite-store")]
 use crate::engine::{EngineError, Node, NodeConfig};
@@ -78,6 +85,12 @@ const PROTOCOL_VERSION: u16 = super::PROTOCOL_VERSION;
 const SEMANTIC_PROTOCOL_V1: u16 = super::SEMANTIC_PROTOCOL_V1;
 #[cfg(test)]
 const SEMANTIC_PROTOCOL_V2: u16 = super::SEMANTIC_PROTOCOL_V2;
+#[cfg(test)]
+const SEMANTIC_PROTOCOL_V3: u16 = super::SEMANTIC_PROTOCOL_V3;
+#[cfg(test)]
+const SEMANTIC_PROTOCOL_V4: u16 = super::SEMANTIC_PROTOCOL_V4;
+#[cfg(test)]
+const SEMANTIC_PROTOCOL_V5: u16 = super::SEMANTIC_PROTOCOL_V5;
 const SUITE_ID: u16 = super::HYBRID_SUITE_ID;
 const PUBLIC_HEADER_LEN: usize = 44;
 const SELECTOR_LEN: usize = 16;
@@ -107,6 +120,7 @@ const BATCH_ID_DOMAIN: &[u8] = b"aster/singleton-batch-id/v1";
 const ROUTE_KEY_LABEL: &[u8] = b"aster/route-key/v1";
 const CONTENT_KEY_LABEL: &[u8] = b"aster/content-key/v1";
 const CONTENT_NONCE_LABEL: &[u8] = b"aster/content-nonce/v1";
+const BLOB_PEER_CONTENT_PROOF_LABEL: &[u8] = b"aster/blob-peer-content-proof/v1";
 const CONTENT_GROUP_DOMAIN: &[u8] = b"aster/content-group/v1";
 const CONTROL_AUTHENTICATION_MAGIC: &[u8; 8] = b"ASTRCA02";
 const CONTROL_AUTHENTICATION_FORMAT: u16 = 2;
@@ -147,6 +161,7 @@ const MISSION_PROOF_NONCE_LABEL: &[u8] = b"aster/mission-proof-nonce/v1";
 const MISSION_PROOF_AAD_DOMAIN: &[u8] = b"aster/mission-proof-aad/v1";
 const MISSION_PROOF_TRANSCRIPT_DOMAIN: &[u8] = b"aster/mission-proof-transcript/v1";
 const TRANSPORT_FRAME_AAD: &[u8] = b"aster/transport-frame/v1";
+const CUSTODY_WRAPPER_AAD: &[u8] = b"aster/custody-wrapper/v3";
 const MAX_HANDSHAKE_FLIGHT_LEN: usize = 64 * 1024;
 const MAX_HANDSHAKE_OFFERS: usize = 16;
 const MAX_TRANSPORT_FRAME_LEN: usize = 16 * 1024 * 1024;
@@ -333,10 +348,16 @@ struct RekeyCredential {
     signature: HybridSignature,
 }
 
+struct VerifiedRekeyRegistry {
+    generation: u64,
+    signed_credentials: BTreeMap<NodeId, RekeyCredential>,
+    authenticated_credentials: BTreeMap<NodeId, Credential>,
+}
+
 #[derive(Clone)]
 struct PlannedRekeyRecipient {
     request: ScopeRekeyRecipient,
-    credential: RekeyCredential,
+    credential: Credential,
 }
 
 /// Opaque authority plan for a fresh capture-excluding scope epoch.
@@ -398,7 +419,7 @@ fn build_scope_rekey_plan(
     scope: Scope,
     epoch: u64,
     mut recipients: Vec<ScopeRekeyRecipient>,
-    credentials: &BTreeMap<NodeId, RekeyCredential>,
+    mut credentials: BTreeMap<NodeId, Credential>,
 ) -> Result<ScopeRekeyPlan, EnvelopeError> {
     if epoch == 0 || recipients.is_empty() || recipients.len() > MAX_REKEY_RECIPIENTS {
         return Err(EnvelopeError("invalid scope rekey plan bounds".into()));
@@ -421,9 +442,15 @@ fn build_scope_rekey_plan(
     let mut planned = Vec::with_capacity(recipients.len());
     for request in recipients {
         let credential = credentials
-            .get(&request.node)
-            .ok_or_else(|| EnvelopeError("unknown scope rekey recipient".into()))?
-            .clone();
+            .remove(&request.node)
+            .ok_or_else(|| EnvelopeError("unknown scope rekey recipient".into()))?;
+        if credential.identity != request.node
+            || (request.route_access && credential.roles & ROLE_RELAY == 0)
+            || (!request.readable_topics.is_empty() && credential.roles & ROLE_READER == 0)
+            || (!request.route_access && request.readable_topics.is_empty())
+        {
+            return Err(authentication_failed());
+        }
         planned.push(PlannedRekeyRecipient {
             request,
             credential,
@@ -843,7 +870,13 @@ impl ReferenceProvisioner {
         recipients: Vec<ScopeRekeyRecipient>,
     ) -> Result<ScopeRekeyPlan, EnvelopeError> {
         self.root.as_ref().ok_or_else(zeroized_service)?;
-        build_scope_rekey_plan(scope, epoch, recipients, &self.issued_rekey_credentials)
+        let credentials = authenticate_rekey_credentials(
+            &self.issued_rekey_credentials,
+            &self.mission,
+            &self.authority_verifying_key,
+            &self.provider,
+        )?;
+        build_scope_rekey_plan(scope, epoch, recipients, credentials)
     }
 
     /// Exports the bounded public recipient registry as one authority-signed canonical artifact.
@@ -906,7 +939,11 @@ impl ReferenceProvisioner {
         minimum_generation: u64,
     ) -> Result<(), EnvelopeError> {
         self.root.as_ref().ok_or_else(zeroized_service)?;
-        let (imported_generation, imported) = verify_rekey_registry(
+        let VerifiedRekeyRegistry {
+            generation: imported_generation,
+            signed_credentials: imported,
+            ..
+        } = verify_rekey_registry(
             encoded,
             minimum_generation,
             &self.mission,
@@ -1083,6 +1120,7 @@ impl Drop for ReferenceProvisioner {
     }
 }
 
+#[derive(Clone)]
 struct Credential {
     body: Vec<u8>,
     signature: HybridSignature,
@@ -1542,6 +1580,63 @@ impl ReferenceEnvelopeSealer {
         self.authority_id()
     }
 
+    pub(crate) fn current_source_route_grant_commitment(
+        &self,
+        scope: &Scope,
+        epoch: u64,
+    ) -> Option<[u8; 32]> {
+        self.route_grant(scope, epoch)
+            .and_then(|grant| route_grant_commitment(&self.mission, grant).ok())
+    }
+
+    pub(crate) fn current_event_route_grant_commitment(
+        &self,
+        scope: &Scope,
+        epoch: u64,
+    ) -> Option<[u8; 32]> {
+        self.current_source_route_grant_commitment(scope, epoch)
+    }
+
+    pub(crate) fn current_blob_physical_lineage(
+        &self,
+        scope: &Scope,
+        topic: &Topic,
+        epoch: u64,
+    ) -> Option<BlobPhysicalLineage> {
+        self.content_grant(scope, topic, epoch).map(|grant| {
+            BlobPhysicalLineage::from_content_grant(
+                self.authority_id,
+                scope,
+                topic,
+                epoch,
+                grant.key.expose(),
+            )
+        })
+    }
+
+    pub(crate) fn blob_peer_content_proof_bytes(
+        &self,
+        claimant: NodeId,
+        scope: &Scope,
+        topic: &Topic,
+        epoch: u64,
+    ) -> Option<[u8; 32]> {
+        if self.zeroized {
+            return None;
+        }
+        let grant = self.content_grant(scope, topic, epoch)?;
+        let mut context =
+            Vec::with_capacity(32 + 32 + 8 + scope.as_str().len() + 8 + topic.as_str().len() + 8);
+        context.extend_from_slice(&self.authority_id);
+        context.extend_from_slice(&claimant);
+        context.extend_from_slice(&(scope.as_str().len() as u64).to_be_bytes());
+        context.extend_from_slice(scope.as_str().as_bytes());
+        context.extend_from_slice(&(topic.as_str().len() as u64).to_be_bytes());
+        context.extend_from_slice(topic.as_str().as_bytes());
+        context.extend_from_slice(&epoch.to_be_bytes());
+        derive_material::<32>(grant.key.expose(), BLOB_PEER_CONTENT_PROOF_LABEL, &context).ok()
+    }
+
     /// Tests whether an authenticated peer credential carries the exact
     /// authority-signed route grant for one scope and key epoch.
     ///
@@ -1590,7 +1685,11 @@ impl ReferenceEnvelopeSealer {
         if self.credential.roles & ROLE_CONTROL_AUTHORITY == 0 {
             return Err(EnvelopeError("node is not a control authority".into()));
         }
-        let (generation, credentials) = verify_rekey_registry(
+        let VerifiedRekeyRegistry {
+            generation,
+            authenticated_credentials: credentials,
+            ..
+        } = verify_rekey_registry(
             encoded_registry,
             minimum_registry_generation,
             &self.mission,
@@ -1598,7 +1697,7 @@ impl ReferenceEnvelopeSealer {
             &self.authority_verifying_key,
             &self.provider,
         )?;
-        let plan = build_scope_rekey_plan(scope, epoch, recipients, &credentials)?;
+        let plan = build_scope_rekey_plan(scope, epoch, recipients, credentials)?;
         Ok((plan, generation))
     }
 
@@ -1762,13 +1861,7 @@ impl ReferenceEnvelopeSealer {
         let mut prepared = Vec::with_capacity(plan.recipients.len());
         let mut unique_topics = BTreeSet::new();
         for planned in &plan.recipients {
-            let credential = decode_credential(
-                planned.credential.body.clone(),
-                planned.credential.signature.clone(),
-                &self.mission,
-                &self.authority_verifying_key,
-                &self.provider,
-            )?;
+            let credential = &planned.credential;
             if credential.identity != planned.request.node
                 || (planned.request.route_access && credential.roles & ROLE_RELAY == 0)
                 || (!planned.request.readable_topics.is_empty()
@@ -1787,7 +1880,7 @@ impl ReferenceEnvelopeSealer {
             if unique_topics.len() > MAX_GRANTS {
                 return Err(EnvelopeError("too many fresh scope topic keys".into()));
             }
-            let credential_hash = rekey_credential_hash(&credential)?;
+            let credential_hash = rekey_credential_hash(credential)?;
             let grant_salt = random_secret(&mut self.provider)?;
             let grant_commitment = rekey_grant_commitment(
                 format,
@@ -1801,7 +1894,7 @@ impl ReferenceEnvelopeSealer {
             )?;
             prepared.push(PreparedRekeyRecipient {
                 request: planned.request.clone(),
-                credential,
+                credential: credential.clone(),
                 credential_hash,
                 grant_salt,
                 grant_commitment,
@@ -2254,6 +2347,29 @@ impl ReferenceEnvelopeSealer {
         Ok((verified, parsed, route))
     }
 
+    pub(crate) fn inspect_source_route_with_lineage(
+        &self,
+        sealed: &[u8],
+    ) -> Result<(VerifiedEnvelope, [u8; 32]), EnvelopeError> {
+        self.ensure_live()?;
+        let parsed = parse_envelope(sealed)?;
+        if parsed.kind != EnvelopeKind::Data {
+            return Err(EnvelopeError("expected a data envelope".into()));
+        }
+        let (route, mut exact_plaintext, lineage) =
+            self.open_data_route_exact_with_lineage(&parsed)?;
+        let verified = self.verify_decoded_data_route(&parsed, &route);
+        exact_plaintext.zeroize();
+        verified.map(|verified| (verified, lineage))
+    }
+
+    pub(crate) fn inspect_event_route_with_lineage(
+        &self,
+        sealed: &[u8],
+    ) -> Result<(VerifiedEnvelope, [u8; 32]), EnvelopeError> {
+        self.inspect_source_route_with_lineage(sealed)
+    }
+
     fn verify_decoded_data_route(
         &self,
         parsed: &ParsedEnvelope<'_>,
@@ -2295,6 +2411,14 @@ impl ReferenceEnvelopeSealer {
         &self,
         parsed: &ParsedEnvelope<'_>,
     ) -> Result<(DecodedDataRoute, Vec<u8>), EnvelopeError> {
+        self.open_data_route_exact_with_lineage(parsed)
+            .map(|(route, plaintext, _)| (route, plaintext))
+    }
+
+    fn open_data_route_exact_with_lineage(
+        &self,
+        parsed: &ParsedEnvelope<'_>,
+    ) -> Result<(DecodedDataRoute, Vec<u8>, [u8; 32]), EnvelopeError> {
         for grant in &self.route_grants {
             let route_key =
                 derive_item_secret(grant.key.expose(), ROUTE_KEY_LABEL, &parsed.selector)?;
@@ -2318,7 +2442,14 @@ impl ReferenceEnvelopeSealer {
                 && route.header.scope == grant.scope
                 && route.header.key_epoch == grant.epoch
             {
-                return Ok((route, plaintext));
+                let lineage = route_grant_commitment(&self.mission, grant);
+                match lineage {
+                    Ok(lineage) => return Ok((route, plaintext, lineage)),
+                    Err(error) => {
+                        plaintext.zeroize();
+                        return Err(error);
+                    }
+                }
             }
             plaintext.zeroize();
         }
@@ -2356,6 +2487,76 @@ impl ReferenceEnvelopeSealer {
         );
         plaintext.zeroize();
         decoded
+    }
+
+    fn verified_control_from_decoded(
+        &self,
+        decoded: DecodedControl,
+        sealed: &[u8],
+    ) -> Result<(VerifiedControl, Option<Vec<NodeId>>), EnvelopeError> {
+        match decoded {
+            DecodedControl::Revocation {
+                signer,
+                sequence,
+                previous,
+                subject,
+                generation,
+            } => Ok((
+                VerifiedControl::Revocation(Revocation {
+                    subject,
+                    authority: self.authority_id,
+                    signer,
+                    generation,
+                    control_sequence: sequence,
+                    previous_control: previous,
+                    sealed_notice: sealed.to_vec(),
+                    observed_at_ms: None,
+                }),
+                None,
+            )),
+            DecodedControl::ScopeEpoch {
+                signer,
+                sequence,
+                previous,
+                scope,
+                epoch,
+                keying,
+            } => {
+                let scope_rekey_recipient_nodes = match &keying {
+                    ScopeEpochKeying::LegacyPreprovisioned => {
+                        if self.route_grant(&scope, epoch).is_none() {
+                            return Err(EnvelopeError(
+                                "scope epoch was not independently pre-provisioned".into(),
+                            ));
+                        }
+                        None
+                    }
+                    ScopeEpochKeying::RecipientPackages { packages, .. } => {
+                        Some(packages.iter().map(|package| package.recipient).collect())
+                    }
+                };
+                Ok((
+                    VerifiedControl::ScopeEpoch(ScopeEpoch {
+                        authority: self.authority_id,
+                        signer,
+                        scope,
+                        epoch,
+                        control_sequence: sequence,
+                        previous_control: previous,
+                        sealed_notice: sealed.to_vec(),
+                    }),
+                    scope_rekey_recipient_nodes,
+                ))
+            }
+        }
+    }
+
+    pub(crate) fn inspect_control_with_scope_rekey_recipient_nodes(
+        &self,
+        sealed: &[u8],
+    ) -> Result<(VerifiedControl, Option<Vec<NodeId>>), EnvelopeError> {
+        let decoded = self.inspect_control_internal(sealed)?;
+        self.verified_control_from_decoded(decoded, sealed)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4038,49 +4239,8 @@ impl EnvelopeSealer for ReferenceEnvelopeSealer {
     }
 
     fn inspect_control(&mut self, sealed: &[u8]) -> Result<VerifiedControl, EnvelopeError> {
-        match self.inspect_control_internal(sealed)? {
-            DecodedControl::Revocation {
-                signer,
-                sequence,
-                previous,
-                subject,
-                generation,
-            } => Ok(VerifiedControl::Revocation(Revocation {
-                subject,
-                authority: self.authority_id,
-                signer,
-                generation,
-                control_sequence: sequence,
-                previous_control: previous,
-                sealed_notice: sealed.to_vec(),
-                observed_at_ms: None,
-            })),
-            DecodedControl::ScopeEpoch {
-                signer,
-                sequence,
-                previous,
-                scope,
-                epoch,
-                keying,
-            } => {
-                if matches!(keying, ScopeEpochKeying::LegacyPreprovisioned)
-                    && self.route_grant(&scope, epoch).is_none()
-                {
-                    return Err(EnvelopeError(
-                        "scope epoch was not independently pre-provisioned".into(),
-                    ));
-                }
-                Ok(VerifiedControl::ScopeEpoch(ScopeEpoch {
-                    authority: self.authority_id,
-                    signer,
-                    scope,
-                    epoch,
-                    control_sequence: sequence,
-                    previous_control: previous,
-                    sealed_notice: sealed.to_vec(),
-                }))
-            }
-        }
+        self.inspect_control_with_scope_rekey_recipient_nodes(sealed)
+            .map(|(control, _)| control)
     }
 
     fn seal_forwarding(
@@ -4463,11 +4623,13 @@ impl ReferenceSessionAwaitingFinished {
         };
         let keys = handshake.into_session_keys();
         let protocol_version = keys.selected_version();
+        let session_id = keys.transcript_hash;
         Ok(ReferenceAuthenticatedSession {
             provider: self.provider,
             peer_identity: self.peer_identity,
             peer_route_grant_commitments: self.peer_route_grant_commitments,
             semantic_version: protocol_version,
+            session_id,
             channel: keys.into_channel(),
         })
     }
@@ -4625,6 +4787,7 @@ impl ReferenceSessionResponderPending {
         };
         let keys = handshake.into_session_keys(final_transcript_hash);
         let protocol_version = keys.selected_version();
+        let session_id = keys.transcript_hash;
         let peer_identity = peer.identity;
         let peer_route_grant_commitments = peer.route_grant_commitments;
         let endpoint = self.endpoint;
@@ -4634,6 +4797,7 @@ impl ReferenceSessionResponderPending {
                 peer_identity,
                 peer_route_grant_commitments,
                 semantic_version: protocol_version,
+                session_id,
                 channel: keys.into_channel(),
             },
             finished_flight,
@@ -4647,6 +4811,7 @@ pub struct ReferenceAuthenticatedSession {
     peer_identity: NodeId,
     peer_route_grant_commitments: Vec<[u8; 32]>,
     semantic_version: u16,
+    session_id: [u8; 32],
     channel: SecureChannel,
 }
 
@@ -4709,6 +4874,61 @@ impl ReferenceAuthenticatedSession {
             .map_err(handshake_error)
     }
 
+    /// Encrypts and authenticates one fixed, transfer-bound semantic-v3 custody claim.
+    ///
+    /// Stable source bytes and range payloads remain in the ordinary peer-neutral
+    /// transfer path.  Only the bounded claim is placed in this distinct session
+    /// record domain.
+    pub fn seal_custody_wrapper(
+        &mut self,
+        claims: &CustodyClaims,
+    ) -> Result<Vec<u8>, EnvelopeError> {
+        if self.semantic_version < MIN_CUSTODY_SEMANTIC_VERSION {
+            return Err(custody_version_unavailable());
+        }
+        let mut plaintext =
+            encode_claims(*claims, self.session_id).map_err(|_| custody_authentication_failed())?;
+        let record = self
+            .channel
+            .seal(&mut self.provider, &plaintext, CUSTODY_WRAPPER_AAD);
+        plaintext.zeroize();
+        let wrapper = encode_transport_frame(&record.map_err(custody_channel_error)?)?;
+        if wrapper.len() > MAX_CUSTODY_WRAPPER_BYTES {
+            return Err(custody_authentication_failed());
+        }
+        Ok(wrapper)
+    }
+
+    /// Authenticates, replay-checks, and context-checks one semantic-v3 custody claim.
+    ///
+    /// `expected` must be built from the live exchange and freshly verified
+    /// stable source header, so TTL and priority cannot be relabelled by a relay.
+    pub fn open_custody_wrapper(
+        &mut self,
+        wrapper: &[u8],
+        expected: CustodyExpectation,
+    ) -> Result<VerifiedCustodyClaims, EnvelopeError> {
+        if self.semantic_version < MIN_CUSTODY_SEMANTIC_VERSION {
+            return Err(custody_version_unavailable());
+        }
+        if wrapper.is_empty() || wrapper.len() > MAX_CUSTODY_WRAPPER_BYTES {
+            return Err(custody_authentication_failed());
+        }
+        let record =
+            decode_transport_frame(wrapper).map_err(|_| custody_authentication_failed())?;
+        let mut plaintext = self
+            .channel
+            .open(&self.provider, &record, CUSTODY_WRAPPER_AAD)
+            .map_err(custody_channel_error)?;
+        let decoded = decode_claims(&plaintext, self.session_id).and_then(|claims| {
+            claims
+                .verify_expected(expected)
+                .map(|()| VerifiedCustodyClaims::from_authenticated(claims))
+        });
+        plaintext.zeroize();
+        decoded.map_err(|_| custody_authentication_failed())
+    }
+
     /// Rapidly erases directional traffic keys.
     pub fn zeroize(&mut self) {
         self.channel.zeroize();
@@ -4750,6 +4970,27 @@ fn handshake_error(error: CryptoError) -> EnvelopeError {
         }
         _ => authentication_failed(),
     }
+}
+
+fn custody_channel_error(error: CryptoError) -> EnvelopeError {
+    match error {
+        CryptoError::ReplayDetected | CryptoError::ReplayTooOld => {
+            EnvelopeError("custody wrapper replay rejected".into())
+        }
+        CryptoError::SequenceExhausted => {
+            EnvelopeError("custody wrapper sequence exhausted".into())
+        }
+        CryptoError::RandomnessUnavailable => reference_open_error(error),
+        _ => custody_authentication_failed(),
+    }
+}
+
+fn custody_authentication_failed() -> EnvelopeError {
+    EnvelopeError("custody wrapper authentication failed".into())
+}
+
+fn custody_version_unavailable() -> EnvelopeError {
+    EnvelopeError("semantic protocol v3 custody is unavailable".into())
 }
 
 fn handshake_prefix(kind: u8) -> Vec<u8> {
@@ -5877,6 +6118,31 @@ fn decode_credential(
     })
 }
 
+fn authenticate_rekey_credentials(
+    credentials: &BTreeMap<NodeId, RekeyCredential>,
+    expected_mission: &[u8; 32],
+    authority_key: &HybridVerifyingKey,
+    provider: &RustCryptoProvider<SysRng>,
+) -> Result<BTreeMap<NodeId, Credential>, EnvelopeError> {
+    let mut authenticated = BTreeMap::new();
+    for (node, signed) in credentials {
+        let credential = decode_credential(
+            signed.body.clone(),
+            signed.signature.clone(),
+            expected_mission,
+            authority_key,
+            provider,
+        )?;
+        if credential.identity != *node
+            || credential.roles & (ROLE_RELAY | ROLE_READER) == 0
+            || authenticated.insert(*node, credential).is_some()
+        {
+            return Err(authentication_failed());
+        }
+    }
+    Ok(authenticated)
+}
+
 fn verify_rekey_registry(
     encoded: &[u8],
     minimum_generation: u64,
@@ -5884,7 +6150,7 @@ fn verify_rekey_registry(
     expected_authority: NodeId,
     authority_key: &HybridVerifyingKey,
     provider: &RustCryptoProvider<SysRng>,
-) -> Result<(u64, BTreeMap<NodeId, RekeyCredential>), EnvelopeError> {
+) -> Result<VerifiedRekeyRegistry, EnvelopeError> {
     if encoded.len() > MAX_REKEY_REGISTRY_LEN {
         return Err(authentication_failed());
     }
@@ -5908,6 +6174,7 @@ fn verify_rekey_registry(
         return Err(authentication_failed());
     }
     let mut credentials = BTreeMap::new();
+    let mut authenticated_credentials = BTreeMap::new();
     let mut previous_node = None;
     for _ in 0..count {
         let node = reader.array::<32>()?;
@@ -5924,11 +6191,13 @@ fn verify_rekey_registry(
             authority_key,
             provider,
         )?;
-        if credential.identity != node
-            || credential.roles & (ROLE_RELAY | ROLE_READER) == 0
-            || credentials
-                .insert(node, RekeyCredential { body, signature })
-                .is_some()
+        if credential.identity != node || credential.roles & (ROLE_RELAY | ROLE_READER) == 0 {
+            return Err(authentication_failed());
+        }
+        if credentials
+            .insert(node, RekeyCredential { body, signature })
+            .is_some()
+            || authenticated_credentials.insert(node, credential).is_some()
         {
             return Err(authentication_failed());
         }
@@ -5940,7 +6209,11 @@ fn verify_rekey_registry(
     provider
         .verify(authority_key, &digest, &signature)
         .map_err(envelope_crypto_error)?;
-    Ok((generation, credentials))
+    Ok(VerifiedRekeyRegistry {
+        generation,
+        signed_credentials: credentials,
+        authenticated_credentials,
+    })
 }
 
 fn route_grant_commitments(
@@ -6070,7 +6343,13 @@ fn parse_batch_envelope(
     sealed: &[u8],
     selected_semantic_version: u16,
 ) -> Result<ParsedBatchEnvelope<'_>, EnvelopeError> {
-    if selected_semantic_version != batch::SEMANTIC_PROTOCOL_VERSION {
+    if !matches!(
+        selected_semantic_version,
+        batch::SEMANTIC_PROTOCOL_VERSION
+            | MIN_CUSTODY_SEMANTIC_VERSION
+            | super::SEMANTIC_PROTOCOL_V4
+            | super::SEMANTIC_PROTOCOL_V5
+    ) {
         return Err(authentication_failed());
     }
     let mut reader = Reader::new(sealed);
@@ -6996,6 +7275,31 @@ mod tests {
         session_privacy_canaries(bundle)
             .unwrap_or_else(|error| panic!("bundle identity failed: {error}"))
             .identity
+    }
+
+    fn complete_sessions_with_versions(
+        initiator_bundle: ProvisioningBundle,
+        responder_bundle: ProvisioningBundle,
+        versions: Vec<u16>,
+    ) -> (ReferenceAuthenticatedSession, ReferenceAuthenticatedSession) {
+        let (initiator, flight_one) =
+            ReferenceSessionInitiator::start_with_semantic_versions(initiator_bundle, versions)
+                .unwrap_or_else(|error| panic!("initiator start failed: {error}"));
+        let responder = ReferenceSessionResponder::open(responder_bundle)
+            .unwrap_or_else(|error| panic!("responder open failed: {error}"));
+        let (responder_pending, flight_two) = responder
+            .receive_client(&flight_one)
+            .unwrap_or_else(|error| panic!("client flight failed: {error}"));
+        let (initiator_pending, flight_three) = initiator
+            .receive_server(&flight_two)
+            .unwrap_or_else(|error| panic!("server flight failed: {error}"));
+        let (responder_session, flight_four) = responder_pending
+            .receive_client_auth(&flight_three)
+            .unwrap_or_else(|error| panic!("client auth failed: {error}"));
+        let initiator_session = initiator_pending
+            .receive_finished(&flight_four)
+            .unwrap_or_else(|error| panic!("server finished failed: {error}"));
+        (initiator_session, responder_session)
     }
 
     fn memory_reference_node(bundle: ProvisioningBundle) -> ReferenceNode {
@@ -9513,6 +9817,30 @@ mod tests {
     }
 
     #[test]
+    fn reference_handshake_selects_v4_for_a_v4_only_offer() {
+        let mut provisioner = ReferenceProvisioner::from_seed([0x3a; 32])
+            .unwrap_or_else(|error| panic!("provisioner failed: {error}"));
+        let initiator_bundle = provisioner
+            .issue_node(1, &[member_access(vec![0])])
+            .unwrap_or_else(|error| panic!("initiator issue failed: {error}"));
+        let responder_bundle = provisioner
+            .issue_node(2, &[member_access(vec![0])])
+            .unwrap_or_else(|error| panic!("responder issue failed: {error}"));
+        let (initiator, responder) = complete_sessions_with_versions(
+            initiator_bundle,
+            responder_bundle,
+            vec![
+                SEMANTIC_PROTOCOL_V4,
+                SEMANTIC_PROTOCOL_V3,
+                SEMANTIC_PROTOCOL_V2,
+                SEMANTIC_PROTOCOL_V1,
+            ],
+        );
+        assert_eq!(initiator.semantic_version(), SEMANTIC_PROTOCOL_V4);
+        assert_eq!(responder.semantic_version(), SEMANTIC_PROTOCOL_V4);
+    }
+
+    #[test]
     fn mission_proof_rejects_version_and_suite_offer_stripping() {
         let mut provisioner = ReferenceProvisioner::from_seed([0x32; 32])
             .unwrap_or_else(|error| panic!("provisioner failed: {error}"));
@@ -9558,6 +9886,47 @@ mod tests {
     }
 
     #[test]
+    fn mission_proof_rejects_stripping_v5_from_the_default_offer() {
+        let mut provisioner = ReferenceProvisioner::from_seed([0x74; 32])
+            .unwrap_or_else(|error| panic!("provisioner failed: {error}"));
+        let initiator_bundle = provisioner
+            .issue_node(1, &[member_access(vec![0])])
+            .unwrap_or_else(|error| panic!("initiator issue failed: {error}"));
+        let responder_bundle = provisioner
+            .issue_node(2, &[member_access(vec![0])])
+            .unwrap_or_else(|error| panic!("responder issue failed: {error}"));
+        let (_initiator, first_flight) = ReferenceSessionInitiator::start(initiator_bundle)
+            .unwrap_or_else(|error| panic!("initiator start failed: {error}"));
+        let (mut hello, mission_proof) = decode_client_flight(&first_flight)
+            .unwrap_or_else(|error| panic!("client flight decode failed: {error}"));
+        assert_eq!(
+            hello.supported_versions,
+            vec![
+                SEMANTIC_PROTOCOL_V5,
+                SEMANTIC_PROTOCOL_V4,
+                SEMANTIC_PROTOCOL_V3,
+                SEMANTIC_PROTOCOL_V2,
+                SEMANTIC_PROTOCOL_V1,
+            ]
+        );
+        hello.supported_versions.remove(0);
+        assert_eq!(
+            hello.supported_versions,
+            vec![
+                SEMANTIC_PROTOCOL_V4,
+                SEMANTIC_PROTOCOL_V3,
+                SEMANTIC_PROTOCOL_V2,
+                SEMANTIC_PROTOCOL_V1,
+            ]
+        );
+        let stripped = encode_client_flight(&hello, &mission_proof)
+            .unwrap_or_else(|error| panic!("stripped flight encoding failed: {error}"));
+        let responder = ReferenceSessionResponder::open(responder_bundle)
+            .unwrap_or_else(|error| panic!("responder open failed: {error}"));
+        assert!(responder.receive_client(&stripped).is_err());
+    }
+
+    #[test]
     fn public_four_flight_session_authenticates_peers_and_rejects_frame_replay() {
         let mut provisioner = ReferenceProvisioner::from_seed([12u8; 32])
             .unwrap_or_else(|error| panic!("provisioner failed: {error}"));
@@ -9574,7 +9943,13 @@ mod tests {
             .unwrap_or_else(|error| panic!("default client flight failed: {error}"));
         assert_eq!(
             default_hello.supported_versions,
-            vec![SEMANTIC_PROTOCOL_V2, SEMANTIC_PROTOCOL_V1]
+            vec![
+                SEMANTIC_PROTOCOL_V5,
+                SEMANTIC_PROTOCOL_V4,
+                SEMANTIC_PROTOCOL_V3,
+                SEMANTIC_PROTOCOL_V2,
+                SEMANTIC_PROTOCOL_V1,
+            ]
         );
         let initiator_id = initiator.endpoint.credential.identity;
         let responder = ReferenceSessionResponder::open(responder_bundle)
@@ -9594,8 +9969,8 @@ mod tests {
             .unwrap_or_else(|error| panic!("server finished failed: {error}"));
         assert_eq!(initiator_session.peer_identity(), responder_id);
         assert_eq!(responder_session.peer_identity(), initiator_id);
-        assert_eq!(initiator_session.semantic_version(), SEMANTIC_PROTOCOL_V2);
-        assert_eq!(responder_session.semantic_version(), SEMANTIC_PROTOCOL_V2);
+        assert_eq!(initiator_session.semantic_version(), SEMANTIC_PROTOCOL_V5);
+        assert_eq!(responder_session.semantic_version(), SEMANTIC_PROTOCOL_V5);
 
         let frame = initiator_session
             .seal_frame(b"opaque replication frame")
@@ -9624,6 +9999,197 @@ mod tests {
             .unwrap_or_else(|| panic!("test frame was empty"));
         tampered[last] ^= 1;
         assert!(initiator_session.open_frame(&tampered).is_err());
+    }
+
+    #[test]
+    fn v3_custody_wrapper_is_nested_replay_safe_and_context_bound() {
+        let mut provisioner = ReferenceProvisioner::from_seed([0x73; 32])
+            .unwrap_or_else(|error| panic!("provisioner failed: {error}"));
+        let initiator_bytes = provisioner
+            .issue_node(1, &[member_access(vec![0])])
+            .and_then(|bundle| bundle.to_bytes())
+            .unwrap_or_else(|error| panic!("initiator fixture failed: {error}"));
+        let responder_bytes = provisioner
+            .issue_node(2, &[member_access(vec![0])])
+            .and_then(|bundle| bundle.to_bytes())
+            .unwrap_or_else(|error| panic!("responder fixture failed: {error}"));
+        let pair = || {
+            complete_sessions_with_versions(
+                ProvisioningBundle::from_bytes(&initiator_bytes)
+                    .unwrap_or_else(|error| panic!("initiator parse failed: {error}")),
+                ProvisioningBundle::from_bytes(&responder_bytes)
+                    .unwrap_or_else(|error| panic!("responder parse failed: {error}")),
+                vec![
+                    SEMANTIC_PROTOCOL_V3,
+                    SEMANTIC_PROTOCOL_V2,
+                    SEMANTIC_PROTOCOL_V1,
+                ],
+            )
+        };
+        let (mut sender, mut receiver) = pair();
+        let (_other_sender, mut other_receiver) = pair();
+        let transfer = crate::custody::CustodyTransferClaims::new(
+            crate::custody::CustodyTransferId::from_exact_hash([0x51; 32]),
+            4_096,
+            Some(10_000),
+            Priority::Immediate,
+        )
+        .unwrap_or_else(|error| panic!("transfer claims failed: {error}"));
+        let claims = CustodyClaims::new(
+            transfer,
+            900,
+            17,
+            crate::custody::CustodyHop::new(
+                2_000,
+                crate::custody::CustodySample {
+                    clock_id: [0x61; 16],
+                    tick_ms: 5_000,
+                },
+                25,
+            )
+            .unwrap_or_else(|error| panic!("hop failed: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("custody claims failed: {error}"));
+        let expected = CustodyExpectation::new(transfer, 900);
+
+        // The selected node nests the small custody record in an ordinary
+        // mission frame.  This creates inner sequence n followed by outer n+1;
+        // opening n+1 before n must remain valid exactly once.
+        let inner = sender
+            .seal_custody_wrapper(&claims)
+            .unwrap_or_else(|error| panic!("custody seal failed: {error}"));
+        assert_eq!(inner.len(), 202);
+        assert!(inner.len() <= MAX_CUSTODY_WRAPPER_BYTES);
+        assert!(
+            receiver
+                .open_custody_wrapper(&vec![0; MAX_CUSTODY_WRAPPER_BYTES + 1], expected)
+                .is_err()
+        );
+        let outer = sender
+            .seal_frame(&inner)
+            .unwrap_or_else(|error| panic!("outer seal failed: {error}"));
+        let opened_inner = receiver
+            .open_frame(&outer)
+            .unwrap_or_else(|error| panic!("outer open failed: {error}"));
+        assert_eq!(opened_inner, inner);
+        let verified = receiver
+            .open_custody_wrapper(&opened_inner, expected)
+            .unwrap_or_else(|error| panic!("custody open failed: {error}"));
+        assert_eq!(verified.transfer_id(), transfer.transfer_id());
+        assert_eq!(verified.exact_len(), transfer.exact_len());
+        assert_eq!(verified.forwarding_age_ms(), 2_025);
+        assert!(receiver.open_custody_wrapper(&inner, expected).is_err());
+
+        let later = sender
+            .seal_frame(b"later ordinary traffic")
+            .unwrap_or_else(|error| panic!("later seal failed: {error}"));
+        assert_eq!(
+            receiver
+                .open_frame(&later)
+                .unwrap_or_else(|error| panic!("later open failed: {error}")),
+            b"later ordinary traffic"
+        );
+
+        let authentic_after_tamper = sender
+            .seal_custody_wrapper(&claims)
+            .unwrap_or_else(|error| panic!("second custody seal failed: {error}"));
+        let mut tampered = authentic_after_tamper.clone();
+        *tampered
+            .last_mut()
+            .unwrap_or_else(|| panic!("custody wrapper was empty")) ^= 1;
+        assert!(receiver.open_custody_wrapper(&tampered, expected).is_err());
+        assert_eq!(
+            receiver
+                .open_custody_wrapper(&authentic_after_tamper, expected)
+                .unwrap_or_else(|error| panic!("authentic retry failed: {error}"))
+                .forwarding_age_ms(),
+            2_025
+        );
+
+        let cross_session = sender
+            .seal_custody_wrapper(&claims)
+            .unwrap_or_else(|error| panic!("cross-session fixture failed: {error}"));
+        assert!(
+            other_receiver
+                .open_custody_wrapper(&cross_session, expected)
+                .is_err()
+        );
+        assert_eq!(
+            receiver
+                .open_custody_wrapper(&cross_session, expected)
+                .unwrap_or_else(|error| panic!("original session rejected claim: {error}"))
+                .forwarding_age_ms(),
+            2_025
+        );
+
+        let wrong_source = crate::custody::CustodyTransferClaims::new(
+            transfer.transfer_id(),
+            transfer.exact_len(),
+            Some(9_999),
+            transfer.source_priority(),
+        )
+        .unwrap_or_else(|error| panic!("wrong source fixture failed: {error}"));
+        let wrong_context = sender
+            .seal_custody_wrapper(&claims)
+            .unwrap_or_else(|error| panic!("context fixture failed: {error}"));
+        assert!(
+            receiver
+                .open_custody_wrapper(
+                    &wrong_context,
+                    CustodyExpectation::new(wrong_source, expected.exchange_id()),
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn v1_v2_keep_durable_frames_and_refuse_finite_custody_wrappers() {
+        for version in [SEMANTIC_PROTOCOL_V1, SEMANTIC_PROTOCOL_V2] {
+            let mut provisioner = ReferenceProvisioner::from_seed([version as u8; 32])
+                .unwrap_or_else(|error| panic!("provisioner failed: {error}"));
+            let initiator_bundle = provisioner
+                .issue_node(1, &[member_access(vec![0])])
+                .unwrap_or_else(|error| panic!("initiator issue failed: {error}"));
+            let responder_bundle = provisioner
+                .issue_node(2, &[member_access(vec![0])])
+                .unwrap_or_else(|error| panic!("responder issue failed: {error}"));
+            let (mut sender, mut receiver) =
+                complete_sessions_with_versions(initiator_bundle, responder_bundle, vec![version]);
+            assert_eq!(sender.semantic_version(), version);
+            assert_eq!(receiver.semantic_version(), version);
+            let durable = sender
+                .seal_frame(b"durable source bytes")
+                .unwrap_or_else(|error| panic!("v{version} durable seal failed: {error}"));
+            assert_eq!(
+                receiver
+                    .open_frame(&durable)
+                    .unwrap_or_else(|error| panic!("v{version} durable open failed: {error}")),
+                b"durable source bytes"
+            );
+            let transfer = crate::custody::CustodyTransferClaims::new(
+                crate::custody::CustodyTransferId::from_exact_hash([version as u8; 32]),
+                128,
+                Some(1_000),
+                Priority::Flash,
+            )
+            .unwrap_or_else(|error| panic!("transfer fixture failed: {error}"));
+            let finite = CustodyClaims::new(
+                transfer,
+                1,
+                1,
+                crate::custody::CustodyHop::new(
+                    0,
+                    crate::custody::CustodySample {
+                        clock_id: [version as u8; 16],
+                        tick_ms: 1,
+                    },
+                    0,
+                )
+                .unwrap_or_else(|error| panic!("finite hop failed: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("finite claims failed: {error}"));
+            assert!(sender.seal_custody_wrapper(&finite).is_err());
+        }
     }
 
     #[test]
@@ -9847,6 +10413,23 @@ mod tests {
         }
         assert!(!format!("{sealed:?}").contains("green"));
         assert!(format!("{sealed:?}").contains("plaintext: \"[NONE]\""));
+
+        let v4_reader_proof = services
+            .reader
+            .open_batch_proof(&sealed.proof_bytes, SEMANTIC_PROTOCOL_V4)
+            .unwrap_or_else(|error| panic!("v4 reader proof open failed: {error}"));
+        let v4_pending = services
+            .reader
+            .open_compact_batch_item(&sealed.items[1].bytes, SEMANTIC_PROTOCOL_V4)
+            .unwrap_or_else(|error| panic!("v4 reader compact open failed: {error}"));
+        assert_eq!(
+            v4_reader_proof.proof_envelope_id(),
+            sealed.proof_envelope_id
+        );
+        assert_eq!(
+            services.reader.pending_batch_proof_id(&v4_pending),
+            sealed.proof_envelope_id
+        );
 
         let reader_proof = services
             .reader
@@ -11903,7 +12486,7 @@ mod tests {
     }
 
     #[test]
-    fn on_path_rewrite_of_an_offered_v2_selection_to_v1_fails_authentication() {
+    fn on_path_rewrite_of_an_offered_v5_selection_to_v4_fails_authentication() {
         let mut provisioner = ReferenceProvisioner::from_seed([0x8e; 32])
             .unwrap_or_else(|error| panic!("provisioner failed: {error}"));
         let initiator_bundle = provisioner
@@ -11919,7 +12502,13 @@ mod tests {
             .unwrap_or_else(|error| panic!("client flight decode failed: {error}"));
         assert_eq!(
             hello.supported_versions,
-            vec![SEMANTIC_PROTOCOL_V2, SEMANTIC_PROTOCOL_V1]
+            vec![
+                SEMANTIC_PROTOCOL_V5,
+                SEMANTIC_PROTOCOL_V4,
+                SEMANTIC_PROTOCOL_V3,
+                SEMANTIC_PROTOCOL_V2,
+                SEMANTIC_PROTOCOL_V1,
+            ]
         );
         let responder = ReferenceSessionResponder::open(responder_bundle)
             .unwrap_or_else(|error| panic!("responder open failed: {error}"));
@@ -11928,12 +12517,12 @@ mod tests {
             .unwrap_or_else(|error| panic!("client flight failed: {error}"));
         let mut server_hello = decode_server_flight(&second_flight)
             .unwrap_or_else(|error| panic!("server flight decode failed: {error}"));
-        assert_eq!(server_hello.selected_version, SEMANTIC_PROTOCOL_V2);
+        assert_eq!(server_hello.selected_version, SEMANTIC_PROTOCOL_V5);
 
-        // Version 1 was genuinely offered, so membership checks alone would
+        // Version 4 was genuinely offered, so membership checks alone would
         // accept it. The rewrite must still fail because selection is bound
         // into the transcript, key schedule, confirmation, and server auth.
-        server_hello.selected_version = SEMANTIC_PROTOCOL_V1;
+        server_hello.selected_version = SEMANTIC_PROTOCOL_V4;
         let rewritten = encode_server_flight(&server_hello)
             .unwrap_or_else(|error| panic!("rewritten server flight encode failed: {error}"));
         assert!(initiator.receive_server(&rewritten).is_err());

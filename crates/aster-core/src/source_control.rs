@@ -7,7 +7,7 @@
 //! control-chain prefix.
 
 use crate::{
-    crypto::{ReferenceEnvelopeSealer, ScopeRekeyRecipient},
+    crypto::{ReferenceEnvelopeSealer, ScopeRekeyPlan, ScopeRekeyRecipient},
     envelope::{ControlPrincipal, EnvelopeError, EnvelopeId, EnvelopeSealer, VerifiedControl},
     model::{NodeId, Scope},
 };
@@ -52,6 +52,138 @@ impl VerifiedControlPrincipal {
     }
 }
 
+/// Opaque registry-authenticated plan for one recipient-filtered scope rekey.
+///
+/// The provider has authenticated the exact public registry, enforced its
+/// generation floor, resolved every requested NodeID to an authority-issued
+/// credential, and canonicalized recipient order. No fresh scope key, topic
+/// key, encapsulation, nonce, or sealed control exists until the separate
+/// sealing call.
+pub struct RegistryAuthenticatedScopeRekeyPlan {
+    plan: ScopeRekeyPlan,
+    mission_authority_id: NodeId,
+    signed_registry_sha256: [u8; 32],
+    registry_generation: u64,
+}
+
+impl std::fmt::Debug for RegistryAuthenticatedScopeRekeyPlan {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RegistryAuthenticatedScopeRekeyPlan")
+            .field("plan", &self.plan)
+            .field("mission_authority_id", &self.mission_authority_id)
+            .field("signed_registry_sha256", &"[REDACTED]")
+            .field("registry_generation", &self.registry_generation)
+            .field("key_material", &"[NONE]")
+            .finish()
+    }
+}
+
+/// Opaque proof that one exact registry-authenticated rekey plan produced one
+/// exact sealed control envelope.
+///
+/// The private constructor binds the sealed-byte SHA-256 identity to the exact
+/// authenticated registry identity and generation, scope, epoch, and canonical
+/// full recipient policies retained by the plan. The capability contains no
+/// key material and deliberately redacts every binding from `Debug` output.
+pub struct ScopeRekeyPublicationCapability {
+    sealed_envelope_id: EnvelopeId,
+    mission_authority_id: NodeId,
+    signed_registry_sha256: [u8; 32],
+    registry_generation: u64,
+    scope: Scope,
+    epoch: u64,
+    recipients: Vec<ScopeRekeyRecipient>,
+}
+
+impl std::fmt::Debug for ScopeRekeyPublicationCapability {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ScopeRekeyPublicationCapability")
+            .field("binding", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl ScopeRekeyPublicationCapability {
+    fn from_plan_and_sealed(plan: &RegistryAuthenticatedScopeRekeyPlan, sealed: &[u8]) -> Self {
+        Self {
+            sealed_envelope_id: Sha256::digest(sealed).into(),
+            mission_authority_id: plan.mission_authority_id,
+            signed_registry_sha256: plan.signed_registry_sha256,
+            registry_generation: plan.registry_generation,
+            scope: plan.plan.scope().clone(),
+            epoch: plan.plan.epoch(),
+            recipients: plan.plan.recipients().cloned().collect(),
+        }
+    }
+
+    /// SHA-256 transfer identity of the exact sealed output from this plan.
+    pub const fn sealed_envelope_id(&self) -> EnvelopeId {
+        self.sealed_envelope_id
+    }
+
+    /// Cryptographic mission-authority domain that authenticated the plan.
+    pub const fn mission_authority_id(&self) -> NodeId {
+        self.mission_authority_id
+    }
+
+    /// SHA-256 identity of the exact provider-authenticated signed registry.
+    pub const fn signed_registry_sha256(&self) -> [u8; 32] {
+        self.signed_registry_sha256
+    }
+
+    /// Provider-authenticated registry generation bound to the sealed output.
+    pub const fn registry_generation(&self) -> u64 {
+        self.registry_generation
+    }
+
+    /// Scope bound to the sealed output.
+    pub const fn scope(&self) -> &Scope {
+        &self.scope
+    }
+
+    /// Nonzero scope epoch bound to the sealed output.
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Canonical full recipient policies bound to the sealed output.
+    pub fn recipient_policies(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (NodeId, bool, &[crate::model::Topic])> + '_ {
+        self.recipients.iter().map(|recipient| {
+            (
+                recipient.node(),
+                recipient.has_route_access(),
+                recipient.readable_topics(),
+            )
+        })
+    }
+}
+
+impl RegistryAuthenticatedScopeRekeyPlan {
+    /// Provider-authenticated generation of the exact registry used to plan.
+    pub const fn registry_generation(&self) -> u64 {
+        self.registry_generation
+    }
+
+    /// Scope authenticated and canonicalized into this plan.
+    pub fn scope(&self) -> &Scope {
+        self.plan.scope()
+    }
+
+    /// Nonzero scope epoch authenticated and canonicalized into this plan.
+    pub fn epoch(&self) -> u64 {
+        self.plan.epoch()
+    }
+
+    /// Canonically ordered recipient identities, without credentials or key material.
+    pub fn recipient_nodes(&self) -> impl ExactSizeIterator<Item = NodeId> + '_ {
+        self.plan.recipients().map(ScopeRekeyRecipient::node)
+    }
+}
+
 /// Source-authenticated metadata for one exact sealed control envelope.
 ///
 /// Fields and constructors are private so callers cannot manufacture claims
@@ -64,6 +196,7 @@ pub struct VerifiedControlEnvelope {
     control: VerifiedControl,
     envelope_id: EnvelopeId,
     mission_authority_id: NodeId,
+    scope_rekey_recipient_nodes: Option<Vec<NodeId>>,
 }
 
 impl VerifiedControlEnvelope {
@@ -71,6 +204,7 @@ impl VerifiedControlEnvelope {
         control: VerifiedControl,
         sealed: &[u8],
         mission_authority_id: NodeId,
+        scope_rekey_recipient_nodes: Option<Vec<NodeId>>,
     ) -> Result<Self, EnvelopeError> {
         if sealed.is_empty() {
             return Err(EnvelopeError("control envelope is empty".into()));
@@ -107,10 +241,27 @@ impl VerifiedControlEnvelope {
                 "authenticated control has invalid chain linkage".into(),
             ));
         }
+        match (&control, scope_rekey_recipient_nodes.as_deref()) {
+            (VerifiedControl::Revocation(_), Some(_)) => {
+                return Err(EnvelopeError(
+                    "revocation control cannot carry scope rekey recipients".into(),
+                ));
+            }
+            (VerifiedControl::ScopeEpoch(_), Some(recipients))
+                if recipients.is_empty()
+                    || recipients.windows(2).any(|pair| pair[0] >= pair[1]) =>
+            {
+                return Err(EnvelopeError(
+                    "authenticated scope rekey recipients are not canonical".into(),
+                ));
+            }
+            _ => {}
+        }
         Ok(Self {
             control,
             envelope_id: Sha256::digest(sealed).into(),
             mission_authority_id,
+            scope_rekey_recipient_nodes,
         })
     }
 
@@ -193,6 +344,16 @@ impl VerifiedControlEnvelope {
         }
     }
 
+    /// Canonically ordered authenticated recipients for an exact scope-rekey
+    /// package/capsule control.
+    ///
+    /// This is `None` for revocations and legacy pre-provisioned scope-epoch
+    /// controls. Only recipient NodeIDs cross this boundary; public
+    /// credentials, package metadata, grants, and key material remain private.
+    pub fn scope_rekey_recipient_nodes(&self) -> Option<&[NodeId]> {
+        self.scope_rekey_recipient_nodes.as_deref()
+    }
+
     /// Checks that bytes accompanying this capability are the exact bytes that
     /// were authenticated when it was created.
     pub fn verify_exact_sealed(&self, sealed: &[u8]) -> Result<(), EnvelopeError> {
@@ -272,8 +433,14 @@ impl ReferenceEnvelopeSealer {
         &mut self,
         sealed: &[u8],
     ) -> Result<VerifiedControlEnvelope, EnvelopeError> {
-        let verified = <Self as EnvelopeSealer>::inspect_control(self, sealed)?;
-        VerifiedControlEnvelope::from_verified(verified, sealed, self.mission_authority_id())
+        let (verified, scope_rekey_recipient_nodes) =
+            self.inspect_control_with_scope_rekey_recipient_nodes(sealed)?;
+        VerifiedControlEnvelope::from_verified(
+            verified,
+            sealed,
+            self.mission_authority_id(),
+            scope_rekey_recipient_nodes,
+        )
     }
 
     /// Creates an existing-format revocation at an already-reserved chain link.
@@ -287,6 +454,61 @@ impl ReferenceEnvelopeSealer {
         <Self as EnvelopeSealer>::seal_revocation_control(
             self, subject, generation, sequence, previous,
         )
+    }
+
+    /// Authenticates one exact signed public registry and resolves a canonical
+    /// rekey plan without generating fresh key material or consuming RNG.
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_scope_rekey_control_from_registry(
+        &self,
+        signed_public_registry: &[u8],
+        minimum_registry_generation: u64,
+        scope: Scope,
+        epoch: u64,
+        recipients: Vec<ScopeRekeyRecipient>,
+    ) -> Result<RegistryAuthenticatedScopeRekeyPlan, EnvelopeError> {
+        let (plan, registry_generation) = self.plan_scope_rekey_from_registry(
+            signed_public_registry,
+            minimum_registry_generation,
+            scope,
+            epoch,
+            recipients,
+        )?;
+        Ok(RegistryAuthenticatedScopeRekeyPlan {
+            plan,
+            mission_authority_id: self.mission_authority_id(),
+            signed_registry_sha256: Sha256::digest(signed_public_registry).into(),
+            registry_generation,
+        })
+    }
+
+    /// Randomizes and seals one previously registry-authenticated rekey plan at
+    /// an already-reserved control-chain link.
+    pub fn seal_chained_scope_rekey_control(
+        &mut self,
+        plan: &RegistryAuthenticatedScopeRekeyPlan,
+        sequence: u64,
+        previous: Option<EnvelopeId>,
+    ) -> Result<Vec<u8>, EnvelopeError> {
+        if plan.mission_authority_id != self.mission_authority_id() {
+            return Err(EnvelopeError(
+                "scope rekey plan belongs to another mission authority".into(),
+            ));
+        }
+        self.seal_scope_rekey_chained(&plan.plan, sequence, previous)
+    }
+
+    /// Randomizes and seals one authenticated rekey plan while minting the
+    /// capability required to commit that exact output as a local publication.
+    pub fn seal_chained_scope_rekey_control_for_publication(
+        &mut self,
+        plan: &RegistryAuthenticatedScopeRekeyPlan,
+        sequence: u64,
+        previous: Option<EnvelopeId>,
+    ) -> Result<(Vec<u8>, ScopeRekeyPublicationCapability), EnvelopeError> {
+        let sealed = self.seal_chained_scope_rekey_control(plan, sequence, previous)?;
+        let capability = ScopeRekeyPublicationCapability::from_plan_and_sealed(plan, &sealed);
+        Ok((sealed, capability))
     }
 
     /// Verifies the existing authority-signed recipient registry, creates the
@@ -303,15 +525,15 @@ impl ReferenceEnvelopeSealer {
         sequence: u64,
         previous: Option<EnvelopeId>,
     ) -> Result<(Vec<u8>, u64), EnvelopeError> {
-        let (plan, registry_generation) = self.plan_scope_rekey_from_registry(
+        let plan = self.plan_scope_rekey_control_from_registry(
             signed_public_registry,
             minimum_registry_generation,
             scope,
             epoch,
             recipients,
         )?;
-        let sealed = self.seal_scope_rekey_chained(&plan, sequence, previous)?;
-        Ok((sealed, registry_generation))
+        let sealed = self.seal_chained_scope_rekey_control(&plan, sequence, previous)?;
+        Ok((sealed, plan.registry_generation()))
     }
 
     /// Freshly reauthenticates exact bytes at the post-commit boundary and
@@ -460,6 +682,7 @@ mod tests {
         assert_eq!(verified.revocation_generation(), Some(7));
         assert_eq!(verified.scope(), None);
         assert_eq!(verified.scope_epoch(), None);
+        assert_eq!(verified.scope_rekey_recipient_nodes(), None);
         assert_eq!(
             verified.envelope_id(),
             <[u8; 32]>::from(Sha256::digest(&sealed))
@@ -471,6 +694,112 @@ mod tests {
         tampered[0] ^= 1;
         assert!(verified.verify_exact_sealed(&tampered).is_err());
         assert!(member.verify_control(&tampered).is_err());
+    }
+
+    #[test]
+    fn registry_plan_and_verified_rekey_expose_canonical_recipient_nodes_only() {
+        let Services {
+            mut authority,
+            mut member,
+            relay,
+            excluded,
+            registry,
+        } = services([0x3a; 32]);
+        let member_id = member.identity();
+        let relay_id = relay.identity();
+        let content_only_id = excluded.identity();
+        let plan = authority
+            .plan_scope_rekey_control_from_registry(
+                &registry,
+                4,
+                scope(),
+                2,
+                vec![
+                    ScopeRekeyRecipient::content_only(content_only_id, vec![topic()])
+                        .expect("content-only recipient"),
+                    ScopeRekeyRecipient::route_only(relay_id),
+                    ScopeRekeyRecipient::member(member_id, vec![topic()])
+                        .expect("member recipient"),
+                ],
+            )
+            .expect("registry-authenticated plan");
+
+        let mut expected = vec![member_id, relay_id, content_only_id];
+        expected.sort_unstable();
+        assert_eq!(plan.registry_generation(), 4);
+        assert_eq!(plan.scope(), &scope());
+        assert_eq!(plan.epoch(), 2);
+        assert_eq!(plan.recipient_nodes().collect::<Vec<_>>(), expected);
+
+        let (sealed, publication) = authority
+            .seal_chained_scope_rekey_control_for_publication(&plan, 1, None)
+            .expect("seal planned control");
+        let verified = member.verify_control(&sealed).expect("verify rekey");
+        assert_eq!(verified.kind(), VerifiedControlKind::ScopeEpoch);
+        assert_eq!(publication.sealed_envelope_id(), verified.envelope_id());
+        assert_eq!(
+            publication.mission_authority_id(),
+            verified.mission_authority_id()
+        );
+        assert_eq!(
+            publication.signed_registry_sha256(),
+            <[u8; 32]>::from(Sha256::digest(&registry))
+        );
+        assert_eq!(publication.registry_generation(), 4);
+        assert_eq!(publication.scope(), &scope());
+        assert_eq!(publication.epoch(), 2);
+        assert_eq!(
+            publication
+                .recipient_policies()
+                .map(|(node, _, _)| node)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            format!("{publication:?}"),
+            "ScopeRekeyPublicationCapability { binding: \"[REDACTED]\" }"
+        );
+        assert_eq!(
+            verified.scope_rekey_recipient_nodes(),
+            Some(expected.as_slice())
+        );
+
+        let mut tampered = sealed;
+        let tampered_index = tampered.len() / 2;
+        tampered[tampered_index] ^= 1;
+        assert!(member.verify_control(&tampered).is_err());
+    }
+
+    #[test]
+    fn registry_plan_rejects_a_sealer_from_another_mission_before_publication() {
+        let Services {
+            authority: planner,
+            member,
+            registry,
+            ..
+        } = services([0x3b; 32]);
+        let plan = planner
+            .plan_scope_rekey_control_from_registry(
+                &registry,
+                0,
+                scope(),
+                2,
+                vec![
+                    ScopeRekeyRecipient::member(member.identity(), vec![topic()])
+                        .expect("member recipient"),
+                ],
+            )
+            .expect("registry-authenticated plan");
+        let Services {
+            authority: mut foreign_authority,
+            ..
+        } = services([0x3c; 32]);
+
+        assert!(
+            foreign_authority
+                .seal_chained_scope_rekey_control_for_publication(&plan, 1, None)
+                .is_err()
+        );
     }
 
     #[test]
@@ -644,6 +973,99 @@ mod tests {
                 .prepare_committed_control_activation(&committed, &different)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn same_epoch_first_rekey_invalidates_only_the_superseded_event_route_lineage() {
+        let Services {
+            mut authority,
+            mut member,
+            registry,
+            ..
+        } = services([0x39; 32]);
+        let old_payload = b"provisioning epoch-one Event";
+        let old_header = EnvelopeHeader {
+            class: DataClass::Event,
+            topic: topic(),
+            scope: scope(),
+            priority: Priority::Immediate,
+            stamp: CausalStamp {
+                dot: Dot {
+                    publisher: authority.identity(),
+                    counter: 1,
+                },
+                context: VersionVector::default(),
+            },
+            event_sequence: Some(1),
+            logical_key: b"same-epoch-old".to_vec(),
+            blob_route: None,
+            ttl_ms: None,
+            content_len: old_payload.len() as u64,
+            tombstone: false,
+            key_epoch: 1,
+        };
+        let old = authority
+            .seal_event(&old_header, old_payload)
+            .expect("seal provisioning-key Event");
+        let old_route = member
+            .verify_event(&old.bytes)
+            .expect("verify provisioning-key Event");
+        let old_lineage = old_route.route_lineage();
+        assert!(member.is_current_event_route_lineage(&scope(), 1, old_lineage));
+        assert_eq!(
+            format!("{old_lineage:?}"),
+            "EventRouteLineage([PROVIDER-OWNED])"
+        );
+
+        let recipients = vec![
+            ScopeRekeyRecipient::member(authority.identity(), vec![topic()])
+                .expect("authority recipient"),
+            ScopeRekeyRecipient::member(member.identity(), vec![topic()])
+                .expect("member recipient"),
+        ];
+        let (sealed_control, _) = authority
+            .seal_chained_scope_rekey_control_from_registry(
+                &registry,
+                0,
+                scope(),
+                1,
+                recipients,
+                1,
+                None,
+            )
+            .expect("same-epoch first rekey");
+        for service in [&mut authority, &mut member] {
+            let committed = service
+                .verify_control(&sealed_control)
+                .expect("verify committed same-epoch control");
+            let ready = service
+                .prepare_committed_control_activation(&committed, &sealed_control)
+                .expect("prepare committed same-epoch control");
+            service
+                .activate_committed_control(ready, false)
+                .expect("activate committed same-epoch control");
+        }
+
+        assert!(member.can_route_event(&scope(), 1));
+        assert!(!member.is_current_event_route_lineage(&scope(), 1, old_lineage));
+        assert!(member.verify_event(&old.bytes).is_err());
+
+        let new_payload = b"replacement epoch-one Event";
+        let mut new_header = old_header;
+        new_header.stamp.dot.counter = 2;
+        new_header.event_sequence = Some(2);
+        new_header.logical_key = b"same-epoch-new".to_vec();
+        new_header.content_len = new_payload.len() as u64;
+        let new = authority
+            .seal_event(&new_header, new_payload)
+            .expect("seal replacement-key Event");
+        let new_route = member
+            .verify_event(&new.bytes)
+            .expect("verify replacement-key Event");
+        let new_lineage = new_route.route_lineage();
+        assert_ne!(new_lineage, old_lineage);
+        assert!(member.is_current_event_route_lineage(&scope(), 1, new_lineage));
+        assert!(!member.is_current_event_route_lineage(&scope(), 2, new_lineage));
     }
 
     #[test]

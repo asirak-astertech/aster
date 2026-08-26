@@ -138,12 +138,13 @@ intervals are anchored only by freshly source/content-verified positions already
 observed in the mission-bound store. Last-contact status is process-local and
 does not claim reachability, publisher completeness, or global convergence.
 
-These Event slices do not replace the broader proven semantic `ApplicationNode`
-or complete the accepted boundary. They have no atomic subscription update,
-live State/Record, Blob, selected-node bindings, protected operational
-provisioning, or generalized control administration. Finite TTL is absent and
-therefore cannot be requested until authenticated cumulative forwarding age and
-expiry exist.
+At the PR-C boundary these Event slices did not replace the broader proven
+semantic `ApplicationNode` or complete the accepted boundary. They had no
+atomic subscription update, live State/Record, Blob, selected-node bindings,
+protected operational provisioning, generalized control administration, or
+finite TTL. The later selected custody slice now adds Linux-only semantic-v3
+finite Event TTL with authenticated cumulative forwarding age and expiry; it
+does not close the other boundaries above.
 The compiled example and exact claim boundary are documented in the
 [selected Event API quickstart](../quickstart/selected-event-api.md).
 
@@ -235,3 +236,54 @@ ingestion, disconnected-process acceptance, live status, finite TTL, expiry,
 garbage collection, or retained execution receipt. The compiled example and
 exact boundary are documented in the
 [selected Record API quickstart](../quickstart/selected-record-api.md).
+
+## Semantic-v4 State/Record network amendment (2026-08-25)
+
+This amendment supersedes the earlier present-tense statements that selected
+State/Record objects have no network path; those statements remain above only
+as the historical boundary of the stopped-slice decisions and their receipts.
+
+The stopped application boundary remains unchanged: State and Record publish,
+query, and guarded resolution still require exclusive ownership while the live
+actor is absent. The selected live actor now reconciles their already durable
+source objects only after the mission session selects semantic version 4. This
+does not create a live State/Record application handle or subscription. The
+default offer is `[4, 3, 2, 1]`; Event retains v1-v3 compatibility and v1-v3
+contacts expose no mutable frames.
+
+The v4 mechanics boundary is protected, class- and direction-separated, and
+bounded. Offer returns exact `MutableApplyResult`; Fetch returns exact
+`MutableFetchResult` and requires exact `MutableFetchResultAck`;
+Finish/Finished bind exact remaining. Valid class, byte, or causal-
+frontier saturation is `DeferredCapacity`, while integrity and policy failures
+remain fatal. State and Record each cap objects at 1 MiB and retained network
+admission at 4,096 rows/16 MiB. A durable peer/class/local Offer/Fetch cursor
+rotates bounded attempts across at most 256 peers and 1,024 rows.
+
+Current source route lineage is mandatory. A same-epoch replacement withholds
+the historical lineage from ordinary current projection/query and network
+inventory/transfer; it does not delete the row. Exact idempotent State publish
+and Record publish/resolution retries may recover their committed historical
+result only through the strict cached/projection/historical verification path.
+Selected finite State/Record TTL is rejected.
+
+Normal and every AtLeast threshold run the v4 mutable lanes because AtLeast is
+an Event-only threshold. ReceiveOnly initiates and discloses no mutable lane.
+`SelectedEventHandle` last-contact status remains Event/contact evidence and is
+not State/Record convergence. Blob networking and every retained acceptance or
+release gate remain open.
+
+## Semantic-v5 stopped-Blob network amendment (2026-08-25)
+
+The default offer is now `[5, 4, 3, 2, 1]`. V5 inherits the State/Record
+mechanics above and adds direct transfer of already-durable Blob sources and
+carrier prefixes; v1-v4 emit zero Blob frames. This does not create a live Blob
+application handle or subscription. `SelectedBlobNode` remains an exclusive
+stopped publish/read facade, while `MutableSourceInterests::with_blob` is an
+additive runtime receive configuration rather than an application delivery API.
+
+The v5 lane is direct content-capable only, source-before-carrier, bounded to
+16-KiB peer-neutral prefix extensions, and completion-gated before ordinary
+visibility. Route-only Blob relay/custody, TTL/GC, pure-byte deduplication,
+large/RSS/physical/mixed/release acceptance, and selected-node language
+bindings remain outside the public boundary.

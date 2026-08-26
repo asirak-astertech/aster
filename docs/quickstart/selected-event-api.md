@@ -10,9 +10,22 @@ cryptography, inspect sealed bytes, choose a carrier, or drive reconciliation.
 The selected Event surface now provides live and stopped-state publish, bounded
 query, durable subscribe/poll/ack, idempotent unsubscribe, and authenticated gap
 inspection. A live `SelectedEventHandle` additionally reports bounded peer and
-last-contact status while the actor owns the store. State, Record, Blob, finite
-TTL, subscription update, selected-node language bindings, protected
-operational provisioning, and generalized control administration remain open.
+last-contact Event status while the actor owns the store. That status is not a
+State/Record convergence signal. State and Record now reconcile already durable
+objects on semantic-v4/v5 contacts, but still have no live application handle.
+Semantic v5 separately transfers already-durable Blobs directly between current
+content-capable peers; the Blob application facade remains stopped. V1-v4 emit
+zero Blob frames. Route-only Blob relay/custody, Blob TTL/GC, and live Blob
+access/subscription remain open. Non-Linux finite Event TTL, atomic subscription update,
+selected-node language bindings, a production provisioning/SecretStore backend,
+protected stock CLI startup, generalized multi-family control policy, and
+automatic/atomic revoke-plus-rekey remediation remain open. The stopped
+`SelectedEventNode` and stopped `SelectedControlAdmin` do accept protected
+artifacts or exact opaque secret references. Caller-provided Rust `NodeConfig`
+construction now accepts the same sources, and a running authority exposes the
+typed `SelectedControlHandle`; those bounded Rust-only seams are documented
+below. Linux semantic-v3/v4/v5 finite Event TTL is documented in the
+[selected custody quickstart](selected-custody-api.md).
 
 ## Run the live example
 
@@ -54,6 +67,129 @@ update claim.
 The fixture persists explicitly unprotected reference mission bundles. They are
 suitable for this disposable demonstration, not operational provisioning.
 Remove the temporary directory when you no longer need it.
+
+## Start a live node with protected provisioning
+
+An embedding Rust application can construct the live configuration before
+calling `start_node` without placing an unprotected-reference bundle on the
+stock CLI path:
+
+```rust
+use aster_mesh::{
+    ProvisioningLoadId, ProvisioningSecretLoader, ProvisioningSecretRef,
+    ProvisioningUnprotector,
+};
+use aster_node::{NodeBootstrapError, NodeConfig, NodeConfigOptions};
+use std::{net::SocketAddr, path::Path, time::Duration};
+
+fn from_protected_file<P: ProvisioningUnprotector + ?Sized>(
+    state: &Path,
+    artifact: &Path,
+    bind: SocketAddr,
+    provider: &mut P,
+) -> Result<NodeConfig, NodeBootstrapError> {
+    NodeConfig::open_protected(
+        state,
+        artifact,
+        NodeConfigOptions::new(bind, Duration::from_millis(500)),
+        provider,
+    )
+}
+
+fn from_secret_ref<L: ProvisioningSecretLoader + ?Sized>(
+    state: &Path,
+    secret_ref: &ProvisioningSecretRef,
+    operation: ProvisioningLoadId,
+    bind: SocketAddr,
+    loader: &mut L,
+) -> Result<NodeConfig, NodeBootstrapError> {
+    NodeConfig::open_secret_ref(
+        state,
+        secret_ref,
+        operation,
+        NodeConfigOptions::new(bind, Duration::from_millis(500)),
+        loader,
+    )
+}
+```
+
+`NodeConfig::from_protected_bytes` is the corresponding caller-supplied byte
+entry point. `NodeConfigOptions` fixes the complete bounded mission-independent
+configuration before provider access. Invalid options and terminal state fail
+before a provider call or state creation; a passing provider/loader is invoked
+once, and rejection never falls back to plaintext parsing.
+
+Relative paths are resolved once against a captured absolute current directory.
+The config then retains the exact absolute lexical state pathname and rejects a
+later mutation before state creation. That witness does not bind an inode,
+parent directory, symlink resolution, later rename, store replacement, or
+rollback history. Runtime `READY` and `STOP` lines report only
+`provisioning=provider-protected-artifact` or
+`provisioning=provider-secret-reference`.
+
+This is a caller-provided Rust bootstrap seam. The repository does not ship a
+production provider, SecretStore, issuance/recovery workflow, protected stock
+CLI startup, or selected-node binding. The recovered canonical bundle remains
+zeroizing plaintext in the process. Protected and secret-reference nodes support
+graceful `RunningNode::shutdown`, but the same-UID local software-zeroization
+hook cannot destroy provider custody or coordinate a provider destroy receipt.
+
+## Open a stopped surface with protected provisioning
+
+When no live actor owns the state, `SelectedEventNode` offers four explicit
+provisioning modes:
+
+```rust
+use aster_mesh::{
+    ProvisioningLoadId, ProvisioningSecretLoader, ProvisioningSecretRef,
+    ProvisioningUnprotector,
+};
+use aster_node::application::{ApplicationError, SelectedEventNode};
+use std::path::Path;
+
+fn open_protected<P: ProvisioningUnprotector + ?Sized>(
+    state: &Path,
+    artifact: &Path,
+    provider: &mut P,
+) -> Result<SelectedEventNode, ApplicationError> {
+    SelectedEventNode::open_protected(state, artifact, provider)
+}
+
+fn open_from_secret_ref<L: ProvisioningSecretLoader + ?Sized>(
+    state: &Path,
+    secret_ref: &ProvisioningSecretRef,
+    operation: ProvisioningLoadId,
+    loader: &mut L,
+) -> Result<SelectedEventNode, ApplicationError> {
+    SelectedEventNode::open_secret_ref(state, secret_ref, operation, loader)
+}
+```
+
+`from_protected_bytes` is the equivalent bounded in-memory artifact entry
+point. `open_unprotected_reference` remains available for fixtures and
+migration and says so in its name. `SelectedControlAdmin` exposes the same four
+open shapes for stopped authority work.
+
+The state terminal check runs before artifact or provider access. Protected
+provider rejection never falls back to canonical plaintext, and errors expose
+only stable sanitized categories. A successful opaque-reference load must
+return a receipt binding the exact caller operation and reference. The
+recovered bundle remains zeroizing plaintext in process; opening does not
+destroy the provider secret or coordinate a live drain.
+
+Relative state and file-artifact paths are resolved against one captured
+absolute current directory before the provider or loader callback. This avoids
+callback-driven current-directory rebinding, but it is not a complete
+filesystem identity or rollback guarantee. Unix protected-file checks reject
+symlinks and bind the opened file to preflight metadata; equivalent non-Unix
+path-swap assurance and deeper parent-directory rename/symlink resistance
+remain open.
+
+You supply the protection or SecretStore implementation. The repository has no
+production backend, hardware/platform key policy, backup/recovery procedure, or
+physical-erasure claim. The age pilot is isolated and non-production, and the
+SecretStore fixture tests only the provider contract. The live runtime, CLI,
+and C/Go/Python bindings still use the unprotected compatibility path.
 
 ## Prove offline publish and later synchronization
 
@@ -175,11 +311,18 @@ Choose an operation key that identifies the application effect, not a random
 attempt. Reusing it with the same publish request returns the original commit;
 reusing it with different content fails closed. Topics and scopes must be
 authorized by current mission policy. Tombstones must have an empty payload.
-The selected Event slice authenticates and returns priority, but does not yet
-schedule contacts, retries, or eviction by that value. That behavior remains
-open in the constrained-operation stack.
-There is deliberately no finite-TTL field while authenticated cumulative
-forwarding age and expiry remain unimplemented.
+The selected Event slice authenticates and returns priority. Semantic-v3/v4/v5
+contacts use it for bounded transmission order and retry cadence, while the
+selected pressure policy fixes same-scope candidates ahead of off-scope rows
+when that exact scope is initially short, then retires expired rows and
+route-only rows before comparing priority within each cohort. The additive
+`publish_with_options` API accepts a positive
+source-authenticated finite TTL on Linux; query, poll, and gap exposure withhold
+an Event at the exact expiry boundary. See [Selected Event custody and
+constrained operation](selected-custody-api.md) for configuration, clock,
+receive-only, quota, compatibility, and claim boundaries. State, Record, and
+Blob remain outside this custody path, so generic cross-class priority eviction
+is still open.
 
 `EventQuery::limit` bounds accepted rows **scanned**, not only matching rows
 returned. A selective page can therefore contain no items while `has_more` is
@@ -200,6 +343,49 @@ acknowledgement ledger. Retrying removal returns `AlreadyAbsent`. To change a
 selector, unsubscribe and then subscribe to the replacement. Those are two
 distinct operations and can create an interval with no receive selector; Aster
 does not claim an atomic or seamless subscription update.
+
+## Publish controls through the live actor
+
+When the running mission credential carries control-authority capability, obtain
+the distinct authority handle before consuming `running`:
+
+```rust
+use aster_node::{RevocationRequest, ScopeRekeyRequest};
+use std::num::NonZeroU64;
+
+let controls = running.selected_controls();
+let request = RevocationRequest::new(subject, NonZeroU64::new(1).unwrap());
+let exact_retry = request;
+
+let receipt = controls.publish_revocation(request).await?;
+// If the response is lost after enqueue, retry `exact_retry`, not a new request.
+```
+
+`publish_scope_rekey` accepts the same bounded `ScopeRekeyRequest` used by
+stopped `SelectedControlAdmin`. Clone that request before awaiting when the
+caller must survive cancellation; the clone shares its bounded signed-registry
+and recipient buffers. Both operations return only after durable publication
+and live policy refresh, or return a sanitized administration error. An
+authenticated pending predecessor gap yields `PolicyUnsettled` for a fresh
+publication without terminating the actor; an exact already-committed retry can
+still recover its historical receipt while policy is deferred.
+
+The control queue holds one command and the actor yields after at most four
+control commands so Event/status and network work can progress. Once enqueue
+completes, dropping or cancelling the future does not cancel actor-owned work;
+the operation may still commit. Retain the exact request and retry it to recover
+the idempotent receipt. A self-revocation normally returns its committed receipt
+before actor teardown. If that response is lost, the live handles close and the
+receipt must be recovered by exact retry through stopped
+`SelectedControlAdmin` after teardown with the retained provisioning
+capability.
+
+This is process-local Rust control, not cross-process administrator IPC. It does
+not discover affected scopes, combine revoke and rekey atomically, issue
+credentials or registries, authorize an operator, destroy provider secrets, or
+add a protected stock CLI/binding. The current tests are automated source-tree
+evidence only; they create no retained control receipt or additional
+`observed-bounded` credit.
 
 ## Interpret gaps conservatively
 

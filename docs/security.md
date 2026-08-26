@@ -52,8 +52,44 @@ source item
 The adapter API has a broadcast capability bit, but no complete protected
 broadcast replication capsule or repair protocol is implemented.
 
-Relays are not content readers by default. The implemented semantic-version-2
-bridge similarly limits a bridge to rule-specific endpoint routing grants and
+### Controlled Iroh connectivity relay
+
+The selected carrier can use one exact operator-pinned HTTPS relay origin below
+the peer QUIC and Aster hybrid mission session. The URL is limited to 2 KiB and
+must have a host, the root path, and no user information, query, or fragment.
+The operator must explicitly select embedded WebPKI trust or provide
+one to eight DER CA roots, each at most 64 KiB and 256 KiB combined. Explicit
+roots replace WebPKI. There is no insecure mode, trust fallback, hosted lookup,
+public/default relay substitution, or port mapping.
+
+The exact remote Iroh endpoint ID is still authenticated independently of relay
+TLS, and the hybrid mission identity is authenticated independently before
+inventory. Neither relay TLS nor Iroh endpoint identity grants mission
+membership, route/content access, source authority, receipt validity, or
+synchronization success. Direct-plus-relay startup does not wait for relay
+readiness; relay-only requires readiness and disables IP. Iroh may probe an
+initial direct locator and the relay in parallel and may learn a later
+authenticated direct path through NAT negotiation. Initial locators are not
+lifetime pins, and no direct-first or NAT-acceptance property follows.
+
+Direct/Relay path telemetry retains only the last observed path and a coalesced
+transition count capped at 1,024. Ordinary closure preserves the last
+observation; missing or continuity-lost observation becomes Unknown and records
+loss of fidelity. These fields are operational diagnostics and are never
+authorization or success inputs.
+
+The controlled Iroh relay is transport infrastructure, not an Aster mission
+node: it has no Aster store or route grant. The payload-blind Aster Event relay
+below is instead a mission node with route-only Event custody, and route-only
+Blob relay/custody remains unimplemented. Current real-process controlled-relay
+evidence is one-host and Event-only. A separate focused direct-Iroh runtime test
+proves that a wrong expected mission fails before inventory; it is not part of
+the relay-path process proof. Neither result creates retained, physical,
+representative-NAT, BTLE, mixed-implementation, N=32,
+State/Record/Blob-over-relay, or release credit.
+
+Aster application relays are not content readers by default. The implemented
+semantic-version-2/3/v4/v5 bridge similarly limits a bridge to rule-specific endpoint routing grants and
 an authority-signed directed-edge authorization. It rewraps the exact immutable
 format-2 source carrier without content access, preserves the source signature
 and origin scope, and exposes a distinct authenticated current scope. A target
@@ -132,33 +168,97 @@ compiler-lifecycle risk and independently prohibits production admission.
 The profile is X25519 and ChaCha20-Poly1305 based. It provides no post-quantum
 artifact-confidentiality or FIPS 140-3 validation claim. The raw
 `ApplicationNode::open`, `MeshService::open`, FFI, Go, and Python paths remain
-unprotected compatibility/test ingestion. The current host also retains a
-zeroizing plaintext bundle copy in process so it can rebuild its backend after
-a paused contact.
+unprotected compatibility/test ingestion. The stock `aster node`,
+`control-revoke`, and `control-rekey` CLI paths also still require an owner-only
+unprotected-reference bundle. A Rust embedding can instead construct a live
+`NodeConfig` from a protected file, protected bytes, or an exact opaque provider
+reference. Every successful path still retains the recovered canonical bundle
+as zeroizing plaintext in the running process.
 
-Persistent custody after ingestion is a separate `SecretStore` problem. A
-production backend needs opaque seal/load/destroy handles, platform or hardware
-key policy, unattended-start decisions, recovery and backup procedures,
-rollback handling, and verified failure behavior. Neither successful provider
-destruction nor software zeroization proves physical flash erasure. This model
-does not defend secrets against a fully compromised running process or root,
-unlocked-memory inspection, swap, DMA, backups, or crash dumps unless the
-selected platform and deployment add those controls.
+`NodeConfig`, stopped `SelectedEventNode`, and stopped `SelectedControlAdmin`
+compose the protection boundary. `NodeConfig::open_protected`,
+`NodeConfig::from_protected_bytes`, and `NodeConfig::open_secret_ref` take a
+private, fully validated `NodeConfigOptions` value, reject durable terminal state
+before provider invocation or state creation, expose only sanitized errors, and
+never fall back from provider rejection to plaintext parsing. The stopped
+surfaces accept the equivalent protected sources. These entry points are
+caller-supplied Rust APIs, not stock CLI or C/Go/Python binding paths, and they
+do not select or admit a provider.
+
+Runtime `READY` and `STOP` receipts expose only the stable non-identifying
+origin labels `provider-protected-artifact` and `provider-secret-reference`.
+They do not expose a path, provider identity, operation ID, or opaque reference,
+and they are not provisioning, custody, or destruction receipts.
+
+Persistent custody now has a provider-neutral contract, not a production
+backend. A versioned, bounded `ProvisioningSecretRef` carries an opaque backend
+locator or capability; its debug output is redacted, but opacity does not make
+it public. Separate caller-chosen install, load, and destroy operation IDs bind
+retries. Checked helpers reject a zeroized install before backend invocation
+and validate the exact install operation; load and destroy validate both the
+exact operation and caller-supplied reference. A
+successful load transfers a bounded Aster-owned zeroizing plaintext value for
+immediate ingestion. A mismatched load result is dropped and zeroized before
+the sanitized rejection returns.
+
+A `ProvisioningDestroyReceipt` records only the trusted backend's assertion
+that its logical destruction contract and durable tombstone completed. Aster
+checks the echoed operation and reference but cannot independently prove the
+backend's durability. `NotFound` is explicitly indeterminate, and neither
+`Destroyed` nor a receipt proves physical flash erasure, snapshot/backup/swap
+removal, remanence protection, or media sanitization. No selected workflow yet
+coordinates live-node drain, store terminalization, reference destruction, and
+recovery policy. A live node created from protected or secret-reference
+provisioning can shut down gracefully, but the selected same-UID local
+software-zeroization path has no provider destroyer and cannot destroy the
+provider artifact, opaque reference, or provider-held secret.
+
+Relative state and protected-file paths for live `NodeConfig` construction and
+the stopped Event/admin opens are resolved against one captured absolute
+current directory before a caller provider or loader can change the process
+current directory. The live config retains that exact absolute lexical state
+pathname and rejects later public-field mutation before state creation. This is
+not an inode, parent-directory, symlink-resolution, rename-history, database
+identity, or rollback witness. Protected file reads separately retain no-follow
+and opened-file identity checks on Unix; equivalent non-Unix path-swap
+assurance, parent-directory symlink/rename races across every boundary,
+database rollback or replacement, and a supported restore/rebind procedure
+remain open.
+
+A production backend still needs platform or hardware key policy,
+authentication/access control, unattended-start decisions, recovery and backup
+procedures, rollback handling, operation-ledger retirement, and verified
+failure behavior. The in-memory fixture tests only the API model; it is not
+evidence of backend durability, secrecy, or erasure. This model does not defend
+secrets against a fully compromised running process or root, unlocked-memory
+inspection, swap, DMA, backups, or crash dumps unless the selected platform and
+deployment add those controls.
 
 ## Mandatory controls
 
 - Canonical ordered semantic-version and complete-suite offers, with selection
   bound into the transcript, KDF, key confirmations, and hybrid authentication;
   there is no algorithm-by-algorithm mixing. The stable framing/profile remains
-  `1`, the default semantic offer is `[2, 1]`, and profile 1 has one registered
+  `1`, the default semantic offer is `[5, 4, 3, 2, 1]`, and profile 1 has one registered
   complete suite.
 - Both classical and PQ signatures verify; failure is indistinguishable on wire.
-- A compact semantic-version-2 batch item is never authenticated by its P-256
+- A compact semantic-version-2/3/v4/v5 batch item is never authenticated by its P-256
   suffix alone: the exact proof credential, authority hybrid signature, source
   hybrid root signature, ciphertext commitment, Merkle path, and item signature
   must all verify. Missing proof means bounded pending state, never delivery.
+- Selected Event/RouteEvent semantic-v3-format custody claims, used by v3, v4, and v5 sessions, use a distinct
+  session-record AAD, bind the exact transfer/source fields, exchange, nonzero
+  policy revision, session ID, and checked cumulative age, and are
+  replay-checked before store admission.
+- Protected v3-format Event interests used in v3/v4/v5 bind an opaque receiver
+  selector generation.
+  Receipts suppress only that generation; `Satisfied` hides Carry versus
+  successful Consume, while `ContentAcceptancePending` reveals only that the
+  offered object still lacks receiver-required content acceptance. The value is
+  not a Byzantine peer-state high-water: an authenticated peer can still lie
+  about its own retention or restore its own older state.
 - Durable partial-transfer progress preserves its first-admission semantic
-  version. Unknown provenance fails closed, and v2-only objects cannot be
+  version. Unknown provenance fails closed, and v2/v3/v4/v5-only objects cannot be
   resumed or served through a selected-v1 session after restart.
 - Hybrid ephemeral establishment, transcript binding, explicit key confirmation,
   direction/purpose labels, and no 0-RTT data.
@@ -171,6 +271,32 @@ selected platform and deployment add those controls.
   Format-2 controls require a root-signed ControlAuthority credential and the
   delegated identity's hybrid signature; signer identity is persisted and
   checked against the applied revocation state before activation.
+- Selected recipient-package rekey authenticates the signed registry and every
+  canonical recipient credential before key generation. A fresh rekey cannot
+  select or activate a recipient that is already revoked when that request is
+  evaluated. An exact same-signer historical duplicate may still recover its
+  original durable receipt after a recipient is later revoked. After any
+  revocation, a new legacy
+  recipient-less scope-epoch control is rejected; an authenticated one that
+  predates revocation may remain historical. Revocation and rekey are still two
+  separate administrator transactions, not an automatic or atomic remediation
+  workflow.
+- A running authority exposes the same bounded operations through
+  `SelectedControlHandle`. Its queue capacity is one, the actor processes at
+  most four control commands before yielding, and each command takes the same
+  policy write lease as other policy mutation. An authenticated pending gap is
+  a deferred, nonterminal policy condition: fresh publication returns the
+  sanitized `PolicyUnsettled` category while an exact historical retry remains
+  recoverable. Dropping or cancelling a caller after enqueue does not retract
+  actor-owned work; it may still commit, so the caller must retain and exactly
+  retry the request. If a self-revocation commits but its response is lost, the
+  live actor closes and receipt recovery requires stopped `SelectedControlAdmin`
+  after teardown. There is no cross-process control-admin IPC.
+- Authenticated control predecessor/rollback poison purges its pending
+  descendants and records a durable rejected-sequence fence. Descendants cannot
+  activate past that fence until a valid alternate fills the rejected
+  sequence. An idempotent administrative retry is labeled local only when the
+  historical effect and persisted local signer match exactly.
 - Decode bounds precede allocation. Malformed input cannot panic the safe core.
 - Adapter endpoint handles are routing-only local hints; only the authenticated
   session NodeID may authorize peer state, grants, inventory, or DATA.
@@ -220,13 +346,17 @@ selected platform and deployment add those controls.
   byte/count/extent limits in an isolated staging partition.
 - Plaintext payload is not written to the protocol store; blobs stream.
 - Secrets use best-effort memory zeroization and platform key-destruction hooks.
+  Provider-neutral SecretStore helpers bind exact install/load/destroy operation
+  receipts and opaque references, but no production backend, recovery policy,
+  coordinated drain/destroy path, or physical-erasure assurance follows from
+  that contract.
 
 ## Key access matrix
 
 | Role | Session | Routing | Content | Publish | Bridge | Authority |
 |---|---:|---:|---:|---:|---:|---:|
 | consumer | yes | joined scopes | granted groups | optional | no | no |
-| relay | yes | carried scopes | no by default | no | no | no |
+| Aster Event relay | yes | carried scopes | no by default | no | no | no |
 | bridge | yes | authorized edge endpoints | no by default | no source authorship | explicit directed edges | no |
 | publisher | yes | origin scopes | required groups | explicit | no | no |
 | authority | policy | policy | fresh recipient packages or legacy activation | control records | grants | yes |
@@ -249,7 +379,7 @@ delegated signers.
 
 Both ordinary and bridge stores persist the authenticated signer. Ordinary
 controls share one chain head keyed by stable `authority_id`; bridge
-authorizations use their own semantic-v2 chain, also keyed by that stable root
+authorizations use their own semantic-v2/v3/v4/v5 chain, also keyed by that stable root
 identifier. Neither creates a per-signer history. A signer revoked in the
 contiguous applied prefix cannot contribute another link. If activation reaches
 a staged link signed by an identity revoked earlier in that prefix, the
@@ -344,6 +474,146 @@ bound or pruning protocol. Per-key or per-stream domains, transitive propagation
 with safe trust semantics, and bounded authenticated retirement/checkpointing
 remain production security and availability gates. No minimum-context clamp is
 claimed or implemented.
+
+### Selected semantic-v4 mutable availability and lineage
+
+State and Record reconciliation is enabled only after the hybrid mission
+session selects semantic version 4 or 5. The v1-v3 Event compatibility paths do not
+accept, act on, or expose mutable interests, inventory, IDs, objects, results,
+or finish counts. Within v4/v5, State and Record and both receiver directions are distinct
+authenticated lanes. Cross-class/direction substitution, result/ack mismatch,
+and finish-remainder mismatch fail the contact.
+
+The selected node rechecks mission, source, route/content authority, revocation,
+scope epoch, interest, exact identity, and current source route lineage under
+one contact policy lease. Same-epoch key replacement does not delete historical
+rows. It withholds the replaced lineage from ordinary current projection/query
+and from network inventory or transfer. Exact idempotent State publish and
+Record publish/resolution retries may recover their committed historical result
+only after strict cached/projection/historical verification; this exception is
+not general read or forwarding authority.
+
+Authenticated capacity saturation is explicit. State and Record each admit no
+more than 4,096 rows or 16 MiB of encoded source bytes, and no object exceeds
+1 MiB. `DeferredCapacity` applies only to an otherwise-valid authenticated
+object blocked by effective ordinary-aggregate or per-class item/byte capacity,
+the 1,024-version per-logical-key projection bound, or the causal-frontier
+bound; existing mutable data is not evicted. An object over 1 MiB is
+structurally invalid and fatal, not deferred. Integrity, policy, lineage, and
+other structural errors remain fatal and cannot be disguised as capacity.
+Offer returns exact `MutableApplyResult`; Fetch returns exact
+`MutableFetchResult` and requires exact `MutableFetchResultAck`;
+Finish/Finished bind exact remaining.
+
+The durable fair-start cursor is reserved metadata keyed by authenticated
+mission peer, class, and local Offer/Fetch mode. It is compare-and-set only
+after the exact authenticated outcome, bounded to 256 configured peers and
+1,024 rows, and pruned for stale configured peers before sockets open. A stale
+cursor race is nonfatal, but it cannot overwrite the winner. These bounds
+contain metadata growth and prevent a fixed lexicographic prefix from starving
+later IDs across repeated partial contacts; they are not evidence of physical
+resource sufficiency or adversarial-link liveness.
+
+Normal and `AtLeast` run the v4/v5 State/Record lanes because `AtLeast` is an Event-only
+threshold. `ReceiveOnly` initiates no contact and discloses no mutable interest,
+inventory, ID, or object. Event last-contact status is deliberately separate
+and is not evidence that State/Record converged. Selected State/Record finite
+TTL is structurally rejected; no mutable forwarding-age/expiry security claim
+is made.
+
+### Selected semantic-v5 Blob authorization, staging, and visibility
+
+Selected Blob transfer is enabled only after the completed hybrid mission
+session selects semantic version 5. Versions 1 through 4 emit and accept zero
+selected Blob frames. V5 inherits all earlier Event and State/Record security
+rules without changing stable wire/profile, envelope, carrier, or ABI version
+1.
+
+The selected network path is direct between content-capable peers. A protected
+exact `(topic, scope, epoch)` interest includes an opaque 32-byte
+`BlobPeerContentProof` minted from the claimant's current content grant and
+bound to mission authority and authenticated NodeID. The sender requires both
+that proof and the peer's current exact route grant; route authority never
+implies content authority. It also rechecks durable revocation and control
+policy. Copying a proof to another identity, changing topic/scope/epoch or
+authority, tampering with it, or replacing the content key at the same epoch
+invalidates it. The proof is repeated and rechecked on every range fetch. This
+does not select the broader route-only Blob relay design.
+
+Two independent lineage bindings close same-epoch substitution. Source route
+lineage binds the current authenticated routing grant. A domain-separated
+physical lineage binds the exact current content grant plus mission,
+scope/topic, and epoch. Pending source installation, carrier service, content
+verification, and publication promotion require the exact lineages committed
+by the plan; a provider-minted `CurrentBlobLineage` proves that both are still
+current at promotion. Historical same-epoch rows may remain durable for audit
+or exact local retry, but are not advertised, served, or promoted as current
+network publications. Redb does not transparently replace them: a new physical
+lineage for the same `(BlobID, content group, numeric epoch)` fails with
+`PhysicalLineageConflict`. Republishing or resuming that Blob after same-epoch
+key replacement under a different physical lineage requires advancing the
+numeric epoch. Terminal or stale cleanup does not erase this witness. It retires
+all unshared chunks, clears finalized digest and reserved/committed byte
+authority, and reclaims files, while retaining the exact unfinished
+`BLOB_IMPORTS` row as a non-public physical-lineage fence. That row remains
+owner/backing-bound, audited on every open path, and charged to the existing
+variant cap. Exact-lineage retry may refill it; a missing physical lineage is
+corruption, and another lineage at the same numeric epoch still conflicts.
+
+The source envelope and complete manifest plan are authenticated and staged
+before any carrier range is requested. Prefix progress is durable under the
+exact `(source transfer ID, carrier ObjectID)` and is not owned by a peer or
+session, so any later authenticated, nonrevoked content-capable peer proving the
+same current selector may continue the exact complement. A range is at most 16
+KiB. Network admission is capped at 64 MiB plaintext and 1,024 chunks; pending
+metadata and prefixes are capped at 10,000 rows and 64 MiB. Capacity failure is
+typed deferral and does not evict accepted data or overwrite existing progress.
+Conflicting prefixes and identity, proof, manifest, lineage, AEAD, digest, and
+whole-Blob failures fail closed for the affected exact work.
+
+Terminal poison of a multi-carrier source advances the durable peer scheduler
+to the lexicographically greatest canonical carrier ID across that source. It
+MUST NOT use manifest-last as a proxy for the greatest ID, because that can
+strand a later eligible source behind adversarial manifest order.
+
+The authenticated source cache and durable pending-source lifecycle are one
+serialized security boundary. Staging, sender-cache repair, terminal or stale
+abort, and post-abort reconciliation use the same local lifecycle lock without
+holding it over network I/O. Reconciliation removes the retired claim, rereads
+the exact durable projection, and freshly authenticates any concurrent exact
+restage before reinsertion. This prevents a delayed cache write from reviving an
+aborted source or an abort from deleting the winner's authenticated claim.
+
+BlobCarrierFinish reports the requester's remaining count and Finished only
+echoes it. That pair closes sequencing; it is not independent evidence of the
+requester's disk state. Exact BlobRangeResult/BlobRangeResultAck tuples are the
+peer-visible evidence for each accepted durable prefix.
+
+Pending bytes confer no publication authority. Promotion requires the exact
+pending plan, all verified canonical carriers, a matching physical depot
+completion, a fresh provider-owned `VerifiedBlobContentCompletion` obtained by
+streaming/decrypting/authenticating every chunk and whole Blob, and the fresh
+current-lineage proof. Redb compares those bindings and installs all ordinary
+publication/index/counter rows while deleting pending rows in one transaction.
+Until that transaction commits, the Blob is absent from ordinary inventory,
+query, read, and serving surfaces. An interrupted or failed verification cannot
+publish a prefix or a merely carrier-complete object.
+
+All redb open modes cross-audit the pending source, its exact manifest route and
+carrier set, the depot expected plan, and the completed publication namespace.
+A self-consistent missing depot plan, changed canonical carrier record, or one
+source present as both pending and completed is corruption and fails without
+repair. Writable predecessor migration is likewise all-or-none: the four v5
+network tables may be added to the prior nine-table Blob schema only when the
+group is wholly absent and owner attribution is valid; read-only and partial-
+group opens never create or repair tables.
+
+Normal and `AtLeast` run this lane because `AtLeast` is Event-only;
+`ReceiveOnly` sends, requests, stages, promotes, and counts zero Blob work.
+There is no selected live Blob application handle/subscription, route-only Blob
+relay or custody, Blob TTL/expiry/garbage collection, metadata-independent
+whole-byte identity/deduplication, or large-file, physical, mixed-implementation,
+and release-acceptance claim.
 
 ## Availability controls
 
@@ -511,10 +781,20 @@ Listing a production gate is not evidence that it has passed. Independent NIST
 algorithm-vector validation remains required; the checked-in, reference-generated
 protocol conformance vectors do not satisfy that gate.
 
+The retained selected N=32 Event run is likewise a scale-boundary observation,
+not broader security acceptance. It used one macOS arm64 host, direct loopback,
+one binary/implementation, one scope/authority/topic, and unprotected-reference
+provisioning. Its raw root contains mission bundles and carrier identity keys
+and must remain outside source control; the checked-in receipt contains only a
+bounded sanitized manifest. The run adds no physical, distributed, NAT,
+controlled-relay, BTLE/cross-transport, packet-capture, mixed-implementation,
+resource-threshold, cryptographic-module, or release claim.
+
 - Bit-level tamper of every envelope/handshake field.
 - signature stripping and classical/PQ downgrade attempts.
-- direct mutation of an honestly selected semantic `2` to offered semantic `1`;
-  the initiator must reject even though membership checks alone would accept it.
+- stripping the current `[5, 4, 3, 2, 1]` offer to `[4, 3, 2, 1]`, `[3, 2, 1]`, `[2, 1]`, or `[1]`,
+  and the retained `[2, 1]` compatibility offer to `[1]`; the initiator must reject even though
+  membership checks alone would accept the selected lower version.
 - malformed public keys/ciphertexts and implicit-rejection behavior.
 - nonce uniqueness across concurrency, crash, rollback, and epoch change.
 - replay windows and old control/key epochs.
@@ -570,7 +850,7 @@ physical-carrier traffic-analysis boundary.
 
 The canonical batch codec, provider authentication, and explicit atomic
 source/store/application path reduce the transferred verification closure for a
-semantic-version-2 batch. The default retained-dual policy preserves v1
+semantic-version-2/3/v4/v5 batch. The default retained-dual policy preserves v1
 compatibility at extra signing/storage cost; explicit batch-only cannot reach a
 selected-v1 peer. Reference peer proof-first, compact-first pending/restart,
 v1-rejection, and Blob-carrier tests pass; the required 3 kbps end-to-end

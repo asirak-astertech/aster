@@ -15,10 +15,15 @@ use std::{
     },
 };
 
-use aster_mesh::{EventContentVerification, ReferenceEnvelopeSealer};
+#[cfg(test)]
+use aster_mesh::CustodySample;
+use aster_mesh::{
+    EventContentVerification, ProvisioningLoadId, ProvisioningSecretLoader, ProvisioningSecretRef,
+    ProvisioningUnprotector, ReferenceEnvelopeSealer,
+};
 pub use aster_mesh::{NodeId, Priority, Scope, Topic};
 use aster_redb_store::{
-    BlobStoreError, ControlPolicySnapshot, ControlTransferId,
+    BlobStoreError, ControlPolicySnapshot, ControlTransferId, CustodyObjectKey, CustodyStoreError,
     EventDeliveryAck as StoreEventDeliveryAck, EventGapScanPlan, EventOperationKey,
     EventQueryFilter, EventReplicationPolicySnapshot, EventSemanticId,
     EventSubscriptionId as StoreEventSubscriptionId, EventSubscriptionKey, EventSubscriptionMode,
@@ -32,10 +37,14 @@ use crate::{
     NodeError,
     mission::UnprotectedReferenceMission,
     runtime::{
-        EVENT_OPERATION_CONFLICT, STORE_FILE, SelectedEventPublish, ensure_principal_active,
-        ensure_state_accepts_normal_operation, event_is_inactive, open_replayed_verifier,
-        publish_selected_event_once, refresh_application_policy, verify_content_stored_claim,
-        verify_stored_claim,
+        AuthenticatedEventRouteCache, EVENT_OPERATION_CONFLICT, EVENT_OPERATION_RETIRED,
+        NodeCustodyClock, STORE_FILE, SelectedEventPublish, StartupEventVerification,
+        absolute_path_from, absolute_state_path, cache_accepted_stored_event,
+        drive_custody_maintenance, ensure_principal_active, ensure_state_accepts_normal_operation,
+        event_is_inactive, migrate_legacy_event_operation_witnesses,
+        open_startup_event_verifier_and_cache,
+        prune_authenticated_event_route_cache_to_sender_projection, publish_selected_event_once,
+        refresh_application_policy, verify_content_stored_claim, verify_stored_claim,
     },
 };
 
@@ -64,6 +73,7 @@ pub const MAX_SELECTED_EVENT_DELIVERIES: usize = MAX_EVENT_POLL_DELIVERIES;
 
 /// Maximum accepted or pending rows freshly verified by one poll.
 pub const MAX_SELECTED_EVENT_SUBSCRIPTION_SCAN: usize = MAX_EVENT_SUBSCRIPTION_SCAN;
+const MAX_SELECTED_EVENT_PLAN_RETRIES: usize = 4;
 
 /// Stable, high-level failure category for selected application operations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,6 +84,8 @@ pub enum ApplicationErrorKind {
     UnauthorizedOrRevoked,
     PolicyUnsettled,
     Conflict,
+    /// The operation remains durably bound after its finite payload was retired.
+    ExpiredOrRetired,
     ResourceLimit,
     StateUnavailable,
     Integrity,
@@ -117,6 +129,9 @@ impl fmt::Display for ApplicationError {
             }
             ApplicationErrorKind::PolicyUnsettled => "mission policy is not settled",
             ApplicationErrorKind::Conflict => "idempotency or causal conflict",
+            ApplicationErrorKind::ExpiredOrRetired => {
+                "idempotent publication expired or was retired"
+            }
             ApplicationErrorKind::ResourceLimit => "selected data resource limit reached",
             ApplicationErrorKind::StateUnavailable => "selected application state is unavailable",
             ApplicationErrorKind::Integrity => "selected data integrity check failed",
@@ -174,8 +189,8 @@ impl fmt::Display for EventId {
 /// The operation key is application-chosen and bounded to 256 bytes. Reusing
 /// the same key with the same request returns the original Event; reusing it
 /// with different content fails closed. Resolution still requires the caller
-/// to remain authorized by current mission policy. Finite TTL is intentionally
-/// absent until authenticated cumulative forwarding age is implemented.
+/// to remain authorized by current mission policy. [`EventPublishOptions`]
+/// supplies the additive finite-TTL path without changing this durable request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EventPublishRequest {
     pub operation_key: Vec<u8>,
@@ -188,6 +203,41 @@ pub struct EventPublishRequest {
     pub tombstone: bool,
 }
 
+/// Additive publication behavior for one selected Event.
+///
+/// Durable publication is the default. A finite TTL is source authenticated,
+/// begins at the local custody checkpoint, and can only cross semantic-v3
+/// mission sessions carrying an authenticated cumulative custody claim.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EventPublishOptions {
+    ttl_ms: Option<u64>,
+}
+
+impl EventPublishOptions {
+    /// Selects the durable, non-expiring Event form.
+    pub const fn durable() -> Self {
+        Self { ttl_ms: None }
+    }
+
+    /// Selects a positive source-authenticated lifetime in milliseconds.
+    pub const fn finite_ttl_ms(ttl_ms: u64) -> Result<Self, ApplicationError> {
+        if ttl_ms == 0 {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::InvalidRequest,
+                "publish",
+            ));
+        }
+        Ok(Self {
+            ttl_ms: Some(ttl_ms),
+        })
+    }
+
+    /// Returns the exact source-authenticated lifetime, when finite.
+    pub const fn ttl_ms(self) -> Option<u64> {
+        self.ttl_ms
+    }
+}
+
 /// Successful durable publication without sealed bytes or provider internals.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EventPublishResult {
@@ -196,6 +246,8 @@ pub struct EventPublishResult {
     pub publisher_counter: u64,
     pub event_sequence: u64,
     pub priority: Priority,
+    /// Exact source-authenticated lifetime, or `None` for a durable Event.
+    pub ttl_ms: Option<u64>,
     pub acceptance_marker: u64,
     pub inserted: bool,
 }
@@ -272,6 +324,8 @@ pub struct EventItem {
     pub topic: Topic,
     pub scope: Scope,
     pub priority: Priority,
+    /// Exact source-authenticated lifetime, or `None` for a durable Event.
+    pub ttl_ms: Option<u64>,
     pub logical_key: Vec<u8>,
     pub payload: Vec<u8>,
     pub tombstone: bool,
@@ -536,9 +590,23 @@ impl SelectedEventHandle {
         &self,
         request: EventPublishRequest,
     ) -> Result<EventPublishResult, ApplicationError> {
+        self.publish_with_options(request, EventPublishOptions::durable())
+            .await
+    }
+
+    /// Publishes with an explicit durable or finite-TTL custody policy.
+    pub async fn publish_with_options(
+        &self,
+        request: EventPublishRequest,
+        options: EventPublishOptions,
+    ) -> Result<EventPublishResult, ApplicationError> {
         let (response, received) = oneshot::channel();
         self.send(
-            SelectedEventCommand::Publish { request, response },
+            SelectedEventCommand::Publish {
+                request,
+                options,
+                response,
+            },
             received,
             "publish",
         )
@@ -659,6 +727,7 @@ fn actor_unavailable(operation: &'static str) -> ApplicationError {
 pub(crate) enum SelectedEventCommand {
     Publish {
         request: EventPublishRequest,
+        options: EventPublishOptions,
         response: oneshot::Sender<Result<EventPublishResult, ApplicationError>>,
     },
     Query {
@@ -721,7 +790,12 @@ impl SelectedEventCommand {
 enum VerifiedSubscriptionCandidate {
     Inactive(EventSemanticId),
     NotSelected,
-    Delivery(EventSemanticId, EventItem),
+    Delivery(
+        EventSemanticId,
+        aster_redb_store::EventTransferId,
+        bool,
+        Box<EventItem>,
+    ),
 }
 
 /// Exclusive high-level handle over the selected Event composition.
@@ -735,41 +809,165 @@ pub struct SelectedEventNode {
     store: Arc<Store>,
     verifier: ReferenceEnvelopeSealer,
     verifier_head: Option<(u64, ControlTransferId)>,
+    custody_clock: NodeCustodyClock,
+    event_route_cache: Arc<AuthenticatedEventRouteCache>,
 }
 
 impl SelectedEventNode {
     /// Opens the current explicitly unprotected reference provisioning path.
     ///
-    /// Terminal state is rejected before mission bytes are loaded. The mission
-    /// authority is then bound to the exact no-follow redb file, all committed
-    /// controls are freshly replayed, and pending control gaps defer use.
+    /// Relative state and mission paths are bound to one current-directory
+    /// snapshot before terminal inspection; this lexical binding does not read
+    /// mission bytes. Terminal state is rejected before mission bytes are
+    /// loaded. The mission authority is then bound to the exact no-follow redb
+    /// file, all committed controls are freshly replayed, and pending control
+    /// gaps defer use.
     pub fn open_unprotected_reference(
         state: impl AsRef<Path>,
         mission_bundle: impl AsRef<Path>,
     ) -> Result<Self, ApplicationError> {
-        let state = state.as_ref();
-        ensure_state_accepts_normal_operation(state)
+        let path_base =
+            std::env::current_dir().map_err(|error| application_error("open", error.into()))?;
+        let state = absolute_path_from(&path_base, state.as_ref())
             .map_err(|error| application_error("open", error))?;
-        let mission = UnprotectedReferenceMission::load(mission_bundle)
-            .map_err(|error| application_error("open", error.into()))?;
-        fs::create_dir_all(state).map_err(|error| application_error("open", error.into()))?;
+        let mission_bundle = absolute_path_from(&path_base, mission_bundle.as_ref())
+            .map_err(|error| application_error("open", error))?;
+        Self::open_with_mission(&state, || {
+            UnprotectedReferenceMission::load(&mission_bundle)
+                .map_err(|error| application_error("open", error.into()))
+        })
+    }
+
+    /// Opens one provider-protected reference provisioning artifact.
+    ///
+    /// Relative state and protected paths are bound to one current-directory
+    /// snapshot without inspecting the artifact. Durable terminal state is
+    /// rejected before the protected file is inspected or the provider is
+    /// called. Provider rejection never falls back to the unprotected reference
+    /// parser, and durable application state is not created until the artifact
+    /// has authenticated and parsed.
+    pub fn open_protected<P>(
+        state: impl AsRef<Path>,
+        protected_mission_bundle: impl AsRef<Path>,
+        unprotector: &mut P,
+    ) -> Result<Self, ApplicationError>
+    where
+        P: ProvisioningUnprotector + ?Sized,
+    {
+        let path_base =
+            std::env::current_dir().map_err(|error| application_error("open", error.into()))?;
+        let state = absolute_path_from(&path_base, state.as_ref())
+            .map_err(|error| application_error("open", error))?;
+        let protected_mission_bundle =
+            absolute_path_from(&path_base, protected_mission_bundle.as_ref())
+                .map_err(|error| application_error("open", error))?;
+        Self::open_with_mission(&state, || {
+            UnprotectedReferenceMission::load_protected(&protected_mission_bundle, unprotector)
+                .map_err(|error| application_error("open", error.into()))
+        })
+    }
+
+    /// Opens provider-protected reference provisioning bytes supplied by the
+    /// embedding application.
+    ///
+    /// Durable terminal state is rejected before the provider is called.
+    /// Provider failure occurs before state-directory or store creation and
+    /// never falls back to treating `protected` as canonical plaintext.
+    pub fn from_protected_bytes<P>(
+        state: impl AsRef<Path>,
+        protected: &[u8],
+        unprotector: &mut P,
+    ) -> Result<Self, ApplicationError>
+    where
+        P: ProvisioningUnprotector + ?Sized,
+    {
+        let state = state.as_ref();
+        Self::open_with_mission(state, || {
+            UnprotectedReferenceMission::from_protected_bytes(protected, unprotector)
+                .map_err(|error| application_error("open", error.into()))
+        })
+    }
+
+    /// Opens one authenticated opaque reference to a provider-persisted
+    /// provisioning secret.
+    ///
+    /// Durable terminal state is rejected before the loader is called. The
+    /// returned load receipt must bind the exact caller-selected operation and
+    /// reference, and rejection occurs before state-directory or store
+    /// creation.
+    pub fn open_secret_ref<L>(
+        state: impl AsRef<Path>,
+        secret_ref: &ProvisioningSecretRef,
+        operation: ProvisioningLoadId,
+        loader: &mut L,
+    ) -> Result<Self, ApplicationError>
+    where
+        L: ProvisioningSecretLoader + ?Sized,
+    {
+        let state = state.as_ref();
+        Self::open_with_mission(state, || {
+            UnprotectedReferenceMission::load_from_secret_store(secret_ref, operation, loader)
+                .map_err(|error| application_error("open", error.into()))
+        })
+    }
+
+    fn open_with_mission<F>(state: &Path, load_mission: F) -> Result<Self, ApplicationError>
+    where
+        F: FnOnce() -> Result<UnprotectedReferenceMission, ApplicationError>,
+    {
+        let state = absolute_state_path(state).map_err(|error| application_error("open", error))?;
+        ensure_state_accepts_normal_operation(&state)
+            .map_err(|error| application_error("open", error))?;
+        let mission = load_mission()?;
+        fs::create_dir_all(&state).map_err(|error| application_error("open", error.into()))?;
         let store = Store::open_for_mission(state.join(STORE_FILE), mission.mission_authority_id())
             .map_err(|error| application_error("open", error.into()))?;
         store
             .require_process_exclusive_lock()
             .map_err(|error| application_error("open", error.into()))?;
-        let verifier = open_replayed_verifier(&store, &mission)
+        let StartupEventVerification {
+            mut verifier,
+            mut historical_verifier,
+            cache: event_route_cache,
+            policy,
+        } = open_startup_event_verifier_and_cache(&store, &mission)
             .map_err(|error| application_error("open", error))?;
         ensure_principal_active(&store, verifier.identity())
             .map_err(|error| application_error("open", error))?;
+        migrate_legacy_event_operation_witnesses(
+            &store,
+            &policy,
+            &mut verifier,
+            &mut historical_verifier,
+        )
+        .map_err(|error| application_error("open", error))?;
+        drop(historical_verifier);
         let verifier_head = store
             .control_head()
             .map_err(|error| application_error("open", error.into()))?;
+        let custody_clock = NodeCustodyClock::open(verifier.identity())
+            .map_err(|error| application_error("open", error))?;
+        drive_custody_maintenance(&store, &custody_clock, &[])
+            .map_err(|error| application_error("open", error))?;
+        prune_authenticated_event_route_cache_to_sender_projection(
+            &store,
+            &policy,
+            &verifier,
+            Some(
+                custody_clock
+                    .sample()
+                    .map_err(|error| application_error("open", error))?,
+            ),
+            &event_route_cache,
+        )
+        .map_err(|error| application_error("open", error))?;
         let mut selected = Self {
             mission,
             store: Arc::new(store),
             verifier,
             verifier_head,
+            custody_clock,
+            event_route_cache,
         };
         selected.current_policy("open")?;
         Ok(selected)
@@ -780,12 +978,16 @@ impl SelectedEventNode {
         store: Arc<Store>,
         verifier: ReferenceEnvelopeSealer,
         verifier_head: Option<(u64, ControlTransferId)>,
+        custody_clock: NodeCustodyClock,
+        event_route_cache: Arc<AuthenticatedEventRouteCache>,
     ) -> Self {
         Self {
             mission,
             store,
             verifier,
             verifier_head,
+            custody_clock,
+            event_route_cache,
         }
     }
 
@@ -812,6 +1014,15 @@ impl SelectedEventNode {
     /// Stable mission authority bound to this store and provisioning artifact.
     pub const fn mission_authority(&self) -> NodeId {
         self.mission.mission_authority_id()
+    }
+
+    /// Performs one bounded expiry and quota-pressure maintenance pass.
+    ///
+    /// Live nodes run the same pass on their scheduler tick. Stopped
+    /// applications can call this method to advance physical retirement even
+    /// when no contacts or selected-data operations occur.
+    pub fn maintain_custody(&self) -> Result<(), ApplicationError> {
+        self.maintain_custody_for("maintain custody")
     }
 
     /// Idempotently creates one durable application-delivery subscription.
@@ -875,76 +1086,97 @@ impl SelectedEventNode {
         &mut self,
         request: EventPollRequest,
     ) -> Result<EventDeliveryPage, ApplicationError> {
+        self.maintain_custody_for("poll")?;
         let request = request.validate()?;
-        let policy = self.current_policy("poll")?;
-        let plan = self
-            .store
-            .prepare_event_subscription_poll_with_policy(
-                &policy,
-                request.subscription.into_store(),
-                request.delivery_limit,
-                request.scan_limit,
-            )
-            .map_err(|error| application_error("poll", error.into()))?;
-        let spec = plan.spec().clone();
-        let mut selection = EventSubscriptionPollSelection::default();
-        let mut opened = Vec::new();
+        for _ in 0..MAX_SELECTED_EVENT_PLAN_RETRIES {
+            let policy = self.current_policy("poll")?;
+            let plan = self
+                .store
+                .prepare_event_subscription_poll_with_policy(
+                    &policy,
+                    request.subscription.into_store(),
+                    request.delivery_limit,
+                    request.scan_limit,
+                )
+                .map_err(|error| application_error("poll", error.into()))?;
+            let spec = plan.spec().clone();
+            let mut selection = EventSubscriptionPollSelection::default();
+            let mut opened = Vec::new();
 
-        for candidate in plan.pending_candidates() {
-            match self.verify_subscription_candidate(&spec, candidate.event.clone())? {
-                VerifiedSubscriptionCandidate::Inactive(id) => {
-                    selection.inactive_pending.push(id);
-                }
-                VerifiedSubscriptionCandidate::Delivery(id, event) => {
-                    selection.deliveries.push(id);
-                    opened.push((id, event));
-                }
-                VerifiedSubscriptionCandidate::NotSelected => {
-                    return Err(ApplicationError::new(
-                        ApplicationErrorKind::Integrity,
-                        "poll",
-                    ));
+            for candidate in plan.pending_candidates() {
+                match self.verify_subscription_candidate(&spec, candidate.event.clone())? {
+                    VerifiedSubscriptionCandidate::Inactive(id) => {
+                        selection.inactive_pending.push(id);
+                    }
+                    VerifiedSubscriptionCandidate::Delivery(id, transfer_id, finite, event) => {
+                        selection.deliveries.push(id);
+                        opened.push((id, transfer_id, finite, event));
+                    }
+                    VerifiedSubscriptionCandidate::NotSelected => {
+                        return Err(ApplicationError::new(
+                            ApplicationErrorKind::Integrity,
+                            "poll",
+                        ));
+                    }
                 }
             }
-        }
-        for candidate in plan.scanned_candidates() {
-            match self.verify_subscription_candidate(&spec, candidate.clone())? {
-                VerifiedSubscriptionCandidate::Delivery(id, event) => {
-                    selection.deliveries.push(id);
-                    opened.push((id, event));
+            for candidate in plan.scanned_candidates() {
+                match self.verify_subscription_candidate(&spec, candidate.clone())? {
+                    VerifiedSubscriptionCandidate::Delivery(id, transfer_id, finite, event) => {
+                        selection.deliveries.push(id);
+                        opened.push((id, transfer_id, finite, event));
+                    }
+                    VerifiedSubscriptionCandidate::Inactive(_)
+                    | VerifiedSubscriptionCandidate::NotSelected => {}
                 }
-                VerifiedSubscriptionCandidate::Inactive(_)
-                | VerifiedSubscriptionCandidate::NotSelected => {}
             }
-        }
 
-        let committed = self
-            .store
-            .commit_event_subscription_poll_with_policy(&policy, &plan, &selection)
-            .map_err(|error| application_error("poll", error.into()))?;
-        if committed.deliveries.len() != opened.len() {
-            return Err(ApplicationError::new(
-                ApplicationErrorKind::Integrity,
-                "poll",
-            ));
-        }
-        let mut deliveries = Vec::with_capacity(committed.deliveries.len());
-        for (committed, (verified_id, event)) in committed.deliveries.into_iter().zip(opened) {
-            if committed.event.semantic_id != verified_id {
+            let committed = match self
+                .store
+                .commit_event_subscription_poll_with_policy(&policy, &plan, &selection)
+            {
+                Ok(committed) => committed,
+                Err(
+                    StoreError::EventSubscriptionPlanChanged
+                    | StoreError::EventSelectorRevisionChanged
+                    | StoreError::ControlPolicyChanged
+                    | StoreError::Custody(CustodyStoreError::PolicyChanged),
+                ) => continue,
+                Err(error) => return Err(application_error("poll", error.into())),
+            };
+            if committed.deliveries.len() != opened.len() {
                 return Err(ApplicationError::new(
                     ApplicationErrorKind::Integrity,
                     "poll",
                 ));
             }
-            deliveries.push(EventDelivery {
-                event,
-                attempt: committed.attempt,
+            let mut deliveries = Vec::with_capacity(committed.deliveries.len());
+            for (committed, (verified_id, transfer_id, finite, event)) in
+                committed.deliveries.into_iter().zip(opened)
+            {
+                if committed.event.semantic_id != verified_id {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::Integrity,
+                        "poll",
+                    ));
+                }
+                if !self.transfer_is_custody_visible(transfer_id, finite, "poll")? {
+                    continue;
+                }
+                deliveries.push(EventDelivery {
+                    event: *event,
+                    attempt: committed.attempt,
+                });
+            }
+            return Ok(EventDeliveryPage {
+                deliveries,
+                has_more: committed.has_more,
             });
         }
-        Ok(EventDeliveryPage {
-            deliveries,
-            has_more: committed.has_more,
-        })
+        Err(ApplicationError::new(
+            ApplicationErrorKind::PolicyUnsettled,
+            "poll",
+        ))
     }
 
     /// Idempotently acknowledges one semantic Event delivery.
@@ -993,6 +1225,7 @@ impl SelectedEventNode {
     /// anchor is source- and content-verified, and the exact plan is required
     /// again after verification before any gap is exposed.
     pub fn gaps(&mut self, query: EventGapQuery) -> Result<EventGapPage, ApplicationError> {
+        self.maintain_custody_for("gaps")?;
         query.validate()?;
         let policy = self.current_policy("gaps")?;
         if self
@@ -1049,6 +1282,30 @@ impl SelectedEventNode {
         &mut self,
         request: EventPublishRequest,
     ) -> Result<EventPublishResult, ApplicationError> {
+        self.publish_with_options(request, EventPublishOptions::durable())
+    }
+
+    /// Durably publishes with an explicit finite or durable custody lifetime.
+    pub fn publish_with_options(
+        &mut self,
+        request: EventPublishRequest,
+        options: EventPublishOptions,
+    ) -> Result<EventPublishResult, ApplicationError> {
+        if options.ttl_ms().is_some()
+            && !request.tombstone
+            && !self.custody_clock.supports_finite_ttl()
+        {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::RequestRejected,
+                "publish",
+            ));
+        }
+        self.maintain_custody_for("publish")?;
+        let custody_sample = Some(
+            self.custody_clock
+                .sample()
+                .map_err(|error| application_error("publish", error))?,
+        );
         let EventPublishRequest {
             operation_key,
             predecessor,
@@ -1073,18 +1330,23 @@ impl SelectedEventNode {
                 topic: &topic,
                 scope: &scope,
                 priority,
+                ttl_ms: options.ttl_ms(),
+                custody_sample,
                 logical_key: &logical_key,
                 payload: &payload,
                 tombstone,
             },
         )
         .map_err(|error| application_error("publish", error))?;
+        cache_accepted_stored_event(&self.event_route_cache, &mut self.verifier, &stored)
+            .map_err(|error| application_error("publish", error))?;
         Ok(EventPublishResult {
             id: EventId::from_store(stored.semantic_id),
             publisher: stored.header.stamp.dot.publisher,
             publisher_counter: stored.header.stamp.dot.counter,
             event_sequence: event_sequence(&stored, "publish")?,
             priority: stored.header.priority,
+            ttl_ms: stored.header.ttl_ms,
             acceptance_marker: stored.acceptance_marker,
             inserted,
         })
@@ -1092,6 +1354,7 @@ impl SelectedEventNode {
 
     /// Returns one bounded marker-ordered page of active, content-verified Events.
     pub fn query(&mut self, query: EventQuery) -> Result<EventQueryPage, ApplicationError> {
+        self.maintain_custody_for("query")?;
         query.validate()?;
         let policy = self.current_policy("query")?;
         let candidates = self
@@ -1133,6 +1396,11 @@ impl SelectedEventNode {
         Ok(replication)
     }
 
+    fn maintain_custody_for(&self, operation: &'static str) -> Result<(), ApplicationError> {
+        drive_custody_maintenance(&self.store, &self.custody_clock, &[])
+            .map_err(|error| application_error(operation, error))
+    }
+
     fn verify_gap_plan(
         &mut self,
         query: &EventGapQuery,
@@ -1154,15 +1422,16 @@ impl SelectedEventNode {
 
         let mut gaps = Vec::new();
         let mut expected = query.after_sequence.checked_add(1);
-        let mut previous = query.after_sequence;
+        let mut structural_previous = query.after_sequence;
         for candidate in plan.candidates() {
             let sequence = candidate.sequence();
-            if sequence <= previous {
+            if sequence <= structural_previous {
                 return Err(ApplicationError::new(
                     ApplicationErrorKind::Integrity,
                     "gaps",
                 ));
             }
+            structural_previous = sequence;
             let stored = candidate.event();
             let route_verified = self
                 .verifier
@@ -1185,6 +1454,14 @@ impl SelectedEventNode {
                     "gaps",
                 ));
             }
+            if event_is_inactive(&self.store, &route_verified)
+                .map_err(|error| application_error("gaps", error))?
+            {
+                continue;
+            }
+            if !self.event_is_custody_visible(stored.transfer_id, &route_verified, "gaps")? {
+                continue;
+            }
             match self
                 .verifier
                 .verify_event_content(route_verified, &stored.sealed)
@@ -1201,6 +1478,13 @@ impl SelectedEventNode {
                     ));
                 }
             }
+            if !self.transfer_is_custody_visible(
+                stored.transfer_id,
+                stored.header.ttl_ms.is_some() && !stored.header.tombstone,
+                "gaps",
+            )? {
+                continue;
+            }
             if let Some(start_sequence) = expected
                 && start_sequence < sequence
             {
@@ -1213,9 +1497,8 @@ impl SelectedEventNode {
                 });
             }
             expected = sequence.checked_add(1);
-            previous = sequence;
         }
-        if previous != plan.scanned_through()
+        if structural_previous != plan.scanned_through()
             || (!plan.candidates().is_empty() && plan.scanned_through() > plan.high_water())
         {
             return Err(ApplicationError::new(
@@ -1235,6 +1518,7 @@ impl SelectedEventNode {
             .verifier
             .verify_event(&stored.sealed)
             .map_err(|error| application_error("poll", error.into()))?;
+        let finite = route_verified.ttl_ms().is_some() && !route_verified.tombstone();
         verify_stored_claim(
             &route_verified,
             stored.transfer_id,
@@ -1247,6 +1531,12 @@ impl SelectedEventNode {
         {
             return Ok(VerifiedSubscriptionCandidate::Inactive(stored.semantic_id));
         }
+        // Custody visibility is rechecked only after the exact poll-plan
+        // commit below. The store's `inactive_pending` class is reserved for
+        // epoch/revocation policy; misclassifying an expired row there would
+        // make the authenticated selection disagree forever. A finite row may
+        // therefore acquire a pending attempt, but plaintext is withheld if
+        // age reaches TTL before final exposure.
         let matches = spec.topic == stored.header.topic
             && if spec.include_descendant_scopes {
                 spec.scope.contains(&stored.header.scope)
@@ -1276,7 +1566,9 @@ impl SelectedEventNode {
         let id = stored.semantic_id;
         Ok(VerifiedSubscriptionCandidate::Delivery(
             id,
-            EventItem {
+            stored.transfer_id,
+            finite,
+            Box::new(EventItem {
                 id: EventId::from_store(id),
                 publisher: stored.header.stamp.dot.publisher,
                 publisher_counter: stored.header.stamp.dot.counter,
@@ -1284,11 +1576,12 @@ impl SelectedEventNode {
                 topic: stored.header.topic,
                 scope: stored.header.scope,
                 priority: stored.header.priority,
+                ttl_ms: stored.header.ttl_ms,
                 logical_key: stored.header.logical_key,
                 payload,
                 tombstone: stored.header.tombstone,
                 acceptance_marker: stored.acceptance_marker,
-            },
+            }),
         ))
     }
 
@@ -1320,6 +1613,7 @@ impl SelectedEventNode {
             .verifier
             .verify_event(&stored.sealed)
             .map_err(|error| application_error("query", error.into()))?;
+        let finite = route_verified.ttl_ms().is_some() && !route_verified.tombstone();
         verify_stored_claim(
             &route_verified,
             stored.transfer_id,
@@ -1333,6 +1627,9 @@ impl SelectedEventNode {
         if event_is_inactive(&self.store, &route_verified)
             .map_err(|error| application_error("query", error))?
         {
+            return Ok(None);
+        }
+        if !self.event_is_custody_visible(stored.transfer_id, &route_verified, "query")? {
             return Ok(None);
         }
         let payload = match self
@@ -1352,6 +1649,9 @@ impl SelectedEventNode {
                 ));
             }
         };
+        if !self.transfer_is_custody_visible(stored.transfer_id, finite, "query")? {
+            return Ok(None);
+        }
         Ok(Some(EventItem {
             id: EventId::from_store(stored.semantic_id),
             publisher: stored.header.stamp.dot.publisher,
@@ -1360,11 +1660,50 @@ impl SelectedEventNode {
             topic: stored.header.topic,
             scope: stored.header.scope,
             priority: stored.header.priority,
+            ttl_ms: stored.header.ttl_ms,
             logical_key: stored.header.logical_key,
             payload,
             tombstone: stored.header.tombstone,
             acceptance_marker: stored.acceptance_marker,
         }))
+    }
+
+    fn event_is_custody_visible(
+        &self,
+        transfer_id: aster_redb_store::EventTransferId,
+        event: &aster_mesh::RouteVerifiedEventEnvelope,
+        operation: &'static str,
+    ) -> Result<bool, ApplicationError> {
+        self.transfer_is_custody_visible(
+            transfer_id,
+            event.ttl_ms().is_some() && !event.tombstone(),
+            operation,
+        )
+    }
+
+    fn transfer_is_custody_visible(
+        &self,
+        transfer_id: aster_redb_store::EventTransferId,
+        finite: bool,
+        operation: &'static str,
+    ) -> Result<bool, ApplicationError> {
+        let sample = if finite {
+            if !self.custody_clock.supports_finite_ttl() {
+                return Ok(false);
+            }
+            Some(
+                self.custody_clock
+                    .sample()
+                    .map_err(|error| application_error(operation, error))?,
+            )
+        } else {
+            None
+        };
+        let status = self
+            .store
+            .custody_sender_status(CustodyObjectKey::event(transfer_id), sample)
+            .map_err(|error| application_error(operation, error.into()))?;
+        Ok(status.is_some_and(|status| status.is_sendable()))
     }
 }
 
@@ -1385,8 +1724,13 @@ fn application_error(operation: &'static str, error: NodeError) -> ApplicationEr
         }
         NodeError::SourceEnvelope(_) => ApplicationErrorKind::Integrity,
         NodeError::Store(error) => store_error_kind(&error),
+        NodeError::EmissionPolicyChanged => ApplicationErrorKind::PolicyUnsettled,
+        NodeError::CustodySendSkipped => ApplicationErrorKind::ExpiredOrRetired,
         NodeError::Protocol(message) if message == EVENT_OPERATION_CONFLICT => {
             ApplicationErrorKind::Conflict
+        }
+        NodeError::Protocol(message) if message == EVENT_OPERATION_RETIRED => {
+            ApplicationErrorKind::ExpiredOrRetired
         }
         NodeError::Protocol(_) => ApplicationErrorKind::Integrity,
         NodeError::Identity(_)
@@ -1410,6 +1754,7 @@ pub(crate) fn runtime_application_error(
 fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
     match error {
         StoreError::Blob(error) => blob_store_error_kind(error),
+        StoreError::Custody(error) => custody_store_error_kind(error),
         StoreError::InvalidEventOperationKey { .. }
         | StoreError::InvalidStateOperationKey { .. }
         | StoreError::InvalidRecordOperationKey { .. }
@@ -1424,19 +1769,23 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         | StoreError::InvalidSemanticEvent(_)
         | StoreError::InvalidSemanticState(_)
         | StoreError::InvalidSemanticRecord(_)
+        | StoreError::MutableTransferCursorPeerLimitExceeded { .. }
         | StoreError::AuthenticatedCustodyAgeRequired => ApplicationErrorKind::InvalidRequest,
         StoreError::EventPublisherRevoked(_)
         | StoreError::StatePublisherRevoked(_)
         | StoreError::RecordPublisherRevoked(_)
         | StoreError::EventKeyEpochStale { .. }
+        | StoreError::EventKeyEpochNotActive { .. }
         | StoreError::StateKeyEpochStale { .. }
         | StoreError::StateKeyEpochNotActive { .. }
         | StoreError::RecordKeyEpochStale { .. }
         | StoreError::RecordKeyEpochNotActive { .. }
         | StoreError::MissionAuthorityMismatch { .. }
         | StoreError::ControlSignerRevoked(_)
-        | StoreError::ControlAuthorityRevoked(_) => ApplicationErrorKind::UnauthorizedOrRevoked,
+        | StoreError::ControlAuthorityRevoked(_)
+        | StoreError::ControlRecipientRevoked(_) => ApplicationErrorKind::UnauthorizedOrRevoked,
         StoreError::ControlPolicyUnsettled { .. }
+        | StoreError::ControlRecipientMetadataMigrationRequired { .. }
         | StoreError::ControlPolicyChanged
         | StoreError::ReservationChanged
         | StoreError::StateReservationChanged
@@ -1454,21 +1803,27 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         | StoreError::MissingReactionPredecessor { .. }
         | StoreError::ReactionContextMissing { .. }
         | StoreError::OperationPredecessorMismatch
+        | StoreError::EventOperationConflict
         | StoreError::StateOperationConflict
         | StoreError::RecordOperationConflict
         | StoreError::RecordConflictRequiresResolution
         | StoreError::RecordProjectionPlanChanged
         | StoreError::EventSubscriptionConflict => ApplicationErrorKind::Conflict,
         StoreError::ItemLimitExceeded { .. }
+        | StoreError::EventOperationLimitExceeded { .. }
+        | StoreError::EventOperationByteLimitExceeded { .. }
         | StoreError::StateProjectionLimitExceeded { .. }
+        | StoreError::StateCausalFrontierLimitExceeded { .. }
         | StoreError::StateOperationLimitExceeded { .. }
         | StoreError::StateOperationByteLimitExceeded { .. }
         | StoreError::RecordProjectionLimitExceeded { .. }
+        | StoreError::RecordCausalFrontierLimitExceeded { .. }
         | StoreError::RecordOperationLimitExceeded { .. }
         | StoreError::RecordOperationByteLimitExceeded { .. }
         | StoreError::EventSubscriptionLimitExceeded { .. }
         | StoreError::EventPendingDeliveryLimitExceeded { .. }
         | StoreError::EventAcknowledgementReceiptLimitExceeded { .. }
+        | StoreError::EventDeliveryLedgerLimitExceeded { .. }
         | StoreError::EventDeliveryAttemptExhausted
         | StoreError::PayloadByteLimitExceeded { .. }
         | StoreError::AcceptanceMarkerExhausted
@@ -1477,6 +1832,7 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         | StoreError::RouteCacheItemLimitExceeded { .. }
         | StoreError::RouteCacheByteLimitExceeded { .. }
         | StoreError::RouteCacheSemanticRepresentationLimit { .. }
+        | StoreError::MutableTransferCursorLimitExceeded { .. }
         | StoreError::ControlItemLimitExceeded { .. }
         | StoreError::ControlByteLimitExceeded { .. }
         | StoreError::ControlSequenceExhausted => ApplicationErrorKind::ResourceLimit,
@@ -1510,6 +1866,7 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         | StoreError::ControlPublicationIntentUnknown { .. }
         | StoreError::ControlPublicationIntentConflict { .. }
         | StoreError::TransferNamespaceCollision { .. }
+        | StoreError::MutableTransferCursorInvariant(_)
         | StoreError::ZeroizationInvariant(_)
         | StoreError::InvalidZeroizationDescriptor { .. }
         | StoreError::ZeroizationIntentConflict
@@ -1517,29 +1874,80 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
     }
 }
 
+fn custody_store_error_kind(error: &CustodyStoreError) -> ApplicationErrorKind {
+    match error {
+        CustodyStoreError::InvalidQuota
+        | CustodyStoreError::InvalidAdmission(_)
+        | CustodyStoreError::PageLimitExceeded { .. } => ApplicationErrorKind::InvalidRequest,
+        CustodyStoreError::ContinuityUnavailable
+        | CustodyStoreError::ContinuityLost
+        | CustodyStoreError::Expired
+        | CustodyStoreError::AlreadyRetired
+        | CustodyStoreError::Retiring
+        | CustodyStoreError::Protected => ApplicationErrorKind::RequestRejected,
+        CustodyStoreError::RetryNotDue { .. } => ApplicationErrorKind::RequestRejected,
+        CustodyStoreError::PolicyChanged | CustodyStoreError::ItemChanged => {
+            ApplicationErrorKind::PolicyUnsettled
+        }
+        CustodyStoreError::LeaseLimitExceeded { .. }
+        | CustodyStoreError::ReceiptLimitExceeded { .. }
+        | CustodyStoreError::RetryLimitExceeded { .. }
+        | CustodyStoreError::RetirementLimitExceeded { .. }
+        | CustodyStoreError::QuotaLimitExceeded { .. }
+        | CustodyStoreError::ItemQuotaExceeded { .. }
+        | CustodyStoreError::ByteQuotaExceeded { .. } => ApplicationErrorKind::ResourceLimit,
+        CustodyStoreError::MissionNotBound
+        | CustodyStoreError::MissionMismatch
+        | CustodyStoreError::ItemNotFound
+        | CustodyStoreError::LeaseNotFound => ApplicationErrorKind::StateUnavailable,
+        CustodyStoreError::AgeOverflow
+        | CustodyStoreError::CounterOverflow
+        | CustodyStoreError::UnsupportedRetirementClass(_)
+        | CustodyStoreError::Invariant(_) => ApplicationErrorKind::Integrity,
+    }
+}
+
 fn blob_store_error_kind(error: &BlobStoreError) -> ApplicationErrorKind {
     match error {
         BlobStoreError::InvalidDepotLimits
         | BlobStoreError::InvalidOperationKey { .. }
-        | BlobStoreError::InvalidPublication(_) => ApplicationErrorKind::InvalidRequest,
+        | BlobStoreError::InvalidPublication(_)
+        | BlobStoreError::InvalidCarrierObjectId
+        | BlobStoreError::InvalidCarrierRange(_)
+        | BlobStoreError::CarrierCursorPeerLimitExceeded { .. } => {
+            ApplicationErrorKind::InvalidRequest
+        }
         BlobStoreError::PublisherRevoked(_)
         | BlobStoreError::KeyEpochStale { .. }
         | BlobStoreError::KeyEpochNotActive { .. } => ApplicationErrorKind::UnauthorizedOrRevoked,
-        BlobStoreError::ReservationChanged | BlobStoreError::ReadPlanChanged => {
-            ApplicationErrorKind::PolicyUnsettled
-        }
-        BlobStoreError::OperationConflict => ApplicationErrorKind::Conflict,
+        BlobStoreError::ReservationChanged
+        | BlobStoreError::ReadPlanChanged
+        | BlobStoreError::PhysicalLineageMigrationRequired => ApplicationErrorKind::PolicyUnsettled,
+        BlobStoreError::OperationConflict
+        | BlobStoreError::PendingSourceConflict
+        | BlobStoreError::CarrierPrefixConflict
+        | BlobStoreError::PhysicalLineageConflict => ApplicationErrorKind::Conflict,
         BlobStoreError::PublicationLimitExceeded { .. }
+        | BlobStoreError::CausalFrontierLimitExceeded { .. }
         | BlobStoreError::OperationLimitExceeded { .. }
         | BlobStoreError::OperationByteLimitExceeded { .. }
         | BlobStoreError::DepotByteLimitExceeded { .. }
         | BlobStoreError::DepotChunkLimitExceeded { .. }
-        | BlobStoreError::DepotVariantLimitExceeded { .. } => ApplicationErrorKind::ResourceLimit,
-        BlobStoreError::Io(_) => ApplicationErrorKind::StateUnavailable,
+        | BlobStoreError::DepotVariantLimitExceeded { .. }
+        | BlobStoreError::NetworkSourceTooLarge { .. }
+        | BlobStoreError::NetworkBlobTooLarge { .. }
+        | BlobStoreError::NetworkStagingRowLimitExceeded { .. }
+        | BlobStoreError::NetworkStagingByteLimitExceeded { .. } => {
+            ApplicationErrorKind::ResourceLimit
+        }
+        BlobStoreError::PendingSourceMissing | BlobStoreError::Io(_) => {
+            ApplicationErrorKind::StateUnavailable
+        }
         BlobStoreError::Verification(_)
         | BlobStoreError::SchemaInvariant(_)
         | BlobStoreError::DepotIntegrity(_)
-        | BlobStoreError::CompletionMismatch => ApplicationErrorKind::Integrity,
+        | BlobStoreError::CompletionMismatch
+        | BlobStoreError::CarrierCursorInvariant(_) => ApplicationErrorKind::Integrity,
     }
 }
 
@@ -1551,11 +1959,51 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    use aster_mesh::{ProvisioningAccess, ReferenceProvisioner};
+    use aster_mesh::{
+        ProvisioningAccess, ProvisioningLoadReceipt, ProvisioningProtectionError,
+        ProvisioningSecretStoreError, ReferenceProvisioner, UnprotectedProvisioning,
+    };
+    use redb::{ReadableDatabase as _, ReadableTable as _};
 
     use super::*;
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn mutable_cursor_and_frontier_store_errors_have_narrow_application_kinds() {
+        for error in [
+            StoreError::StateCausalFrontierLimitExceeded {
+                current: 4_096,
+                limit: 4_096,
+            },
+            StoreError::RecordCausalFrontierLimitExceeded {
+                current: 4_096,
+                limit: 4_096,
+            },
+            StoreError::MutableTransferCursorLimitExceeded {
+                current: 1_024,
+                limit: 1_024,
+            },
+        ] {
+            assert_eq!(
+                store_error_kind(&error),
+                ApplicationErrorKind::ResourceLimit
+            );
+        }
+        assert_eq!(
+            store_error_kind(&StoreError::MutableTransferCursorPeerLimitExceeded {
+                requested: 257,
+                limit: 256,
+            }),
+            ApplicationErrorKind::InvalidRequest
+        );
+        assert_eq!(
+            store_error_kind(&StoreError::MutableTransferCursorInvariant(
+                "test integrity"
+            )),
+            ApplicationErrorKind::Integrity
+        );
+    }
 
     struct TestRoot(PathBuf);
 
@@ -1581,18 +2029,188 @@ mod tests {
         }
     }
 
-    fn selected_node(root: &TestRoot) -> SelectedEventNode {
+    struct CountingUnprotector {
+        calls: usize,
+        plaintext: Option<Vec<u8>>,
+        reject: bool,
+    }
+
+    impl CountingUnprotector {
+        fn accepting(plaintext: Vec<u8>) -> Self {
+            Self {
+                calls: 0,
+                plaintext: Some(plaintext),
+                reject: false,
+            }
+        }
+
+        fn rejecting() -> Self {
+            Self {
+                calls: 0,
+                plaintext: None,
+                reject: true,
+            }
+        }
+    }
+
+    impl ProvisioningUnprotector for CountingUnprotector {
+        fn unprotect(
+            &mut self,
+            _protected: &[u8],
+            _maximum_plaintext_len: usize,
+        ) -> Result<UnprotectedProvisioning, ProvisioningProtectionError> {
+            self.calls += 1;
+            if self.reject {
+                return Err(ProvisioningProtectionError::Rejected);
+            }
+            UnprotectedProvisioning::new(
+                self.plaintext
+                    .take()
+                    .ok_or(ProvisioningProtectionError::Unavailable)?,
+            )
+        }
+    }
+
+    struct CountingSecretLoader {
+        calls: usize,
+        expected_operation: ProvisioningLoadId,
+        expected_ref: ProvisioningSecretRef,
+        returned_operation: ProvisioningLoadId,
+        returned_ref: ProvisioningSecretRef,
+        plaintext: Option<Vec<u8>>,
+    }
+
+    impl ProvisioningSecretLoader for CountingSecretLoader {
+        fn load(
+            &mut self,
+            operation: ProvisioningLoadId,
+            secret_ref: &ProvisioningSecretRef,
+        ) -> Result<ProvisioningLoadReceipt, ProvisioningSecretStoreError> {
+            self.calls += 1;
+            assert_eq!(operation, self.expected_operation);
+            assert_eq!(secret_ref, &self.expected_ref);
+            let plaintext = UnprotectedProvisioning::new(
+                self.plaintext
+                    .take()
+                    .ok_or(ProvisioningSecretStoreError::Unavailable)?,
+            )
+            .map_err(|_| ProvisioningSecretStoreError::Rejected)?;
+            Ok(ProvisioningLoadReceipt::new(
+                self.returned_operation,
+                self.returned_ref.clone(),
+                plaintext,
+            ))
+        }
+    }
+
+    struct ChdirUnprotector {
+        calls: usize,
+        destination: PathBuf,
+        expected_protected: Vec<u8>,
+        plaintext: Option<Vec<u8>>,
+    }
+
+    impl ProvisioningUnprotector for ChdirUnprotector {
+        fn unprotect(
+            &mut self,
+            protected: &[u8],
+            _maximum_plaintext_len: usize,
+        ) -> Result<UnprotectedProvisioning, ProvisioningProtectionError> {
+            self.calls += 1;
+            assert_eq!(protected, self.expected_protected);
+            std::env::set_current_dir(&self.destination)
+                .expect("provider changes the process current directory");
+            UnprotectedProvisioning::new(
+                self.plaintext
+                    .take()
+                    .ok_or(ProvisioningProtectionError::Unavailable)?,
+            )
+        }
+    }
+
+    struct ChdirPath {
+        destination: PathBuf,
+        relative: PathBuf,
+    }
+
+    impl AsRef<Path> for ChdirPath {
+        fn as_ref(&self) -> &Path {
+            std::env::set_current_dir(&self.destination)
+                .expect("path callback changes the process current directory");
+            &self.relative
+        }
+    }
+
+    struct ChdirSecretLoader {
+        calls: usize,
+        destination: PathBuf,
+        expected_operation: ProvisioningLoadId,
+        expected_ref: ProvisioningSecretRef,
+        plaintext: Option<Vec<u8>>,
+    }
+
+    impl ProvisioningSecretLoader for ChdirSecretLoader {
+        fn load(
+            &mut self,
+            operation: ProvisioningLoadId,
+            secret_ref: &ProvisioningSecretRef,
+        ) -> Result<ProvisioningLoadReceipt, ProvisioningSecretStoreError> {
+            self.calls += 1;
+            assert_eq!(operation, self.expected_operation);
+            assert_eq!(secret_ref, &self.expected_ref);
+            std::env::set_current_dir(&self.destination)
+                .expect("secret loader changes the process current directory");
+            let plaintext = UnprotectedProvisioning::new(
+                self.plaintext
+                    .take()
+                    .ok_or(ProvisioningSecretStoreError::Unavailable)?,
+            )
+            .map_err(|_| ProvisioningSecretStoreError::Rejected)?;
+            Ok(ProvisioningLoadReceipt::new(
+                operation,
+                secret_ref.clone(),
+                plaintext,
+            ))
+        }
+    }
+
+    fn run_isolated_cwd_test(test_name: &str, body: impl FnOnce()) {
+        const CHILD_ENV: &str = "ASTER_SELECTED_EVENT_CWD_TEST_CHILD";
+        if std::env::var_os(CHILD_ENV).as_deref() == Some(std::ffi::OsStr::new(test_name)) {
+            body();
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .arg(test_name)
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(CHILD_ENV, test_name)
+            .output()
+            .expect("run isolated current-directory regression child");
+        assert!(
+            output.status.success(),
+            "isolated current-directory regression failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    fn selected_mission_bytes(seed: [u8; 32]) -> Vec<u8> {
         let scope = Scope::new("mission/apps").expect("scope");
         let alpha = Topic::new("ops.alpha").expect("topic");
         let beta = Topic::new("ops.beta").expect("topic");
         let access =
             ProvisioningAccess::member(scope, vec![1], vec![alpha, beta]).expect("member access");
-        let mut provisioner = ReferenceProvisioner::from_seed([0x5a; 32]).expect("provisioner");
-        let bytes = provisioner
+        let mut provisioner = ReferenceProvisioner::from_seed(seed).expect("provisioner");
+        provisioner
             .issue_node(1, &[access])
             .expect("issue node")
             .to_bytes()
-            .expect("encode mission");
+            .expect("encode mission")
+    }
+
+    fn selected_node(root: &TestRoot) -> SelectedEventNode {
+        let bytes = selected_mission_bytes([0x5a; 32]);
         let mission_path = root.path().join("mission.unprotected-reference.bundle");
         drop(
             UnprotectedReferenceMission::persist(&mission_path, bytes)
@@ -1600,6 +2218,281 @@ mod tests {
         );
         SelectedEventNode::open_unprotected_reference(root.path(), &mission_path)
             .expect("open selected Event node")
+    }
+
+    #[test]
+    fn relative_paths_remain_bound_across_path_provider_and_loader_cwd_changes() {
+        run_isolated_cwd_test(
+            "application::tests::relative_paths_remain_bound_across_path_provider_and_loader_cwd_changes",
+            || {
+                let original_cwd = std::env::current_dir().expect("original current directory");
+                let root = TestRoot::new("relative-state-cwd-binding");
+                let origin = root.path().join("origin");
+                let callback_cwd = root.path().join("callback-cwd");
+                fs::create_dir_all(&origin).expect("create original current directory");
+                fs::create_dir_all(&callback_cwd).expect("create callback current directory");
+                std::env::set_current_dir(&origin).expect("select original current directory");
+                let bound_origin =
+                    std::env::current_dir().expect("resolved original current directory");
+
+                let mission_name = Path::new("mission.unprotected-reference.bundle");
+                let origin_mission = selected_mission_bytes([0x6a; 32]);
+                let expected_identity =
+                    UnprotectedReferenceMission::from_bytes(origin_mission.clone())
+                        .expect("parse original mission fixture")
+                        .identity();
+                drop(
+                    UnprotectedReferenceMission::persist(
+                        bound_origin.join(mission_name),
+                        origin_mission,
+                    )
+                    .expect("persist original mission fixture"),
+                );
+                drop(
+                    UnprotectedReferenceMission::persist(
+                        callback_cwd.join(mission_name),
+                        selected_mission_bytes([0x6b; 32]),
+                    )
+                    .expect("persist decoy mission fixture"),
+                );
+                let mission = ChdirPath {
+                    destination: callback_cwd.clone(),
+                    relative: mission_name.to_path_buf(),
+                };
+                let unprotected_state = Path::new("unprotected-relative-state");
+                let node =
+                    SelectedEventNode::open_unprotected_reference(unprotected_state, &mission)
+                        .expect("open Event node after mission-path cwd change");
+                assert_eq!(node.identity(), expected_identity);
+                assert!(
+                    bound_origin
+                        .join(unprotected_state)
+                        .join(STORE_FILE)
+                        .is_file()
+                );
+                assert!(!callback_cwd.join(unprotected_state).exists());
+                drop(node);
+
+                std::env::set_current_dir(&origin)
+                    .expect("restore origin before protected-path case");
+
+                let protected_name = Path::new("mission.protected");
+                let origin_protected = b"origin-provider-authenticated-envelope";
+                fs::write(bound_origin.join(protected_name), origin_protected)
+                    .expect("write original protected mission fixture");
+                fs::write(
+                    callback_cwd.join(protected_name),
+                    b"decoy-provider-authenticated-envelope",
+                )
+                .expect("write decoy protected mission fixture");
+                let protected = ChdirPath {
+                    destination: callback_cwd.clone(),
+                    relative: protected_name.to_path_buf(),
+                };
+                let protected_state = Path::new("protected-relative-state");
+                let mut unprotector = ChdirUnprotector {
+                    calls: 0,
+                    destination: callback_cwd.clone(),
+                    expected_protected: origin_protected.to_vec(),
+                    plaintext: Some(selected_mission_bytes([0x6c; 32])),
+                };
+                let node = SelectedEventNode::open_protected(
+                    protected_state,
+                    &protected,
+                    &mut unprotector,
+                )
+                .expect("open Event node after provider cwd change");
+                assert_eq!(unprotector.calls, 1);
+                assert!(
+                    bound_origin
+                        .join(protected_state)
+                        .join(STORE_FILE)
+                        .is_file()
+                );
+                assert!(!callback_cwd.join(protected_state).exists());
+                drop(node);
+
+                std::env::set_current_dir(&origin)
+                    .expect("restore origin before secret-loader case");
+                let secret_state = Path::new("secret-relative-state");
+                let operation = ProvisioningLoadId::new([0x6d; 32]);
+                let secret_ref =
+                    ProvisioningSecretRef::from_opaque(b"cwd-bound-secret-ref".to_vec())
+                        .expect("secret reference");
+                let mut loader = ChdirSecretLoader {
+                    calls: 0,
+                    destination: callback_cwd.clone(),
+                    expected_operation: operation,
+                    expected_ref: secret_ref.clone(),
+                    plaintext: Some(selected_mission_bytes([0x6e; 32])),
+                };
+                let node = SelectedEventNode::open_secret_ref(
+                    secret_state,
+                    &secret_ref,
+                    operation,
+                    &mut loader,
+                )
+                .expect("open Event node after secret-loader cwd change");
+                assert_eq!(loader.calls, 1);
+                assert!(bound_origin.join(secret_state).join(STORE_FILE).is_file());
+                assert!(!callback_cwd.join(secret_state).exists());
+                drop(node);
+
+                std::env::set_current_dir(original_cwd)
+                    .expect("restore process current directory after regression");
+            },
+        );
+    }
+
+    #[test]
+    fn protected_bytes_open_calls_provider_once_and_raw_input_never_falls_back() {
+        let root = TestRoot::new("protected-bytes-open");
+        let bytes = selected_mission_bytes([0x61; 32]);
+        let expected =
+            UnprotectedReferenceMission::from_bytes(bytes.clone()).expect("parse expected mission");
+
+        let protected_state = root.path().join("protected-state");
+        let mut unprotector = CountingUnprotector::accepting(bytes.clone());
+        let node = SelectedEventNode::from_protected_bytes(
+            &protected_state,
+            b"provider-authenticated-envelope",
+            &mut unprotector,
+        )
+        .expect("open protected selected Event node");
+        assert_eq!(unprotector.calls, 1);
+        assert_eq!(node.identity(), expected.identity());
+        assert!(protected_state.join(STORE_FILE).is_file());
+        drop(node);
+
+        let raw_state = root.path().join("raw-fallback-state");
+        let mut no_fallback = CountingUnprotector::accepting(bytes.clone());
+        let Err(error) =
+            SelectedEventNode::from_protected_bytes(&raw_state, &bytes, &mut no_fallback)
+        else {
+            panic!("raw provisioning bytes must not open through the protected API");
+        };
+        assert_eq!(error.kind(), ApplicationErrorKind::Provisioning);
+        assert_eq!(no_fallback.calls, 0);
+        assert!(!raw_state.exists());
+    }
+
+    #[test]
+    fn protected_file_provider_failure_does_not_create_selected_state() {
+        let root = TestRoot::new("protected-file-rejection");
+        let protected = root.path().join("mission.protected");
+        fs::write(&protected, b"provider-authenticated-envelope").expect("write protected fixture");
+        let state = root.path().join("rejected-state");
+        let mut unprotector = CountingUnprotector::rejecting();
+
+        let Err(error) = SelectedEventNode::open_protected(&state, &protected, &mut unprotector)
+        else {
+            panic!("rejecting provider must fail selected open");
+        };
+        assert_eq!(error.kind(), ApplicationErrorKind::Provisioning);
+        assert_eq!(unprotector.calls, 1);
+        assert!(!state.exists());
+    }
+
+    #[test]
+    fn secret_ref_open_requires_exact_receipt_and_rejection_creates_no_state() {
+        let root = TestRoot::new("secret-ref-open");
+        let bytes = selected_mission_bytes([0x63; 32]);
+        let expected =
+            UnprotectedReferenceMission::from_bytes(bytes.clone()).expect("parse expected mission");
+        let operation = ProvisioningLoadId::new([0x64; 32]);
+        let secret_ref = ProvisioningSecretRef::from_opaque(b"selected-secret-ref".to_vec())
+            .expect("secret ref");
+        let mut exact = CountingSecretLoader {
+            calls: 0,
+            expected_operation: operation,
+            expected_ref: secret_ref.clone(),
+            returned_operation: operation,
+            returned_ref: secret_ref.clone(),
+            plaintext: Some(bytes.clone()),
+        };
+        let state = root.path().join("secret-ref-state");
+        let node = SelectedEventNode::open_secret_ref(&state, &secret_ref, operation, &mut exact)
+            .expect("open exact secret reference");
+        assert_eq!(exact.calls, 1);
+        assert_eq!(node.identity(), expected.identity());
+        assert_eq!(node.mission.persistent_secret_ref(), Some(&secret_ref));
+        assert!(state.join(STORE_FILE).is_file());
+        drop(node);
+
+        let rejected_state = root.path().join("rejected-secret-ref-state");
+        let other_ref = ProvisioningSecretRef::from_opaque(b"mismatched-secret-ref".to_vec())
+            .expect("other secret ref");
+        let mut mismatched = CountingSecretLoader {
+            calls: 0,
+            expected_operation: operation,
+            expected_ref: secret_ref.clone(),
+            returned_operation: ProvisioningLoadId::new([0x65; 32]),
+            returned_ref: other_ref,
+            plaintext: Some(bytes),
+        };
+        let Err(error) = SelectedEventNode::open_secret_ref(
+            &rejected_state,
+            &secret_ref,
+            operation,
+            &mut mismatched,
+        ) else {
+            panic!("mismatched persistent-secret receipt must be rejected");
+        };
+        assert_eq!(error.kind(), ApplicationErrorKind::Provisioning);
+        assert_eq!(mismatched.calls, 1);
+        assert!(!rejected_state.exists());
+    }
+
+    #[test]
+    fn terminal_state_precedes_protected_file_and_provider_access() {
+        let root = TestRoot::new("protected-terminal-preflight");
+        let bytes = selected_mission_bytes([0x62; 32]);
+        let mission =
+            UnprotectedReferenceMission::from_bytes(bytes.clone()).expect("parse terminal mission");
+        let state = root.path().join("terminal-state");
+        fs::create_dir(&state).expect("create terminal state");
+        let mut store =
+            Store::open_for_mission(state.join(STORE_FILE), mission.mission_authority_id())
+                .expect("open terminal store");
+        let intent = aster_redb_store::ZeroizationIntent::new(
+            b"mission-artifact".to_vec(),
+            b"carrier-identity".to_vec(),
+        )
+        .expect("zeroization intent");
+        store
+            .begin_zeroization(&intent)
+            .expect("enter terminal state");
+        drop(store);
+
+        let missing_protected = root.path().join("must-not-be-read.protected");
+        let mut unprotector = CountingUnprotector::accepting(bytes);
+        let Err(error) =
+            SelectedEventNode::open_protected(&state, &missing_protected, &mut unprotector)
+        else {
+            panic!("terminal state must reject selected protected open");
+        };
+        assert_eq!(error.kind(), ApplicationErrorKind::StateUnavailable);
+        assert_eq!(unprotector.calls, 0);
+        assert!(!missing_protected.exists());
+
+        let operation = ProvisioningLoadId::new([0x66; 32]);
+        let secret_ref = ProvisioningSecretRef::from_opaque(b"terminal-secret-ref".to_vec())
+            .expect("terminal secret ref");
+        let mut loader = CountingSecretLoader {
+            calls: 0,
+            expected_operation: operation,
+            expected_ref: secret_ref.clone(),
+            returned_operation: operation,
+            returned_ref: secret_ref.clone(),
+            plaintext: Some(selected_mission_bytes([0x62; 32])),
+        };
+        let Err(error) =
+            SelectedEventNode::open_secret_ref(&state, &secret_ref, operation, &mut loader)
+        else {
+            panic!("terminal state must reject selected secret-reference open");
+        };
+        assert_eq!(error.kind(), ApplicationErrorKind::StateUnavailable);
+        assert_eq!(loader.calls, 0);
     }
 
     fn request(operation: &[u8], topic: &str, key: &[u8], payload: &[u8]) -> EventPublishRequest {
@@ -1675,6 +2568,167 @@ mod tests {
         assert_eq!(all.items.len(), 2);
         assert_eq!(all.scanned_through, 2);
         assert!(!all.has_more);
+    }
+
+    #[test]
+    fn finite_event_crossing_ttl_during_final_query_and_poll_recheck_is_withheld() {
+        let query_root = TestRoot::new("finite-final-query-recheck");
+        let mut node = selected_node(&query_root);
+        let clock_id = [0x9a; 16];
+        node.custody_clock = NodeCustodyClock::injected(clock_id, 0, 0);
+        let published = node
+            .publish_with_options(
+                request(b"ops/finite", "ops.alpha", b"asset-ttl", b"brief"),
+                EventPublishOptions::finite_ttl_ms(10).expect("positive TTL"),
+            )
+            .expect("publish finite Event");
+
+        // The initial source/age check observes TTL-1. Content verification is
+        // followed by the final sample at exactly TTL, which must not escape.
+        node.custody_clock = NodeCustodyClock::injected(clock_id, 8, 1);
+        let queried = node.query(EventQuery::default()).expect("finite query");
+        assert!(queried.items.is_empty());
+
+        // Use an independent durable clock history to exercise the same
+        // boundary after the poll-plan commit without ever rewinding a
+        // continuity domain. The pending attempt may remain, but plaintext at
+        // age == TTL must not be returned.
+        let poll_root = TestRoot::new("finite-final-poll-recheck");
+        let mut poll_node = selected_node(&poll_root);
+        let poll_clock_id = [0x9b; 16];
+        poll_node.custody_clock = NodeCustodyClock::injected(poll_clock_id, 0, 0);
+        poll_node
+            .publish_with_options(
+                request(b"ops/finite", "ops.alpha", b"asset-ttl", b"brief"),
+                EventPublishOptions::finite_ttl_ms(10).expect("positive TTL"),
+            )
+            .expect("publish finite poll Event");
+        let subscription = poll_node
+            .subscribe(subscription_request(b"subscriptions/finite", "ops.alpha"))
+            .expect("subscribe finite Event");
+        poll_node.custody_clock = NodeCustodyClock::injected(poll_clock_id, 9, 1);
+        let polled = poll_node
+            .poll(EventPollRequest {
+                subscription: subscription.id,
+                delivery_limit: 8,
+                scan_limit: 8,
+            })
+            .expect("finite poll");
+        assert!(polled.deliveries.is_empty());
+        assert_eq!(published.event_sequence, 1);
+    }
+
+    #[test]
+    fn finite_retirement_waits_for_lease_and_operation_fence_survives_reopen() {
+        let root = TestRoot::new("finite-retirement-fence");
+        let clock_id = [0x8b; 16];
+        let publication = request(
+            b"ops/finite-retired",
+            "ops.alpha",
+            b"asset-retired",
+            b"short-lived",
+        );
+        let options = EventPublishOptions::finite_ttl_ms(10).expect("positive TTL");
+        {
+            let mut node = selected_node(&root);
+            node.custody_clock = NodeCustodyClock::injected(clock_id, 0, 0);
+            node.publish_with_options(publication.clone(), options)
+                .expect("publish finite Event");
+            let operation =
+                EventOperationKey::new(publication.operation_key.clone()).expect("operation key");
+            let aster_redb_store::EventOperationResolution::Live(stored) = node
+                .store
+                .event_operation_resolution(&operation)
+                .expect("resolve operation")
+                .expect("operation exists")
+            else {
+                panic!("fresh finite operation is not live");
+            };
+            let revision = node
+                .store
+                .custody_policy_revision()
+                .expect("custody revision");
+            let lease = node
+                .store
+                .begin_custody_send(
+                    [0x37; 32],
+                    CustodyObjectKey::event(stored.transfer_id),
+                    aster_redb_store::CustodyPeerSelectorRevision::new(0),
+                    Some(CustodySample {
+                        clock_id,
+                        tick_ms: 9,
+                    }),
+                    0,
+                    revision,
+                )
+                .expect("hold transfer lease");
+
+            node.custody_clock = NodeCustodyClock::injected(clock_id, 10, 0);
+            node.maintain_custody().expect("mark expired custody");
+            let held = node.store.event_stats().expect("leased Event stats");
+            assert_eq!(held.events, 1, "active lease must retain the source row");
+            assert_eq!(
+                held.retiring_events, 1,
+                "active lease must leave the expired source marked retiring"
+            );
+            assert!(
+                held.total_sealed_bytes > 0,
+                "active lease must delay physical byte retirement"
+            );
+            assert!(
+                node.query(EventQuery::default())
+                    .expect("expired query")
+                    .items
+                    .is_empty(),
+                "expired bytes held by a lease must remain application-invisible"
+            );
+
+            node.store
+                .release_transfer_lease(lease.id)
+                .expect("release held lease");
+            node.maintain_custody().expect("finalize retirement");
+            let retired = node.store.event_stats().expect("retired Event stats");
+            assert_eq!(retired.events, 0);
+            assert_eq!(retired.retiring_events, 0);
+            assert_eq!(retired.total_sealed_bytes, 0);
+            assert!(
+                node.store
+                    .get_transfer(stored.transfer_id)
+                    .expect("retired transfer lookup")
+                    .is_none()
+            );
+        }
+
+        let mut reopened = SelectedEventNode::open_unprotected_reference(
+            root.path(),
+            root.path().join("mission.unprotected-reference.bundle"),
+        )
+        .expect("reopen retired node");
+        reopened.custody_clock = NodeCustodyClock::injected(clock_id, 11, 0);
+        let exact = reopened
+            .publish_with_options(publication.clone(), options)
+            .expect_err("exact retired retry must remain fenced");
+        assert_eq!(exact.kind(), ApplicationErrorKind::ExpiredOrRetired);
+
+        let mut changed = publication;
+        changed.payload = b"changed-after-retirement".to_vec();
+        let changed_error = reopened
+            .publish_with_options(changed, options)
+            .expect_err("changed retired operation must remain fenced");
+        assert_eq!(changed_error.kind(), ApplicationErrorKind::Conflict);
+
+        let next = reopened
+            .publish(request(
+                b"ops/after-retired",
+                "ops.alpha",
+                b"asset-next",
+                b"next",
+            ))
+            .expect("publish after retired retries");
+        assert_eq!(
+            next.publisher_counter, 2,
+            "retired retries must not consume a new source dot"
+        );
     }
 
     #[test]
@@ -1817,6 +2871,226 @@ mod tests {
                 .items
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn legacy_operation_binds_retained_plaintext_before_any_randomized_reseal() {
+        const EVENT_OPERATIONS: redb::TableDefinition<&[u8], &[u8]> =
+            redb::TableDefinition::new("aster.event-operations.v1");
+        const EVENT_OPERATION_WITNESSES: redb::TableDefinition<&[u8], &[u8]> =
+            redb::TableDefinition::new("aster.event-operation-witnesses.v1");
+        const METADATA: redb::TableDefinition<&str, u64> =
+            redb::TableDefinition::new("aster.metadata.v1");
+        const EVENT_OPERATION_TOTAL_BYTES: &str = "semantic_event_operation_total_bytes";
+        let root = TestRoot::new("legacy-operation-intent-upgrade");
+        let publication = request(b"ops/legacy", "ops.alpha", b"asset", b"retained");
+        let first = {
+            let mut node = selected_node(&root);
+            node.publish(publication.clone())
+                .expect("initial publication")
+        };
+
+        // Recreate the accepted v1 operation encoding: version, exact transfer
+        // ID, and absent predecessor. The v2 plaintext/intent digests are
+        // deliberately removed while the original Event bytes remain live.
+        let database = redb::Database::open(root.path().join(STORE_FILE))
+            .expect("open operation table for legacy fixture");
+        let write = database.begin_write().expect("legacy fixture write");
+        let removed_operation_bytes = {
+            let mut operations = write.open_table(EVENT_OPERATIONS).expect("operations");
+            let current = operations
+                .get(publication.operation_key.as_slice())
+                .expect("read operation")
+                .expect("operation row")
+                .value()
+                .to_vec();
+            assert_eq!(current[0], 2, "fixture starts from canonical v2");
+            assert_eq!(current[33], 0, "fixture operation has no predecessor");
+            let mut legacy = Vec::with_capacity(34);
+            legacy.push(1);
+            legacy.extend_from_slice(&current[1..34]);
+            operations
+                .insert(publication.operation_key.as_slice(), legacy.as_slice())
+                .expect("install legacy row");
+            u64::try_from(current.len() - legacy.len()).expect("fixture size difference fits u64")
+        };
+        {
+            let mut metadata = write.open_table(METADATA).expect("metadata");
+            let operation_bytes = metadata
+                .get(EVENT_OPERATION_TOTAL_BYTES)
+                .expect("read operation accounting")
+                .expect("operation accounting")
+                .value();
+            metadata
+                .insert(
+                    EVENT_OPERATION_TOTAL_BYTES,
+                    operation_bytes
+                        .checked_sub(removed_operation_bytes)
+                        .expect("legacy row is smaller"),
+                )
+                .expect("adjust operation accounting for legacy fixture");
+        }
+        write.commit().expect("commit legacy fixture");
+        drop(database);
+
+        let mut reopened = SelectedEventNode::open_unprotected_reference(
+            root.path(),
+            root.path().join("mission.unprotected-reference.bundle"),
+        )
+        .expect("reopen legacy operation");
+        let policy = reopened
+            .store
+            .control_policy_snapshot()
+            .expect("settled proactive-migration policy");
+        assert!(
+            reopened
+                .store
+                .unbound_legacy_event_operations_with_policy(&policy, None, MAX_EVENT_PAGE)
+                .expect("scan proactive legacy recovery")
+                .is_empty(),
+            "stopped-node open must bind the retained plaintext witness before replay"
+        );
+        let retried = reopened
+            .publish(publication.clone())
+            .expect("bind exact retained plaintext");
+        assert!(!retried.inserted);
+        assert_eq!(retried.id, first.id);
+        assert_eq!(retried.publisher_counter, first.publisher_counter);
+        assert_eq!(retried.event_sequence, first.event_sequence);
+        assert_eq!(
+            reopened
+                .query(EventQuery::default())
+                .expect("query one exact Event")
+                .items
+                .len(),
+            1
+        );
+        let mut changed = publication;
+        changed.payload = b"changed".to_vec();
+        assert_eq!(
+            reopened
+                .publish(changed)
+                .expect_err("changed legacy operation intent")
+                .kind(),
+            ApplicationErrorKind::Conflict
+        );
+        drop(reopened);
+
+        let database = redb::Database::open(root.path().join(STORE_FILE))
+            .expect("reopen witnessed operation table");
+        let read = database.begin_read().expect("read witnessed operation");
+        let operations = read.open_table(EVENT_OPERATIONS).expect("operations");
+        assert_eq!(
+            operations
+                .get(b"ops/legacy".as_slice())
+                .expect("read witnessed operation")
+                .expect("witnessed row")
+                .value()[0],
+            1,
+            "transfer-keyed witnesses deliberately preserve aliasable v1 operation rows"
+        );
+        let witnesses = read
+            .open_table(EVENT_OPERATION_WITNESSES)
+            .expect("operation witnesses");
+        let witness_rows = witnesses
+            .iter()
+            .expect("iterate operation witnesses")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read operation witnesses");
+        assert_eq!(witness_rows.len(), 1);
+        assert_eq!(witness_rows[0].1.value()[0], 1);
+    }
+
+    #[test]
+    fn proactive_legacy_migration_pages_past_a_full_alias_page() {
+        const EVENT_OPERATIONS: redb::TableDefinition<&[u8], &[u8]> =
+            redb::TableDefinition::new("aster.event-operations.v1");
+        const METADATA: redb::TableDefinition<&str, u64> =
+            redb::TableDefinition::new("aster.metadata.v1");
+        const EVENT_OPERATION_COUNT: &str = "semantic_event_operation_count";
+        const EVENT_OPERATION_TOTAL_BYTES: &str = "semantic_event_operation_total_bytes";
+        let root = TestRoot::new("legacy-operation-page-and-aliases");
+        let first = request(b"ops/page/0-first", "ops.alpha", b"first", b"one");
+        let second = request(b"ops/page/z-final", "ops.alpha", b"second", b"two");
+        {
+            let mut node = selected_node(&root);
+            node.publish(first.clone()).expect("publish first Event");
+            node.publish(second.clone()).expect("publish second Event");
+        }
+
+        let database = redb::Database::open(root.path().join(STORE_FILE))
+            .expect("open operation table for paged fixture");
+        let write = database.begin_write().expect("paged fixture write");
+        let (operation_count, operation_bytes) = {
+            let mut operations = write.open_table(EVENT_OPERATIONS).expect("operations");
+            let legacy_row = |key: &[u8]| {
+                let current = operations
+                    .get(key)
+                    .expect("read operation")
+                    .expect("operation row")
+                    .value()
+                    .to_vec();
+                assert_eq!(current[0], 2);
+                assert_eq!(current[33], 0);
+                let mut legacy = Vec::with_capacity(34);
+                legacy.push(1);
+                legacy.extend_from_slice(&current[1..34]);
+                legacy
+            };
+            let first_legacy = legacy_row(&first.operation_key);
+            let second_legacy = legacy_row(&second.operation_key);
+            operations
+                .insert(first.operation_key.as_slice(), first_legacy.as_slice())
+                .expect("downgrade first operation");
+            operations
+                .insert(second.operation_key.as_slice(), second_legacy.as_slice())
+                .expect("downgrade second operation");
+            for index in 0..MAX_EVENT_PAGE {
+                let alias = format!("ops/page/a{index:04}");
+                operations
+                    .insert(alias.as_bytes(), first_legacy.as_slice())
+                    .expect("insert legacy alias");
+            }
+            operations
+                .iter()
+                .expect("iterate operation fixture")
+                .try_fold((0u64, 0u64), |(count, bytes), row| {
+                    let (key, value) = row.expect("operation row");
+                    let row_bytes = u64::try_from(key.value().len() + value.value().len())
+                        .expect("operation row usage fits u64");
+                    Some((count.checked_add(1)?, bytes.checked_add(row_bytes)?))
+                })
+                .expect("operation fixture accounting fits")
+        };
+        {
+            let mut metadata = write.open_table(METADATA).expect("metadata");
+            metadata
+                .insert(EVENT_OPERATION_COUNT, operation_count)
+                .expect("replace operation count");
+            metadata
+                .insert(EVENT_OPERATION_TOTAL_BYTES, operation_bytes)
+                .expect("replace operation bytes");
+        }
+        write.commit().expect("commit paged legacy fixture");
+        drop(database);
+
+        let reopened = SelectedEventNode::open_unprotected_reference(
+            root.path(),
+            root.path().join("mission.unprotected-reference.bundle"),
+        )
+        .expect("proactively recover every legacy page");
+        let policy = reopened
+            .store
+            .control_policy_snapshot()
+            .expect("settled recovery policy");
+        assert!(
+            reopened
+                .store
+                .unbound_legacy_event_operations_with_policy(&policy, None, MAX_EVENT_PAGE)
+                .expect("scan remaining legacy operations")
+                .is_empty(),
+            "exclusive paging must reach the distinct transfer beyond a full alias page"
         );
     }
 
