@@ -34,6 +34,7 @@ understand Aster's wire format or cryptography before building an application.
 | Design a binding | [Binding pattern](bindings/pattern.md) |
 | Implement an independent compatible node | [Protocol](protocol.md), [wire grammar](wire.cddl), and [security objects](envelope.md) |
 | Assess progress, security, or production blockers | [Capability roadmap](implementation/capability-roadmap.md), [Security](security.md), [Conformance](conformance.md), and [requirements status](implementation/requirements-status.md) |
+| Review development inputs and public provenance | [Public development provenance record](provenance/independent-development-record.md) and [public source register](provenance/public-source-register.csv) |
 | Run validation or interpret evidence | [CI](ci.md), [Conformance](conformance.md), and the [lab guide](../lab/README.md) |
 
 ## Know which kind of document you are reading
@@ -82,6 +83,9 @@ boundary; [requirements status](implementation/requirements-status.md),
 - [Source requirements](../data-mesh-requirements.md) — frozen target-state
   grounding requirements; use the [capability roadmap](implementation/capability-roadmap.md)
   for delivery planning and PR review.
+- [Public development provenance record](provenance/independent-development-record.md)
+  — review path from product intent and public inputs to decisions,
+  implementation, and retained repository history.
 
 ## Contributing
 
