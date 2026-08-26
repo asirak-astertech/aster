@@ -1,83 +1,64 @@
 # Selected production-lane architecture
 
-This page depicts the bounded control/Event composition, networked State and
-Record reconciliation, and local Blob surface that execute today.
-It is intentionally narrower than Aster's complete protocol and semantic
-reference implementation. The live selected Event API provides publish,
-bounded query, durable subscribe/poll/ack, idempotent unsubscribe, authenticated
-gap inspection, and bounded peer/last-contact status through the running node's
-sole actor. The stopped Event handle provides the same data operations when no
-runtime owns the store. An exclusive stopped `SelectedStateNode` additionally
-provides source-authenticated State publication and exact-key causal projection.
-An exclusive stopped `SelectedRecordNode` preserves and annotates exact-key
-causal heads and accepts explicit application-reviewed resolution only through
-an exact sibling guard. State and Record have no live application handles, but
-their durable source objects use class-specific reconciliation frames under
-explicit receiver interests. An exclusive stopped `SelectedBlobNode` streams one
-source-authenticated immutable object through a bounded encrypted local depot
-without returning provider readers or key material. Blob likewise has no live
-handle or reconciliation frames. Automatic registered-policy Record merge,
-remote Blob chunk transfer, atomic subscription update, finite-TTL custody,
-protected operational provisioning, additional carriers, generalized control
-administration, and release authorization remain outside this selected lane.
+This page explains how the selected implementation turns Aster's concepts into
+runtime authorities and trust boundaries. It is intentionally narrower than
+the complete protocol and semantic reference implementation.
+
+| Data class | Selected networking | Application surface |
+|---|---|---|
+| Event | Direct-Iroh reconciliation | Live Rust handle, stopped Rust handle, and local ConnectRPC agent |
+| State | Class-specific direct-Iroh reconciliation | Exclusive stopped Rust handle |
+| Record | Class-specific direct-Iroh reconciliation | Exclusive stopped Rust handle |
+| Blob | Not composed | Exclusive stopped Rust handle and encrypted local depot |
+
+Read the diagrams from broadest to narrowest: application surfaces, runtime
+ownership, then the publication and contact flows for each mechanism. Exact
+evidence and remaining release gates live in
+[requirements status](implementation/requirements-status.md), not in these
+diagrams.
 
 ## Components and trust boundaries
 
+### Application surfaces
+
 ```mermaid
 flowchart LR
-    Operator["Same-UID Unix operator"]
-    Authority["Stopped authority CLI"]
-    Application["Application"]
-    LiveHandle["SelectedEventHandle<br/>publish · query · subscribe · poll · ack<br/>unsubscribe · gaps · status"]
-    StoppedEvent["Stopped SelectedEventNode<br/>same Event data operations<br/>without live status"]
-    StoppedState["Stopped SelectedStateNode<br/>publish · exact-key query<br/>current + recoverable"]
-    StoppedRecord["Stopped SelectedRecordNode<br/>publish · exact-key query · guarded resolve<br/>current + concurrent + superseded"]
-    StoppedBlob["Stopped SelectedBlobNode<br/>stream publish · verified read_into<br/>bounded encrypted depot"]
-    BuiltIns["Built-in roles<br/>Ping · Pong · relay"]
-    Artifacts["Retained mission bundle<br/>and carrier identity"]
+    App["Application"] --> Connect["ConnectRPC agent"]
+    App --> LiveRust["Live Rust handle"]
+    App --> StoppedRust["Stopped Rust handles"]
+    Connect --> LiveEvent["Event operations"]
+    LiveRust --> LiveEvent
+    LiveEvent --> Actor["Running aster-node actor"]
+    StoppedRust --> Event["Event"]
+    StoppedRust --> State["State"]
+    StoppedRust --> Record["Record"]
+    StoppedRust --> Blob["Blob"]
+    Event --> Exclusive["Exclusive store authority"]
+    State --> Exclusive
+    Record --> Exclusive
+    Blob --> Depot["Encrypted local depot"]
+    Actor --> Network["Event, State, and Record reconciliation"]
+```
 
-    subgraph Local["Selected aster-node composition"]
-        Node["aster-node<br/>ordering and lifecycle"]
-        Core["aster-core control/source providers<br/>authority · publisher · protected headers"]
-        Session["aster-core mission session<br/>four-flight hybrid authentication"]
-        Profile["aster-profile<br/>canonical exact-ID ordering"]
-        Diff["aster-negentropy<br/>set difference only"]
-        Store["aster-redb-store<br/>durable acceptance/effect authority<br/>Event delivery + State/Record + local Blob"]
-        Depot["private Blob depot<br/>bounded encrypted chunk files"]
-        Carrier["aster-iroh<br/>direct authenticated carrier"]
-    end
+The running actor and stopped handles never own the store at the same time.
+State and Record objects published through stopped handles can reconcile after
+those handles close and the actor starts. Blob remains local.
 
-    Peer["Peer aster-node<br/>independent identity and store"]
+### Runtime trust path
 
-    Application -->|"live Event mode"| LiveHandle -->|"bounded commands"| Node
-    Application -->|"stopped Event mode"| StoppedEvent
-    Application -->|"stopped State mode"| StoppedState
-    Application -->|"stopped Record mode"| StoppedRecord
-    Application -->|"stopped Blob mode"| StoppedBlob
-    Node -->|"sanitized results"| LiveHandle
-    BuiltIns -. "run inside actor" .-> Node
-    StoppedEvent -->|"exclusive stopped-node Event operations"| Store
-    Store -->|"bounded Event candidates and durable receipts"| StoppedEvent
-    StoppedEvent -->|"fresh Event source/content verification"| Core
-    StoppedState -->|"exclusive stopped-node State operations"| Store
-    Store -->|"bounded State projection plan"| StoppedState
-    StoppedState -->|"fresh State source/content verification"| Core
-    StoppedRecord -->|"exclusive stopped-node Record operations"| Store
-    Store -->|"bounded Record projection plan"| StoppedRecord
-    StoppedRecord -->|"fresh Record source/content verification"| Core
-    StoppedBlob -->|"exclusive stopped-node Blob operations"| Store
-    Store -->|"bounded Blob publication plan"| StoppedBlob
-    StoppedBlob -->|"fresh manifest/source/content verification"| Core
-    StoppedBlob -->|"bounded encrypted chunks"| Depot
-    Store -->|"exact committed-chunk markers"| Depot
-    Authority -->|"control input"| Node
-    Node -->|"uses control/source providers"| Core
-    Node -->|"uses canonical ordering"| Profile
-    Node -->|"reconciles exact-ID sets"| Diff
-    Node -->|"commits accepted Event/State/Record/control state"| Store
-    Node -->|"runs mission session"| Session --> Carrier <--> Peer
-    Operator -. "local zeroize" .-> Node
-    Artifacts -. "exact retained files" .-> Node
+```mermaid
+flowchart LR
+    API["Live Event API"] --> Node["aster-node<br/>ordering and lifecycle"]
+    Authority["Authority CLI"] --> Node
+    Operator["Same-UID Unix operator"] -. "local zeroize" .-> Node
+    Node --> Core["aster-core<br/>control and source verification"]
+    Node --> Store["redb<br/>durable policy and data authority"]
+    Store --> Depot["Encrypted Blob depot"]
+    Node --> Profile["Canonical transfer IDs"]
+    Profile --> Diff["Bounded set difference"]
+    Node --> Session["Hybrid mission session"]
+    Session --> Carrier["Direct Iroh carrier"]
+    Carrier <--> Peer["Peer aster-node"]
 ```
 
 `aster-node` is the sole composition root. `aster-iroh` authenticates only the
@@ -333,33 +314,16 @@ sequenceDiagram
     participant S as Mission-bound redb
     participant C as Contact task
 
-    A->>H: high-level Event operation
-    H->>N: bounded command + one-shot reply
-    alt subscribe or unsubscribe
-        N->>L: acquire write lease
-        N->>S: atomically update selector generation and delivery ledger
-        S-->>N: durable selector receipt
-    else publish
-        N->>L: acquire read lease
-        N->>N: validate request and source-seal Event
-        N->>S: policy-bound idempotent commit
-        S-->>N: durable publication result
-    else query, poll, or gaps
-        N->>L: acquire read lease
-        N->>S: request bounded structural candidates or plan
-        S-->>N: untrusted candidate page or plan
-        N->>N: freshly verify source; verify content for returned data
-        N->>S: recheck exact poll/gap plan when applicable
-    else acknowledge or status
-        N->>L: acquire read lease
-        N->>S: check current policy, delivery ledger, or selector snapshot
-        S-->>N: durable acknowledgement or local policy state
-    end
-    N-->>H: sanitized application result
+    A->>H: typed Event operation
+    H->>N: bounded command
+    N->>L: read lease, or write lease for selector changes
+    N->>S: policy-bound transaction or structural plan
+    S-->>N: durable result or untrusted candidates
+    N->>N: freshly verify source, content, and plan
+    N-->>H: sanitized result
     H-->>A: typed result
-
     C->>N: completed authenticated contact receipt
-    N->>N: record peer, bounded remainder, and exact contact policy
+    N->>N: update bounded local contact state
     A->>H: status()
     H->>N: status command
     N->>S: current control and selector policy
@@ -367,6 +331,12 @@ sequenceDiagram
     H-->>A: typed status
     Note over A,N: LastContactComplete is not global convergence
 ```
+
+Selector changes take the policy write lease and update the selector generation
+and delivery ledger atomically. Publish, query, poll, acknowledge, gaps, and
+status take a read lease. Candidate rows and store plans are structural input,
+not trusted application results; the actor verifies them before returning
+sanitized values.
 
 Gap results follow the same trust rule. The store prepares a bounded structural
 plan, the selected node freshly verifies every observed source position, and
@@ -384,30 +354,21 @@ sequenceDiagram
     participant P as Peer node
     participant S as redb store
 
-    L->>C: exact EndpointId + direct address
-    C->>P: authenticated carrier connection
-    L->>P: hybrid mission flights 1 and 3
-    P->>L: hybrid mission flights 2 and 4
-    Note over L,P: independently verify exact mission NodeId
+    L->>C: connect to exact endpoint and address
+    C->>P: authenticate carrier endpoint
+    L->>P: complete hybrid mission authentication
+    P-->>L: prove expected mission NodeId
     L->>P: control reconciliation query
     P->>L: source-authenticated control suffix
     L->>S: commit and activate contiguous control prefix
-    L->>S: atomically capture policy + selector generation
-    L->>P: protected canonical receive interest
-    P->>L: protected canonical receive interest
+    L->>P: exchange protected receive interests
     Note over L,P: empty interest means receive-none
-    L->>P: reconcile IDs in peer-receiver universe
-    P->>L: independently authorize peer-receiver difference
-    L->>P: offer only peer-selected, peer-routable bytes
-    P->>L: reconcile IDs in local-receiver universe
-    L->>P: independently authorize local-receiver difference
-    P->>L: local fetches only locally selected, locally routable bytes
+    L->>P: reconcile and offer inside peer's authorized universe
+    P->>L: reconcile and fetch inside local authorized universe
     alt content grant
         L->>S: verify source + admit semantic Event
-        L->>L: application reaction may run
     else route-only grant
         L->>S: retain bounded exact bytes only
-        Note over L,S: no content open or semantic Event row
     end
 ```
 

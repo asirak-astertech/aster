@@ -9,6 +9,18 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** ar
 normative. The protocol specification, not the Rust representation, is the
 interoperability authority.
 
+## Find a section
+
+| Need | Sections |
+|---|---|
+| Understand the invariants and layers | [Design invariants](#1-design-invariants) through [primitive types](#3-primitive-types-and-encoding) |
+| Implement identities and source authentication | [Identity and dots](#4-identity-dots-and-semantic-item-core) through [source authentication](#6-source-authentication) |
+| Implement causality and data-class reducers | [Causality](#7-causality) and [data class reducers](#8-data-class-reducers) |
+| Implement synchronization and resource policy | [Reconciliation](#9-exact-reconciliation-and-resumption) through [priority and emissions](#11-priority-retry-eviction-and-emissions) |
+| Implement routing, sessions, and lifecycle controls | [Scopes and bridges](#12-scopes-topics-relay-and-bridge-policy) through [revocation and zeroization](#14-revocation-rekey-and-zeroization) |
+| Add a carrier or discovery profile | [Carrier behavior](#15-carrier-fragmentation-broadcast-and-loops) and [discovery](#16-discovery-and-link-profiles) |
+| Check compatibility, errors, or bounds | [Versioning](#17-versioning-and-extensions) through [known bounds](#20-known-bounds) |
+
 ## 1. Design invariants
 
 1. A transport carries opaque frames and never defines data meaning.

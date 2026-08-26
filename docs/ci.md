@@ -5,6 +5,15 @@ commands on pushes to `main`, pull requests targeting `main`, merge queues, and
 manual dispatches. Configure branch protection or a ruleset to require the
 single stable check name **`CI / required`**.
 
+## Find a section
+
+| Need | Read |
+|---|---|
+| Understand the required GitHub checks | [Validation lanes](#validation-lanes) |
+| Interpret selected-node test evidence | [Selected composition coverage](#selected-composition-coverage) |
+| Review dependency and security caveats | [Security posture](#security-posture) |
+| Run the checks on a workstation | [Running checks locally](#running-checks-locally) |
+
 ## Validation lanes
 
 | Check | Runner | Purpose |
