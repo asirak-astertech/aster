@@ -21,3 +21,12 @@ policy excludes public-domain dependencies, `RecordStore` must be replaced by an
 admitted implementation before an MVP claim.
 
 A deployment can replace the store without changing the public API or wire.
+
+## Semantic-v5 compatibility note (2026-08-25)
+
+The retained core SQLite compatibility store advances schema 14 to 15 only by
+widening `transfer_identities.origin_semantic_version` from `1..=4` to
+`1..=5`. Its transactional migration preserves every existing v1-v4 row and
+restart provenance before admitting v5. This does not add SQLite to the normal
+selected `aster-node` graph: selected Event/State/Record/Blob storage and the
+semantic-v5 pending Blob source/carrier state remain in `aster-redb-store`.

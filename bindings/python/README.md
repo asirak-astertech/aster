@@ -13,8 +13,9 @@ library.
 `PROTOCOL_VERSION` is retained as the legacy name for replication-wire version
 `1`; new code should use `REPLICATION_WIRE_VERSION`. The separate
 `DEFAULT_SEMANTIC_VERSION` and `HIGHEST_SUPPORTED_SEMANTIC_VERSION` values are
-both `2` in this build. These process-wide constants do not report a particular
-session's negotiated result.
+both `5` in this build; authenticated sessions retain semantic versions 4, 3,
+2, and 1 for compatibility. These process-wide constants do not report a
+particular session's negotiated result.
 
 `Node` currently accepts the canonical unprotected inner provisioning bytes for
 compatibility and tests; no protected-provider binding is shipped. Raw open is

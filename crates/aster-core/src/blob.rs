@@ -16,7 +16,7 @@ use aes_gcm::{
 };
 use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::fs::{self, File, OpenOptions};
@@ -65,14 +65,61 @@ const ROUTE_TREE_MAGIC: &[u8; 8] = b"ASTRRT01";
 const ROUTE_TREE_FILE: &str = "route-tree.bin";
 const TRANSFER_FIXED_LEN: usize = 8 + 2 + 32 + 32 + 8 + 32 + 4 + 1;
 const MAX_ROUTE_PROOF_HASHES: usize = 16;
-const MAX_TRANSFER_OBJECT_BYTES: u64 =
-    (TRANSFER_FIXED_LEN + MAX_ROUTE_PROOF_HASHES * 32 + MAX_BLOB_CHUNK_SIZE as usize + GCM_TAG_LEN)
-        as u64;
+/// Exact maximum encoded size of one canonical `ASTRBT01` Blob transfer object.
+///
+/// This is a carrier bound, not a transport-frame recommendation. Ranged transports
+/// should generally select a smaller fixed payload budget and resume by the complete
+/// typed [`ObjectId`].
+pub const MAX_BLOB_TRANSFER_OBJECT_BYTES: usize =
+    TRANSFER_FIXED_LEN + MAX_ROUTE_PROOF_HASHES * 32 + MAX_BLOB_CHUNK_SIZE as usize + GCM_TAG_LEN;
 const MAX_ROUTE_TREE_BYTES: u64 =
     8 + 2 + 32 + 8 + 1 + ((MAX_ROUTE_PROOF_HASHES as u64 + 1) * 8) + (MAX_BLOB_CHUNKS * 2 * 32);
 const TRANSFER_DIRECTORY: &str = "transfer-objects";
 const MAX_STORE_SUMMARY_BYTES: u64 = 2048;
 static STORE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+const BLOB_PHYSICAL_LINEAGE_DOMAIN: &[u8] = b"aster/blob-physical-lineage/v1";
+
+/// Opaque, provider-minted identity of the exact content grant which produced
+/// one physical encrypted Blob variant.
+///
+/// `(BlobId, content group, epoch)` is insufficient when a committed rekey
+/// replaces content-key material at the same epoch. This one-way binding lets a
+/// durable adapter distinguish those physical variants without receiving key
+/// material or an algorithm handle.
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct BlobPhysicalLineage([u8; 32]);
+
+impl BlobPhysicalLineage {
+    pub(crate) fn from_content_grant(
+        mission_authority_id: NodeId,
+        scope: &Scope,
+        topic: &Topic,
+        epoch: u64,
+        epoch_seed: &[u8; 32],
+    ) -> Self {
+        let mut hasher = domain_hasher(BLOB_PHYSICAL_LINEAGE_DOMAIN);
+        hasher.update(mission_authority_id);
+        hasher.update((scope.as_str().len() as u64).to_be_bytes());
+        hasher.update(scope.as_str().as_bytes());
+        hasher.update((topic.as_str().len() as u64).to_be_bytes());
+        hasher.update(topic.as_str().as_bytes());
+        hasher.update(epoch.to_be_bytes());
+        hasher.update(epoch_seed);
+        Self(finalize_sha256(hasher))
+    }
+
+    /// Stable one-way persistence binding. This is not content-key material.
+    pub const fn binding(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for BlobPhysicalLineage {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str("BlobPhysicalLineage([PROVIDER-OWNED])")
+    }
+}
 
 /// Hard local byte and committed-chunk quotas for the concrete Blob store.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -510,6 +557,197 @@ impl BlobTransferObject {
     }
 }
 
+/// Opaque canonical identity of one source-bound Blob carrier.
+///
+/// The only public representation is the exact 33-byte typed wire form. A
+/// caller cannot turn arbitrary bytes into this type without an exact verified
+/// transfer plan.
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct BlobCarrierId(ObjectId);
+
+impl BlobCarrierId {
+    pub const WIRE_LEN: usize = ObjectId::WIRE_LEN;
+
+    /// Exact `kind=BlobChunk || digest` representation used on the wire and as
+    /// a durable peer-neutral staging key.
+    pub fn wire_bytes(self) -> [u8; Self::WIRE_LEN] {
+        self.0.to_wire_bytes()
+    }
+}
+
+impl fmt::Debug for BlobCarrierId {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str("BlobCarrierId([SOURCE-BOUND])")
+    }
+}
+
+/// Canonical carrier bytes built from one exact verified transfer plan and a
+/// matching durable encrypted chunk.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BuiltBlobTransferObject {
+    object_id: BlobCarrierId,
+    bytes: Vec<u8>,
+}
+
+impl BuiltBlobTransferObject {
+    pub const fn object_id(&self) -> BlobCarrierId {
+        self.object_id
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+/// One complete carrier authenticated against an exact source and canonical
+/// manifest plan.
+///
+/// Fields and construction are private so parsing a structurally valid
+/// `ASTRBT01` object alone cannot mint this capability.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedBlobTransferObject {
+    object: BlobTransferObject,
+    expected_record: BlobChunkRecord,
+}
+
+impl VerifiedBlobTransferObject {
+    pub const fn object_id(&self) -> BlobCarrierId {
+        BlobCarrierId(self.object.object_id)
+    }
+
+    pub const fn source_envelope(&self) -> EnvelopeId {
+        self.object.source_envelope
+    }
+
+    pub const fn blob_id(&self) -> BlobId {
+        self.object.blob_id
+    }
+
+    pub const fn index(&self) -> u64 {
+        self.object.index
+    }
+
+    pub const fn record(&self) -> BlobChunkRecord {
+        self.expected_record
+    }
+
+    pub fn ciphertext(&self) -> &[u8] {
+        &self.object.ciphertext
+    }
+}
+
+/// Nonconstructible exact transfer plan derived from a provider-authenticated
+/// source Blob and its complete canonical manifest bytes.
+pub struct VerifiedBlobTransferPlan {
+    route: AuthenticatedBlobRoute,
+    manifest: BlobManifest,
+    manifest_bytes: Vec<u8>,
+    manifest_digest: [u8; 32],
+    physical_lineage: BlobPhysicalLineage,
+    tree: BlobRouteTree,
+    carrier_indexes: BTreeMap<ObjectId, u64>,
+}
+
+impl fmt::Debug for VerifiedBlobTransferPlan {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedBlobTransferPlan")
+            .field("source_envelope", &self.route.source_envelope)
+            .field("blob_id", &self.manifest.id)
+            .field("chunk_count", &self.manifest.chunk_count)
+            .field("manifest_len", &self.manifest_bytes.len())
+            .field("manifest_bytes", &"[REDACTED]")
+            .field("manifest_digest", &"[REDACTED]")
+            .field("physical_lineage", &self.physical_lineage)
+            .finish()
+    }
+}
+
+/// Proof that a provider-bound reader freshly authenticated every ciphertext,
+/// AEAD tag, plaintext digest, and the whole immutable Blob.
+///
+/// This capability is separate from a store's physical completion marker.
+/// Durable remote publication must require both.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct VerifiedBlobContentCompletion {
+    mission_authority_id: NodeId,
+    source_envelope: EnvelopeId,
+    blob_id: BlobId,
+    manifest_digest: [u8; 32],
+    physical_lineage: BlobPhysicalLineage,
+    chunk_count: u64,
+    plaintext_bytes: u64,
+}
+
+impl fmt::Debug for VerifiedBlobContentCompletion {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedBlobContentCompletion")
+            .field("mission_authority_id", &self.mission_authority_id)
+            .field("source_envelope", &self.source_envelope)
+            .field("blob_id", &self.blob_id)
+            .field("manifest_digest", &"[REDACTED]")
+            .field("physical_lineage", &self.physical_lineage)
+            .field("chunk_count", &self.chunk_count)
+            .field("plaintext_bytes", &self.plaintext_bytes)
+            .finish()
+    }
+}
+
+impl VerifiedBlobContentCompletion {
+    pub(crate) const fn new(
+        mission_authority_id: NodeId,
+        source_envelope: EnvelopeId,
+        blob_id: BlobId,
+        manifest_digest: [u8; 32],
+        physical_lineage: BlobPhysicalLineage,
+        chunk_count: u64,
+        plaintext_bytes: u64,
+    ) -> Self {
+        Self {
+            mission_authority_id,
+            source_envelope,
+            blob_id,
+            manifest_digest,
+            physical_lineage,
+            chunk_count,
+            plaintext_bytes,
+        }
+    }
+
+    pub const fn mission_authority_id(&self) -> NodeId {
+        self.mission_authority_id
+    }
+
+    pub const fn source_envelope(&self) -> EnvelopeId {
+        self.source_envelope
+    }
+
+    pub const fn blob_id(&self) -> BlobId {
+        self.blob_id
+    }
+
+    pub const fn manifest_digest(&self) -> &[u8; 32] {
+        &self.manifest_digest
+    }
+
+    pub const fn physical_lineage(&self) -> BlobPhysicalLineage {
+        self.physical_lineage
+    }
+
+    pub const fn chunk_count(&self) -> u64 {
+        self.chunk_count
+    }
+
+    pub const fn plaintext_bytes(&self) -> u64 {
+        self.plaintext_bytes
+    }
+}
+
 /// Durable seam for staged digests and independently verified encrypted chunks.
 ///
 /// `commit_verified_chunk` must atomically make the bytes and record visible, or neither. All
@@ -519,6 +757,19 @@ pub trait BlobStore {
     type StoreError: Error + Send + Sync + 'static;
 
     fn begin_blob(&mut self, manifest: &BlobManifest) -> Result<(), Self::StoreError>;
+
+    /// Begins one physical encrypted variant with its provider-owned content lineage.
+    ///
+    /// Existing adapters retain source compatibility through this conservative
+    /// default. Adapters which co-locate multiple same-epoch content-key lineages
+    /// must override it and include `lineage` in their physical variant identity.
+    fn begin_blob_with_lineage(
+        &mut self,
+        manifest: &BlobManifest,
+        _lineage: BlobPhysicalLineage,
+    ) -> Result<(), Self::StoreError> {
+        self.begin_blob(manifest)
+    }
     fn put_plaintext_digest(
         &mut self,
         id: BlobId,
@@ -575,6 +826,14 @@ impl<S: BlobStore + ?Sized> BlobStore for &mut S {
 
     fn begin_blob(&mut self, manifest: &BlobManifest) -> Result<(), Self::StoreError> {
         (**self).begin_blob(manifest)
+    }
+
+    fn begin_blob_with_lineage(
+        &mut self,
+        manifest: &BlobManifest,
+        lineage: BlobPhysicalLineage,
+    ) -> Result<(), Self::StoreError> {
+        (**self).begin_blob_with_lineage(manifest, lineage)
     }
 
     fn put_plaintext_digest(
@@ -725,6 +984,7 @@ pub(crate) struct BlobAccess {
     epoch_seed: BlobSecret,
     content_group: [u8; 32],
     epoch: u64,
+    physical_lineage: BlobPhysicalLineage,
 }
 
 impl BlobAccess {
@@ -734,6 +994,13 @@ impl BlobAccess {
             epoch_seed: BlobSecret(epoch_seed),
             content_group: content_group_id(scope, topic),
             epoch,
+            physical_lineage: BlobPhysicalLineage::from_content_grant(
+                [0_u8; 32],
+                scope,
+                topic,
+                epoch,
+                &epoch_seed,
+            ),
         }
     }
 }
@@ -889,12 +1156,35 @@ pub(crate) fn install_source_authenticated_manifest<R: Read + Seek, S: BlobStore
     expected: &InspectedBlobManifest,
     store: &mut S,
 ) -> Result<VerifiedBlobManifest, BlobError> {
+    install_source_authenticated_manifest_inner(input, expected, store, None)
+}
+
+pub(crate) fn install_source_authenticated_manifest_with_lineage<R: Read + Seek, S: BlobStore>(
+    input: &mut R,
+    expected: &InspectedBlobManifest,
+    store: &mut S,
+    lineage: BlobPhysicalLineage,
+) -> Result<VerifiedBlobManifest, BlobError> {
+    install_source_authenticated_manifest_inner(input, expected, store, Some(lineage))
+}
+
+fn install_source_authenticated_manifest_inner<R: Read + Seek, S: BlobStore>(
+    input: &mut R,
+    expected: &InspectedBlobManifest,
+    store: &mut S,
+    lineage: Option<BlobPhysicalLineage>,
+) -> Result<VerifiedBlobManifest, BlobError> {
     input.seek(SeekFrom::Start(0))?;
     let checked = parse_manifest(input, |_index, _record| Ok(()))?;
     if &checked != expected {
         return Err(BlobError::AuthenticationFailed);
     }
-    store.begin_blob(&checked.manifest).map_err(store_error)?;
+    match lineage {
+        Some(lineage) => store
+            .begin_blob_with_lineage(&checked.manifest, lineage)
+            .map_err(store_error)?,
+        None => store.begin_blob(&checked.manifest).map_err(store_error)?,
+    }
     input.seek(SeekFrom::Start(0))?;
     let installed = parse_manifest(input, |index, record| {
         store
@@ -1055,6 +1345,319 @@ impl BlobRouteTree {
             }
         }
         Ok(bytes)
+    }
+}
+
+impl VerifiedBlobTransferPlan {
+    pub(crate) fn from_authenticated_manifest(
+        route: AuthenticatedBlobRoute,
+        physical_lineage: BlobPhysicalLineage,
+        manifest_bytes: &[u8],
+        expected: &InspectedBlobManifest,
+    ) -> Result<Self, BlobError> {
+        if manifest_bytes.is_empty() || manifest_bytes.len() as u64 > MAX_BLOB_MANIFEST_BYTES {
+            return Err(BlobError::InvalidManifest);
+        }
+        let capacity = usize::try_from(expected.manifest.chunk_count)
+            .map_err(|_| BlobError::LengthOverflow)?;
+        let mut records = Vec::with_capacity(capacity);
+        let mut input = io::Cursor::new(manifest_bytes);
+        let inspected = parse_manifest(&mut input, |_index, record| {
+            records.push(record);
+            Ok(())
+        })?;
+        if &inspected != expected {
+            return Err(BlobError::AuthenticationFailed);
+        }
+        validate_selected_manifest(inspected.manifest())?;
+        let tree = BlobRouteTree::build(inspected.manifest.id, records)?;
+        if tree.commitment()? != route.commitment
+            || inspected.manifest.id != route.commitment.blob_id
+            || inspected.manifest.chunk_count != route.commitment.chunk_count
+        {
+            return Err(BlobError::AuthenticationFailed);
+        }
+
+        let mut carrier_indexes = BTreeMap::new();
+        for index in 0..inspected.manifest.chunk_count {
+            let record = tree.record(index)?;
+            let proof = tree.proof(index)?;
+            let object_id = transfer_object_id(
+                route.source_envelope,
+                inspected.manifest.id,
+                index,
+                record.ciphertext_sha256,
+                record.ciphertext_len,
+                &proof,
+            );
+            if carrier_indexes.insert(object_id, index).is_some() {
+                return Err(BlobError::AuthenticationFailed);
+            }
+        }
+
+        Ok(Self {
+            route,
+            manifest: inspected.manifest,
+            manifest_bytes: manifest_bytes.to_vec(),
+            manifest_digest: inspected.manifest_digest,
+            physical_lineage,
+            tree,
+            carrier_indexes,
+        })
+    }
+
+    /// Source envelope and route commitment which authenticate this plan.
+    pub const fn authenticated_route(&self) -> AuthenticatedBlobRoute {
+        self.route
+    }
+
+    /// Stable transfer identity of the exact source envelope.
+    pub const fn source_envelope(&self) -> EnvelopeId {
+        self.route.source_envelope
+    }
+
+    /// Exact selected manifest authenticated by the source envelope.
+    pub const fn manifest(&self) -> &BlobManifest {
+        &self.manifest
+    }
+
+    /// Exact canonical manifest encoding authenticated by the source envelope.
+    pub fn manifest_bytes(&self) -> &[u8] {
+        &self.manifest_bytes
+    }
+
+    /// Domain-separated digest of [`Self::manifest_bytes`].
+    pub const fn manifest_digest(&self) -> &[u8; 32] {
+        &self.manifest_digest
+    }
+
+    /// Exact content-key lineage which produced this physical encrypted variant.
+    pub const fn physical_lineage(&self) -> BlobPhysicalLineage {
+        self.physical_lineage
+    }
+
+    /// Complete ordered manifest records. The slice is bounded by
+    /// [`MAX_BLOB_CHUNKS`] and is suitable for one adapter-owned atomic import.
+    pub fn chunk_records(&self) -> &[BlobChunkRecord] {
+        &self.tree.records
+    }
+
+    /// Canonical source-bound carrier identity for one manifest index.
+    pub fn carrier_id(&self, index: u64) -> Result<BlobCarrierId, BlobError> {
+        let record = self.tree.record(index)?;
+        let proof = self.tree.proof(index)?;
+        Ok(BlobCarrierId(transfer_object_id(
+            self.route.source_envelope,
+            self.manifest.id,
+            index,
+            record.ciphertext_sha256,
+            record.ciphertext_len,
+            &proof,
+        )))
+    }
+
+    /// Iterates every canonical carrier ID in manifest order.
+    pub fn carrier_ids(&self) -> impl Iterator<Item = BlobCarrierId> + '_ {
+        (0..self.manifest.chunk_count).map(|index| {
+            self.carrier_id(index)
+                .expect("verified plan contains every bounded manifest record")
+        })
+    }
+
+    /// Resolves an exact typed wire identity to its manifest index.
+    pub fn carrier_index(&self, wire_id: &[u8; BlobCarrierId::WIRE_LEN]) -> Result<u64, BlobError> {
+        let object_id =
+            ObjectId::from_wire_bytes(*wire_id).ok_or(BlobError::AuthenticationFailed)?;
+        self.carrier_indexes
+            .get(&object_id)
+            .copied()
+            .ok_or(BlobError::MissingChunk)
+    }
+
+    /// Exact total encoded length of a canonical carrier, without reading its
+    /// ciphertext from the durable adapter.
+    pub fn carrier_total_len(
+        &self,
+        wire_id: &[u8; BlobCarrierId::WIRE_LEN],
+    ) -> Result<u64, BlobError> {
+        let index = self.carrier_index(wire_id)?;
+        let record = self.tree.record(index)?;
+        let proof = self.tree.proof(index)?;
+        let length = TRANSFER_FIXED_LEN
+            .checked_add(
+                proof
+                    .len()
+                    .checked_mul(32)
+                    .ok_or(BlobError::LengthOverflow)?,
+            )
+            .and_then(|value| value.checked_add(record.ciphertext_len as usize))
+            .ok_or(BlobError::LengthOverflow)?;
+        if length > MAX_BLOB_TRANSFER_OBJECT_BYTES {
+            return Err(BlobError::InvalidManifest);
+        }
+        u64::try_from(length).map_err(|_| BlobError::LengthOverflow)
+    }
+
+    /// Builds the stable `ASTRBT01` carrier after proving that the adapter is
+    /// finalized for this exact manifest and retains the exact encrypted chunk.
+    pub fn build_carrier<S: BlobStore + ?Sized>(
+        &self,
+        store: &mut S,
+        index: u64,
+    ) -> Result<BuiltBlobTransferObject, BlobError> {
+        if store
+            .finalized_manifest_digest(self.manifest.id)
+            .map_err(store_error)?
+            != Some(self.manifest_digest)
+        {
+            return Err(BlobError::AuthenticationFailed);
+        }
+        let record = self.tree.record(index)?;
+        validate_record(&self.manifest, index, &record)?;
+        if store
+            .chunk_record(self.manifest.id, index)
+            .map_err(store_error)?
+            != Some(record)
+            || store
+                .expected_chunk_record(self.manifest.id, index)
+                .map_err(store_error)?
+                .is_some_and(|expected| expected != record)
+        {
+            return Err(BlobError::AuthenticationFailed);
+        }
+        let mut ciphertext = Vec::with_capacity(
+            usize::try_from(record.ciphertext_len).map_err(|_| BlobError::LengthOverflow)?,
+        );
+        if !store
+            .read_verified_chunk(self.manifest.id, index, &mut ciphertext)
+            .map_err(store_error)?
+        {
+            return Err(BlobError::MissingChunk);
+        }
+        let proof = self.tree.proof(index)?;
+        let bytes = encode_transfer_object(
+            self.route.source_envelope,
+            self.manifest.id,
+            index,
+            record,
+            &proof,
+            &ciphertext,
+        )?;
+        let object_id = self.carrier_id(index)?;
+        if u64::try_from(bytes.len()).map_err(|_| BlobError::LengthOverflow)?
+            != self.carrier_total_len(&object_id.wire_bytes())?
+        {
+            return Err(BlobError::AuthenticationFailed);
+        }
+        Ok(BuiltBlobTransferObject { object_id, bytes })
+    }
+
+    /// Reads a bounded range from the canonical carrier identified by its
+    /// exact typed wire ID. The returned total is stable across peers/resumes.
+    pub fn read_carrier_range<S: BlobStore + ?Sized>(
+        &self,
+        store: &mut S,
+        wire_id: &[u8; BlobCarrierId::WIRE_LEN],
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<(u64, Vec<u8>), BlobError> {
+        let index = self.carrier_index(wire_id)?;
+        let carrier = self.build_carrier(store, index)?;
+        if &carrier.object_id.wire_bytes() != wire_id {
+            return Err(BlobError::AuthenticationFailed);
+        }
+        let total = u64::try_from(carrier.bytes.len()).map_err(|_| BlobError::LengthOverflow)?;
+        let start = usize::try_from(offset).map_err(|_| BlobError::LengthOverflow)?;
+        if start > carrier.bytes.len() {
+            return Err(BlobError::InvalidManifest);
+        }
+        let end = start.saturating_add(max_bytes).min(carrier.bytes.len());
+        Ok((total, carrier.bytes[start..end].to_vec()))
+    }
+
+    /// Authenticates one complete carrier against this exact source, canonical
+    /// proof tree, and complete manifest record.
+    pub fn verify_carrier(
+        &self,
+        wire_id: &[u8; BlobCarrierId::WIRE_LEN],
+        bytes: &[u8],
+    ) -> Result<VerifiedBlobTransferObject, BlobError> {
+        let index = self.carrier_index(wire_id)?;
+        let object_id =
+            ObjectId::from_wire_bytes(*wire_id).ok_or(BlobError::AuthenticationFailed)?;
+        let object = authenticate_blob_transfer_object_for_route(object_id, bytes, self.route)?;
+        let expected_record = self.tree.record(index)?;
+        if object.index != index
+            || object.object_id != self.carrier_id(index)?.0
+            || object.ciphertext_sha256 != expected_record.ciphertext_sha256
+            || object.ciphertext_len != expected_record.ciphertext_len
+        {
+            return Err(BlobError::AuthenticationFailed);
+        }
+        Ok(VerifiedBlobTransferObject {
+            object,
+            expected_record,
+        })
+    }
+
+    /// Installs one plan-verified carrier through the adapter's atomic chunk
+    /// commit seam. This does not finalize or publish the Blob.
+    pub fn install_verified_carrier<S: BlobStore + ?Sized>(
+        &self,
+        store: &mut S,
+        verified: &VerifiedBlobTransferObject,
+    ) -> Result<(), BlobError> {
+        let index = verified.object.index;
+        let expected = self.tree.record(index)?;
+        if verified.object.source_envelope != self.route.source_envelope
+            || verified.object.blob_id != self.manifest.id
+            || verified.expected_record != expected
+            || verified.object.object_id != self.carrier_id(index)?.0
+        {
+            return Err(BlobError::AuthenticationFailed);
+        }
+        store
+            .put_expected_chunk_record(self.manifest.id, index, expected)
+            .map_err(store_error)?;
+        store
+            .commit_verified_chunk(
+                self.manifest.id,
+                index,
+                expected,
+                &verified.object.ciphertext,
+            )
+            .map_err(store_error)
+    }
+
+    /// Rechecks every expected/committed record and the exact durable
+    /// finalization digest. This proves physical completeness, not plaintext
+    /// authenticity; publication also requires [`VerifiedBlobContentCompletion`].
+    pub fn verify_store_completion<S: BlobStore + ?Sized>(
+        &self,
+        store: &mut S,
+    ) -> Result<(), BlobError> {
+        for (index, record) in self.tree.records.iter().copied().enumerate() {
+            let index = u64::try_from(index).map_err(|_| BlobError::LengthOverflow)?;
+            if store
+                .expected_chunk_record(self.manifest.id, index)
+                .map_err(store_error)?
+                != Some(record)
+                || store
+                    .chunk_record(self.manifest.id, index)
+                    .map_err(store_error)?
+                    != Some(record)
+            {
+                return Err(BlobError::AuthenticationFailed);
+            }
+        }
+        if store
+            .finalized_manifest_digest(self.manifest.id)
+            .map_err(store_error)?
+            != Some(self.manifest_digest)
+        {
+            return Err(BlobError::AuthenticationFailed);
+        }
+        Ok(())
     }
 }
 
@@ -1524,7 +2127,7 @@ impl StoredCarrierScan {
                 .bytes_seen
                 .checked_add(length)
                 .ok_or(BlobError::LengthOverflow)?;
-            if self.bytes_seen > self.max_bytes || length > MAX_TRANSFER_OBJECT_BYTES {
+            if self.bytes_seen > self.max_bytes || length > MAX_BLOB_TRANSFER_OBJECT_BYTES as u64 {
                 return Err(BlobError::InvalidManifest);
             }
             if name.starts_with(".tmp-") {
@@ -1557,7 +2160,7 @@ fn insert_bounded_id(ids: &mut BTreeSet<ObjectId>, object_id: ObjectId, limit: u
 
 fn read_bounded_carrier(path: &Path) -> io::Result<Vec<u8>> {
     let length = fs::metadata(path)?.len();
-    if length > MAX_TRANSFER_OBJECT_BYTES {
+    if length > MAX_BLOB_TRANSFER_OBJECT_BYTES as u64 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "transfer object length",
@@ -1893,8 +2496,11 @@ pub(crate) fn authenticate_blob_transfer_object_for_route(
 pub struct ReferenceBlobService<S = FileBlobStore> {
     store: S,
     epoch_seed: BlobSecret,
+    scope: Scope,
+    topic: Topic,
     content_group: [u8; 32],
     epoch: u64,
+    physical_lineage: BlobPhysicalLineage,
     mission_authority_id: Option<NodeId>,
     zeroized: bool,
 }
@@ -1923,8 +2529,17 @@ impl ReferenceBlobService {
         Ok(Self {
             store: FileBlobStore::open_with_config(path, config)?,
             epoch_seed: BlobSecret(epoch_seed),
+            scope: scope.clone(),
+            topic: topic.clone(),
             content_group: content_group_id(scope, topic),
             epoch,
+            physical_lineage: BlobPhysicalLineage::from_content_grant(
+                [0_u8; 32],
+                scope,
+                topic,
+                epoch,
+                &epoch_seed,
+            ),
             mission_authority_id: None,
             zeroized: false,
         })
@@ -2019,8 +2634,17 @@ impl<S: BlobStore> ReferenceBlobService<S> {
         Self {
             store,
             epoch_seed: BlobSecret(epoch_seed),
+            scope: scope.clone(),
+            topic: topic.clone(),
             content_group: content_group_id(scope, topic),
             epoch,
+            physical_lineage: BlobPhysicalLineage::from_content_grant(
+                mission_authority_id,
+                scope,
+                topic,
+                epoch,
+                &epoch_seed,
+            ),
             mission_authority_id: Some(mission_authority_id),
             zeroized: false,
         }
@@ -2052,7 +2676,9 @@ impl<S: BlobStore> ReferenceBlobService<S> {
             content_epoch: self.epoch,
         };
         validate_selected_manifest(&manifest)?;
-        self.store.begin_blob(&manifest).map_err(store_error)?;
+        self.store
+            .begin_blob_with_lineage(&manifest, self.physical_lineage)
+            .map_err(store_error)?;
         for (index, digest) in prepared.plaintext_digests.iter().copied().enumerate() {
             self.store
                 .put_plaintext_digest(
@@ -2147,7 +2773,12 @@ impl<S: BlobStore> ReferenceBlobService<S> {
         {
             return Err(BlobError::AuthenticationFailed);
         }
-        install_source_authenticated_manifest(input, inspected, &mut self.store)
+        install_source_authenticated_manifest_with_lineage(
+            input,
+            inspected,
+            &mut self.store,
+            self.physical_lineage,
+        )
     }
 
     pub(crate) const fn bound_mission_authority_id(&self) -> Option<NodeId> {
@@ -2165,6 +2796,13 @@ impl<S: BlobStore> ReferenceBlobService<S> {
             return Err(BlobError::AuthenticationFailed);
         }
         self.mission_authority_id = Some(mission_authority_id);
+        self.physical_lineage = BlobPhysicalLineage::from_content_grant(
+            mission_authority_id,
+            &self.scope,
+            &self.topic,
+            self.epoch,
+            self.epoch_seed.expose(),
+        );
         Ok(())
     }
 
@@ -2174,6 +2812,15 @@ impl<S: BlobStore> ReferenceBlobService<S> {
 
     pub(crate) const fn bound_epoch(&self) -> u64 {
         self.epoch
+    }
+
+    /// Provider-owned physical lineage bound to this exact content service.
+    pub const fn physical_lineage(&self) -> BlobPhysicalLineage {
+        self.physical_lineage
+    }
+
+    pub(crate) fn store_mut(&mut self) -> &mut S {
+        &mut self.store
     }
 
     pub fn zeroize(&mut self) {
@@ -2187,6 +2834,7 @@ impl<S: BlobStore> ReferenceBlobService<S> {
             epoch_seed: BlobSecret(*self.epoch_seed.expose()),
             content_group: self.content_group,
             epoch: self.epoch,
+            physical_lineage: self.physical_lineage,
         })
     }
 
@@ -2365,7 +3013,7 @@ fn scan_store_usage(root: &Path) -> io::Result<(u64, u64)> {
                     io::Error::new(io::ErrorKind::InvalidData, "transfer object name")
                 })?;
                 let named_id = object_id_from_hex(encoded)?;
-                if metadata.len() > MAX_TRANSFER_OBJECT_BYTES {
+                if metadata.len() > MAX_BLOB_TRANSFER_OBJECT_BYTES as u64 {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "transfer object length",
@@ -2705,7 +3353,9 @@ impl<'a, S: BlobStore> BlobWriter<'a, S> {
             content_group: self.access.content_group,
             content_epoch: self.access.epoch,
         };
-        self.store.begin_blob(&manifest).map_err(store_error)?;
+        self.store
+            .begin_blob_with_lineage(&manifest, self.access.physical_lineage)
+            .map_err(store_error)?;
         digest_scratch.seek(SeekFrom::Start(0))?;
         for index in 0..chunk_count {
             let mut digest = [0u8; 32];
@@ -4610,7 +5260,7 @@ mod tests {
             scanned += 1;
         }
         assert_eq!(scanned, carriers.len());
-        assert!(bounded_scan.peak_buffer_bytes as u64 <= MAX_TRANSFER_OBJECT_BYTES);
+        assert!(bounded_scan.peak_buffer_bytes <= MAX_BLOB_TRANSFER_OBJECT_BYTES);
 
         let wrong_route = AuthenticatedBlobRoute::new(
             EnvelopeId::from_sealed_bytes(b"different source envelope"),

@@ -415,6 +415,18 @@ control trigger. Pathnames remain as zero-length tombstones. Physical media,
 copy-on-write history, snapshots, swap, backups, database rollback/replacement,
 and non-Unix behavior are outside the proof.
 
+The selected N=32 retained receipt changes evidence depth, not this authority
+layout. An operator-attested Cargo release-profile binary run for the signed
+source ran the Event line with 32 distinct mission identities/stores in 65
+exact cohorts and 158 exact-named executions with distinct READY PIDs on one
+macOS arm64 host over direct loopback. The directed data-motion cohorts were
+serial two-process edges; the final no-op recorded 32 distinct READY PIDs,
+without overlap timing or an OS sampler that would prove simultaneity.
+That same-build, same-implementation, one-scope/authority/topic line does not
+establish distributed or physical architecture, the separate at-least-100-node
+target, NAT/relay/BTLE/cross-transport behavior, independent interoperability,
+resource thresholds, or release readiness.
+
 ## Follow the evidence
 
 - [Capability tour](quickstart/capability-tour.md) — fastest visible behavior.

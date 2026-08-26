@@ -3,7 +3,7 @@
 - Specification version: 0.1.0-draft.2
 - Wire major/minor: 1.0
 - Status: reference draft; not production-authorized
-- Date: 2026-08-19
+- Date: 2026-08-25
 
 The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** are
 normative. The protocol specification, not the Rust representation, is the
@@ -74,7 +74,7 @@ The protocol has two deterministic encodings. Replication messages use the RFC
 
 [`wire.cddl`](wire.cddl) defines those maps. Security objects—credentials, source envelopes,
 handshake flights, custody wrappers, controls, and Blob manifests—use the fixed,
-length-prefixed binary structures in [envelope.md](envelope.md); the semantic-v2
+length-prefixed binary structures in [envelope.md](envelope.md); the semantic-v2/v3/v4/v5
 batch additions use the fixed structures in §6.1. Those readers reject
 truncation, trailing bytes, nonzero reserved fields, unknown critical kinds, and
 lengths above their field-specific bound before allocation. A security object is
@@ -87,8 +87,12 @@ words, signature messages, KDF salts, labels, and contexts are normative in
 Security digests and semantic identifiers are 32-byte SHA-256 results. The
 replication namespace uses a fixed 33-byte `ObjectID = kind u8 || digest[32]`.
 Semantic version 1 permits kind `1` source envelopes and kind `2` Blob chunk
-carriers. Semantic version 2 additionally permits kind `3` source-batch proofs,
-kind `4` bridge authorizations, and kind `5` bridge-route wrappers. Full typed
+carriers. Semantic versions 2, 3, and 4 additionally permit kind `3` source-batch
+proofs, kind `4` bridge authorizations, and kind `5` bridge-route wrappers.
+Semantic versions 3 and 4 additionally enable session-bound custody records for
+the selected Event/RouteEvent path without allocating a new stable transfer-
+object kind. Semantic version 4 adds selected protected State/Record mechanics
+frames, not a new stable transfer-object kind. Full typed
 identifiers decide ordering and dispatch; a session MAY use dictionary indexes
 only after collision-safe binding to the full value.
 
@@ -129,7 +133,7 @@ filesystem can detect deletion of itself; this remains a deployment gate.
 | 7 | Event sequence | optional `u64` |
 | 8 | logical key/stream | wire maximum 65,536 bytes; profile admission maximum 4,096 |
 | 9 | Blob route commitment | tag; BlobID, nonzero chunk count, and Merkle root exactly for Blob |
-| 10 | TTL milliseconds | optional `u64`; absent means durable, zero means already expired |
+| 10 | TTL milliseconds | optional `u64`; absent means durable; for non-tombstone data, zero means already expired; tombstone markers remain durable regardless of this field |
 | 11 | declared content length | `u64` |
 | 12 | tombstone | canonical boolean byte |
 | 13 | content epoch | `u64` |
@@ -172,7 +176,7 @@ TTL, publisher/counter/context, Event sequence, tombstone state, declared
 content length, authenticated Blob route commitment, content group/epoch/nonce,
 ciphertext length, and the authentication fields selected by the envelope
 format. Format 2 carries the unchanged singleton authentication-manifest
-identifier and hybrid source signature. Semantic-v2 format 3 carries the exact
+identifier and hybrid source signature. Semantic-v2/v3/v4/v5 format 3 carries the exact
 batch reference, Merkle path, and item ECDSA suffix in §6.1. A consumer MUST
 reject if a repeated semantic field differs from decrypted ItemCore.
 
@@ -203,15 +207,15 @@ delivery. Missing or stripped signatures fail.
 The fixed envelope includes a singleton authentication-manifest identifier and
 both publisher signatures bind the complete canonical semantic header, including
 the conditional Blob route commitment. Its bytes and meaning remain unchanged:
-semantic-v2 peers MAY still use format 2 for a singleton or urgent fallback, but
+semantic-v2/v3/v4/v5 peers MAY still use format 2 for a singleton or urgent fallback, but
 no implementation may reinterpret a format-2 byte as compact batch
 authentication.
 
-### 6.1 Semantic-v2 content-committing PQ batch profile
+### 6.1 Semantic-v2/v3/v4/v5 content-committing PQ batch profile
 
 This profile amortizes the authority credential and ML-DSA source signature
 without removing post-quantum authentication. It is available only after the
-authenticated session selects semantic version 2. A batch has `2..64` items
+authenticated session selects semantic version 2, 3, or 4. A batch has `2..64` items
 from one publisher with one data class, topic, scope, content-key epoch, and
 credential. Causal counters are nonzero and contiguous in item-index order.
 Event sequences are also nonzero and contiguous for class `1` Event; every
@@ -311,7 +315,7 @@ noncanonical; structure and the computed root decide validity.
 
 #### 6.1.3 BatchProof object and compact item suffix
 
-The batch proof is a stable semantic-v2 transfer object with `ObjectKind = 3`.
+The batch proof is a stable semantic-v2/v3/v4/v5 transfer object with `ObjectKind = 3`.
 Its protected route plaintext is exactly:
 
 ```text
@@ -373,11 +377,12 @@ rejects a canonical message containing a kind-3 ObjectID, and a semantic-v1
 fixed-envelope decoder rejects an `ASTRENV3` header before route or content
 dispatch.
 This rule preserves all semantic-v1 format-2 bytes and corpus vectors exactly.
-A semantic-v2 session accepts format-2 singleton fallback as well as valid
-format-3 proof/item representations. When both representations are published,
-they share ItemID but retain distinct EnvelopeIDs, receipts, retry completion,
-custody, and garbage-collection references. ItemID deduplication occurs only at
-application semantics; it must not collapse stable transfer objects.
+A semantic-v2, semantic-v3, semantic-v4, or semantic-v5 session accepts format-2 singleton fallback as
+well as valid format-3 proof/item representations. When both representations
+are published, they share ItemID but retain distinct EnvelopeIDs, receipts,
+retry completion, custody, and garbage-collection references. ItemID
+deduplication occurs only at application semantics; it must not collapse stable
+transfer objects.
 
 The exact proof-envelope overhead is `P(g,s,t) = 10230 + 32g + s + t` bytes.
 For `n` items the compact authentication total is
@@ -557,7 +562,7 @@ bounded retention cannot prevent that indefinitely.
 For each policy-filtered snapshot selected by the embedding node, the implemented
 inventory is an exact sparse nibble-radix Merkle tree keyed by the full 33-byte
 typed ObjectID. It therefore has 66 nibble levels. A leaf commits to that full
-typed identifier, keeping source envelopes, Blob chunk carriers, and semantic-v2
+typed identifier, keeping source envelopes, Blob chunk carriers, and semantic-v2/v3/v4/v5
 batch proofs disjoint even if their 32-byte digests collide. Internal hashes
 commit to depth, ordered child summaries, and counts. ItemID, singleton/batch
 identifiers, proof dependencies, and semantic fields are authenticated inside
@@ -642,6 +647,205 @@ contact may restart tree traversal without discarding durably verified ranges.
 Delivery is at least once; application acknowledgement state is separate from
 protocol receipt state.
 
+### 9.1 Selected semantic-v4 State and Record reconciliation
+
+The selected mechanics profile adds State and Record when the authenticated
+mission session selects semantic version `4` or `5`. Semantic versions `1`,
+`2`, and `3` retain their Event compatibility behavior and MUST NOT send,
+accept, reserve, or count mutable frames. The default semantic offer is
+`[5, 4, 3, 2, 1]`; stable replication-wire/profile, handshake framing, source
+envelopes, and suite remain version `1`. Semantic v5 inherits these State/Record
+mechanics unchanged and adds the separate Blob mechanics in §9.2.
+
+State and Record are independent classes (`State = 1`, `Record = 2`). Each has
+two receiver-directed lanes, so every contact has four independent reconciliation
+lanes: local Offer and local Fetch for each class. Every frame carries its class
+and stable receiver direction, and every object-carrying frame binds a typed
+32-byte exact transfer ID. A class or direction mismatch fails the contact; one
+lane can neither satisfy nor advance another. Each class exchanges its own
+canonical topic/scope interest, and empty interest means receive-none.
+
+Inventory and difference messages use bounded Negentropy frames of at most
+16 KiB for at most 64 reconciliation rounds. The selected contact reserves
+enough protected frame/byte budget for every lane to complete its bounded
+reconciliation exchange, make at least one eligible object attempt, and finish;
+Event work cannot consume that reserve. A mutable object is at most 1 MiB.
+State and Record each have an independent hard admission ceiling of 4,096 rows
+and 16 MiB of encoded source bytes. Existing mutable rows are not pruned to
+admit a new row.
+
+An offered object receives an exact `MutableApplyResult`. A fetched object
+receives an exact `MutableFetchResult`, and the serving endpoint MUST return an
+exact `MutableFetchResultAck` before it accepts another fetch or a finish on that
+lane. The acknowledgement repeats class, direction, transfer ID, and
+disposition. The only nonfatal dispositions are `Duplicate`, `Inserted`, and
+`DeferredCapacity`. `DeferredCapacity` applies only to an otherwise-valid authenticated object
+blocked by effective ordinary-aggregate or per-class item/byte capacity, the
+1,024-version per-logical-key projection bound, or the causal-frontier bound. An
+object over 1 MiB is structurally invalid and fatal, not deferred. Capacity
+deferral does not convert malformed bytes, source failure, stale policy,
+wrong class/interest, wrong route
+lineage, or an integrity failure into absence or success; those remain fatal.
+
+`MutableFinish` and `MutableFinished` carry an exact equal `remaining` count.
+The count includes every authenticated difference not durably satisfied,
+including a capacity-deferred attempt. Missing, duplicate, changed, or
+out-of-order result/acknowledgement and finish messages fail the contact. This
+makes both endpoints' bounded contact receipts agree without treating a served
+byte count as durable remote admission. Event last-contact completion remains a
+separate Event/status boundary and MUST NOT be interpreted as State or Record
+convergence.
+
+Every authenticated peer/class/local-mode lane has a durable 32-byte rotation
+cursor. Candidate IDs are canonically sorted; selection begins at the strict
+successor of the cursor, wraps at most once, and is bounded by lane capacity.
+The cursor need not remain in the current difference. It advances by compare-
+and-set only after the exact authenticated result/acknowledgement; a stale CAS
+does not fail the contact or mutate the winner. Cursor metadata is reserved
+outside ordinary item quota, is capped at 256 configured mission peers and four
+rows per peer (1,024 total), and is pruned for no-longer-configured peers during
+mandatory startup validation before sockets open.
+
+Inventory, serving, admission, cursor advancement, and finish all execute under
+one contact policy lease. Every State/Record candidate is freshly bound to its
+current source route lineage. A same-epoch key replacement leaves an old exact
+row durable for authenticated historical retry and audit but withholds that
+historical lineage from ordinary current projection/query and network inventory
+or transfer. An exact idempotent State publish or Record publish/resolution
+operation retry MAY recover its committed historical result only through the
+strict cached/projection/historical verification path.
+Selected State and Record finite TTL is rejected: profile 4 defines no mutable
+forwarding-age or expiry path.
+
+`Normal` and every `AtLeast(priority)` policy run all four mutable lanes;
+`AtLeast` is solely an Event emission threshold. `ReceiveOnly` initiates no
+contact and sends or discloses no mutable interest, inventory, ID, or object.
+This is stricter than the bounded mandatory reply traffic allowed while
+receiving selected Event work.
+
+### 9.2 Selected semantic-v5 direct Blob transfer
+
+Semantic version `5` inherits the exact Event behavior of versions `1` through
+`4` and the semantic-v4 State/Record mechanics above. It additionally allocates
+one selected Blob source class (`MutableClass = 3`) and one Blob carrier lane.
+The default descending offer is `[5, 4, 3, 2, 1]`. Stable replication-wire and
+ABI version `1`, handshake framing, `ASTRENV2`/`ASTRENV3` source formats,
+`ASTRBT01` carriers, typed ObjectIDs, and the registered cryptographic suite do
+not change. A semantic-v1, v2, v3, or v4 session MUST emit, accept, reserve, and
+count zero Blob interest, Blob-class mutable, Blob range, and Blob carrier
+finish frames. State and Record retain their semantic-v4 behavior in v5.
+
+The core SQLite compatibility store advances schema 14 to 15 only to admit
+`origin_semantic_version = 5` in `transfer_identities`. The transactional
+migration copies every existing row unchanged, retains v1-v4 provenance, and
+then permits v5 provenance across restart; it does not create or migrate the
+selected redb Blob staging/depot tables.
+
+The v5 protected-frame allocation is `0x6b` BlobInterest, `0x6c`
+BlobInterestReply, Blob class `3` under the existing mutable source tags
+`0x71..0x92`, and `0xa1` BlobRangeFetch, `0xa2` BlobRange, `0xa5`
+BlobRangeResult, `0xa6` BlobRangeResultAck, `0xb1` BlobCarrierFinish, and `0xb2`
+BlobCarrierFinished. Unknown, malformed, truncated, trailing, wrong-class,
+wrong-direction, cross-source, cross-carrier, changed-result, and out-of-order
+variants fail the authenticated contact.
+
+Each Blob interest selector names one exact `(topic, scope, epoch)` and carries
+one fixed 32-byte provider-minted `BlobPeerContentProof`. Descendant-scope and
+wildcard selectors are not permitted. The proof is domain-separated over the
+mission authority, authenticated claimant NodeID, exact selector, and current
+content grant; it exposes no content key. The serving endpoint verifies it
+against that same authenticated peer, the peer's current exact route grant, and
+durable nonrevocation policy. Route authority alone is insufficient. A copied
+proof cannot be replayed by another peer, and a same-epoch content-key
+replacement invalidates the old proof. Old rows are withheld after such a
+replacement, but the store deliberately rejects a new physical lineage for the
+same `(BlobID, content group, numeric epoch)` as `PhysicalLineageConflict`;
+republishing or resuming that Blob under a different physical lineage requires
+advancing the numeric epoch. Terminal or stale cleanup MUST preserve that rule:
+it removes the pending source and prefixes, clears the finalized digest, chunk
+rows, reserved and committed bytes, and files, but retains the exact unfinished
+`BLOB_IMPORTS` row as a non-public physical-lineage fence. The fence remains
+charged to the existing `max_variants`/`DEPOT_VARIANT_COUNT` bound; exact-lineage
+retry may refill it, a different same-epoch lineage conflicts, and numeric epoch
+advance consumes another bounded variant. It creates no table, schema, quota, or
+publication. Every open-path audit requires its owner/backing binding and
+nonempty physical lineage; a zero-lineage fence is corruption.
+
+The requester repeats the proof in every BlobRangeFetch, and the sender
+rechecks proof, route, revocation, source route lineage, and physical content
+lineage before advertising a source and before serving every range. The
+selected v5 lane is therefore direct between current content-capable peers; the
+reference route-only relay design in §8.4 and `envelope.md` is not selected
+here.
+
+For each receiver direction, the Blob source phase completes first through the
+class-separated mutable inventory/difference/Offer/Fetch/result/ack/finish
+grammar. A receiver authenticates the exact source envelope, canonical
+manifest, source route lineage, physical content lineage, BlobID, manifest
+digest, ordered chunk records, and canonical kind-`2` carrier IDs before it
+atomically installs the pending source plan. Pending source and carrier bytes
+are staging only: they are absent from ordinary publication inventory, query,
+read, and serving surfaces.
+
+Only after that source phase may the carrier lane request an exact complement.
+Each request is a nonempty contiguous range of at most 16 KiB and binds the
+receiver direction, source transfer ID, strict 33-byte kind-`2` carrier ID,
+exact total length, offset, requested length, and current content proof. The
+response repeats the tuple and returns `Data` or `Unavailable`; result and
+acknowledgement additionally bind the exact accepted length and one of
+`Partial`, `Complete`, `Duplicate`, `DeferredCapacity`, or `Unavailable`.
+Finish carries the requester's exact remaining
+count and Finished echoes it; this is sequencing agreement, not an independent
+responder proof of the requester's disk truth. The exact per-range Result/Ack is
+the durable accepted-prefix evidence. The durable prefix is keyed by exact source and carrier, never by peer,
+connection, or session. A later contact with any other authenticated,
+nonrevoked peer that proves the same current exact content entitlement can
+continue from the first missing byte; peer-specific cursors affect bounded
+fair scheduling only and do not own progress. If one multi-carrier source ends
+terminally, its scheduler position advances past the lexicographically greatest
+canonical carrier ID in that source, not merely the last manifest record, so a
+later eligible source cannot be stranded behind carrier order.
+
+Every local transition that can install, repair, retire, or reconcile a Blob
+source and its authenticated cache claim is serialized with the matching
+durable store transition. The critical section spans no await or network I/O.
+After a successful durable abort, the implementation removes the old cache
+claim, rereads the exact state-neutral durable source projection, freshly
+authenticates any concurrent exact restage, and only then reinstalls its claim.
+No interleaving may leave an orphan claim or a durable pending source without
+its authenticated claim.
+
+Selected network admission rejects a Blob over 64 MiB of plaintext or 1,024
+chunks, an exact source over 1 MiB, or one canonical carrier over 128 KiB.
+Pending Blob source, manifest-record, and carrier-prefix metadata share a hard
+10,000-row staging ceiling, and staged carrier-prefix bytes share a hard 64-MiB
+ceiling. A range never exceeds 16 KiB, and durable carrier scheduling is bounded
+to 256 configured mission peers. Saturation returns typed deferral without
+evicting accepted publications or existing pending progress; malformed,
+unauthorized, stale-lineage, conflicting-prefix, and integrity failures remain
+fatal for the affected exact work.
+
+Carrier completion still does not publish a Blob. The receiver verifies every
+complete canonical `ASTRBT01` carrier into the encrypted depot, requires the
+exact depot completion marker, freshly streams and decrypts every exact
+manifest chunk, verifies every AEAD tag and per-chunk plaintext digest, verifies
+the whole BlobID, and obtains a nonconstructible content-completion proof. It
+then freshly obtains a nonconstructible current-lineage proof binding mission
+authority, source transfer, route lineage, physical lineage, BlobID, and
+manifest digest. One redb transaction requires the pending plan, both proofs,
+and depot completion to agree, installs the ordinary publication/index/counter
+rows, and removes the pending source and prefixes. Failure leaves no partial
+publication; an exact duplicate promotion is idempotent. A completed source is
+served only after the same current policy and lineage checks.
+
+`Normal` and every `AtLeast(priority)` run Blob source and carrier work because
+`AtLeast` filters Event emission only. `ReceiveOnly` initiates, requests,
+advertises, sends, accepts, reserves, and counts zero selected Blob work. This
+slice does not add a live Blob application handle or subscription, selected
+route-only Blob relay/custody, Blob TTL/expiry/garbage collection, a
+metadata-independent whole-byte identity or deduplication claim, or large-file,
+physical-carrier, mixed-implementation, and release acceptance.
+
 The reference driver can initiate an exchange and can answer one through its
 responder-with-start path, so its in-memory authenticated flow is bidirectional.
 If backend storage rejects a received range, the intent remains queued for a
@@ -671,17 +875,66 @@ reference-to-reference validation, not the required 3 kbps/live-carrier gate.
 ## 10. TTL and freshness without synchronized clocks
 
 TTL is a signed duration, never an ordering timestamp. A custody wrapper carries
-an authenticated nondecreasing age lower bound. Each node persists received age
-and adds elapsed local monotonic residence before offer, request, retry, send, or
-delivery while that monotonic clock remains continuous. The wrapper contains no
-wall-clock timestamp, and profile 1 does not define a cross-node wall-time
-adjustment.
+an authenticated nondecreasing effective-age lower bound. For a finite row,
+each node persists received age and adds elapsed local monotonic residence
+before offer, request, retry, send, or delivery while that monotonic clock
+remains continuous. Durable and tombstone rows instead retain the maximum
+received/authenticated age without charging idle local residence. Before every
+selected v3 send, the sender conservatively charges
+`32 + ceil(exact_sealed_event_bytes / 1024)` milliseconds for synchronous frame,
+AEAD, durable-store, and final-policy work. A finite transfer is withheld when
+that charged age reaches its TTL; the post-store carrier-adjacent sample must
+remain within the authenticated charge or the frame is abandoned before any
+application byte is written. Durable Events and tombstones receive the same age
+charge even though they do not expire. The wrapper contains no wall-clock
+timestamp, and profile 1 defines no cross-node wall-time adjustment.
+
+For selected Event/RouteEvent transfer under semantic version 3, 4, or 5, each offer
+carries the exact 150-byte `ASTRCU03` claim defined in
+[envelope.md](envelope.md) §7.1 inside a replay-checked `ASTRFR01` session
+record. The claim binds the completed session transcript, transfer digest and
+exact length, exchange, nonzero emission-policy revision, prior age, local
+monotonic sample and hop delta, source priority, and optional source TTL. The
+receiver compares transfer, length, exchange, priority, and TTL with the live
+exchange and freshly verified source header. The existing `ASTRFWD1` provider
+wrapper in [envelope.md](envelope.md) §7 remains a distinct legacy per-hop
+object and is never reinterpreted as this semantic-v3-format session record.
+
+The protected semantic-v3-format Event-interest request and reply, used in
+semantic-v3, semantic-v4, and semantic-v5 sessions, also carry the
+receiver's opaque durable selector generation. Zero is canonical only for an
+empty interest; otherwise the generation is at least the number of projected
+selectors. The value discloses neither Carry versus Consume nor any selector
+beyond the already protected interest. A send-suppression receipt is valid only
+for the exact authenticated generation that produced it. Consequently a hidden
+Carry-to-Consume change invalidates the old hint and permits one bounded
+reoffer, including when ReceiveOnly deliberately supplies no inventory. The
+sender receipt table is also bounded at 262,144 hints and deterministically
+replaces a hint at saturation, so an unchanged generation may receive a bounded
+duplicate offer after its exact hint is displaced.
+
+Each v3 offer is acknowledged with a protected, exchange-bound result. The
+receiver-relative `Satisfied` disposition covers both Carry retention and
+Consume content acceptance. `ContentAcceptancePending` means only that the
+offered bytes were retained route-only while the receiver required Consume; it
+removes any suppression receipt and, while the exact item remains live and
+retryable, retains the bounded retry/backoff record. For
+`ContentAcceptancePending`, expiry or retirement during settlement drains the
+lease without creating a retry or receipt.
+Normal reconciliation may settle a retry when its authenticated common set
+proves the peer already holds the transfer. Blind ReceiveOnly contacts cannot
+make that inference.
 
 If finite-TTL age cannot be bounded across reboot or power loss, the node MUST
 mark the item non-forwardable until a trusted time source proves it unexpired; it
 MAY retain it locally with an indeterminate-age annotation. Durable items are not
 affected. An item known locally to have `age >= TTL` MUST NOT be offered,
 requested, retransmitted, or sent and MUST enter garbage collection.
+
+That trusted-time recovery rule is available to profiles that define such a
+proof. The selected Event implementation does not: clock-domain loss is sticky,
+the exact transfer remains withheld, and recovery requires an
+application-specific replacement or a new source revision.
 
 Session counters/windows, full ItemID deduplication, publisher counter ledgers,
 mission epochs, and control-chain rollback checks ensure captured traffic is not
@@ -691,24 +944,41 @@ infer real age from a capture alone; provisioning epochs bound this case.
 ## 11. Priority, retry, eviction, and emissions
 
 Wire priorities are fixed: 0 ROUTINE, 1 PRIORITY, 2 IMMEDIATE, 3 FLASH. Doctrine
-profiles MAY change display names but not ordinals. Publisher priority is capped
-before signing by topic/integrator policy. A bridge may locally suppress or
-demote scheduling but never rewrite the source-signed priority, reset custody
-age, or extend TTL.
+profiles MAY change display names but not ordinals. The selected Event API signs
+the caller-supplied priority directly; it does not currently apply a
+topic/integrator default, cap, or override. The generic semantic `Engine` can be
+configured with a global publisher-priority cap, but that is a distinct API
+surface. A bridge may locally suppress or demote scheduling but never rewrite
+the source-signed priority, reset custody age, or extend TTL.
 
 When eligible work is queued, higher priority receives earlier initial
-transmission, greater in-flight allowance, and later eviction. Within a priority
+transmission and earlier retry deadlines; due work is sent in priority/queue
+order while respecting the adapter's minimum retry interval. Within a priority
 lane, bounded fairness and expiry urgency prevent a Blob from monopolizing a
-link. The authenticated runtime also gives higher priority earlier retry
-deadlines and sends due work in priority/queue order while respecting the
-adapter's minimum retry interval. At saturation, higher-priority work may
-replace only lower-priority expendable NODE, WANT, or DATA retries. Retained
-INTEREST, SUMMARY, and PROBE causal work is not silently evicted. Exact queue
-and byte ceilings are in §18.
+link. At saturation, higher-priority work may replace lower-priority expendable
+NODE, WANT, or DATA retries. The selected
+Event-custody ledger additionally permits deterministic replacement of an
+inactive equal-priority backoff hint, preferring the incoming peer's own hint,
+so one peer cannot monopolize the shared bound. This never removes the custody
+item or an active lease; displaced work becomes eligible again without its old
+delay. Retained INTEREST, SUMMARY, and PROBE causal work is not silently
+evicted. Exact queue and byte ceilings are in §18.
 
-Committed storage pressure evicts expired data, then unconsumed relay data, then
-uses ascending priority/nearest expiry/oldest policy order. Current keys,
-revocation/control state, and retained tombstone fences use reserved quota.
+Committed storage pressure fixes its candidate partition once at the start of
+the atomic admission. If the exact scope is short, every same-scope candidate
+ranks ahead of every off-scope candidate for that transaction; otherwise all
+candidates form one aggregate cohort. Within each cohort it evicts expired data
+first. Consequently a simultaneous aggregate shortage can consume a same-scope
+live candidate before an off-scope expired candidate. For ordinary selected
+Event/RouteEvent admission, only a live row whose priority is strictly lower
+than the incoming demand is eligible; eligible rows then rank unconsumed
+route-only data, ascending priority, nearest expiry, oldest acceptance, and
+exact key. Emergency aggregate admission for authority/control or the selected
+tombstone partition may bypass that live-priority cutoff, but never the
+live/non-expired protection, pending-delivery, tombstone, or retirement
+exclusions. Expiry is an absolute lifetime decision and may retire an otherwise
+protected row. Current keys, revocation/control state, and retained tombstone
+fences use reserved quota.
 
 The reference isolates unauthenticated transfer staging from committed-record
 eviction. It reserves one quarter of configured `max_bytes`, capped at 64 MiB
@@ -722,17 +992,29 @@ even though the fixed envelope format has a larger bound.
 
 Emission modes are:
 
-- `Normal`: all eligible traffic and discovery.
-- `AtLeast(p)`: no discovery; application and supporting control traffic below
-  `p` is suppressed.
-- `ReceiveOnly`: no discovery, inventory, or item transmission; mandatory
-  authentication/link acknowledgements may occur to ingest on connection-oriented
-  transports.
+- `Normal`: all eligible application traffic and configured contact initiation.
+- `AtLeast(p)`: Event application objects below `p` are withheld. It does not by
+  itself disable configured contact initiation, the protocol/control work
+  needed to authenticate and complete an allowed contact, semantic-v4/v5
+  State/Record reconciliation, or semantic-v5 Blob transfer; the threshold is
+  Event-only.
+- `ReceiveOnly`: no contact initiation, discovery, inventory disclosure, or
+  application/control object transmission; mandatory connection
+  authentication, acknowledgements, and bounded apply results may occur while
+  ingesting authenticated inbound Event work. It initiates and discloses no
+  semantic-v4/v5 State/Record lane or semantic-v5 Blob lane.
 - `PassiveOnly`: zero framework-originated bytes; receives only unsolicited
   independently protected broadcast/push.
 
-The physical distinction is mandatory in operator presentation and remains a
-stakeholder-validation item.
+The selected Iroh endpoint has hosted discovery, public/default relay
+substitution, and port mapping disabled in every mode; those deployment
+properties are not effects of `AtLeast`. When one controlled relay is selected,
+direct-plus-relay startup does not wait for relay readiness, while the explicit
+relay-only mode requires readiness and disables IP transport. Neither choice
+changes the Event emission meaning above. The selected API ships the first
+three modes but not `PassiveOnly`. Physical emission measurement and the
+distinction between receive-only protocol responses and literal radio silence
+remain stakeholder-validation items.
 
 ## 12. Scopes, topics, relay, and bridge policy
 
@@ -757,7 +1039,7 @@ is persisted with the authorization. The former format `1` and bare root-signed
 control shape are not accepted. Exact fields and signature input are in
 [envelope.md](envelope.md) §6.2.
 
-The semantic-version-2 bridge path decrypts protected route metadata, evaluates
+The semantic-version-2/3/v4/v5 bridge path decrypts protected route metadata, evaluates
 an authority-issued exact directed-edge policy plus a local narrowing filter,
 and creates a destination routing wrapper around the byte-identical format-2
 source envelope. ObjectKind 4 authorization controls and ObjectKind 5 wrappers
@@ -832,8 +1114,10 @@ The key schedule uses exact concatenation of the 32-byte P-256 ECDH result and
 direction/protection/confirmation labels. The stable handshake framing,
 credential/envelope encoding, cryptographic profile, and replication wire
 profile remain version `1`. Inside that framing, a default initiator offers
-semantic versions `[2, 1]`; an honest current responder selects the highest
-common value, so current peers select `2` and a v1-only peer selects `1`. The
+semantic versions `[5, 4, 3, 2, 1]`; an honest current responder selects the highest
+common value, so current peers select `5`, a v4-only peer selects `4`, a v3-only peer selects `3`, a v2-only
+peer selects `2`, and a
+v1-only peer selects `1`. The
 selected semantic version is bound into the public transcript, key schedule,
 key confirmations, and hybrid handshake authentication.
 
@@ -937,6 +1221,43 @@ is authenticated before semantic parsing. Fragmentation and reassembly are owned
 by the core runtime; IP and BTLE adapters carry opaque core fragments and MUST
 NOT create an incompatible adapter-specific fragmentation protocol. For an MTU
 too small for mandatory security overhead, the core uses the link's reported MTU.
+
+The selected Iroh carrier additionally supports one controlled route below the
+Aster mission session. Configuration pins exactly one HTTPS relay root origin of
+at most 2 KiB: it must have a host, use the root path, and contain no user
+information, query, or fragment. Trust is explicitly either the embedded WebPKI
+root set or one to eight nonempty DER CA roots, each at most 64 KiB and at most
+256 KiB combined.
+An explicit DER set replaces WebPKI; there is no insecure TLS mode, trust
+fallback, or second/public/default relay candidate. Hosted address lookup and
+port mapping remain disabled.
+
+A controlled `PeerRoute` serializes to at most 3,072 bytes and binds the exact
+Iroh endpoint ID, the sole relay origin, and zero to eight sorted unique initial
+direct socket locators. The reusable carrier API accepts all eight; the current
+`aster node` CLI supplies one initial socket for each existing `--peer` value.
+These are initial locators,
+not lifetime address pins. Iroh may probe direct and relay paths in parallel and,
+after authenticating the exact endpoint, may derive later direct paths through
+its NAT negotiation. The profile therefore makes no direct-first ordering,
+temporal fallback, or representative NAT claim. Relay-only binding supplies no
+IP transport and waits for the pinned relay to become ready; direct-plus-relay
+binding retains IP and does not block startup on relay readiness.
+
+For one authenticated connection, a `PathWitness` reports the last observed
+Direct or Relay selection and at most 1,024 coalesced observed path-kind
+transitions. Ordinary path closure retains the last selection. A missing initial
+observation or lost observation continuity reports Unknown, and lost continuity
+or reaching the transition cap marks the witness saturated. This telemetry is
+diagnostic only: it never establishes endpoint or mission identity, admission,
+authorization, receipt validity, or replication success.
+
+The controlled Iroh relay is connectivity infrastructure below peer QUIC; it is
+not the payload-blind Aster Event relay described in §12 and holds no Aster store
+or route grant. The route-only Blob relay design remains unselected. Adding this
+carrier path changes no semantic version, stable replication wire/profile or C
+ABI version, security-object format, source object, or `aster-carrier/1`
+framing.
 
 Reassembly is bounded globally and per authenticated adjacency. Duplicate
 segments are harmless. Length overflow and excessive sparse state fail within
@@ -1164,29 +1485,39 @@ version, cryptographic suite ID, and object/data-class registries are separate.
 A transport addition changes none of them. `PROTOCOL_VERSION` and the legacy C
 `aster_protocol_version()` report stable replication-wire/profile version `1`;
 the unambiguous replication-wire surfaces also report `1`, while the default and
-highest-supported semantic-version surfaces report `2`.
+highest-supported semantic-version surfaces report `4`.
 
-The current handshake negotiates semantic versions `2` and `1` and the complete
-suite `0x0001`. Offers are nonempty, nonzero, duplicate-free canonical descending
-lists of at most 16 values. The responder selects the highest common semantic
+The current handshake negotiates semantic versions `4`, `3`, `2`, and `1` and the
+complete suite `0x0001`. Offers are nonempty, nonzero, duplicate-free canonical
+descending lists of at most 16 values. The responder selects the highest common semantic
 version and its locally preferred complete common suite; the initiator requires
 both selections to have been offered and to be locally supported. Semantic `1`
 permits transfer object kinds `1` (source envelope) and `2` (Blob chunk).
-Semantic `2` additionally permits the reserved kinds `3` (source-batch proof),
-`4` (bridge authorization), and `5` (bridge-route wrapper). A v1 session filters
+Semantics `2`, `3`, `4`, and `5` additionally permit the reserved kinds `3`
+(source-batch proof), `4` (bridge authorization), and `5` (bridge-route
+wrapper). Semantics `3`, `4`, and `5` add the bounded session custody record in
+[envelope.md](envelope.md) §7.1; neither allocates another stable object kind.
+Semantics `4` and `5` enable the §9.1 selected State/Record mechanics frames;
+semantic `5` additionally enables the §9.2 selected Blob mechanics frames. A
+v1-v3 selected-node session filters all mutable frames, and v4 filters all Blob
+frames, completely.
+A v1 session filters
 those extended kinds before inventory-root construction and rejects them in
 messages, durable progress, and transfer events rather than silently processing
-v2 semantics. Semantic 1 also rejects envelope format 3 and compact batch
-authentication. Semantic 2 permits both the unchanged format-2 singleton and
-the §6.1 format-3 batch representation; negotiated semantics never rewrite
-stored stable bytes.
+v2/v3/v4/v5 semantics. Semantic 1 also rejects envelope format 3 and compact batch
+authentication. Semantics 2, 3, 4, and 5 permit both the unchanged format-2
+singleton and the §6.1 format-3 batch representation; negotiated semantics
+never rewrite stored stable bytes.
 
 Durable ranged-transfer progress records the immutable semantic version under
 which the object was first admitted. A source object first admitted under v1 may
-resume on v1 or v2; a source first admitted under v2 may resume only on v2.
-Recognized stable Blob carriers admitted under either version may resume on
-either version, while v2-only kinds `3..5` resume only on v2. Migrated progress
+resume on v1, v2, v3, or v4; a source first admitted under v2, v3, or v4 may
+resume only on v2, v3, or v4. Recognized stable Blob carriers admitted under any supported
+version may resume on any supported version, while extended kinds `3..5` resume
+only on v2, v3, or v4. Migrated progress
 without trustworthy origin-version provenance is suppressed rather than guessed.
+Selected mutable State/Record transfer itself remains v4-only regardless of the
+stable source object's earlier compatibility provenance.
 Eligibility filtering occurs before page limits so incompatible early rows
 cannot starve later compatible work.
 
@@ -1217,10 +1548,13 @@ outbound, and replay limits:
 
 | Resource | Bound | Saturation behavior |
 |---|---:|---|
-| retained retry records | 128 entries | higher priority may replace only lower-priority expendable NODE/WANT/DATA work; otherwise backpressure or deferred WANT |
+| retained retry records | 128 entries | higher priority replaces lower-priority expendable work first; selected Event custody may replace an inactive equal-priority backoff hint deterministically without deleting the item or an active lease; otherwise backpressure or deferred WANT |
 | one-shot logical outbox | 128 entries | new one-shot work returns explicit backpressure |
 | retained handshake flight | 1 entry | a causal authenticated next flight replaces or retires it |
 | combined pending logical bytes | 16 MiB | checked before every retry insert/refresh, outbox insert, and handshake replacement |
+| selected mutable object | 1 MiB | oversized State/Record bytes fail before durable admission; malformed or unauthorized bytes remain fatal |
+| selected mutable class | 4,096 rows and 16 MiB encoded source bytes, independently for State and Record | an otherwise valid new object receives `DeferredCapacity`; no existing mutable row is pruned |
+| mutable fairness cursor | 256 configured mission peers, 4 peer/class/local-mode rows each, 1,024 rows total | startup rejects an overbound configured set and prunes rows for peers no longer configured; ordinary data quota cannot consume the reserve |
 | logical sends per pump | 128 | remaining due work keeps its monotonic deadline |
 | UDP datagrams examined per adapter poll | 64 | yields `None`; a later poll may continue queued input |
 | discardable unauthenticated carrier failures per runtime pump | 64 | yields with the contact intact; subsequent valid input can progress |
@@ -1275,8 +1609,8 @@ and visible quota/eviction policy. Evictions and conflicts surface to the app.
 | class | 0 State, 1 Event, 2 Record, 3 Blob; every other value rejected in profile 1 |
 | priority | 0 Routine, 1 Priority, 2 Immediate, 3 Flash |
 | message | 1 Interest, 2 Summary, 3 Probe, 4 Node, 5 Offer, 6 Want, 7 Data, 8 Receipt |
-| transfer object kind | semantic 1: 1 source envelope, 2 Blob chunk; semantic 2 adds 3 source-batch proof, 4 bridge authorization, 5 bridge-route wrapper |
-| source envelope format | 2 singleton hybrid authentication; semantic 2 adds 3 content-committing batch authentication |
+| transfer object kind | semantic 1: 1 source envelope, 2 Blob chunk; semantics 2, 3, 4, and 5 add 3 source-batch proof, 4 bridge authorization, 5 bridge-route wrapper; semantics 4 and 5 add selected State/Record mechanics frames, and semantic 5 adds selected Blob mechanics frames, without allocating another object kind |
+| source envelope format | 2 singleton hybrid authentication; semantics 2, 3, 4, and 5 add 3 content-committing batch authentication |
 | batch authentication mode | 1 exact proof reference, Merkle path, and P-256 item signature |
 | suite | `0x0001` provisional hybrid reference suite |
 | map field | unknown `0..63` critical; unknown `64..2^64-1` optional |
@@ -1296,7 +1630,7 @@ forbidden. The closed fixed-binary magic, kind, and role registries are in
 - Encryption does not hide traffic analysis.
 - PQ handshakes/signatures remain large; caching/batching reduces frequency only.
 - Format 2 carries a full credential and two large signatures per singleton
-  source envelope. The semantic-v2 provider and atomic explicit batch
+  source envelope. The semantic-v2/v3/v4/v5 provider and atomic explicit batch
   source/store/application path plus reference peer proof/compact runtime
   amortize transferred verification bytes, but the required 3 kbps end-to-end
   measurement and independent interoperability remain separate gates.

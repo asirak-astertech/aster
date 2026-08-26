@@ -1,12 +1,16 @@
-use aster_mesh::{Scope, Topic};
-use aster_negentropy::MAX_FRAME_SIZE_LIMIT;
-use aster_redb_store::{ControlTransferId, EventTransferId, RecordTransferId, StateTransferId};
+use aster_mesh::{MAX_CUSTODY_WRAPPER_BYTES, Priority, Scope, Topic};
+use aster_negentropy::{MAX_CARDINALITY_LIMIT, MAX_FRAME_SIZE_LIMIT};
+use aster_redb_store::{
+    BlobTransferId, ControlTransferId, EventTransferId, RecordTransferId, StateTransferId,
+};
 
 use crate::NodeError;
 
 const MAGIC: &[u8; 4] = b"ASM\x01";
 const EVENT_INTEREST: u8 = 0x09;
 const EVENT_INTEREST_REPLY: u8 = 0x0a;
+const EVENT_INTEREST_REPLY_V3: u8 = 0x0b;
+const EVENT_INTEREST_V3: u8 = 0x0c;
 const INVENTORY_QUERY: u8 = 0x11;
 const INVENTORY_REPLY: u8 = 0x12;
 const INVENTORY_COMPLETE: u8 = 0x13;
@@ -15,12 +19,18 @@ const DIFFERENCE_QUERY: u8 = 0x15;
 const DIFFERENCE_REPLY: u8 = 0x16;
 const DIFFERENCE_BOUND: u8 = 0x17;
 const DIFFERENCE_BOUND_ACK: u8 = 0x18;
+const EVENT_LANE_DEFERRED: u8 = 0x19;
+const EVENT_LANE_DEFERRED_ACK: u8 = 0x1a;
 const FETCH: u8 = 0x21;
 const OBJECT: u8 = 0x22;
 const OFFER: u8 = 0x23;
 const APPLY_RESULT: u8 = 0x24;
+const OFFER_V3: u8 = 0x25;
+const APPLY_RESULT_V3: u8 = 0x26;
 const FINISH: u8 = 0x31;
 const FINISHED: u8 = 0x32;
+const FINISH_V3: u8 = 0x33;
+const FINISHED_V3: u8 = 0x34;
 const CONTROL_INVENTORY_QUERY: u8 = 0x41;
 const CONTROL_INVENTORY_REPLY: u8 = 0x42;
 const CONTROL_INVENTORY_COMPLETE: u8 = 0x43;
@@ -29,6 +39,7 @@ const CONTROL_DIFFERENCE_QUERY: u8 = 0x45;
 const CONTROL_DIFFERENCE_REPLY: u8 = 0x46;
 const CONTROL_DIFFERENCE_BOUND: u8 = 0x47;
 const CONTROL_DIFFERENCE_BOUND_ACK: u8 = 0x48;
+const CONTROL_INVENTORY_REPLY_V3: u8 = 0x49;
 const CONTROL_FETCH: u8 = 0x51;
 const CONTROL_OBJECT: u8 = 0x52;
 const CONTROL_OFFER: u8 = 0x53;
@@ -37,6 +48,8 @@ const CONTROL_FINISH: u8 = 0x61;
 const CONTROL_FINISHED: u8 = 0x62;
 const MUTABLE_INTEREST: u8 = 0x69;
 const MUTABLE_INTEREST_REPLY: u8 = 0x6a;
+const BLOB_INTEREST: u8 = 0x6b;
+const BLOB_INTEREST_REPLY: u8 = 0x6c;
 const MUTABLE_INVENTORY_QUERY: u8 = 0x71;
 const MUTABLE_INVENTORY_REPLY: u8 = 0x72;
 const MUTABLE_INVENTORY_COMPLETE: u8 = 0x73;
@@ -45,17 +58,31 @@ const MUTABLE_DIFFERENCE_QUERY: u8 = 0x75;
 const MUTABLE_DIFFERENCE_REPLY: u8 = 0x76;
 const MUTABLE_DIFFERENCE_BOUND: u8 = 0x77;
 const MUTABLE_DIFFERENCE_BOUND_ACK: u8 = 0x78;
+const MUTABLE_LANE_DEFERRED: u8 = 0x79;
+const MUTABLE_LANE_DEFERRED_ACK: u8 = 0x7a;
 const MUTABLE_FETCH: u8 = 0x81;
 const MUTABLE_OBJECT: u8 = 0x82;
 const MUTABLE_OFFER: u8 = 0x83;
 const MUTABLE_APPLY_RESULT: u8 = 0x84;
+const MUTABLE_FETCH_RESULT: u8 = 0x85;
+const MUTABLE_FETCH_RESULT_ACK: u8 = 0x86;
 const MUTABLE_FINISH: u8 = 0x91;
 const MUTABLE_FINISHED: u8 = 0x92;
+const BLOB_RANGE_FETCH: u8 = 0xa1;
+const BLOB_RANGE: u8 = 0xa2;
+const BLOB_RANGE_RESULT: u8 = 0xa5;
+const BLOB_RANGE_RESULT_ACK: u8 = 0xa6;
+const BLOB_CARRIER_FINISH: u8 = 0xb1;
+const BLOB_CARRIER_FINISHED: u8 = 0xb2;
 pub(crate) const MAX_OBJECT_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_BLOB_RANGE_BYTES: usize = 16 * 1024;
+pub(crate) const BLOB_CONTENT_PROOF_BYTES: usize = 32;
 pub(crate) const MAX_EVENT_INTEREST_SELECTORS: usize = 256;
 const MAX_EVENT_NAME_BYTES: usize = 128;
-const MAX_EVENT_INTEREST_BYTES: usize =
+pub(crate) const MAX_EVENT_INTEREST_BYTES: usize =
     2 + MAX_EVENT_INTEREST_SELECTORS * (2 + MAX_EVENT_NAME_BYTES + 2 + MAX_EVENT_NAME_BYTES + 1);
+pub(crate) const MAX_BLOB_INTEREST_BYTES: usize = 2 + MAX_EVENT_INTEREST_SELECTORS
+    * (2 + MAX_EVENT_NAME_BYTES + 2 + MAX_EVENT_NAME_BYTES + 8 + BLOB_CONTENT_PROOF_BYTES);
 
 /// Receiver of Events selected by one directional reconciliation lane.
 ///
@@ -65,6 +92,73 @@ const MAX_EVENT_INTEREST_BYTES: usize =
 pub(crate) enum EventDirection {
     ToSessionInitiator,
     ToSessionResponder,
+}
+
+/// Bounded operator emission state disclosed only as a protected v3 response.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FrameEmissionPolicy {
+    Normal,
+    AtLeast(Priority),
+    ReceiveOnly,
+}
+
+/// Receiver-relative result for one authenticated semantic-v3 Event offer.
+///
+/// This reports whether the exact bytes satisfied the receiver's requested
+/// durability level. `Satisfied` preserves ambiguity between Carry retention
+/// and Consume acceptance. `ContentAcceptancePending` deliberately reveals,
+/// only for this offered object, that stronger acceptance was required but
+/// unavailable; it discloses neither the selector set nor unrelated inventory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EventApplyDisposition {
+    Satisfied,
+    ContentAcceptancePending,
+}
+
+impl EventApplyDisposition {
+    const fn encode(self) -> u8 {
+        match self {
+            Self::Satisfied => 1,
+            Self::ContentAcceptancePending => 2,
+        }
+    }
+
+    fn decode(value: u8) -> Result<Self, NodeError> {
+        match value {
+            1 => Ok(Self::Satisfied),
+            2 => Ok(Self::ContentAcceptancePending),
+            _ => Err(NodeError::Protocol(
+                "v3 Event apply disposition is unknown".into(),
+            )),
+        }
+    }
+}
+
+impl FrameEmissionPolicy {
+    const fn encode(self) -> u8 {
+        match self {
+            Self::Normal => 0,
+            Self::AtLeast(Priority::Routine) => 1,
+            Self::AtLeast(Priority::Priority) => 2,
+            Self::AtLeast(Priority::Immediate) => 3,
+            Self::AtLeast(Priority::Flash) => 4,
+            Self::ReceiveOnly => 5,
+        }
+    }
+
+    fn decode(value: u8) -> Result<Self, NodeError> {
+        match value {
+            0 => Ok(Self::Normal),
+            1 => Ok(Self::AtLeast(Priority::Routine)),
+            2 => Ok(Self::AtLeast(Priority::Priority)),
+            3 => Ok(Self::AtLeast(Priority::Immediate)),
+            4 => Ok(Self::AtLeast(Priority::Flash)),
+            5 => Ok(Self::ReceiveOnly),
+            _ => Err(NodeError::Protocol(
+                "protected emission policy is unknown".into(),
+            )),
+        }
+    }
 }
 
 impl EventDirection {
@@ -91,6 +185,7 @@ impl EventDirection {
 pub(crate) enum MutableClass {
     State,
     Record,
+    Blob,
 }
 
 impl MutableClass {
@@ -98,6 +193,7 @@ impl MutableClass {
         match self {
             Self::State => 1,
             Self::Record => 2,
+            Self::Blob => 3,
         }
     }
 
@@ -105,8 +201,42 @@ impl MutableClass {
         match value {
             1 => Ok(Self::State),
             2 => Ok(Self::Record),
+            3 => Ok(Self::Blob),
             _ => Err(NodeError::Protocol(
                 "mutable source-object class is unknown or missing".into(),
+            )),
+        }
+    }
+}
+
+/// Receiver-local outcome for one fully verified mutable source object.
+///
+/// Capacity deferral is distinct from a duplicate: the authenticated object
+/// remains outstanding for a later lane, while integrity and policy failures
+/// remain fatal and never acquire a wire disposition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MutableApplyDisposition {
+    Duplicate,
+    Inserted,
+    DeferredCapacity,
+}
+
+impl MutableApplyDisposition {
+    const fn encode(self) -> u8 {
+        match self {
+            Self::Duplicate => 0,
+            Self::Inserted => 1,
+            Self::DeferredCapacity => 2,
+        }
+    }
+
+    fn decode(value: u8) -> Result<Self, NodeError> {
+        match value {
+            0 => Ok(Self::Duplicate),
+            1 => Ok(Self::Inserted),
+            2 => Ok(Self::DeferredCapacity),
+            _ => Err(NodeError::Protocol(
+                "mutable apply disposition is unknown".into(),
             )),
         }
     }
@@ -117,6 +247,7 @@ impl MutableClass {
 pub(crate) enum MutableTransferId {
     State(StateTransferId),
     Record(RecordTransferId),
+    Blob(BlobTransferId),
 }
 
 impl MutableTransferId {
@@ -124,6 +255,7 @@ impl MutableTransferId {
         match self {
             Self::State(_) => MutableClass::State,
             Self::Record(_) => MutableClass::Record,
+            Self::Blob(_) => MutableClass::Blob,
         }
     }
 
@@ -131,6 +263,101 @@ impl MutableTransferId {
         match self {
             Self::State(id) => id.as_bytes(),
             Self::Record(id) => id.as_bytes(),
+            Self::Blob(id) => id.as_bytes(),
+        }
+    }
+}
+
+/// Exact typed identity of one canonical encrypted Blob chunk carrier.
+///
+/// The fixed representation is the protocol `ObjectId` wire form
+/// `BlobChunk(2):u8 || digest:32`. No other object kind is accepted here.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct BlobObjectId([u8; 33]);
+
+impl BlobObjectId {
+    const BLOB_CHUNK_KIND: u8 = 2;
+
+    pub(crate) fn new(digest: [u8; 32]) -> Self {
+        let mut bytes = [0u8; 33];
+        bytes[0] = Self::BLOB_CHUNK_KIND;
+        bytes[1..].copy_from_slice(&digest);
+        Self(bytes)
+    }
+
+    pub(crate) const fn as_bytes(&self) -> &[u8; 33] {
+        &self.0
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, NodeError> {
+        if bytes.len() != 33 || bytes[0] != Self::BLOB_CHUNK_KIND {
+            return Err(NodeError::Protocol(
+                "Blob carrier object identifier differs".into(),
+            ));
+        }
+        let mut object = [0u8; 33];
+        object.copy_from_slice(bytes);
+        Ok(Self(object))
+    }
+}
+
+/// Sender outcome for one exact Blob carrier range request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BlobRangeDisposition {
+    Data,
+    Unavailable,
+}
+
+impl BlobRangeDisposition {
+    const fn encode(self) -> u8 {
+        match self {
+            Self::Data => 1,
+            Self::Unavailable => 2,
+        }
+    }
+
+    fn decode(value: u8) -> Result<Self, NodeError> {
+        match value {
+            1 => Ok(Self::Data),
+            2 => Ok(Self::Unavailable),
+            _ => Err(NodeError::Protocol(
+                "Blob range disposition is unknown".into(),
+            )),
+        }
+    }
+}
+
+/// Receiver outcome for one exact Blob carrier range response.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BlobRangeApplyDisposition {
+    Partial,
+    Complete,
+    Duplicate,
+    DeferredCapacity,
+    Unavailable,
+}
+
+impl BlobRangeApplyDisposition {
+    const fn encode(self) -> u8 {
+        match self {
+            Self::Partial => 1,
+            Self::Complete => 2,
+            Self::Duplicate => 3,
+            Self::DeferredCapacity => 4,
+            Self::Unavailable => 5,
+        }
+    }
+
+    fn decode(value: u8) -> Result<Self, NodeError> {
+        match value {
+            1 => Ok(Self::Partial),
+            2 => Ok(Self::Complete),
+            3 => Ok(Self::Duplicate),
+            4 => Ok(Self::DeferredCapacity),
+            5 => Ok(Self::Unavailable),
+            _ => Err(NodeError::Protocol(
+                "Blob range apply disposition is unknown".into(),
+            )),
         }
     }
 }
@@ -214,10 +441,112 @@ impl EventInterest {
     }
 }
 
+/// One exact content-key entitlement offered for protected Blob replication.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct BlobInterestSelector {
+    topic: Topic,
+    scope: Scope,
+    epoch: u64,
+    content_proof: [u8; BLOB_CONTENT_PROOF_BYTES],
+}
+
+impl BlobInterestSelector {
+    pub(crate) const fn new(
+        topic: Topic,
+        scope: Scope,
+        epoch: u64,
+        content_proof: [u8; BLOB_CONTENT_PROOF_BYTES],
+    ) -> Self {
+        Self {
+            topic,
+            scope,
+            epoch,
+            content_proof,
+        }
+    }
+
+    pub(crate) const fn topic(&self) -> &Topic {
+        &self.topic
+    }
+
+    pub(crate) const fn scope(&self) -> &Scope {
+        &self.scope
+    }
+
+    pub(crate) const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    pub(crate) const fn content_proof(&self) -> &[u8; BLOB_CONTENT_PROOF_BYTES] {
+        &self.content_proof
+    }
+}
+
+/// Canonical protected v5 Blob interest with exact topic/scope selectors.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct BlobInterest(Vec<BlobInterestSelector>);
+
+impl BlobInterest {
+    pub(crate) fn new(mut selectors: Vec<BlobInterestSelector>) -> Result<Self, NodeError> {
+        if selectors.len() > MAX_EVENT_INTEREST_SELECTORS {
+            return Err(NodeError::Protocol(format!(
+                "Blob interest selector count exceeds {MAX_EVENT_INTEREST_SELECTORS}"
+            )));
+        }
+        selectors.sort_unstable();
+        selectors.dedup();
+        if selectors
+            .windows(2)
+            .any(|pair| pair[0].topic() == pair[1].topic() && pair[0].scope() == pair[1].scope())
+        {
+            return Err(NodeError::Protocol(
+                "Blob interest repeats an exact topic/scope selector".into(),
+            ));
+        }
+        Ok(Self(selectors))
+    }
+
+    pub(crate) const fn empty() -> Self {
+        Self(Vec::new())
+    }
+
+    pub(crate) fn selectors(&self) -> &[BlobInterestSelector] {
+        &self.0
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub(crate) fn selector(&self, topic: &Topic, scope: &Scope) -> Option<&BlobInterestSelector> {
+        self.0
+            .iter()
+            .find(|selector| selector.topic() == topic && selector.scope() == scope)
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum Frame {
     EventInterest(EventInterest),
+    EventInterestV3 {
+        interest: EventInterest,
+        selector_revision: u64,
+        policy: FrameEmissionPolicy,
+        policy_revision: u64,
+    },
     EventInterestReply(EventInterest),
+    EventInterestReplyV3 {
+        interest: EventInterest,
+        selector_revision: u64,
+        policy: FrameEmissionPolicy,
+        policy_revision: u64,
+    },
+    BlobInterest(BlobInterest),
+    BlobInterestReply(BlobInterest),
     InventoryQuery {
         direction: EventDirection,
         bytes: Vec<u8>,
@@ -246,6 +575,12 @@ pub(crate) enum Frame {
     DifferenceBoundAck {
         direction: EventDirection,
     },
+    EventLaneDeferred {
+        direction: EventDirection,
+    },
+    EventLaneDeferredAck {
+        direction: EventDirection,
+    },
     Fetch {
         direction: EventDirection,
         id: EventTransferId,
@@ -260,13 +595,32 @@ pub(crate) enum Frame {
         id: EventTransferId,
         bytes: Vec<u8>,
     },
+    OfferV3 {
+        direction: EventDirection,
+        id: EventTransferId,
+        exchange_id: u64,
+        custody: Vec<u8>,
+        bytes: Vec<u8>,
+    },
     ApplyResult {
         direction: EventDirection,
         id: EventTransferId,
         inserted: bool,
     },
+    ApplyResultV3 {
+        direction: EventDirection,
+        id: EventTransferId,
+        exchange_id: u64,
+        inserted: bool,
+        disposition: EventApplyDisposition,
+    },
     ControlInventoryQuery(Vec<u8>),
     ControlInventoryReply(Vec<u8>),
+    ControlInventoryReplyV3 {
+        bytes: Vec<u8>,
+        policy: FrameEmissionPolicy,
+        policy_revision: u64,
+    },
     ControlInventoryComplete,
     ControlInventoryCompleteAck,
     ControlDifferenceQuery(Vec<u8>),
@@ -293,6 +647,14 @@ pub(crate) enum Frame {
     },
     Finished {
         direction: EventDirection,
+    },
+    FinishV3 {
+        direction: EventDirection,
+        remaining: u64,
+    },
+    FinishedV3 {
+        direction: EventDirection,
+        remaining: u64,
     },
     MutableInterest {
         class: MutableClass,
@@ -338,6 +700,14 @@ pub(crate) enum Frame {
         class: MutableClass,
         direction: EventDirection,
     },
+    MutableLaneDeferred {
+        class: MutableClass,
+        direction: EventDirection,
+    },
+    MutableLaneDeferredAck {
+        class: MutableClass,
+        direction: EventDirection,
+    },
     MutableFetch {
         direction: EventDirection,
         id: MutableTransferId,
@@ -355,19 +725,90 @@ pub(crate) enum Frame {
     MutableApplyResult {
         direction: EventDirection,
         id: MutableTransferId,
-        inserted: bool,
+        disposition: MutableApplyDisposition,
+    },
+    MutableFetchResult {
+        direction: EventDirection,
+        id: MutableTransferId,
+        disposition: MutableApplyDisposition,
+    },
+    MutableFetchResultAck {
+        direction: EventDirection,
+        id: MutableTransferId,
+        disposition: MutableApplyDisposition,
     },
     MutableFinish {
         class: MutableClass,
         direction: EventDirection,
+        remaining: u64,
     },
     MutableFinished {
         class: MutableClass,
         direction: EventDirection,
+        remaining: u64,
+    },
+    BlobRangeFetch {
+        direction: EventDirection,
+        source_id: BlobTransferId,
+        object_id: BlobObjectId,
+        total_len: u64,
+        offset: u64,
+        requested_len: u32,
+        content_proof: [u8; BLOB_CONTENT_PROOF_BYTES],
+    },
+    BlobRange {
+        direction: EventDirection,
+        source_id: BlobTransferId,
+        object_id: BlobObjectId,
+        total_len: u64,
+        offset: u64,
+        requested_len: u32,
+        disposition: BlobRangeDisposition,
+        bytes: Vec<u8>,
+    },
+    BlobRangeResult {
+        direction: EventDirection,
+        source_id: BlobTransferId,
+        object_id: BlobObjectId,
+        total_len: u64,
+        offset: u64,
+        accepted_len: u32,
+        disposition: BlobRangeApplyDisposition,
+    },
+    BlobRangeResultAck {
+        direction: EventDirection,
+        source_id: BlobTransferId,
+        object_id: BlobObjectId,
+        total_len: u64,
+        offset: u64,
+        accepted_len: u32,
+        disposition: BlobRangeApplyDisposition,
+    },
+    BlobCarrierFinish {
+        direction: EventDirection,
+        remaining: u64,
+    },
+    BlobCarrierFinished {
+        direction: EventDirection,
+        remaining: u64,
     },
 }
 
 impl Frame {
+    pub(crate) const fn serves_application_or_control_object(&self) -> bool {
+        matches!(
+            self,
+            Self::Object { .. }
+                | Self::Offer { .. }
+                | Self::OfferV3 { .. }
+                | Self::ControlObject { .. }
+                | Self::ControlOffer { .. }
+                | Self::MutableObject { .. }
+                | Self::MutableOffer { .. }
+                | Self::BlobRange { .. }
+        )
+    }
+
     pub(crate) fn encode(&self) -> Result<Vec<u8>, NodeError> {
         let mut output = Vec::new();
         output.extend_from_slice(MAGIC);
@@ -376,9 +817,43 @@ impl Frame {
                 output.push(EVENT_INTEREST);
                 encode_event_interest(&mut output, interest)?;
             }
+            Self::EventInterestV3 {
+                interest,
+                selector_revision,
+                policy,
+                policy_revision,
+            } => {
+                require_selector_revision(interest, *selector_revision)?;
+                output.push(EVENT_INTEREST_V3);
+                output.push(policy.encode());
+                output.extend_from_slice(&policy_revision.to_be_bytes());
+                output.extend_from_slice(&selector_revision.to_be_bytes());
+                encode_event_interest(&mut output, interest)?;
+            }
             Self::EventInterestReply(interest) => {
                 output.push(EVENT_INTEREST_REPLY);
                 encode_event_interest(&mut output, interest)?;
+            }
+            Self::EventInterestReplyV3 {
+                interest,
+                selector_revision,
+                policy,
+                policy_revision,
+            } => {
+                require_selector_revision(interest, *selector_revision)?;
+                output.push(EVENT_INTEREST_REPLY_V3);
+                output.push(policy.encode());
+                output.extend_from_slice(&policy_revision.to_be_bytes());
+                output.extend_from_slice(&selector_revision.to_be_bytes());
+                encode_event_interest(&mut output, interest)?;
+            }
+            Self::BlobInterest(interest) => {
+                output.push(BLOB_INTEREST);
+                encode_blob_interest(&mut output, interest)?;
+            }
+            Self::BlobInterestReply(interest) => {
+                output.push(BLOB_INTEREST_REPLY);
+                encode_blob_interest(&mut output, interest)?;
             }
             Self::InventoryQuery { direction, bytes } => {
                 output.push(INVENTORY_QUERY);
@@ -416,6 +891,14 @@ impl Frame {
                 output.push(DIFFERENCE_BOUND_ACK);
                 output.push(direction.encode());
             }
+            Self::EventLaneDeferred { direction } => {
+                output.push(EVENT_LANE_DEFERRED);
+                output.push(direction.encode());
+            }
+            Self::EventLaneDeferredAck { direction } => {
+                output.push(EVENT_LANE_DEFERRED_ACK);
+                output.push(direction.encode());
+            }
             Self::Fetch { direction, id } => {
                 output.push(FETCH);
                 output.push(direction.encode());
@@ -441,6 +924,25 @@ impl Frame {
                 output.extend_from_slice(id.as_bytes());
                 encode_bytes(&mut output, bytes, MAX_OBJECT_BYTES, "Event offer")?;
             }
+            Self::OfferV3 {
+                direction,
+                id,
+                exchange_id,
+                custody,
+                bytes,
+            } => {
+                output.push(OFFER_V3);
+                output.push(direction.encode());
+                output.extend_from_slice(id.as_bytes());
+                output.extend_from_slice(&exchange_id.to_be_bytes());
+                encode_bytes(
+                    &mut output,
+                    custody,
+                    MAX_CUSTODY_WRAPPER_BYTES,
+                    "custody wrapper",
+                )?;
+                encode_bytes(&mut output, bytes, MAX_OBJECT_BYTES, "Event object")?;
+            }
             Self::ApplyResult {
                 direction,
                 id,
@@ -450,6 +952,20 @@ impl Frame {
                 output.push(direction.encode());
                 output.extend_from_slice(id.as_bytes());
                 output.push(u8::from(*inserted));
+            }
+            Self::ApplyResultV3 {
+                direction,
+                id,
+                exchange_id,
+                inserted,
+                disposition,
+            } => {
+                output.push(APPLY_RESULT_V3);
+                output.push(direction.encode());
+                output.extend_from_slice(id.as_bytes());
+                output.extend_from_slice(&exchange_id.to_be_bytes());
+                output.push(u8::from(*inserted));
+                output.push(disposition.encode());
             }
             Self::ControlInventoryQuery(bytes) => {
                 output.push(CONTROL_INVENTORY_QUERY);
@@ -462,6 +978,21 @@ impl Frame {
             }
             Self::ControlInventoryReply(bytes) => {
                 output.push(CONTROL_INVENTORY_REPLY);
+                encode_bytes(
+                    &mut output,
+                    bytes,
+                    MAX_FRAME_SIZE_LIMIT,
+                    "control inventory reply",
+                )?;
+            }
+            Self::ControlInventoryReplyV3 {
+                bytes,
+                policy,
+                policy_revision,
+            } => {
+                output.push(CONTROL_INVENTORY_REPLY_V3);
+                output.push(policy.encode());
+                output.extend_from_slice(&policy_revision.to_be_bytes());
                 encode_bytes(
                     &mut output,
                     bytes,
@@ -520,12 +1051,30 @@ impl Frame {
                 output.push(FINISHED);
                 output.push(direction.encode());
             }
+            Self::FinishV3 {
+                direction,
+                remaining,
+            } => encode_v3_finish(&mut output, FINISH_V3, *direction, *remaining)?,
+            Self::FinishedV3 {
+                direction,
+                remaining,
+            } => encode_v3_finish(&mut output, FINISHED_V3, *direction, *remaining)?,
             Self::MutableInterest { class, interest } => {
+                if *class == MutableClass::Blob {
+                    return Err(NodeError::Protocol(
+                        "Blob interest requires the protected v5 Blob interest frame".into(),
+                    ));
+                }
                 output.push(MUTABLE_INTEREST);
                 output.push(class.encode());
                 encode_event_interest(&mut output, interest)?;
             }
             Self::MutableInterestReply { class, interest } => {
+                if *class == MutableClass::Blob {
+                    return Err(NodeError::Protocol(
+                        "Blob interest reply requires the protected v5 Blob interest frame".into(),
+                    ));
+                }
                 output.push(MUTABLE_INTEREST_REPLY);
                 output.push(class.encode());
                 encode_event_interest(&mut output, interest)?;
@@ -602,6 +1151,14 @@ impl Frame {
                 output.push(MUTABLE_DIFFERENCE_BOUND_ACK);
                 encode_mutable_lane(&mut output, *class, *direction);
             }
+            Self::MutableLaneDeferred { class, direction } => {
+                output.push(MUTABLE_LANE_DEFERRED);
+                encode_mutable_lane(&mut output, *class, *direction);
+            }
+            Self::MutableLaneDeferredAck { class, direction } => {
+                output.push(MUTABLE_LANE_DEFERRED_ACK);
+                encode_mutable_lane(&mut output, *class, *direction);
+            }
             Self::MutableFetch { direction, id } => {
                 output.push(MUTABLE_FETCH);
                 encode_mutable_id(&mut output, *direction, *id);
@@ -627,20 +1184,152 @@ impl Frame {
             Self::MutableApplyResult {
                 direction,
                 id,
-                inserted,
+                disposition,
             } => {
                 output.push(MUTABLE_APPLY_RESULT);
                 encode_mutable_id(&mut output, *direction, *id);
-                output.push(u8::from(*inserted));
+                output.push(disposition.encode());
             }
-            Self::MutableFinish { class, direction } => {
+            Self::MutableFetchResult {
+                direction,
+                id,
+                disposition,
+            } => {
+                output.push(MUTABLE_FETCH_RESULT);
+                encode_mutable_id(&mut output, *direction, *id);
+                output.push(disposition.encode());
+            }
+            Self::MutableFetchResultAck {
+                direction,
+                id,
+                disposition,
+            } => {
+                output.push(MUTABLE_FETCH_RESULT_ACK);
+                encode_mutable_id(&mut output, *direction, *id);
+                output.push(disposition.encode());
+            }
+            Self::MutableFinish {
+                class,
+                direction,
+                remaining,
+            } => {
                 output.push(MUTABLE_FINISH);
                 encode_mutable_lane(&mut output, *class, *direction);
+                encode_mutable_remaining(&mut output, *remaining)?;
             }
-            Self::MutableFinished { class, direction } => {
+            Self::MutableFinished {
+                class,
+                direction,
+                remaining,
+            } => {
                 output.push(MUTABLE_FINISHED);
                 encode_mutable_lane(&mut output, *class, *direction);
+                encode_mutable_remaining(&mut output, *remaining)?;
             }
+            Self::BlobRangeFetch {
+                direction,
+                source_id,
+                object_id,
+                total_len,
+                offset,
+                requested_len,
+                content_proof,
+            } => {
+                output.push(BLOB_RANGE_FETCH);
+                encode_blob_range_tuple(
+                    &mut output,
+                    *direction,
+                    *source_id,
+                    *object_id,
+                    *total_len,
+                    *offset,
+                    *requested_len,
+                )?;
+                output.extend_from_slice(content_proof);
+            }
+            Self::BlobRange {
+                direction,
+                source_id,
+                object_id,
+                total_len,
+                offset,
+                requested_len,
+                disposition,
+                bytes,
+            } => {
+                output.push(BLOB_RANGE);
+                encode_blob_range_tuple(
+                    &mut output,
+                    *direction,
+                    *source_id,
+                    *object_id,
+                    *total_len,
+                    *offset,
+                    *requested_len,
+                )?;
+                output.push(disposition.encode());
+                encode_blob_range_payload(&mut output, *disposition, *requested_len, bytes)?;
+            }
+            Self::BlobRangeResult {
+                direction,
+                source_id,
+                object_id,
+                total_len,
+                offset,
+                accepted_len,
+                disposition,
+            } => {
+                output.push(BLOB_RANGE_RESULT);
+                encode_blob_range_result(
+                    &mut output,
+                    *direction,
+                    *source_id,
+                    *object_id,
+                    *total_len,
+                    *offset,
+                    *accepted_len,
+                    *disposition,
+                )?;
+            }
+            Self::BlobRangeResultAck {
+                direction,
+                source_id,
+                object_id,
+                total_len,
+                offset,
+                accepted_len,
+                disposition,
+            } => {
+                output.push(BLOB_RANGE_RESULT_ACK);
+                encode_blob_range_result(
+                    &mut output,
+                    *direction,
+                    *source_id,
+                    *object_id,
+                    *total_len,
+                    *offset,
+                    *accepted_len,
+                    *disposition,
+                )?;
+            }
+            Self::BlobCarrierFinish {
+                direction,
+                remaining,
+            } => encode_blob_carrier_finish(
+                &mut output,
+                BLOB_CARRIER_FINISH,
+                *direction,
+                *remaining,
+            )?,
+            Self::BlobCarrierFinished {
+                direction,
+                remaining,
+            } => encode_blob_carrier_finish(
+                &mut output,
+                BLOB_CARRIER_FINISHED,
+                *direction,
+                *remaining,
+            )?,
         }
         Ok(output)
     }
@@ -655,7 +1344,61 @@ impl Frame {
         let body = &input[5..];
         match tag {
             EVENT_INTEREST => Ok(Self::EventInterest(decode_event_interest(body)?)),
+            EVENT_INTEREST_V3 => {
+                if body.len() < 17 {
+                    return Err(NodeError::Protocol(
+                        "v3 Event interest request is truncated".into(),
+                    ));
+                }
+                let policy = FrameEmissionPolicy::decode(body[0])?;
+                let policy_revision = u64::from_be_bytes(
+                    body[1..9]
+                        .try_into()
+                        .map_err(|_| NodeError::Protocol("v3 policy revision differs".into()))?,
+                );
+                let selector_revision = u64::from_be_bytes(
+                    body[9..17]
+                        .try_into()
+                        .map_err(|_| NodeError::Protocol("v3 selector revision differs".into()))?,
+                );
+                let interest = decode_event_interest(&body[17..])?;
+                require_selector_revision(&interest, selector_revision)?;
+                Ok(Self::EventInterestV3 {
+                    interest,
+                    selector_revision,
+                    policy,
+                    policy_revision,
+                })
+            }
             EVENT_INTEREST_REPLY => Ok(Self::EventInterestReply(decode_event_interest(body)?)),
+            EVENT_INTEREST_REPLY_V3 => {
+                if body.len() < 17 {
+                    return Err(NodeError::Protocol(
+                        "v3 Event interest reply is truncated".into(),
+                    ));
+                }
+                let policy = FrameEmissionPolicy::decode(body[0])?;
+                let policy_revision = u64::from_be_bytes(
+                    body[1..9]
+                        .try_into()
+                        .map_err(|_| NodeError::Protocol("v3 policy revision differs".into()))?,
+                );
+                let selector_revision = u64::from_be_bytes(
+                    body[9..17]
+                        .try_into()
+                        .map_err(|_| NodeError::Protocol("v3 selector revision differs".into()))?,
+                );
+                let interest = decode_event_interest(&body[17..])?;
+                require_selector_revision(&interest, selector_revision)?;
+                Ok(Self::EventInterestReplyV3 {
+                    interest,
+                    selector_revision,
+                    policy,
+                    policy_revision,
+                })
+            }
+            BLOB_INTEREST => Ok(Self::BlobInterest(decode_blob_interest(body)?)),
+            BLOB_INTEREST_REPLY => Ok(Self::BlobInterestReply(decode_blob_interest(body)?)),
             INVENTORY_QUERY => {
                 let (direction, body) = decode_direction(body)?;
                 Ok(Self::InventoryQuery {
@@ -696,6 +1439,12 @@ impl Frame {
             DIFFERENCE_BOUND_ACK => Ok(Self::DifferenceBoundAck {
                 direction: decode_direction_only(body)?,
             }),
+            EVENT_LANE_DEFERRED => Ok(Self::EventLaneDeferred {
+                direction: decode_direction_only(body)?,
+            }),
+            EVENT_LANE_DEFERRED_ACK => Ok(Self::EventLaneDeferredAck {
+                direction: decode_direction_only(body)?,
+            }),
             FETCH => {
                 let (direction, body) = decode_direction(body)?;
                 Ok(Self::Fetch {
@@ -724,6 +1473,29 @@ impl Frame {
                     })
                 }
             }
+            OFFER_V3 => {
+                let (direction, body) = decode_direction(body)?;
+                if body.len() < 40 {
+                    return Err(NodeError::Protocol("v3 Event object is truncated".into()));
+                }
+                let id = decode_exact_id(&body[..32])?;
+                let exchange_id = u64::from_be_bytes(body[32..40].try_into().map_err(|_| {
+                    NodeError::Protocol("v3 Event exchange identifier differs".into())
+                })?);
+                let (custody, body) = decode_leading_bytes(
+                    &body[40..],
+                    MAX_CUSTODY_WRAPPER_BYTES,
+                    "custody wrapper",
+                )?;
+                let bytes = decode_bytes(body, MAX_OBJECT_BYTES, "Event object")?.to_vec();
+                Ok(Self::OfferV3 {
+                    direction,
+                    id,
+                    exchange_id,
+                    custody: custody.to_vec(),
+                    bytes,
+                })
+            }
             APPLY_RESULT => {
                 let (direction, body) = decode_direction(body)?;
                 if body.len() != 33 || body[32] > 1 {
@@ -735,12 +1507,48 @@ impl Frame {
                     inserted: body[32] == 1,
                 })
             }
+            APPLY_RESULT_V3 => {
+                let (direction, body) = decode_direction(body)?;
+                if body.len() != 42 || body[40] > 1 {
+                    return Err(NodeError::Protocol("v3 apply result frame differs".into()));
+                }
+                Ok(Self::ApplyResultV3 {
+                    direction,
+                    id: decode_exact_id(&body[..32])?,
+                    exchange_id: u64::from_be_bytes(body[32..40].try_into().map_err(|_| {
+                        NodeError::Protocol("v3 apply exchange identifier differs".into())
+                    })?),
+                    inserted: body[40] == 1,
+                    disposition: EventApplyDisposition::decode(body[41])?,
+                })
+            }
             CONTROL_INVENTORY_QUERY => Ok(Self::ControlInventoryQuery(
                 decode_bytes(body, MAX_FRAME_SIZE_LIMIT, "control inventory query")?.to_vec(),
             )),
             CONTROL_INVENTORY_REPLY => Ok(Self::ControlInventoryReply(
                 decode_bytes(body, MAX_FRAME_SIZE_LIMIT, "control inventory reply")?.to_vec(),
             )),
+            CONTROL_INVENTORY_REPLY_V3 => {
+                if body.len() < 9 {
+                    return Err(NodeError::Protocol(
+                        "v3 control inventory reply is truncated".into(),
+                    ));
+                }
+                Ok(Self::ControlInventoryReplyV3 {
+                    policy: FrameEmissionPolicy::decode(body[0])?,
+                    policy_revision: u64::from_be_bytes(
+                        body[1..9].try_into().map_err(|_| {
+                            NodeError::Protocol("v3 policy revision differs".into())
+                        })?,
+                    ),
+                    bytes: decode_bytes(
+                        &body[9..],
+                        MAX_FRAME_SIZE_LIMIT,
+                        "control inventory reply",
+                    )?
+                    .to_vec(),
+                })
+            }
             CONTROL_INVENTORY_COMPLETE if body.is_empty() => Ok(Self::ControlInventoryComplete),
             CONTROL_INVENTORY_COMPLETE_ACK if body.is_empty() => {
                 Ok(Self::ControlInventoryCompleteAck)
@@ -787,8 +1595,27 @@ impl Frame {
             FINISHED => Ok(Self::Finished {
                 direction: decode_direction_only(body)?,
             }),
+            FINISH_V3 => {
+                let (direction, remaining) = decode_v3_finish(body)?;
+                Ok(Self::FinishV3 {
+                    direction,
+                    remaining,
+                })
+            }
+            FINISHED_V3 => {
+                let (direction, remaining) = decode_v3_finish(body)?;
+                Ok(Self::FinishedV3 {
+                    direction,
+                    remaining,
+                })
+            }
             MUTABLE_INTEREST | MUTABLE_INTEREST_REPLY => {
                 let (class, body) = decode_mutable_class(body)?;
+                if class == MutableClass::Blob {
+                    return Err(NodeError::Protocol(
+                        "Blob interest requires the protected v5 Blob interest frame".into(),
+                    ));
+                }
                 let interest = decode_event_interest(body)?;
                 if tag == MUTABLE_INTEREST {
                     Ok(Self::MutableInterest { class, interest })
@@ -847,6 +1674,14 @@ impl Frame {
                     Ok(Self::MutableDifferenceBoundAck { class, direction })
                 }
             }
+            MUTABLE_LANE_DEFERRED | MUTABLE_LANE_DEFERRED_ACK => {
+                let (class, direction) = decode_mutable_lane_only(body)?;
+                if tag == MUTABLE_LANE_DEFERRED {
+                    Ok(Self::MutableLaneDeferred { class, direction })
+                } else {
+                    Ok(Self::MutableLaneDeferredAck { class, direction })
+                }
+            }
             MUTABLE_FETCH => {
                 let (direction, id, body) = decode_mutable_id(body)?;
                 if !body.is_empty() {
@@ -875,7 +1710,7 @@ impl Frame {
             }
             MUTABLE_APPLY_RESULT => {
                 let (direction, id, body) = decode_mutable_id(body)?;
-                if body.len() != 1 || body[0] > 1 {
+                if body.len() != 1 {
                     return Err(NodeError::Protocol(
                         "mutable apply result frame differs".into(),
                     ));
@@ -883,15 +1718,128 @@ impl Frame {
                 Ok(Self::MutableApplyResult {
                     direction,
                     id,
-                    inserted: body[0] == 1,
+                    disposition: MutableApplyDisposition::decode(body[0])?,
                 })
             }
-            MUTABLE_FINISH | MUTABLE_FINISHED => {
-                let (class, direction) = decode_mutable_lane_only(body)?;
-                if tag == MUTABLE_FINISH {
-                    Ok(Self::MutableFinish { class, direction })
+            MUTABLE_FETCH_RESULT | MUTABLE_FETCH_RESULT_ACK => {
+                let (direction, id, body) = decode_mutable_id(body)?;
+                if body.len() != 1 {
+                    return Err(NodeError::Protocol(
+                        "mutable fetch result frame differs".into(),
+                    ));
+                }
+                let disposition = MutableApplyDisposition::decode(body[0])?;
+                if tag == MUTABLE_FETCH_RESULT {
+                    Ok(Self::MutableFetchResult {
+                        direction,
+                        id,
+                        disposition,
+                    })
                 } else {
-                    Ok(Self::MutableFinished { class, direction })
+                    Ok(Self::MutableFetchResultAck {
+                        direction,
+                        id,
+                        disposition,
+                    })
+                }
+            }
+            MUTABLE_FINISH | MUTABLE_FINISHED => {
+                let (class, direction, body) = decode_mutable_lane(body)?;
+                let remaining = decode_mutable_remaining(body)?;
+                if tag == MUTABLE_FINISH {
+                    Ok(Self::MutableFinish {
+                        class,
+                        direction,
+                        remaining,
+                    })
+                } else {
+                    Ok(Self::MutableFinished {
+                        class,
+                        direction,
+                        remaining,
+                    })
+                }
+            }
+            BLOB_RANGE_FETCH => {
+                let (direction, source_id, object_id, total_len, offset, requested_len, body) =
+                    decode_blob_range_tuple(body)?;
+                if body.len() != BLOB_CONTENT_PROOF_BYTES {
+                    return Err(NodeError::Protocol(
+                        "Blob range fetch content proof length differs".into(),
+                    ));
+                }
+                let content_proof = body.try_into().map_err(|_| {
+                    NodeError::Protocol("Blob range fetch content proof length differs".into())
+                })?;
+                Ok(Self::BlobRangeFetch {
+                    direction,
+                    source_id,
+                    object_id,
+                    total_len,
+                    offset,
+                    requested_len,
+                    content_proof,
+                })
+            }
+            BLOB_RANGE => {
+                let (direction, source_id, object_id, total_len, offset, requested_len, body) =
+                    decode_blob_range_tuple(body)?;
+                let Some((&encoded_disposition, body)) = body.split_first() else {
+                    return Err(NodeError::Protocol(
+                        "Blob range disposition is missing".into(),
+                    ));
+                };
+                let disposition = BlobRangeDisposition::decode(encoded_disposition)?;
+                let bytes = decode_bytes(body, MAX_BLOB_RANGE_BYTES, "Blob range")?.to_vec();
+                validate_blob_range_payload(disposition, requested_len, &bytes)?;
+                Ok(Self::BlobRange {
+                    direction,
+                    source_id,
+                    object_id,
+                    total_len,
+                    offset,
+                    requested_len,
+                    disposition,
+                    bytes,
+                })
+            }
+            BLOB_RANGE_RESULT | BLOB_RANGE_RESULT_ACK => {
+                let (direction, source_id, object_id, total_len, offset, accepted_len, disposition) =
+                    decode_blob_range_result(body)?;
+                if tag == BLOB_RANGE_RESULT {
+                    Ok(Self::BlobRangeResult {
+                        direction,
+                        source_id,
+                        object_id,
+                        total_len,
+                        offset,
+                        accepted_len,
+                        disposition,
+                    })
+                } else {
+                    Ok(Self::BlobRangeResultAck {
+                        direction,
+                        source_id,
+                        object_id,
+                        total_len,
+                        offset,
+                        accepted_len,
+                        disposition,
+                    })
+                }
+            }
+            BLOB_CARRIER_FINISH | BLOB_CARRIER_FINISHED => {
+                let (direction, remaining) = decode_blob_carrier_finish(body)?;
+                if tag == BLOB_CARRIER_FINISH {
+                    Ok(Self::BlobCarrierFinish {
+                        direction,
+                        remaining,
+                    })
+                } else {
+                    Ok(Self::BlobCarrierFinished {
+                        direction,
+                        remaining,
+                    })
                 }
             }
             _ => Err(NodeError::Protocol(
@@ -899,6 +1847,357 @@ impl Frame {
             )),
         }
     }
+}
+
+fn encode_blob_range_tuple(
+    output: &mut Vec<u8>,
+    direction: EventDirection,
+    source_id: BlobTransferId,
+    object_id: BlobObjectId,
+    total_len: u64,
+    offset: u64,
+    requested_len: u32,
+) -> Result<(), NodeError> {
+    validate_blob_range_bounds(total_len, offset, requested_len)?;
+    output.push(direction.encode());
+    output.extend_from_slice(source_id.as_bytes());
+    output.extend_from_slice(object_id.as_bytes());
+    output.extend_from_slice(&total_len.to_be_bytes());
+    output.extend_from_slice(&offset.to_be_bytes());
+    output.extend_from_slice(&requested_len.to_be_bytes());
+    Ok(())
+}
+
+type DecodedBlobRangeTuple<'a> = (
+    EventDirection,
+    BlobTransferId,
+    BlobObjectId,
+    u64,
+    u64,
+    u32,
+    &'a [u8],
+);
+
+fn decode_blob_range_tuple(input: &[u8]) -> Result<DecodedBlobRangeTuple<'_>, NodeError> {
+    let (direction, mut body) = decode_direction(input)?;
+    let source = take_exact(&mut body, 32, "Blob source transfer identifier")?;
+    let object = take_exact(&mut body, 33, "Blob carrier object identifier")?;
+    let total = take_exact(&mut body, 8, "Blob carrier total length")?;
+    let offset = take_exact(&mut body, 8, "Blob range offset")?;
+    let requested = take_exact(&mut body, 4, "Blob requested range length")?;
+    let source_id = BlobTransferId::new(source.try_into().map_err(|_| {
+        NodeError::Protocol("Blob source transfer identifier length differs".into())
+    })?);
+    let object_id = BlobObjectId::decode(object)?;
+    let total_len = u64::from_be_bytes(
+        total
+            .try_into()
+            .map_err(|_| NodeError::Protocol("Blob carrier total length differs".into()))?,
+    );
+    let offset = u64::from_be_bytes(
+        offset
+            .try_into()
+            .map_err(|_| NodeError::Protocol("Blob range offset differs".into()))?,
+    );
+    let requested_len = u32::from_be_bytes(
+        requested
+            .try_into()
+            .map_err(|_| NodeError::Protocol("Blob requested range length differs".into()))?,
+    );
+    validate_blob_range_bounds(total_len, offset, requested_len)?;
+    Ok((
+        direction,
+        source_id,
+        object_id,
+        total_len,
+        offset,
+        requested_len,
+        body,
+    ))
+}
+
+fn validate_blob_range_bounds(
+    total_len: u64,
+    offset: u64,
+    requested_len: u32,
+) -> Result<(), NodeError> {
+    if total_len == 0 {
+        return Err(NodeError::Protocol(
+            "Blob carrier total length is zero".into(),
+        ));
+    }
+    if requested_len == 0 || requested_len as usize > MAX_BLOB_RANGE_BYTES {
+        return Err(NodeError::Protocol(format!(
+            "Blob requested range length must be 1..={MAX_BLOB_RANGE_BYTES} bytes"
+        )));
+    }
+    if offset >= total_len
+        || offset
+            .checked_add(u64::from(requested_len))
+            .is_none_or(|end| end > total_len)
+    {
+        return Err(NodeError::Protocol(
+            "Blob requested range exceeds the carrier length".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn encode_blob_range_payload(
+    output: &mut Vec<u8>,
+    disposition: BlobRangeDisposition,
+    requested_len: u32,
+    bytes: &[u8],
+) -> Result<(), NodeError> {
+    validate_blob_range_payload(disposition, requested_len, bytes)?;
+    encode_bytes(output, bytes, MAX_BLOB_RANGE_BYTES, "Blob range")
+}
+
+fn validate_blob_range_payload(
+    disposition: BlobRangeDisposition,
+    requested_len: u32,
+    bytes: &[u8],
+) -> Result<(), NodeError> {
+    match disposition {
+        BlobRangeDisposition::Data
+            if bytes.len()
+                == usize::try_from(requested_len).expect("u32 range length fits usize") =>
+        {
+            Ok(())
+        }
+        BlobRangeDisposition::Unavailable if bytes.is_empty() => Ok(()),
+        BlobRangeDisposition::Data => Err(NodeError::Protocol(
+            "Blob Data range length differs from the exact request".into(),
+        )),
+        BlobRangeDisposition::Unavailable => Err(NodeError::Protocol(
+            "unavailable Blob range must have an empty payload".into(),
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_blob_range_result(
+    output: &mut Vec<u8>,
+    direction: EventDirection,
+    source_id: BlobTransferId,
+    object_id: BlobObjectId,
+    total_len: u64,
+    offset: u64,
+    accepted_len: u32,
+    disposition: BlobRangeApplyDisposition,
+) -> Result<(), NodeError> {
+    validate_blob_range_result(total_len, offset, accepted_len, disposition)?;
+    output.push(direction.encode());
+    output.extend_from_slice(source_id.as_bytes());
+    output.extend_from_slice(object_id.as_bytes());
+    output.extend_from_slice(&total_len.to_be_bytes());
+    output.extend_from_slice(&offset.to_be_bytes());
+    output.extend_from_slice(&accepted_len.to_be_bytes());
+    output.push(disposition.encode());
+    Ok(())
+}
+
+type DecodedBlobRangeResult = (
+    EventDirection,
+    BlobTransferId,
+    BlobObjectId,
+    u64,
+    u64,
+    u32,
+    BlobRangeApplyDisposition,
+);
+
+fn decode_blob_range_result(input: &[u8]) -> Result<DecodedBlobRangeResult, NodeError> {
+    if input.len() != 87 {
+        return Err(NodeError::Protocol(
+            "Blob range result length differs".into(),
+        ));
+    }
+    let (direction, mut body) = decode_direction(input)?;
+    let source = take_exact(&mut body, 32, "Blob source transfer identifier")?;
+    let object = take_exact(&mut body, 33, "Blob carrier object identifier")?;
+    let total = take_exact(&mut body, 8, "Blob carrier total length")?;
+    let offset = take_exact(&mut body, 8, "Blob range offset")?;
+    let accepted = take_exact(&mut body, 4, "Blob accepted range length")?;
+    let disposition = BlobRangeApplyDisposition::decode(body[0])?;
+    let source_id = BlobTransferId::new(source.try_into().map_err(|_| {
+        NodeError::Protocol("Blob source transfer identifier length differs".into())
+    })?);
+    let object_id = BlobObjectId::decode(object)?;
+    let total_len = u64::from_be_bytes(
+        total
+            .try_into()
+            .map_err(|_| NodeError::Protocol("Blob carrier total length differs".into()))?,
+    );
+    let offset = u64::from_be_bytes(
+        offset
+            .try_into()
+            .map_err(|_| NodeError::Protocol("Blob range offset differs".into()))?,
+    );
+    let accepted_len = u32::from_be_bytes(
+        accepted
+            .try_into()
+            .map_err(|_| NodeError::Protocol("Blob accepted range length differs".into()))?,
+    );
+    validate_blob_range_result(total_len, offset, accepted_len, disposition)?;
+    Ok((
+        direction,
+        source_id,
+        object_id,
+        total_len,
+        offset,
+        accepted_len,
+        disposition,
+    ))
+}
+
+fn validate_blob_range_result(
+    total_len: u64,
+    offset: u64,
+    accepted_len: u32,
+    disposition: BlobRangeApplyDisposition,
+) -> Result<(), NodeError> {
+    if total_len == 0 || offset >= total_len {
+        return Err(NodeError::Protocol(
+            "Blob range result bounds differ".into(),
+        ));
+    }
+    match disposition {
+        BlobRangeApplyDisposition::Partial | BlobRangeApplyDisposition::Complete
+            if accepted_len == 0 || accepted_len as usize > MAX_BLOB_RANGE_BYTES =>
+        {
+            return Err(NodeError::Protocol(format!(
+                "accepted Blob range length must be 1..={MAX_BLOB_RANGE_BYTES} bytes"
+            )));
+        }
+        BlobRangeApplyDisposition::Duplicate
+        | BlobRangeApplyDisposition::DeferredCapacity
+        | BlobRangeApplyDisposition::Unavailable
+            if accepted_len != 0 =>
+        {
+            return Err(NodeError::Protocol(
+                "non-writing Blob range result must accept zero bytes".into(),
+            ));
+        }
+        _ => {}
+    }
+    let end = offset
+        .checked_add(u64::from(accepted_len))
+        .ok_or_else(|| NodeError::Protocol("Blob accepted range end overflows".into()))?;
+    if end > total_len {
+        return Err(NodeError::Protocol(
+            "accepted Blob range exceeds the carrier length".into(),
+        ));
+    }
+    match disposition {
+        BlobRangeApplyDisposition::Partial if end >= total_len => Err(NodeError::Protocol(
+            "partial Blob range result reaches the carrier end".into(),
+        )),
+        BlobRangeApplyDisposition::Complete if end != total_len => Err(NodeError::Protocol(
+            "complete Blob range result does not reach the carrier end".into(),
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn encode_blob_carrier_finish(
+    output: &mut Vec<u8>,
+    tag: u8,
+    direction: EventDirection,
+    remaining: u64,
+) -> Result<(), NodeError> {
+    if remaining > MAX_CARDINALITY_LIMIT as u64 {
+        return Err(NodeError::Protocol(
+            "Blob carrier remaining count exceeds the selected cardinality bound".into(),
+        ));
+    }
+    output.push(tag);
+    output.push(direction.encode());
+    output.extend_from_slice(&remaining.to_be_bytes());
+    Ok(())
+}
+
+fn decode_blob_carrier_finish(body: &[u8]) -> Result<(EventDirection, u64), NodeError> {
+    let (direction, body) = decode_direction(body)?;
+    if body.len() != 8 {
+        return Err(NodeError::Protocol(
+            "Blob carrier remaining count length differs".into(),
+        ));
+    }
+    let remaining =
+        u64::from_be_bytes(body.try_into().map_err(|_| {
+            NodeError::Protocol("Blob carrier remaining count length differs".into())
+        })?);
+    if remaining > MAX_CARDINALITY_LIMIT as u64 {
+        return Err(NodeError::Protocol(
+            "Blob carrier remaining count exceeds the selected cardinality bound".into(),
+        ));
+    }
+    Ok((direction, remaining))
+}
+
+fn encode_v3_finish(
+    output: &mut Vec<u8>,
+    tag: u8,
+    direction: EventDirection,
+    remaining: u64,
+) -> Result<(), NodeError> {
+    if remaining > MAX_CARDINALITY_LIMIT as u64 {
+        return Err(NodeError::Protocol(
+            "v3 Event lane remaining count exceeds the selected cardinality bound".into(),
+        ));
+    }
+    output.push(tag);
+    output.push(direction.encode());
+    output.extend_from_slice(&remaining.to_be_bytes());
+    Ok(())
+}
+
+fn encode_mutable_remaining(output: &mut Vec<u8>, remaining: u64) -> Result<(), NodeError> {
+    if remaining > MAX_CARDINALITY_LIMIT as u64 {
+        return Err(NodeError::Protocol(
+            "mutable lane remaining count exceeds the selected cardinality bound".into(),
+        ));
+    }
+    output.extend_from_slice(&remaining.to_be_bytes());
+    Ok(())
+}
+
+fn decode_mutable_remaining(body: &[u8]) -> Result<u64, NodeError> {
+    if body.len() != 8 {
+        return Err(NodeError::Protocol(
+            "mutable lane remaining count length differs".into(),
+        ));
+    }
+    let remaining =
+        u64::from_be_bytes(body.try_into().map_err(|_| {
+            NodeError::Protocol("mutable lane remaining count length differs".into())
+        })?);
+    if remaining > MAX_CARDINALITY_LIMIT as u64 {
+        return Err(NodeError::Protocol(
+            "mutable lane remaining count exceeds the selected cardinality bound".into(),
+        ));
+    }
+    Ok(remaining)
+}
+
+fn decode_v3_finish(body: &[u8]) -> Result<(EventDirection, u64), NodeError> {
+    let (direction, body) = decode_direction(body)?;
+    if body.len() != 8 {
+        return Err(NodeError::Protocol(
+            "v3 Event lane remaining count length differs".into(),
+        ));
+    }
+    let remaining = u64::from_be_bytes(
+        body.try_into()
+            .map_err(|_| NodeError::Protocol("v3 Event lane remaining count differs".into()))?,
+    );
+    if remaining > MAX_CARDINALITY_LIMIT as u64 {
+        return Err(NodeError::Protocol(
+            "v3 Event lane remaining count exceeds the selected cardinality bound".into(),
+        ));
+    }
+    Ok((direction, remaining))
 }
 
 fn encode_event_interest(output: &mut Vec<u8>, interest: &EventInterest) -> Result<(), NodeError> {
@@ -935,6 +2234,20 @@ fn encode_event_interest(output: &mut Vec<u8>, interest: &EventInterest) -> Resu
     Ok(())
 }
 
+fn require_selector_revision(
+    interest: &EventInterest,
+    selector_revision: u64,
+) -> Result<(), NodeError> {
+    let selector_count = u64::try_from(interest.len())
+        .map_err(|_| NodeError::Protocol("Event interest selector count exceeds u64".into()))?;
+    if selector_revision < selector_count {
+        return Err(NodeError::Protocol(
+            "v3 selector revision precedes its canonical Event interest".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn encode_event_name(output: &mut Vec<u8>, value: &str, label: &str) -> Result<(), NodeError> {
     if value.is_empty() || value.len() > MAX_EVENT_NAME_BYTES {
         return Err(NodeError::Protocol(format!(
@@ -961,7 +2274,7 @@ fn decode_event_interest(input: &[u8]) -> Result<EventInterest, NodeError> {
             "Event interest selector count exceeds {MAX_EVENT_INTEREST_SELECTORS}"
         )));
     }
-    let mut selectors = Vec::with_capacity(count);
+    let mut selectors: Vec<EventInterestSelector> = Vec::with_capacity(count);
     for _ in 0..count {
         let topic = decode_event_topic(&mut input)?;
         let scope = decode_event_scope(&mut input)?;
@@ -992,6 +2305,100 @@ fn decode_event_interest(input: &[u8]) -> Result<EventInterest, NodeError> {
         ));
     }
     Ok(EventInterest(selectors))
+}
+
+fn encode_blob_interest(output: &mut Vec<u8>, interest: &BlobInterest) -> Result<(), NodeError> {
+    if interest.len() > MAX_EVENT_INTEREST_SELECTORS {
+        return Err(NodeError::Protocol(format!(
+            "Blob interest selector count exceeds {MAX_EVENT_INTEREST_SELECTORS}"
+        )));
+    }
+    let count = u16::try_from(interest.len())
+        .map_err(|_| NodeError::Protocol("Blob interest selector count exceeds u16".into()))?;
+    let start = output.len();
+    output.extend_from_slice(&count.to_be_bytes());
+    let mut previous: Option<&BlobInterestSelector> = None;
+    for selector in interest.selectors() {
+        if previous.is_some_and(|previous| previous >= selector) {
+            return Err(NodeError::Protocol(
+                "Blob interest selectors are not strictly canonical".into(),
+            ));
+        }
+        if previous.is_some_and(|previous| {
+            previous.topic() == selector.topic() && previous.scope() == selector.scope()
+        }) {
+            return Err(NodeError::Protocol(
+                "Blob interest repeats an exact topic/scope selector".into(),
+            ));
+        }
+        encode_event_name(output, selector.topic().as_str(), "Blob topic")?;
+        encode_event_name(output, selector.scope().as_str(), "Blob scope")?;
+        output.extend_from_slice(&selector.epoch().to_be_bytes());
+        output.extend_from_slice(selector.content_proof());
+        previous = Some(selector);
+    }
+    let encoded = output
+        .len()
+        .checked_sub(start)
+        .ok_or_else(|| NodeError::Protocol("Blob interest length underflow".into()))?;
+    if encoded > MAX_BLOB_INTEREST_BYTES {
+        return Err(NodeError::Protocol(format!(
+            "Blob interest exceeds {MAX_BLOB_INTEREST_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn decode_blob_interest(input: &[u8]) -> Result<BlobInterest, NodeError> {
+    if input.len() > MAX_BLOB_INTEREST_BYTES {
+        return Err(NodeError::Protocol(format!(
+            "Blob interest exceeds {MAX_BLOB_INTEREST_BYTES} bytes"
+        )));
+    }
+    let mut input = input;
+    let count = usize::from(take_u16(&mut input, "Blob interest selector count")?);
+    if count > MAX_EVENT_INTEREST_SELECTORS {
+        return Err(NodeError::Protocol(format!(
+            "Blob interest selector count exceeds {MAX_EVENT_INTEREST_SELECTORS}"
+        )));
+    }
+    let mut selectors: Vec<BlobInterestSelector> = Vec::with_capacity(count);
+    for _ in 0..count {
+        let topic = decode_event_topic(&mut input)?;
+        let scope = decode_event_scope(&mut input)?;
+        let epoch = u64::from_be_bytes(
+            take_exact(&mut input, 8, "Blob interest epoch")?
+                .try_into()
+                .map_err(|_| NodeError::Protocol("Blob interest epoch length differs".into()))?,
+        );
+        let content_proof = take_exact(
+            &mut input,
+            BLOB_CONTENT_PROOF_BYTES,
+            "Blob interest content proof",
+        )?
+        .try_into()
+        .map_err(|_| NodeError::Protocol("Blob interest content proof length differs".into()))?;
+        let selector = BlobInterestSelector::new(topic, scope, epoch, content_proof);
+        if let Some(previous) = selectors.last() {
+            if previous >= &selector {
+                return Err(NodeError::Protocol(
+                    "Blob interest selectors are not strictly canonical".into(),
+                ));
+            }
+            if previous.topic() == selector.topic() && previous.scope() == selector.scope() {
+                return Err(NodeError::Protocol(
+                    "Blob interest repeats an exact topic/scope selector".into(),
+                ));
+            }
+        }
+        selectors.push(selector);
+    }
+    if !input.is_empty() {
+        return Err(NodeError::Protocol(
+            "Blob interest has trailing bytes".into(),
+        ));
+    }
+    Ok(BlobInterest(selectors))
 }
 
 fn decode_event_topic(input: &mut &[u8]) -> Result<Topic, NodeError> {
@@ -1085,6 +2492,7 @@ fn decode_mutable_id(
     let id = match class {
         MutableClass::State => MutableTransferId::State(StateTransferId::new(bytes)),
         MutableClass::Record => MutableTransferId::Record(RecordTransferId::new(bytes)),
+        MutableClass::Blob => MutableTransferId::Blob(BlobTransferId::new(bytes)),
     };
     Ok((direction, id, &body[32..]))
 }
@@ -1160,6 +2568,33 @@ fn decode_bytes<'a>(input: &'a [u8], maximum: usize, label: &str) -> Result<&'a 
     Ok(&input[4..])
 }
 
+fn decode_leading_bytes<'a>(
+    input: &'a [u8],
+    maximum: usize,
+    label: &str,
+) -> Result<(&'a [u8], &'a [u8]), NodeError> {
+    if input.len() < 4 {
+        return Err(NodeError::Protocol(format!("{label} length is truncated")));
+    }
+    let length = u32::from_be_bytes(
+        input[..4]
+            .try_into()
+            .map_err(|_| NodeError::Protocol(format!("{label} length differs")))?,
+    ) as usize;
+    if length > maximum {
+        return Err(NodeError::Protocol(format!(
+            "{label} body exceeds {maximum} bytes"
+        )));
+    }
+    let end = 4usize
+        .checked_add(length)
+        .ok_or_else(|| NodeError::Protocol(format!("{label} length overflows usize")))?;
+    if input.len() < end {
+        return Err(NodeError::Protocol(format!("{label} is truncated")));
+    }
+    Ok((&input[4..end], &input[end..]))
+}
+
 fn decode_exact_id(input: &[u8]) -> Result<EventTransferId, NodeError> {
     if input.len() != 32 {
         return Err(NodeError::Protocol(
@@ -1189,6 +2624,16 @@ mod tests {
         let control_id = ControlTransferId::new([0x55; 32]);
         let state_id = MutableTransferId::State(StateTransferId::new([0x66; 32]));
         let record_id = MutableTransferId::Record(RecordTransferId::new([0x77; 32]));
+        let blob_source = BlobTransferId::new([0x88; 32]);
+        let blob_id = MutableTransferId::Blob(blob_source);
+        let blob_object = BlobObjectId::new([0x99; 32]);
+        let blob_interest = BlobInterest::new(vec![BlobInterestSelector::new(
+            Topic::new("blob").expect("Blob topic"),
+            Scope::new("mission/blob").expect("Blob scope"),
+            9,
+            [0xab; BLOB_CONTENT_PROOF_BYTES],
+        )])
+        .expect("Blob interest");
         let interest = EventInterest::new(vec![
             selector("zulu", "mission/bravo", true),
             selector("alpha", "mission/alpha", false),
@@ -1198,7 +2643,21 @@ mod tests {
         let to_responder = EventDirection::ToSessionResponder;
         let frames = [
             Frame::EventInterest(EventInterest::empty()),
-            Frame::EventInterestReply(interest),
+            Frame::EventInterestV3 {
+                interest: EventInterest::empty(),
+                selector_revision: 0,
+                policy: FrameEmissionPolicy::Normal,
+                policy_revision: 5,
+            },
+            Frame::EventInterestReply(interest.clone()),
+            Frame::EventInterestReplyV3 {
+                interest,
+                selector_revision: 11,
+                policy: FrameEmissionPolicy::AtLeast(Priority::Immediate),
+                policy_revision: 7,
+            },
+            Frame::BlobInterest(blob_interest.clone()),
+            Frame::BlobInterestReply(blob_interest),
             Frame::InventoryQuery {
                 direction: to_responder,
                 bytes: vec![1, 2],
@@ -1227,6 +2686,12 @@ mod tests {
             Frame::DifferenceBoundAck {
                 direction: to_responder,
             },
+            Frame::EventLaneDeferred {
+                direction: to_responder,
+            },
+            Frame::EventLaneDeferredAck {
+                direction: to_initiator,
+            },
             Frame::Fetch {
                 direction: to_initiator,
                 id,
@@ -1241,13 +2706,32 @@ mod tests {
                 id,
                 bytes: b"offer".to_vec(),
             },
+            Frame::OfferV3 {
+                direction: to_responder,
+                id,
+                exchange_id: 17,
+                custody: b"bounded-custody-offer".to_vec(),
+                bytes: b"v3-offer".to_vec(),
+            },
             Frame::ApplyResult {
                 direction: to_responder,
                 id,
                 inserted: true,
             },
+            Frame::ApplyResultV3 {
+                direction: to_responder,
+                id,
+                exchange_id: 17,
+                inserted: false,
+                disposition: EventApplyDisposition::ContentAcceptancePending,
+            },
             Frame::ControlInventoryQuery(vec![9, 10]),
             Frame::ControlInventoryReply(vec![11, 12]),
+            Frame::ControlInventoryReplyV3 {
+                bytes: vec![11, 12],
+                policy: FrameEmissionPolicy::ReceiveOnly,
+                policy_revision: 9,
+            },
             Frame::ControlInventoryComplete,
             Frame::ControlInventoryCompleteAck,
             Frame::ControlDifferenceQuery(vec![13, 14]),
@@ -1274,6 +2758,14 @@ mod tests {
             },
             Frame::Finished {
                 direction: to_initiator,
+            },
+            Frame::FinishV3 {
+                direction: to_responder,
+                remaining: 17,
+            },
+            Frame::FinishedV3 {
+                direction: to_initiator,
+                remaining: 17,
             },
             Frame::MutableInterest {
                 class: MutableClass::State,
@@ -1320,6 +2812,14 @@ mod tests {
                 class: MutableClass::State,
                 direction: to_responder,
             },
+            Frame::MutableLaneDeferred {
+                class: MutableClass::State,
+                direction: to_responder,
+            },
+            Frame::MutableLaneDeferredAck {
+                class: MutableClass::Record,
+                direction: to_initiator,
+            },
             Frame::MutableFetch {
                 direction: to_initiator,
                 id: state_id,
@@ -1337,15 +2837,86 @@ mod tests {
             Frame::MutableApplyResult {
                 direction: to_responder,
                 id: record_id,
-                inserted: true,
+                disposition: MutableApplyDisposition::Inserted,
+            },
+            Frame::MutableFetchResult {
+                direction: to_initiator,
+                id: state_id,
+                disposition: MutableApplyDisposition::DeferredCapacity,
+            },
+            Frame::MutableFetchResultAck {
+                direction: to_initiator,
+                id: state_id,
+                disposition: MutableApplyDisposition::DeferredCapacity,
             },
             Frame::MutableFinish {
                 class: MutableClass::Record,
                 direction: to_initiator,
+                remaining: 17,
             },
             Frame::MutableFinished {
                 class: MutableClass::Record,
                 direction: to_initiator,
+                remaining: 17,
+            },
+            Frame::MutableFetch {
+                direction: to_initiator,
+                id: blob_id,
+            },
+            Frame::BlobRangeFetch {
+                direction: to_initiator,
+                source_id: blob_source,
+                object_id: blob_object,
+                total_len: 8,
+                offset: 0,
+                requested_len: 4,
+                content_proof: [0xaa; BLOB_CONTENT_PROOF_BYTES],
+            },
+            Frame::BlobRange {
+                direction: to_initiator,
+                source_id: blob_source,
+                object_id: blob_object,
+                total_len: 8,
+                offset: 0,
+                requested_len: 4,
+                disposition: BlobRangeDisposition::Data,
+                bytes: vec![1, 2, 3, 4],
+            },
+            Frame::BlobRange {
+                direction: to_initiator,
+                source_id: blob_source,
+                object_id: blob_object,
+                total_len: 8,
+                offset: 4,
+                requested_len: 4,
+                disposition: BlobRangeDisposition::Unavailable,
+                bytes: Vec::new(),
+            },
+            Frame::BlobRangeResult {
+                direction: to_initiator,
+                source_id: blob_source,
+                object_id: blob_object,
+                total_len: 8,
+                offset: 0,
+                accepted_len: 4,
+                disposition: BlobRangeApplyDisposition::Partial,
+            },
+            Frame::BlobRangeResultAck {
+                direction: to_initiator,
+                source_id: blob_source,
+                object_id: blob_object,
+                total_len: 8,
+                offset: 4,
+                accepted_len: 4,
+                disposition: BlobRangeApplyDisposition::Complete,
+            },
+            Frame::BlobCarrierFinish {
+                direction: to_initiator,
+                remaining: 1,
+            },
+            Frame::BlobCarrierFinished {
+                direction: to_initiator,
+                remaining: 0,
             },
         ];
         for frame in frames {
@@ -1361,6 +2932,553 @@ mod tests {
     fn unknown_version_and_tag_fail_closed() {
         assert!(Frame::decode(b"BAD!\x11\0\0\0\0").is_err());
         assert!(Frame::decode(b"ASM\x01\xff").is_err());
+    }
+
+    #[test]
+    fn mutable_finish_remaining_is_bounded_and_exact() {
+        let frame = Frame::MutableFinish {
+            class: MutableClass::State,
+            direction: EventDirection::ToSessionResponder,
+            remaining: MAX_CARDINALITY_LIMIT as u64,
+        };
+        let encoded = frame.encode().expect("encode bounded mutable finish");
+        assert_eq!(
+            Frame::decode(&encoded).expect("decode mutable finish"),
+            frame
+        );
+
+        assert!(
+            Frame::MutableFinished {
+                class: MutableClass::Record,
+                direction: EventDirection::ToSessionInitiator,
+                remaining: MAX_CARDINALITY_LIMIT as u64 + 1,
+            }
+            .encode()
+            .is_err()
+        );
+
+        let mut truncated = encoded;
+        truncated.pop();
+        assert!(Frame::decode(&truncated).is_err());
+    }
+
+    #[test]
+    fn mutable_apply_dispositions_use_one_bounded_outcome_byte() {
+        let id = MutableTransferId::State(StateTransferId::new([0x5a; 32]));
+        for (disposition, encoded_outcome) in [
+            (MutableApplyDisposition::Duplicate, 0),
+            (MutableApplyDisposition::Inserted, 1),
+            (MutableApplyDisposition::DeferredCapacity, 2),
+        ] {
+            let frame = Frame::MutableApplyResult {
+                direction: EventDirection::ToSessionResponder,
+                id,
+                disposition,
+            };
+            let encoded = frame.encode().expect("encode mutable apply result");
+            assert_eq!(encoded.last().copied(), Some(encoded_outcome));
+            assert_eq!(Frame::decode(&encoded).expect("decode disposition"), frame);
+        }
+
+        let mut unknown = Frame::MutableApplyResult {
+            direction: EventDirection::ToSessionResponder,
+            id,
+            disposition: MutableApplyDisposition::Inserted,
+        }
+        .encode()
+        .expect("encode mutable apply result");
+        *unknown.last_mut().expect("outcome byte") = 3;
+        assert!(Frame::decode(&unknown).is_err());
+    }
+
+    #[test]
+    fn mutable_fetch_result_codec_binds_tag_class_direction_id_and_disposition() {
+        let id = MutableTransferId::State(StateTransferId::new([0x5a; 32]));
+        for disposition in [
+            MutableApplyDisposition::Duplicate,
+            MutableApplyDisposition::Inserted,
+            MutableApplyDisposition::DeferredCapacity,
+        ] {
+            let result = Frame::MutableFetchResult {
+                direction: EventDirection::ToSessionInitiator,
+                id,
+                disposition,
+            };
+            let ack = Frame::MutableFetchResultAck {
+                direction: EventDirection::ToSessionInitiator,
+                id,
+                disposition,
+            };
+            let encoded_result = result.encode().expect("encode mutable fetch result");
+            let encoded_ack = ack.encode().expect("encode mutable fetch result ack");
+            assert_eq!(encoded_result.len(), 40);
+            assert_eq!(encoded_ack.len(), 40);
+            assert_eq!(encoded_result[4], MUTABLE_FETCH_RESULT);
+            assert_eq!(encoded_ack[4], MUTABLE_FETCH_RESULT_ACK);
+            assert_eq!(&encoded_result[5..], &encoded_ack[5..]);
+            assert_eq!(
+                Frame::decode(&encoded_result).expect("decode mutable fetch result"),
+                result
+            );
+            assert_eq!(
+                Frame::decode(&encoded_ack).expect("decode mutable fetch result ack"),
+                ack
+            );
+        }
+
+        let result = Frame::MutableFetchResult {
+            direction: EventDirection::ToSessionInitiator,
+            id,
+            disposition: MutableApplyDisposition::DeferredCapacity,
+        };
+        let encoded = result.encode().expect("encode exact fetch-result tuple");
+
+        let mut wrong_tag = encoded.clone();
+        wrong_tag[4] = MUTABLE_FETCH_RESULT_ACK;
+        assert_eq!(
+            Frame::decode(&wrong_tag).expect("decode result as acknowledgement"),
+            Frame::MutableFetchResultAck {
+                direction: EventDirection::ToSessionInitiator,
+                id,
+                disposition: MutableApplyDisposition::DeferredCapacity,
+            }
+        );
+
+        let mut wrong_class = encoded.clone();
+        wrong_class[5] = MutableClass::Record.encode();
+        assert_ne!(
+            Frame::decode(&wrong_class).expect("decode wrong-class fetch result"),
+            result
+        );
+
+        let mut wrong_direction = encoded.clone();
+        wrong_direction[6] = EventDirection::ToSessionResponder.encode();
+        assert_ne!(
+            Frame::decode(&wrong_direction).expect("decode wrong-direction fetch result"),
+            result
+        );
+
+        let mut wrong_id = encoded.clone();
+        wrong_id[7] ^= 1;
+        assert_ne!(
+            Frame::decode(&wrong_id).expect("decode wrong-id fetch result"),
+            result
+        );
+
+        let mut wrong_disposition = encoded.clone();
+        *wrong_disposition.last_mut().expect("disposition byte") =
+            MutableApplyDisposition::Inserted.encode();
+        assert_ne!(
+            Frame::decode(&wrong_disposition).expect("decode wrong-disposition fetch result"),
+            result
+        );
+
+        let mut unknown_disposition = encoded.clone();
+        *unknown_disposition.last_mut().expect("disposition byte") = 3;
+        assert!(Frame::decode(&unknown_disposition).is_err());
+
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(Frame::decode(&trailing).is_err());
+
+        let mut truncated = encoded;
+        truncated.pop();
+        assert!(Frame::decode(&truncated).is_err());
+    }
+
+    #[test]
+    fn blob_source_class_and_chunk_object_id_are_exactly_typed() {
+        let source = BlobTransferId::new([0x5b; 32]);
+        let frame = Frame::MutableFetch {
+            direction: EventDirection::ToSessionInitiator,
+            id: MutableTransferId::Blob(source),
+        };
+        let encoded = frame.encode().expect("encode Blob source fetch");
+        assert_eq!(encoded[5], 3);
+        assert_eq!(
+            Frame::decode(&encoded).expect("decode Blob source fetch"),
+            frame
+        );
+
+        let blob_interest = BlobInterest::new(vec![BlobInterestSelector::new(
+            Topic::new("blob").expect("Blob topic"),
+            Scope::new("mission/blob").expect("Blob scope"),
+            7,
+            [0x5c; BLOB_CONTENT_PROOF_BYTES],
+        )])
+        .expect("Blob interest");
+        for source_frame in [
+            Frame::BlobInterest(blob_interest.clone()),
+            Frame::BlobInterestReply(blob_interest),
+            Frame::MutableInventoryQuery {
+                class: MutableClass::Blob,
+                direction: EventDirection::ToSessionInitiator,
+                bytes: vec![1, 2, 3],
+            },
+            Frame::MutableFinish {
+                class: MutableClass::Blob,
+                direction: EventDirection::ToSessionInitiator,
+                remaining: 1,
+            },
+        ] {
+            let encoded = source_frame.encode().expect("encode Blob source phase");
+            assert_eq!(
+                Frame::decode(&encoded).expect("decode Blob source phase"),
+                source_frame
+            );
+        }
+
+        let object = BlobObjectId::new([0x6c; 32]);
+        assert_eq!(object.as_bytes()[0], 2);
+        assert_eq!(&object.as_bytes()[1..], &[0x6c; 32]);
+
+        let mut wrong_kind = Frame::BlobRangeFetch {
+            direction: EventDirection::ToSessionInitiator,
+            source_id: source,
+            object_id: object,
+            total_len: 1,
+            offset: 0,
+            requested_len: 1,
+            content_proof: [0x6d; BLOB_CONTENT_PROOF_BYTES],
+        }
+        .encode()
+        .expect("encode Blob fetch");
+        assert_eq!(wrong_kind.len(), 123);
+        assert_eq!(&wrong_kind[91..], &[0x6d; BLOB_CONTENT_PROOF_BYTES]);
+        wrong_kind[38] = 1;
+        assert!(Frame::decode(&wrong_kind).is_err());
+        wrong_kind[38] = 0xff;
+        assert!(Frame::decode(&wrong_kind).is_err());
+
+        assert!(
+            Frame::MutableInterest {
+                class: MutableClass::Blob,
+                interest: EventInterest::empty(),
+            }
+            .encode()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn blob_interest_is_exact_canonical_and_proof_bound() {
+        assert_eq!(MAX_BLOB_INTEREST_BYTES, 76_802);
+        let alpha = BlobInterestSelector::new(
+            Topic::new("alpha").expect("topic"),
+            Scope::new("mission/alpha").expect("scope"),
+            7,
+            [0xa1; BLOB_CONTENT_PROOF_BYTES],
+        );
+        let bravo = BlobInterestSelector::new(
+            Topic::new("bravo").expect("topic"),
+            Scope::new("mission/bravo").expect("scope"),
+            8,
+            [0xb2; BLOB_CONTENT_PROOF_BYTES],
+        );
+        let interest = BlobInterest::new(vec![bravo.clone(), alpha.clone(), alpha.clone()])
+            .expect("canonical Blob interest");
+        assert_eq!(interest.selectors(), &[alpha.clone(), bravo.clone()]);
+        assert_eq!(
+            interest
+                .selector(alpha.topic(), alpha.scope())
+                .expect("exact selector")
+                .content_proof(),
+            &[0xa1; BLOB_CONTENT_PROOF_BYTES]
+        );
+        assert!(!interest.is_empty());
+
+        assert!(
+            BlobInterest::new(vec![
+                alpha.clone(),
+                BlobInterestSelector::new(
+                    alpha.topic().clone(),
+                    alpha.scope().clone(),
+                    9,
+                    [0xc3; BLOB_CONTENT_PROOF_BYTES],
+                ),
+            ])
+            .is_err()
+        );
+
+        let frame = Frame::BlobInterest(interest);
+        let encoded = frame.encode().expect("encode Blob interest");
+        assert_eq!(
+            Frame::decode(&encoded).expect("decode Blob interest"),
+            frame
+        );
+
+        let mut noncanonical = encoded.clone();
+        let selector_len = 2 + 5 + 2 + 13 + 8 + BLOB_CONTENT_PROOF_BYTES;
+        let first = noncanonical[7..7 + selector_len].to_vec();
+        let second = noncanonical[7 + selector_len..7 + 2 * selector_len].to_vec();
+        noncanonical[7..7 + selector_len].copy_from_slice(&second);
+        noncanonical[7 + selector_len..7 + 2 * selector_len].copy_from_slice(&first);
+        assert!(Frame::decode(&noncanonical).is_err());
+
+        let mut truncated_proof =
+            Frame::BlobInterestReply(BlobInterest::new(vec![alpha]).expect("single Blob interest"))
+                .encode()
+                .expect("encode Blob interest proof");
+        truncated_proof.pop();
+        assert!(Frame::decode(&truncated_proof).is_err());
+    }
+
+    #[test]
+    fn blob_range_fetch_and_data_enforce_exact_bounded_ranges() {
+        let source_id = BlobTransferId::new([0x71; 32]);
+        let object_id = BlobObjectId::new([0x72; 32]);
+        let maximum = Frame::BlobRange {
+            direction: EventDirection::ToSessionInitiator,
+            source_id,
+            object_id,
+            total_len: MAX_BLOB_RANGE_BYTES as u64,
+            offset: 0,
+            requested_len: MAX_BLOB_RANGE_BYTES as u32,
+            disposition: BlobRangeDisposition::Data,
+            bytes: vec![0x73; MAX_BLOB_RANGE_BYTES],
+        };
+        let encoded = maximum.encode().expect("encode maximum Blob range");
+        assert_eq!(
+            Frame::decode(&encoded).expect("decode maximum Blob range"),
+            maximum
+        );
+
+        for invalid in [
+            Frame::BlobRangeFetch {
+                direction: EventDirection::ToSessionInitiator,
+                source_id,
+                object_id,
+                total_len: 0,
+                offset: 0,
+                requested_len: 1,
+                content_proof: [0x74; BLOB_CONTENT_PROOF_BYTES],
+            },
+            Frame::BlobRangeFetch {
+                direction: EventDirection::ToSessionInitiator,
+                source_id,
+                object_id,
+                total_len: 1,
+                offset: 0,
+                requested_len: 0,
+                content_proof: [0x74; BLOB_CONTENT_PROOF_BYTES],
+            },
+            Frame::BlobRangeFetch {
+                direction: EventDirection::ToSessionInitiator,
+                source_id,
+                object_id,
+                total_len: MAX_BLOB_RANGE_BYTES as u64 + 1,
+                offset: 0,
+                requested_len: MAX_BLOB_RANGE_BYTES as u32 + 1,
+                content_proof: [0x74; BLOB_CONTENT_PROOF_BYTES],
+            },
+            Frame::BlobRangeFetch {
+                direction: EventDirection::ToSessionInitiator,
+                source_id,
+                object_id,
+                total_len: 8,
+                offset: 4,
+                requested_len: 5,
+                content_proof: [0x74; BLOB_CONTENT_PROOF_BYTES],
+            },
+        ] {
+            assert!(invalid.encode().is_err());
+        }
+
+        assert!(
+            Frame::BlobRange {
+                direction: EventDirection::ToSessionInitiator,
+                source_id,
+                object_id,
+                total_len: 4,
+                offset: 0,
+                requested_len: 4,
+                disposition: BlobRangeDisposition::Data,
+                bytes: vec![0; 3],
+            }
+            .encode()
+            .is_err()
+        );
+        assert!(
+            Frame::BlobRange {
+                direction: EventDirection::ToSessionInitiator,
+                source_id,
+                object_id,
+                total_len: 4,
+                offset: 0,
+                requested_len: 4,
+                disposition: BlobRangeDisposition::Unavailable,
+                bytes: vec![0],
+            }
+            .encode()
+            .is_err()
+        );
+
+        let mut noncanonical = Frame::BlobRange {
+            direction: EventDirection::ToSessionInitiator,
+            source_id,
+            object_id,
+            total_len: 4,
+            offset: 0,
+            requested_len: 4,
+            disposition: BlobRangeDisposition::Data,
+            bytes: vec![0; 4],
+        }
+        .encode()
+        .expect("encode exact Blob range");
+        noncanonical[92..96].copy_from_slice(&3u32.to_be_bytes());
+        noncanonical.pop();
+        assert!(Frame::decode(&noncanonical).is_err());
+
+        let mut unknown = encoded;
+        unknown[91] = 0xff;
+        assert!(Frame::decode(&unknown).is_err());
+    }
+
+    #[test]
+    fn blob_range_result_and_ack_bind_exact_canonical_outcome() {
+        let source_id = BlobTransferId::new([0x81; 32]);
+        let object_id = BlobObjectId::new([0x82; 32]);
+        let cases = [
+            (BlobRangeApplyDisposition::Partial, 8, 0, 4),
+            (BlobRangeApplyDisposition::Complete, 8, 4, 4),
+            (BlobRangeApplyDisposition::Duplicate, 8, 0, 0),
+            (BlobRangeApplyDisposition::DeferredCapacity, 8, 0, 0),
+            (BlobRangeApplyDisposition::Unavailable, 8, 0, 0),
+        ];
+        for (disposition, total_len, offset, accepted_len) in cases {
+            let result = Frame::BlobRangeResult {
+                direction: EventDirection::ToSessionInitiator,
+                source_id,
+                object_id,
+                total_len,
+                offset,
+                accepted_len,
+                disposition,
+            };
+            let ack = Frame::BlobRangeResultAck {
+                direction: EventDirection::ToSessionInitiator,
+                source_id,
+                object_id,
+                total_len,
+                offset,
+                accepted_len,
+                disposition,
+            };
+            let encoded_result = result.encode().expect("encode Blob range result");
+            let encoded_ack = ack.encode().expect("encode Blob range result ack");
+            assert_eq!(encoded_result.len(), 92);
+            assert_eq!(encoded_ack.len(), 92);
+            assert_eq!(&encoded_result[5..], &encoded_ack[5..]);
+            assert_eq!(
+                Frame::decode(&encoded_result).expect("decode result"),
+                result
+            );
+            assert_eq!(Frame::decode(&encoded_ack).expect("decode ack"), ack);
+        }
+
+        for invalid in [
+            Frame::BlobRangeResult {
+                direction: EventDirection::ToSessionInitiator,
+                source_id,
+                object_id,
+                total_len: 8,
+                offset: 0,
+                accepted_len: 0,
+                disposition: BlobRangeApplyDisposition::Partial,
+            },
+            Frame::BlobRangeResult {
+                direction: EventDirection::ToSessionInitiator,
+                source_id,
+                object_id,
+                total_len: 8,
+                offset: 0,
+                accepted_len: 1,
+                disposition: BlobRangeApplyDisposition::Duplicate,
+            },
+            Frame::BlobRangeResult {
+                direction: EventDirection::ToSessionInitiator,
+                source_id,
+                object_id,
+                total_len: 8,
+                offset: 0,
+                accepted_len: 1,
+                disposition: BlobRangeApplyDisposition::Unavailable,
+            },
+            Frame::BlobRangeResult {
+                direction: EventDirection::ToSessionInitiator,
+                source_id,
+                object_id,
+                total_len: 8,
+                offset: 0,
+                accepted_len: 8,
+                disposition: BlobRangeApplyDisposition::Partial,
+            },
+            Frame::BlobRangeResult {
+                direction: EventDirection::ToSessionInitiator,
+                source_id,
+                object_id,
+                total_len: 8,
+                offset: 0,
+                accepted_len: 4,
+                disposition: BlobRangeApplyDisposition::Complete,
+            },
+        ] {
+            assert!(invalid.encode().is_err());
+        }
+
+        let mut unknown = Frame::BlobRangeResult {
+            direction: EventDirection::ToSessionInitiator,
+            source_id,
+            object_id,
+            total_len: 8,
+            offset: 4,
+            accepted_len: 4,
+            disposition: BlobRangeApplyDisposition::Complete,
+        }
+        .encode()
+        .expect("encode Blob result");
+        *unknown.last_mut().expect("disposition") = 0xff;
+        assert!(Frame::decode(&unknown).is_err());
+    }
+
+    #[test]
+    fn blob_carrier_finish_remaining_is_bounded_and_exact() {
+        let frame = Frame::BlobCarrierFinish {
+            direction: EventDirection::ToSessionInitiator,
+            remaining: MAX_CARDINALITY_LIMIT as u64,
+        };
+        let encoded = frame.encode().expect("encode Blob carrier finish");
+        assert_eq!(
+            Frame::decode(&encoded).expect("decode Blob carrier finish"),
+            frame
+        );
+        assert!(
+            Frame::BlobCarrierFinished {
+                direction: EventDirection::ToSessionInitiator,
+                remaining: MAX_CARDINALITY_LIMIT as u64 + 1,
+            }
+            .encode()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn v3_custody_prefix_is_bounded_before_payload_parsing() {
+        let frame = Frame::OfferV3 {
+            direction: EventDirection::ToSessionResponder,
+            id: EventTransferId::new([0x73; 32]),
+            exchange_id: 99,
+            custody: vec![0x44; 8],
+            bytes: b"stable-source".to_vec(),
+        };
+        let mut encoded = frame.encode().expect("encode v3 offer");
+        encoded[46..50].copy_from_slice(
+            &u32::try_from(MAX_CUSTODY_WRAPPER_BYTES + 1)
+                .expect("custody bound fits u32")
+                .to_be_bytes(),
+        );
+        assert!(Frame::decode(&encoded).is_err());
+        assert!(frame.serves_application_or_control_object());
     }
 
     #[test]
@@ -1381,6 +3499,17 @@ mod tests {
             Frame::ControlOffer {
                 id: control_id,
                 bytes: oversized.clone(),
+            }
+            .encode()
+            .is_err()
+        );
+        assert!(
+            Frame::OfferV3 {
+                direction: EventDirection::ToSessionResponder,
+                id: event_id,
+                exchange_id: 1,
+                custody: vec![0u8; MAX_CUSTODY_WRAPPER_BYTES + 1],
+                bytes: Vec::new(),
             }
             .encode()
             .is_err()
@@ -1452,6 +3581,53 @@ mod tests {
             Frame::decode(&encoded).expect("decode empty interest"),
             Frame::EventInterest(EventInterest::empty())
         );
+    }
+
+    #[test]
+    fn v3_interest_binds_a_canonical_selector_revision_and_exact_overhead() {
+        let interest = EventInterest::new(vec![
+            selector("alpha", "mission/alpha", false),
+            selector("bravo", "mission/bravo", true),
+        ])
+        .expect("canonical interest");
+        let legacy_len = Frame::EventInterest(interest.clone())
+            .encode()
+            .expect("legacy interest")
+            .len();
+        let encoded = Frame::EventInterestV3 {
+            interest: interest.clone(),
+            selector_revision: 2,
+            policy: FrameEmissionPolicy::Normal,
+            policy_revision: 1,
+        }
+        .encode()
+        .expect("v3 interest");
+        assert_eq!(encoded.len(), legacy_len + 17);
+
+        assert!(
+            Frame::EventInterestV3 {
+                interest: interest.clone(),
+                selector_revision: 1,
+                policy: FrameEmissionPolicy::Normal,
+                policy_revision: 1,
+            }
+            .encode()
+            .is_err()
+        );
+
+        let mut malformed = encoded;
+        malformed[14..22].copy_from_slice(&1u64.to_be_bytes());
+        assert!(Frame::decode(&malformed).is_err());
+
+        let empty = Frame::EventInterestReplyV3 {
+            interest: EventInterest::empty(),
+            selector_revision: 0,
+            policy: FrameEmissionPolicy::ReceiveOnly,
+            policy_revision: 1,
+        }
+        .encode()
+        .expect("zero-revision empty interest");
+        assert_eq!(empty.len(), 4 + 1 + 1 + 8 + 8 + 2);
     }
 
     #[test]
@@ -1577,8 +3753,23 @@ mod tests {
                 id,
                 inserted: false,
             },
+            Frame::ApplyResultV3 {
+                direction,
+                id,
+                exchange_id: 19,
+                inserted: true,
+                disposition: EventApplyDisposition::Satisfied,
+            },
             Frame::Finish { direction },
             Frame::Finished { direction },
+            Frame::FinishV3 {
+                direction,
+                remaining: 23,
+            },
+            Frame::FinishedV3 {
+                direction,
+                remaining: 23,
+            },
         ];
         for frame in frames {
             let encoded = frame.encode().expect("directional encode");
@@ -1593,5 +3784,42 @@ mod tests {
             unknown[5] = 3;
             assert!(Frame::decode(&unknown).is_err());
         }
+
+        let mut invalid_disposition = Frame::ApplyResultV3 {
+            direction,
+            id,
+            exchange_id: 23,
+            inserted: true,
+            disposition: EventApplyDisposition::Satisfied,
+        }
+        .encode()
+        .expect("v3 apply result");
+        *invalid_disposition
+            .last_mut()
+            .expect("v3 apply result has disposition") = 0;
+        assert!(Frame::decode(&invalid_disposition).is_err());
+    }
+
+    #[test]
+    fn v3_finish_remaining_is_canonical_and_cardinality_bounded() {
+        let direction = EventDirection::ToSessionResponder;
+        let boundary = Frame::FinishV3 {
+            direction,
+            remaining: MAX_CARDINALITY_LIMIT as u64,
+        };
+        let encoded = boundary.encode().expect("boundary finish");
+        assert_eq!(Frame::decode(&encoded).expect("decode boundary"), boundary);
+
+        assert!(
+            Frame::FinishV3 {
+                direction,
+                remaining: MAX_CARDINALITY_LIMIT as u64 + 1,
+            }
+            .encode()
+            .is_err()
+        );
+        let mut oversized = encoded;
+        oversized[6..14].copy_from_slice(&(MAX_CARDINALITY_LIMIT as u64 + 1).to_be_bytes());
+        assert!(Frame::decode(&oversized).is_err());
     }
 }

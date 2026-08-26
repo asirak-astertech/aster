@@ -30,14 +30,16 @@ BatchProof EnvelopeID. Every item therefore requires all of the following:
 3. a valid, canonical inclusion proof for the exact item leaf; and
 4. the source's P-256 signature over that leaf and the exact proof references.
 
-Batch proofs and compact envelopes are semantic-protocol-version-2 objects and
-are valid only on an authenticated adjacency which selected semantic protocol
-version 2 and complete suite `0x0001`. A version-2 implementation offers the
-canonical descending version list `[2, 1]`; selection remains the responder's
-highest common version. An adjacency which selected version 1 is deliberately
-singleton-only and must neither inventory nor transfer a batch proof or compact
-envelope. Version 2 adds this representation; it does not remove the existing
-version-1 format-2 singleton representation.
+Batch proofs and compact envelopes use the fixed semantic-protocol construction
+marker `2` and are valid only on an authenticated adjacency which selected
+semantic protocol version 2 or 3 and complete suite `0x0001`. The current
+implementation offers the canonical descending version list `[3, 2, 1]`; a
+v2-compatibility implementation may offer `[2, 1]`, and selection remains the
+responder's highest common version. An adjacency which selected version 1 is
+deliberately singleton-only and must neither inventory nor transfer a batch
+proof or compact envelope. Version 2 introduced this representation; version 3
+inherits it without changing its source bytes or removing the version-1
+format-2 singleton representation.
 
 Changing an item while retaining a public batch proof consequently requires a
 SHA-256 second preimage/collision or a new ML-DSA signature even if P-256 is
@@ -83,7 +85,7 @@ aster/pq-batch-item-ecdsa/v1
 
 The `/v1` suffixes above version the Aster-specific cryptographic construction;
 they do not assert semantic protocol version 1. This first construction is
-carried only by semantic protocol version 2.
+carried only by semantic protocol version 2 or 3.
 
 No label may be reused by a singleton signature, control, credential, content
 AEAD, or transport handshake.
@@ -130,11 +132,11 @@ semantic protocol version. A batch proof reuses the same authority-issued
 credential and NodeID that make its retained format-2 singleton representation
 verifiable by a version-1 peer; it does not rewrite a version field and thereby
 derive a different publisher identity. The current credential encoding remains
-version 1 and is admitted by both semantic versions. Semantic version 2 is
-instead bound by the proof and compact public headers, manifest, authenticated
-session, and signatures described here. These bindings prevent credential,
-authority, mission, suite, protocol, or publisher substitution while preserving
-one cross-version source identity.
+version 1 and is admitted by semantic versions 1, 2, and 3. Semantic versions 2
+and 3 instead bind the fixed construction marker through the proof and compact
+public headers, manifest, authenticated session, and signatures described here.
+These bindings prevent credential, authority, mission, suite, protocol, or
+publisher substitution while preserving one cross-version source identity.
 
 The source hybrid-signs
 `hash_domain("aster/pq-batch-signature/v1", manifest)`. Both signature families
@@ -356,9 +358,9 @@ staging. Successful proof processing is ordered as follows:
 4. retry dependent pending items and atomically promote only those whose full
    verification succeeds.
 
-A compact item received first on a selected-version-2 adjacency is stored only
-in a bounded
-`pending_batch_items` area keyed by exact item EnvelopeID and proof EnvelopeID.
+A compact item received first on a selected-version-2-or-3 adjacency is stored
+only in a bounded `pending_batch_items` area keyed by exact item EnvelopeID and
+proof EnvelopeID.
 It is not inserted into `items`, causal/event acceptance ledgers, subscriptions,
 or the application-visible query index. Its parsed dependency causes a Want for
 typed ObjectKind 3. A missing proof is a dependency state, not an authentication
@@ -374,7 +376,7 @@ No alternate proof bytes may be spliced under the same EnvelopeID.
 ### Inventory, ordering, retention, and quota
 
 ObjectKind 3 uses the existing Offer/Want/Data/Receipt ranged-transfer flow only
-when the authenticated adjacency selected semantic protocol version 2 and
+when the authenticated adjacency selected semantic protocol version 2 or 3 and
 complete suite `0x0001`. No proof bytes are embedded in forwarding metadata.
 For every selected compact item, inventory includes its proof unless the peer
 has already acknowledged that exact proof EnvelopeID. The scheduler emits the
@@ -385,9 +387,9 @@ through durable pending state.
 An adjacency which selected version 1 inventories, Wants, transfers, and
 receipts only format-2 singleton source envelopes. It must never advertise or
 serve ObjectKind 3 or a format-3 envelope. An adjacency which selected version
-2 may use either format-3 batch objects or format-2 singleton objects, including
-the urgent fallback. Consequently, a selected-version-1 peer receives the
-retained or source-materialized singleton representation, never an attempted
+2 or 3 may use either format-3 batch objects or format-2 singleton objects,
+including the urgent fallback. Consequently, a selected-version-1 peer receives
+the retained or source-materialized singleton representation, never an attempted
 translation by a relay.
 
 A proof is route-authorized for exactly its manifest scope and epoch. It is
@@ -418,22 +420,23 @@ topic content key or payload plaintext.
 - A proof from a revoked publisher and every dependent item are rejected for
   new ingestion or serving under the same revocation policy as singleton items.
   Batching does not create a post-revocation authorization window.
-- A version-2 implementation offers semantic versions `[2, 1]` in canonical
-  descending order. The complete offer and selected version are already bound
+- The current implementation offers semantic versions `[3, 2, 1]` in canonical
+  descending order; a v2-compatibility implementation may offer `[2, 1]`. The
+  complete offer and selected version are already bound
   by the authenticated mission proof, handshake transcript, KDF inputs, hybrid
   handshake signatures, and key confirmations. Stripping or reordering an
   offer, or changing a version selection, therefore fails the handshake rather
   than silently disabling batching.
 - Legitimate selection of version 1 with a version-1 peer is not an error. It
   constrains that adjacency to the complete format-2 singleton representation.
-  A version-2 implementation must reject ObjectKind 3 or a format-3 envelope
+  A version-2-or-3 implementation must reject ObjectKind 3 or a format-3 envelope
   received on a selected-version-1 session. A version-1 parser rejects the
   critical unknown object kind or envelope format as intended.
 - The proof public header, manifest preamble, compact public header, leaf
-  header, and verification context must all agree on semantic protocol 2,
-  envelope format 3, and complete suite `0x0001`. A missing BatchProof can never
-  be reinterpreted as semantic version 1, format 2, or ECDSA-only
-  authentication.
+  header, and verification context must all agree on construction marker 2,
+  envelope format 3, and complete suite `0x0001`; the authenticated session must
+  have selected semantic version 2 or 3. A missing BatchProof can never be
+  reinterpreted as semantic version 1, format 2, or ECDSA-only authentication.
 - Scope and epoch must equal in the proof manifest, compact header, local route
   grant, and active-store policy. A proof cannot span an epoch transition.
 - `first + count - 1` must not overflow. An index outside the count, a causal
@@ -562,8 +565,8 @@ later materialization defers, but does not eliminate, those singleton signing
 costs.
 
 `A_dual` is a committed-storage and quota consequence, not the amount sent to a
-version-2 peer. A version-2 transfer which selects the batch representation
-still sends `A_batch` and retains the stated amortization. A version-1 link
+version-2-or-3 peer. A version-2-or-3 transfer which selects the batch
+representation still sends `A_batch` and retains the stated amortization. A version-1 link
 sends the singleton representation and therefore has the singleton baseline
 cost and no 3 kbps batching gain.
 
@@ -573,12 +576,12 @@ Existing format-2 singleton envelopes remain the fail-closed compatibility and
 urgent path. They are semantic-version-1 objects, carry the complete credential
 and full hybrid item signature, and require no BatchProof dependency. They are
 the only source-data representation allowed on a selected-version-1 adjacency;
-a selected-version-2 adjacency may carry either these singletons or the new
-semantic-version-2 batch representation.
+a selected-version-2-or-3 adjacency may carry either these singletons or the
+construction-marker-2 batch representation.
 
 - Ordinary `publish` remains an immediate singleton operation.
 - Flash/urgent items never wait for a batch. The singleton fallback is available
-  on both selected protocol versions; a version-2 adjacency can carry format 2.
+  on every selected protocol version; a version-2-or-3 adjacency can carry format 2.
   An already complete explicit batch may still be committed in the same call.
 - An explicit batch with fewer than two items is rejected rather than silently
   changing authentication mode; the caller may publish those items as
@@ -610,7 +613,7 @@ custody-preserving pending promotion, singleton-on-compact registration, and
 durable rejected-proof state. The focused receipt-gating regression, complete
 store test group, FFI 12/12, Go 8/8, Python 9/9, linked C/C++ smoke, and strict
 store/FFI lint gates pass. Peer inventory, Want, serving, ingest, receipt gating,
-and dependency promotion are implemented. Focused evidence verifies exact v1/v2
+and dependency promotion are implemented. Focused evidence verifies exact v1/v2/v3
 representation inventory, proof-first batch-only replication, compact-first
 private staging across restart followed by exact-proof promotion, selected-v1
 compact rejection, and a finalized two-Blob proof/compact/carrier transfer with
@@ -629,9 +632,40 @@ cross-peer partial resume, crash at every commit boundary, atomic dual
 representation, source-only materialization restart, logical-item deduplication
 and credential/NodeID equality across both representations,
 selected-version-1 suppression and rejection, offer-strip/reorder downgrade
-rejection, version-2 singleton fallback,
+rejection, version-2-or-3 singleton fallback,
 quota/eviction reference integrity, relay no-plaintext and no-conversion
 canaries, broadcast deduplication, and the serialized 3 kbps accounting gate.
 
 No new dependency or external implementation input was used to define this
 contract.
+
+## Semantic-v4 inheritance amendment (2026-08-25)
+
+This amendment supersedes the earlier present-tense statements that the
+current/default offer is `[3, 2, 1]`. They remain above only as the historical
+negotiation boundary of the v2/v3 batch decision and its evidence.
+
+Semantic version 4 inherits the unchanged semantic-v2 batch object kinds,
+`ASTRENV3` bytes, proof/compact dependency rules, atomic publication behavior,
+and semantic-v3 Event custody behavior. It does not allocate a new batch
+format, source-envelope version, ObjectKind, credential, suite, or stable
+replication-wire version. Default/highest negotiation becomes 4 with offer
+`[4, 3, 2, 1]`; v1-v3 Event compatibility remains intact.
+
+The only v4-only addition in this slice is selected protected State/Record
+mechanics. Those class- and direction-separated interest, Negentropy, object,
+result/acknowledgement, and finish frames are session mechanics rather than
+batch source representations. A v1-v3 contact must not send or accept them.
+Consequently, this amendment does not turn a State/Record object into a compact
+batch, change retained-dual policy, or grant new batch/bridge acceptance credit.
+
+## Semantic-v5 inheritance amendment (2026-08-25)
+
+Semantic version 5 inherits the same semantic-v2 batch bytes and all v3/v4
+behavior without allocating another batch format, ObjectKind, source-envelope,
+suite, or wire version. Default/highest negotiation becomes 5 with offer
+`[5, 4, 3, 2, 1]`. The v5-only selected Blob source/carrier mechanics use the
+existing source representations and `ASTRBT01` kind-2 carriers; v1-v4 emit zero
+Blob mechanics frames. This creates no additional batch acceptance claim.
+Independent v4 interoperability and a fresh complete release receipt remain
+required.

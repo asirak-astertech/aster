@@ -1,6 +1,5 @@
 # Proposal 0003: Idiomatic IP mesh provider comparison
 
-> ****
 
 - Status: completed — no provider selected; no dependency or production profile
   admitted
@@ -16,8 +15,8 @@
 - Result: [Proposal 0003 result](0003-idiomatic-ip-mesh-provider-results.md)
 - Decision: [Decision 0024](../decisions/0024-refactor-durable-node-ownership-before-ip-provider-selection.md)
 - Preserves: [Decision 0002](../decisions/0002-dependency-admission.md),
-  [Decision 0014](../decisions/0014-total-assurance-build-vs-buy.md),
-  [Decision 0015](../decisions/0015-library-backed-mechanism-reduction.md),
+  Decision 0014 (“Build versus buy is governed by total assurance cost”;
+  Decision 0015 (“Delete custom mechanism behind narrow library-backed seams”;
   [Decision 0022](../decisions/0022-ip-mesh-experiment-no-selection.md), and
   [Decision 0023](../decisions/0023-mesh-host-contract-no-libp2p-selection.md)
 - Prior results: [Proposal 0001](0001-ip-mesh-vertical-slice-results.md) and

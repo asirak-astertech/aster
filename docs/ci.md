@@ -48,6 +48,16 @@ mechanically: required selected crates and `reference-session` must remain
 reachable, while `sqlite-store`, `adapter-sdk`, SQLite packages, the legacy
 host/IP runtime, the lab, and the libp2p pilot must remain absent.
 
+The normal node graph already reaches Iroh's client-side `iroh-relay` package;
+it does not enable `iroh-relay/server`, `iroh-relay/test-utils`, or
+`aster-iroh/test-utils`. The direct `rustls` 0.23.43 edge used to construct
+explicit relay trust adds no package or version beyond the existing lock.
+Only the dev/all-feature `aster-iroh/test-utils` fixture enables the
+`iroh-relay` server and test features and their server/ACME package graph. The
+expanded lock and test graph still requires the ordinary exact-license,
+advisory, SBOM, supported-target, and release-admission review; a green fixture
+test is not production server admission.
+
 The retained parent PR-A/pre-subscription 2026-08-24 frozen-tree run passed 336
 `aster-core`, 57 redb-store, 48 node-library, six node-binary, and ten
 node-integration tests plus doc tests.
@@ -129,9 +139,9 @@ The frozen SHA-256 identities are:
 - `crates/aster-node/tests/mesh_cli.rs`: `59c858c0bc559944546e88eefee550523fd64905e4b2779a9a3d1a7eb2b8ce0e`
 - `crates/aster-redb-store/src/lib.rs`: `364e5a1d8d7f7b24ab75afe8ec2791023db83b11997bd07722c7d107a16a6a00`
 
-This is current-code automated loopback evidence only: no retained PR-C
-execution root or log artifact, physical system, independent implementation,
-or release artifact is claimed.
+At that frozen PR-C tree, this was current-code automated loopback evidence
+only: no retained PR-C execution root or log artifact, physical system,
+independent implementation, or release artifact is claimed.
 
 The later stopped/local State, Record, and Blob gates are additive to that Event
 surface and do not change its wire. Record validation covers the typed
@@ -177,11 +187,14 @@ and both insert flags true in 1.26 seconds; an exact 0.84-second rerun returned
 the same semantic ID and projection with both insert flags false.
 
 The exact Record source/dependency hashes are pinned in the
-[requirements evidence](implementation/requirements-status.md#current-selected-record-automated-evidence).
-This is stopped/local automated evidence, not a Record contact, disconnected-
-process acceptance result, retained execution receipt, or release artifact.
-Record has no live handle or reconciliation frames; automatic registered-policy
-merge, finite TTL, expiry/garbage collection, selected-node bindings, physical
+[requirements evidence](implementation/requirements-status.md#prior-selected-record-stopped-slice-automated-evidence).
+This is the earlier stopped/local automated evidence, not a Record contact,
+disconnected-process acceptance result, retained execution receipt, or release
+artifact. At this frozen slice Record had no live handle or reconciliation
+frames; the later semantic-v4 gate below adds frames but no live application
+handle. Automatic registered-policy
+merge, finite TTL design (the selected form is rejected), expiry/garbage
+collection, selected-node bindings, physical
 systems, mixed implementations, and scale remain open.
 
 The subsequent stopped/local Blob gate adds a typed source-manifest capability,
@@ -259,7 +272,7 @@ an earlier sandboxed attempt was denied by the host before those socket tests
 could run and is not counted as a test failure or success.
 
 The exact Blob source identities are pinned in the
-[requirements evidence](implementation/requirements-status.md#current-selected-blob-automated-evidence).
+[requirements evidence](implementation/requirements-status.md#prior-selected-blob-automated-evidence).
 A disposable provisioned fixture then ran the compiled Blob example twice over
 18,783 input bytes. The 4.792-second first run returned one chunk,
 `inserted=true`, and Blob ID
@@ -270,6 +283,344 @@ outputs matched the input byte-for-byte at SHA-256
 The fixture is not retained, and this is local executable evidence rather than
 a Blob contact, remote-resume result, physical-storage measurement, or release
 receipt.
+
+The subsequent selected Event custody gate originally added semantic-v3
+authenticated cumulative age; current semantic v4 inherits that format. The
+gate also adds Linux finite Event TTL, priority-sensitive scheduling/retry, bounded
+logical aggregate and exact-scope quotas, retirement/fences, constrained
+emission, receive-only ingestion, protected lane-defer acknowledgement,
+receiver-relative apply disposition, and generation-scoped sender suppression
+receipts.
+Representative focused commands are:
+
+```sh
+cargo test --locked -p aster-core --features reference-session custody
+cargo test --locked -p aster-redb-store --lib custody
+cargo test --locked -p aster-node --lib receive_only_v3
+cargo test --locked -p aster-node --lib v3_preopen_stale_work
+cargo test --locked -p aster-node --lib same_epoch_rekey_restart
+```
+
+The carrier test separately rejects in the callback after acquiring a QUIC
+stream and before writing application bytes. Node tests cover ReceiveOnly blind
+v3 offers without local inventory/control disclosure, threshold and priority
+order, exact TTL boundaries, pre-open stale-work continuation, post-open
+zero-byte/fatal rejection, live policy revision races, bounded contact defer,
+same-epoch historical source lineage and v1 witness migration, cache warm/reuse,
+and final query/poll expiry withholding. Store tests cover exact-scope quota
+configuration, aggregate quota enforcement/rejection, authority reserve,
+continuous/lost age, route promotion, retirement/lease drain, retry/receipt
+settlement, sender/receiver visibility, crash-reopen cleanup, cardinality/audit
+corruption, and one-transaction bounded scheduling. Exact final counts, timings,
+and source hashes are recorded in the
+[prior semantic-v3 custody requirements evidence](implementation/requirements-status.md#prior-semantic-v3-selected-event-custody-automated-evidence).
+
+This is current-code automated evidence, not a retained physical acceptance
+receipt. Finite TTL is Linux/Event/v3-format only, inherited in v3/v4/v5;
+receive-only is not physical RF silence. V1/v2 deterministic whole-contact
+partials, generic cross-class priority eviction, selected State/Record custody
+or future TTL design (the current finite form rejects), long-offline and
+many-node scale, mixed implementations, operational provisioning with a
+production backend or protected stock CLI/binding, and release gates remain
+open. Caller-provided protected Rust `NodeConfig` construction is tracked by the
+separate current-code gate below.
+Networked Blob was outside that Event-custody receipt; the separate semantic-v5
+software gate below does not relabel it.
+
+The subsequent stopped protected-provisioning/control-administration Step 4
+gate is pinned separately in the
+[requirements evidence](implementation/requirements-status.md#prior-protected-provisioning-and-control-administration-automated-evidence).
+On fresh isolated targets, current Rust 1.97.1 and Rust 1.91.0 each passed 927
+executable workspace tests with zero failures and one deliberately ignored
+performance experiment; every-target/every-feature Clippy and all 17 Rustdoc
+crate-targets passed with warnings denied on both toolchains. The current and
+Rust 1.91 real-process `mesh_cli` targets passed 13/13 in 144.36s and 139.03s,
+respectively. The ordinary ready deadline is raised to 40 seconds; the cold offline
+cell uses separate 90-second startup, 120-second contact, and 150-second
+completion bounds. This historical freeze is stopped Rust automation, not a
+protected live CLI/binding, production SecretStore, operational recovery or
+destroy workflow, physical receipt, or release authorization.
+
+The later frozen source slice adds caller-provided protected live bootstrap and
+actor-owned live control administration. Its focused reproduction commands are:
+
+```sh
+cargo test --locked -p aster-core provisioning --lib
+cargo test --locked -p aster-node mission::tests --lib
+cargo test --locked -p aster-node control_admin::tests --lib
+cargo test --locked -p aster-node --test protected_runtime -- --test-threads=1
+cargo test --locked -p aster-node \
+  protected_live_controls_refresh_policy_retry_exactly_and_close_on_shutdown --lib
+cargo test --locked -p aster-node \
+  live_control_pending_gap_returns_policy_unsettled_and_preserves_exact_retry --lib
+cargo test --locked -p aster-node \
+  saturated_cloned_live_control_retries_do_not_starve_event_status_or_publish --lib
+cargo test --locked -p aster-node \
+  cancelled_enqueued_live_control_remains_actor_owned_and_exactly_retryable --lib
+cargo test --locked -p aster-node \
+  live_self_revocation_returns_receipt_before_actor_teardown --lib
+```
+
+The `protected_runtime` integration target names twelve Unix cells covering
+exact option/origin preservation, protected bytes and file artifacts, relative
+path capture across provider/loader current-directory changes, invalid options,
+uninspectable and terminal state before provider access, raw-inner rejection,
+sanitized errors, missing artifacts, exact and mismatched secret-load receipts,
+and lexical state-witness mutation. Focused core/mission tests additionally name
+`secret_reference_is_bounded_canonical_versioned_and_redacted`,
+`provisioning_origins_have_stable_nonidentifying_receipt_labels`, and
+`protected_state_witness_is_lexical_and_clone_local`.
+
+At the exact source identities recorded in the
+[requirements ledger](implementation/requirements-status.md#current-protected-live-startup-and-control-automated-evidence),
+the reported current-code gates passed: core library 380/380 in 45.21s; node library
+180/180 in 69.94s; protected-runtime integration 12/12 in 0.15s; node
+all-target/all-feature check in 12m04s; strict node all-target/all-feature
+Clippy with warnings denied in 25.84s; fresh-target workspace all-feature
+no-dependency Rustdoc with warnings denied in 17.97s; and formatting plus diff
+checks.
+
+The final serialized gate over those source identities and the preceding frozen
+documentation bytes ran outside the sandbox for real-Iroh loopback:
+
+```sh
+CARGO_TARGET_DIR=/private/tmp/aster-protected-admin-full-check CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=1 mise run check
+# exit 0
+```
+
+The all-feature workspace tests and strict Clippy passed. Major test results
+were core 388/388, node library 180/180, node main 12/12, `mesh_cli` 20/20,
+`protected_runtime` 12/12, redb 166/166, `aster-iroh` 13/13, host 74/74, IP
+50/50, lab 32/32, and FFI 13/13; all doctests also passed. C/C++ syntax,
+conformance and Python wire checks, Python bindings 12/12, lab Python 162/162,
+Go, license, dependency, and requirements gates were green. The requirements
+gate remained 348 IDs, 119 mappings, and 78/37/233 statuses. This is a
+non-retained current-code CI receipt: it creates no execution root, observed
+credit, or status movement. The source freeze is signed commit
+`164ccc1dbafd7fa954c06eb7cf555671ff597ba1`; no signed documentation commit is
+claimed here.
+
+The live-control cells cover capacity-one pressure with a four-command yield
+budget, policy refresh before response, nonfatal pending-policy deferral, exact
+retry, graceful shutdown, self-revocation receipt-before-teardown, and
+post-enqueue caller cancellation followed by stopped exact recovery. This is a
+source-hashed current-code evidence boundary, not a retained execution root,
+physical result, or additional `observed-bounded` credit. No production
+provider, protected stock CLI/binding, cross-process admin IPC, or coordinated
+provider destruction is added. The post-enqueue cancellation cell is Unix-only.
+
+The semantic-v4 State/Record gate is inherited unchanged by v5 and additive to
+those frozen slices. The handshake default/highest is 5 with
+`[5, 4, 3, 2, 1]`; Event retains v1-v4 compatibility, selected mutable frames
+are absent in v1-v3, and selected Blob frames are absent in v1-v4. Focused validation
+must cover the complete State/Record class and direction grammar, including all
+20 structured mutable tags in `selected_frame_decode`; exact offer
+`MutableApplyResult`, fetch `MutableFetchResult` plus required exact
+`MutableFetchResultAck`, and Finish/Finished remaining matching; missing,
+duplicate, changed, cross-class, cross-direction, and out-of-order rejection;
+and v1-v3 plus ReceiveOnly mutable absence. Normal and every AtLeast threshold
+must still run mutable lanes because AtLeast is Event-only.
+
+Store/runtime cells must additionally exercise the fatal 1 MiB structural
+object limit and, for otherwise-valid authenticated objects, typed effective
+ordinary-aggregate/per-class item or byte, 1,024-version per-logical-key
+projection, and causal-frontier deferral without mutation. They also exercise
+the exact 4,096-row and 16-MiB per-class boundaries, bounded-contact fair
+progress, and the durable
+peer/class/local Offer/Fetch cursor at 256 peers and 1,024 rows. Cursor CAS,
+restart, stale-peer prune, additive-schema audit, malformed/overbound rejection,
+ordinary-quota isolation, and terminal preservation are mandatory. Current
+route-lineage tests must prove that a same-epoch replacement withholds historical
+lineage from ordinary current projection/query and network inventory/transfer while exact
+idempotent State publish and Record publish/resolution retries may recover the
+committed result only through the strict cached/projection/historical path.
+Selected finite State/Record TTL must reject.
+
+Representative focused commands are:
+
+```sh
+cargo test --locked -p aster-node frame::tests
+cargo test --locked -p aster-redb-store mutable_transfer_cursor
+cargo test --locked -p aster-redb-store apply_stops_at_retained
+cargo test --locked -p aster-redb-store state_and_record_frontier_capacity_errors_are_typed_and_transactional -- --exact
+cargo test --locked -p aster-node runtime::tests::real_iroh_contact_converges_state_and_disconnected_record_siblings -- --exact
+cargo test --locked -p aster-node same_epoch_rekey_restart
+cargo check --locked --manifest-path fuzz/Cargo.toml --bin selected_frame_decode
+```
+
+The final source manifest, exact two-toolchain matrix results, binding gates,
+and the disclosed pre-existing lab-oracle retry are pinned in the
+[prior State/Record requirements evidence](implementation/requirements-status.md#prior-selected-state-and-record-network-automated-evidence).
+This remains current-code automation only, not a retained execution root. Event
+last-contact status is not State/Record convergence. Physical links,
+State/Record relay, NAT, BTLE, resource brackets, mixed implementations, and
+release gates remain open. This State/Record gate supplies no scale evidence;
+the separate retained N=32 receipt is Event-only.
+
+The semantic-v5 direct Blob gate is additive to the earlier stopped/local Blob
+gate. It must cover all Blob interest/source/range/result/ack/finish frame bytes,
+malformed and cross-tuple rejection, and v1-v4 zero-Blob behavior. Provider
+tests require a current 32-byte peer content proof plus route authority and
+nonrevocation and reject route-only, wrong peer/topic/scope/epoch/authority,
+tamper, stale proof, and same-epoch replacement. Store tests require source-
+before-carrier staging, contiguous peer-neutral prefixes of at most 16 KiB,
+64-MiB/1,024-chunk admission, 10,000-row/64-MiB staging bounds, exact depot plus
+fresh full-content/current-lineage completion, and zero ordinary visibility
+before atomic promotion. A new physical lineage for the same `(BlobID, content
+group, numeric epoch)` must fail with `PhysicalLineageConflict`; republish or
+resume requires an epoch advance. Finish/Finished is only the requester's
+remaining-count echo, while each exact Result/Ack binds accepted prefix
+progress. Read-only, writable, and terminal-preservation opens must cross-audit
+pending source/manifest route/carriers against the depot plan and completed
+namespace, rejecting a changed plan, a self-consistent missing plan, or a
+pending/completed collision without repair. Writable predecessor migration must add all
+four network tables to the prior nine-table Blob group only as one absent group
+under the owner-token/binding rules; read-only or partial-group open must not
+migrate or repair it.
+
+Startup cleanup must also begin from an authenticated source plus one durable
+carrier range and reclaim exactly the pending source, cached claim, carrier
+prefix, network-staging accounting, chunks/files, finalized digest, and every
+reserved or committed depot byte after each of same-epoch lineage replacement,
+numeric epoch advance, and publisher revocation. It must retain exactly one
+non-public unfinished physical-lineage fence charged to the existing variant
+cap, reopen with no other progress, permit exact-lineage refill, reject a
+different same-epoch lineage without mutation, permit numeric epoch advance,
+and reject a zero-lineage fence on every open path. Valid later Blob work must
+succeed and a second reopen must remain clean.
+
+Runtime races are part of the gate. One regression must pause exact restage
+between fresh authentication and cache insertion while an abort wins, then
+prove the shared source/store/cache lifecycle lock leaves neither an orphan
+claim nor an unclaimed durable source and requires no restart. Another must use
+a multi-carrier source whose manifest-last carrier is not its greatest ID and
+prove terminal poison advances to the lexicographic maximum so a later source
+is selected.
+
+The final runtime gate is one small bounded three-node direct-Iroh case: source
+and first receiver make only partial carrier progress, runtime/store/provider
+cache ownership tears down, then after reopen a different eligible content peer
+continues the same exact source/carrier complement to a fully verified visible
+publication. Normal and AtLeast must run the lane because AtLeast is Event-only;
+ReceiveOnly must perform zero Blob work. This is current-code
+same-implementation loopback automation, not a retained execution root, live
+Blob application handle, route-only Blob relay, 100+ MiB/RSS or resource test,
+physical system, mixed implementation, or release acceptance.
+
+Representative focused commands include:
+
+```sh
+cargo test --locked -p aster-core source_blob::tests::blob_peer_content_proof_is_exact_current_and_identity_bound -- --exact
+cargo test --locked -p aster-core schema_v14_migrates_and_v5_provenance_survives_restart -- --exact
+cargo test --locked -p aster-node frame::tests::blob
+cargo test --locked -p aster-redb-store blob::tests::network_blob_stages_transfers_promotes_serves_and_reopens -- --exact
+cargo test --locked -p aster-redb-store blob::tests::pending_blob_audit_binds_exact_manifest_route_and_carriers_on_all_open_paths -- --exact
+cargo test --locked -p aster-redb-store blob::tests::predecessor_nine_table_blob_schema_migrates_network_additively_with_owner_tokens -- --exact
+cargo test --locked -p aster-node runtime::tests::blob_source_carrier_reopen_resumes_exact_complement_from_different_peer -- --exact
+cargo test --locked -p aster-node runtime::tests::stale_pending_blob_cleanup_reclaims_exact_cache_and_depot_state -- --exact
+cargo test --locked -p aster-node runtime::tests::pending_blob_abort_reconciles_concurrent_exact_restage_without_restart -- --exact
+cargo test --locked -p aster-node runtime::tests::blob_lifecycle_lock_serializes_delayed_projection_insert_and_abort -- --exact
+cargo test --locked -p aster-node runtime::tests::terminal_blob_poison_advances_scheduler_past_source_to_later_candidate -- --exact
+cargo test --locked -p aster-node runtime::tests::authenticated_peer_without_scope_grant_learns_no_event_id_and_cannot_fetch -- --exact
+cargo check --locked --manifest-path fuzz/Cargo.toml --bin selected_frame_decode
+```
+
+The exact three-node, cleanup, delayed-insert/abort, terminal multi-carrier,
+all-open-path audit, and predecessor-migration results plus the frozen source
+manifest are recorded in the [prior semantic-v5 Blob requirements evidence](implementation/requirements-status.md#prior-semantic-v5-direct-blob-network-automated-evidence).
+Independent final audit found no remaining P0–P3. The repair retains the bounded
+non-public physical-lineage fence, serializes durable-source/cache transitions,
+and advances terminal cursor state to the lexicographic maximum. Exactly six
+requirements moved to `implemented-uncredited`; this current-code automation
+creates no retained Blob receipt or `observed-bounded` credit and does not
+relabel historical Event/control evidence.
+Strict workspace Rustdoc and a fresh isolated `aster-node` plus `aster-iroh`
+documentation build are also part of the frozen gate; stale Cargo rmeta is not a
+source change or an accepted substitute for the clean isolated build.
+
+## Controlled Iroh relay software gate
+
+The controlled-relay slice is bound to signed code commit
+`b0a1203f4f24c05edd31e5ce1ea0f3b7f9bd2f52`. Focused carrier tests cover exact
+route/trust bounds, relay-only operation with pinned TLS, rejection of a valid
+but unrelated CA without trust fallback, usable direct selection, direct
+operation while the pinned relay is dead, wrong authenticated endpoint
+identity, and bounded relay loss without public-relay substitution. Their exact
+test names are:
+
+- `controlled_route_and_trust_bounds_are_exact`
+- `relay_only_exact_peer_succeeds_with_pinned_tls_trust`
+- `relay_tls_rejects_a_valid_but_unrelated_ca_without_fallback`
+- `usable_exact_direct_candidate_becomes_selected`
+- `dead_pinned_relay_still_allows_the_exact_direct_candidate`
+- `controlled_route_rejects_the_wrong_authenticated_identity`
+- `relay_loss_is_bounded_and_has_no_public_relay_substitution`
+
+CLI unit tests require an inseparable URL/trust choice, reject duplicate
+relay-only and value flags without reflecting token-bearing values, and keep
+the help text bounded and free of authority claims:
+
+- `controlled_relay_flags_are_inseparable_and_trust_is_explicit`
+- `relay_only_switch_rejects_duplicate_ambiguity`
+- `controlled_relay_value_duplicates_are_rejected_without_echoing_values`
+- `help_advertises_bounded_controlled_relay_without_authority_claims`
+
+The serialized real-process cells use one local HTTPS relay with explicit DER
+trust. They select Relay when the initiator's exact direct candidate is
+unusable and the responder has IP disabled, complete Event transfer and an
+equal-inventory no-op, prove an unavailable controlled relay does not block an
+exact direct no-op, and reject partial/malformed/duplicate secret-bearing CLI
+configuration before state or mission access:
+
+- `controlled_relay_selected_when_direct_candidate_unusable_then_noops`
+- `unavailable_controlled_relay_does_not_block_exact_direct_sync`
+- `manual_node_rejects_partial_controlled_relay_before_state_or_mission_access`
+- `manual_node_rejects_malformed_relay_root_before_state_or_mission_access`
+- `manual_node_redacts_duplicate_token_bearing_relay_url_before_state_access`
+
+The focused runtime test
+`right_carrier_with_wrong_expected_mission_fails_before_inventory` separately
+uses direct Iroh to prove wrong-expected-mission ordering before inventory. It
+is not part of the relay-path process proof.
+
+After the final harness correction, the focused relay Event E2E rerun passed
+1/1 in 204.69 seconds. The frozen full-matrix receipt remains the serialized
+`mesh_cli` result below. The exact final full-repository command was:
+
+```sh
+env CARGO_TARGET_DIR=/private/tmp/aster-controlled-relay-full-check \
+  CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=1 mise run check
+```
+
+It ran outside the sandbox for loopback tests and exited zero. Visible
+constituent timings were `aster-node` library 170/170 in 157.48 seconds,
+`mesh_cli` 20/20 in 153.91 seconds, `aster-iroh` 13/13 in 9.28 seconds,
+`aster-ip` 50/50 in 2.20 seconds, and `aster-lab` library 32/32 in 53.56
+seconds. The remaining workspace suites and doctests, language bindings,
+conformance, project-license, selected-dependency-boundary, and
+dependency-exception-scope gates also passed. No trustworthy aggregate wall
+time was retained.
+
+The exact fresh all-feature documentation command was:
+
+```sh
+env RUSTDOCFLAGS=-Dwarnings \
+  CARGO_TARGET_DIR=/private/tmp/aster-controlled-relay-rustdoc-final-20260825 \
+  CARGO_BUILD_JOBS=2 \
+  cargo doc --locked --workspace --all-features --no-deps
+```
+
+It exited zero in 57.67 seconds.
+
+This is current one-host software evidence only. Initial direct and relay paths
+may be probed in parallel, so it is not a temporal direct-first/fallback result;
+authenticated Iroh NAT negotiation may also derive later direct paths, so it is
+not representative-NAT acceptance. Path kind and a coalesced transition count
+capped at 1,024 are observation-only diagnostics and never authorization or
+success inputs. The gate creates no retained receipt and grants no physical,
+NAT, BTLE/cross-transport, mixed-implementation, N=32, resource-bracket,
+State/Record/Blob-over-controlled-relay, route-only Blob custody, release, or
+`observed-bounded` credit.
 
 The 57th test in that parent redb-store receipt is a Unix writable-open
 durability adversary. Every new or existing writer, including a terminal
@@ -291,9 +642,9 @@ must move exactly one pre-existing Event difference, emit no application Event,
 and retain zero control counters. Every passing no-op contact must retain zero
 for all six control and all five Event counters. The generic schedule has
 `2N+1` cohorts and `5N-2` child processes: N=4 therefore uses nine cohorts and
-18 processes, while the accepted maximum N=32 would use 65 cohorts and 158
-processes. A successful integration root is removed; use the equivalent manual
-command when logs and a durable
+18 processes, while N=32 uses 65 cohorts and 158 executions. The routine
+integration cell remains N=4; N=32 is a manual acceptance run. A successful
+integration root is removed; use the equivalent manual command when logs and a durable
 receipt are needed:
 
 ```sh
@@ -384,6 +735,22 @@ exact terminal convergence pass. All 228 passing no-op contacts reported all
 recorded in the
 [requirements status](implementation/requirements-status.md).
 
+A separate 2026-08-25 manual gate used an operator-attested Cargo release-
+profile binary run for the signed current-tree source at N=32 on one macOS
+arm64 host over direct loopback. The no-dependency validator accepted 65/65
+exact cohorts, 158/158 exact-named executions with distinct READY PIDs, 32 distinct
+mission identities and stores, 30 payload-blind intermediates, and a final
+zero-difference no-op with 32 distinct log-observed READY PIDs; all 158 child
+stderr files were empty. No overlap timing or OS sampler proves simultaneity.
+The 62 data-motion edge cohorts remained serial two-process
+contacts. The raw retained root contains unprotected mission and carrier
+identity material and is not a source artifact; only the sanitized checked-in
+receipt is reviewable. This moves only `DM-9-21A` to `observed-bounded`. It is
+not the at-least-100-node target, a distributed/physical topology, NAT,
+controlled-relay, BTLE/cross-transport, mixed-implementation, resource-threshold,
+or release evidence. The exact receipt and replay command are in the
+[requirements status](implementation/requirements-status.md#selected-n32-retained-receipt).
+
 The node tests establish the existing `aster-core` four-flight hybrid session
 over real loopback Iroh and exercise it in the selected runtime before
 inventory. They require exact carrier-to-mission binding, protected mechanics
@@ -401,11 +768,12 @@ They remain bounded to Event, one control family/scope, and loopback. The
 current code additionally has durable Event Consume/Carry selectors, live and
 stopped-state poll/ack, idempotent unsubscribe, verified gap inspection,
 bounded last-contact status, protected receiver-directed filtering, and
-separate stopped/local State and Record projections plus local Blob streaming;
+separate stopped State and Record projections plus stopped Blob streaming and
+semantic-v5 direct Blob transfer/resume automation;
 it does not turn the retained parent roots into PR-B, PR-C, State, Record, or
-Blob receipts. The tests do not claim networked State/Record/Blob, remote Blob
-chunks, global convergence, generalized control
-administration, finite-TTL custody, protected provisioning, platform-complete
+Blob receipts. Those retained parent tests do not claim networked State/Record
+or Blob, remote Blob chunks, global convergence, generalized control
+administration, non-Linux/cross-class finite-TTL custody, protected provisioning, platform-complete
 zeroization assurance, admitted release cryptography, independent review, or
 physical-network acceptance.
 

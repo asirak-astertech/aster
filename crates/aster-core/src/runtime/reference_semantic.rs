@@ -5,6 +5,7 @@ use crate::crypto::{
     BatchCryptoProvider, BridgeCryptoProvider, ReferenceEnvelopeSealer, VerifiedBatchItem,
     VerifiedBatchProof, VerifiedBridgeSourceRoute, VerifiedBridgeWrapper,
 };
+use crate::custody::{CustodyAge, CustodyContinuity, CustodySample};
 use crate::engine::{EnvelopeError, EnvelopeSealer, ObservedForwardedIngest, stored_from_verified};
 use crate::store::{
     BridgeAuthorizationCursor, BridgeControlOutcome, BridgeRouteOutcome, BridgeRouteReadiness,
@@ -1407,7 +1408,9 @@ impl ReferenceSemanticRuntimeBackend {
             else {
                 return Ok(());
             };
-            let forwarding_age = conservative_item_custody_age(&item, sample);
+            let Some(forwarding_age) = conservative_item_custody_age(&item, sample) else {
+                return Ok(());
+            };
             (item.sealed, forwarding_age)
         };
         let wrapper = self
@@ -3375,10 +3378,8 @@ impl ReferenceSemanticRuntimeBackend {
                 if !want.need_forwarding {
                     return Err(missing("compact batch item omitted forwarding metadata"));
                 }
-                let age = conservative_item_custody_age(&live.item, sample);
-                if age == u64::MAX && !live.item.tombstone {
-                    return Err(missing("compact batch custody continuity is unavailable"));
-                }
+                let age = conservative_item_custody_age(&live.item, sample)
+                    .ok_or_else(|| missing("compact batch custody continuity is unavailable"))?;
                 let forwarding = self
                     .node_mut()
                     .envelopes_mut()
@@ -3909,7 +3910,7 @@ impl ReferenceSemanticRuntimeBackend {
         kind: &BridgeReadKind,
         offset: u64,
         max_bytes: usize,
-        sample: Option<crate::store::CustodySample>,
+        sample: Option<CustodySample>,
     ) -> Result<Vec<u8>, BlobRuntimeError> {
         let range = crate::store::ChunkRange {
             start: offset,
@@ -4838,7 +4839,11 @@ fn semantic_restart_progress_allowed(
 ) -> bool {
     if !matches!(
         semantic_version,
-        wire::SEMANTIC_PROTOCOL_V1 | wire::SEMANTIC_PROTOCOL_V2
+        wire::SEMANTIC_PROTOCOL_V1
+            | wire::SEMANTIC_PROTOCOL_V2
+            | wire::SEMANTIC_PROTOCOL_V3
+            | wire::SEMANTIC_PROTOCOL_V4
+            | wire::SEMANTIC_PROTOCOL_V5
     ) {
         return false;
     }
@@ -4854,7 +4859,11 @@ fn semantic_restart_progress_allowed(
     };
     if !matches!(
         origin_semantic_version,
-        wire::SEMANTIC_PROTOCOL_V1 | wire::SEMANTIC_PROTOCOL_V2
+        wire::SEMANTIC_PROTOCOL_V1
+            | wire::SEMANTIC_PROTOCOL_V2
+            | wire::SEMANTIC_PROTOCOL_V3
+            | wire::SEMANTIC_PROTOCOL_V4
+            | wire::SEMANTIC_PROTOCOL_V5
     ) {
         return false;
     }
@@ -4871,8 +4880,8 @@ fn semantic_restart_progress_allowed(
         ObjectKind::SourceBatchProof
         | ObjectKind::BridgeAuthorization
         | ObjectKind::BridgeRouteWrapper => {
-            semantic_version == wire::SEMANTIC_PROTOCOL_V2
-                && origin_semantic_version == wire::SEMANTIC_PROTOCOL_V2
+            semantic_version >= wire::SEMANTIC_PROTOCOL_V2
+                && origin_semantic_version >= wire::SEMANTIC_PROTOCOL_V2
         }
     }
 }
@@ -4916,57 +4925,59 @@ fn stored_item_matches_batch_verification(item: &StoredItem, verified: &Verified
         && item.key_epoch == envelope.header.key_epoch
 }
 
-fn bridge_forwarding_age(
-    route: &StoredBridgeRoute,
-    sample: Option<crate::store::CustodySample>,
-) -> Option<u64> {
-    if route.age_continuity_unknown || !route.custody_elapsed_available {
-        return None;
+fn bridge_forwarding_age(route: &StoredBridgeRoute, sample: Option<CustodySample>) -> Option<u64> {
+    let base_age_ms = route
+        .cumulative_custody_age_ms
+        .max(route.authenticated_forwarding_age_ms);
+    let mut age = runtime_custody_age(
+        base_age_ms,
+        route.age_continuity_unknown,
+        route.custody_clock_id,
+        route.custody_tick_ms,
+        route.custody_elapsed_available,
+    );
+    match age.effective_age(sample) {
+        Ok(age_ms) => Some(age_ms),
+        Err(_) if route.tombstone || route.ttl_ms.is_none() => Some(age.cumulative_age_ms()),
+        Err(_) => None,
     }
-    let sample = sample?;
-    let clock_id = route.custody_clock_id?;
-    let tick_ms = route.custody_tick_ms?;
-    if sample.clock_id != clock_id || sample.tick_ms < tick_ms {
-        return None;
-    }
-    Some(
-        route
-            .cumulative_custody_age_ms
-            .max(route.authenticated_forwarding_age_ms)
-            .saturating_add(sample.tick_ms - tick_ms),
-    )
 }
 
 fn conservative_item_custody_age(
     item: &crate::store::StoredItem,
-    sample: Option<crate::store::CustodySample>,
-) -> u64 {
-    if item.tombstone || item.ttl_ms.is_none() {
-        if item.custody_elapsed_available
-            && let (Some(clock_id), Some(tick), Some(sample)) =
-                (item.custody_clock_id, item.custody_tick_ms, sample)
-            && clock_id == sample.clock_id
-            && sample.tick_ms >= tick
-        {
-            return item
-                .custody_age_ms
-                .saturating_add(sample.tick_ms.saturating_sub(tick));
-        }
-        return item.custody_age_ms;
+    sample: Option<CustodySample>,
+) -> Option<u64> {
+    let mut age = runtime_custody_age(
+        item.custody_age_ms,
+        false,
+        item.custody_clock_id,
+        item.custody_tick_ms,
+        item.custody_elapsed_available,
+    );
+    match age.effective_age(sample) {
+        Ok(age_ms) => Some(age_ms),
+        Err(_) if item.tombstone || item.ttl_ms.is_none() => Some(age.cumulative_age_ms()),
+        Err(_) => None,
     }
-    if !item.custody_elapsed_available {
-        return u64::MAX;
-    }
-    let (Some(clock_id), Some(tick), Some(sample)) =
-        (item.custody_clock_id, item.custody_tick_ms, sample)
-    else {
-        return u64::MAX;
+}
+
+fn runtime_custody_age(
+    cumulative_age_ms: u64,
+    continuity_unknown: bool,
+    clock_id: Option<[u8; 16]>,
+    tick_ms: Option<u64>,
+    elapsed_available: bool,
+) -> CustodyAge {
+    let checkpoint = clock_id
+        .zip(tick_ms)
+        .map(|(clock_id, tick_ms)| CustodySample { clock_id, tick_ms });
+    let continuity = if !continuity_unknown && elapsed_available {
+        CustodyContinuity::Continuous
+    } else {
+        CustodyContinuity::Lost
     };
-    if clock_id != sample.clock_id || sample.tick_ms < tick {
-        return u64::MAX;
-    }
-    item.custody_age_ms
-        .saturating_add(sample.tick_ms.saturating_sub(tick))
+    CustodyAge::from_parts(cumulative_age_ms, checkpoint, continuity)
+        .unwrap_or_else(|_| CustodyAge::unknown(cumulative_age_ms))
 }
 
 fn authenticated_blob_route(
@@ -5904,7 +5915,27 @@ mod tests {
             status: crate::store::VersionStatus::Current,
             inserted_order: 1,
         };
-        assert_eq!(conservative_item_custody_age(&item, None), u64::MAX);
+        assert_eq!(conservative_item_custody_age(&item, None), None);
+        let mut durable = item.clone();
+        durable.ttl_ms = None;
+        assert_eq!(conservative_item_custody_age(&durable, None), Some(4));
+        let mut tombstone = item.clone();
+        tombstone.tombstone = true;
+        assert_eq!(conservative_item_custody_age(&tombstone, None), Some(4));
+
+        let overflowing_sample = CustodySample {
+            clock_id: [0x44; 16],
+            tick_ms: 2,
+        };
+        let mut overflowing = item;
+        overflowing.custody_age_ms = u64::MAX;
+        overflowing.custody_clock_id = Some(overflowing_sample.clock_id);
+        overflowing.custody_tick_ms = Some(1);
+        overflowing.custody_elapsed_available = true;
+        assert_eq!(
+            conservative_item_custody_age(&overflowing, Some(overflowing_sample)),
+            None
+        );
     }
 
     #[test]
@@ -5948,6 +5979,22 @@ mod tests {
             &source(Some(wire::SEMANTIC_PROTOCOL_V2)),
             wire::SEMANTIC_PROTOCOL_V2
         ));
+        assert!(semantic_restart_progress_allowed(
+            &source(Some(wire::SEMANTIC_PROTOCOL_V2)),
+            wire::SEMANTIC_PROTOCOL_V3
+        ));
+        assert!(semantic_restart_progress_allowed(
+            &source(Some(wire::SEMANTIC_PROTOCOL_V3)),
+            wire::SEMANTIC_PROTOCOL_V2
+        ));
+        assert!(semantic_restart_progress_allowed(
+            &source(Some(wire::SEMANTIC_PROTOCOL_V3)),
+            wire::SEMANTIC_PROTOCOL_V4
+        ));
+        assert!(semantic_restart_progress_allowed(
+            &source(Some(wire::SEMANTIC_PROTOCOL_V4)),
+            wire::SEMANTIC_PROTOCOL_V3
+        ));
         assert!(!semantic_restart_progress_allowed(
             &source(None),
             wire::SEMANTIC_PROTOCOL_V2
@@ -5960,6 +6007,15 @@ mod tests {
             &proof,
             wire::SEMANTIC_PROTOCOL_V1
         ));
+        assert!(semantic_restart_progress_allowed(
+            &proof,
+            wire::SEMANTIC_PROTOCOL_V4
+        ));
+        assert!(semantic_restart_progress_allowed(
+            &proof,
+            wire::SEMANTIC_PROTOCOL_V5
+        ));
+        assert!(!semantic_restart_progress_allowed(&proof, 6));
     }
 
     #[test]
@@ -6086,6 +6142,18 @@ mod tests {
         );
         assert_eq!(
             backend
+                .durably_disposed_object_len(compact_id, wire::SEMANTIC_PROTOCOL_V3)
+                .unwrap(),
+            Some(material.compact_bytes.len() as u64)
+        );
+        assert_eq!(
+            backend
+                .durably_disposed_object_len(compact_id, wire::SEMANTIC_PROTOCOL_V4)
+                .unwrap(),
+            Some(material.compact_bytes.len() as u64)
+        );
+        assert_eq!(
+            backend
                 .durably_disposed_object_len(compact_id, wire::SEMANTIC_PROTOCOL_V1)
                 .unwrap(),
             None
@@ -6162,7 +6230,31 @@ mod tests {
         );
         assert_eq!(
             backend
+                .durably_disposed_object_len(compact_id, wire::SEMANTIC_PROTOCOL_V3)
+                .unwrap(),
+            Some(material.compact_bytes.len() as u64)
+        );
+        assert_eq!(
+            backend
+                .durably_disposed_object_len(compact_id, wire::SEMANTIC_PROTOCOL_V4)
+                .unwrap(),
+            Some(material.compact_bytes.len() as u64)
+        );
+        assert_eq!(
+            backend
                 .durably_disposed_object_len(quarantined_id, wire::SEMANTIC_PROTOCOL_V2)
+                .unwrap(),
+            Some(quarantined_bytes.len() as u64)
+        );
+        assert_eq!(
+            backend
+                .durably_disposed_object_len(quarantined_id, wire::SEMANTIC_PROTOCOL_V3)
+                .unwrap(),
+            Some(quarantined_bytes.len() as u64)
+        );
+        assert_eq!(
+            backend
+                .durably_disposed_object_len(quarantined_id, wire::SEMANTIC_PROTOCOL_V4)
                 .unwrap(),
             Some(quarantined_bytes.len() as u64)
         );

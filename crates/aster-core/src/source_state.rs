@@ -8,6 +8,7 @@ use crate::{
     crypto::ReferenceEnvelopeSealer,
     envelope::{EnvelopeError, EnvelopeHeader, EnvelopeSealer, SealRequest, SealedEnvelope},
     model::{DataClass, Dot, ItemId, NodeId, Priority, Scope, Topic, VersionVector},
+    source_event::SourceRouteLineage,
 };
 use sha2::{Digest, Sha256};
 
@@ -30,6 +31,7 @@ pub struct RouteVerifiedStateEnvelope {
     envelope: crate::envelope::VerifiedEnvelope,
     envelope_id: [u8; 32],
     mission_authority_id: NodeId,
+    route_lineage: SourceRouteLineage,
 }
 
 impl RouteVerifiedStateEnvelope {
@@ -37,6 +39,7 @@ impl RouteVerifiedStateEnvelope {
         envelope: crate::envelope::VerifiedEnvelope,
         sealed: &[u8],
         mission_authority_id: NodeId,
+        route_lineage: SourceRouteLineage,
     ) -> Result<Self, EnvelopeError> {
         if envelope.header.class != DataClass::State
             || envelope.header.event_sequence.is_some()
@@ -53,6 +56,7 @@ impl RouteVerifiedStateEnvelope {
             envelope,
             envelope_id: Sha256::digest(sealed).into(),
             mission_authority_id,
+            route_lineage,
         })
     }
 
@@ -78,6 +82,16 @@ impl RouteVerifiedStateEnvelope {
     /// Alias for [`Self::mission_authority_id`].
     pub const fn authority_id(&self) -> NodeId {
         self.mission_authority_id()
+    }
+
+    /// Opaque identity of the exact provider route grant used for verification.
+    ///
+    /// Cache this token with the authenticated claim, then call
+    /// [`ReferenceEnvelopeSealer::is_current_source_route_lineage`] before
+    /// using the claim as sender authority. A scope/epoch match alone is
+    /// insufficient when a rekey replaces key material at the same epoch.
+    pub const fn route_lineage(&self) -> SourceRouteLineage {
+        self.route_lineage
     }
 
     /// Complete provider-authenticated State metadata.
@@ -367,8 +381,13 @@ impl ReferenceEnvelopeSealer {
         &mut self,
         sealed: &[u8],
     ) -> Result<RouteVerifiedStateEnvelope, EnvelopeError> {
-        let verified = <Self as EnvelopeSealer>::inspect(self, sealed)?;
-        RouteVerifiedStateEnvelope::from_verified(verified, sealed, self.mission_authority_id())
+        let (verified, route_commitment) = self.inspect_source_route_with_lineage(sealed)?;
+        RouteVerifiedStateEnvelope::from_verified(
+            verified,
+            sealed,
+            self.mission_authority_id(),
+            SourceRouteLineage::from_commitment(route_commitment),
+        )
     }
 
     /// Authenticates a State and requires its source to equal `expected`.
@@ -426,7 +445,7 @@ mod tests {
     use super::*;
     use crate::{
         blob::{BlobId, BlobRouteCommitment},
-        crypto::{ProvisioningAccess, ReferenceProvisioner},
+        crypto::{ProvisioningAccess, ReferenceProvisioner, ScopeRekeyRecipient},
         model::{CausalStamp, Dot, Priority, Scope, Topic, VersionVector},
     };
 
@@ -579,6 +598,15 @@ mod tests {
         );
         assert_eq!(first.authority_id(), first.mission_authority_id());
         assert_eq!(first.mission_authority_id(), reader.mission_authority_id());
+        assert!(reader.is_current_source_route_lineage(
+            first.scope(),
+            first.key_epoch(),
+            first.route_lineage(),
+        ));
+        assert_eq!(
+            format!("{:?}", first.route_lineage()),
+            "SourceRouteLineage([PROVIDER-OWNED])"
+        );
         assert_eq!(first.publisher(), publisher.identity());
         assert_eq!(first.dot(), header.stamp.dot);
         assert_eq!(first.causal_context(), &header.stamp.context);
@@ -804,6 +832,74 @@ mod tests {
         assert!(wrong_topic.can_open_state_content(&scope(), &other_topic(), 1));
         assert!(!publisher.can_route_state(&scope(), 2));
         assert!(!publisher.can_open_state_content(&scope(), &topic(), 2));
+    }
+
+    #[test]
+    fn same_epoch_rekey_invalidates_state_lineage_while_numeric_route_remains() {
+        let mut provisioner =
+            ReferenceProvisioner::from_seed([0x4b; 32]).expect("lineage provisioner");
+        let authority_bundle = provisioner
+            .issue_control_authority(1, &[member_access()])
+            .expect("lineage authority bundle");
+        let reader_bundle = provisioner
+            .issue_node(2, &[member_access()])
+            .expect("lineage reader bundle");
+        let mut authority =
+            ReferenceEnvelopeSealer::open(authority_bundle).expect("lineage authority");
+        let mut reader = ReferenceEnvelopeSealer::open(reader_bundle).expect("lineage reader");
+
+        let old_payload = b"old State grant";
+        let old_header = header(authority.identity(), old_payload, None);
+        let old = authority
+            .seal_state(&old_header, old_payload)
+            .expect("seal old State");
+        let old_route = reader.verify_state(&old.bytes).expect("verify old State");
+        let old_lineage = old_route.route_lineage();
+        assert!(reader.is_current_source_route_lineage(&scope(), 1, old_lineage));
+        let foreign = wrong_mission_reader();
+        assert!(!foreign.is_current_source_route_lineage(&scope(), 1, old_lineage));
+
+        let plan = provisioner
+            .plan_scope_rekey(
+                scope(),
+                1,
+                vec![
+                    ScopeRekeyRecipient::member(authority.identity(), vec![topic()])
+                        .expect("authority recipient"),
+                    ScopeRekeyRecipient::member(reader.identity(), vec![topic()])
+                        .expect("reader recipient"),
+                ],
+            )
+            .expect("same-epoch State rekey plan");
+        let control = authority
+            .seal_scope_rekey_chained(&plan, 1, None)
+            .expect("same-epoch State rekey control");
+        for service in [&mut authority, &mut reader] {
+            <ReferenceEnvelopeSealer as EnvelopeSealer>::inspect_control(service, &control)
+                .expect("fresh control verification");
+            <ReferenceEnvelopeSealer as EnvelopeSealer>::activate_control(service, &control, false)
+                .expect("activate same-epoch State rekey");
+        }
+
+        assert!(reader.can_route_state(&scope(), 1));
+        assert!(!reader.is_current_source_route_lineage(&scope(), 1, old_lineage));
+        assert!(reader.verify_state(&old.bytes).is_err());
+
+        let new_payload = b"new State grant";
+        let mut new_header = old_header;
+        new_header.stamp.dot.counter = 2;
+        new_header.content_len = new_payload.len() as u64;
+        let new = authority
+            .seal_state(&new_header, new_payload)
+            .expect("seal replacement State");
+        let new_route = reader
+            .verify_state(&new.bytes)
+            .expect("freshly verify replacement State");
+        let new_lineage = new_route.route_lineage();
+        assert_ne!(new_lineage, old_lineage);
+        assert!(reader.is_current_source_route_lineage(&scope(), 1, new_lineage));
+        assert!(!reader.is_current_source_route_lineage(&scope(), 2, new_lineage));
+        assert!(!foreign.is_current_source_route_lineage(&scope(), 1, new_lineage));
     }
 
     #[test]

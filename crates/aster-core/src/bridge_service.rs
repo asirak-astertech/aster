@@ -15,11 +15,12 @@ use crate::crypto::{
     VerifiedBridgeAuthorization as ProviderVerifiedAuthorization,
     VerifiedBridgeSourceRoute as ProviderVerifiedSource,
 };
+use crate::custody::{CustodyAge, CustodyContinuity, CustodySample};
 use crate::engine::{EmissionPolicy, EnvelopeError, EnvelopeHeader, EnvelopeSealer};
 use crate::model::{NodeId, Priority, Scope, Topic};
 use crate::store::{
     BridgeAuthorizationCursor, BridgeControlOutcome, BridgeRouteOutcome, BridgeRouteReadiness,
-    CustodySample, EnvelopeId, RecordStore, SqliteStore, StoreError, StoredBridgeRoute, StoredItem,
+    EnvelopeId, RecordStore, SqliteStore, StoreError, StoredBridgeRoute, StoredItem,
     VerifiedBlobRouteMetadata, VerifiedBridgeAuthorization as StoreVerifiedAuthorization,
     VerifiedBridgeRoute as StoreVerifiedRoute, VerifiedBridgeSource as StoreVerifiedSource,
     VerifiedBridgeSourceMetadata,
@@ -1233,19 +1234,20 @@ fn effective_custody(
     elapsed_available: bool,
     sample: Option<CustodySample>,
 ) -> (u64, bool) {
-    if persisted_unknown || !elapsed_available {
+    let checkpoint = clock_id
+        .zip(tick_ms)
+        .map(|(clock_id, tick_ms)| CustodySample { clock_id, tick_ms });
+    let continuity = if !persisted_unknown && elapsed_available {
+        CustodyContinuity::Continuous
+    } else {
+        CustodyContinuity::Lost
+    };
+    let Ok(mut age) = CustodyAge::from_parts(persisted_age_ms, checkpoint, continuity) else {
         return (persisted_age_ms, true);
-    }
-    match (clock_id, tick_ms, sample) {
-        (Some(clock_id), Some(tick_ms), Some(sample))
-            if clock_id == sample.clock_id && sample.tick_ms >= tick_ms =>
-        {
-            (
-                persisted_age_ms.saturating_add(sample.tick_ms - tick_ms),
-                false,
-            )
-        }
-        _ => (persisted_age_ms, true),
+    };
+    match age.effective_age(sample) {
+        Ok(age_ms) => (age_ms, false),
+        Err(_) => (age.cumulative_age_ms(), true),
     }
 }
 
@@ -1314,6 +1316,24 @@ mod tests {
     use crate::engine::SealRequest;
     use crate::model::{CausalStamp, DataClass, Dot, VersionVector};
     use crate::store::{ApplyOutcome, BridgeFilter, ScopeEpoch, StoreConfig, VersionStatus};
+
+    #[test]
+    fn effective_custody_overflow_loses_continuity_instead_of_saturating_live() {
+        assert_eq!(
+            effective_custody(
+                u64::MAX,
+                false,
+                Some([0x91; 16]),
+                Some(1),
+                true,
+                Some(CustodySample {
+                    clock_id: [0x91; 16],
+                    tick_ms: 2,
+                }),
+            ),
+            (u64::MAX, true)
+        );
+    }
 
     struct Fixture {
         authority: ReferenceEnvelopeSealer,

@@ -23,14 +23,17 @@ aster-mesh = { package = "aster-core", path = "../aster-core", default-features 
 aster-negentropy = { path = "../aster-negentropy" }
 aster-profile = { path = "../aster-profile" }
 aster-redb-store = { path = "../aster-redb-store" }
+getrandom.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 zeroize.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
-rustix.workspace = true
+rustix = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
+aster-iroh = { path = "../aster-iroh", features = ["test-utils"] }
 redb.workspace = true
 
 [lints]

@@ -15,12 +15,16 @@ use crate::bridge::{
     MAX_WRAPPER_TOTAL_BYTES, exact_object_id, priority_allowed,
 };
 use crate::crypto::{PendingBatchItem, VerifiedBatchItem, VerifiedBatchProof};
+use crate::custody::{CustodyAge, CustodyContinuity, CustodyDisposition, evaluate_custody};
 pub use crate::envelope::{ControlPrincipal, EnvelopeId, Revocation, ScopeEpoch};
 use crate::model::{
     CausalStamp, ConflictAnnotation, DataClass, Dot, ItemId, MAX_CAUSAL_CONTEXT_ENTRIES, NodeId,
     PeerStatus, Priority, Scope, SyncStatus, Topic, VersionVector,
 };
-use crate::wire::{ObjectId, ObjectKind, SEMANTIC_PROTOCOL_V2};
+use crate::wire::{
+    ObjectId, ObjectKind, SEMANTIC_PROTOCOL_V2, SEMANTIC_PROTOCOL_V3, SEMANTIC_PROTOCOL_V4,
+    SEMANTIC_PROTOCOL_V5,
+};
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -28,7 +32,7 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::path::Path;
 
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 15;
 // Schema-11 stores had one node-global frontier. Schema 12 preserves every one
 // of those observations in this domain, which cannot collide with validated
 // Topic or Scope values because both reject the empty string.
@@ -213,28 +217,25 @@ impl InventoryMetadata {
 
     pub fn is_forwardable_at(&self, sample: Option<CustodySample>) -> bool {
         match self {
-            Self::Control { .. }
-            | Self::Data {
-                tombstone: true, ..
-            }
-            | Self::Data { ttl_ms: None, .. } => true,
+            Self::Control { .. } => true,
             Self::Data {
                 ttl_ms,
+                tombstone,
                 custody_age_ms,
                 custody_clock_id,
                 custody_tick_ms,
                 custody_elapsed_available,
                 ..
-            } => custody_age_from_fields(
+            } => custody_disposition_from_fields(
                 *ttl_ms,
+                *tombstone,
                 *custody_age_ms,
                 *custody_clock_id,
                 *custody_tick_ms,
                 *custody_elapsed_available,
                 sample,
             )
-            .zip(*ttl_ms)
-            .is_some_and(|(age, ttl)| age < ttl),
+            .is_forwardable(),
         }
     }
 }
@@ -394,6 +395,7 @@ pub(crate) struct StoredBridgeRoute {
     pub(crate) topic: Topic,
     pub(crate) priority: Priority,
     pub(crate) ttl_ms: Option<u64>,
+    pub(crate) tombstone: bool,
     pub(crate) hop_count: u8,
     pub(crate) cumulative_custody_age_ms: u64,
     pub(crate) authenticated_forwarding_age_ms: u64,
@@ -785,10 +787,64 @@ impl VerifiedBridgeRoute {
 }
 
 /// One reading from a local elapsed clock continuity domain.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CustodySample {
-    pub clock_id: [u8; 16],
-    pub tick_ms: u64,
+pub use crate::custody::CustodySample;
+
+type LegacyCustodyFields = (u64, bool, Option<[u8; 16]>, Option<u64>, bool);
+
+fn custody_age_from_legacy_fields(
+    cumulative_age_ms: u64,
+    age_continuity_unknown: bool,
+    custody_clock_id: Option<[u8; 16]>,
+    custody_tick_ms: Option<u64>,
+    custody_elapsed_available: bool,
+) -> CustodyAge {
+    let checkpoint = custody_checkpoint(custody_clock_id, custody_tick_ms);
+    let continuity = if !age_continuity_unknown && custody_elapsed_available {
+        CustodyContinuity::Continuous
+    } else {
+        CustodyContinuity::Lost
+    };
+    CustodyAge::from_parts(cumulative_age_ms, checkpoint, continuity).unwrap_or_else(|_| {
+        CustodyAge::from_parts(cumulative_age_ms, checkpoint, CustodyContinuity::Lost)
+            .unwrap_or(CustodyAge::unknown(cumulative_age_ms))
+    })
+}
+
+fn custody_fields_from_age(age: CustodyAge) -> LegacyCustodyFields {
+    if !age.is_continuous() {
+        return (age.cumulative_age_ms(), true, None, None, false);
+    }
+    let checkpoint = age.checkpoint_sample();
+    (
+        age.cumulative_age_ms(),
+        false,
+        checkpoint.map(|value| value.clock_id),
+        checkpoint.map(|value| value.tick_ms),
+        true,
+    )
+}
+
+fn merge_authenticated_custody_fields(
+    existing: Option<LegacyCustodyFields>,
+    authenticated_age_ms: u64,
+    sample: Option<CustodySample>,
+) -> LegacyCustodyFields {
+    let Some((age_ms, unknown, clock_id, tick_ms, available)) = existing else {
+        return sample.map_or_else(
+            || custody_fields_from_age(CustodyAge::unknown(authenticated_age_ms)),
+            |sample| custody_fields_from_age(CustodyAge::new(authenticated_age_ms, sample)),
+        );
+    };
+    let mut age = custody_age_from_legacy_fields(age_ms, unknown, clock_id, tick_ms, available);
+    if age
+        .merge_authenticated_age(authenticated_age_ms, sample)
+        .is_err()
+    {
+        return custody_fields_from_age(CustodyAge::unknown(
+            age.cumulative_age_ms().max(authenticated_age_ms),
+        ));
+    }
+    custody_fields_from_age(age)
 }
 
 impl StoredItem {
@@ -797,21 +853,29 @@ impl StoredItem {
     }
 
     pub fn is_expired_at(&self, sample: Option<CustodySample>) -> bool {
-        if self.tombstone {
-            return false;
-        }
-        self.ttl_ms
-            .zip(custody_age_at(self, sample))
-            .is_some_and(|(ttl, age)| age >= ttl)
+        custody_disposition_from_fields(
+            self.ttl_ms,
+            self.tombstone,
+            self.custody_age_ms,
+            self.custody_clock_id,
+            self.custody_tick_ms,
+            self.custody_elapsed_available,
+            sample,
+        )
+        .is_expired()
     }
 
     pub fn is_forwardable_at(&self, sample: Option<CustodySample>) -> bool {
-        if self.tombstone || self.ttl_ms.is_none() {
-            return true;
-        }
-        custody_age_at(self, sample)
-            .zip(self.ttl_ms)
-            .is_some_and(|(age, ttl)| age < ttl)
+        custody_disposition_from_fields(
+            self.ttl_ms,
+            self.tombstone,
+            self.custody_age_ms,
+            self.custody_clock_id,
+            self.custody_tick_ms,
+            self.custody_elapsed_available,
+            sample,
+        )
+        .is_forwardable()
     }
 
     fn accounted_bytes(&self) -> u64 {
@@ -908,26 +972,18 @@ pub(crate) struct StoredPendingBatchItem {
 
 impl StoredPendingBatchItem {
     pub(crate) fn effective_custody_age_ms(&self, sample: Option<CustodySample>) -> Option<u64> {
-        if self.age_continuity_unknown || !self.custody_elapsed_available {
-            return self
-                .ttl_ms
-                .is_none()
-                .then_some(self.cumulative_custody_age_ms);
+        let mut age = custody_age_from_legacy_fields(
+            self.cumulative_custody_age_ms,
+            self.age_continuity_unknown,
+            self.custody_clock_id,
+            self.custody_tick_ms,
+            self.custody_elapsed_available,
+        );
+        match age.effective_age(sample) {
+            Ok(value) => Some(value),
+            Err(_) if self.ttl_ms.is_none() => Some(age.cumulative_age_ms()),
+            Err(_) => None,
         }
-        let ((clock_id, tick_ms), sample) = self
-            .custody_clock_id
-            .zip(self.custody_tick_ms)
-            .zip(sample)?;
-        if clock_id != sample.clock_id || sample.tick_ms < tick_ms {
-            return self
-                .ttl_ms
-                .is_none()
-                .then_some(self.cumulative_custody_age_ms);
-        }
-        Some(
-            self.cumulative_custody_age_ms
-                .saturating_add(sample.tick_ms - tick_ms),
-        )
     }
 }
 
@@ -1134,18 +1190,20 @@ fn transfer_resume_is_compatible(
         (None, None) => true,
         (None, Some(_)) | (Some(_), None) => false,
         (Some(origin), Some(requested))
-            if !matches!(origin, 1 | 2) || !matches!(requested, 1 | 2) =>
+            if !matches!(origin, 1..=5) || !matches!(requested, 1..=5) =>
         {
             false
         }
         (Some(_), Some(_)) if kind == ObjectKind::BlobChunk => true,
         (Some(1), Some(requested))
-            if kind == ObjectKind::SourceEnvelope && matches!(requested, 1 | 2) =>
+            if kind == ObjectKind::SourceEnvelope && matches!(requested, 1..=5) =>
         {
             true
         }
-        (Some(2), Some(2)) if kind == ObjectKind::SourceEnvelope => true,
-        (Some(origin), Some(requested)) => origin == requested,
+        (Some(origin), Some(requested)) if kind == ObjectKind::SourceEnvelope => {
+            origin >= 2 && requested >= 2
+        }
+        (Some(origin), Some(requested)) => origin >= 2 && requested >= 2,
     }
 }
 
@@ -1559,7 +1617,7 @@ pub trait RecordStore {
         now_ms: Option<u64>,
         semantic_version: u16,
     ) -> Result<(), StoreError> {
-        if !matches!(semantic_version, 1 | 2) {
+        if !matches!(semantic_version, 1..=5) {
             return Err(StoreError::Invalid(
                 "unsupported transfer semantic version".into(),
             ));
@@ -1990,6 +2048,18 @@ impl SqliteStore {
         }
         if version == 11 {
             migrate_v11_to_v12(&connection)?;
+            version = 12;
+        }
+        if version == 12 {
+            migrate_v12_to_v13(&connection)?;
+            version = 13;
+        }
+        if version == 13 {
+            migrate_v13_to_v14(&connection)?;
+            version = 14;
+        }
+        if version == 14 {
+            migrate_v14_to_v15(&connection)?;
         }
         persist_config(&connection, &config)?;
         Ok(Self {
@@ -2070,7 +2140,7 @@ impl SqliteStore {
         now_ms: Option<u64>,
         origin_semantic_version: Option<u16>,
     ) -> Result<(), StoreError> {
-        if origin_semantic_version.is_some_and(|version| !matches!(version, 1 | 2)) {
+        if origin_semantic_version.is_some_and(|version| !matches!(version, 1..=5)) {
             return Err(StoreError::Invalid(
                 "unsupported transfer semantic version".into(),
             ));
@@ -2160,7 +2230,7 @@ impl SqliteStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        if selected_version.is_some_and(|version| !matches!(version, 1 | 2)) {
+        if selected_version.is_some_and(|version| !matches!(version, 1..=5)) {
             return Err(StoreError::Invalid(
                 "unsupported transfer semantic version".into(),
             ));
@@ -2181,11 +2251,11 @@ impl SqliteStore {
                 values.push(vec![ObjectKind::SourceEnvelope as u8].into());
                 values.push(vec![ObjectKind::BlobChunk as u8].into());
             }
-            Some(2) => {
+            Some(2) | Some(3) | Some(4) | Some(5) => {
                 sql.push_str(
                     " WHERE i.origin_semantic_version IS NOT NULL AND\n\
                        (substr(i.object_id,1,1) IN (?,?) OR\n\
-                        (i.origin_semantic_version=2 AND\n\
+                        (i.origin_semantic_version IN (2,3,4,5) AND\n\
                          substr(i.object_id,1,1) IN (?,?,?)))",
                 );
                 values.push(vec![ObjectKind::SourceEnvelope as u8].into());
@@ -2269,7 +2339,7 @@ impl SqliteStore {
         Ok(progress)
     }
 
-    /// Point lookup for an exact semantic-v2 transfer which has already been
+    /// Point lookup for an exact semantic-v2+ transfer which has already been
     /// moved crash-atomically into private dependency or quarantine storage.
     /// These tables are not inventory or acceptance indexes. Their exact byte
     /// lengths equal the immutable completed-transfer lengths checked by the
@@ -2279,7 +2349,13 @@ impl SqliteStore {
         object_id: ObjectId,
         semantic_version: u16,
     ) -> Result<Option<u64>, StoreError> {
-        if semantic_version != SEMANTIC_PROTOCOL_V2 {
+        if !matches!(
+            semantic_version,
+            SEMANTIC_PROTOCOL_V2
+                | SEMANTIC_PROTOCOL_V3
+                | SEMANTIC_PROTOCOL_V4
+                | SEMANTIC_PROTOCOL_V5
+        ) {
             return Ok(None);
         }
 
@@ -2555,51 +2631,19 @@ fn merged_pending_batch_custody(
     authenticated_age_ms: u64,
     sample: Option<CustodySample>,
 ) -> (u64, bool, Option<[u8; 16]>, Option<u64>, bool) {
-    let Some(existing) = existing else {
-        return match sample {
-            Some(sample) => (
-                authenticated_age_ms,
-                false,
-                Some(sample.clock_id),
-                Some(sample.tick_ms),
-                true,
-            ),
-            None => (authenticated_age_ms, true, None, None, false),
-        };
-    };
-    let continuous = !existing.age_continuity_unknown
-        && existing.custody_elapsed_available
-        && existing
-            .custody_clock_id
-            .zip(existing.custody_tick_ms)
-            .zip(sample)
-            .is_some_and(|((clock_id, tick_ms), sample)| {
-                clock_id == sample.clock_id && sample.tick_ms >= tick_ms
-            });
-    if continuous {
-        let sample = sample.expect("continuous pending batch custody has a sample");
-        let tick_ms = existing
-            .custody_tick_ms
-            .expect("continuous pending batch custody has a tick");
-        (
-            existing
-                .cumulative_custody_age_ms
-                .saturating_add(sample.tick_ms - tick_ms)
-                .max(authenticated_age_ms),
-            false,
-            Some(sample.clock_id),
-            Some(sample.tick_ms),
-            true,
-        )
-    } else {
-        (
-            existing.cumulative_custody_age_ms.max(authenticated_age_ms),
-            true,
-            None,
-            None,
-            false,
-        )
-    }
+    merge_authenticated_custody_fields(
+        existing.map(|value| {
+            (
+                value.cumulative_custody_age_ms,
+                value.age_continuity_unknown,
+                value.custody_clock_id,
+                value.custody_tick_ms,
+                value.custody_elapsed_available,
+            )
+        }),
+        authenticated_age_ms,
+        sample,
+    )
 }
 
 #[allow(dead_code)]
@@ -3471,7 +3515,7 @@ impl SqliteStore {
         item_id: &ItemId,
         semantic_version: u16,
     ) -> Result<Option<StoredItemRepresentation>, StoreError> {
-        if !matches!(semantic_version, 1 | 2) {
+        if !matches!(semantic_version, 1..=5) {
             return Err(StoreError::Invalid(
                 "unsupported representation semantic version".into(),
             ));
@@ -5167,27 +5211,25 @@ impl SqliteStore {
             } else {
                 (checkpoint.2, checkpoint.3, checkpoint.4)
             };
-            let live = !continuity_unknown
-                && bridge_custody_is_live(
-                    committed.ttl_ms,
-                    source.metadata.tombstone,
-                    cumulative_age,
-                    false,
-                    continuity.0,
-                    continuity.1,
-                    continuity.2,
-                    sample,
-                )
-                && bridge_custody_is_live(
-                    source.metadata.ttl_ms,
-                    source.metadata.tombstone,
-                    source.cumulative_custody_age_ms,
-                    false,
-                    source.custody_clock_id,
-                    source.custody_tick_ms,
-                    source.custody_elapsed_available,
-                    sample,
-                );
+            let live = bridge_custody_is_live(
+                committed.ttl_ms,
+                source.metadata.tombstone,
+                cumulative_age,
+                continuity_unknown,
+                continuity.0,
+                continuity.1,
+                continuity.2,
+                sample,
+            ) && bridge_custody_is_live(
+                source.metadata.ttl_ms,
+                source.metadata.tombstone,
+                source.cumulative_custody_age_ms,
+                false,
+                source.custody_clock_id,
+                source.custody_tick_ms,
+                source.custody_elapsed_available,
+                sample,
+            );
             let transaction = self.connection.transaction()?;
             if has_transfer != 0 {
                 exact_typed_transfer_bytes_tx(
@@ -7131,12 +7173,13 @@ impl SqliteStore {
             .cumulative_custody_age_ms
             .max(verified.authenticated_forwarding_age_ms)
             .max(verified.source.authenticated_forwarding_age_ms);
-        if (verified.source.metadata.ttl_ms.is_some() && last_hop.age_continuity_unknown)
-            || verified
-                .source
-                .metadata
-                .ttl_ms
-                .is_some_and(|ttl| authenticated_age >= ttl)
+        if !verified.source.metadata.tombstone
+            && ((verified.source.metadata.ttl_ms.is_some() && last_hop.age_continuity_unknown)
+                || verified
+                    .source
+                    .metadata
+                    .ttl_ms
+                    .is_some_and(|ttl| authenticated_age >= ttl))
         {
             return Err(StoreError::BridgeRouteIneligible);
         }
@@ -7301,7 +7344,10 @@ impl SqliteStore {
             .max(verified.authenticated_forwarding_age_ms)
             .max(verified.source.authenticated_forwarding_age_ms);
         let available = !final_hop.age_continuity_unknown && sample.is_some();
-        if verified.source.metadata.ttl_ms.is_some() && !available {
+        if !verified.source.metadata.tombstone
+            && verified.source.metadata.ttl_ms.is_some()
+            && !available
+        {
             return Err(StoreError::BridgeRouteIneligible);
         }
         let new_accounted_bytes = bridge_source_accounted_bytes(&verified.source)?;
@@ -7911,6 +7957,7 @@ impl SqliteStore {
             && existing.topic == metadata.topic
             && existing.priority == metadata.priority
             && existing.ttl_ms == metadata.ttl_ms
+            && existing.tombstone == metadata.tombstone
             && usize::from(existing.hop_count) == verified.route.hops.len()
             && existing.exact_wrapper_bytes == verified.exact_wrapper_bytes
             && existing.exact_source_bytes == verified.source.exact_bytes
@@ -8182,7 +8229,7 @@ impl SqliteStore {
             .query_row(
                 "SELECT w.bridge_route_id,w.origin_envelope_id,w.source_item_id,w.source_publisher,\n\
                         w.origin_scope,w.origin_route_epoch,w.current_scope,w.current_route_epoch,\n\
-                        w.source_topic,w.source_priority,w.source_ttl_ms,w.hop_count,\n\
+                        w.source_topic,w.source_priority,w.source_ttl_ms,coalesce(s.tombstone,0),w.hop_count,\n\
                         w.cumulative_custody_age_ms,w.forwarding_custody_age_ms,\n\
                         w.age_continuity_unknown,\n\
                         w.custody_clock_id,w.custody_tick_ms,w.custody_elapsed_available,w.exact_bytes,\n\
@@ -8213,13 +8260,14 @@ impl SqliteStore {
                         row.get::<_, i64>(12)?,
                         row.get::<_, i64>(13)?,
                         row.get::<_, i64>(14)?,
-                        row.get::<_, Option<Vec<u8>>>(15)?,
-                        row.get::<_, Option<i64>>(16)?,
-                        row.get::<_, i64>(17)?,
-                        row.get::<_, Vec<u8>>(18)?,
+                        row.get::<_, i64>(15)?,
+                        row.get::<_, Option<Vec<u8>>>(16)?,
+                        row.get::<_, Option<i64>>(17)?,
+                        row.get::<_, i64>(18)?,
                         row.get::<_, Vec<u8>>(19)?,
-                        row.get::<_, i64>(20)?,
+                        row.get::<_, Vec<u8>>(20)?,
                         row.get::<_, i64>(21)?,
+                        row.get::<_, i64>(22)?,
                     ))
                 },
             )
@@ -8236,6 +8284,7 @@ impl SqliteStore {
             topic,
             priority,
             ttl,
+            tombstone,
             hop_count,
             custody_age,
             forwarding_age,
@@ -8300,6 +8349,7 @@ impl SqliteStore {
             ttl_ms: ttl
                 .map(|value| from_sql_u64(value, "bridge source TTL"))
                 .transpose()?,
+            tombstone: sql_bool(tombstone, "bridge source tombstone")?,
             hop_count: u8::try_from(from_sql_u64(hop_count, "bridge hop count")?)
                 .map_err(|_| StoreError::Corrupt("bridge hop count outside byte range".into()))?,
             cumulative_custody_age_ms,
@@ -10858,51 +10908,19 @@ fn merged_bridge_source_custody(
     authenticated_age_ms: u64,
     sample: Option<CustodySample>,
 ) -> (u64, bool, Option<[u8; 16]>, Option<u64>, bool) {
-    let Some(existing) = existing else {
-        return match sample {
-            Some(sample) => (
-                authenticated_age_ms,
-                false,
-                Some(sample.clock_id),
-                Some(sample.tick_ms),
-                true,
-            ),
-            None => (authenticated_age_ms, true, None, None, false),
-        };
-    };
-    let continuous = !existing.age_continuity_unknown
-        && existing.custody_elapsed_available
-        && existing
-            .custody_clock_id
-            .zip(existing.custody_tick_ms)
-            .zip(sample)
-            .is_some_and(|((clock_id, tick_ms), sample)| {
-                clock_id == sample.clock_id && sample.tick_ms >= tick_ms
-            });
-    if continuous {
-        let sample = sample.expect("continuous custody has a sample");
-        let prior_tick = existing
-            .custody_tick_ms
-            .expect("continuous custody has a tick");
-        (
-            existing
-                .cumulative_custody_age_ms
-                .saturating_add(sample.tick_ms - prior_tick)
-                .max(authenticated_age_ms),
-            false,
-            Some(sample.clock_id),
-            Some(sample.tick_ms),
-            true,
-        )
-    } else {
-        (
-            existing.cumulative_custody_age_ms.max(authenticated_age_ms),
-            true,
-            None,
-            None,
-            false,
-        )
-    }
+    merge_authenticated_custody_fields(
+        existing.map(|value| {
+            (
+                value.cumulative_custody_age_ms,
+                value.age_continuity_unknown,
+                value.custody_clock_id,
+                value.custody_tick_ms,
+                value.custody_elapsed_available,
+            )
+        }),
+        authenticated_age_ms,
+        sample,
+    )
 }
 
 #[allow(dead_code)]
@@ -10910,29 +10928,17 @@ fn ordinary_item_bridge_custody(
     item: &StoredItem,
     sample: Option<CustodySample>,
 ) -> (u64, bool, Option<[u8; 16]>, Option<u64>, bool) {
-    if !item.custody_elapsed_available {
-        return (item.custody_age_ms, true, None, None, false);
+    let mut age = custody_age_from_legacy_fields(
+        item.custody_age_ms,
+        !item.custody_elapsed_available,
+        item.custody_clock_id,
+        item.custody_tick_ms,
+        item.custody_elapsed_available,
+    );
+    if sample.is_some() && age.checkpoint(sample).is_err() {
+        age.mark_continuity_lost();
     }
-    let Some((clock_id, tick_ms)) = item.custody_clock_id.zip(item.custody_tick_ms) else {
-        return (item.custody_age_ms, true, None, None, false);
-    };
-    match sample {
-        None => (
-            item.custody_age_ms,
-            false,
-            Some(clock_id),
-            Some(tick_ms),
-            true,
-        ),
-        Some(sample) if sample.clock_id == clock_id && sample.tick_ms >= tick_ms => (
-            item.custody_age_ms.saturating_add(sample.tick_ms - tick_ms),
-            false,
-            Some(sample.clock_id),
-            Some(sample.tick_ms),
-            true,
-        ),
-        Some(_) => (item.custody_age_ms, true, None, None, false),
-    }
+    custody_fields_from_age(age)
 }
 
 #[allow(dead_code)]
@@ -10940,19 +10946,14 @@ fn bridge_source_custody_age_at(
     source: &StoredBridgeSource,
     sample: Option<CustodySample>,
 ) -> Option<u64> {
-    if source.age_continuity_unknown || !source.custody_elapsed_available {
-        return None;
-    }
-    let (clock_id, tick_ms, sample) = source
-        .custody_clock_id
-        .zip(source.custody_tick_ms)
-        .zip(sample)
-        .map(|((clock_id, tick_ms), sample)| (clock_id, tick_ms, sample))?;
-    (clock_id == sample.clock_id && sample.tick_ms >= tick_ms).then(|| {
-        source
-            .cumulative_custody_age_ms
-            .saturating_add(sample.tick_ms - tick_ms)
-    })
+    let mut age = custody_age_from_legacy_fields(
+        source.cumulative_custody_age_ms,
+        source.age_continuity_unknown,
+        source.custody_clock_id,
+        source.custody_tick_ms,
+        source.custody_elapsed_available,
+    );
+    age.effective_age(sample).ok()
 }
 
 #[allow(dead_code)]
@@ -10960,28 +10961,17 @@ fn checkpoint_bridge_source_custody(
     source: &StoredBridgeSource,
     sample: Option<CustodySample>,
 ) -> (u64, bool, Option<[u8; 16]>, Option<u64>, bool) {
-    match bridge_source_custody_age_at(source, sample).zip(sample) {
-        Some((age, sample)) => (
-            age,
-            false,
-            Some(sample.clock_id),
-            Some(sample.tick_ms),
-            true,
-        ),
-        None if sample.is_none()
-            && !source.age_continuity_unknown
-            && source.custody_elapsed_available =>
-        {
-            (
-                source.cumulative_custody_age_ms,
-                false,
-                source.custody_clock_id,
-                source.custody_tick_ms,
-                true,
-            )
-        }
-        None => (source.cumulative_custody_age_ms, true, None, None, false),
+    let mut age = custody_age_from_legacy_fields(
+        source.cumulative_custody_age_ms,
+        source.age_continuity_unknown,
+        source.custody_clock_id,
+        source.custody_tick_ms,
+        source.custody_elapsed_available,
+    );
+    if sample.is_some() && age.checkpoint(sample).is_err() {
+        age.mark_continuity_lost();
     }
+    custody_fields_from_age(age)
 }
 
 #[allow(dead_code)]
@@ -10989,31 +10979,17 @@ fn checkpoint_bridge_route_custody(
     route: &StoredBridgeRoute,
     sample: Option<CustodySample>,
 ) -> (u64, bool, Option<[u8; 16]>, Option<u64>, bool) {
-    if route.age_continuity_unknown || !route.custody_elapsed_available {
-        return (route.cumulative_custody_age_ms, true, None, None, false);
+    let mut age = custody_age_from_legacy_fields(
+        route.cumulative_custody_age_ms,
+        route.age_continuity_unknown,
+        route.custody_clock_id,
+        route.custody_tick_ms,
+        route.custody_elapsed_available,
+    );
+    if sample.is_some() && age.checkpoint(sample).is_err() {
+        age.mark_continuity_lost();
     }
-    let Some((clock_id, tick_ms)) = route.custody_clock_id.zip(route.custody_tick_ms) else {
-        return (route.cumulative_custody_age_ms, true, None, None, false);
-    };
-    match sample {
-        None => (
-            route.cumulative_custody_age_ms,
-            false,
-            Some(clock_id),
-            Some(tick_ms),
-            true,
-        ),
-        Some(sample) if sample.clock_id == clock_id && sample.tick_ms >= tick_ms => (
-            route
-                .cumulative_custody_age_ms
-                .saturating_add(sample.tick_ms - tick_ms),
-            false,
-            Some(sample.clock_id),
-            Some(sample.tick_ms),
-            true,
-        ),
-        Some(_) => (route.cumulative_custody_age_ms, true, None, None, false),
-    }
+    custody_fields_from_age(age)
 }
 
 #[allow(dead_code)]
@@ -11021,25 +10997,17 @@ fn checkpoint_pending_bridge_wrapper_custody(
     wrapper: &StoredPendingBridgeWrapper,
     sample: Option<CustodySample>,
 ) -> (u64, bool, Option<[u8; 16]>, Option<u64>, bool) {
-    if wrapper.age_continuity_unknown || !wrapper.custody_elapsed_available {
-        return (wrapper.cumulative_custody_age_ms, true, None, None, false);
+    let mut age = custody_age_from_legacy_fields(
+        wrapper.cumulative_custody_age_ms,
+        wrapper.age_continuity_unknown,
+        wrapper.custody_clock_id,
+        wrapper.custody_tick_ms,
+        wrapper.custody_elapsed_available,
+    );
+    if age.checkpoint(sample).is_err() {
+        age.mark_continuity_lost();
     }
-    let Some((clock_id, tick_ms)) = wrapper.custody_clock_id.zip(wrapper.custody_tick_ms) else {
-        return (wrapper.cumulative_custody_age_ms, true, None, None, false);
-    };
-    match sample {
-        None => (wrapper.cumulative_custody_age_ms, true, None, None, false),
-        Some(sample) if sample.clock_id == clock_id && sample.tick_ms >= tick_ms => (
-            wrapper
-                .cumulative_custody_age_ms
-                .saturating_add(sample.tick_ms - tick_ms),
-            false,
-            Some(sample.clock_id),
-            Some(sample.tick_ms),
-            true,
-        ),
-        Some(_) => (wrapper.cumulative_custody_age_ms, true, None, None, false),
-    }
+    custody_fields_from_age(age)
 }
 
 #[allow(dead_code)]
@@ -11346,7 +11314,7 @@ fn recompute_bridge_projection_group_tx(
 #[allow(dead_code)]
 fn bridge_custody_is_live(
     ttl_ms: Option<u64>,
-    _tombstone: bool,
+    tombstone: bool,
     cumulative_age_ms: u64,
     age_continuity_unknown: bool,
     custody_clock_id: Option<[u8; 16]>,
@@ -11354,20 +11322,14 @@ fn bridge_custody_is_live(
     custody_elapsed_available: bool,
     sample: Option<CustodySample>,
 ) -> bool {
-    if ttl_ms.is_none() {
-        return true;
-    }
-    if age_continuity_unknown || !custody_elapsed_available {
-        return false;
-    }
-    let (Some(clock_id), Some(tick_ms), Some(sample), Some(ttl_ms)) =
-        (custody_clock_id, custody_tick_ms, sample, ttl_ms)
-    else {
-        return false;
-    };
-    clock_id == sample.clock_id
-        && sample.tick_ms >= tick_ms
-        && cumulative_age_ms.saturating_add(sample.tick_ms - tick_ms) < ttl_ms
+    let mut age = custody_age_from_legacy_fields(
+        cumulative_age_ms,
+        age_continuity_unknown,
+        custody_clock_id,
+        custody_tick_ms,
+        custody_elapsed_available,
+    );
+    evaluate_custody(ttl_ms, tombstone, &mut age, sample).is_forwardable()
 }
 
 #[allow(dead_code)]
@@ -11625,7 +11587,10 @@ fn create_schema(connection: &Connection) -> Result<(), StoreError> {
     migrate_v8_to_v9(connection)?;
     migrate_v9_to_v10(connection)?;
     migrate_v10_to_v11(connection)?;
-    migrate_v11_to_v12(connection)
+    migrate_v11_to_v12(connection)?;
+    migrate_v12_to_v13(connection)?;
+    migrate_v13_to_v14(connection)?;
+    migrate_v14_to_v15(connection)
 }
 
 fn migrate_v1_to_v2(connection: &Connection) -> Result<(), StoreError> {
@@ -12335,6 +12300,66 @@ fn migrate_v11_to_v12(connection: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
+fn migrate_v12_to_v13(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch(
+        "BEGIN IMMEDIATE;\n\
+         ALTER TABLE transfer_identities RENAME TO transfer_identities_v12;\n\
+         CREATE TABLE transfer_identities (\n\
+           storage_key BLOB PRIMARY KEY REFERENCES wants(object_id) ON DELETE CASCADE\n\
+             CHECK(length(storage_key)=32),\n\
+           object_id BLOB NOT NULL UNIQUE CHECK(length(object_id)=33),\n\
+           origin_semantic_version INTEGER\n\
+             CHECK(origin_semantic_version IS NULL OR origin_semantic_version IN (1,2,3))\n\
+         ) STRICT;\n\
+         INSERT INTO transfer_identities(storage_key,object_id,origin_semantic_version)\n\
+           SELECT storage_key,object_id,origin_semantic_version FROM transfer_identities_v12;\n\
+         DROP TABLE transfer_identities_v12;\n\
+         PRAGMA user_version=13;\n\
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
+fn migrate_v13_to_v14(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch(
+        "BEGIN IMMEDIATE;\n\
+         ALTER TABLE transfer_identities RENAME TO transfer_identities_v13;\n\
+         CREATE TABLE transfer_identities (\n\
+           storage_key BLOB PRIMARY KEY REFERENCES wants(object_id) ON DELETE CASCADE\n\
+             CHECK(length(storage_key)=32),\n\
+           object_id BLOB NOT NULL UNIQUE CHECK(length(object_id)=33),\n\
+           origin_semantic_version INTEGER\n\
+             CHECK(origin_semantic_version IS NULL OR origin_semantic_version IN (1,2,3,4))\n\
+         ) STRICT;\n\
+         INSERT INTO transfer_identities(storage_key,object_id,origin_semantic_version)\n\
+           SELECT storage_key,object_id,origin_semantic_version FROM transfer_identities_v13;\n\
+         DROP TABLE transfer_identities_v13;\n\
+         PRAGMA user_version=14;\n\
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
+fn migrate_v14_to_v15(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch(
+        "BEGIN IMMEDIATE;\n\
+         ALTER TABLE transfer_identities RENAME TO transfer_identities_v14;\n\
+         CREATE TABLE transfer_identities (\n\
+           storage_key BLOB PRIMARY KEY REFERENCES wants(object_id) ON DELETE CASCADE\n\
+             CHECK(length(storage_key)=32),\n\
+           object_id BLOB NOT NULL UNIQUE CHECK(length(object_id)=33),\n\
+           origin_semantic_version INTEGER\n\
+             CHECK(origin_semantic_version IS NULL OR origin_semantic_version IN (1,2,3,4,5))\n\
+         ) STRICT;\n\
+         INSERT INTO transfer_identities(storage_key,object_id,origin_semantic_version)\n\
+           SELECT storage_key,object_id,origin_semantic_version FROM transfer_identities_v14;\n\
+         DROP TABLE transfer_identities_v14;\n\
+         PRAGMA user_version=15;\n\
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
 fn persist_config(connection: &Connection, config: &StoreConfig) -> Result<(), StoreError> {
     let values = [
         ("max_items", config.max_items),
@@ -12478,19 +12503,16 @@ impl LifecycleItem {
     }
 
     fn is_expired_at(&self, sample: Option<CustodySample>) -> bool {
-        if self.tombstone {
-            return false;
-        }
-        self.ttl_ms
-            .zip(custody_age_from_fields(
-                self.ttl_ms,
-                self.custody_age_ms,
-                self.custody_clock_id,
-                self.custody_tick_ms,
-                self.custody_elapsed_available,
-                sample,
-            ))
-            .is_some_and(|(ttl, age)| age >= ttl)
+        custody_disposition_from_fields(
+            self.ttl_ms,
+            self.tombstone,
+            self.custody_age_ms,
+            self.custody_clock_id,
+            self.custody_tick_ms,
+            self.custody_elapsed_available,
+            sample,
+        )
+        .is_expired()
     }
 }
 
@@ -12676,47 +12698,33 @@ fn load_item_tx(
         .optional()?)
 }
 
-fn custody_age_at(item: &StoredItem, sample: Option<CustodySample>) -> Option<u64> {
-    custody_age_from_fields(
-        item.ttl_ms,
-        item.custody_age_ms,
-        item.custody_clock_id,
-        item.custody_tick_ms,
-        item.custody_elapsed_available,
-        sample,
-    )
-}
-
-fn custody_age_from_fields(
+fn custody_disposition_from_fields(
     ttl_ms: Option<u64>,
+    tombstone: bool,
     custody_age_ms: u64,
     custody_clock_id: Option<[u8; 16]>,
     custody_tick_ms: Option<u64>,
     custody_elapsed_available: bool,
     sample: Option<CustodySample>,
-) -> Option<u64> {
-    if ttl_ms.is_none() {
-        if custody_elapsed_available
-            && let (Some(clock_id), Some(tick), Some(sample)) =
-                (custody_clock_id, custody_tick_ms, sample)
-            && clock_id == sample.clock_id
-            && sample.tick_ms >= tick
-        {
-            return Some(custody_age_ms.saturating_add(sample.tick_ms.saturating_sub(tick)));
-        }
-        return Some(custody_age_ms);
-    }
-    if !custody_elapsed_available {
-        return None;
-    }
-    let (Some(clock_id), Some(tick), Some(sample)) = (custody_clock_id, custody_tick_ms, sample)
-    else {
-        return None;
+) -> CustodyDisposition {
+    let checkpoint = custody_checkpoint(custody_clock_id, custody_tick_ms);
+    let continuity = if custody_elapsed_available {
+        CustodyContinuity::Continuous
+    } else {
+        CustodyContinuity::Lost
     };
-    if clock_id != sample.clock_id || sample.tick_ms < tick {
-        return None;
-    }
-    Some(custody_age_ms.saturating_add(sample.tick_ms.saturating_sub(tick)))
+    let mut age = CustodyAge::from_parts(custody_age_ms, checkpoint, continuity)
+        .unwrap_or_else(|_| CustodyAge::unknown(custody_age_ms));
+    evaluate_custody(ttl_ms, tombstone, &mut age, sample)
+}
+
+fn custody_checkpoint(
+    custody_clock_id: Option<[u8; 16]>,
+    custody_tick_ms: Option<u64>,
+) -> Option<CustodySample> {
+    custody_clock_id
+        .zip(custody_tick_ms)
+        .map(|(clock_id, tick_ms)| CustodySample { clock_id, tick_ms })
 }
 
 fn advance_custody_fields(
@@ -12727,25 +12735,28 @@ fn advance_custody_fields(
     custody_elapsed_available: &mut bool,
     sample: Option<CustodySample>,
 ) {
-    let effective = custody_age_from_fields(
-        ttl_ms,
-        *custody_age_ms,
-        *custody_clock_id,
-        *custody_tick_ms,
-        *custody_elapsed_available,
-        sample,
-    );
-    match (effective, sample) {
-        (Some(age), Some(sample)) if *custody_elapsed_available => {
-            *custody_age_ms = (*custody_age_ms).max(age);
-            *custody_clock_id = Some(sample.clock_id);
-            *custody_tick_ms = Some(sample.tick_ms);
-        }
-        (None, _) if ttl_ms.is_some() => {
-            *custody_elapsed_available = false;
-        }
-        _ => {}
+    let checkpoint = custody_checkpoint(*custody_clock_id, *custody_tick_ms);
+    let continuity = if *custody_elapsed_available {
+        CustodyContinuity::Continuous
+    } else {
+        CustodyContinuity::Lost
+    };
+    let Ok(mut age) = CustodyAge::from_parts(*custody_age_ms, checkpoint, continuity) else {
+        *custody_elapsed_available = false;
+        return;
+    };
+    if ttl_ms.is_none() && sample.is_none() {
+        return;
     }
+    if age.checkpoint(sample).is_err() {
+        *custody_elapsed_available = false;
+        return;
+    }
+    *custody_age_ms = age.cumulative_age_ms();
+    let checkpoint = age.checkpoint_sample();
+    *custody_clock_id = checkpoint.map(|value| value.clock_id);
+    *custody_tick_ms = checkpoint.map(|value| value.tick_ms);
+    *custody_elapsed_available = age.is_continuous();
 }
 
 fn advance_custody_tx(
@@ -12827,15 +12838,25 @@ fn merge_duplicate_custody_tx(
             "semantic item was replayed with a different source-sealed envelope".into(),
         ));
     }
-    let age = existing.custody_age_ms.max(incoming.custody_age_ms);
     // Once elapsed custody becomes unknown it cannot be made known again by a
-    // replay; doing so would erase unaccounted local custody time.
-    let available = existing.custody_elapsed_available && incoming.custody_elapsed_available;
-    let (clock_id, tick) = if available {
-        (incoming.custody_clock_id, incoming.custody_tick_ms)
-    } else {
-        (existing.custody_clock_id, existing.custody_tick_ms)
-    };
+    // replay; doing so would erase unaccounted local custody time.  When both
+    // states are continuous, account local residence at the incoming sample
+    // before taking the nondecreasing authenticated maximum.
+    let incoming_sample = incoming
+        .custody_elapsed_available
+        .then(|| custody_checkpoint(incoming.custody_clock_id, incoming.custody_tick_ms))
+        .flatten();
+    let (age, _, clock_id, tick, available) = merge_authenticated_custody_fields(
+        Some((
+            existing.custody_age_ms,
+            !existing.custody_elapsed_available,
+            existing.custody_clock_id,
+            existing.custody_tick_ms,
+            existing.custody_elapsed_available,
+        )),
+        incoming.custody_age_ms,
+        incoming_sample,
+    );
     transaction.execute(
         "UPDATE items SET custody_age_ms=?1,custody_clock_id=?2,custody_tick_ms=?3,\n\
            custody_elapsed_available=?4 WHERE item_id=?5",
@@ -17820,7 +17841,70 @@ mod sqlite_integration_tests {
         }
     }
 
+    fn downgrade_schema_v13_to_v12_for_test(connection: &Connection) {
+        downgrade_schema_v14_to_v13_for_test(connection);
+        connection
+            .execute_batch(
+                "ALTER TABLE transfer_identities RENAME TO transfer_identities_v13;\n\
+                 CREATE TABLE transfer_identities (\n\
+                   storage_key BLOB PRIMARY KEY REFERENCES wants(object_id) ON DELETE CASCADE\n\
+                     CHECK(length(storage_key)=32),\n\
+                   object_id BLOB NOT NULL UNIQUE CHECK(length(object_id)=33),\n\
+                   origin_semantic_version INTEGER\n\
+                     CHECK(origin_semantic_version IS NULL OR origin_semantic_version IN (1,2))\n\
+                 ) STRICT;\n\
+                 INSERT INTO transfer_identities(storage_key,object_id,origin_semantic_version)\n\
+                   SELECT storage_key,object_id,origin_semantic_version\n\
+                   FROM transfer_identities_v13;\n\
+                 DROP TABLE transfer_identities_v13;\n\
+                 PRAGMA user_version=12;",
+            )
+            .unwrap();
+    }
+
+    fn downgrade_schema_v14_to_v13_for_test(connection: &Connection) {
+        downgrade_schema_v15_to_v14_for_test(connection);
+        connection
+            .execute_batch(
+                "ALTER TABLE transfer_identities RENAME TO transfer_identities_v14;\n\
+                 CREATE TABLE transfer_identities (\n\
+                   storage_key BLOB PRIMARY KEY REFERENCES wants(object_id) ON DELETE CASCADE\n\
+                     CHECK(length(storage_key)=32),\n\
+                   object_id BLOB NOT NULL UNIQUE CHECK(length(object_id)=33),\n\
+                   origin_semantic_version INTEGER\n\
+                     CHECK(origin_semantic_version IS NULL OR origin_semantic_version IN (1,2,3))\n\
+                 ) STRICT;\n\
+                 INSERT INTO transfer_identities(storage_key,object_id,origin_semantic_version)\n\
+                   SELECT storage_key,object_id,origin_semantic_version\n\
+                   FROM transfer_identities_v14;\n\
+                 DROP TABLE transfer_identities_v14;\n\
+                 PRAGMA user_version=13;",
+            )
+            .unwrap();
+    }
+
+    fn downgrade_schema_v15_to_v14_for_test(connection: &Connection) {
+        connection
+            .execute_batch(
+                "ALTER TABLE transfer_identities RENAME TO transfer_identities_v15;\n\
+                 CREATE TABLE transfer_identities (\n\
+                   storage_key BLOB PRIMARY KEY REFERENCES wants(object_id) ON DELETE CASCADE\n\
+                     CHECK(length(storage_key)=32),\n\
+                   object_id BLOB NOT NULL UNIQUE CHECK(length(object_id)=33),\n\
+                   origin_semantic_version INTEGER\n\
+                     CHECK(origin_semantic_version IS NULL OR origin_semantic_version IN (1,2,3,4))\n\
+                 ) STRICT;\n\
+                 INSERT INTO transfer_identities(storage_key,object_id,origin_semantic_version)\n\
+                   SELECT storage_key,object_id,origin_semantic_version\n\
+                   FROM transfer_identities_v15;\n\
+                 DROP TABLE transfer_identities_v15;\n\
+                 PRAGMA user_version=14;",
+            )
+            .unwrap();
+    }
+
     fn downgrade_schema_v12_to_v11_for_test(connection: &Connection) {
+        downgrade_schema_v13_to_v12_for_test(connection);
         connection
             .execute_batch(
                 "ALTER TABLE causal_frontier RENAME TO causal_frontier_v12;\n\
@@ -18147,6 +18231,200 @@ mod sqlite_integration_tests {
             assert_eq!(unrelated.counter(&legacy_a), 7);
             assert_eq!(unrelated.counter(&legacy_b), 9);
             assert_eq!(unrelated.counter(&[0xc3; 32]), 0);
+        }
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("sqlite3-wal"));
+        let _ = fs::remove_file(path.with_extension("sqlite3-shm"));
+    }
+
+    #[test]
+    fn populated_schema_v12_transfer_provenance_migrates_to_current() {
+        let path = std::env::temp_dir().join(format!(
+            "aster-transfer-v12-to-current-{}-{}.sqlite3",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let proof = ObjectId::new(ObjectKind::SourceBatchProof, [0xd3; 32]);
+        let storage_key = transfer_storage_key(proof);
+        {
+            let mut store = SqliteStore::open(&path, StoreConfig::default()).unwrap();
+            store
+                .begin_transfer_for_semantic_version(proof, 8, Priority::Immediate, None, 2)
+                .unwrap();
+            store
+                .put_sealed_chunk(storage_key, 8, 0, &[1, 2, 3], None)
+                .unwrap();
+        }
+        {
+            let connection = Connection::open(&path).unwrap();
+            downgrade_schema_v13_to_v12_for_test(&connection);
+            assert_eq!(
+                connection
+                    .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                12
+            );
+        }
+        {
+            let mut store = SqliteStore::open(&path, StoreConfig::default()).unwrap();
+            assert_eq!(
+                store
+                    .connection
+                    .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                SCHEMA_VERSION
+            );
+            assert_eq!(
+                store.transfer_progress_for_semantic_version(4, 8).unwrap()[0]
+                    .origin_semantic_version,
+                Some(2)
+            );
+            store
+                .begin_transfer_for_semantic_version(proof, 8, Priority::Flash, None, 4)
+                .unwrap();
+            assert_eq!(
+                store.missing_ranges(&storage_key, 8).unwrap(),
+                vec![ChunkRange::new(3, 8).unwrap()]
+            );
+        }
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("sqlite3-wal"));
+        let _ = fs::remove_file(path.with_extension("sqlite3-shm"));
+    }
+
+    #[test]
+    fn schema_v13_migrates_and_v4_provenance_survives_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "aster-transfer-v13-to-v14-{}-{}.sqlite3",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let existing = ObjectId::new(ObjectKind::SourceBatchProof, [0xd4; 32]);
+        let v4 = ObjectId::new(ObjectKind::BridgeAuthorization, [0xd5; 32]);
+        {
+            let mut store = SqliteStore::open(&path, StoreConfig::default()).unwrap();
+            store
+                .begin_transfer_for_semantic_version(existing, 8, Priority::Immediate, None, 3)
+                .unwrap();
+        }
+        {
+            let connection = Connection::open(&path).unwrap();
+            downgrade_schema_v14_to_v13_for_test(&connection);
+            assert_eq!(
+                connection
+                    .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                13
+            );
+        }
+        {
+            let mut store = SqliteStore::open(&path, StoreConfig::default()).unwrap();
+            assert_eq!(
+                store
+                    .connection
+                    .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                SCHEMA_VERSION
+            );
+            store
+                .begin_transfer_for_semantic_version(existing, 8, Priority::Flash, None, 4)
+                .unwrap();
+            store
+                .begin_transfer_for_semantic_version(v4, 9, Priority::Routine, None, 4)
+                .unwrap();
+            store
+                .put_sealed_chunk(transfer_storage_key(v4), 9, 0, &[1, 2, 3], None)
+                .unwrap();
+        }
+        {
+            let mut store = SqliteStore::open(&path, StoreConfig::default()).unwrap();
+            let progress = store.transfer_progress_for_semantic_version(4, 8).unwrap();
+            assert!(progress.iter().any(|entry| {
+                entry.object_id == existing && entry.origin_semantic_version == Some(3)
+            }));
+            assert!(progress.iter().any(|entry| {
+                entry.object_id == v4
+                    && entry.origin_semantic_version == Some(4)
+                    && entry.received == [ChunkRange::new(0, 3).unwrap()]
+            }));
+        }
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("sqlite3-wal"));
+        let _ = fs::remove_file(path.with_extension("sqlite3-shm"));
+    }
+
+    #[test]
+    fn schema_v14_migrates_and_v5_provenance_survives_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "aster-transfer-v14-to-v15-{}-{}.sqlite3",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let existing_v4 = ObjectId::new(ObjectKind::SourceBatchProof, [0xd6; 32]);
+        let new_v5 = ObjectId::new(ObjectKind::BridgeAuthorization, [0xd7; 32]);
+        {
+            let mut store = SqliteStore::open(&path, StoreConfig::default()).unwrap();
+            store
+                .begin_transfer_for_semantic_version(existing_v4, 8, Priority::Immediate, None, 4)
+                .unwrap();
+            store
+                .put_sealed_chunk(transfer_storage_key(existing_v4), 8, 0, &[1, 2], None)
+                .unwrap();
+        }
+        {
+            let connection = Connection::open(&path).unwrap();
+            downgrade_schema_v15_to_v14_for_test(&connection);
+            assert_eq!(
+                connection
+                    .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                14
+            );
+        }
+        {
+            let mut store = SqliteStore::open(&path, StoreConfig::default()).unwrap();
+            assert_eq!(
+                store
+                    .connection
+                    .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                SCHEMA_VERSION
+            );
+            let migrated = store.transfer_progress_for_semantic_version(5, 8).unwrap();
+            assert!(migrated.iter().any(|entry| {
+                entry.object_id == existing_v4
+                    && entry.origin_semantic_version == Some(4)
+                    && entry.received == [ChunkRange::new(0, 2).unwrap()]
+            }));
+            store
+                .begin_transfer_for_semantic_version(new_v5, 9, Priority::Routine, None, 5)
+                .unwrap();
+            store
+                .put_sealed_chunk(transfer_storage_key(new_v5), 9, 0, &[3, 4, 5], None)
+                .unwrap();
+        }
+        {
+            let mut store = SqliteStore::open(&path, StoreConfig::default()).unwrap();
+            let progress = store.transfer_progress_for_semantic_version(5, 8).unwrap();
+            assert!(progress.iter().any(|entry| {
+                entry.object_id == existing_v4
+                    && entry.origin_semantic_version == Some(4)
+                    && entry.received == [ChunkRange::new(0, 2).unwrap()]
+            }));
+            assert!(progress.iter().any(|entry| {
+                entry.object_id == new_v5
+                    && entry.origin_semantic_version == Some(5)
+                    && entry.received == [ChunkRange::new(0, 3).unwrap()]
+            }));
         }
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(path.with_extension("sqlite3-wal"));
@@ -20519,6 +20797,19 @@ mod sqlite_integration_tests {
         assert_eq!(retained.custody_age_ms, 50);
         assert!(!retained.custody_elapsed_available);
         assert!(store.collect_garbage(None, None).unwrap().is_empty());
+
+        let below_ttl = test_item(4, 1, Some(100), 99, None);
+        assert!(!below_ttl.is_expired_at(None));
+        assert!(!below_ttl.is_forwardable_at(None));
+
+        let at_ttl = test_item(5, 1, Some(100), 100, None);
+        assert!(at_ttl.is_expired_at(None));
+        assert!(!at_ttl.is_forwardable_at(None));
+
+        let mut durable_tombstone = test_item(6, 1, Some(0), u64::MAX, None);
+        durable_tombstone.tombstone = true;
+        assert!(!durable_tombstone.is_expired_at(None));
+        assert!(durable_tombstone.is_forwardable_at(None));
     }
 
     #[test]
@@ -20536,6 +20827,12 @@ mod sqlite_integration_tests {
         store
             .begin_transfer_for_semantic_version(blob, 8, Priority::Immediate, Some(3), 1)
             .unwrap();
+        store
+            .begin_transfer_for_semantic_version(blob, 8, Priority::Flash, Some(4), 3)
+            .unwrap();
+        store
+            .begin_transfer_for_semantic_version(blob, 8, Priority::Flash, Some(5), 4)
+            .unwrap();
         assert_eq!(store.missing_ranges(&blob_key, 8).unwrap(), before);
         assert_eq!(
             store.transfer_progress(8).unwrap()[0].origin_semantic_version,
@@ -20549,9 +20846,18 @@ mod sqlite_integration_tests {
         store
             .begin_transfer_for_semantic_version(source_v1, 8, Priority::Routine, None, 2)
             .unwrap();
+        store
+            .begin_transfer_for_semantic_version(source_v1, 8, Priority::Routine, None, 4)
+            .unwrap();
         let source_v2 = ObjectId::new(ObjectKind::SourceEnvelope, [0xf2; 32]);
         store
             .begin_transfer_for_semantic_version(source_v2, 8, Priority::Routine, None, 2)
+            .unwrap();
+        store
+            .begin_transfer_for_semantic_version(source_v2, 8, Priority::Immediate, None, 3)
+            .unwrap();
+        store
+            .begin_transfer_for_semantic_version(source_v2, 8, Priority::Immediate, None, 4)
             .unwrap();
         let source_v2_key = transfer_storage_key(source_v2);
         store
@@ -20569,6 +20875,42 @@ mod sqlite_integration_tests {
             Err(StoreError::Invalid(_))
         ));
         assert_eq!(store.missing_ranges(&source_v2_key, 8).unwrap(), before);
+
+        let source_v3 = ObjectId::new(ObjectKind::SourceEnvelope, [0xf4; 32]);
+        store
+            .begin_transfer_for_semantic_version(source_v3, 8, Priority::Routine, None, 3)
+            .unwrap();
+        store
+            .begin_transfer_for_semantic_version(source_v3, 8, Priority::Immediate, None, 2)
+            .unwrap();
+        store
+            .begin_transfer_for_semantic_version(source_v3, 8, Priority::Immediate, None, 4)
+            .unwrap();
+        let proof_v3 = ObjectId::new(ObjectKind::SourceBatchProof, [0xf5; 32]);
+        store
+            .begin_transfer_for_semantic_version(proof_v3, 8, Priority::Routine, None, 3)
+            .unwrap();
+        store
+            .begin_transfer_for_semantic_version(proof_v3, 8, Priority::Immediate, None, 2)
+            .unwrap();
+        store
+            .begin_transfer_for_semantic_version(proof_v3, 8, Priority::Immediate, None, 4)
+            .unwrap();
+
+        let proof_v4 = ObjectId::new(ObjectKind::SourceBatchProof, [0xf6; 32]);
+        store
+            .begin_transfer_for_semantic_version(proof_v4, 8, Priority::Routine, None, 4)
+            .unwrap();
+        store
+            .begin_transfer_for_semantic_version(proof_v4, 8, Priority::Immediate, None, 2)
+            .unwrap();
+        store
+            .begin_transfer_for_semantic_version(proof_v4, 8, Priority::Immediate, None, 5)
+            .unwrap();
+        assert!(matches!(
+            store.begin_transfer_for_semantic_version(proof_v4, 8, Priority::Immediate, None, 6),
+            Err(StoreError::Invalid(_))
+        ));
 
         let unknown = ObjectId::new(ObjectKind::SourceEnvelope, [0xf3; 32]);
         store
@@ -20615,6 +20957,28 @@ mod sqlite_integration_tests {
                 .collect::<Vec<_>>(),
             vec![blob]
         );
+        assert_eq!(
+            store
+                .transfer_progress_for_semantic_version(3, 16)
+                .unwrap()
+                .len(),
+            5
+        );
+        assert_eq!(
+            store
+                .transfer_progress_for_semantic_version(4, 16)
+                .unwrap()
+                .len(),
+            5
+        );
+        assert_eq!(
+            store
+                .transfer_progress_for_semantic_version(5, 16)
+                .unwrap()
+                .len(),
+            5
+        );
+        assert!(store.transfer_progress_for_semantic_version(6, 16).is_err());
     }
 
     #[test]
@@ -20871,6 +21235,7 @@ mod sqlite_integration_tests {
         let mut tombstone =
             verified_bridge_route(&[&authorization], 0xe6, b"retained-bridge-tombstone");
         tombstone.source.metadata.tombstone = true;
+        tombstone.source.metadata.ttl_ms = Some(0);
         store
             .promote_verified_bridge_route_at(&tombstone, Some(bridge_sample(10)))
             .unwrap();
@@ -20879,11 +21244,16 @@ mod sqlite_integration_tests {
             evict_bridge_mappings_for_quota_tx(&transaction, None, 0, 0).unwrap();
             transaction.commit().unwrap();
         }
+        let stored_tombstone = store
+            .stored_bridge_route(&tombstone.wrapper_envelope_id)
+            .unwrap()
+            .unwrap();
+        assert!(stored_tombstone.tombstone);
+        assert_eq!(stored_tombstone.ttl_ms, Some(0));
         assert!(
             store
-                .stored_bridge_route(&tombstone.wrapper_envelope_id)
+                .bridge_route_is_live_at(&tombstone.wrapper_envelope_id, None)
                 .unwrap()
-                .is_some()
         );
         assert!(
             store
@@ -21933,6 +22303,31 @@ mod sqlite_integration_tests {
                 .envelope_id,
             compact.envelope_id
         );
+        assert_eq!(
+            store
+                .stored_item_representation(&compact.id, 3)
+                .unwrap()
+                .unwrap()
+                .envelope_id,
+            compact.envelope_id
+        );
+        assert_eq!(
+            store
+                .stored_item_representation(&compact.id, 4)
+                .unwrap()
+                .unwrap()
+                .envelope_id,
+            compact.envelope_id
+        );
+        assert_eq!(
+            store
+                .stored_item_representation(&compact.id, 5)
+                .unwrap()
+                .unwrap()
+                .envelope_id,
+            compact.envelope_id
+        );
+        assert!(store.stored_item_representation(&compact.id, 6).is_err());
         let next = store
             .reserve_batch_publish(
                 [7; 32],

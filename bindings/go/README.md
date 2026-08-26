@@ -24,7 +24,8 @@ only after the application has committed its own result.
 `1`; new code should use `ReplicationWireVersion()`. The default and highest
 implemented semantic version are reported separately by
 `DefaultSemanticVersion()` and `HighestSupportedSemanticVersion()` and are both
-`2` in this build. These process-wide values do not report a particular
+`5` in this build; authenticated sessions retain semantic versions 4, 3, 2,
+and 1 for compatibility. These process-wide values do not report a particular
 session's negotiated result.
 
 Queried and subscribed `Item` values expose `OriginScope` and `CurrentScope`.

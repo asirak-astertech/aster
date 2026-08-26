@@ -1,6 +1,5 @@
 # Proposal 0001: Operational IP mesh vertical-slice experiment
 
-> ****
 
 - Status: completed — no production winner; no dependency admitted
 - Date: 2026-08-21
@@ -14,9 +13,10 @@
   targets; §12 relay, NAT, and capture scenarios
 - Related decisions: [0002](../decisions/0002-dependency-admission.md),
   [0007](../decisions/0007-ip-and-btle-links.md),
-  [0014](../decisions/0014-total-assurance-build-vs-buy.md),
-  [0015](../decisions/0015-library-backed-mechanism-reduction.md), and
-  [0016](../decisions/0016-tokio-relay-host-boundary.md)
+  0014 (“Build versus buy is governed by total assurance cost”;  not part of this repository artifact),
+  0015 (“Delete custom mechanism behind narrow library-backed seams”; not part of this repository artifact), and
+  0016 (“Tokio owns relay host I/O and scheduling”; not
+  part of this repository artifact)
 
 ## Activation record — 2026-08-21
 
@@ -205,7 +205,7 @@ eligible operational-mesh winner.
 This is also a Phase-0 prerequisite: B must be route-only, the source item must
 be an Event, B must survive restart, B's application surface must not consume
 the plaintext, and C must receive and acknowledge the original item. A records
-the ItemID and source EnvelopeID; privileged lab evidence proves B's custody of
+the ItemID and source EnvelopeID; lab evidence proves B's custody of
 that EnvelopeID; C recomputes and delivers the original ItemID. If this control
 fails, stop the connectivity comparison and open a data-plane proposal rather
 than blaming a candidate substrate.
@@ -381,11 +381,11 @@ evidence.
 5. Require automatic discovery, candidate validation, and mutual Aster
    authentication.
 6. Require B to hold the exact source EnvelopeID durably; verify through
-   privileged lab evidence that custody occurred while B's public application
+   lab evidence that custody occurred while B's public application
    surface cannot consume the plaintext or obtain an endpoint-only plaintext
    digest.
 7. Stop A completely. Crash and restart B from the same durable directory.
-8. Prove through the privileged lab receipt that B has the source EnvelopeID
+8. Prove through the lab receipt that B has the source EnvelopeID
    before C starts or any second contact begins. This does not expand B's public
    route-only application API.
 9. Start C without B's locator or carrier identity. Require B and C to discover

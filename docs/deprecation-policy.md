@@ -27,14 +27,24 @@ Unknown optional extensions remain ignorable throughout a major version.
 Unknown critical values fail only the containing object/session and never cause
 silent reinterpretation. Stable replication-wire, credential/envelope, crypto-
 profile, and handshake-framing encodings remain version `1`. The current
-handshake separately negotiates semantic versions `2` and `1` and complete suite
-`0x0001`; a default offer is `[2, 1]`, and an honest responder selects the
+handshake separately negotiates semantic versions `5`, `4`, `3`, `2`, and `1` and
+complete suite `0x0001`; a default offer is `[5, 4, 3, 2, 1]`, and an honest responder selects the
 highest common semantic version. Offer and selection are transcript, KDF,
 confirmation, and hybrid-authentication bound, so an unauthenticated on-path
 rewrite fails.
 
+Semantic version `4` adds the selected protected, class- and direction-separated
+State/Record mechanics lanes; semantic version `5` inherits them and adds the
+selected direct-content Blob source/carrier mechanics. Event remains compatible
+across semantic versions `1` through `5`; State/Record frames are absent from
+v1-v3 contacts and Blob frames are absent from v1-v4 contacts.
+This is a negotiated-behavior addition: stable wire/profile, handshake framing,
+suite, and source-object formats are not renumbered. A v4 State/Record object is
+therefore never silently downgraded into an Event or processed by a v1-v3
+mutable lane, and a v5 Blob transfer is never silently accepted as v4 traffic.
+
 Negotiation does not authenticate the responder's full capability set. An
-accepted older or modified peer can complete semantic `1`, so production use
+accepted older or modified peer can complete semantic `1`, `2`, or `3`, so production use
 that depends on downgrade resistance remains fail-closed at release
 authorization until all of the following exist: an authority-signed mission
 minimum semantic version, durable per-identity observed high-water state,

@@ -65,14 +65,22 @@ use zeroize::Zeroize;
 pub(crate) const PROTOCOL_VERSION: u16 = 1;
 pub(crate) const SEMANTIC_PROTOCOL_V1: u16 = 1;
 pub(crate) const SEMANTIC_PROTOCOL_V2: u16 = 2;
+pub(crate) const SEMANTIC_PROTOCOL_V3: u16 = 3;
+pub(crate) const SEMANTIC_PROTOCOL_V4: u16 = 4;
+pub(crate) const SEMANTIC_PROTOCOL_V5: u16 = 5;
 pub(crate) const HYBRID_SUITE_ID: u16 = 0x0001;
 
 const NONCE_LEN: usize = 12;
 const HASH_LEN: usize = 32;
 const MAX_OFFERED_VERSIONS: usize = 16;
 const MAX_OFFERED_SUITES: usize = 16;
-pub(crate) const SUPPORTED_SEMANTIC_PROTOCOL_VERSIONS: &[u16] =
-    &[SEMANTIC_PROTOCOL_V2, SEMANTIC_PROTOCOL_V1];
+pub(crate) const SUPPORTED_SEMANTIC_PROTOCOL_VERSIONS: &[u16] = &[
+    SEMANTIC_PROTOCOL_V5,
+    SEMANTIC_PROTOCOL_V4,
+    SEMANTIC_PROTOCOL_V3,
+    SEMANTIC_PROTOCOL_V2,
+    SEMANTIC_PROTOCOL_V1,
+];
 // Preference order is policy, never numeric suite-ID order.
 const SUPPORTED_HYBRID_SUITES: &[u16] = &[HYBRID_SUITE_ID];
 const HYBRID_SUITE_LABEL: &[u8] =
@@ -2434,7 +2442,7 @@ mod tests {
         assert!(matches!(
             InitiatorHandshake::start(
                 &mut initiator_provider,
-                vec![SEMANTIC_PROTOCOL_V2 + 1],
+                vec![SEMANTIC_PROTOCOL_V5 + 1],
                 vec![HYBRID_SUITE_ID]
             ),
             Err(CryptoError::UnsupportedProtocolVersion)
@@ -2466,7 +2474,7 @@ mod tests {
         assert_eq!(prepared.public_hello.selected_suite, HYBRID_SUITE_ID);
 
         let mut unsupported_version = hello.clone();
-        unsupported_version.supported_versions = vec![SEMANTIC_PROTOCOL_V2 + 1];
+        unsupported_version.supported_versions = vec![SEMANTIC_PROTOCOL_V5 + 1];
         assert!(matches!(
             ResponderHandshakePrepared::respond(&mut responder_provider, &unsupported_version),
             Err(CryptoError::UnsupportedProtocolVersion)
@@ -2546,31 +2554,55 @@ mod tests {
 
     #[test]
     fn transcript_binds_the_complete_version_offer_against_downgrade() {
-        let mut initiator_provider = provider(7_004);
-        let mut responder_provider = provider(17_004);
-        let responder_key = responder_provider
-            .generate_signing_key()
-            .unwrap_or_else(|error| panic!("key generation failed: {error}"));
-        let (initiator_state, mut stripped_hello) = InitiatorHandshake::start(
-            &mut initiator_provider,
-            vec![PROTOCOL_VERSION + 1, PROTOCOL_VERSION],
-            vec![HYBRID_SUITE_ID],
-        )
-        .unwrap_or_else(|error| panic!("client start failed: {error}"));
-
-        stripped_hello.supported_versions.remove(0);
-        let prepared =
-            ResponderHandshakePrepared::respond(&mut responder_provider, &stripped_hello)
-                .unwrap_or_else(|error| panic!("server preparation failed: {error}"));
-        let (_responder_state, server_hello) = prepared
-            .seal_server_auth(
-                &mut responder_provider,
-                &responder_key,
-                b"server credential",
+        for (seed, stripped_versions) in [
+            (
+                7_004,
+                vec![
+                    SEMANTIC_PROTOCOL_V4,
+                    SEMANTIC_PROTOCOL_V3,
+                    SEMANTIC_PROTOCOL_V2,
+                    SEMANTIC_PROTOCOL_V1,
+                ],
+            ),
+            (7_005, vec![SEMANTIC_PROTOCOL_V2, SEMANTIC_PROTOCOL_V1]),
+            (7_006, vec![SEMANTIC_PROTOCOL_V1]),
+        ] {
+            let mut initiator_provider = provider(seed);
+            let mut responder_provider = provider(seed.wrapping_add(10_000));
+            let responder_key = responder_provider
+                .generate_signing_key()
+                .unwrap_or_else(|error| panic!("key generation failed: {error}"));
+            let (initiator_state, mut stripped_hello) = InitiatorHandshake::start(
+                &mut initiator_provider,
+                SUPPORTED_SEMANTIC_PROTOCOL_VERSIONS.to_vec(),
+                vec![HYBRID_SUITE_ID],
             )
-            .unwrap_or_else(|error| panic!("server response failed: {error}"));
-        let result = initiator_state.open_server_auth(&initiator_provider, &server_hello);
-        assert!(matches!(result, Err(CryptoError::KeyConfirmationFailed)));
+            .unwrap_or_else(|error| panic!("client start failed: {error}"));
+            assert_eq!(
+                stripped_hello.supported_versions,
+                vec![
+                    SEMANTIC_PROTOCOL_V5,
+                    SEMANTIC_PROTOCOL_V4,
+                    SEMANTIC_PROTOCOL_V3,
+                    SEMANTIC_PROTOCOL_V2,
+                    SEMANTIC_PROTOCOL_V1
+                ]
+            );
+
+            stripped_hello.supported_versions = stripped_versions;
+            let prepared =
+                ResponderHandshakePrepared::respond(&mut responder_provider, &stripped_hello)
+                    .unwrap_or_else(|error| panic!("server preparation failed: {error}"));
+            let (_responder_state, server_hello) = prepared
+                .seal_server_auth(
+                    &mut responder_provider,
+                    &responder_key,
+                    b"server credential",
+                )
+                .unwrap_or_else(|error| panic!("server response failed: {error}"));
+            let result = initiator_state.open_server_auth(&initiator_provider, &server_hello);
+            assert!(matches!(result, Err(CryptoError::KeyConfirmationFailed)));
+        }
     }
 
     #[test]

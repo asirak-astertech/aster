@@ -13,7 +13,8 @@ Version reporting separates stable encoding from negotiated behavior.
 `aster_protocol_version()` remains a compatibility alias for
 `aster_replication_wire_version()` and returns wire/profile version `1`.
 `aster_default_semantic_version()` and
-`aster_highest_supported_semantic_version()` both return `2` for this build.
+`aster_highest_supported_semantic_version()` both return `5` for this build;
+authenticated sessions retain semantic versions 4, 3, 2, and 1 for compatibility.
 None of these process-wide functions reports the version selected by a
 particular authenticated session.
 

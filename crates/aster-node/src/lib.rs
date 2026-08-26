@@ -2,32 +2,46 @@
 //!
 //! The selected runtime composes a mission-authenticated Iroh carrier, bounded
 //! Negentropy reconciliation, mission-bound redb state, and the existing
-//! `aster-core` source-authenticated Event semantics. Its stopped-state
+//! `aster-core` source-authenticated Event semantics. Negotiated semantic v3
+//! adds authenticated custody age, finite-TTL forwarding, bounded global and
+//! per-scope quotas, priority-aware scheduling, and live
+//! [`EventEmissionPolicy`] control (including receive-only operation), while
+//! v1/v2 remain compatible for durable Events. Its stopped-state
 //! application boundary also composes source-authenticated latest-value State,
 //! explicit-conflict Record, and streaming immutable Blob operations. State and
 //! Record additionally use class-specific, explicitly interested reconciliation
-//! lanes; Blob remains local. The State and Record application handles remain
-//! stopped/exclusive even though their durable objects can cross a live contact.
+//! lanes; semantic v5 adds an explicitly interested, resumable Blob lane. The
+//! State, Record, and Blob application handles remain stopped/exclusive even
+//! though their durable objects can cross a live contact.
 //! The caller-identified opaque API remains isolated for compatibility and is
 //! not advertised by the production Event reconciliation path.
 
 #![forbid(unsafe_code)]
 
 pub mod application;
+pub mod control_admin;
 mod frame;
 mod identity;
 pub mod mission;
 mod runtime;
 
+pub use aster_redb_store::{CustodyQuota, StoreLimits};
+pub use control_admin::{
+    ControlAdminError, ControlAdminErrorKind, MAX_SELECTED_REKEY_RECIPIENTS,
+    MAX_SELECTED_REKEY_REGISTRY_BYTES, MAX_SELECTED_REKEY_TOPIC_GRANTS, RegistryGenerationWitness,
+    RevocationRequest, ScopeRekeyRequest, SelectedControlAdmin, SelectedControlHandle,
+};
 pub use identity::{IdentityError, NodeIdentity};
+pub use mission::MissionProvisioningOrigin;
 pub use runtime::{
-    ControlPublicationReceipt, DemoScenario, MissionExpectedPeer, MutableSourceInterests,
-    NodeApplication, NodeConfig, NodeError, NodeReceipt, PeerReceipt, RunningNode,
+    ControlPublicationReceipt, DemoScenario, EventEmissionPolicy,
+    MAX_CUSTODY_FINALIZATION_CHARGE_MS, MissionExpectedPeer, MutableSourceInterests,
+    NodeApplication, NodeBootstrapError, NodeBootstrapErrorKind, NodeConfig, NodeConfigOptions,
+    NodeError, NodeReceipt, PeerReceipt, RunningNode, SelectedForwardingConfig,
     SoftwareZeroizationPathState, SoftwareZeroizationReceipt, SoftwareZeroizationState,
     SourceInterestSelector, StoreReceipt, ensure_state_accepts_normal_operation,
-    format_control_transfer_id, inspect_store, publish_revocation_control,
-    publish_scope_rekey_control, put_opaque, run_demo, run_demo_scenario, run_node, start_node,
-    zeroize_node,
+    format_control_transfer_id, inspect_store, put_opaque, run_demo, run_demo_scenario, run_node,
+    run_node_with_forwarding, start_node, start_node_with_forwarding, zeroize_node,
 };
 
 use aster_mesh::NodeId;

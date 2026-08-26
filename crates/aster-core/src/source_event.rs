@@ -10,6 +10,60 @@ use crate::{
     model::{DataClass, Dot, ItemId, NodeId, Priority, Scope, Topic, VersionVector},
 };
 use sha2::{Digest, Sha256};
+use std::fmt;
+
+/// Opaque identity of the exact provider route grant that authenticated source data.
+///
+/// Scope and epoch alone do not identify a route grant: a committed rekey may
+/// replace key material at the same coordinates. This token carries no key
+/// material. Its one-way binding can be persisted, while currentness can only
+/// be decided by the provider which owns the active route policy.
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SourceRouteLineage([u8; 32]);
+
+impl SourceRouteLineage {
+    pub(crate) const fn from_commitment(commitment: [u8; 32]) -> Self {
+        Self(commitment)
+    }
+
+    /// Stable provider-owned one-way persistence binding. This is not route
+    /// key material and cannot mint or refresh a lineage capability.
+    pub const fn binding(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SourceRouteLineage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SourceRouteLineage([PROVIDER-OWNED])")
+    }
+}
+
+/// Event-named compatibility wrapper for [`SourceRouteLineage`].
+///
+/// Existing Event callers retain their original token and current-lineage API.
+/// New class-neutral compositions should use [`SourceRouteLineage`] and
+/// [`ReferenceEnvelopeSealer::is_current_source_route_lineage`].
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct EventRouteLineage(SourceRouteLineage);
+
+impl EventRouteLineage {
+    pub(crate) const fn from_commitment(commitment: [u8; 32]) -> Self {
+        Self(SourceRouteLineage::from_commitment(commitment))
+    }
+}
+
+impl From<EventRouteLineage> for SourceRouteLineage {
+    fn from(lineage: EventRouteLineage) -> Self {
+        lineage.0
+    }
+}
+
+impl fmt::Debug for EventRouteLineage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("EventRouteLineage([PROVIDER-OWNED])")
+    }
+}
 
 /// Route- and source-authenticated metadata for one exact source-sealed Event.
 ///
@@ -24,6 +78,7 @@ pub struct RouteVerifiedEventEnvelope {
     envelope: crate::envelope::VerifiedEnvelope,
     envelope_id: [u8; 32],
     mission_authority_id: NodeId,
+    route_lineage: EventRouteLineage,
 }
 
 impl RouteVerifiedEventEnvelope {
@@ -31,6 +86,7 @@ impl RouteVerifiedEventEnvelope {
         envelope: crate::envelope::VerifiedEnvelope,
         sealed: &[u8],
         mission_authority_id: NodeId,
+        route_lineage: EventRouteLineage,
     ) -> Result<Self, EnvelopeError> {
         if envelope.header.class != DataClass::Event || envelope.header.event_sequence.is_none() {
             return Err(EnvelopeError(
@@ -41,6 +97,7 @@ impl RouteVerifiedEventEnvelope {
             envelope,
             envelope_id: Sha256::digest(sealed).into(),
             mission_authority_id,
+            route_lineage,
         })
     }
 
@@ -66,6 +123,22 @@ impl RouteVerifiedEventEnvelope {
     /// Alias for [`Self::mission_authority_id`].
     pub const fn authority_id(&self) -> NodeId {
         self.mission_authority_id()
+    }
+
+    /// Opaque identity of the exact provider route grant used for verification.
+    ///
+    /// Cache this token with the authenticated claim, then call
+    /// [`ReferenceEnvelopeSealer::is_current_event_route_lineage`] before using
+    /// the claim as sender authority. A scope/epoch match alone is insufficient
+    /// when a rekey replaces key material at the same epoch.
+    pub const fn route_lineage(&self) -> EventRouteLineage {
+        self.route_lineage
+    }
+
+    /// Class-neutral identity of the exact provider route grant used for
+    /// verification.
+    pub const fn source_route_lineage(&self) -> SourceRouteLineage {
+        self.route_lineage.0
     }
 
     /// Complete provider-authenticated Event metadata.
@@ -157,11 +230,15 @@ impl RouteVerifiedEventEnvelope {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContentVerifiedEventEnvelope {
     route: RouteVerifiedEventEnvelope,
+    content_sha256: [u8; 32],
 }
 
 impl ContentVerifiedEventEnvelope {
-    fn from_opened(route: RouteVerifiedEventEnvelope) -> Self {
-        Self { route }
+    fn from_opened(route: RouteVerifiedEventEnvelope, payload: &[u8]) -> Self {
+        Self {
+            route,
+            content_sha256: Sha256::digest(payload).into(),
+        }
     }
 
     /// Semantic identifier derived by the existing source-envelope profile.
@@ -254,6 +331,17 @@ impl ContentVerifiedEventEnvelope {
         self.route.verify_exact_sealed(sealed)
     }
 
+    /// Checks that application bytes still equal the exact authenticated
+    /// plaintext that minted this capability.
+    pub fn verify_exact_payload(&self, payload: &[u8]) -> Result<(), EnvelopeError> {
+        if <[u8; 32]>::from(Sha256::digest(payload)) != self.content_sha256 {
+            return Err(EnvelopeError(
+                "source Event capability does not match plaintext payload".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Applies the existing age-zero TTL rule to a locally created Event.
     ///
     /// This method is only for atomic local publication, where custody begins
@@ -296,6 +384,40 @@ pub enum EventContentVerification {
 }
 
 impl ReferenceEnvelopeSealer {
+    /// Tests whether the exact route grant which authenticated cached source
+    /// data remains installed at the claimed scope and epoch.
+    ///
+    /// This is stronger than the class-named numeric route checks, which only
+    /// answer whether some grant exists at those coordinates. The opaque token
+    /// prevents a same-epoch replacement from authorizing bytes authenticated
+    /// under the superseded grant.
+    pub fn is_current_source_route_lineage(
+        &self,
+        scope: &Scope,
+        epoch: u64,
+        lineage: SourceRouteLineage,
+    ) -> bool {
+        self.current_source_route_grant_commitment(scope, epoch)
+            .is_some_and(|current| current == lineage.0)
+    }
+
+    /// Tests whether the exact route grant which authenticated a cached Event
+    /// remains installed at the claimed scope and epoch.
+    ///
+    /// This is intentionally stronger than [`Self::can_route_event`], which
+    /// answers only whether some grant exists at those coordinates. The opaque
+    /// lineage token prevents a same-epoch replacement from authorizing source
+    /// bytes authenticated under the superseded grant.
+    pub fn is_current_event_route_lineage(
+        &self,
+        scope: &Scope,
+        epoch: u64,
+        lineage: EventRouteLineage,
+    ) -> bool {
+        self.current_event_route_grant_commitment(scope, epoch)
+            .is_some_and(|current| current == SourceRouteLineage::from(lineage).0)
+    }
+
     /// Seals an Event through the existing hybrid source-envelope provider.
     ///
     /// Counter, causal context, Event sequence, scope, topic, data priority,
@@ -325,8 +447,13 @@ impl ReferenceEnvelopeSealer {
         &mut self,
         sealed: &[u8],
     ) -> Result<RouteVerifiedEventEnvelope, EnvelopeError> {
-        let verified = <Self as EnvelopeSealer>::inspect(self, sealed)?;
-        RouteVerifiedEventEnvelope::from_verified(verified, sealed, self.mission_authority_id())
+        let (verified, route_commitment) = self.inspect_event_route_with_lineage(sealed)?;
+        RouteVerifiedEventEnvelope::from_verified(
+            verified,
+            sealed,
+            self.mission_authority_id(),
+            EventRouteLineage::from_commitment(route_commitment),
+        )
     }
 
     /// Authenticates an Event and requires its source to equal `expected`.
@@ -371,7 +498,7 @@ impl ReferenceEnvelopeSealer {
                     ));
                 }
                 Ok(EventContentVerification::ContentVerified {
-                    event: ContentVerifiedEventEnvelope::from_opened(event),
+                    event: ContentVerifiedEventEnvelope::from_opened(event, &payload),
                     payload,
                 })
             }
@@ -520,6 +647,24 @@ mod tests {
         );
         assert_eq!(publisher.authority_id(), publisher.mission_authority_id());
         assert_eq!(first.mission_authority_id(), reader.mission_authority_id());
+        assert!(reader.is_current_event_route_lineage(
+            first.scope(),
+            first.key_epoch(),
+            first.route_lineage(),
+        ));
+        assert!(reader.is_current_source_route_lineage(
+            first.scope(),
+            first.key_epoch(),
+            first.source_route_lineage(),
+        ));
+        assert_eq!(
+            format!("{:?}", first.route_lineage()),
+            "EventRouteLineage([PROVIDER-OWNED])"
+        );
+        assert_eq!(
+            format!("{:?}", first.source_route_lineage()),
+            "SourceRouteLineage([PROVIDER-OWNED])"
+        );
         assert_eq!(first.publisher(), publisher.identity());
         assert_eq!(first.dot(), header.stamp.dot);
         assert_eq!(first.causal_context(), &header.stamp.context);
@@ -546,6 +691,12 @@ mod tests {
         content
             .verify_exact_sealed(&sealed.bytes)
             .expect("content token exact bytes");
+        content
+            .verify_exact_payload(payload)
+            .expect("content token exact plaintext");
+        let mut stale_payload = opened.clone();
+        stale_payload[0] ^= 1;
+        assert!(content.verify_exact_payload(&stale_payload).is_err());
 
         let mut different = sealed.bytes.clone();
         different[0] ^= 1;

@@ -1,16 +1,18 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, btree_map::Entry},
     error::Error,
     fmt,
     fs::{self, File},
+    future::Future,
     io,
     net::{SocketAddr, UdpSocket},
     path::{Path, PathBuf},
+    pin::Pin,
     process::{Command, Stdio},
     str::FromStr,
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex as StdMutex, RwLock as StdRwLock,
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -22,28 +24,49 @@ use std::os::unix::{
     fs::{DirBuilderExt as _, FileTypeExt as _, MetadataExt as _, PermissionsExt as _},
 };
 
-use aster_iroh::{CarrierError, Endpoint, EndpointConfig, EndpointId, ExpectedPeer};
+use aster_iroh::{
+    CarrierError, Endpoint, EndpointConfig, EndpointId, ExpectedPeer, PeerRoute, PinnedRelay,
+    SelectedPath,
+};
 use aster_mesh::{
-    EventContentVerification, NodeId, Priority, ProvisioningAccess, RecordContentVerification,
+    BlobContentVerification, BlobError, BlobId, BlobPhysicalLineage, ContentVerifiedBlobEnvelope,
+    ContentVerifiedEventEnvelope, CustodyClaims, CustodyError, CustodyExpectation, CustodyHop,
+    CustodySample, CustodyTransferClaims, CustodyTransferId, EventContentVerification,
+    EventRouteLineage, MAX_CUSTODY_WRAPPER_BYTES, MIN_CUSTODY_SEMANTIC_VERSION, NodeId, Priority,
+    ProvisioningAccess, ProvisioningLoadId, ProvisioningProtectionError, ProvisioningSecretLoader,
+    ProvisioningSecretRef, ProvisioningUnprotector, RecordContentVerification,
     ReferenceEnvelopeSealer, ReferenceProvisioner, RouteVerifiedEventEnvelope,
     RouteVerifiedRecordEnvelope, RouteVerifiedStateEnvelope, Scope, ScopeRekeyRecipient,
-    StateContentVerification, Topic, VerifiedControlEnvelope, VerifiedControlKind,
-    engine::EnvelopeError,
+    SourceRouteLineage, StateContentVerification, Topic, VerifiedBlobTransferPlan,
+    VerifiedControlEnvelope, VerifiedControlKind, engine::EnvelopeError,
 };
 use aster_negentropy::{
-    Difference, Initiator, InitiatorStep, ReconciliationError, ReconciliationLimits, Responder,
+    DEFAULT_FRAME_SIZE_LIMIT, Difference, Initiator, InitiatorStep, MAX_CARDINALITY_LIMIT,
+    MAX_ROUND_LIMIT, ReconciliationError, ReconciliationLimits, Responder,
 };
 use aster_profile::{InventorySnapshot, ItemId};
 use aster_redb_store::{
-    ControlOutcome, ControlPolicySnapshot, ControlRejectionReason, ControlTransferId,
-    EventOnceOutcome, EventOperationKey, EventReplicationPolicySnapshot, EventSemanticId,
-    EventSubscriptionKey, EventSubscriptionMode, EventSubscriptionSpec, EventTransferId,
-    MAX_EVENT_PAGE, RecordTransferId, RejectedControl, RouteCacheOutcome,
-    ScopeRekeyPublicationIntent, StateTransferId, Store, StoreBackingIdentity, StoreError,
-    StoreInspection, StoreZeroizationState, StoredControl, StoredControlEffect, StoredEvent,
-    StoredEventTransfer, StoredRecord, StoredState, ZeroizationArtifact, ZeroizationIntent,
-    ZeroizationStore,
+    ApplyOutcome, BlobCarrierAppendOutcome, BlobCarrierCommitOutcome, BlobCarrierFetchCursor,
+    BlobCarrierObjectId, BlobSourceProjection, BlobSourceRetention, BlobSourceStageOutcome,
+    BlobStoreError, BlobTransferId, ControlOutcome, ControlPolicySnapshot, ControlRejectionReason,
+    ControlTransferId, CustodyObjectKey, CustodyPeerApplyDisposition, CustodyPeerApplyEvidence,
+    CustodyPeerSelectorRevision, CustodyPolicyRevision, CustodyPressureDemand, CustodyQuota,
+    CustodyReconciliationEvidence, CustodyReconciliationSelection, CustodySendAuthorization,
+    CustodySenderProjection, CustodyStoreError, CustodyUsage, EventOnceOutcome, EventOperationKey,
+    EventOperationRequest, EventOperationResolution, EventPublicationIntent, EventPublicationSpec,
+    EventReplicationPolicySnapshot, EventSemanticId, EventSubscriptionKey, EventSubscriptionMode,
+    EventSubscriptionSpec, EventTransferId, LocalCustodyCheckpoint, MAX_BLOB_NETWORK_RANGE_BYTES,
+    MAX_BLOB_NETWORK_SOURCE_BYTES, MAX_BLOB_NETWORK_STAGING_ROWS, MAX_CUSTODY_PAGE,
+    MAX_CUSTODY_RETIREMENTS, MAX_EVENT_PAGE, MAX_MUTABLE_TRANSFER_CURSOR_PEERS,
+    MAX_NETWORK_BLOB_BYTES, MAX_NETWORK_BLOB_CHUNKS, MAX_ROUTE_CACHE_ITEMS,
+    MutableTransferCursorClass, MutableTransferCursorMode, RecordSenderProjection,
+    RecordTransferId, RejectedControl, RouteCacheOutcome, ScopeRekeyPublicationIntent,
+    StateSenderProjection, StateTransferId, Store, StoreBackingIdentity, StoreError,
+    StoreInspection, StoreLimits, StoreZeroizationState, StoredControl, StoredControlEffect,
+    StoredEvent, StoredEventTransfer, StoredRecord, StoredState, TransferLease,
+    ZeroizationArtifact, ZeroizationIntent, ZeroizationStore,
 };
+use sha2::{Digest as _, Sha256};
 #[cfg(unix)]
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
@@ -63,31 +86,130 @@ use crate::{
         SelectedEventCommand, SelectedEventHandle, SelectedEventNode, SelectedEventStatus,
         runtime_application_error,
     },
+    control_admin::{SelectedControlCommand, SelectedControlHandle, admin_error},
     format_node_id, format_path_field, format_receipt_field,
     frame::{
-        EventDirection, EventInterest, EventInterestSelector, Frame, MAX_OBJECT_BYTES,
-        MutableClass, MutableTransferId,
+        BlobInterest, BlobInterestSelector, BlobObjectId, BlobRangeApplyDisposition,
+        BlobRangeDisposition, EventApplyDisposition, EventDirection, EventInterest,
+        EventInterestSelector, Frame, FrameEmissionPolicy, MAX_EVENT_INTEREST_BYTES,
+        MAX_OBJECT_BYTES, MutableApplyDisposition, MutableClass, MutableTransferId,
     },
     mission::{
-        MissionHandshakeReceipt, MissionPeerBinding, MissionProvisioningError, MissionSession,
-        MissionSessionError, PreparedIdentityErasure, PreparedMissionErasure,
-        ResumedSoftwareErasure, SoftwareErasureError, SoftwareErasureTarget,
-        SoftwareSecretArtifact, UnprotectedReferenceMission, initiate_over_iroh_metered,
-        respond_over_iroh_metered,
+        MissionHandshakeReceipt, MissionPeerBinding, MissionProvisioningError,
+        MissionProvisioningOrigin, MissionSession, MissionSessionError, PreparedIdentityErasure,
+        PreparedMissionErasure, ResumedSoftwareErasure, SoftwareErasureError,
+        SoftwareErasureTarget, SoftwareSecretArtifact, UnprotectedReferenceMission,
+        initiate_over_iroh_metered, respond_over_iroh_metered,
     },
     parse_node_id,
 };
+#[cfg(test)]
+use aster_mesh::{ReferenceSessionInitiator, ReferenceSessionResponder, UnprotectedProvisioning};
+#[cfg(test)]
+use aster_redb_store::{
+    CUSTODY_EMERGENCY_BYTE_RESERVE, CUSTODY_EMERGENCY_ITEM_RESERVE,
+    DEFAULT_MAX_TOTAL_PAYLOAD_BYTES, MAX_CONTROL_BYTES, MAX_CONTROL_ITEMS,
+};
 
 pub(crate) const STORE_FILE: &str = "mesh.redb";
-const MAX_CONFIGURED_PEERS: usize = 256;
+const MAX_CONFIGURED_PEERS: usize = MAX_MUTABLE_TRANSFER_CURSOR_PEERS;
 const MAX_INBOUND_CONTACTS: usize = 16;
 const MAX_OUTBOUND_CONTACTS: usize = 16;
 const APPLICATION_COMMAND_CAPACITY: usize = 32;
+const CONTROL_COMMAND_CAPACITY: usize = 1;
+const CONTROL_COMMAND_BUDGET: usize = 4;
 const APPLICATION_COMMAND_BUDGET: usize = 8;
 const NETWORK_EVENT_BUDGET: usize = 8;
 const MAX_CONTACT_ITEMS: usize = 3_500;
 const MAX_CONTACT_FRAMES: usize = 8_192;
 const MAX_CONTACT_BYTES: usize = 64 * 1024 * 1024;
+// Exact selected codecs: Frame magic/tag/direction/id/exchange/two lengths plus
+// the maximum bounded custody wrapper. Source Event bytes are charged separately.
+const OFFER_V3_PLAINTEXT_OVERHEAD_BYTES: usize =
+    4 + 1 + 1 + 32 + 8 + 4 + MAX_CUSTODY_WRAPPER_BYTES + 4;
+// Reference session record: magic/version/suite/sequence/nonce/length/GCM tag.
+const APPLICATION_PROTECTION_OVERHEAD_BYTES: usize = 8 + 2 + 2 + 8 + 12 + 4 + 16;
+const APPLY_RESULT_V3_PLAINTEXT_BYTES: usize = 4 + 1 + 1 + 32 + 8 + 1 + 1;
+const DIRECTION_ONLY_PLAINTEXT_BYTES: usize = 4 + 1 + 1;
+const FINISH_V3_PLAINTEXT_BYTES: usize = DIRECTION_ONLY_PLAINTEXT_BYTES + 8;
+const RECONCILIATION_FRAME_OVERHEAD_BYTES: usize = 4 + 1 + 1 + 4;
+const OFFER_V3_EXCHANGE_OVERHEAD_BYTES: usize = OFFER_V3_PLAINTEXT_OVERHEAD_BYTES
+    + APPLICATION_PROTECTION_OVERHEAD_BYTES
+    + APPLY_RESULT_V3_PLAINTEXT_BYTES
+    + APPLICATION_PROTECTION_OVERHEAD_BYTES;
+const FINISH_EXCHANGE_BYTES: usize =
+    2 * (FINISH_V3_PLAINTEXT_BYTES + APPLICATION_PROTECTION_OVERHEAD_BYTES);
+const EVENT_LANE_DEFER_EXCHANGE_BYTES: usize =
+    2 * (DIRECTION_ONLY_PLAINTEXT_BYTES + APPLICATION_PROTECTION_OVERHEAD_BYTES);
+const EXCHANGE_FRAMES: usize = 2;
+const MIN_MUTABLE_SEMANTIC_VERSION: u16 = 4;
+const MIN_BLOB_NETWORK_SEMANTIC_VERSION: u16 = 5;
+const MUTABLE_RECONCILIATION_FRAME_BYTES: usize = 16 * 1024;
+const MUTABLE_RECONCILIATION_ROUNDS: u32 = 64;
+const MUTABLE_LANE_PLAINTEXT_BYTES: usize = 4 + 1 + 1 + 1;
+const MUTABLE_FINISH_PLAINTEXT_BYTES: usize = MUTABLE_LANE_PLAINTEXT_BYTES + 8;
+const MUTABLE_INTEREST_PLAINTEXT_MAX_BYTES: usize = 4 + 1 + 1 + MAX_EVENT_INTEREST_BYTES;
+const MUTABLE_RECONCILIATION_FRAME_OVERHEAD_BYTES: usize = 4 + 1 + 1 + 1 + 4;
+const MUTABLE_RECONCILIATION_EXCHANGE_MAX_BYTES: usize = 2
+    * (MUTABLE_RECONCILIATION_FRAME_OVERHEAD_BYTES
+        + MUTABLE_RECONCILIATION_FRAME_BYTES
+        + APPLICATION_PROTECTION_OVERHEAD_BYTES);
+const MUTABLE_INTEREST_EXCHANGE_MAX_BYTES: usize =
+    2 * (MUTABLE_INTEREST_PLAINTEXT_MAX_BYTES + APPLICATION_PROTECTION_OVERHEAD_BYTES);
+const BLOB_INTEREST_PLAINTEXT_MAX_BYTES: usize = 4 + 1 + crate::frame::MAX_BLOB_INTEREST_BYTES;
+const BLOB_INTEREST_EXCHANGE_MAX_BYTES: usize =
+    2 * (BLOB_INTEREST_PLAINTEXT_MAX_BYTES + APPLICATION_PROTECTION_OVERHEAD_BYTES);
+const MUTABLE_FINISH_EXCHANGE_BYTES: usize =
+    2 * (MUTABLE_FINISH_PLAINTEXT_BYTES + APPLICATION_PROTECTION_OVERHEAD_BYTES);
+const MUTABLE_LANE_DEFER_EXCHANGE_BYTES: usize =
+    2 * (MUTABLE_LANE_PLAINTEXT_BYTES + APPLICATION_PROTECTION_OVERHEAD_BYTES);
+const MUTABLE_ID_PLAINTEXT_BYTES: usize = MUTABLE_LANE_PLAINTEXT_BYTES + 32;
+const MUTABLE_OBJECT_PLAINTEXT_MAX_BYTES: usize = MUTABLE_ID_PLAINTEXT_BYTES + 4 + MAX_OBJECT_BYTES;
+const MUTABLE_APPLY_DISPOSITION_BYTES: usize = 1;
+const MUTABLE_APPLY_PLAINTEXT_BYTES: usize =
+    MUTABLE_ID_PLAINTEXT_BYTES + MUTABLE_APPLY_DISPOSITION_BYTES;
+const MUTABLE_FETCH_RESULT_EXCHANGE_BYTES: usize =
+    2 * (MUTABLE_APPLY_PLAINTEXT_BYTES + APPLICATION_PROTECTION_OVERHEAD_BYTES);
+const MUTABLE_TRANSFER_EXCHANGE_MAX_BYTES: usize = MUTABLE_OBJECT_PLAINTEXT_MAX_BYTES
+    + MUTABLE_APPLY_PLAINTEXT_BYTES
+    + 2 * APPLICATION_PROTECTION_OVERHEAD_BYTES;
+const MUTABLE_LANE_GUARANTEED_ITEMS: usize = 1;
+const MUTABLE_LANE_RECONCILIATION_EXCHANGES: usize = 2 * MUTABLE_RECONCILIATION_ROUNDS as usize + 2;
+const MUTABLE_LANE_FULL_GUARANTEE_BYTES: usize = MUTABLE_LANE_RECONCILIATION_EXCHANGES
+    * MUTABLE_RECONCILIATION_EXCHANGE_MAX_BYTES
+    + MUTABLE_TRANSFER_EXCHANGE_MAX_BYTES
+    + MUTABLE_FINISH_EXCHANGE_BYTES;
+const MUTABLE_LANE_FULL_GUARANTEE_EXCHANGES: usize = MUTABLE_LANE_RECONCILIATION_EXCHANGES + 2;
+const MUTABLE_FETCH_LANES_PER_CONTACT: usize = 2;
+const MUTABLE_CONTACT_RESERVE_BYTES: usize = 2 * MUTABLE_INTEREST_EXCHANGE_MAX_BYTES
+    + 4 * MUTABLE_LANE_FULL_GUARANTEE_BYTES
+    + MUTABLE_FETCH_LANES_PER_CONTACT * MUTABLE_FETCH_RESULT_EXCHANGE_BYTES;
+const MUTABLE_CONTACT_RESERVE_EXCHANGES: usize =
+    2 + 4 * MUTABLE_LANE_FULL_GUARANTEE_EXCHANGES + MUTABLE_FETCH_LANES_PER_CONTACT;
+const BLOB_RANGE_FETCH_PLAINTEXT_BYTES: usize =
+    4 + 1 + 1 + 32 + 33 + 8 + 8 + 4 + crate::frame::BLOB_CONTENT_PROOF_BYTES;
+const BLOB_RANGE_PLAINTEXT_MAX_BYTES: usize =
+    4 + 1 + 1 + 32 + 33 + 8 + 8 + 4 + 1 + 4 + crate::frame::MAX_BLOB_RANGE_BYTES;
+const BLOB_RANGE_RESULT_PLAINTEXT_BYTES: usize = 4 + 1 + 1 + 32 + 33 + 8 + 8 + 4 + 1;
+const BLOB_CARRIER_FINISH_PLAINTEXT_BYTES: usize = 4 + 1 + 1 + 8;
+const BLOB_RANGE_FETCH_EXCHANGE_MAX_BYTES: usize = BLOB_RANGE_FETCH_PLAINTEXT_BYTES
+    + BLOB_RANGE_PLAINTEXT_MAX_BYTES
+    + 2 * APPLICATION_PROTECTION_OVERHEAD_BYTES;
+const BLOB_RANGE_RESULT_EXCHANGE_BYTES: usize =
+    2 * (BLOB_RANGE_RESULT_PLAINTEXT_BYTES + APPLICATION_PROTECTION_OVERHEAD_BYTES);
+const BLOB_CARRIER_FINISH_EXCHANGE_BYTES: usize =
+    2 * (BLOB_CARRIER_FINISH_PLAINTEXT_BYTES + APPLICATION_PROTECTION_OVERHEAD_BYTES);
+const BLOB_CARRIER_CONTACT_RESERVE_EXCHANGES: usize = 3;
+const BLOB_CARRIER_CONTACT_RESERVE_BYTES: usize = BLOB_RANGE_FETCH_EXCHANGE_MAX_BYTES
+    + BLOB_RANGE_RESULT_EXCHANGE_BYTES
+    + BLOB_CARRIER_FINISH_EXCHANGE_BYTES;
+const MUTABLE_V5_CONTACT_RESERVE_BYTES: usize = 2 * MUTABLE_INTEREST_EXCHANGE_MAX_BYTES
+    + BLOB_INTEREST_EXCHANGE_MAX_BYTES
+    + 6 * MUTABLE_LANE_FULL_GUARANTEE_BYTES
+    + 3 * MUTABLE_FETCH_RESULT_EXCHANGE_BYTES
+    + BLOB_CARRIER_CONTACT_RESERVE_BYTES;
+const MUTABLE_V5_CONTACT_RESERVE_EXCHANGES: usize =
+    3 + 6 * MUTABLE_LANE_FULL_GUARANTEE_EXCHANGES + 3 + BLOB_CARRIER_CONTACT_RESERVE_EXCHANGES;
 const CONTACT_DEADLINE: Duration = Duration::from_secs(30);
 const DEMO_MISSION_BUNDLE_FILE: &str = "mission.unprotected-reference.bundle";
 const DEMO_SIGNED_REGISTRY_FILE: &str = "signed-public-rekey-registry.bin";
@@ -100,8 +222,64 @@ const DEMO_PING_OPERATION: &[u8] = b"aster.sample.ping-pong.v1/ping";
 const DEMO_PONG_OPERATION_PREFIX: &[u8] = b"aster.sample.ping-pong.v1/pong/";
 const DEMO_EVENT_SUBSCRIPTION_KEY: &[u8] = b"aster.sample.ping-pong.v1/receive";
 const MAX_EVENT_PUBLISH_RETRIES: usize = 4;
+const MAX_CUSTODY_MAINTENANCE_RETRIES: usize = 4;
+const CUSTODY_FINALIZATION_FIXED_MS: u64 = 32;
+const CUSTODY_FINALIZATION_BYTES_PER_MS: u64 = 1_024;
+/// Conservative authenticated age charged for the synchronous v3 send-finalization path.
+///
+/// The bound budgets one millisecond per KiB of the maximum selected Event
+/// object plus 32 milliseconds for frame construction, both AEAD records,
+/// and the final durable lease/policy check. If real finalization exceeds this
+/// public charge, the sealed frame is abandoned before carrier I/O.
+pub const MAX_CUSTODY_FINALIZATION_CHARGE_MS: u64 = (MAX_OBJECT_BYTES as u64)
+    .div_ceil(CUSTODY_FINALIZATION_BYTES_PER_MS)
+    + CUSTODY_FINALIZATION_FIXED_MS;
+
+fn custody_finalization_charge_ms(exact_len: u64) -> Result<u64, NodeError> {
+    let byte_charge = exact_len.div_ceil(CUSTODY_FINALIZATION_BYTES_PER_MS);
+    let charge = CUSTODY_FINALIZATION_FIXED_MS
+        .checked_add(byte_charge)
+        .ok_or_else(|| NodeError::Protocol("custody finalization charge overflows".into()))?;
+    if charge > MAX_CUSTODY_FINALIZATION_CHARGE_MS {
+        return Err(NodeError::Protocol(
+            "custody transfer length exceeds the selected finalization bound".into(),
+        ));
+    }
+    Ok(charge)
+}
+
+fn charged_custody_finalization_age(
+    observed_age_ms: u64,
+    exact_len: u64,
+    ttl_ms: Option<u64>,
+) -> Result<u64, NodeError> {
+    let charged = observed_age_ms
+        .checked_add(custody_finalization_charge_ms(exact_len)?)
+        .ok_or_else(|| {
+            NodeError::Protocol("custody finalization charge overflows cumulative age".into())
+        })?;
+    if ttl_ms.is_some_and(|ttl_ms| charged >= ttl_ms) {
+        return Err(NodeError::CustodySendSkipped);
+    }
+    Ok(charged)
+}
+
+fn require_finalization_within_charge(
+    observed_age_ms: u64,
+    authenticated_age_ms: u64,
+) -> Result<(), NodeError> {
+    if observed_age_ms > authenticated_age_ms {
+        return Err(NodeError::Protocol(
+            "custody send finalization exceeded its authenticated age charge; sealed frame was abandoned"
+                .into(),
+        ));
+    }
+    Ok(())
+}
 pub(crate) const EVENT_OPERATION_CONFLICT: &str =
     "durable Event operation differs from the requested application Event";
+pub(crate) const EVENT_OPERATION_RETIRED: &str =
+    "durable Event operation is permanently bound to retired custody";
 const MAX_CONTROL_PUBLISH_RETRIES: usize = 4;
 #[cfg(unix)]
 const LOCAL_ZEROIZATION_REQUEST_MAGIC: &[u8] = b"ASTER-ZEROIZE-LOCAL-V1\0";
@@ -109,6 +287,95 @@ const LOCAL_ZEROIZATION_REQUEST_MAGIC: &[u8] = b"ASTER-ZEROIZE-LOCAL-V1\0";
 const MAX_LOCAL_ZEROIZATION_PATH_BYTES: usize = 8 * 1024;
 #[cfg(unix)]
 const MAX_LOCAL_ZEROIZATION_RESPONSE_BYTES: usize = 8 * 1024;
+
+fn selected_reconciliation_limits() -> Result<ReconciliationLimits, NodeError> {
+    Ok(ReconciliationLimits::new(
+        DEFAULT_FRAME_SIZE_LIMIT,
+        MAX_ROUND_LIMIT,
+        MAX_CARDINALITY_LIMIT,
+    )?)
+}
+
+const fn supports_mutable_semantic(semantic_version: u16) -> bool {
+    semantic_version >= MIN_MUTABLE_SEMANTIC_VERSION
+}
+
+const MUTABLE_V4_CLASSES: [MutableClass; 2] = [MutableClass::State, MutableClass::Record];
+const MUTABLE_V5_CLASSES: [MutableClass; 3] = [
+    MutableClass::State,
+    MutableClass::Record,
+    MutableClass::Blob,
+];
+
+fn mutable_classes_for_semantic(semantic_version: u16) -> &'static [MutableClass] {
+    match semantic_version {
+        MIN_BLOB_NETWORK_SEMANTIC_VERSION.. => &MUTABLE_V5_CLASSES,
+        MIN_MUTABLE_SEMANTIC_VERSION.. => &MUTABLE_V4_CLASSES,
+        _ => &[],
+    }
+}
+
+const READY_RECONCILIATION_CLASSES: &str = "event,state,record,blob-v5-opt-in";
+
+const fn contact_reconciliation_classes(semantic_version: u16) -> &'static str {
+    if semantic_version >= MIN_BLOB_NETWORK_SEMANTIC_VERSION {
+        "event,state,record,blob"
+    } else {
+        "event,state,record"
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PostEventReserve {
+    exchanges: usize,
+    bytes: usize,
+    items: usize,
+}
+
+fn post_event_reserve(semantic_version: u16) -> Option<PostEventReserve> {
+    match semantic_version {
+        MIN_BLOB_NETWORK_SEMANTIC_VERSION.. => Some(PostEventReserve {
+            exchanges: MUTABLE_V5_CONTACT_RESERVE_EXCHANGES,
+            bytes: MUTABLE_V5_CONTACT_RESERVE_BYTES,
+            items: 6 * MUTABLE_LANE_GUARANTEED_ITEMS + 1,
+        }),
+        MIN_MUTABLE_SEMANTIC_VERSION.. => Some(PostEventReserve {
+            exchanges: MUTABLE_CONTACT_RESERVE_EXCHANGES,
+            bytes: MUTABLE_CONTACT_RESERVE_BYTES,
+            items: 4 * MUTABLE_LANE_GUARANTEED_ITEMS,
+        }),
+        _ => None,
+    }
+}
+
+fn selected_mutable_reconciliation_limits() -> Result<ReconciliationLimits, NodeError> {
+    Ok(ReconciliationLimits::new(
+        MUTABLE_RECONCILIATION_FRAME_BYTES,
+        MUTABLE_RECONCILIATION_ROUNDS,
+        MAX_CARDINALITY_LIMIT,
+    )?)
+}
+
+fn validate_forwarding_config(forwarding: &SelectedForwardingConfig) -> Result<(), NodeError> {
+    let required = forwarding
+        .store_limits()
+        .max_items()
+        .checked_add(MAX_ROUTE_CACHE_ITEMS)
+        .and_then(|items| items.checked_add(MAX_CUSTODY_RETIREMENTS))
+        .ok_or_else(|| {
+            NodeError::Configuration(
+                "configured Event inventory capacity overflows its bounded cardinality".into(),
+            )
+        })?;
+    let selected_cardinality =
+        u64::try_from(MAX_CARDINALITY_LIMIT).expect("selected reconciliation cardinality fits u64");
+    if required > selected_cardinality {
+        return Err(NodeError::Configuration(format!(
+            "configured live Events, route cache, and permanent custody retirements require cardinality {required}, exceeding selected reconciliation bound {selected_cardinality}"
+        )));
+    }
+    Ok(())
+}
 #[cfg(unix)]
 const LOCAL_ZEROIZATION_IO_DEADLINE: Duration = Duration::from_secs(10);
 #[cfg(unix)]
@@ -228,7 +495,11 @@ pub struct SourceInterestSelector {
 }
 
 impl SourceInterestSelector {
-    /// Creates one exact topic/scope selector for State or Record replication.
+    /// Creates one topic/scope selector for mutable replication.
+    ///
+    /// State and Record may include descendant scopes. The selected semantic-v5
+    /// Blob profile requires an exact scope so its protected content-key proof
+    /// can bind one unambiguous current epoch.
     pub const fn new(topic: Topic, scope: Scope, include_descendant_scopes: bool) -> Self {
         Self {
             topic,
@@ -258,18 +529,38 @@ impl SourceInterestSelector {
 pub struct MutableSourceInterests {
     state: Vec<SourceInterestSelector>,
     record: Vec<SourceInterestSelector>,
+    blob: Vec<SourceInterestSelector>,
 }
 
 impl MutableSourceInterests {
-    /// Creates explicit State and Record selector sets. Empty means receive none.
+    /// Creates explicit State and Record selector sets; Blob remains opt-in via
+    /// [`Self::with_blob`]. Empty means receive none.
     pub fn new(state: Vec<SourceInterestSelector>, record: Vec<SourceInterestSelector>) -> Self {
-        Self { state, record }
+        Self {
+            state,
+            record,
+            blob: Vec::new(),
+        }
+    }
+
+    /// Adds the explicit semantic-v5 Blob source/content selector set.
+    ///
+    /// Keeping this additive preserves the semantic-v4 constructor contract:
+    /// callers which do not opt in disclose and receive no Blob identifiers.
+    pub fn with_blob(mut self, blob: Vec<SourceInterestSelector>) -> Self {
+        self.blob = blob;
+        self
+    }
+
+    fn blob_selectors(&self) -> &[SourceInterestSelector] {
+        &self.blob
     }
 
     fn for_class(&self, class: MutableClass) -> Result<EventInterest, NodeError> {
         let selectors = match class {
             MutableClass::State => &self.state,
             MutableClass::Record => &self.record,
+            MutableClass::Blob => &self.blob,
         };
         EventInterest::new(
             selectors
@@ -286,6 +577,47 @@ impl MutableSourceInterests {
     }
 }
 
+fn protected_blob_interest(
+    store: &Store,
+    verifier: &ReferenceEnvelopeSealer,
+    interests: &MutableSourceInterests,
+    enabled: bool,
+) -> Result<BlobInterest, NodeError> {
+    if !enabled {
+        return Ok(BlobInterest::empty());
+    }
+    let mut selectors = Vec::new();
+    for configured in interests.blob_selectors() {
+        if configured.include_descendant_scopes() {
+            return Err(NodeError::Configuration(
+                "Blob interests must use exact scopes".into(),
+            ));
+        }
+        // Static initial provisioning is epoch one even before a durable rekey
+        // establishes an explicit scope high-water.
+        let epoch = store
+            .active_scope_epoch(configured.scope())?
+            .map_or(1, |(epoch, _)| epoch);
+        if !verifier.can_open_blob_content(configured.scope(), configured.topic(), epoch) {
+            continue;
+        }
+        let proof =
+            verifier.mint_blob_peer_content_proof(configured.scope(), configured.topic(), epoch)?;
+        selectors.push(BlobInterestSelector::new(
+            configured.topic().clone(),
+            configured.scope().clone(),
+            epoch,
+            proof.wire_bytes(),
+        ));
+    }
+    let interest = BlobInterest::new(selectors)?;
+    if interest.is_empty() {
+        Ok(BlobInterest::empty())
+    } else {
+        Ok(interest)
+    }
+}
+
 /// One selected-stack node process configuration.
 #[derive(Clone, Debug)]
 pub struct NodeConfig {
@@ -297,7 +629,7 @@ pub struct NodeConfig {
     pub mission: UnprotectedReferenceMission,
     /// Exact manually admitted carrier-to-mission peer bindings.
     pub peers: Vec<MissionExpectedPeer>,
-    /// Explicit class-separated State and Record receive interests.
+    /// Explicit class-separated State, Record, and opt-in semantic-v5 Blob interests.
     pub mutable_interests: MutableSourceInterests,
     /// Delay between bounded contacts.
     pub sync_interval: Duration,
@@ -307,13 +639,935 @@ pub struct NodeConfig {
     pub application: NodeApplication,
 }
 
+/// Mission-independent options for protected selected-node startup.
+///
+/// Keeping these fields private makes provider callbacks run only after the
+/// complete bounded option set and terminal state have been checked. Existing
+/// callers may continue to construct [`NodeConfig`] directly.
+#[derive(Clone, Debug)]
+pub struct NodeConfigOptions {
+    bind: SocketAddr,
+    peers: Vec<MissionExpectedPeer>,
+    mutable_interests: MutableSourceInterests,
+    sync_interval: Duration,
+    run_for: Option<Duration>,
+    application: NodeApplication,
+}
+
+impl NodeConfigOptions {
+    /// Creates protected-startup options with no peers or mutable interests.
+    pub fn new(bind: SocketAddr, sync_interval: Duration) -> Self {
+        Self {
+            bind,
+            peers: Vec::new(),
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval,
+            run_for: None,
+            application: NodeApplication::Relay,
+        }
+    }
+
+    /// Replaces the exact admitted carrier-to-mission peer bindings.
+    pub fn with_peers(mut self, peers: Vec<MissionExpectedPeer>) -> Self {
+        self.peers = peers;
+        self
+    }
+
+    /// Replaces the explicit State, Record, and Blob receive interests.
+    pub fn with_mutable_interests(mut self, interests: MutableSourceInterests) -> Self {
+        self.mutable_interests = interests;
+        self
+    }
+
+    /// Selects an optional bounded actor lifetime.
+    pub const fn with_run_for(mut self, run_for: Option<Duration>) -> Self {
+        self.run_for = run_for;
+        self
+    }
+
+    /// Selects the sample application role hosted by the actor.
+    pub const fn with_application(mut self, application: NodeApplication) -> Self {
+        self.application = application;
+        self
+    }
+
+    fn into_config(self, state: PathBuf, mission: UnprotectedReferenceMission) -> NodeConfig {
+        NodeConfig {
+            state,
+            bind: self.bind,
+            mission,
+            peers: self.peers,
+            mutable_interests: self.mutable_interests,
+            sync_interval: self.sync_interval,
+            run_for: self.run_for,
+            application: self.application,
+        }
+    }
+}
+
+/// Stable, source-free protected-bootstrap failure categories.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum NodeBootstrapErrorKind {
+    /// Mission-independent runtime options were invalid.
+    InvalidConfiguration,
+    /// The selected durable state could not safely start.
+    StateUnavailable,
+    /// The protected artifact could not be opened or safely inspected.
+    ArtifactUnavailable,
+    /// The configured protection provider or secret store was unavailable.
+    ProtectionUnavailable,
+    /// The provider rejected or could not authenticate the request.
+    Rejected,
+    /// A protected artifact or recovered secret exceeded its public bound.
+    TooLarge,
+    /// Recovered plaintext was not one canonical mission bundle.
+    InvalidBundle,
+}
+
+/// Sanitized protected selected-node bootstrap failure.
+///
+/// This value deliberately carries no path, provider text, operation identity,
+/// opaque secret reference, principal, or internal error source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NodeBootstrapError {
+    operation: &'static str,
+    kind: NodeBootstrapErrorKind,
+}
+
+impl NodeBootstrapError {
+    const fn new(operation: &'static str, kind: NodeBootstrapErrorKind) -> Self {
+        Self { operation, kind }
+    }
+
+    /// Stable operation associated with the failure.
+    pub const fn operation(self) -> &'static str {
+        self.operation
+    }
+
+    /// Stable public failure category.
+    pub const fn kind(self) -> NodeBootstrapErrorKind {
+        self.kind
+    }
+}
+
+impl fmt::Display for NodeBootstrapError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let category = match self.kind {
+            NodeBootstrapErrorKind::InvalidConfiguration => "invalid configuration",
+            NodeBootstrapErrorKind::StateUnavailable => "selected state unavailable",
+            NodeBootstrapErrorKind::ArtifactUnavailable => "protected artifact unavailable",
+            NodeBootstrapErrorKind::ProtectionUnavailable => "protection provider unavailable",
+            NodeBootstrapErrorKind::Rejected => "protected provisioning rejected",
+            NodeBootstrapErrorKind::TooLarge => "protected provisioning exceeds its bound",
+            NodeBootstrapErrorKind::InvalidBundle => "provisioning bundle is invalid",
+        };
+        write!(formatter, "node bootstrap {}: {category}", self.operation)
+    }
+}
+
+impl Error for NodeBootstrapError {}
+
+impl NodeConfig {
+    /// Creates an ordinary in-memory configuration with conservative defaults.
+    pub fn new(
+        state: impl Into<PathBuf>,
+        bind: SocketAddr,
+        mission: UnprotectedReferenceMission,
+    ) -> Self {
+        NodeConfigOptions::new(bind, Duration::from_millis(500)).into_config(state.into(), mission)
+    }
+
+    /// Opens one provider-protected mission artifact without creating state.
+    pub fn open_protected<P>(
+        state: impl AsRef<Path>,
+        protected_mission: impl AsRef<Path>,
+        options: NodeConfigOptions,
+        unprotector: &mut P,
+    ) -> Result<Self, NodeBootstrapError>
+    where
+        P: ProvisioningUnprotector + ?Sized,
+    {
+        let operation = "open protected mission";
+        let path_base = std::env::current_dir().map_err(|_| {
+            NodeBootstrapError::new(operation, NodeBootstrapErrorKind::StateUnavailable)
+        })?;
+        let state = absolute_path_from(&path_base, state.as_ref()).map_err(|_| {
+            NodeBootstrapError::new(operation, NodeBootstrapErrorKind::StateUnavailable)
+        })?;
+        let protected_mission = absolute_path_from(&path_base, protected_mission.as_ref())
+            .map_err(|_| {
+                NodeBootstrapError::new(operation, NodeBootstrapErrorKind::ArtifactUnavailable)
+            })?;
+        Self::open_with_protected_mission(state, options, operation, || {
+            UnprotectedReferenceMission::load_protected(protected_mission, unprotector)
+        })
+    }
+
+    /// Opens provider-protected mission bytes supplied by an embedding caller.
+    pub fn from_protected_bytes<P>(
+        state: impl AsRef<Path>,
+        protected_mission: &[u8],
+        options: NodeConfigOptions,
+        unprotector: &mut P,
+    ) -> Result<Self, NodeBootstrapError>
+    where
+        P: ProvisioningUnprotector + ?Sized,
+    {
+        let operation = "open protected mission bytes";
+        let path_base = std::env::current_dir().map_err(|_| {
+            NodeBootstrapError::new(operation, NodeBootstrapErrorKind::StateUnavailable)
+        })?;
+        let state = absolute_path_from(&path_base, state.as_ref()).map_err(|_| {
+            NodeBootstrapError::new(operation, NodeBootstrapErrorKind::StateUnavailable)
+        })?;
+        Self::open_with_protected_mission(state, options, operation, || {
+            UnprotectedReferenceMission::from_protected_bytes(protected_mission, unprotector)
+        })
+    }
+
+    /// Loads one authenticated provider-persisted opaque mission reference.
+    pub fn open_secret_ref<L>(
+        state: impl AsRef<Path>,
+        secret_ref: &ProvisioningSecretRef,
+        load: ProvisioningLoadId,
+        options: NodeConfigOptions,
+        loader: &mut L,
+    ) -> Result<Self, NodeBootstrapError>
+    where
+        L: ProvisioningSecretLoader + ?Sized,
+    {
+        let operation = "open provisioning secret reference";
+        let path_base = std::env::current_dir().map_err(|_| {
+            NodeBootstrapError::new(operation, NodeBootstrapErrorKind::StateUnavailable)
+        })?;
+        let state = absolute_path_from(&path_base, state.as_ref()).map_err(|_| {
+            NodeBootstrapError::new(operation, NodeBootstrapErrorKind::StateUnavailable)
+        })?;
+        Self::open_with_protected_mission(state, options, operation, || {
+            UnprotectedReferenceMission::load_from_secret_store(secret_ref, load, loader)
+        })
+    }
+
+    fn open_with_protected_mission<F>(
+        state: PathBuf,
+        options: NodeConfigOptions,
+        operation: &'static str,
+        load_mission: F,
+    ) -> Result<Self, NodeBootstrapError>
+    where
+        F: FnOnce() -> Result<UnprotectedReferenceMission, MissionProvisioningError>,
+    {
+        validate_node_config_fields(
+            options.sync_interval,
+            options.run_for,
+            &options.peers,
+            &options.mutable_interests,
+        )
+        .map_err(|_| {
+            NodeBootstrapError::new(operation, NodeBootstrapErrorKind::InvalidConfiguration)
+        })?;
+        ensure_state_accepts_normal_operation(&state).map_err(|_| {
+            NodeBootstrapError::new(operation, NodeBootstrapErrorKind::StateUnavailable)
+        })?;
+        let mission = load_mission()
+            .map_err(|error| node_bootstrap_mission_error(operation, error))?
+            .with_protected_state_witness(state.clone());
+        let config = options.into_config(state, mission);
+        validate_node_config(&config).map_err(|_| {
+            NodeBootstrapError::new(operation, NodeBootstrapErrorKind::InvalidConfiguration)
+        })?;
+        Ok(config)
+    }
+
+    /// Returns the coarse, non-identifying source used to provision this node.
+    pub const fn provisioning_origin(&self) -> MissionProvisioningOrigin {
+        self.mission.provisioning_origin()
+    }
+}
+
+fn node_bootstrap_mission_error(
+    operation: &'static str,
+    error: MissionProvisioningError,
+) -> NodeBootstrapError {
+    let kind = match error {
+        MissionProvisioningError::Io(_)
+        | MissionProvisioningError::NotRegular(_)
+        | MissionProvisioningError::Changed(_)
+        | MissionProvisioningError::UnsafePermissions(_)
+        | MissionProvisioningError::OwnerOnlyPermissionsUnavailable(_)
+        | MissionProvisioningError::Artifact(_) => NodeBootstrapErrorKind::ArtifactUnavailable,
+        MissionProvisioningError::TooLarge { .. }
+        | MissionProvisioningError::Protection(ProvisioningProtectionError::TooLarge) => {
+            NodeBootstrapErrorKind::TooLarge
+        }
+        MissionProvisioningError::Protection(ProvisioningProtectionError::Unavailable) => {
+            NodeBootstrapErrorKind::ProtectionUnavailable
+        }
+        MissionProvisioningError::Protection(ProvisioningProtectionError::Rejected) => {
+            NodeBootstrapErrorKind::Rejected
+        }
+        MissionProvisioningError::Protection(_) => NodeBootstrapErrorKind::Rejected,
+        MissionProvisioningError::Invalid(_) => NodeBootstrapErrorKind::InvalidBundle,
+    };
+    NodeBootstrapError::new(operation, kind)
+}
+
+/// Operator-selected Event emission behavior for the selected runtime.
+///
+/// This policy affects network initiation and source-authenticated Event or
+/// supporting-control transmission. It does not rewrite authenticated priority
+/// or TTL metadata, and receive-only mode continues to admit authenticated
+/// inbound work within the configured durable limits.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum EventEmissionPolicy {
+    /// Initiate configured contacts and transmit every eligible priority.
+    #[default]
+    Normal,
+    /// Initiate contacts but transmit only Events at or above `minimum`.
+    AtLeast(
+        /// Lowest source-authenticated priority eligible for transmission.
+        Priority,
+    ),
+    /// Never initiate a contact or send unsolicited application/control work.
+    ReceiveOnly,
+}
+
+impl EventEmissionPolicy {
+    /// Constructs the bounded threshold form.
+    pub const fn at_least(minimum: Priority) -> Self {
+        Self::AtLeast(minimum)
+    }
+
+    /// Returns whether this node may initiate a carrier contact.
+    pub const fn permits_contact_initiation(self) -> bool {
+        !matches!(self, Self::ReceiveOnly)
+    }
+
+    /// Returns whether an Event with `priority` may be transmitted.
+    pub const fn permits_event(self, priority: Priority) -> bool {
+        match self {
+            Self::Normal => true,
+            Self::AtLeast(minimum) => priority as u8 >= minimum as u8,
+            Self::ReceiveOnly => false,
+        }
+    }
+
+    const fn encode(self) -> u8 {
+        match self {
+            Self::Normal => 0,
+            Self::AtLeast(Priority::Routine) => 1,
+            Self::AtLeast(Priority::Priority) => 2,
+            Self::AtLeast(Priority::Immediate) => 3,
+            Self::AtLeast(Priority::Flash) => 4,
+            Self::ReceiveOnly => 5,
+        }
+    }
+
+    fn decode(value: u8) -> Result<Self, NodeError> {
+        match value {
+            0 => Ok(Self::Normal),
+            1 => Ok(Self::at_least(Priority::Routine)),
+            2 => Ok(Self::at_least(Priority::Priority)),
+            3 => Ok(Self::at_least(Priority::Immediate)),
+            4 => Ok(Self::at_least(Priority::Flash)),
+            5 => Ok(Self::ReceiveOnly),
+            _ => Err(NodeError::Protocol(
+                "in-memory Event emission policy is invalid".into(),
+            )),
+        }
+    }
+}
+
+/// Additive selected-runtime routing, forwarding, and durable-admission configuration.
+///
+/// Keeping this separate from [`NodeConfig`] preserves source compatibility for
+/// existing callers. Use [`start_node_with_forwarding`] or
+/// [`run_node_with_forwarding`] to select non-default behavior.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SelectedForwardingConfig {
+    emission_policy: EventEmissionPolicy,
+    store_limits: StoreLimits,
+    scope_quotas: Vec<CustodyQuota>,
+    controlled_relay: Option<ControlledRelayRouting>,
+}
+
+/// One explicitly selected, operator-controlled relay route.
+///
+/// The relay is a carrier locator only. Exact carrier identity and the
+/// independent mission handshake remain mandatory for every contact.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ControlledRelayRouting {
+    relay: PinnedRelay,
+    relay_only: bool,
+}
+
+impl SelectedForwardingConfig {
+    /// Creates a forwarding configuration with explicit aggregate store limits.
+    pub const fn new(emission_policy: EventEmissionPolicy, store_limits: StoreLimits) -> Self {
+        Self {
+            emission_policy,
+            store_limits,
+            scope_quotas: Vec::new(),
+            controlled_relay: None,
+        }
+    }
+
+    /// Returns the initial Event emission policy.
+    pub const fn emission_policy(&self) -> EventEmissionPolicy {
+        self.emission_policy
+    }
+
+    /// Returns the aggregate durable-admission limits.
+    pub const fn store_limits(&self) -> StoreLimits {
+        self.store_limits
+    }
+
+    /// Replaces the initial emission policy.
+    pub const fn with_emission_policy(mut self, policy: EventEmissionPolicy) -> Self {
+        self.emission_policy = policy;
+        self
+    }
+
+    /// Replaces the aggregate durable-admission limits.
+    pub const fn with_store_limits(mut self, limits: StoreLimits) -> Self {
+        self.store_limits = limits;
+        self
+    }
+
+    /// Adds or replaces one exact-scope custody quota.
+    pub fn with_scope_quota(mut self, quota: CustodyQuota) -> Result<Self, NodeError> {
+        let Some(scope) = quota.scope() else {
+            return Err(NodeError::Configuration(
+                "SelectedForwardingConfig scope quota must name an exact scope".into(),
+            ));
+        };
+        if let Some(existing) = self
+            .scope_quotas
+            .iter_mut()
+            .find(|existing| existing.scope() == Some(scope))
+        {
+            *existing = quota;
+        } else {
+            self.scope_quotas.push(quota);
+            self.scope_quotas
+                .sort_by(|left, right| left.scope().cmp(&right.scope()));
+        }
+        Ok(self)
+    }
+
+    /// Exact-scope quotas installed before readiness and network creation.
+    pub fn scope_quotas(&self) -> &[CustodyQuota] {
+        &self.scope_quotas
+    }
+
+    /// Enables one exact initial direct locator alongside one pinned relay.
+    ///
+    /// The legacy exact peer socket is the sole operator-supplied initial
+    /// direct candidate. The carrier may derive authenticated direct paths
+    /// after connection; its public relay set, hosted discovery, and external
+    /// address lookup stay disabled.
+    pub fn with_controlled_relay(mut self, relay: PinnedRelay) -> Self {
+        self.controlled_relay = Some(ControlledRelayRouting {
+            relay,
+            relay_only: false,
+        });
+        self
+    }
+
+    /// Enables a relay-only route through one explicitly pinned relay.
+    ///
+    /// This is an operator-visible routing constraint, not authorization.
+    /// Exact carrier and mission identities are still checked before inventory.
+    pub fn with_controlled_relay_only(mut self, relay: PinnedRelay) -> Self {
+        self.controlled_relay = Some(ControlledRelayRouting {
+            relay,
+            relay_only: true,
+        });
+        self
+    }
+
+    /// Returns the explicitly configured relay, if any.
+    pub fn controlled_relay(&self) -> Option<&PinnedRelay> {
+        self.controlled_relay.as_ref().map(|routing| &routing.relay)
+    }
+
+    /// Returns whether configured contacts deliberately omit direct candidates.
+    pub fn controlled_relay_only(&self) -> bool {
+        self.controlled_relay
+            .as_ref()
+            .is_some_and(|routing| routing.relay_only)
+    }
+}
+
+impl Default for SelectedForwardingConfig {
+    fn default() -> Self {
+        Self {
+            emission_policy: EventEmissionPolicy::Normal,
+            store_limits: StoreLimits::default(),
+            scope_quotas: Vec::new(),
+            controlled_relay: None,
+        }
+    }
+}
+
+/// Process-local reader for one OS monotonic-clock continuity domain.
+///
+/// Linux and macOS derive the domain from the current boot plus mission
+/// identity, so a stopped handle and a later runtime in the same boot share a
+/// checkpoint domain. Linux uses the suspend-inclusive boot clock. This crate
+/// cannot safely call macOS `mach_continuous_time` under its no-unsafe policy,
+/// so finite custody is explicitly disabled there; `CLOCK_MONOTONIC` remains
+/// usable only for durable v3 scheduling. Other Unix monotonic sources and the
+/// process-local non-Unix fallback likewise have no proven suspend-inclusive
+/// contract, so finite custody is Linux-only until such a source is integrated;
+/// durable v3 scheduling remains portable.
+#[derive(Clone, Debug)]
+pub(crate) struct NodeCustodyClock {
+    clock_id: [u8; 16],
+    #[cfg(not(unix))]
+    origin: Arc<Instant>,
+    #[cfg(test)]
+    injected: Option<Arc<InjectedCustodyClock>>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct InjectedCustodyClock {
+    next_tick_ms: AtomicU64,
+    step_ms: u64,
+}
+
+impl NodeCustodyClock {
+    /// Whether this target supplies a suspend-inclusive custody clock.
+    pub(crate) const fn platform_supports_finite_ttl() -> bool {
+        cfg!(target_os = "linux")
+    }
+
+    /// Whether this reader may exercise finite custody semantics.
+    ///
+    /// Deterministic injected readers are test-only continuity authorities;
+    /// production readers remain limited to the proven Linux clock source.
+    pub(crate) fn supports_finite_ttl(&self) -> bool {
+        Self::platform_supports_finite_ttl()
+            || cfg!(test) && {
+                #[cfg(test)]
+                {
+                    self.injected.is_some()
+                }
+                #[cfg(not(test))]
+                {
+                    false
+                }
+            }
+    }
+
+    pub(crate) fn open(identity: NodeId) -> Result<Self, NodeError> {
+        let mut domain = Vec::new();
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(boot_id) = fs::read("/proc/sys/kernel/random/boot_id") {
+                domain.extend_from_slice(b"linux-boot-id\0");
+                domain.extend_from_slice(&boot_id);
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if let Ok(output) = Command::new("/usr/sbin/sysctl")
+                .args(["-n", "kern.boottime"])
+                .output()
+                && output.status.success()
+                && !output.stdout.is_empty()
+            {
+                domain.extend_from_slice(b"macos-kern-boottime\0");
+                domain.extend_from_slice(&output.stdout);
+            }
+        }
+        if domain.is_empty() {
+            domain.extend_from_slice(b"process-fallback\0");
+            let mut nonce = [0u8; 32];
+            getrandom::fill(&mut nonce).map_err(|_| {
+                NodeError::Configuration(
+                    "operating-system entropy is unavailable for custody clock continuity".into(),
+                )
+            })?;
+            domain.extend_from_slice(&nonce);
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(b"ASTER-SELECTED-CUSTODY-CLOCK-V1\0");
+        hasher.update(identity);
+        hasher.update(&domain);
+        let digest = hasher.finalize();
+        let mut clock_id = [0u8; 16];
+        clock_id.copy_from_slice(&digest[..16]);
+        Ok(Self {
+            clock_id,
+            #[cfg(not(unix))]
+            origin: Arc::new(Instant::now()),
+            #[cfg(test)]
+            injected: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn injected(clock_id: [u8; 16], first_tick_ms: u64, step_ms: u64) -> Self {
+        Self {
+            clock_id,
+            #[cfg(not(unix))]
+            origin: Arc::new(Instant::now()),
+            injected: Some(Arc::new(InjectedCustodyClock {
+                next_tick_ms: AtomicU64::new(first_tick_ms),
+                step_ms,
+            })),
+        }
+    }
+
+    #[cfg(test)]
+    fn set_injected_tick(&self, tick_ms: u64) -> Result<(), NodeError> {
+        let injected = self.injected.as_ref().ok_or_else(|| {
+            NodeError::Protocol("custody test hook requires an injected clock".into())
+        })?;
+        injected.next_tick_ms.store(tick_ms, Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub(crate) fn sample(&self) -> Result<CustodySample, NodeError> {
+        #[cfg(test)]
+        if let Some(injected) = &self.injected {
+            let tick_ms = injected
+                .next_tick_ms
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |tick| {
+                    tick.checked_add(injected.step_ms)
+                })
+                .map_err(|_| NodeError::Protocol("injected custody clock overflowed".into()))?;
+            return Ok(CustodySample {
+                clock_id: self.clock_id,
+                tick_ms,
+            });
+        }
+        #[cfg(target_os = "linux")]
+        let tick_ms = {
+            let time = rustix::time::clock_gettime(rustix::time::ClockId::Boottime);
+            checked_custody_tick_ms(time.tv_sec, time.tv_nsec)?
+        };
+        #[cfg(all(unix, not(target_os = "linux")))]
+        let tick_ms = {
+            let time = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+            checked_custody_tick_ms(time.tv_sec, time.tv_nsec)?
+        };
+        #[cfg(not(unix))]
+        let tick_ms = u64::try_from(self.origin.elapsed().as_millis()).map_err(|_| {
+            NodeError::Protocol("process custody clock overflowed milliseconds".into())
+        })?;
+        Ok(CustodySample {
+            clock_id: self.clock_id,
+            tick_ms,
+        })
+    }
+}
+
+/// Runs one bounded expiry and quota-pressure maintenance pass.
+///
+/// A continuity observation may itself revise durable custody policy. The
+/// whole pass therefore retries from a fresh revision instead of mixing
+/// plans from two continuity/config generations.
+pub(crate) fn drive_custody_maintenance(
+    store: &Store,
+    clock: &NodeCustodyClock,
+    scope_quotas: &[CustodyQuota],
+) -> Result<(), NodeError> {
+    for _ in 0..MAX_CUSTODY_MAINTENANCE_RETRIES {
+        let policy_revision = store.custody_policy_revision()?;
+        let sample = clock.sample()?;
+        let pass = (|| -> Result<(), StoreError> {
+            store.collect_custody_garbage(Some(sample), policy_revision, MAX_CUSTODY_PAGE)?;
+            store.collect_custody_pressure(
+                None,
+                CustodyPressureDemand {
+                    usage: CustodyUsage { items: 0, bytes: 0 },
+                    priority: Priority::Flash,
+                },
+                Some(sample),
+                policy_revision,
+                MAX_CUSTODY_PAGE,
+            )?;
+            for quota in scope_quotas {
+                store.collect_custody_pressure(
+                    quota.scope(),
+                    CustodyPressureDemand {
+                        usage: CustodyUsage { items: 0, bytes: 0 },
+                        priority: Priority::Flash,
+                    },
+                    Some(sample),
+                    policy_revision,
+                    MAX_CUSTODY_PAGE,
+                )?;
+            }
+            Ok(())
+        })();
+        match pass {
+            Ok(()) => return Ok(()),
+            Err(StoreError::Custody(CustodyStoreError::PolicyChanged)) => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(NodeError::Protocol(format!(
+        "custody maintenance policy changed {MAX_CUSTODY_MAINTENANCE_RETRIES} times"
+    )))
+}
+
+#[cfg(unix)]
+fn checked_custody_tick_ms(seconds: i64, nanoseconds: i64) -> Result<u64, NodeError> {
+    let seconds = u64::try_from(seconds)
+        .map_err(|_| NodeError::Protocol("monotonic custody clock is negative".into()))?;
+    let nanoseconds = u64::try_from(nanoseconds).map_err(|_| {
+        NodeError::Protocol("monotonic custody clock nanoseconds are negative".into())
+    })?;
+    seconds
+        .checked_mul(1_000)
+        .and_then(|millis| millis.checked_add(nanoseconds / 1_000_000))
+        .ok_or_else(|| NodeError::Protocol("monotonic custody clock overflowed".into()))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EmissionPolicySnapshot {
+    policy: EventEmissionPolicy,
+    revision: u64,
+}
+
+/// Lock-free, revisioned live emission policy shared by the actor and contacts.
+///
+/// The raw revision is a seqlock: odd values denote an update in progress and
+/// even values denote a stable snapshot. Public revisions divide that value by
+/// two so callers observe a dense monotonic sequence.
+struct LiveEmissionPolicy {
+    encoded: AtomicU8,
+    revision: AtomicU64,
+}
+
+#[derive(Clone)]
+struct ContactEmissionGuard {
+    live: Arc<LiveEmissionPolicy>,
+    captured: EmissionPolicySnapshot,
+    custody_clock: NodeCustodyClock,
+}
+
+impl ContactEmissionGuard {
+    fn require_current(&self) -> Result<EmissionPolicySnapshot, NodeError> {
+        self.live.require(self.captured)?;
+        Ok(self.captured)
+    }
+
+    fn require_initiation(&self) -> Result<EmissionPolicySnapshot, NodeError> {
+        let snapshot = self.require_current()?;
+        if snapshot.policy.permits_contact_initiation() {
+            Ok(snapshot)
+        } else {
+            Err(NodeError::Protocol(
+                "receive-only policy forbids initiated mission frames".into(),
+            ))
+        }
+    }
+
+    fn require_response(&self, response: &Frame) -> Result<EmissionPolicySnapshot, NodeError> {
+        let snapshot = self.require_current()?;
+        if matches!(snapshot.policy, EventEmissionPolicy::ReceiveOnly)
+            && response.serves_application_or_control_object()
+        {
+            return Err(NodeError::Protocol(
+                "receive-only policy forbids serving application or control objects".into(),
+            ));
+        }
+        Ok(snapshot)
+    }
+}
+
+tokio::task_local! {
+    static CONTACT_EMISSION_GUARD: ContactEmissionGuard;
+    static CONTACT_EVENT_ROUTE_CACHE: Arc<AuthenticatedEventRouteCache>;
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_RECONCILIATION_EXCHANGES_BEFORE_DEFER: std::cell::Cell<Option<usize>>;
+    static TEST_CUSTODY_PREOPEN_RACES: std::cell::RefCell<Vec<TestCustodyPreopenRace>>;
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TestCustodyPreopenRace {
+    Expire {
+        transfer_id: EventTransferId,
+        tick_ms: u64,
+    },
+    ItemChanged(EventTransferId),
+    LeaseLimitExceeded(EventTransferId),
+    RetryLimitExceeded(EventTransferId),
+    RetryNotDue(EventTransferId),
+    ForceRouteOnly(EventTransferId),
+    FinalPolicyChange,
+}
+
+fn require_contact_policy_current() -> Result<Option<EmissionPolicySnapshot>, NodeError> {
+    CONTACT_EMISSION_GUARD
+        .try_with(ContactEmissionGuard::require_current)
+        .map_or(Ok(None), |snapshot| snapshot.map(Some))
+}
+
+fn contact_custody_sample() -> Result<Option<CustodySample>, NodeError> {
+    CONTACT_EMISSION_GUARD
+        .try_with(|guard| guard.custody_clock.sample())
+        .map_or(Ok(None), |sample| sample.map(Some))
+}
+
+fn contact_supports_finite_ttl() -> bool {
+    CONTACT_EMISSION_GUARD
+        .try_with(|guard| guard.custody_clock.supports_finite_ttl())
+        .unwrap_or_else(|_| NodeCustodyClock::platform_supports_finite_ttl())
+}
+
+fn contact_policy_or_normal() -> Result<EmissionPolicySnapshot, NodeError> {
+    Ok(
+        require_contact_policy_current()?.unwrap_or(EmissionPolicySnapshot {
+            policy: EventEmissionPolicy::Normal,
+            revision: 0,
+        }),
+    )
+}
+
+const fn frame_emission_policy(policy: EventEmissionPolicy) -> FrameEmissionPolicy {
+    match policy {
+        EventEmissionPolicy::Normal => FrameEmissionPolicy::Normal,
+        EventEmissionPolicy::AtLeast(minimum) => FrameEmissionPolicy::AtLeast(minimum),
+        EventEmissionPolicy::ReceiveOnly => FrameEmissionPolicy::ReceiveOnly,
+    }
+}
+
+const fn event_emission_policy(policy: FrameEmissionPolicy) -> EventEmissionPolicy {
+    match policy {
+        FrameEmissionPolicy::Normal => EventEmissionPolicy::Normal,
+        FrameEmissionPolicy::AtLeast(minimum) => EventEmissionPolicy::AtLeast(minimum),
+        FrameEmissionPolicy::ReceiveOnly => EventEmissionPolicy::ReceiveOnly,
+    }
+}
+
+fn observe_remote_emission_policy(
+    observed: &mut Option<EmissionPolicySnapshot>,
+    policy: FrameEmissionPolicy,
+    revision: u64,
+) -> Result<EmissionPolicySnapshot, NodeError> {
+    if revision == 0 {
+        return Err(NodeError::Protocol(
+            "peer emission policy revision zero is reserved".into(),
+        ));
+    }
+    let snapshot = EmissionPolicySnapshot {
+        policy: event_emission_policy(policy),
+        revision,
+    };
+    if observed.is_some_and(|previous| previous != snapshot) {
+        return Err(NodeError::Protocol(
+            "peer emission policy changed within one authenticated contact".into(),
+        ));
+    }
+    *observed = Some(snapshot);
+    Ok(snapshot)
+}
+
+fn require_contact_frame_initiation() -> Result<Option<EmissionPolicySnapshot>, NodeError> {
+    CONTACT_EMISSION_GUARD
+        .try_with(ContactEmissionGuard::require_initiation)
+        .map_or(Ok(None), |snapshot| snapshot.map(Some))
+}
+
+fn require_contact_frame_response(
+    response: &Frame,
+) -> Result<Option<EmissionPolicySnapshot>, NodeError> {
+    CONTACT_EMISSION_GUARD
+        .try_with(|guard| guard.require_response(response))
+        .map_or(Ok(None), |snapshot| snapshot.map(Some))
+}
+
+impl LiveEmissionPolicy {
+    fn new(policy: EventEmissionPolicy) -> Self {
+        Self {
+            encoded: AtomicU8::new(policy.encode()),
+            // Public revision zero is reserved by the custody-claim codec.
+            revision: AtomicU64::new(2),
+        }
+    }
+
+    fn snapshot(&self) -> Result<EmissionPolicySnapshot, NodeError> {
+        loop {
+            let before = self.revision.load(Ordering::Acquire);
+            if before & 1 == 1 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let encoded = self.encoded.load(Ordering::Acquire);
+            let after = self.revision.load(Ordering::Acquire);
+            if before == after {
+                return Ok(EmissionPolicySnapshot {
+                    policy: EventEmissionPolicy::decode(encoded)?,
+                    revision: after / 2,
+                });
+            }
+        }
+    }
+
+    fn update(&self, policy: EventEmissionPolicy) -> Result<u64, NodeError> {
+        loop {
+            let current = self.revision.load(Ordering::Acquire);
+            if current & 1 == 1 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let current_policy = EventEmissionPolicy::decode(self.encoded.load(Ordering::Acquire))?;
+            if current_policy == policy {
+                return Ok(current / 2);
+            }
+            let stable = current.checked_add(2).ok_or_else(|| {
+                NodeError::Protocol("Event emission policy revision is exhausted".into())
+            })?;
+            if self
+                .revision
+                .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                continue;
+            }
+            self.encoded.store(policy.encode(), Ordering::Release);
+            self.revision.store(stable, Ordering::Release);
+            return Ok(stable / 2);
+        }
+    }
+
+    fn require(&self, expected: EmissionPolicySnapshot) -> Result<(), NodeError> {
+        if self.snapshot()? == expected {
+            Ok(())
+        } else {
+            Err(NodeError::EmissionPolicyChanged)
+        }
+    }
+}
+
 /// Metrics for one completed contact from this local node's point of view.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PeerReceipt {
+    /// Authenticated negotiated semantic protocol version.
+    pub semantic_version: u16,
     /// Authenticated remote endpoint.
     pub peer: Option<EndpointId>,
     /// Independently hybrid-authenticated Aster identity.
     pub mission_peer: Option<NodeId>,
+    /// Carrier-selected path observed after mission authentication.
+    ///
+    /// This is operational evidence only and is never authorization input.
+    pub carrier_path: Option<SelectedPath>,
+    /// Carrier path transitions observed during this connection.
+    pub carrier_path_transitions: u16,
+    /// Whether transition observation reached its fixed carrier bound or lost continuity.
+    pub carrier_path_transitions_saturated: bool,
     /// Negentropy response rounds.
     pub rounds: u32,
     /// Items offered from local to remote.
@@ -324,8 +1578,27 @@ pub struct PeerReceipt {
     pub inserted: usize,
     /// Harmless duplicate transfers observed.
     pub duplicates: usize,
-    /// Negotiated item identifiers deferred to a later bounded contact.
+    /// Lane-local work deferred to a later bounded contact.
+    ///
+    /// Normal lanes count identifiers independently derived from the
+    /// authenticated difference. A no-disclosure ReceiveOnly lane instead
+    /// records the bounded, authenticated peer-reported count echoed by the
+    /// v3 finish exchange; that responder cannot enumerate the skipped IDs.
     pub remaining: usize,
+    /// Event reconciliation lanes cleanly deferred by the authenticated v3 budget boundary.
+    pub deferred_event_lanes: usize,
+    /// State/Record objects deterministically deferred to a later semantic-v4 contact.
+    pub mutable_remaining: usize,
+    /// State/Record reconciliation lanes cleanly deferred at an authenticated v4 boundary.
+    pub deferred_mutable_lanes: usize,
+    /// Exact Blob carrier ranges durably settled during this contact.
+    pub blob_ranges_fetched: usize,
+    /// Exact Blob carrier payload bytes durably accepted during this contact.
+    pub blob_bytes_fetched: usize,
+    /// Blob carrier objects still outstanding after the authenticated finish.
+    pub blob_remaining: usize,
+    /// Blob range attempts deferred by a typed durable capacity boundary.
+    pub blob_deferred: usize,
     /// Mission-control transfers offered from local durable state.
     pub controls_offered: usize,
     /// Mission-control transfers fetched from the remote durable state.
@@ -384,6 +1657,16 @@ pub struct NodeReceipt {
     pub contacts: usize,
     /// Number of contact attempts that failed visibly and were retried later.
     pub contact_errors: usize,
+    /// Successful contacts whose final bounded carrier observation was direct.
+    pub direct_contacts: usize,
+    /// Successful contacts whose final bounded carrier observation was relayed.
+    pub relay_contacts: usize,
+    /// Successful contacts whose carrier path could not be observed reliably.
+    pub unknown_path_contacts: usize,
+    /// Bounded carrier path transitions observed across successful contacts.
+    pub carrier_path_transitions: u64,
+    /// Contacts whose transition observation saturated or lost fidelity.
+    pub carrier_path_transition_saturations: usize,
     /// Final durable item count.
     pub items: u64,
     /// Final durable acceptance marker count.
@@ -402,12 +1685,82 @@ pub struct NodeReceipt {
     pub pending_controls: u64,
     /// Durable mission-control chain highwater.
     pub control_highwater: u64,
+    /// Blob carrier ranges settled across successful contacts.
+    pub blob_ranges_fetched: u64,
+    /// Blob carrier payload bytes accepted across successful contacts.
+    pub blob_bytes_fetched: u64,
+    /// Blob carrier/source work reported outstanding across contacts.
+    pub blob_remaining: u64,
+    /// Blob range attempts deferred by durable capacity.
+    pub blob_deferred: u64,
+    /// Final application-visible Blob publication count.
+    pub blobs: u64,
+    /// Final staged, non-visible Blob source count.
+    pub pending_blobs: u64,
+}
+
+fn account_path_receipt(total: &mut NodeReceipt, contact: &PeerReceipt) -> Result<(), NodeError> {
+    let counter = match contact.carrier_path.unwrap_or(SelectedPath::Unknown) {
+        SelectedPath::Direct => &mut total.direct_contacts,
+        SelectedPath::Relay => &mut total.relay_contacts,
+        SelectedPath::Unknown => &mut total.unknown_path_contacts,
+    };
+    *counter = counter
+        .checked_add(1)
+        .ok_or_else(|| NodeError::Protocol("aggregate carrier path count overflow".into()))?;
+    total.carrier_path_transitions = total
+        .carrier_path_transitions
+        .checked_add(u64::from(contact.carrier_path_transitions))
+        .ok_or_else(|| NodeError::Protocol("aggregate carrier path transition overflow".into()))?;
+    if contact.carrier_path_transitions_saturated {
+        total.carrier_path_transition_saturations = total
+            .carrier_path_transition_saturations
+            .checked_add(1)
+            .ok_or_else(|| {
+                NodeError::Protocol("aggregate carrier path saturation count overflow".into())
+            })?;
+    }
+    Ok(())
+}
+
+fn account_blob_receipt(total: &mut NodeReceipt, contact: &PeerReceipt) -> Result<(), NodeError> {
+    total.blob_ranges_fetched = total
+        .blob_ranges_fetched
+        .checked_add(
+            u64::try_from(contact.blob_ranges_fetched)
+                .map_err(|_| NodeError::Protocol("contact Blob range count exceeds u64".into()))?,
+        )
+        .ok_or_else(|| NodeError::Protocol("aggregate Blob range count overflow".into()))?;
+    total.blob_bytes_fetched = total
+        .blob_bytes_fetched
+        .checked_add(
+            u64::try_from(contact.blob_bytes_fetched)
+                .map_err(|_| NodeError::Protocol("contact Blob byte count exceeds u64".into()))?,
+        )
+        .ok_or_else(|| NodeError::Protocol("aggregate Blob byte count overflow".into()))?;
+    total.blob_remaining =
+        total
+            .blob_remaining
+            .checked_add(u64::try_from(contact.blob_remaining).map_err(|_| {
+                NodeError::Protocol("contact Blob remaining count exceeds u64".into())
+            })?)
+            .ok_or_else(|| NodeError::Protocol("aggregate Blob remaining count overflow".into()))?;
+    total.blob_deferred =
+        total
+            .blob_deferred
+            .checked_add(u64::try_from(contact.blob_deferred).map_err(|_| {
+                NodeError::Protocol("contact Blob deferral count exceeds u64".into())
+            })?)
+            .ok_or_else(|| NodeError::Protocol("aggregate Blob deferral count overflow".into()))?;
+    Ok(())
 }
 
 /// Owned lifecycle for one running selected-stack node actor.
 pub struct RunningNode {
     selected_events: SelectedEventHandle,
+    selected_controls: SelectedControlHandle,
     application_admission: Arc<AtomicBool>,
+    emission_policy: Arc<LiveEmissionPolicy>,
     shutdown: Option<mpsc::Sender<()>>,
     task: Option<JoinHandle<Result<NodeReceipt, NodeError>>>,
 }
@@ -416,6 +1769,26 @@ impl RunningNode {
     /// Returns a cloneable, bounded live selected-Event application handle.
     pub fn selected_events(&self) -> SelectedEventHandle {
         self.selected_events.clone()
+    }
+
+    /// Returns the cloneable, one-command live authority-control handle.
+    pub fn selected_controls(&self) -> SelectedControlHandle {
+        self.selected_controls.clone()
+    }
+
+    /// Returns the stable current emission policy and its monotonic revision.
+    pub fn event_emission_policy(&self) -> Result<(EventEmissionPolicy, u64), NodeError> {
+        let snapshot = self.emission_policy.snapshot()?;
+        Ok((snapshot.policy, snapshot.revision))
+    }
+
+    /// Atomically replaces the live emission policy.
+    ///
+    /// In-flight contacts recheck this revision immediately before every
+    /// application/control frame send and durable receive commit. A changed
+    /// revision closes that contact so later work starts from a fresh policy.
+    pub fn set_event_emission_policy(&self, policy: EventEmissionPolicy) -> Result<u64, NodeError> {
+        self.emission_policy.update(policy)
     }
 
     /// Requests graceful shutdown, closes command admission, and waits for cleanup.
@@ -472,6 +1845,18 @@ enum ApplicationPolicyLease {
     Write { _guard: OwnedRwLockWriteGuard<()> },
 }
 
+type ControlPolicyLeaseFuture =
+    Pin<Box<dyn Future<Output = OwnedRwLockWriteGuard<()>> + Send + 'static>>;
+
+async fn await_control_policy_lease(
+    pending: &mut Option<ControlPolicyLeaseFuture>,
+) -> OwnedRwLockWriteGuard<()> {
+    pending
+        .as_mut()
+        .expect("pending live control command requires one policy-write future")
+        .await
+}
+
 async fn acquire_application_policy_lease(
     policy_lock: Arc<RwLock<()>>,
     write: bool,
@@ -520,7 +1905,7 @@ impl SelectedEventStatusTracker {
             peer,
             AuthenticatedContactObservation {
                 contacts: next_contacts,
-                complete: receipt.remaining == 0 && receipt.controls_remaining == 0,
+                complete: selected_event_contact_complete(receipt),
                 policy: contact.event_policy,
             },
         );
@@ -602,6 +1987,10 @@ impl SelectedEventStatusTracker {
             peers,
         })
     }
+}
+
+const fn selected_event_contact_complete(receipt: &PeerReceipt) -> bool {
+    receipt.remaining == 0 && receipt.controls_remaining == 0 && receipt.deferred_event_lanes == 0
 }
 
 /// Read-only logical store receipt.
@@ -734,11 +2123,19 @@ pub struct ControlPublicationReceipt {
     pub transfer_id: ControlTransferId,
     /// Nonzero stable-authority chain position.
     pub sequence: u64,
-    /// True only when this process committed the exact control row.
+    /// True only when this call committed the exact control row. False means
+    /// an applied row was recovered through an exact durable reservation bound
+    /// to the same provider-authenticated authority and delegated signer.
     pub emitted: bool,
     /// Ordered controls activated after this durable transaction.
     pub activated: usize,
 }
+
+pub(crate) const CONTROL_AUTHORITY_REQUIRED: &str = "mission control authority is required";
+pub(crate) const CONTROL_PUBLICATION_CONFLICT: &str =
+    "local control conflicts with durable authenticated history";
+pub(crate) const CONTROL_POLICY_UNSETTLED: &str =
+    "local control policy is unsettled; retry required";
 
 /// Selected-stack composition failure.
 #[derive(Debug)]
@@ -763,6 +2160,10 @@ pub enum NodeError {
     Reconciliation(ReconciliationError),
     /// Authenticated carrier failure.
     Carrier(CarrierError),
+    /// Live Event emission policy changed after a contact captured its revision.
+    EmissionPolicyChanged,
+    /// A custody item became routinely unsendable before carrier acquisition.
+    CustodySendSkipped,
     /// Strict mechanics-frame failure.
     Protocol(String),
     /// Filesystem or child-process I/O failure.
@@ -788,6 +2189,12 @@ impl fmt::Display for NodeError {
             Self::Store(error) => write!(formatter, "{error}"),
             Self::Reconciliation(error) => write!(formatter, "{error}"),
             Self::Carrier(error) => write!(formatter, "{error}"),
+            Self::EmissionPolicyChanged => {
+                formatter.write_str("live Event emission policy changed; reconnect required")
+            }
+            Self::CustodySendSkipped => {
+                formatter.write_str("custody Event became unsendable before carrier acquisition")
+            }
             Self::Protocol(message) => write!(formatter, "mechanics protocol: {message}"),
             Self::Io(error) => write!(formatter, "node I/O: {error}"),
             Self::Demo(message) => write!(formatter, "virtual mesh demo: {message}"),
@@ -807,7 +2214,12 @@ impl Error for NodeError {
             Self::Reconciliation(error) => Some(error),
             Self::Carrier(error) => Some(error),
             Self::Io(error) => Some(error),
-            Self::Configuration(_) | Self::Revoked(_) | Self::Protocol(_) | Self::Demo(_) => None,
+            Self::Configuration(_)
+            | Self::Revoked(_)
+            | Self::EmissionPolicyChanged
+            | Self::CustodySendSkipped
+            | Self::Protocol(_)
+            | Self::Demo(_) => None,
         }
     }
 }
@@ -916,7 +2328,7 @@ fn store_receipt_from_inspection(inspection: StoreInspection) -> StoreReceipt {
 /// carrier identity, or binds sockets.
 pub fn ensure_state_accepts_normal_operation(state: &Path) -> Result<(), NodeError> {
     let store_path = state.join(STORE_FILE);
-    if !store_path.exists() {
+    if !store_path.try_exists()? {
         return Ok(());
     }
     let status = match Store::inspect_zeroization_state(&store_path) {
@@ -930,6 +2342,35 @@ pub fn ensure_state_accepts_normal_operation(state: &Path) -> Result<(), NodeErr
         return Err(StoreError::StoreZeroized(status.state()).into());
     }
     Ok(())
+}
+
+/// Resolves a caller path against one previously captured absolute cwd without
+/// following filesystem links.
+pub(crate) fn absolute_path_from(base: &Path, path: &Path) -> Result<PathBuf, NodeError> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    };
+    if !path.is_absolute() {
+        return Err(NodeError::Configuration(
+            "relative path could not be resolved against the current directory".into(),
+        ));
+    }
+    Ok(path)
+}
+
+/// Freezes one caller-selected state root without following filesystem links.
+///
+/// Provider and secret-loader callbacks are caller code and can change the
+/// process current directory. Resolving a relative state root exactly once,
+/// before such a callback, keeps the terminal precheck and every later store
+/// operation bound to the same lexical pathname.
+pub(crate) fn absolute_state_path(state: &Path) -> Result<PathBuf, NodeError> {
+    if state.is_absolute() {
+        return Ok(state.to_path_buf());
+    }
+    absolute_path_from(&std::env::current_dir()?, state)
 }
 
 #[cfg(unix)]
@@ -1542,9 +2983,176 @@ pub(crate) struct SelectedEventPublish<'a> {
     pub topic: &'a Topic,
     pub scope: &'a Scope,
     pub priority: Priority,
+    pub ttl_ms: Option<u64>,
+    pub custody_sample: Option<CustodySample>,
     pub logical_key: &'a [u8],
     pub payload: &'a [u8],
     pub tombstone: bool,
+}
+
+/// Proactively binds every retained pre-intent Event operation to a freshly
+/// verified plaintext witness before custody maintenance can collect bytes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct LegacyEventWitnessMigration {
+    pub operation_rows_scanned: usize,
+    pub transfers_verified: usize,
+}
+
+fn try_open_legacy_event_witness(
+    sealer: &mut ReferenceEnvelopeSealer,
+    stored: &StoredEvent,
+) -> Result<Option<(ContentVerifiedEventEnvelope, Vec<u8>)>, NodeError> {
+    let Ok(route) = sealer.verify_event(&stored.sealed) else {
+        return Ok(None);
+    };
+    verify_stored_claim(
+        &route,
+        stored.transfer_id,
+        stored.semantic_id,
+        &stored.header,
+    )?;
+    let verification = match sealer.verify_event_content(route, &stored.sealed) {
+        Ok(verification) => verification,
+        Err(_) => return Ok(None),
+    };
+    let EventContentVerification::ContentVerified { event, payload } = verification else {
+        return Ok(None);
+    };
+    verify_content_stored_claim(&event, stored)?;
+    Ok(Some((event, payload)))
+}
+
+pub(crate) fn migrate_legacy_event_operation_witnesses(
+    store: &Store,
+    policy: &ControlPolicySnapshot,
+    sealer: &mut ReferenceEnvelopeSealer,
+    historical_sealer: &mut ReferenceEnvelopeSealer,
+) -> Result<LegacyEventWitnessMigration, NodeError> {
+    if sealer.identity() != historical_sealer.identity()
+        || sealer.mission_authority_id() != historical_sealer.mission_authority_id()
+    {
+        return Err(NodeError::Protocol(
+            "legacy Event migration verifiers belong to different missions".into(),
+        ));
+    }
+    let mut after = None;
+    let mut recovered_transfers = BTreeSet::new();
+    let mut report = LegacyEventWitnessMigration::default();
+    loop {
+        let page = store.unbound_legacy_event_operations_with_policy(
+            policy,
+            after.as_ref(),
+            MAX_EVENT_PAGE,
+        )?;
+        if page.is_empty() {
+            return Ok(report);
+        }
+        for recovery in page {
+            report.operation_rows_scanned = report
+                .operation_rows_scanned
+                .checked_add(1)
+                .ok_or_else(|| NodeError::Protocol("legacy recovery count overflow".into()))?;
+            after = Some(recovery.operation().clone());
+            let stored = recovery.event();
+            if !recovered_transfers.insert(stored.transfer_id) {
+                continue;
+            }
+            report.transfers_verified = report
+                .transfers_verified
+                .checked_add(1)
+                .ok_or_else(|| NodeError::Protocol("legacy recovery count overflow".into()))?;
+            let opened = match try_open_legacy_event_witness(sealer, stored)? {
+                Some(opened) => Some(opened),
+                None => try_open_legacy_event_witness(historical_sealer, stored)?,
+            };
+            let (event, payload) = opened.ok_or_else(|| {
+                NodeError::Protocol(
+                    "legacy Event operation recovery lacks exact historical content authorization"
+                        .into(),
+                )
+            })?;
+            let intent = EventPublicationIntent::new(
+                EventPublicationSpec::new(
+                    stored.header.stamp.dot.publisher,
+                    stored.header.topic.clone(),
+                    stored.header.scope.clone(),
+                    stored.header.priority,
+                    stored.header.logical_key.clone(),
+                    stored.header.tombstone,
+                    stored.header.ttl_ms,
+                )?,
+                &payload,
+            )?;
+            let request = EventOperationRequest::new(
+                recovery.operation(),
+                &intent,
+                &payload,
+                recovery.predecessor(),
+            )?;
+            let resolution = store.bind_legacy_event_operation_intent_with_policy(
+                policy,
+                &request,
+                &event,
+                &stored.sealed,
+            )?;
+            let exact = match resolution {
+                Some(EventOperationResolution::Live(resolved)) => {
+                    resolved.transfer_id == stored.transfer_id
+                }
+                Some(EventOperationResolution::Withheld { transfer_id, .. })
+                | Some(EventOperationResolution::Retired { transfer_id, .. }) => {
+                    transfer_id == stored.transfer_id
+                }
+                None => false,
+            };
+            if !exact {
+                return Err(NodeError::Protocol(
+                    "legacy Event operation changed during proactive recovery".into(),
+                ));
+            }
+        }
+    }
+}
+
+fn verify_existing_event_publication(
+    sealer: &mut ReferenceEnvelopeSealer,
+    stored: &StoredEvent,
+    intent: &EventPublicationIntent,
+    payload: &[u8],
+) -> Result<ContentVerifiedEventEnvelope, NodeError> {
+    let route = sealer.verify_event(&stored.sealed)?;
+    verify_stored_claim(
+        &route,
+        stored.transfer_id,
+        stored.semantic_id,
+        &stored.header,
+    )?;
+    let (event, opened) = match sealer.verify_event_content(route, &stored.sealed)? {
+        EventContentVerification::ContentVerified { event, payload } => (event, payload),
+        EventContentVerification::RouteOnly(_) => {
+            return Err(NodeError::Protocol(
+                "durable local Event operation lost content authorization".into(),
+            ));
+        }
+    };
+    verify_content_stored_claim(&event, stored)?;
+    // Key epoch, reservation dot/context, and Event sequence deliberately do
+    // not participate in the public operation intent. This preserves exact
+    // authorized replay of an old operation across a later scope rekey while
+    // every application-controlled field and plaintext remain exact.
+    if opened != payload
+        || stored.header.stamp.dot.publisher != intent.publisher()
+        || &stored.header.topic != intent.topic()
+        || &stored.header.scope != intent.scope()
+        || stored.header.priority != intent.priority()
+        || stored.header.logical_key.as_slice() != intent.logical_key()
+        || stored.header.content_len != intent.content_len()
+        || stored.header.ttl_ms != intent.ttl_ms()
+        || stored.header.tombstone != intent.tombstone()
+    {
+        return Err(NodeError::Protocol(EVENT_OPERATION_CONFLICT.into()));
+    }
+    Ok(event)
 }
 
 pub(crate) fn publish_selected_event_once(
@@ -1559,19 +3167,102 @@ pub(crate) fn publish_selected_event_once(
         topic,
         scope,
         priority,
+        ttl_ms,
+        custody_sample,
         logical_key,
         payload,
         tombstone,
     } = request;
+    if ttl_ms == Some(0) {
+        return Err(NodeError::Configuration(
+            "finite Event TTL must be greater than zero milliseconds".into(),
+        ));
+    }
+    if ttl_ms.is_some() && custody_sample.is_none() {
+        return Err(NodeError::Configuration(
+            "finite Event publication requires a continuous custody sample".into(),
+        ));
+    }
+    if tombstone && ttl_ms.is_some() {
+        return Err(NodeError::Configuration(
+            "Event tombstones are durable and cannot carry finite TTL".into(),
+        ));
+    }
     if tombstone && !payload.is_empty() {
         return Err(NodeError::Configuration(
             "Event tombstones must carry an empty payload".into(),
         ));
     }
+    let intent = EventPublicationIntent::new(
+        EventPublicationSpec::new(
+            sealer.identity(),
+            topic.clone(),
+            scope.clone(),
+            priority,
+            logical_key.to_vec(),
+            tombstone,
+            ttl_ms,
+        )?,
+        payload,
+    )?;
+    let operation_request = EventOperationRequest::new(operation, &intent, payload, predecessor)?;
+    let existing_prebind = if let Some(existing) = store.event_operation_resolution(operation)? {
+        match existing {
+            EventOperationResolution::Live(stored) => {
+                let verified =
+                    verify_existing_event_publication(sealer, &stored, &intent, payload)?;
+                Some((stored, verified))
+            }
+            EventOperationResolution::Retired { .. } => {
+                // A bound-v2 retired operation still needs the store's private
+                // intent digest comparison below to distinguish exact replay
+                // from changed-key reuse without resurrecting retired bytes.
+                None
+            }
+            EventOperationResolution::Withheld { .. } => {
+                // Marked retirement is already non-authoritative to the
+                // application. The atomic commit below still compares the
+                // private request digest without reopening withheld bytes.
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if let Some((stored, original)) = existing_prebind.as_ref() {
+        match store.bind_legacy_event_operation_intent_with_policy(
+            policy,
+            &operation_request,
+            original,
+            &stored.sealed,
+        ) {
+            Ok(Some(EventOperationResolution::Live(resolved))) if resolved == *stored => {}
+            Ok(Some(
+                EventOperationResolution::Withheld { .. }
+                | EventOperationResolution::Retired { .. },
+            )) => {}
+            Ok(Some(EventOperationResolution::Live(_))) | Ok(None) => {
+                return Err(NodeError::Protocol(
+                    "durable Event operation changed during intent preflight".into(),
+                ));
+            }
+            Err(StoreError::EventOperationConflict | StoreError::OperationPredecessorMismatch) => {
+                return Err(NodeError::Protocol(EVENT_OPERATION_CONFLICT.into()));
+            }
+            Err(error) => return Err(error.into()),
+        }
+        // This housekeeping-only witness is bound to the freshly verified
+        // original transfer and plaintext before a fresh reservation. The
+        // publication still proceeds through current-epoch sealing and the
+        // atomic commit below, which independently enforces current authority.
+    }
     let key_epoch = store
         .active_scope_epoch(scope)?
         .map_or(1, |(epoch, _)| epoch);
     for _ in 0..MAX_EVENT_PUBLISH_RETRIES {
+        let custody_revision = custody_sample
+            .map(|_| store.custody_policy_revision())
+            .transpose()?;
         let reservation = match predecessor {
             Some(predecessor) => store.reserve_reaction_event_with_policy(
                 policy,
@@ -1585,7 +3276,7 @@ pub(crate) fn publish_selected_event_once(
         let header = reservation.header(
             priority,
             logical_key.to_vec(),
-            None,
+            ttl_ms,
             u64::try_from(payload.len())
                 .map_err(|_| NodeError::Protocol("Event payload length overflows u64".into()))?,
             tombstone,
@@ -1609,14 +3300,27 @@ pub(crate) fn publish_selected_event_once(
                 ));
             }
         };
-        match store.commit_reserved_event_once_with_policy(
-            policy,
-            operation,
-            predecessor,
-            &reservation,
-            &verified,
-            &sealed.bytes,
-        ) {
+        let committed = match (custody_sample, custody_revision) {
+            (Some(sample), Some(revision)) => store.commit_reserved_event_once_with_custody_policy(
+                policy,
+                LocalCustodyCheckpoint::new(revision, sample),
+                &operation_request,
+                &reservation,
+                &verified,
+                &sealed.bytes,
+            ),
+            (None, None) => store.commit_reserved_event_once_with_policy(
+                policy,
+                &operation_request,
+                &reservation,
+                &verified,
+                &sealed.bytes,
+            ),
+            _ => Err(StoreError::SemanticInvariant(
+                "custody sample and policy revision were not captured together",
+            )),
+        };
+        match committed {
             Ok(outcome) => {
                 let (transfer_id, semantic_id, inserted) = match outcome {
                     EventOnceOutcome::Inserted {
@@ -1634,6 +3338,9 @@ pub(crate) fn publish_selected_event_once(
                         semantic_id,
                         ..
                     } => (transfer_id, semantic_id, false),
+                    EventOnceOutcome::Retired { .. } => {
+                        return Err(NodeError::Protocol(EVENT_OPERATION_RETIRED.into()));
+                    }
                 };
                 let stored = match store.get_transfer_with_policy(policy, transfer_id)? {
                     Some(StoredEventTransfer::Accepted(stored)) => stored,
@@ -1680,7 +3387,7 @@ pub(crate) fn publish_selected_event_once(
                     || &stored.header.scope != scope
                     || stored.header.priority != priority
                     || stored.header.logical_key.as_slice() != logical_key
-                    || stored.header.ttl_ms.is_some()
+                    || stored.header.ttl_ms != ttl_ms
                     || stored.header.tombstone != tombstone
                     || (inserted && stored.header.key_epoch != key_epoch)
                 {
@@ -1689,6 +3396,10 @@ pub(crate) fn publish_selected_event_once(
                 return Ok((stored, inserted));
             }
             Err(StoreError::ReservationChanged) => continue,
+            Err(StoreError::Custody(CustodyStoreError::PolicyChanged)) => continue,
+            Err(StoreError::EventOperationConflict | StoreError::OperationPredecessorMismatch) => {
+                return Err(NodeError::Protocol(EVENT_OPERATION_CONFLICT.into()));
+            }
             Err(error) => return Err(error.into()),
         }
     }
@@ -1697,15 +3408,27 @@ pub(crate) fn publish_selected_event_once(
     )))
 }
 
+struct DemoEventPublish<'a> {
+    operation: &'a EventOperationKey,
+    predecessor: Option<EventSemanticId>,
+    custody_sample: CustodySample,
+    logical_key: Vec<u8>,
+    payload: &'a [u8],
+}
+
 fn publish_event_once(
     store: &Store,
     policy: &ControlPolicySnapshot,
     sealer: &mut ReferenceEnvelopeSealer,
-    operation: &EventOperationKey,
-    predecessor: Option<EventSemanticId>,
-    logical_key: Vec<u8>,
-    payload: &[u8],
+    request: DemoEventPublish<'_>,
 ) -> Result<(StoredEvent, bool), NodeError> {
+    let DemoEventPublish {
+        operation,
+        predecessor,
+        custody_sample,
+        logical_key,
+        payload,
+    } = request;
     publish_selected_event_once(
         store,
         policy,
@@ -1716,6 +3439,8 @@ fn publish_event_once(
             topic: &demo_event_topic()?,
             scope: &demo_scope()?,
             priority: Priority::Immediate,
+            ttl_ms: None,
+            custody_sample: Some(custody_sample),
             logical_key: &logical_key,
             payload,
             tombstone: false,
@@ -1723,14 +3448,27 @@ fn publish_event_once(
     )
 }
 
+struct SampleApplicationContext<'a> {
+    store: &'a Store,
+    policy: &'a ControlPolicySnapshot,
+    sealer: &'a mut ReferenceEnvelopeSealer,
+    custody_clock: &'a NodeCustodyClock,
+    event_route_cache: &'a AuthenticatedEventRouteCache,
+}
+
 fn drive_sample_application(
     role: NodeApplication,
-    store: &Store,
-    policy: &ControlPolicySnapshot,
-    sealer: &mut ReferenceEnvelopeSealer,
+    context: SampleApplicationContext<'_>,
     cursor: &mut u64,
     initial_receipt_emitted: &mut bool,
 ) -> Result<(), NodeError> {
+    let SampleApplicationContext {
+        store,
+        policy,
+        sealer,
+        custody_clock,
+        event_route_cache,
+    } = context;
     match role {
         NodeApplication::Relay => Ok(()),
         NodeApplication::PingEmitter | NodeApplication::EpochTwoPingEmitter => {
@@ -1748,11 +3486,15 @@ fn drive_sample_application(
                 store,
                 policy,
                 sealer,
-                &ping_operation_key()?,
-                None,
-                DEMO_PING_LOGICAL_KEY.to_vec(),
-                DEMO_PING_PAYLOAD,
+                DemoEventPublish {
+                    operation: &ping_operation_key()?,
+                    predecessor: None,
+                    custody_sample: custody_clock.sample()?,
+                    logical_key: DEMO_PING_LOGICAL_KEY.to_vec(),
+                    payload: DEMO_PING_PAYLOAD,
+                },
             )?;
+            cache_accepted_stored_event(event_route_cache, sealer, &ping)?;
             println!(
                 "APPLICATION status={} kind=ping transfer_id={} semantic_id={} publisher={} source_authenticated=true ttl=none",
                 if inserted { "emitted" } else { "existing" },
@@ -1807,11 +3549,15 @@ fn drive_sample_application(
                     store,
                     policy,
                     sealer,
-                    &operation,
-                    Some(event.semantic_id),
-                    event.semantic_id.as_bytes().to_vec(),
-                    DEMO_PONG_PAYLOAD,
+                    DemoEventPublish {
+                        operation: &operation,
+                        predecessor: Some(event.semantic_id),
+                        custody_sample: custody_clock.sample()?,
+                        logical_key: event.semantic_id.as_bytes().to_vec(),
+                        payload: DEMO_PONG_PAYLOAD,
+                    },
                 )?;
+                cache_accepted_stored_event(event_route_cache, sealer, &pong)?;
                 println!(
                     "APPLICATION status={} kind=pong transfer_id={} semantic_id={} publisher={} correlation_semantic_id={} ping_publisher={} source_authenticated=true causal_observation=verified ttl=none",
                     if inserted { "emitted" } else { "existing" },
@@ -1863,6 +3609,14 @@ fn verify_stored_control_claim(
     verified: &VerifiedControlEnvelope,
     stored: &StoredControl,
 ) -> Result<(), NodeError> {
+    verify_stored_control_claim_with_legacy_recipient_backfill(verified, stored, false)
+}
+
+fn verify_stored_control_claim_with_legacy_recipient_backfill(
+    verified: &VerifiedControlEnvelope,
+    stored: &StoredControl,
+    allow_legacy_recipient_backfill: bool,
+) -> Result<(), NodeError> {
     verified.verify_exact_sealed(&stored.sealed)?;
     let predecessor = verified.previous_control().map(ControlTransferId::new);
     let effect_matches = match (&stored.effect, verified.kind()) {
@@ -1886,6 +3640,13 @@ fn verify_stored_control_claim(
         }
         _ => false,
     };
+    let recipient_claim_matches = if stored.scope_rekey_recipient_metadata_authenticated {
+        verified.scope_rekey_recipient_nodes() == stored.scope_rekey_recipients.as_deref()
+    } else {
+        allow_legacy_recipient_backfill
+            && matches!(&stored.effect, StoredControlEffect::ScopeEpoch { .. })
+            && stored.scope_rekey_recipients.is_none()
+    };
     if ControlTransferId::new(verified.envelope_id()) != stored.transfer_id
         || verified.mission_authority_id() != stored.authority
         || verified.signer() != stored.signer
@@ -1893,6 +3654,7 @@ fn verify_stored_control_claim(
         || predecessor != stored.previous_control
         || verified.kind() != stored.kind()
         || !effect_matches
+        || !recipient_claim_matches
     {
         return Err(NodeError::Protocol(
             "persisted mission-control claim differs from fresh source authentication".into(),
@@ -1983,10 +3745,40 @@ impl EventLaneGuard {
     }
 }
 
+#[derive(Clone, Debug)]
+struct EventInterestSnapshot {
+    interest: EventInterest,
+    selector_revision: CustodyPeerSelectorRevision,
+}
+
+impl EventInterestSnapshot {
+    fn protected(interest: EventInterest, selector_revision: u64) -> Result<Self, NodeError> {
+        let selector_count = u64::try_from(interest.len())
+            .map_err(|_| NodeError::Protocol("Event interest selector count exceeds u64".into()))?;
+        if selector_revision < selector_count {
+            return Err(NodeError::Protocol(
+                "v3 selector revision precedes its canonical Event interest".into(),
+            ));
+        }
+        Ok(Self {
+            interest,
+            selector_revision: CustodyPeerSelectorRevision::new(selector_revision),
+        })
+    }
+
+    fn legacy(interest: EventInterest) -> Self {
+        Self {
+            interest,
+            selector_revision: CustodyPeerSelectorRevision::new(0),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct DirectedEventLane<'a> {
     guard: &'a EventLaneGuard,
     receiver_interest: &'a EventInterest,
+    receiver_selector_revision: CustodyPeerSelectorRevision,
     direction: EventDirection,
 }
 
@@ -1996,6 +3788,13 @@ struct EventReceiveAuthority<'a> {
     peer_route_commitments: &'a [[u8; 32]],
     receiver_interest: &'a EventInterest,
     local_replication_policy: &'a EventReplicationPolicySnapshot,
+}
+
+struct ReceivedCustody<'a> {
+    mission: &'a mut MissionSession,
+    exchange_id: u64,
+    expected_policy_revision: u64,
+    wrapper: &'a [u8],
 }
 
 fn activate_committed_controls(
@@ -2045,6 +3844,22 @@ pub(crate) fn open_replayed_verifier(
     store: &Store,
     credentials: &UnprotectedReferenceMission,
 ) -> Result<ReferenceEnvelopeSealer, NodeError> {
+    let recipient_backfills = store.scope_rekey_recipient_backfill_controls()?;
+    if !recipient_backfills.is_empty() {
+        let mut migration_verifier = ReferenceEnvelopeSealer::open(credentials.fresh_bundle()?)?;
+        let mut verified_backfills = Vec::with_capacity(recipient_backfills.len());
+        for stored in &recipient_backfills {
+            let verified = migration_verifier.verify_control(&stored.sealed)?;
+            verify_stored_control_claim_with_legacy_recipient_backfill(&verified, stored, true)?;
+            verified_backfills.push(verified);
+        }
+        let authenticated_backfills = verified_backfills
+            .iter()
+            .zip(&recipient_backfills)
+            .map(|(verified, stored)| (verified, stored.sealed.as_slice()))
+            .collect::<Vec<_>>();
+        store.backfill_scope_rekey_recipients_batch(&authenticated_backfills)?;
+    }
     let mut verifier = ReferenceEnvelopeSealer::open(credentials.fresh_bundle()?)?;
     replay_applied_controls(store, &mut verifier)?;
     Ok(verifier)
@@ -2081,6 +3896,12 @@ fn existing_control_receipt(
     transfer_id: ControlTransferId,
     expected: &StoredControlEffect,
 ) -> Result<ControlPublicationReceipt, NodeError> {
+    let principal = verifier
+        .verified_control_principal()
+        .ok_or_else(|| NodeError::Configuration(CONTROL_AUTHORITY_REQUIRED.into()))?;
+    if !store.local_control_receipt_matches(transfer_id, principal)? {
+        return Err(NodeError::Protocol(CONTROL_PUBLICATION_CONFLICT.into()));
+    }
     let stored = store
         .get_control(transfer_id)?
         .ok_or_else(|| NodeError::Protocol("active control index points to no row".into()))?;
@@ -2102,7 +3923,10 @@ fn existing_control_receipt(
 fn rejected_control_error(rejected: &RejectedControl) -> NodeError {
     match rejected.reason {
         ControlRejectionReason::AuthorityRevoked(principal)
-        | ControlRejectionReason::SignerRevoked(principal) => NodeError::Revoked(principal),
+        | ControlRejectionReason::SignerRevoked(principal)
+        | ControlRejectionReason::ScopeRekeyRecipientRevoked(principal) => {
+            NodeError::Revoked(principal)
+        }
         ControlRejectionReason::InvalidatedPredecessor(predecessor) => {
             NodeError::Protocol(format!(
                 "control {} was invalidated by rejected predecessor {}",
@@ -2110,6 +3934,18 @@ fn rejected_control_error(rejected: &RejectedControl) -> NodeError {
                 format_control_transfer_id(predecessor),
             ))
         }
+        ControlRejectionReason::PredecessorMismatch => {
+            NodeError::Protocol("control named a non-current predecessor".into())
+        }
+        ControlRejectionReason::EffectRollback => {
+            NodeError::Protocol("control effect rolled back durable policy".into())
+        }
+        ControlRejectionReason::LegacyRecipientSetUnavailable => NodeError::Protocol(
+            "legacy scope control lacks authenticated recipient evidence after revocation".into(),
+        ),
+        ControlRejectionReason::RejectedSequenceFence(sequence) => NodeError::Protocol(format!(
+            "control is above rejected sequence fence {sequence}"
+        )),
     }
 }
 
@@ -2143,12 +3979,11 @@ fn finish_local_control_publication(
     let mut receipt = existing_control_receipt(store, verifier, expected_id, expected_effect)?;
     receipt.emitted = true;
     receipt.activated = activated;
-    ensure_principal_active(store, verifier.identity())?;
     Ok(receipt)
 }
 
 /// Publishes or reloads one authority-signed revocation by durable effect identity.
-pub fn publish_revocation_control(
+pub(crate) fn publish_revocation_control(
     state: &Path,
     mission: &UnprotectedReferenceMission,
     subject: NodeId,
@@ -2163,35 +3998,48 @@ pub fn publish_revocation_control(
     let store_path = state.join(STORE_FILE);
     let store = Store::open_for_mission(&store_path, mission.mission_authority_id())?;
     store.require_process_exclusive_lock()?;
-    let mut verifier = open_replayed_verifier(&store, mission)?;
-    ensure_principal_active(&store, verifier.identity())?;
-    let principal = verifier.verified_control_principal().ok_or_else(|| {
-        NodeError::Configuration("mission node is not a control authority".into())
-    })?;
+    publish_revocation_control_in_store(&store, mission, subject, generation)
+}
+
+fn publish_revocation_control_in_store(
+    store: &Store,
+    mission: &UnprotectedReferenceMission,
+    subject: NodeId,
+    generation: u64,
+) -> Result<ControlPublicationReceipt, NodeError> {
+    if generation == 0 {
+        return Err(NodeError::Configuration(
+            "revocation generation must be nonzero".into(),
+        ));
+    }
+    let mut verifier = open_replayed_verifier(store, mission)?;
+    let principal = verifier
+        .verified_control_principal()
+        .ok_or_else(|| NodeError::Configuration(CONTROL_AUTHORITY_REQUIRED.into()))?;
     let expected_effect = StoredControlEffect::Revocation {
         subject,
         generation,
     };
+    if let Some(transfer_id) = store.find_applied_control_effect(&expected_effect)? {
+        return existing_control_receipt(store, &mut verifier, transfer_id, &expected_effect);
+    }
+    if let Some((active_generation, _)) = store.active_revocation(subject)?
+        && active_generation >= generation
+    {
+        return Err(NodeError::Protocol(CONTROL_PUBLICATION_CONFLICT.into()));
+    }
+    ensure_principal_active(store, verifier.identity())?;
     for _ in 0..MAX_CONTROL_PUBLISH_RETRIES {
-        if let Some((active_generation, transfer_id)) = store.active_revocation(subject)? {
-            if active_generation == generation {
-                return existing_control_receipt(
-                    &store,
-                    &mut verifier,
-                    transfer_id,
-                    &expected_effect,
-                );
-            }
-            if active_generation > generation {
-                return Err(NodeError::Protocol(format!(
-                    "revocation generation {generation} rolls back active generation {active_generation}"
-                )));
-            }
+        if let Some(transfer_id) = store.find_applied_control_effect(&expected_effect)? {
+            return existing_control_receipt(store, &mut verifier, transfer_id, &expected_effect);
+        }
+        if let Some((active_generation, _)) = store.active_revocation(subject)?
+            && active_generation >= generation
+        {
+            return Err(NodeError::Protocol(CONTROL_PUBLICATION_CONFLICT.into()));
         }
         if store.control_stats()?.pending != 0 {
-            return Err(NodeError::Protocol(
-                "pending control gap blocks local authority publication".into(),
-            ));
+            return Err(NodeError::Protocol(CONTROL_POLICY_UNSETTLED.into()));
         }
         let reservation = store.reserve_control(principal)?;
         let sealed = verifier.seal_chained_revocation_control(
@@ -2205,7 +4053,7 @@ pub fn publish_revocation_control(
         match store.commit_reserved_control(&reservation, &verified, &sealed) {
             Ok(outcome) => {
                 return finish_local_control_publication(
-                    &store,
+                    store,
                     &mut verifier,
                     transfer_id,
                     &expected_effect,
@@ -2216,13 +4064,11 @@ pub fn publish_revocation_control(
             Err(error) => return Err(error.into()),
         }
     }
-    Err(NodeError::Protocol(format!(
-        "control reservation changed {MAX_CONTROL_PUBLISH_RETRIES} times"
-    )))
+    Err(NodeError::Protocol(CONTROL_POLICY_UNSETTLED.into()))
 }
 
 /// Publishes or reloads one recipient-filtered scope rekey by durable effect identity.
-pub fn publish_scope_rekey_control(
+pub(crate) fn publish_scope_rekey_control(
     state: &Path,
     mission: &UnprotectedReferenceMission,
     signed_public_registry: &[u8],
@@ -2240,69 +4086,116 @@ pub fn publish_scope_rekey_control(
     let store_path = state.join(STORE_FILE);
     let store = Store::open_for_mission(&store_path, mission.mission_authority_id())?;
     store.require_process_exclusive_lock()?;
-    let mut verifier = open_replayed_verifier(&store, mission)?;
-    ensure_principal_active(&store, verifier.identity())?;
-    let principal = verifier.verified_control_principal().ok_or_else(|| {
-        NodeError::Configuration("mission node is not a control authority".into())
-    })?;
+    publish_scope_rekey_control_in_store(
+        &store,
+        mission,
+        signed_public_registry,
+        minimum_registry_generation,
+        scope,
+        epoch,
+        &recipients,
+    )
+}
+
+fn publish_scope_rekey_control_in_store(
+    store: &Store,
+    mission: &UnprotectedReferenceMission,
+    signed_public_registry: &[u8],
+    minimum_registry_generation: u64,
+    scope: Scope,
+    epoch: u64,
+    recipients: &[ScopeRekeyRecipient],
+) -> Result<ControlPublicationReceipt, NodeError> {
+    if epoch == 0 || recipients.is_empty() {
+        return Err(NodeError::Configuration(
+            "scope rekey requires a nonzero epoch and at least one recipient".into(),
+        ));
+    }
+    let mut verifier = open_replayed_verifier(store, mission)?;
+    let principal = verifier
+        .verified_control_principal()
+        .ok_or_else(|| NodeError::Configuration(CONTROL_AUTHORITY_REQUIRED.into()))?;
     let expected_effect = StoredControlEffect::ScopeEpoch {
         scope: scope.clone(),
         epoch,
     };
-    for _ in 0..MAX_CONTROL_PUBLISH_RETRIES {
-        if let Some((active_epoch, _)) = store.active_scope_epoch(&scope)?
-            && active_epoch > epoch
-        {
-            return Err(NodeError::Protocol(format!(
-                "scope epoch {epoch} rolls back active epoch {active_epoch}"
-            )));
-        }
-        if store.control_stats()?.pending != 0 {
-            return Err(NodeError::Protocol(
-                "pending control gap blocks local authority publication".into(),
-            ));
-        }
-        let reservation = store.reserve_control(principal)?;
-        let (sealed, registry_generation) = verifier
-            .seal_chained_scope_rekey_control_from_registry(
-                signed_public_registry,
-                minimum_registry_generation,
-                scope.clone(),
-                epoch,
-                recipients.clone(),
-                reservation.sequence(),
-                reservation.previous_control().map(|id| *id.as_bytes()),
-            )?;
-        let intent = ScopeRekeyPublicationIntent::new(
+    if let Some(transfer_id) = store.find_applied_control_effect(&expected_effect)? {
+        store.verify_scope_rekey_publication_request(
+            transfer_id,
             principal,
             signed_public_registry,
-            registry_generation,
             scope.clone(),
             epoch,
-            &recipients,
+            recipients,
         )?;
-        if let Some((active_epoch, active_id)) = store.active_scope_epoch(&scope)? {
-            if active_epoch > epoch {
-                return Err(NodeError::Protocol(format!(
-                    "scope epoch {epoch} rolls back active epoch {active_epoch}"
-                )));
-            }
-            if active_epoch == epoch {
-                store.verify_scope_rekey_publication_intent(active_id, &intent)?;
-                return existing_control_receipt(
-                    &store,
-                    &mut verifier,
-                    active_id,
-                    &expected_effect,
-                );
-            }
+        return existing_control_receipt(store, &mut verifier, transfer_id, &expected_effect);
+    }
+    if let Some((active_epoch, _)) = store.active_scope_epoch(&scope)?
+        && active_epoch >= epoch
+    {
+        return Err(NodeError::Protocol(CONTROL_PUBLICATION_CONFLICT.into()));
+    }
+    ensure_principal_active(store, verifier.identity())?;
+    if store.control_stats()?.pending != 0 {
+        return Err(NodeError::Protocol(CONTROL_POLICY_UNSETTLED.into()));
+    }
+    let plan = verifier.plan_scope_rekey_control_from_registry(
+        signed_public_registry,
+        minimum_registry_generation,
+        scope.clone(),
+        epoch,
+        recipients.to_vec(),
+    )?;
+    let planned_recipients = plan.recipient_nodes().collect::<Vec<_>>();
+    store.ensure_scope_rekey_recipients_active(&planned_recipients)?;
+    let intent = ScopeRekeyPublicationIntent::new(
+        principal,
+        signed_public_registry,
+        plan.registry_generation(),
+        scope.clone(),
+        epoch,
+        recipients,
+    )?;
+    for _ in 0..MAX_CONTROL_PUBLISH_RETRIES {
+        if let Some(transfer_id) = store.find_applied_control_effect(&expected_effect)? {
+            store.verify_scope_rekey_publication_request(
+                transfer_id,
+                principal,
+                signed_public_registry,
+                scope.clone(),
+                epoch,
+                recipients,
+            )?;
+            return existing_control_receipt(store, &mut verifier, transfer_id, &expected_effect);
         }
+        if let Some((active_epoch, _)) = store.active_scope_epoch(&scope)?
+            && active_epoch >= epoch
+        {
+            return Err(NodeError::Protocol(CONTROL_PUBLICATION_CONFLICT.into()));
+        }
+        if store.control_stats()?.pending != 0 {
+            return Err(NodeError::Protocol(CONTROL_POLICY_UNSETTLED.into()));
+        }
+        ensure_principal_active(store, verifier.identity())?;
+        store.ensure_scope_rekey_recipients_active(&planned_recipients)?;
+        let reservation = store.reserve_control(principal)?;
+        let (sealed, publication) = verifier.seal_chained_scope_rekey_control_for_publication(
+            &plan,
+            reservation.sequence(),
+            reservation.previous_control().map(|id| *id.as_bytes()),
+        )?;
         let verified = verifier.verify_control(&sealed)?;
         let transfer_id = ControlTransferId::new(verified.envelope_id());
-        match store.commit_reserved_scope_rekey_control(&reservation, &verified, &sealed, &intent) {
+        match store.commit_reserved_scope_rekey_control(
+            &reservation,
+            &verified,
+            &sealed,
+            &publication,
+            &intent,
+        ) {
             Ok(outcome) => {
                 return finish_local_control_publication(
-                    &store,
+                    store,
                     &mut verifier,
                     transfer_id,
                     &expected_effect,
@@ -2313,9 +4206,7 @@ pub fn publish_scope_rekey_control(
             Err(error) => return Err(error.into()),
         }
     }
-    Err(NodeError::Protocol(format!(
-        "control reservation changed {MAX_CONTROL_PUBLISH_RETRIES} times"
-    )))
+    Err(NodeError::Protocol(CONTROL_POLICY_UNSETTLED.into()))
 }
 
 fn load_verified_control(
@@ -2326,6 +4217,15 @@ fn load_verified_control(
     let stored = store
         .get_control(transfer_id)?
         .ok_or_else(|| NodeError::Protocol("authorized mission control is missing".into()))?;
+    // Selected controls are source-authenticated Flash work. Keep the priority
+    // gate explicit so supporting control can never bypass an AtLeast floor if
+    // the retained control profile later admits another authenticated class.
+    if !contact_policy_or_normal()?
+        .policy
+        .permits_event(stored.priority())
+    {
+        return Err(NodeError::EmissionPolicyChanged);
+    }
     let verified = verifier.verify_control(&stored.sealed)?;
     verify_stored_control_claim(&verified, &stored)?;
     Ok(stored.sealed)
@@ -2412,9 +4312,7 @@ fn load_verified_transfer(
     Ok(sealed)
 }
 
-/// Reauthenticates one exact outbound Event against both the negotiated receive
-/// interest and the authenticated peer's current route grant before disclosure.
-fn load_verified_transfer_for_peer(
+fn load_verified_transfer_for_peer_with_claims(
     store: &Store,
     policy: &ControlPolicySnapshot,
     verifier: &mut ReferenceEnvelopeSealer,
@@ -2422,8 +4320,9 @@ fn load_verified_transfer_for_peer(
     peer: NodeId,
     peer_route_commitments: &[[u8; 32]],
     receiver_interest: &EventInterest,
-) -> Result<Vec<u8>, NodeError> {
-    let (verified, sealed, _) = load_route_verified_transfer(store, policy, verifier, transfer_id)?;
+) -> Result<(RouteVerifiedEventEnvelope, Vec<u8>, EventTransferState), NodeError> {
+    let (verified, sealed, state) =
+        load_route_verified_transfer(store, policy, verifier, transfer_id)?;
     ensure_event_epoch_active(store, &verified)?;
     if !receiver_interest.matches(verified.topic(), verified.scope()) {
         return Err(NodeError::Protocol(
@@ -2441,13 +4340,1634 @@ fn load_verified_transfer_for_peer(
                 .into(),
         ));
     }
-    Ok(sealed)
+    Ok((verified, sealed, state))
+}
+
+fn load_scheduled_transfer_for_peer_with_claims(
+    store: &Store,
+    verifier: &mut ReferenceEnvelopeSealer,
+    scheduled: ScheduledCustodyTransfer,
+    peer: NodeId,
+    peer_route_commitments: &[[u8; 32]],
+    receiver_interest: &EventInterest,
+) -> Result<(RouteVerifiedEventEnvelope, Vec<u8>, EventTransferState), NodeError> {
+    let (verified, sealed, state) =
+        load_scheduled_route_verified_transfer(store, verifier, scheduled)?;
+    ensure_event_epoch_active(store, &verified)?;
+    if !receiver_interest.matches(verified.topic(), verified.scope()) {
+        return Err(NodeError::Protocol(
+            "outbound Event is outside the peer's protected receive interest".into(),
+        ));
+    }
+    if !verifier.peer_can_route(
+        peer,
+        peer_route_commitments,
+        verified.scope(),
+        verified.key_epoch(),
+    ) {
+        return Err(NodeError::Protocol(
+            "authenticated peer no longer has the Event route grant for this scope and epoch"
+                .into(),
+        ));
+    }
+    Ok((verified, sealed, state))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EventTransferState {
     Accepted,
     RouteCached,
+}
+
+impl EventTransferState {
+    const fn custody_key(self, transfer_id: EventTransferId) -> CustodyObjectKey {
+        match self {
+            Self::Accepted => CustodyObjectKey::event(transfer_id),
+            Self::RouteCached => CustodyObjectKey::route_event(transfer_id),
+        }
+    }
+}
+
+/// Compact private capability derived only from fresh source verification.
+///
+/// It intentionally retains no sealed bytes or application plaintext. Every
+/// contact joins it to a fresh one-snapshot store projection, and every actual
+/// send reloads and reauthenticates the exact source bytes again.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AuthenticatedEventRouteClaim {
+    transfer_id: EventTransferId,
+    object: CustodyObjectKey,
+    mission_authority: NodeId,
+    semantic_id: EventSemanticId,
+    source_publisher: NodeId,
+    topic: Topic,
+    scope: Scope,
+    key_epoch: u64,
+    route_lineage: EventRouteLineage,
+    priority: Priority,
+    ttl_ms: Option<u64>,
+    tombstone: bool,
+    exact_len: u64,
+}
+
+impl AuthenticatedEventRouteClaim {
+    fn from_verified(
+        verified: &RouteVerifiedEventEnvelope,
+        state: EventTransferState,
+        exact_len: usize,
+    ) -> Result<Self, NodeError> {
+        let transfer_id = EventTransferId::new(verified.envelope_id());
+        Ok(Self {
+            transfer_id,
+            object: state.custody_key(transfer_id),
+            mission_authority: verified.mission_authority_id(),
+            semantic_id: EventSemanticId::new(verified.item_id()),
+            source_publisher: verified.publisher(),
+            topic: verified.topic().clone(),
+            scope: verified.scope().clone(),
+            key_epoch: verified.key_epoch(),
+            route_lineage: verified.route_lineage(),
+            priority: verified.priority(),
+            ttl_ms: verified.ttl_ms(),
+            tombstone: verified.tombstone(),
+            exact_len: u64::try_from(exact_len)
+                .map_err(|_| NodeError::Protocol("Event transfer length exceeds u64".into()))?,
+        })
+    }
+
+    fn matches_projection(&self, projection: &CustodySenderProjection) -> bool {
+        self.object == projection.object() && self.matches_projection_source(projection)
+    }
+
+    fn matches_projection_source(&self, projection: &CustodySenderProjection) -> bool {
+        self.transfer_id == EventTransferId::new(projection.object().transfer_id())
+            && self.semantic_id == EventSemanticId::new(projection.semantic_id())
+            && self.source_publisher == projection.source_publisher()
+            && &self.topic == projection.topic()
+            && &self.scope == projection.scope()
+            && self.key_epoch == projection.key_epoch()
+            && self.priority == projection.priority()
+            && self.ttl_ms == projection.ttl_ms()
+            && self.tombstone == projection.tombstone()
+            && self.exact_len == projection.accounted_bytes()
+    }
+
+    fn same_authenticated_source(&self, other: &Self) -> bool {
+        self.transfer_id == other.transfer_id
+            && self.mission_authority == other.mission_authority
+            && self.semantic_id == other.semantic_id
+            && self.source_publisher == other.source_publisher
+            && self.topic == other.topic
+            && self.scope == other.scope
+            && self.key_epoch == other.key_epoch
+            && self.route_lineage == other.route_lineage
+            && self.priority == other.priority
+            && self.ttl_ms == other.ttl_ms
+            && self.tombstone == other.tombstone
+            && self.exact_len == other.exact_len
+    }
+
+    fn with_object(mut self, object: CustodyObjectKey) -> Self {
+        self.object = object;
+        self
+    }
+
+    fn is_route_cached(&self) -> bool {
+        self.object == CustodyObjectKey::route_event(self.transfer_id)
+    }
+}
+
+/// Compact capability for one freshly source-authenticated State or Record.
+///
+/// The claim binds an opaque provider route lineage to the store's compact
+/// metadata projection without retaining sealed bytes or application content.
+/// Contacts may use it for discovery only while its route lineage remains
+/// current; an actual send reloads and reauthenticates the exact source bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AuthenticatedMutableRouteClaim {
+    transfer_id: MutableTransferId,
+    mission_authority: NodeId,
+    semantic_id: [u8; 32],
+    source_publisher: NodeId,
+    topic: Topic,
+    scope: Scope,
+    key_epoch: u64,
+    route_lineage: SourceRouteLineage,
+    exact_len: u64,
+    acceptance_marker: u64,
+    metadata_fingerprint: [u8; 32],
+}
+
+/// Compact capability for one freshly source- and content-authenticated Blob.
+///
+/// Pending and completed rows share the same immutable source claim. The
+/// retention bit is deliberately kept out of the authenticated identity so an
+/// atomic pending-to-completed promotion can update cache state without
+/// changing what the source bytes mean.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AuthenticatedBlobRouteClaim {
+    transfer_id: BlobTransferId,
+    mission_authority: NodeId,
+    semantic_id: [u8; 32],
+    source_publisher: NodeId,
+    topic: Topic,
+    scope: Scope,
+    key_epoch: u64,
+    route_lineage: SourceRouteLineage,
+    physical_lineage: BlobPhysicalLineage,
+    exact_len: u64,
+    manifest_digest: [u8; 32],
+    blob_id: BlobId,
+    metadata_fingerprint: [u8; 32],
+    retention: BlobSourceRetention,
+}
+
+impl AuthenticatedBlobRouteClaim {
+    fn from_verified(
+        verified: &ContentVerifiedBlobEnvelope,
+        sealed: &[u8],
+        projection: &BlobSourceProjection,
+        retention: BlobSourceRetention,
+    ) -> Result<Self, NodeError> {
+        verified.verify_exact_sealed(sealed)?;
+        let claim = Self {
+            transfer_id: BlobTransferId::new(verified.envelope_id()),
+            mission_authority: verified.mission_authority_id(),
+            semantic_id: verified.item_id(),
+            source_publisher: verified.publisher(),
+            topic: verified.topic().clone(),
+            scope: verified.scope().clone(),
+            key_epoch: verified.key_epoch(),
+            route_lineage: verified.route_lineage(),
+            physical_lineage: verified.physical_lineage(),
+            exact_len: u64::try_from(sealed.len())
+                .map_err(|_| NodeError::Protocol("Blob source length exceeds u64".into()))?,
+            manifest_digest: *verified.manifest_digest(),
+            blob_id: verified.blob_id(),
+            metadata_fingerprint: projection.metadata_fingerprint,
+            retention,
+        };
+        if !claim.matches_projection(projection) {
+            return Err(NodeError::Protocol(
+                "authenticated Blob source differs from its compact projection".into(),
+            ));
+        }
+        Ok(claim)
+    }
+
+    fn matches_projection(&self, projection: &BlobSourceProjection) -> bool {
+        self.transfer_id == projection.transfer_id
+            && self.semantic_id == *projection.semantic_id.as_bytes()
+            && self.source_publisher == projection.publisher
+            && self.topic == projection.topic
+            && self.scope == projection.scope
+            && self.key_epoch == projection.epoch
+            && self.exact_len == projection.sealed_len
+            && self.route_lineage.binding() == &projection.route_lineage
+            && self.physical_lineage.binding() == &projection.physical_lineage
+            && self.manifest_digest == projection.manifest_digest
+            && self.blob_id == projection.blob_id
+            && self.metadata_fingerprint == projection.metadata_fingerprint
+    }
+
+    fn matches_verified(&self, verified: &ContentVerifiedBlobEnvelope, sealed: &[u8]) -> bool {
+        self.transfer_id == BlobTransferId::new(verified.envelope_id())
+            && self.mission_authority == verified.mission_authority_id()
+            && self.semantic_id == verified.item_id()
+            && self.source_publisher == verified.publisher()
+            && self.topic == *verified.topic()
+            && self.scope == *verified.scope()
+            && self.key_epoch == verified.key_epoch()
+            && self.route_lineage == verified.route_lineage()
+            && self.physical_lineage == verified.physical_lineage()
+            && self.exact_len == u64::try_from(sealed.len()).unwrap_or(u64::MAX)
+            && self.manifest_digest == *verified.manifest_digest()
+            && self.blob_id == verified.blob_id()
+    }
+}
+
+impl AuthenticatedMutableRouteClaim {
+    fn from_verified_state(
+        verified: &RouteVerifiedStateEnvelope,
+        stored: &StoredState,
+        projection: &StateSenderProjection,
+    ) -> Result<Self, NodeError> {
+        verify_stored_state_claim(verified, stored)?;
+        let claim = Self {
+            transfer_id: MutableTransferId::State(StateTransferId::new(verified.envelope_id())),
+            mission_authority: verified.mission_authority_id(),
+            semantic_id: verified.item_id(),
+            source_publisher: verified.publisher(),
+            topic: verified.topic().clone(),
+            scope: verified.scope().clone(),
+            key_epoch: verified.key_epoch(),
+            route_lineage: verified.route_lineage(),
+            exact_len: u64::try_from(stored.sealed.len())
+                .map_err(|_| NodeError::Protocol("State transfer length exceeds u64".into()))?,
+            acceptance_marker: stored.acceptance_marker,
+            metadata_fingerprint: projection.metadata_fingerprint(),
+        };
+        if !claim.matches_state_projection(projection) {
+            return Err(NodeError::Protocol(
+                "authenticated State source differs from its compact sender projection".into(),
+            ));
+        }
+        Ok(claim)
+    }
+
+    fn from_verified_record(
+        verified: &RouteVerifiedRecordEnvelope,
+        stored: &StoredRecord,
+        projection: &RecordSenderProjection,
+    ) -> Result<Self, NodeError> {
+        verify_stored_record_claim(verified, stored)?;
+        let claim = Self {
+            transfer_id: MutableTransferId::Record(RecordTransferId::new(verified.envelope_id())),
+            mission_authority: verified.mission_authority_id(),
+            semantic_id: verified.item_id(),
+            source_publisher: verified.publisher(),
+            topic: verified.topic().clone(),
+            scope: verified.scope().clone(),
+            key_epoch: verified.key_epoch(),
+            route_lineage: verified.route_lineage(),
+            exact_len: u64::try_from(stored.sealed.len())
+                .map_err(|_| NodeError::Protocol("Record transfer length exceeds u64".into()))?,
+            acceptance_marker: stored.acceptance_marker,
+            metadata_fingerprint: projection.metadata_fingerprint(),
+        };
+        if !claim.matches_record_projection(projection) {
+            return Err(NodeError::Protocol(
+                "authenticated Record source differs from its compact sender projection".into(),
+            ));
+        }
+        Ok(claim)
+    }
+
+    fn matches_state_projection(&self, projection: &StateSenderProjection) -> bool {
+        self.transfer_id == MutableTransferId::State(projection.transfer_id())
+            && self.semantic_id == *projection.semantic_id().as_bytes()
+            && self.source_publisher == projection.publisher()
+            && &self.topic == projection.topic()
+            && &self.scope == projection.scope()
+            && self.key_epoch == projection.key_epoch()
+            && self.exact_len == projection.exact_len()
+            && self.acceptance_marker == projection.acceptance_marker()
+            && self.metadata_fingerprint == projection.metadata_fingerprint()
+    }
+
+    fn matches_record_projection(&self, projection: &RecordSenderProjection) -> bool {
+        self.transfer_id == MutableTransferId::Record(projection.transfer_id())
+            && self.semantic_id == *projection.semantic_id().as_bytes()
+            && self.source_publisher == projection.publisher()
+            && &self.topic == projection.topic()
+            && &self.scope == projection.scope()
+            && self.key_epoch == projection.key_epoch()
+            && self.exact_len == projection.exact_len()
+            && self.acceptance_marker == projection.acceptance_marker()
+            && self.metadata_fingerprint == projection.metadata_fingerprint()
+    }
+
+    fn matches_verified_state(
+        &self,
+        verified: &RouteVerifiedStateEnvelope,
+        stored: &StoredState,
+    ) -> bool {
+        self.transfer_id == MutableTransferId::State(stored.transfer_id)
+            && self.mission_authority == verified.mission_authority_id()
+            && self.semantic_id == verified.item_id()
+            && self.semantic_id == *stored.semantic_id.as_bytes()
+            && self.source_publisher == verified.publisher()
+            && self.topic == *verified.topic()
+            && self.scope == *verified.scope()
+            && self.key_epoch == verified.key_epoch()
+            && self.route_lineage == verified.route_lineage()
+            && self.exact_len == u64::try_from(stored.sealed.len()).unwrap_or(u64::MAX)
+            && self.acceptance_marker == stored.acceptance_marker
+    }
+
+    fn matches_verified_record(
+        &self,
+        verified: &RouteVerifiedRecordEnvelope,
+        stored: &StoredRecord,
+    ) -> bool {
+        self.transfer_id == MutableTransferId::Record(stored.transfer_id)
+            && self.mission_authority == verified.mission_authority_id()
+            && self.semantic_id == verified.item_id()
+            && self.semantic_id == *stored.semantic_id.as_bytes()
+            && self.source_publisher == verified.publisher()
+            && self.topic == *verified.topic()
+            && self.scope == *verified.scope()
+            && self.key_epoch == verified.key_epoch()
+            && self.route_lineage == verified.route_lineage()
+            && self.exact_len == u64::try_from(stored.sealed.len()).unwrap_or(u64::MAX)
+            && self.acceptance_marker == stored.acceptance_marker
+    }
+}
+
+#[derive(Debug)]
+struct AuthenticatedMutableSenderSnapshot {
+    class: MutableClass,
+    claims: BTreeMap<MutableTransferId, AuthenticatedMutableRouteClaim>,
+    blob_claims: BTreeMap<BlobTransferId, AuthenticatedBlobRouteClaim>,
+}
+
+impl AuthenticatedMutableSenderSnapshot {
+    fn new(
+        class: MutableClass,
+        claims: BTreeMap<MutableTransferId, AuthenticatedMutableRouteClaim>,
+    ) -> Result<Self, NodeError> {
+        if claims.keys().any(|id| id.class() != class) {
+            return Err(NodeError::Protocol(
+                "authenticated mutable sender snapshot crossed data classes".into(),
+            ));
+        }
+        Ok(Self {
+            class,
+            claims,
+            blob_claims: BTreeMap::new(),
+        })
+    }
+
+    fn new_blob(claims: BTreeMap<BlobTransferId, AuthenticatedBlobRouteClaim>) -> Self {
+        Self {
+            class: MutableClass::Blob,
+            claims: BTreeMap::new(),
+            blob_claims: claims,
+        }
+    }
+
+    fn claim(&self, id: MutableTransferId) -> Option<&AuthenticatedMutableRouteClaim> {
+        (id.class() == self.class)
+            .then(|| self.claims.get(&id))
+            .flatten()
+    }
+
+    fn blob_claim(&self, id: BlobTransferId) -> Option<&AuthenticatedBlobRouteClaim> {
+        (self.class == MutableClass::Blob)
+            .then(|| self.blob_claims.get(&id))
+            .flatten()
+    }
+}
+
+const MAX_AUTHENTICATED_MUTABLE_ROUTE_CLAIMS: usize = 8_192;
+
+struct AuthenticatedEventRouteCacheInner {
+    verifier_identity: NodeId,
+    mission_authority: NodeId,
+    control_head: Option<(u64, ControlTransferId)>,
+    claims: BTreeMap<EventTransferId, AuthenticatedEventRouteClaim>,
+    mutable_claims: BTreeMap<MutableTransferId, AuthenticatedMutableRouteClaim>,
+    blob_claims: BTreeMap<BlobTransferId, AuthenticatedBlobRouteClaim>,
+}
+
+pub(crate) struct AuthenticatedEventRouteCache {
+    // Serializes every live durable Blob source transition with the matching
+    // authenticated-cache update. Lock order is policy/EventLaneGuard, this
+    // lifecycle lock, Store/depot/redb, then `inner`; callers must never hold
+    // it across an await or network operation.
+    blob_lifecycle: StdMutex<()>,
+    inner: StdRwLock<AuthenticatedEventRouteCacheInner>,
+    capacity: usize,
+    blob_capacity: usize,
+    #[cfg(test)]
+    source_verifications: AtomicU64,
+    #[cfg(test)]
+    mutable_source_verifications: AtomicU64,
+}
+
+impl AuthenticatedEventRouteCache {
+    fn empty(verifier: &ReferenceEnvelopeSealer) -> Self {
+        Self {
+            blob_lifecycle: StdMutex::new(()),
+            inner: StdRwLock::new(AuthenticatedEventRouteCacheInner {
+                verifier_identity: verifier.identity(),
+                mission_authority: verifier.mission_authority_id(),
+                control_head: None,
+                claims: BTreeMap::new(),
+                mutable_claims: BTreeMap::new(),
+                blob_claims: BTreeMap::new(),
+            }),
+            capacity: MAX_CARDINALITY_LIMIT,
+            blob_capacity: MAX_CARDINALITY_LIMIT + MAX_BLOB_NETWORK_STAGING_ROWS as usize,
+            #[cfg(test)]
+            source_verifications: AtomicU64::new(0),
+            #[cfg(test)]
+            mutable_source_verifications: AtomicU64::new(0),
+        }
+    }
+
+    fn empty_for_store(
+        verifier: &ReferenceEnvelopeSealer,
+        store: &Store,
+    ) -> Result<Self, NodeError> {
+        let mut cache = Self::empty(verifier);
+        cache.blob_capacity = usize::try_from(store.limits().max_items())
+            .map_err(|_| NodeError::Configuration("store item limit exceeds usize".into()))?
+            .checked_add(
+                usize::try_from(MAX_BLOB_NETWORK_STAGING_ROWS)
+                    .expect("Blob staging row bound fits usize"),
+            )
+            .ok_or_else(|| NodeError::Configuration("Blob route cache bound overflows".into()))?;
+        Ok(cache)
+    }
+
+    #[cfg(test)]
+    fn empty_with_capacity(verifier: &ReferenceEnvelopeSealer, capacity: usize) -> Self {
+        let mut cache = Self::empty(verifier);
+        cache.capacity = capacity;
+        cache
+    }
+
+    fn require_binding(&self, verifier: &ReferenceEnvelopeSealer) -> Result<(), NodeError> {
+        let inner = self.inner.read().map_err(|_| {
+            NodeError::Protocol("authenticated Event route cache lock is poisoned".into())
+        })?;
+        if inner.verifier_identity != verifier.identity()
+            || inner.mission_authority != verifier.mission_authority_id()
+        {
+            return Err(NodeError::Protocol(
+                "authenticated Event route cache belongs to another verifier".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn lock_blob_lifecycle(&self) -> Result<std::sync::MutexGuard<'_, ()>, NodeError> {
+        self.blob_lifecycle.lock().map_err(|_| {
+            NodeError::Protocol("authenticated Blob source lifecycle lock is poisoned".into())
+        })
+    }
+
+    fn observe_control_head(
+        &self,
+        verifier: &ReferenceEnvelopeSealer,
+        control_head: Option<(u64, ControlTransferId)>,
+    ) -> Result<(), NodeError> {
+        let mut inner = self.inner.write().map_err(|_| {
+            NodeError::Protocol("authenticated Event route cache lock is poisoned".into())
+        })?;
+        if inner.verifier_identity != verifier.identity()
+            || inner.mission_authority != verifier.mission_authority_id()
+        {
+            return Err(NodeError::Protocol(
+                "authenticated Event route cache belongs to another verifier".into(),
+            ));
+        }
+        inner.control_head = control_head;
+        Ok(())
+    }
+
+    fn replace(
+        &self,
+        verifier: &ReferenceEnvelopeSealer,
+        control_head: Option<(u64, ControlTransferId)>,
+        claims: BTreeMap<EventTransferId, AuthenticatedEventRouteClaim>,
+    ) -> Result<(), NodeError> {
+        if claims.len() > self.capacity {
+            return Err(NodeError::Protocol(
+                "authenticated Event route cache exceeds the selected cardinality bound".into(),
+            ));
+        }
+        if claims.values().any(|claim| {
+            claim.mission_authority != verifier.mission_authority_id()
+                || claim.transfer_id != EventTransferId::new(claim.object.transfer_id())
+        }) {
+            return Err(NodeError::Protocol(
+                "authenticated Event route cache claim differs from its verifier or key".into(),
+            ));
+        }
+        let mut inner = self.inner.write().map_err(|_| {
+            NodeError::Protocol("authenticated Event route cache lock is poisoned".into())
+        })?;
+        if inner.verifier_identity != verifier.identity()
+            || inner.mission_authority != verifier.mission_authority_id()
+        {
+            return Err(NodeError::Protocol(
+                "authenticated Event route cache belongs to another verifier".into(),
+            ));
+        }
+        inner.control_head = control_head;
+        inner.claims = claims;
+        Ok(())
+    }
+
+    fn get(
+        &self,
+        verifier: &ReferenceEnvelopeSealer,
+        transfer_id: EventTransferId,
+    ) -> Result<Option<AuthenticatedEventRouteClaim>, NodeError> {
+        let inner = self.inner.read().map_err(|_| {
+            NodeError::Protocol("authenticated Event route cache lock is poisoned".into())
+        })?;
+        if inner.verifier_identity != verifier.identity()
+            || inner.mission_authority != verifier.mission_authority_id()
+        {
+            return Err(NodeError::Protocol(
+                "authenticated Event route cache belongs to another verifier".into(),
+            ));
+        }
+        Ok(inner.claims.get(&transfer_id).cloned())
+    }
+
+    fn insert(
+        &self,
+        verifier: &ReferenceEnvelopeSealer,
+        claim: AuthenticatedEventRouteClaim,
+    ) -> Result<(), NodeError> {
+        if claim.mission_authority != verifier.mission_authority_id()
+            || claim.transfer_id != EventTransferId::new(claim.object.transfer_id())
+        {
+            return Err(NodeError::Protocol(
+                "authenticated Event route cache insertion differs from its verifier or key".into(),
+            ));
+        }
+        let mut inner = self.inner.write().map_err(|_| {
+            NodeError::Protocol("authenticated Event route cache lock is poisoned".into())
+        })?;
+        if inner.verifier_identity != verifier.identity()
+            || inner.mission_authority != verifier.mission_authority_id()
+        {
+            return Err(NodeError::Protocol(
+                "authenticated Event route cache belongs to another verifier".into(),
+            ));
+        }
+        if let Some(existing) = inner.claims.get(&claim.transfer_id) {
+            if !existing.same_authenticated_source(&claim) {
+                return Err(NodeError::Protocol(
+                    "authenticated Event route cache has conflicting exact claims".into(),
+                ));
+            }
+            if existing.object != claim.object {
+                let route = CustodyObjectKey::route_event(claim.transfer_id);
+                let accepted = CustodyObjectKey::event(claim.transfer_id);
+                if existing.object == accepted && claim.object == route {
+                    // A delayed route-only admission may finish after another
+                    // contact promoted the exact representation. Cache class
+                    // is monotonic, so the stale insert is a no-op.
+                    return Ok(());
+                }
+                if existing.object != route || claim.object != accepted {
+                    return Err(NodeError::Protocol(
+                        "authenticated Event route cache class changed outside route-to-accepted promotion"
+                            .into(),
+                    ));
+                }
+                inner.claims.insert(claim.transfer_id, claim);
+            }
+            return Ok(());
+        }
+        if inner.claims.len() == self.capacity {
+            // This cache is only an optimization. A successful durable commit
+            // must not become an application error or suppress a peer ACK just
+            // because stale claims filled the cache between projections. Do
+            // not evict an existing proof: it may be a historical same-epoch
+            // lineage that the final verifier can no longer reconstruct. A
+            // fresh projection first prunes stale rows, then exact-loads and
+            // authenticates this current-lineage cache miss.
+            return Ok(());
+        }
+        inner.claims.insert(claim.transfer_id, claim);
+        Ok(())
+    }
+
+    fn prune_to(&self, projected: &[EventTransferId]) -> Result<(), NodeError> {
+        let mut inner = self.inner.write().map_err(|_| {
+            NodeError::Protocol("authenticated Event route cache lock is poisoned".into())
+        })?;
+        inner
+            .claims
+            .retain(|transfer_id, _| projected.binary_search(transfer_id).is_ok());
+        Ok(())
+    }
+
+    fn replace_mutable(
+        &self,
+        verifier: &ReferenceEnvelopeSealer,
+        claims: BTreeMap<MutableTransferId, AuthenticatedMutableRouteClaim>,
+    ) -> Result<(), NodeError> {
+        if claims.len() > MAX_AUTHENTICATED_MUTABLE_ROUTE_CLAIMS {
+            return Err(NodeError::Protocol(
+                "authenticated mutable route cache exceeds its selected cardinality bound".into(),
+            ));
+        }
+        if claims.iter().any(|(id, claim)| {
+            *id != claim.transfer_id || claim.mission_authority != verifier.mission_authority_id()
+        }) {
+            return Err(NodeError::Protocol(
+                "authenticated mutable route cache claim differs from its verifier or key".into(),
+            ));
+        }
+        let mut inner = self.inner.write().map_err(|_| {
+            NodeError::Protocol("authenticated Event route cache lock is poisoned".into())
+        })?;
+        if inner.verifier_identity != verifier.identity()
+            || inner.mission_authority != verifier.mission_authority_id()
+        {
+            return Err(NodeError::Protocol(
+                "authenticated Event route cache belongs to another verifier".into(),
+            ));
+        }
+        inner.mutable_claims = claims;
+        Ok(())
+    }
+
+    fn get_mutable(
+        &self,
+        verifier: &ReferenceEnvelopeSealer,
+        transfer_id: MutableTransferId,
+    ) -> Result<Option<AuthenticatedMutableRouteClaim>, NodeError> {
+        let inner = self.inner.read().map_err(|_| {
+            NodeError::Protocol("authenticated Event route cache lock is poisoned".into())
+        })?;
+        if inner.verifier_identity != verifier.identity()
+            || inner.mission_authority != verifier.mission_authority_id()
+        {
+            return Err(NodeError::Protocol(
+                "authenticated Event route cache belongs to another verifier".into(),
+            ));
+        }
+        Ok(inner.mutable_claims.get(&transfer_id).cloned())
+    }
+
+    fn replace_blobs(
+        &self,
+        verifier: &ReferenceEnvelopeSealer,
+        claims: BTreeMap<BlobTransferId, AuthenticatedBlobRouteClaim>,
+    ) -> Result<(), NodeError> {
+        if claims.len() > self.blob_capacity {
+            return Err(NodeError::Protocol(
+                "authenticated Blob route cache exceeds its selected durable bounds".into(),
+            ));
+        }
+        if claims.iter().any(|(id, claim)| {
+            *id != claim.transfer_id || claim.mission_authority != verifier.mission_authority_id()
+        }) {
+            return Err(NodeError::Protocol(
+                "authenticated Blob route cache claim differs from its verifier or key".into(),
+            ));
+        }
+        let mut inner = self.inner.write().map_err(|_| {
+            NodeError::Protocol("authenticated Event route cache lock is poisoned".into())
+        })?;
+        if inner.verifier_identity != verifier.identity()
+            || inner.mission_authority != verifier.mission_authority_id()
+        {
+            return Err(NodeError::Protocol(
+                "authenticated Event route cache belongs to another verifier".into(),
+            ));
+        }
+        inner.blob_claims = claims;
+        Ok(())
+    }
+
+    fn get_blob(
+        &self,
+        verifier: &ReferenceEnvelopeSealer,
+        transfer_id: BlobTransferId,
+    ) -> Result<Option<AuthenticatedBlobRouteClaim>, NodeError> {
+        let inner = self.inner.read().map_err(|_| {
+            NodeError::Protocol("authenticated Event route cache lock is poisoned".into())
+        })?;
+        if inner.verifier_identity != verifier.identity()
+            || inner.mission_authority != verifier.mission_authority_id()
+        {
+            return Err(NodeError::Protocol(
+                "authenticated Event route cache belongs to another verifier".into(),
+            ));
+        }
+        Ok(inner.blob_claims.get(&transfer_id).cloned())
+    }
+
+    fn insert_blob(
+        &self,
+        verifier: &ReferenceEnvelopeSealer,
+        claim: AuthenticatedBlobRouteClaim,
+    ) -> Result<(), NodeError> {
+        if claim.mission_authority != verifier.mission_authority_id() {
+            return Err(NodeError::Protocol(
+                "authenticated Blob route cache insertion belongs to another verifier".into(),
+            ));
+        }
+        let mut inner = self.inner.write().map_err(|_| {
+            NodeError::Protocol("authenticated Event route cache lock is poisoned".into())
+        })?;
+        if inner.verifier_identity != verifier.identity()
+            || inner.mission_authority != verifier.mission_authority_id()
+        {
+            return Err(NodeError::Protocol(
+                "authenticated Event route cache belongs to another verifier".into(),
+            ));
+        }
+        if let Some(existing) = inner.blob_claims.get_mut(&claim.transfer_id) {
+            let same_source = existing.transfer_id == claim.transfer_id
+                && existing.mission_authority == claim.mission_authority
+                && existing.semantic_id == claim.semantic_id
+                && existing.source_publisher == claim.source_publisher
+                && existing.topic == claim.topic
+                && existing.scope == claim.scope
+                && existing.key_epoch == claim.key_epoch
+                && existing.route_lineage == claim.route_lineage
+                && existing.physical_lineage == claim.physical_lineage
+                && existing.exact_len == claim.exact_len
+                && existing.manifest_digest == claim.manifest_digest
+                && existing.blob_id == claim.blob_id
+                && existing.metadata_fingerprint == claim.metadata_fingerprint;
+            if !same_source {
+                return Err(NodeError::Protocol(
+                    "authenticated Blob route cache has conflicting exact claims".into(),
+                ));
+            }
+            existing.retention = claim.retention;
+            return Ok(());
+        }
+        if inner.blob_claims.len() >= self.blob_capacity {
+            return Err(NodeError::Protocol(
+                "authenticated Blob route cache exhausted before durable class caps".into(),
+            ));
+        }
+        inner.blob_claims.insert(claim.transfer_id, claim);
+        Ok(())
+    }
+
+    fn remove_pending_blob(
+        &self,
+        verifier: &ReferenceEnvelopeSealer,
+        claim: &AuthenticatedBlobRouteClaim,
+    ) -> Result<(), NodeError> {
+        let mut inner = self.inner.write().map_err(|_| {
+            NodeError::Protocol("authenticated Event route cache lock is poisoned".into())
+        })?;
+        if inner.verifier_identity != verifier.identity()
+            || inner.mission_authority != verifier.mission_authority_id()
+        {
+            return Err(NodeError::Protocol(
+                "authenticated Event route cache belongs to another verifier".into(),
+            ));
+        }
+        match inner.blob_claims.get(&claim.transfer_id) {
+            Some(existing)
+                if existing == claim && claim.retention == BlobSourceRetention::Pending =>
+            {
+                inner.blob_claims.remove(&claim.transfer_id);
+                Ok(())
+            }
+            Some(_) => Err(NodeError::Protocol(
+                "pending Blob cache removal conflicts with its exact authenticated claim".into(),
+            )),
+            None => Ok(()),
+        }
+    }
+
+    #[cfg(test)]
+    fn blob_claim_count(&self) -> usize {
+        self.inner
+            .read()
+            .expect("authenticated Blob route cache test lock")
+            .blob_claims
+            .len()
+    }
+
+    pub(crate) fn is_current_state_sender_projection(
+        &self,
+        verifier: &ReferenceEnvelopeSealer,
+        projection: &StateSenderProjection,
+    ) -> Result<bool, NodeError> {
+        let id = MutableTransferId::State(projection.transfer_id());
+        let claim = self.get_mutable(verifier, id)?.ok_or_else(|| {
+            NodeError::Protocol(
+                "State sender projection lacks its startup-authenticated route claim".into(),
+            )
+        })?;
+        if !claim.matches_state_projection(projection) {
+            return Err(NodeError::Protocol(
+                "State sender projection differs from its startup-authenticated route claim".into(),
+            ));
+        }
+        Ok(verifier.is_current_source_route_lineage(
+            &claim.scope,
+            claim.key_epoch,
+            claim.route_lineage,
+        ))
+    }
+
+    pub(crate) fn is_current_record_sender_projection(
+        &self,
+        verifier: &ReferenceEnvelopeSealer,
+        projection: &RecordSenderProjection,
+    ) -> Result<bool, NodeError> {
+        let id = MutableTransferId::Record(projection.transfer_id());
+        let claim = self.get_mutable(verifier, id)?.ok_or_else(|| {
+            NodeError::Protocol(
+                "Record sender projection lacks its startup-authenticated route claim".into(),
+            )
+        })?;
+        if !claim.matches_record_projection(projection) {
+            return Err(NodeError::Protocol(
+                "Record sender projection differs from its startup-authenticated route claim"
+                    .into(),
+            ));
+        }
+        Ok(verifier.is_current_source_route_lineage(
+            &claim.scope,
+            claim.key_epoch,
+            claim.route_lineage,
+        ))
+    }
+
+    /// Installs a claim freshly bound to one exact retained store row.
+    ///
+    /// Mutable exact rows are immutable and their two durable class caps sum
+    /// to this cache's cardinality. A conflicting key or exhausted cache is
+    /// therefore an invariant failure, never an optimization miss: silently
+    /// dropping the new proof could strand it after a same-epoch rekey.
+    fn insert_mutable(
+        &self,
+        verifier: &ReferenceEnvelopeSealer,
+        claim: AuthenticatedMutableRouteClaim,
+    ) -> Result<(), NodeError> {
+        if claim.mission_authority != verifier.mission_authority_id() {
+            return Err(NodeError::Protocol(
+                "authenticated mutable route cache insertion belongs to another verifier".into(),
+            ));
+        }
+        let mut inner = self.inner.write().map_err(|_| {
+            NodeError::Protocol("authenticated Event route cache lock is poisoned".into())
+        })?;
+        if inner.verifier_identity != verifier.identity()
+            || inner.mission_authority != verifier.mission_authority_id()
+        {
+            return Err(NodeError::Protocol(
+                "authenticated Event route cache belongs to another verifier".into(),
+            ));
+        }
+        if let Some(existing) = inner.mutable_claims.get(&claim.transfer_id) {
+            if existing != &claim {
+                return Err(NodeError::Protocol(
+                    "authenticated mutable route cache has conflicting exact claims".into(),
+                ));
+            }
+            return Ok(());
+        }
+        if inner.mutable_claims.len() >= MAX_AUTHENTICATED_MUTABLE_ROUTE_CLAIMS {
+            return Err(NodeError::Protocol(
+                "authenticated mutable route cache exhausted before its durable class caps".into(),
+            ));
+        }
+        inner.mutable_claims.insert(claim.transfer_id, claim);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn record_source_verification(&self) {
+        self.source_verifications.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(not(test))]
+    const fn record_source_verification(&self) {}
+
+    #[cfg(test)]
+    fn source_verifications(&self) -> u64 {
+        self.source_verifications.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn record_mutable_source_verification(&self) {
+        self.mutable_source_verifications
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(not(test))]
+    const fn record_mutable_source_verification(&self) {}
+
+    #[cfg(test)]
+    fn mutable_source_verifications(&self) -> u64 {
+        self.mutable_source_verifications.load(Ordering::Relaxed)
+    }
+}
+
+/// Cancellation-safe owner of one durable async-transfer lease.
+///
+/// Dropping a contact future at any await point synchronously releases the
+/// exact lease. A successful authenticated receipt consumes it atomically in
+/// the store before disarming this guard.
+struct CustodyLeaseGuard {
+    store: Arc<Store>,
+    lease: Option<TransferLease>,
+}
+
+impl CustodyLeaseGuard {
+    fn begin(
+        store: Arc<Store>,
+        peer: NodeId,
+        object: CustodyObjectKey,
+        peer_selector_revision: CustodyPeerSelectorRevision,
+        sample: CustodySample,
+        policy_revision: CustodyPolicyRevision,
+    ) -> Result<Self, NodeError> {
+        let lease = store.begin_custody_send(
+            peer,
+            object,
+            peer_selector_revision,
+            Some(sample),
+            0,
+            policy_revision,
+        )?;
+        Ok(Self {
+            store,
+            lease: Some(lease),
+        })
+    }
+
+    fn lease(&self) -> Result<&TransferLease, NodeError> {
+        self.lease.as_ref().ok_or_else(|| {
+            NodeError::Protocol("custody transfer lease was already consumed".into())
+        })
+    }
+
+    fn require_send(
+        &self,
+        sample: CustodySample,
+        policy_revision: CustodyPolicyRevision,
+    ) -> Result<CustodySendAuthorization, NodeError> {
+        Ok(self
+            .store
+            .require_custody_send(self.lease()?, Some(sample), policy_revision)?)
+    }
+
+    fn settle_apply(
+        mut self,
+        disposition: CustodyPeerApplyDisposition,
+        peer_selector_revision: CustodyPeerSelectorRevision,
+        authenticated_age_ms: u64,
+        sample: CustodySample,
+        policy_revision: CustodyPolicyRevision,
+    ) -> Result<(), NodeError> {
+        self.store.settle_peer_custody_apply(
+            self.lease()?,
+            CustodyPeerApplyEvidence::new(disposition, peer_selector_revision),
+            authenticated_age_ms,
+            Some(sample),
+            policy_revision,
+        )?;
+        self.lease = None;
+        Ok(())
+    }
+}
+
+fn map_preopen_custody_expiry(error: NodeError) -> NodeError {
+    if matches!(
+        error,
+        NodeError::Store(StoreError::Custody(
+            CustodyStoreError::Expired
+                | CustodyStoreError::AlreadyRetired
+                | CustodyStoreError::Retiring
+                | CustodyStoreError::ItemChanged
+                | CustodyStoreError::ItemNotFound
+                | CustodyStoreError::LeaseLimitExceeded { .. }
+                | CustodyStoreError::RetryLimitExceeded { .. }
+                | CustodyStoreError::RetryNotDue { .. }
+        ))
+    ) {
+        NodeError::CustodySendSkipped
+    } else {
+        error
+    }
+}
+
+impl Drop for CustodyLeaseGuard {
+    fn drop(&mut self) {
+        if let Some(lease) = self.lease.take() {
+            let _ = self.store.release_transfer_lease(lease.id);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CustodyExchangeSequence(u64);
+
+impl CustodyExchangeSequence {
+    const fn new() -> Self {
+        Self(1)
+    }
+
+    fn take(&mut self) -> Result<u64, NodeError> {
+        let current = self.0;
+        self.0 = self.0.checked_add(1).ok_or_else(|| {
+            NodeError::Protocol("custody exchange identifier sequence is exhausted".into())
+        })?;
+        Ok(current)
+    }
+}
+
+struct PreparedOutboundCustody {
+    exchange_id: u64,
+    transfer: CustodyTransferClaims,
+    finite_ttl_ms: Option<u64>,
+    emission_revision: u64,
+    peer_selector_revision: CustodyPeerSelectorRevision,
+    policy_revision: CustodyPolicyRevision,
+    lease: CustodyLeaseGuard,
+}
+
+impl PreparedOutboundCustody {
+    fn build_offer(
+        &self,
+        mission: &mut MissionSession,
+        direction: EventDirection,
+        transfer_id: EventTransferId,
+        bytes: Vec<u8>,
+    ) -> Result<(Frame, (u64, CustodySample)), NodeError> {
+        require_contact_policy_current()?;
+        let sample = contact_custody_sample()?.ok_or_else(|| {
+            NodeError::Protocol("authenticated custody send lacks a local clock sample".into())
+        })?;
+        let authorization = self
+            .lease
+            .require_send(sample, self.policy_revision)
+            .map_err(map_preopen_custody_expiry)?;
+        let observed_age_ms = authorization.age_ms;
+        let sample = authorization.sample.ok_or_else(|| {
+            NodeError::Protocol("custody store omitted the normalized send checkpoint".into())
+        })?;
+        let authenticated_age_ms = charged_custody_finalization_age(
+            observed_age_ms,
+            self.transfer.exact_len(),
+            self.finite_ttl_ms,
+        )?;
+        let prior_age_ms = self.lease.lease()?.age_ms;
+        let hop_delta_ms = authenticated_age_ms
+            .checked_sub(prior_age_ms)
+            .ok_or_else(|| {
+                NodeError::Protocol("custody age regressed while preparing a send".into())
+            })?;
+        let hop =
+            CustodyHop::new(prior_age_ms, sample, hop_delta_ms).map_err(custody_claim_error)?;
+        let claims =
+            CustodyClaims::new(self.transfer, self.exchange_id, self.emission_revision, hop)
+                .map_err(custody_claim_error)?;
+        let wrapper = mission.seal_custody_wrapper(&claims)?;
+        Ok((
+            Frame::OfferV3 {
+                direction,
+                id: transfer_id,
+                exchange_id: self.exchange_id,
+                custody: wrapper,
+                bytes,
+            },
+            (authenticated_age_ms, sample),
+        ))
+    }
+
+    fn require_final_send(
+        &self,
+        bound: (u64, CustodySample),
+    ) -> Result<(u64, CustodySample), NodeError> {
+        require_contact_policy_current()?;
+        let sample = contact_custody_sample()?.ok_or_else(|| {
+            NodeError::Protocol("final custody send lacks a local clock sample".into())
+        })?;
+        let authorization = self.lease.require_send(sample, self.policy_revision)?;
+        let authorization_sample = authorization.sample.ok_or_else(|| {
+            NodeError::Protocol("custody store omitted the normalized final-send checkpoint".into())
+        })?;
+        let post_check_sample = contact_custody_sample()?.ok_or_else(|| {
+            NodeError::Protocol("final custody send lacks a post-check clock sample".into())
+        })?;
+        if post_check_sample.clock_id != authorization_sample.clock_id {
+            return Err(NodeError::Protocol(
+                "custody clock continuity changed during the final durable send check".into(),
+            ));
+        }
+        let post_check_delta_ms = post_check_sample
+            .tick_ms
+            .checked_sub(authorization_sample.tick_ms)
+            .ok_or_else(|| {
+                NodeError::Protocol(
+                    "custody clock regressed during the final durable send check".into(),
+                )
+            })?;
+        let observed_age_ms = authorization
+            .age_ms
+            .checked_add(post_check_delta_ms)
+            .ok_or_else(|| {
+                NodeError::Protocol(
+                    "custody age overflowed during the final durable send check".into(),
+                )
+            })?;
+        require_finalization_within_charge(observed_age_ms, bound.0)?;
+        #[cfg(test)]
+        apply_test_policy_change_during_final_send()?;
+        // This is deliberately the last operation before the carrier invokes
+        // `write_all`: emission policy can change while the synchronous store
+        // authorization and post-check clock sampling above are in progress.
+        require_contact_policy_current()?;
+        Ok((bound.0, post_check_sample))
+    }
+
+    fn settle_apply(
+        self,
+        disposition: EventApplyDisposition,
+        authenticated_age_ms: u64,
+        sample: CustodySample,
+    ) -> Result<(), NodeError> {
+        let disposition = match disposition {
+            EventApplyDisposition::Satisfied => CustodyPeerApplyDisposition::Satisfied,
+            EventApplyDisposition::ContentAcceptancePending => {
+                CustodyPeerApplyDisposition::ContentAcceptancePending
+            }
+        };
+        self.lease.settle_apply(
+            disposition,
+            self.peer_selector_revision,
+            authenticated_age_ms,
+            sample,
+            self.policy_revision,
+        )
+    }
+}
+
+fn custody_claim_error(error: CustodyError) -> NodeError {
+    NodeError::Protocol(format!("invalid custody transfer claim: {error}"))
+}
+
+struct OutboundCustodySource<'a> {
+    peer: NodeId,
+    transfer_id: EventTransferId,
+    object: CustodyObjectKey,
+    policy_revision: CustodyPolicyRevision,
+    verified: &'a RouteVerifiedEventEnvelope,
+    exact_len: usize,
+    exchange_id: u64,
+    peer_selector_revision: CustodyPeerSelectorRevision,
+}
+
+fn prepare_outbound_custody(
+    store: Arc<Store>,
+    mission: &MissionSession,
+    source: OutboundCustodySource<'_>,
+) -> Result<PreparedOutboundCustody, NodeError> {
+    let OutboundCustodySource {
+        peer,
+        transfer_id,
+        object,
+        policy_revision,
+        verified,
+        exact_len,
+        exchange_id,
+        peer_selector_revision,
+    } = source;
+    if mission.semantic_version() < MIN_CUSTODY_SEMANTIC_VERSION {
+        return Err(NodeError::Protocol(
+            "custody wrappers require authenticated semantic protocol v3".into(),
+        ));
+    }
+    if verified.ttl_ms().is_some() && !verified.tombstone() && !contact_supports_finite_ttl() {
+        return Err(NodeError::Protocol(
+            "finite-TTL forwarding requires a suspend-inclusive custody clock".into(),
+        ));
+    }
+    let emission = contact_policy_or_normal()?;
+    if !emission.policy.permits_event(verified.priority()) {
+        return Err(NodeError::EmissionPolicyChanged);
+    }
+    let initial_sample = contact_custody_sample()?.ok_or_else(|| {
+        NodeError::Protocol("authenticated custody send lacks a local clock sample".into())
+    })?;
+    let lease = CustodyLeaseGuard::begin(
+        store,
+        peer,
+        object,
+        peer_selector_revision,
+        initial_sample,
+        policy_revision,
+    )
+    .map_err(map_preopen_custody_expiry)?;
+    let exact_len = u64::try_from(exact_len)
+        .map_err(|_| NodeError::Protocol("Event transfer length exceeds u64".into()))?;
+    let transfer = CustodyTransferClaims::new(
+        CustodyTransferId::from_exact_hash(*transfer_id.as_bytes()),
+        exact_len,
+        verified.ttl_ms(),
+        verified.priority(),
+    )
+    .map_err(custody_claim_error)?;
+    Ok(PreparedOutboundCustody {
+        exchange_id,
+        transfer,
+        finite_ttl_ms: verified.ttl_ms().filter(|_| !verified.tombstone()),
+        emission_revision: emission.revision,
+        peer_selector_revision,
+        policy_revision,
+        lease,
+    })
+}
+
+fn minimum_emission_priority(policy: EventEmissionPolicy) -> Result<Priority, NodeError> {
+    match policy {
+        EventEmissionPolicy::Normal => Ok(Priority::Routine),
+        EventEmissionPolicy::AtLeast(minimum) => Ok(minimum),
+        EventEmissionPolicy::ReceiveOnly => Err(NodeError::Protocol(
+            "receive-only policy has no outbound Event schedule".into(),
+        )),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct V3CustodyScheduleBudget {
+    max_offers: usize,
+    offer_wire_bytes: u64,
+}
+
+fn v3_custody_schedule_budget(
+    receipt: &PeerReceipt,
+    requested_offers: usize,
+    reserve_future_defer: bool,
+    post_event_semantic: Option<u16>,
+) -> Result<V3CustodyScheduleBudget, NodeError> {
+    let post_event = post_event_semantic.and_then(post_event_reserve);
+    let used_frames = receipt
+        .handshake_frames
+        .checked_add(receipt.protected_frames)
+        .ok_or_else(|| NodeError::Protocol("contact frame count overflow".into()))?;
+    let remaining_frames = MAX_CONTACT_FRAMES
+        .checked_sub(used_frames)
+        .ok_or_else(|| NodeError::Protocol("contact frame budget is exhausted".into()))?;
+    let reserved_exchanges = 1usize
+        .checked_add(usize::from(reserve_future_defer))
+        .and_then(|exchanges| {
+            exchanges.checked_add(post_event.map_or(0, |reserve| reserve.exchanges))
+        })
+        .ok_or_else(|| NodeError::Protocol("contact frame reserve overflow".into()))?;
+    let reserved_frames = EXCHANGE_FRAMES
+        .checked_mul(reserved_exchanges)
+        .ok_or_else(|| NodeError::Protocol("contact frame reserve overflow".into()))?;
+    let offer_frames = remaining_frames
+        .checked_sub(reserved_frames)
+        .ok_or_else(|| {
+            NodeError::Protocol("contact lacks the reserved Event finish exchange".into())
+        })?;
+    let max_offers = requested_offers.min(offer_frames / EXCHANGE_FRAMES);
+
+    let used_bytes = receipt
+        .handshake_bytes
+        .checked_add(receipt.protected_bytes)
+        .ok_or_else(|| NodeError::Protocol("contact byte count overflow".into()))?;
+    let remaining_bytes = MAX_CONTACT_BYTES
+        .checked_sub(used_bytes)
+        .ok_or_else(|| NodeError::Protocol("contact byte budget is exhausted".into()))?;
+    let reserved_bytes = FINISH_EXCHANGE_BYTES
+        .checked_add(if reserve_future_defer {
+            EVENT_LANE_DEFER_EXCHANGE_BYTES
+        } else {
+            0
+        })
+        .and_then(|bytes| bytes.checked_add(post_event.map_or(0, |reserve| reserve.bytes)))
+        .ok_or_else(|| NodeError::Protocol("contact byte reserve overflow".into()))?;
+    let offer_wire_bytes = remaining_bytes.checked_sub(reserved_bytes).ok_or_else(|| {
+        NodeError::Protocol("contact lacks the reserved Event continuation exchanges".into())
+    })?;
+    Ok(V3CustodyScheduleBudget {
+        max_offers,
+        offer_wire_bytes: u64::try_from(offer_wire_bytes)
+            .map_err(|_| NodeError::Protocol("contact byte budget exceeds u64".into()))?,
+    })
+}
+
+fn v3_offer_exchange_wire_bytes(accounted_bytes: u64) -> Result<u64, NodeError> {
+    accounted_bytes
+        .checked_add(
+            u64::try_from(OFFER_V3_EXCHANGE_OVERHEAD_BYTES)
+                .map_err(|_| NodeError::Protocol("v3 Event framing overhead exceeds u64".into()))?,
+        )
+        .ok_or_else(|| NodeError::Protocol("v3 Event exchange byte charge overflow".into()))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ScheduledCustodyTransfer {
+    transfer_id: EventTransferId,
+    object: CustodyObjectKey,
+    peer_selector_revision: CustodyPeerSelectorRevision,
+    policy_revision: CustodyPolicyRevision,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlannedEventTransfer {
+    Legacy(EventTransferId),
+    Custody(ScheduledCustodyTransfer),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CustodyScheduleReserve {
+    future_defer: bool,
+    post_event_semantic: Option<u16>,
+}
+
+impl PlannedEventTransfer {
+    const fn transfer_id(self) -> EventTransferId {
+        match self {
+            Self::Legacy(transfer_id) => transfer_id,
+            Self::Custody(scheduled) => scheduled.transfer_id,
+        }
+    }
+
+    const fn custody(self) -> Option<ScheduledCustodyTransfer> {
+        match self {
+            Self::Legacy(_) => None,
+            Self::Custody(scheduled) => Some(scheduled),
+        }
+    }
+}
+
+fn ordered_due_custody_transfers(
+    store: &Store,
+    peer: NodeId,
+    candidates: &[EventTransferId],
+    limit: usize,
+    receipt: &PeerReceipt,
+    evidence: CustodyReconciliationEvidence,
+    reserve: CustodyScheduleReserve,
+) -> Result<Vec<ScheduledCustodyTransfer>, NodeError> {
+    let budget = v3_custody_schedule_budget(
+        receipt,
+        limit,
+        reserve.future_defer,
+        reserve.post_event_semantic,
+    )?;
+    if candidates.is_empty() || budget.max_offers == 0 {
+        return Ok(Vec::new());
+    }
+    let emission = contact_policy_or_normal()?;
+    let minimum = minimum_emission_priority(emission.policy)?;
+    let sample = contact_custody_sample()?.ok_or_else(|| {
+        NodeError::Protocol("custody scheduling lacks a local clock sample".into())
+    })?;
+    let policy_revision = store.custody_policy_revision()?;
+    let peer_selector_revision = match evidence {
+        CustodyReconciliationEvidence::Blind(revision)
+        | CustodyReconciliationEvidence::AuthenticatedPeerMissing(revision) => revision,
+    };
+    // One store transaction normalizes continuity once and selects the global
+    // metadata-only top-K across the full negotiated difference. This avoids
+    // both payload cloning and thousands of page-sized writer commits.
+    let due = store.next_custody_outbound_bulk_from_transfers(
+        peer,
+        candidates,
+        CustodyReconciliationSelection::new(minimum, evidence),
+        budget.max_offers,
+        Some(sample),
+        policy_revision,
+    )?;
+    let mut selected_bytes = 0u64;
+    let mut ordered = Vec::new();
+    for candidate in due {
+        let exchange_bytes = v3_offer_exchange_wire_bytes(candidate.accounted_bytes)?;
+        let Some(next_bytes) = selected_bytes.checked_add(exchange_bytes) else {
+            break;
+        };
+        // A contact never skips a higher-ranked due item to send a lower one.
+        // This makes partial progress deterministic and preserves priority/FIFO
+        // order under both item and wire-byte pressure.
+        if next_bytes > budget.offer_wire_bytes {
+            break;
+        }
+        selected_bytes = next_bytes;
+        ordered.push(ScheduledCustodyTransfer {
+            transfer_id: EventTransferId::new(candidate.object.transfer_id()),
+            object: candidate.object,
+            peer_selector_revision,
+            policy_revision,
+        });
+    }
+    Ok(ordered)
+}
+
+fn verify_borrowed_stored_event_transfer(
+    verifier: &mut ReferenceEnvelopeSealer,
+    transfer: &StoredEventTransfer,
+) -> Result<(RouteVerifiedEventEnvelope, EventTransferState, usize), NodeError> {
+    match transfer {
+        StoredEventTransfer::Accepted(event) => {
+            let verified = verifier.verify_event(&event.sealed)?;
+            verify_stored_claim(
+                &verified,
+                event.transfer_id,
+                event.semantic_id,
+                &event.header,
+            )?;
+            Ok((verified, EventTransferState::Accepted, event.sealed.len()))
+        }
+        StoredEventTransfer::RouteCached(event) => {
+            let verified = verifier.verify_event(&event.sealed)?;
+            verify_stored_claim(
+                &verified,
+                event.transfer_id,
+                event.semantic_claim,
+                &event.header_claim,
+            )?;
+            Ok((
+                verified,
+                EventTransferState::RouteCached,
+                event.sealed.len(),
+            ))
+        }
+    }
+}
+
+fn stored_event_transfer_id(transfer: &StoredEventTransfer) -> EventTransferId {
+    match transfer {
+        StoredEventTransfer::Accepted(event) => event.transfer_id,
+        StoredEventTransfer::RouteCached(event) => event.transfer_id,
+    }
+}
+
+/// Attempts source authentication without treating an unavailable historical
+/// key as corruption. Callers must prove every deferred transfer with a later
+/// verifier before performing any custody mutation.
+fn try_verify_borrowed_stored_event_transfer(
+    verifier: &mut ReferenceEnvelopeSealer,
+    transfer: &StoredEventTransfer,
+) -> Result<Option<(RouteVerifiedEventEnvelope, EventTransferState, usize)>, NodeError> {
+    match transfer {
+        StoredEventTransfer::Accepted(event) => {
+            let Ok(verified) = verifier.verify_event(&event.sealed) else {
+                return Ok(None);
+            };
+            verify_stored_claim(
+                &verified,
+                event.transfer_id,
+                event.semantic_id,
+                &event.header,
+            )?;
+            Ok(Some((
+                verified,
+                EventTransferState::Accepted,
+                event.sealed.len(),
+            )))
+        }
+        StoredEventTransfer::RouteCached(event) => {
+            let Ok(verified) = verifier.verify_event(&event.sealed) else {
+                return Ok(None);
+            };
+            verify_stored_claim(
+                &verified,
+                event.transfer_id,
+                event.semantic_claim,
+                &event.header_claim,
+            )?;
+            Ok(Some((
+                verified,
+                EventTransferState::RouteCached,
+                event.sealed.len(),
+            )))
+        }
+    }
+}
+
+fn verify_stored_event_transfer(
+    verifier: &mut ReferenceEnvelopeSealer,
+    transfer: StoredEventTransfer,
+) -> Result<(RouteVerifiedEventEnvelope, Vec<u8>, EventTransferState), NodeError> {
+    let (verified, state, _) = verify_borrowed_stored_event_transfer(verifier, &transfer)?;
+    let sealed = match transfer {
+        StoredEventTransfer::Accepted(event) => event.sealed,
+        StoredEventTransfer::RouteCached(event) => event.sealed,
+    };
+    Ok((verified, sealed, state))
+}
+
+fn try_authenticate_stored_state(
+    verifier: &mut ReferenceEnvelopeSealer,
+    stored: &StoredState,
+    projection: &StateSenderProjection,
+) -> Result<Option<AuthenticatedMutableRouteClaim>, NodeError> {
+    let Ok(verified) = verifier.verify_state(&stored.sealed) else {
+        return Ok(None);
+    };
+    AuthenticatedMutableRouteClaim::from_verified_state(&verified, stored, projection).map(Some)
+}
+
+fn authenticate_stored_state(
+    verifier: &mut ReferenceEnvelopeSealer,
+    stored: &StoredState,
+    projection: &StateSenderProjection,
+) -> Result<AuthenticatedMutableRouteClaim, NodeError> {
+    let verified = verifier.verify_state(&stored.sealed)?;
+    AuthenticatedMutableRouteClaim::from_verified_state(&verified, stored, projection)
+}
+
+fn try_authenticate_stored_record(
+    verifier: &mut ReferenceEnvelopeSealer,
+    stored: &StoredRecord,
+    projection: &RecordSenderProjection,
+) -> Result<Option<AuthenticatedMutableRouteClaim>, NodeError> {
+    let Ok(verified) = verifier.verify_record(&stored.sealed) else {
+        return Ok(None);
+    };
+    AuthenticatedMutableRouteClaim::from_verified_record(&verified, stored, projection).map(Some)
+}
+
+fn authenticate_stored_record(
+    verifier: &mut ReferenceEnvelopeSealer,
+    stored: &StoredRecord,
+    projection: &RecordSenderProjection,
+) -> Result<AuthenticatedMutableRouteClaim, NodeError> {
+    let verified = verifier.verify_record(&stored.sealed)?;
+    AuthenticatedMutableRouteClaim::from_verified_record(&verified, stored, projection)
+}
+
+fn try_authenticate_blob_source(
+    verifier: &mut ReferenceEnvelopeSealer,
+    sealed: &[u8],
+    projection: &BlobSourceProjection,
+    retention: BlobSourceRetention,
+) -> Result<Option<AuthenticatedBlobRouteClaim>, NodeError> {
+    let Ok(route) = verifier.verify_blob(sealed) else {
+        return Ok(None);
+    };
+    let BlobContentVerification::ContentVerified { blob, .. } =
+        verifier.verify_blob_content(route, sealed)?
+    else {
+        return Ok(None);
+    };
+    AuthenticatedBlobRouteClaim::from_verified(&blob, sealed, projection, retention).map(Some)
+}
+
+fn authenticate_blob_source(
+    verifier: &mut ReferenceEnvelopeSealer,
+    sealed: &[u8],
+    projection: &BlobSourceProjection,
+    retention: BlobSourceRetention,
+) -> Result<AuthenticatedBlobRouteClaim, NodeError> {
+    let route = verifier.verify_blob(sealed)?;
+    let BlobContentVerification::ContentVerified { blob, .. } =
+        verifier.verify_blob_content(route, sealed)?
+    else {
+        return Err(NodeError::Protocol(
+            "retained Blob source cannot be opened by its current provider".into(),
+        ));
+    };
+    AuthenticatedBlobRouteClaim::from_verified(&blob, sealed, projection, retention)
+}
+
+fn retained_blob_sealed(
+    store: &Store,
+    projection: &BlobSourceProjection,
+    retention: BlobSourceRetention,
+) -> Result<Vec<u8>, NodeError> {
+    match retention {
+        BlobSourceRetention::Completed { .. } => store
+            .get_blob(projection.transfer_id)?
+            .map(|stored| stored.sealed)
+            .ok_or_else(|| {
+                NodeError::Protocol("completed Blob projection lost its source row".into())
+            }),
+        BlobSourceRetention::Pending => store
+            .pending_blob_source(projection.transfer_id)?
+            .map(|pending| pending.sealed)
+            .ok_or_else(|| {
+                NodeError::Protocol("pending Blob projection lost its source row".into())
+            }),
+    }
 }
 
 fn load_route_verified_transfer(
@@ -2458,29 +5978,568 @@ fn load_route_verified_transfer(
 ) -> Result<(RouteVerifiedEventEnvelope, Vec<u8>, EventTransferState), NodeError> {
     let transfer = store
         .get_transfer_with_policy(policy, transfer_id)?
-        .ok_or_else(|| NodeError::Protocol("authorized Event transfer is missing".into()))?;
-    match transfer {
-        StoredEventTransfer::Accepted(event) => {
-            let verified = verifier.verify_event(&event.sealed)?;
-            verify_stored_claim(
-                &verified,
-                event.transfer_id,
-                event.semantic_id,
-                &event.header,
-            )?;
-            Ok((verified, event.sealed, EventTransferState::Accepted))
+        .ok_or(NodeError::CustodySendSkipped)?;
+    verify_stored_event_transfer(verifier, transfer)
+}
+
+fn load_scheduled_route_verified_transfer(
+    store: &Store,
+    verifier: &mut ReferenceEnvelopeSealer,
+    scheduled: ScheduledCustodyTransfer,
+) -> Result<(RouteVerifiedEventEnvelope, Vec<u8>, EventTransferState), NodeError> {
+    let sample = contact_custody_sample()?.ok_or_else(|| {
+        NodeError::Protocol("scheduled custody load lacks a local clock sample".into())
+    })?;
+    let transfer = store
+        .load_scheduled_custody_transfer(scheduled.object, Some(sample), scheduled.policy_revision)?
+        .ok_or(NodeError::CustodySendSkipped)?;
+    let (verified, sealed, state) = verify_stored_event_transfer(verifier, transfer)?;
+    if EventTransferId::new(verified.envelope_id()) != scheduled.transfer_id
+        || state.custody_key(scheduled.transfer_id) != scheduled.object
+    {
+        return Err(NodeError::Protocol(
+            "scheduled custody source differs from its exact store authorization".into(),
+        ));
+    }
+    Ok((verified, sealed, state))
+}
+
+#[cfg(test)]
+fn rebuild_authenticated_event_route_cache(
+    store: &Store,
+    policy: &ControlPolicySnapshot,
+    verifier: &mut ReferenceEnvelopeSealer,
+    _sample: Option<CustodySample>,
+    cache: &AuthenticatedEventRouteCache,
+) -> Result<(), NodeError> {
+    cache.require_binding(verifier)?;
+    let control_head = store.control_head()?;
+    let policy_revision = store.custody_policy_revision()?;
+    let mut claims = BTreeMap::new();
+    let visited = store.visit_retained_custody_event_sources_with_policy::<NodeError, _>(
+        policy,
+        policy_revision,
+        |transfer| {
+            let (verified, state, exact_len) =
+                verify_borrowed_stored_event_transfer(verifier, transfer)?;
+            cache.record_source_verification();
+            let claim = AuthenticatedEventRouteClaim::from_verified(&verified, state, exact_len)?;
+            if claims.insert(claim.transfer_id, claim).is_some() {
+                return Err(NodeError::Protocol(
+                    "sender source snapshot contains a duplicate exact Event transfer".into(),
+                ));
+            }
+            if claims.len() > MAX_CARDINALITY_LIMIT {
+                return Err(NodeError::Protocol(
+                    "sender source snapshot exceeds the selected cardinality bound".into(),
+                ));
+            }
+            Ok(())
+        },
+    )?;
+    if visited != claims.len() {
+        return Err(NodeError::Protocol(
+            "retained source snapshot count differs from its exact verified claims".into(),
+        ));
+    }
+    if store.control_head()? != control_head {
+        return Err(NodeError::EmissionPolicyChanged);
+    }
+    cache.replace(verifier, control_head, claims)
+}
+
+#[cfg(test)]
+pub(crate) fn prewarm_authenticated_event_route_cache(
+    store: &Store,
+    policy: &ControlPolicySnapshot,
+    verifier: &mut ReferenceEnvelopeSealer,
+    sample: Option<CustodySample>,
+) -> Result<Arc<AuthenticatedEventRouteCache>, NodeError> {
+    let cache = Arc::new(AuthenticatedEventRouteCache::empty_for_store(
+        verifier, store,
+    )?);
+    rebuild_authenticated_event_route_cache(store, policy, verifier, sample, &cache)?;
+    Ok(cache)
+}
+
+/// Opens one verifier and proves every retained custody Event source before
+/// startup is allowed to mutate quotas, operation witnesses, or custody rows.
+///
+/// The pre-control pass preserves availability for retained default-key rows
+/// whose provisioning grant is later replaced by the first committed rekey.
+/// The final pass, after replaying the exact durable control prefix into the
+/// same verifier, proves dynamic-key rows. Every exact retained transfer must
+/// be covered by the union before this function returns.
+pub(crate) struct StartupEventVerification {
+    pub verifier: ReferenceEnvelopeSealer,
+    pub historical_verifier: ReferenceEnvelopeSealer,
+    pub cache: Arc<AuthenticatedEventRouteCache>,
+    pub policy: ControlPolicySnapshot,
+}
+
+pub(crate) fn open_startup_event_verifier_and_cache(
+    store: &Store,
+    credentials: &UnprotectedReferenceMission,
+) -> Result<StartupEventVerification, NodeError> {
+    let mut verifier = ReferenceEnvelopeSealer::open(credentials.fresh_bundle()?)?;
+    let historical_verifier = ReferenceEnvelopeSealer::open(credentials.fresh_bundle()?)?;
+    let initial_policy = store.control_policy_snapshot()?;
+    let policy_revision = store.custody_policy_revision()?;
+    let cache = Arc::new(AuthenticatedEventRouteCache::empty_for_store(
+        &verifier, store,
+    )?);
+    let mut retained = BTreeSet::new();
+    let mut claims = BTreeMap::new();
+    let mut retained_states = BTreeSet::new();
+    let mut retained_records = BTreeSet::new();
+    let mut mutable_claims = BTreeMap::new();
+    let mut retained_blobs = BTreeMap::new();
+    let mut blob_claims = BTreeMap::new();
+
+    let first_visited = store.visit_retained_custody_event_sources_with_policy::<NodeError, _>(
+        &initial_policy,
+        policy_revision,
+        |transfer| {
+            let transfer_id = stored_event_transfer_id(transfer);
+            if !retained.insert(transfer_id) {
+                return Err(NodeError::Protocol(
+                    "retained source snapshot contains a duplicate exact Event transfer".into(),
+                ));
+            }
+            if let Some((verified, state, exact_len)) =
+                try_verify_borrowed_stored_event_transfer(&mut verifier, transfer)?
+            {
+                cache.record_source_verification();
+                let claim =
+                    AuthenticatedEventRouteClaim::from_verified(&verified, state, exact_len)?;
+                if claim.transfer_id != transfer_id || claims.insert(transfer_id, claim).is_some() {
+                    return Err(NodeError::Protocol(
+                        "pre-control retained Event proof differs from its exact transfer".into(),
+                    ));
+                }
+            }
+            if retained.len() > MAX_CARDINALITY_LIMIT {
+                return Err(NodeError::Protocol(
+                    "retained Event proof exceeds the selected cardinality bound".into(),
+                ));
+            }
+            Ok(())
+        },
+    )?;
+    if first_visited != retained.len() {
+        return Err(NodeError::Protocol(
+            "pre-control retained Event snapshot count differs".into(),
+        ));
+    }
+
+    let first_state_visited = store.visit_retained_state_sources_with_policy::<NodeError, _>(
+        &initial_policy,
+        |stored, projection| {
+            let transfer_id = projection.transfer_id();
+            if stored.transfer_id != transfer_id || !retained_states.insert(transfer_id) {
+                return Err(NodeError::Protocol(
+                    "pre-control retained State snapshot contains a duplicate or mismatched exact transfer"
+                        .into(),
+                ));
+            }
+            if let Some(claim) =
+                try_authenticate_stored_state(&mut verifier, stored, projection)?
+            {
+                cache.record_mutable_source_verification();
+                let id = MutableTransferId::State(transfer_id);
+                if claim.transfer_id != id || mutable_claims.insert(id, claim).is_some() {
+                    return Err(NodeError::Protocol(
+                        "pre-control retained State proof differs from its exact transfer".into(),
+                    ));
+                }
+            }
+            Ok(())
+        },
+    )?;
+    if first_state_visited != retained_states.len() {
+        return Err(NodeError::Protocol(
+            "pre-control retained State snapshot count differs".into(),
+        ));
+    }
+    let first_record_visited = store.visit_retained_record_sources_with_policy::<NodeError, _>(
+        &initial_policy,
+        |stored, projection| {
+            let transfer_id = projection.transfer_id();
+            if stored.transfer_id != transfer_id || !retained_records.insert(transfer_id) {
+                return Err(NodeError::Protocol(
+                    "pre-control retained Record snapshot contains a duplicate or mismatched exact transfer"
+                        .into(),
+                ));
+            }
+            if let Some(claim) =
+                try_authenticate_stored_record(&mut verifier, stored, projection)?
+            {
+                cache.record_mutable_source_verification();
+                let id = MutableTransferId::Record(transfer_id);
+                if claim.transfer_id != id || mutable_claims.insert(id, claim).is_some() {
+                    return Err(NodeError::Protocol(
+                        "pre-control retained Record proof differs from its exact transfer".into(),
+                    ));
+                }
+            }
+            Ok(())
+        },
+    )?;
+    if first_record_visited != retained_records.len()
+        || retained_states
+            .len()
+            .checked_add(retained_records.len())
+            .is_none_or(|count| count > MAX_AUTHENTICATED_MUTABLE_ROUTE_CLAIMS)
+    {
+        return Err(NodeError::Protocol(
+            "pre-control retained mutable snapshot exceeds or differs from its bound".into(),
+        ));
+    }
+
+    let mut first_blobs = Vec::new();
+    store.visit_retained_blob_sources(None, |item| first_blobs.push(item.clone()))?;
+    for item in first_blobs {
+        let id = item.source.transfer_id;
+        if retained_blobs
+            .insert(id, (item.source.clone(), item.retention))
+            .is_some()
+        {
+            return Err(NodeError::Protocol(
+                "pre-control retained Blob snapshot contains a duplicate exact transfer".into(),
+            ));
         }
-        StoredEventTransfer::RouteCached(event) => {
-            let verified = verifier.verify_event(&event.sealed)?;
-            verify_stored_claim(
-                &verified,
-                event.transfer_id,
-                event.semantic_claim,
-                &event.header_claim,
-            )?;
-            Ok((verified, event.sealed, EventTransferState::RouteCached))
+        let sealed = retained_blob_sealed(store, &item.source, item.retention)?;
+        if let Some(claim) =
+            try_authenticate_blob_source(&mut verifier, &sealed, &item.source, item.retention)?
+            && (claim.transfer_id != id || blob_claims.insert(id, claim).is_some())
+        {
+            return Err(NodeError::Protocol(
+                "pre-control retained Blob proof differs from its exact transfer".into(),
+            ));
         }
     }
+    if retained_blobs.len() > cache.blob_capacity {
+        return Err(NodeError::Protocol(
+            "pre-control retained Blob snapshot exceeds its durable bounds".into(),
+        ));
+    }
+
+    replay_applied_controls(store, &mut verifier)?;
+    let final_policy = store.control_policy_snapshot()?;
+    let mut final_seen = BTreeSet::new();
+    let second_visited = store.visit_retained_custody_event_sources_with_policy::<NodeError, _>(
+        &final_policy,
+        policy_revision,
+        |transfer| {
+            let transfer_id = stored_event_transfer_id(transfer);
+            if !final_seen.insert(transfer_id) || !retained.contains(&transfer_id) {
+                return Err(NodeError::Protocol(
+                    "final retained Event snapshot differs from the pre-control snapshot".into(),
+                ));
+            }
+            if let Entry::Vacant(entry) = claims.entry(transfer_id) {
+                let (verified, state, exact_len) =
+                    verify_borrowed_stored_event_transfer(&mut verifier, transfer)?;
+                cache.record_source_verification();
+                let claim =
+                    AuthenticatedEventRouteClaim::from_verified(&verified, state, exact_len)?;
+                if claim.transfer_id != transfer_id {
+                    return Err(NodeError::Protocol(
+                        "final retained Event proof differs from its exact transfer".into(),
+                    ));
+                }
+                entry.insert(claim);
+            }
+            Ok(())
+        },
+    )?;
+    if second_visited != retained.len() || final_seen != retained || claims.len() != retained.len()
+    {
+        return Err(NodeError::Protocol(
+            "retained Event source proof is incomplete across control replay".into(),
+        ));
+    }
+    let mut final_states = BTreeSet::new();
+    let second_state_visited = store.visit_retained_state_sources_with_policy::<NodeError, _>(
+        &final_policy,
+        |stored, projection| {
+            let transfer_id = projection.transfer_id();
+            if !final_states.insert(transfer_id) || !retained_states.contains(&transfer_id) {
+                return Err(NodeError::Protocol(
+                    "final retained State snapshot differs from the pre-control snapshot".into(),
+                ));
+            }
+            let id = MutableTransferId::State(transfer_id);
+            if let Entry::Vacant(entry) = mutable_claims.entry(id) {
+                let claim = authenticate_stored_state(&mut verifier, stored, projection)?;
+                cache.record_mutable_source_verification();
+                if claim.transfer_id != id {
+                    return Err(NodeError::Protocol(
+                        "final retained State proof differs from its exact transfer".into(),
+                    ));
+                }
+                entry.insert(claim);
+            }
+            Ok(())
+        },
+    )?;
+    let mut final_records = BTreeSet::new();
+    let second_record_visited = store.visit_retained_record_sources_with_policy::<NodeError, _>(
+        &final_policy,
+        |stored, projection| {
+            let transfer_id = projection.transfer_id();
+            if !final_records.insert(transfer_id) || !retained_records.contains(&transfer_id) {
+                return Err(NodeError::Protocol(
+                    "final retained Record snapshot differs from the pre-control snapshot".into(),
+                ));
+            }
+            let id = MutableTransferId::Record(transfer_id);
+            if let Entry::Vacant(entry) = mutable_claims.entry(id) {
+                let claim = authenticate_stored_record(&mut verifier, stored, projection)?;
+                cache.record_mutable_source_verification();
+                if claim.transfer_id != id {
+                    return Err(NodeError::Protocol(
+                        "final retained Record proof differs from its exact transfer".into(),
+                    ));
+                }
+                entry.insert(claim);
+            }
+            Ok(())
+        },
+    )?;
+    let retained_mutable_count = retained_states
+        .len()
+        .checked_add(retained_records.len())
+        .ok_or_else(|| NodeError::Protocol("retained mutable proof count overflow".into()))?;
+    if second_state_visited != retained_states.len()
+        || second_record_visited != retained_records.len()
+        || final_states != retained_states
+        || final_records != retained_records
+        || mutable_claims.len() != retained_mutable_count
+    {
+        return Err(NodeError::Protocol(
+            "retained mutable source proof is incomplete across control replay".into(),
+        ));
+    }
+    let mut final_blobs = Vec::new();
+    store.visit_retained_blob_sources(None, |item| final_blobs.push(item.clone()))?;
+    let mut final_blob_ids = BTreeSet::new();
+    for item in final_blobs {
+        let id = item.source.transfer_id;
+        if !final_blob_ids.insert(id)
+            || retained_blobs.get(&id) != Some(&(item.source.clone(), item.retention))
+        {
+            return Err(NodeError::Protocol(
+                "final retained Blob snapshot differs from the pre-control snapshot".into(),
+            ));
+        }
+        if let Entry::Vacant(entry) = blob_claims.entry(id) {
+            let sealed = retained_blob_sealed(store, &item.source, item.retention)?;
+            let claim =
+                authenticate_blob_source(&mut verifier, &sealed, &item.source, item.retention)?;
+            if claim.transfer_id != id {
+                return Err(NodeError::Protocol(
+                    "final retained Blob proof differs from its exact transfer".into(),
+                ));
+            }
+            entry.insert(claim);
+        }
+    }
+    if final_blob_ids.len() != retained_blobs.len() || blob_claims.len() != retained_blobs.len() {
+        return Err(NodeError::Protocol(
+            "retained Blob source proof is incomplete across control replay".into(),
+        ));
+    }
+    let control_head = store.control_head()?;
+    if final_policy.head() != control_head {
+        return Err(NodeError::Protocol(
+            "retained Event proof policy differs from the replayed control head".into(),
+        ));
+    }
+    cache.replace(&verifier, control_head, claims)?;
+    cache.replace_mutable(&verifier, mutable_claims)?;
+    cache.replace_blobs(&verifier, blob_claims)?;
+    cleanup_ineligible_pending_blobs(store, &mut verifier, &cache)?;
+    Ok(StartupEventVerification {
+        verifier,
+        historical_verifier,
+        cache,
+        policy: final_policy,
+    })
+}
+
+pub(crate) fn prune_authenticated_event_route_cache_to_sender_projection(
+    store: &Store,
+    policy: &ControlPolicySnapshot,
+    verifier: &ReferenceEnvelopeSealer,
+    sample: Option<CustodySample>,
+    cache: &AuthenticatedEventRouteCache,
+) -> Result<(), NodeError> {
+    cache.require_binding(verifier)?;
+    let control_head = store.control_head()?;
+    let projections = store.sender_transfer_inventory_with_policy(
+        policy,
+        sample,
+        store.custody_policy_revision()?,
+    )?;
+    let mut projected = Vec::with_capacity(projections.len());
+    for projection in projections {
+        let transfer_id = EventTransferId::new(projection.object().transfer_id());
+        let claim = cache.get(verifier, transfer_id)?.ok_or_else(|| {
+            NodeError::Protocol(
+                "sender projection lacks its startup-authenticated Event capability".into(),
+            )
+        })?;
+        if !claim.matches_projection(&projection) {
+            return Err(NodeError::Protocol(
+                "sender projection differs from its startup-authenticated Event capability".into(),
+            ));
+        }
+        // Keep historical-but-authenticated claims cached even when a
+        // same-epoch rekey replaced their exact route lineage. Contacts use
+        // the lineage check to withhold them; retaining the capability avoids
+        // treating that safe historical row as an unproved cache miss later.
+        projected.push(transfer_id);
+    }
+    projected.sort_unstable();
+    projected.dedup();
+    cache.prune_to(&projected)?;
+    if store.control_head()? != control_head {
+        return Err(NodeError::EmissionPolicyChanged);
+    }
+    cache.observe_control_head(verifier, control_head)
+}
+
+pub(crate) fn cache_accepted_stored_event(
+    cache: &AuthenticatedEventRouteCache,
+    verifier: &mut ReferenceEnvelopeSealer,
+    event: &StoredEvent,
+) -> Result<(), NodeError> {
+    let verified = verifier.verify_event(&event.sealed)?;
+    verify_stored_claim(
+        &verified,
+        event.transfer_id,
+        event.semantic_id,
+        &event.header,
+    )?;
+    let claim = AuthenticatedEventRouteClaim::from_verified(
+        &verified,
+        EventTransferState::Accepted,
+        event.sealed.len(),
+    )?;
+    cache.insert(verifier, claim)
+}
+
+fn cache_contact_verified_event(
+    verifier: &ReferenceEnvelopeSealer,
+    claim: AuthenticatedEventRouteClaim,
+) -> Result<(), NodeError> {
+    CONTACT_EVENT_ROUTE_CACHE
+        .try_with(|cache| cache.insert(verifier, claim))
+        .map_or(Ok(()), |result| result)
+}
+
+fn cached_sender_route_claims(
+    store: &Store,
+    policy: &ControlPolicySnapshot,
+    verifier: &mut ReferenceEnvelopeSealer,
+) -> Result<Vec<AuthenticatedEventRouteClaim>, NodeError> {
+    let cache = match CONTACT_EVENT_ROUTE_CACHE.try_with(Arc::clone) {
+        Ok(cache) => {
+            cache.require_binding(verifier)?;
+            cache.observe_control_head(verifier, store.control_head()?)?;
+            cache
+        }
+        Err(_) => {
+            #[cfg(not(test))]
+            return Err(NodeError::Protocol(
+                "contact lacks an authenticated Event route cache".into(),
+            ));
+            #[cfg(test)]
+            prewarm_authenticated_event_route_cache(
+                store,
+                policy,
+                verifier,
+                contact_custody_sample()?,
+            )?
+        }
+    };
+    let sample = contact_custody_sample()?;
+    let policy_revision = store.custody_policy_revision()?;
+    let projections =
+        store.sender_transfer_inventory_with_policy(policy, sample, policy_revision)?;
+    let mut projected = projections
+        .iter()
+        .map(|projection| EventTransferId::new(projection.object().transfer_id()))
+        .collect::<Vec<_>>();
+    projected.sort_unstable();
+    projected.dedup();
+    // Prune before admitting misses so stale retirement claims cannot occupy
+    // the full cardinality bound and block a newly live exact transfer.
+    cache.prune_to(&projected)?;
+    let mut claims = Vec::with_capacity(projections.len());
+    for projection in projections {
+        let transfer_id = EventTransferId::new(projection.object().transfer_id());
+        let mut claim = cache.get(verifier, transfer_id)?;
+        if let Some(existing) = claim.as_ref()
+            && existing.object != projection.object()
+            && existing.matches_projection_source(&projection)
+        {
+            let route = CustodyObjectKey::route_event(transfer_id);
+            let accepted = CustodyObjectKey::event(transfer_id);
+            if existing.object == accepted && projection.object() == route {
+                // The store snapshot can precede a concurrent promotion whose
+                // cache insert already completed. Class-neutral reconciliation
+                // may safely withhold this stale projection until next contact.
+                continue;
+            }
+            if existing.object != route || projection.object() != accepted {
+                return Err(NodeError::Protocol(
+                    "fresh sender projection reverses an accepted Event to route-only state".into(),
+                ));
+            }
+            let promoted = existing.clone().with_object(projection.object());
+            cache.insert(verifier, promoted.clone())?;
+            claim = Some(promoted);
+        }
+        let claim = match claim {
+            Some(claim) => claim,
+            None => {
+                let Some(transfer) = store.load_scheduled_custody_transfer(
+                    projection.object(),
+                    sample,
+                    policy_revision,
+                )?
+                else {
+                    // The one-snapshot projection became stale before its exact
+                    // cache miss could be authenticated. Withhold it; a later
+                    // contact will derive a fresh projection.
+                    continue;
+                };
+                let (verified, state, exact_len) =
+                    verify_borrowed_stored_event_transfer(verifier, &transfer)?;
+                cache.record_source_verification();
+                let claim =
+                    AuthenticatedEventRouteClaim::from_verified(&verified, state, exact_len)?;
+                cache.insert(verifier, claim.clone())?;
+                claim
+            }
+        };
+        if !claim.matches_projection(&projection) {
+            return Err(NodeError::Protocol(
+                "fresh sender projection differs from its authenticated Event route claim".into(),
+            ));
+        }
+        if !verifier.is_current_event_route_lineage(
+            &claim.scope,
+            claim.key_epoch,
+            claim.route_lineage,
+        ) {
+            continue;
+        }
+        claims.push(claim);
+    }
+    Ok(claims)
 }
 
 fn transfer_inventory_for_peer(
@@ -2490,27 +6549,26 @@ fn transfer_inventory_for_peer(
     peer: NodeId,
     peer_route_commitments: &[[u8; 32]],
     receiver_interest: &EventInterest,
+    allow_finite_ttl: bool,
 ) -> Result<InventorySnapshot, NodeError> {
     if receiver_interest.is_empty() {
         return Ok(InventorySnapshot::default());
     }
-    let inventory = store.transfer_inventory_with_policy(policy)?;
+    let claims = cached_sender_route_claims(store, policy, verifier)?;
+    let emission = contact_policy_or_normal()?;
     let mut authorized = Vec::new();
-    for transfer_id in inventory.iter().copied() {
-        let (verified, _, _) = load_route_verified_transfer(store, policy, verifier, transfer_id)?;
-        if event_is_inactive(store, &verified)? {
+    for claim in claims {
+        if !allow_finite_ttl && claim.ttl_ms.is_some() && !claim.tombstone {
             continue;
         }
-        if !receiver_interest.matches(verified.topic(), verified.scope()) {
+        if !emission.policy.permits_event(claim.priority) {
             continue;
         }
-        if verifier.peer_can_route(
-            peer,
-            peer_route_commitments,
-            verified.scope(),
-            verified.key_epoch(),
-        ) {
-            authorized.push(transfer_id.reconciliation_item_id());
+        if !receiver_interest.matches(&claim.topic, &claim.scope) {
+            continue;
+        }
+        if verifier.peer_can_route(peer, peer_route_commitments, &claim.scope, claim.key_epoch) {
+            authorized.push(claim.transfer_id.reconciliation_item_id());
         }
     }
     Ok(InventorySnapshot::new(authorized))
@@ -2526,39 +6584,75 @@ fn transfer_inventory_for_receiver(
     policy: &EventReplicationPolicySnapshot,
     verifier: &mut ReferenceEnvelopeSealer,
     receiver_interest: &EventInterest,
+    allow_finite_ttl: bool,
 ) -> Result<InventorySnapshot, NodeError> {
     if receiver_interest.is_empty() {
         return Ok(InventorySnapshot::default());
     }
-    let inventory = store.transfer_inventory_with_policy(policy.control_policy())?;
+    let claims = cached_sender_route_claims(store, policy.control_policy(), verifier)?;
     let mut authorized = Vec::new();
-    for transfer_id in inventory.iter().copied() {
-        let (verified, _, state) =
-            load_route_verified_transfer(store, policy.control_policy(), verifier, transfer_id)?;
-        if event_is_inactive(store, &verified)? {
+    for claim in claims {
+        if !allow_finite_ttl && claim.ttl_ms.is_some() && !claim.tombstone {
             continue;
         }
-        if !receiver_interest.matches(verified.topic(), verified.scope()) {
+        if !receiver_interest.matches(&claim.topic, &claim.scope) {
             continue;
         }
-        let Some(mode) = policy.effective_mode(verified.topic(), verified.scope()) else {
+        let Some(mode) = policy.effective_mode(&claim.topic, &claim.scope) else {
             continue;
         };
-        if state == EventTransferState::RouteCached && mode == EventSubscriptionMode::Consume {
+        if claim.is_route_cached() && mode == EventSubscriptionMode::Consume {
             continue;
         }
-        authorized.push(transfer_id.reconciliation_item_id());
+        authorized.push(claim.transfer_id.reconciliation_item_id());
+    }
+    // Retired exact IDs belong only to the receiver baseline. They suppress
+    // endless re-offers after payload GC without ever advertising bytes that
+    // this node can no longer serve. The store filters the retained
+    // authenticated metadata through the exact replication-policy snapshot;
+    // the negotiated interest is rechecked here as an additional narrowing.
+    let cardinality_limit = MAX_CARDINALITY_LIMIT;
+    let mut after = None;
+    loop {
+        let page = store.event_receiver_fences_with_policy(policy, after, MAX_CUSTODY_PAGE)?;
+        if page.is_empty() {
+            break;
+        }
+        after = page.last().map(|fence| fence.object);
+        let complete = page.len() < MAX_CUSTODY_PAGE;
+        for fence in page {
+            if !receiver_interest.matches(&fence.topic, &fence.scope) {
+                continue;
+            }
+            if !verifier.can_route_event(&fence.scope, fence.key_epoch) {
+                continue;
+            }
+            // Retirement is a permanent exact-transfer fence. A later
+            // Carry/Consume selector change cannot resurrect the same bytes;
+            // a source must publish a new exact Event revision to reacquire.
+            if authorized.len() == cardinality_limit {
+                return Err(NodeError::Protocol(
+                    "receiver inventory exceeds the reconciliation cardinality bound".into(),
+                ));
+            }
+            authorized
+                .push(EventTransferId::new(fence.object.transfer_id()).reconciliation_item_id());
+        }
+        if complete {
+            break;
+        }
     }
     Ok(InventorySnapshot::new(authorized))
 }
 
-fn event_epoch_is_stale(
+fn event_epoch_is_inactive(
     store: &Store,
     verified: &RouteVerifiedEventEnvelope,
 ) -> Result<bool, NodeError> {
-    Ok(store
+    let active = store
         .active_scope_epoch(verified.scope())?
-        .is_some_and(|(epoch, _)| verified.key_epoch() < epoch))
+        .map_or(1, |(epoch, _)| epoch);
+    Ok(verified.key_epoch() != active)
 }
 
 fn event_source_is_revoked(
@@ -2572,23 +6666,81 @@ pub(crate) fn event_is_inactive(
     store: &Store,
     verified: &RouteVerifiedEventEnvelope,
 ) -> Result<bool, NodeError> {
-    Ok(event_epoch_is_stale(store, verified)? || event_source_is_revoked(store, verified)?)
+    Ok(event_epoch_is_inactive(store, verified)? || event_source_is_revoked(store, verified)?)
 }
 
 fn ensure_event_epoch_active(
     store: &Store,
     verified: &RouteVerifiedEventEnvelope,
 ) -> Result<(), NodeError> {
-    if let Some((current, _)) = store.active_scope_epoch(verified.scope())?
-        && verified.key_epoch() < current
-    {
+    let current = store
+        .active_scope_epoch(verified.scope())?
+        .map_or(1, |(epoch, _)| epoch);
+    if verified.key_epoch() != current {
         return Err(NodeError::Protocol(format!(
-            "Event key epoch {} is stale behind active scope epoch {current}",
+            "Event key epoch {} is not the active scope epoch {current}",
             verified.key_epoch()
         )));
     }
     ensure_principal_active(store, verified.publisher())?;
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReceivedEventApply {
+    inserted: bool,
+    disposition: EventApplyDisposition,
+}
+
+impl ReceivedEventApply {
+    const fn accepted(inserted: bool) -> Self {
+        Self {
+            inserted,
+            disposition: EventApplyDisposition::Satisfied,
+        }
+    }
+
+    const fn from_route_cache(outcome: RouteCacheOutcome) -> Self {
+        let inserted = matches!(outcome, RouteCacheOutcome::Inserted { .. });
+        let disposition = match outcome.custody_disposition() {
+            CustodyPeerApplyDisposition::Satisfied => EventApplyDisposition::Satisfied,
+            CustodyPeerApplyDisposition::ContentAcceptancePending => {
+                EventApplyDisposition::ContentAcceptancePending
+            }
+        };
+        Self {
+            inserted,
+            disposition,
+        }
+    }
+}
+
+fn verify_received_event_content(
+    verifier: &mut ReferenceEnvelopeSealer,
+    route_verified: RouteVerifiedEventEnvelope,
+    sealed: &[u8],
+    _transfer_id: EventTransferId,
+) -> Result<EventContentVerification, NodeError> {
+    #[cfg(test)]
+    if TEST_CUSTODY_PREOPEN_RACES
+        .try_with(|races| {
+            let mut races = races.borrow_mut();
+            let index = races.iter().position(
+                |race| matches!(race, TestCustodyPreopenRace::ForceRouteOnly(id) if *id == _transfer_id),
+            )?;
+            races.remove(index);
+            Some(())
+        })
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        // Deterministically model a transiently unavailable content grant
+        // after route authentication. Later contacts use the same identity and
+        // verifier without this hook and can promote the exact retained bytes.
+        return Ok(EventContentVerification::RouteOnly(route_verified));
+    }
+    Ok(verifier.verify_event_content(route_verified, sealed)?)
 }
 
 fn accept_received_transfer(
@@ -2597,13 +6749,64 @@ fn accept_received_transfer(
     authority: EventReceiveAuthority<'_>,
     transfer_id: EventTransferId,
     sealed: &[u8],
-) -> Result<bool, NodeError> {
+    custody: Option<ReceivedCustody<'_>>,
+) -> Result<ReceivedEventApply, NodeError> {
     let route_verified = verifier.verify_event(sealed)?;
     if EventTransferId::new(route_verified.envelope_id()) != transfer_id {
         return Err(NodeError::Protocol(
             "received Event bytes do not match their exact transfer identity".into(),
         ));
     }
+    let finite = route_verified.ttl_ms().is_some() && !route_verified.tombstone();
+    if finite && !contact_supports_finite_ttl() {
+        return Err(NodeError::Protocol(
+            "finite-TTL admission requires a suspend-inclusive custody clock".into(),
+        ));
+    }
+    // Capture the exact durable policy generation before opening the wrapper;
+    // the atomic store call rechecks it after all cryptographic work.
+    let expected_custody_revision = if custody.is_some() {
+        Some(store.custody_policy_revision()?)
+    } else {
+        None
+    };
+    let verified_custody = if let Some(custody) = custody {
+        let exact_len = u64::try_from(sealed.len())
+            .map_err(|_| NodeError::Protocol("received Event length exceeds u64".into()))?;
+        let transfer = CustodyTransferClaims::new(
+            CustodyTransferId::from_exact_hash(*transfer_id.as_bytes()),
+            exact_len,
+            route_verified.ttl_ms(),
+            route_verified.priority(),
+        )
+        .map_err(custody_claim_error)?;
+        let expected = CustodyExpectation::new(transfer, custody.exchange_id);
+        let verified = custody
+            .mission
+            .open_custody_wrapper(custody.wrapper, expected)?;
+        if verified.policy_revision() != custody.expected_policy_revision {
+            return Err(NodeError::Protocol(
+                "custody claim policy revision differs from the authenticated sender snapshot"
+                    .into(),
+            ));
+        }
+        if finite
+            && let Some(ttl_ms) = route_verified.ttl_ms()
+            && verified.forwarding_age_ms() >= ttl_ms
+        {
+            return Err(NodeError::Protocol(
+                "received Event is expired at its authenticated cumulative age".into(),
+            ));
+        }
+        Some(verified)
+    } else {
+        if finite {
+            return Err(NodeError::Protocol(
+                "finite-TTL Event arrived without an authenticated v3 custody wrapper".into(),
+            ));
+        }
+        None
+    };
     ensure_event_epoch_active(store, &route_verified)?;
     if !authority
         .receiver_interest
@@ -2633,28 +6836,104 @@ fn accept_received_transfer(
         ));
     };
     if mode == EventSubscriptionMode::Carry {
-        let outcome = store.cache_route_verified_event_with_replication_policy(
-            authority.local_replication_policy,
+        let route_claim = AuthenticatedEventRouteClaim::from_verified(
             &route_verified,
-            sealed,
+            EventTransferState::RouteCached,
+            sealed.len(),
         )?;
-        return Ok(matches!(outcome, RouteCacheOutcome::Inserted { .. }));
-    }
-    match verifier.verify_event_content(route_verified, sealed)? {
-        EventContentVerification::ContentVerified { event, .. } => Ok(store
-            .apply_verified_event_with_replication_policy(
+        let outcome = if let Some(claims) = verified_custody.as_ref() {
+            require_contact_policy_current()?;
+            let receiver_sample = contact_custody_sample()?.ok_or_else(|| {
+                NodeError::Protocol("v3 Event admission lacks a receiver clock sample".into())
+            })?;
+            store.cache_route_verified_event_with_custody_policy(
                 authority.local_replication_policy,
-                &event,
+                expected_custody_revision.ok_or_else(|| {
+                    NodeError::Protocol("v3 custody revision was not captured".into())
+                })?,
+                claims,
+                receiver_sample,
+                &route_verified,
                 sealed,
             )?
-            .inserted()),
-        EventContentVerification::RouteOnly(event) => {
-            let outcome = store.cache_route_verified_event_with_replication_policy(
+        } else {
+            store.cache_route_verified_event_with_replication_policy(
                 authority.local_replication_policy,
-                &event,
+                &route_verified,
                 sealed,
+            )?
+        };
+        let apply = ReceivedEventApply::from_route_cache(outcome);
+        if apply.inserted {
+            cache_contact_verified_event(verifier, route_claim)?;
+        }
+        return Ok(apply);
+    }
+    let accepted_claim = AuthenticatedEventRouteClaim::from_verified(
+        &route_verified,
+        EventTransferState::Accepted,
+        sealed.len(),
+    )?;
+    match verify_received_event_content(verifier, route_verified, sealed, transfer_id)? {
+        EventContentVerification::ContentVerified { event, .. } => {
+            let outcome = if let Some(claims) = verified_custody.as_ref() {
+                require_contact_policy_current()?;
+                let receiver_sample = contact_custody_sample()?.ok_or_else(|| {
+                    NodeError::Protocol("v3 Event admission lacks a receiver clock sample".into())
+                })?;
+                store.apply_verified_event_with_custody_policy(
+                    authority.local_replication_policy,
+                    expected_custody_revision.ok_or_else(|| {
+                        NodeError::Protocol("v3 custody revision was not captured".into())
+                    })?,
+                    claims,
+                    receiver_sample,
+                    &event,
+                    sealed,
+                )?
+            } else {
+                store.apply_verified_event_with_replication_policy(
+                    authority.local_replication_policy,
+                    &event,
+                    sealed,
+                )?
+            };
+            cache_contact_verified_event(verifier, accepted_claim)?;
+            Ok(ReceivedEventApply::accepted(outcome.inserted()))
+        }
+        EventContentVerification::RouteOnly(event) => {
+            let route_claim = AuthenticatedEventRouteClaim::from_verified(
+                &event,
+                EventTransferState::RouteCached,
+                sealed.len(),
             )?;
-            Ok(matches!(outcome, RouteCacheOutcome::Inserted { .. }))
+            let outcome = if let Some(claims) = verified_custody.as_ref() {
+                require_contact_policy_current()?;
+                let receiver_sample = contact_custody_sample()?.ok_or_else(|| {
+                    NodeError::Protocol("v3 Event admission lacks a receiver clock sample".into())
+                })?;
+                store.cache_route_verified_event_with_custody_policy(
+                    authority.local_replication_policy,
+                    expected_custody_revision.ok_or_else(|| {
+                        NodeError::Protocol("v3 custody revision was not captured".into())
+                    })?,
+                    claims,
+                    receiver_sample,
+                    &event,
+                    sealed,
+                )?
+            } else {
+                store.cache_route_verified_event_with_replication_policy(
+                    authority.local_replication_policy,
+                    &event,
+                    sealed,
+                )?
+            };
+            let apply = ReceivedEventApply::from_route_cache(outcome);
+            if apply.inserted {
+                cache_contact_verified_event(verifier, route_claim)?;
+            }
+            Ok(apply)
         }
     }
 }
@@ -2705,115 +6984,280 @@ fn ensure_mutable_active(
     ensure_principal_active(store, publisher)
 }
 
-fn load_verified_mutable(
-    store: &Store,
-    _policy: &ControlPolicySnapshot,
-    verifier: &mut ReferenceEnvelopeSealer,
-    id: MutableTransferId,
-) -> Result<(Topic, Scope, NodeId, u64, Vec<u8>), NodeError> {
-    match id {
-        MutableTransferId::State(id) => {
-            let stored = store.get_state(id)?.ok_or_else(|| {
-                NodeError::Protocol("authorized State transfer is missing".into())
-            })?;
-            let verified = verifier.verify_state(&stored.sealed)?;
-            verify_stored_state_claim(&verified, &stored)?;
-            ensure_mutable_active(
-                store,
-                verified.publisher(),
-                verified.scope(),
-                verified.key_epoch(),
-            )?;
-            Ok((
-                verified.topic().clone(),
-                verified.scope().clone(),
-                verified.publisher(),
-                verified.key_epoch(),
-                stored.sealed,
-            ))
-        }
-        MutableTransferId::Record(id) => {
-            let stored = store.get_record(id)?.ok_or_else(|| {
-                NodeError::Protocol("authorized Record transfer is missing".into())
-            })?;
-            let verified = verifier.verify_record(&stored.sealed)?;
-            verify_stored_record_claim(&verified, &stored)?;
-            ensure_mutable_active(
-                store,
-                verified.publisher(),
-                verified.scope(),
-                verified.key_epoch(),
-            )?;
-            Ok((
-                verified.topic().clone(),
-                verified.scope().clone(),
-                verified.publisher(),
-                verified.key_epoch(),
-                stored.sealed,
-            ))
-        }
-    }
+fn mutable_source_fits_transfer_bound(exact_len: u64) -> bool {
+    usize::try_from(exact_len).is_ok_and(|len| len <= MAX_OBJECT_BYTES)
 }
 
-fn mutable_inventory(
+fn repair_blob_sender_cache_miss(
+    store: &Store,
+    verifier: &mut ReferenceEnvelopeSealer,
+    cache: &AuthenticatedEventRouteCache,
+    expected: &BlobSourceProjection,
+) -> Result<Option<AuthenticatedBlobRouteClaim>, NodeError> {
+    let _lifecycle = cache.lock_blob_lifecycle()?;
+    let Some(retained) = store.blob_source_projection(expected.transfer_id)? else {
+        // The compact inventory raced an exact source retirement.
+        return Ok(None);
+    };
+    if retained.source != *expected {
+        return Err(NodeError::Protocol(
+            "Blob sender cache repair crossed state-neutral source projections".into(),
+        ));
+    }
+    if let Some(mut claim) = cache.get_blob(verifier, expected.transfer_id)? {
+        if !claim.matches_projection(&retained.source) {
+            return Err(NodeError::Protocol(
+                "Blob sender cache repair conflicts with its authenticated cache claim".into(),
+            ));
+        }
+        claim.retention = retained.retention;
+        return Ok(Some(claim));
+    }
+    let sealed = retained_blob_sealed(store, &retained.source, retained.retention)?;
+    let claim = authenticate_blob_source(verifier, &sealed, &retained.source, retained.retention)?;
+    cache.record_mutable_source_verification();
+    cache.insert_blob(verifier, claim.clone())?;
+    Ok(Some(claim))
+}
+
+fn cached_mutable_sender_snapshot(
     store: &Store,
     policy: &ControlPolicySnapshot,
     verifier: &mut ReferenceEnvelopeSealer,
     class: MutableClass,
-    interest: &EventInterest,
+) -> Result<AuthenticatedMutableSenderSnapshot, NodeError> {
+    let cache = match CONTACT_EVENT_ROUTE_CACHE.try_with(Arc::clone) {
+        Ok(cache) => {
+            cache.require_binding(verifier)?;
+            cache
+        }
+        Err(_) => {
+            #[cfg(not(test))]
+            return Err(NodeError::Protocol(
+                "contact lacks an authenticated mutable route cache".into(),
+            ));
+            #[cfg(test)]
+            Arc::new(AuthenticatedEventRouteCache::empty(verifier))
+        }
+    };
+    let control_head = store.control_head()?;
+    cache.observe_control_head(verifier, control_head)?;
+    let mut claims = BTreeMap::new();
+    let mut blob_claims = BTreeMap::new();
+
+    match class {
+        MutableClass::State => {
+            let projections = store.state_sender_inventory_with_policy(policy)?;
+            for projection in projections {
+                let id = MutableTransferId::State(projection.transfer_id());
+                let cached = cache.get_mutable(verifier, id)?;
+                let claim = if let Some(claim) = cached
+                    && claim.matches_state_projection(&projection)
+                {
+                    claim
+                } else {
+                    let Some(stored) = store.get_state(projection.transfer_id())? else {
+                        // The compact snapshot became stale before exact cache
+                        // repair. Withhold this row until a later contact.
+                        continue;
+                    };
+                    let claim = authenticate_stored_state(verifier, &stored, &projection)?;
+                    cache.record_mutable_source_verification();
+                    cache.insert_mutable(verifier, claim.clone())?;
+                    claim
+                };
+                if !mutable_source_fits_transfer_bound(claim.exact_len)
+                    || !verifier.is_current_source_route_lineage(
+                        &claim.scope,
+                        claim.key_epoch,
+                        claim.route_lineage,
+                    )
+                {
+                    // Historical same-epoch and legacy oversized rows remain
+                    // durably retained but never enter a live v4 inventory.
+                    continue;
+                }
+                if claims.insert(id, claim).is_some() {
+                    return Err(NodeError::Protocol(
+                        "State sender projection contains a duplicate exact transfer".into(),
+                    ));
+                }
+            }
+        }
+        MutableClass::Record => {
+            let projections = store.record_sender_inventory_with_policy(policy)?;
+            for projection in projections {
+                let id = MutableTransferId::Record(projection.transfer_id());
+                let cached = cache.get_mutable(verifier, id)?;
+                let claim = if let Some(claim) = cached
+                    && claim.matches_record_projection(&projection)
+                {
+                    claim
+                } else {
+                    let Some(stored) = store.get_record(projection.transfer_id())? else {
+                        continue;
+                    };
+                    let claim = authenticate_stored_record(verifier, &stored, &projection)?;
+                    cache.record_mutable_source_verification();
+                    cache.insert_mutable(verifier, claim.clone())?;
+                    claim
+                };
+                if !mutable_source_fits_transfer_bound(claim.exact_len)
+                    || !verifier.is_current_source_route_lineage(
+                        &claim.scope,
+                        claim.key_epoch,
+                        claim.route_lineage,
+                    )
+                {
+                    continue;
+                }
+                if claims.insert(id, claim).is_some() {
+                    return Err(NodeError::Protocol(
+                        "Record sender projection contains a duplicate exact transfer".into(),
+                    ));
+                }
+            }
+        }
+        MutableClass::Blob => {
+            let mut retained = Vec::new();
+            store.visit_retained_blob_sources(Some(policy), |item| retained.push(item.clone()))?;
+            for item in retained {
+                let projection = item.source;
+                let retention = item.retention;
+                let id = projection.transfer_id;
+                let cached = cache.get_blob(verifier, id)?;
+                let claim = if let Some(claim) = cached {
+                    if !claim.matches_projection(&projection) {
+                        return Err(NodeError::Protocol(
+                            "Blob sender projection conflicts with its authenticated cache claim"
+                                .into(),
+                        ));
+                    }
+                    let mut claim = claim;
+                    claim.retention = retention;
+                    claim
+                } else {
+                    let Some(claim) =
+                        repair_blob_sender_cache_miss(store, verifier, &cache, &projection)?
+                    else {
+                        continue;
+                    };
+                    claim
+                };
+                if !mutable_source_fits_transfer_bound(claim.exact_len)
+                    || claim.exact_len
+                        > u64::try_from(MAX_BLOB_NETWORK_SOURCE_BYTES)
+                            .expect("Blob source bound fits u64")
+                    || !verifier.is_current_source_route_lineage(
+                        &claim.scope,
+                        claim.key_epoch,
+                        claim.route_lineage,
+                    )
+                    || !verifier.is_current_blob_physical_lineage(
+                        &claim.scope,
+                        &claim.topic,
+                        claim.key_epoch,
+                        claim.physical_lineage,
+                    )
+                {
+                    continue;
+                }
+                if blob_claims.insert(id, claim).is_some() {
+                    return Err(NodeError::Protocol(
+                        "Blob sender projection contains a duplicate exact transfer".into(),
+                    ));
+                }
+            }
+        }
+    }
+    if store.control_head()? != control_head {
+        return Err(NodeError::EmissionPolicyChanged);
+    }
+    cache.observe_control_head(verifier, control_head)?;
+    if class == MutableClass::Blob {
+        Ok(AuthenticatedMutableSenderSnapshot::new_blob(blob_claims))
+    } else {
+        AuthenticatedMutableSenderSnapshot::new(class, claims)
+    }
+}
+
+fn mutable_inventory(
+    snapshot: &AuthenticatedMutableSenderSnapshot,
+    verifier: &ReferenceEnvelopeSealer,
+    interest: MutableReceiveInterest<'_>,
     peer: Option<(NodeId, &[[u8; 32]])>,
 ) -> Result<InventorySnapshot, NodeError> {
-    if interest.is_empty() {
-        return Ok(InventorySnapshot::default());
-    }
-    let ids = match class {
-        MutableClass::State => store
-            .state_inventory_with_policy(policy)?
-            .iter()
-            .copied()
-            .map(MutableTransferId::State)
-            .collect::<Vec<_>>(),
-        MutableClass::Record => store
-            .record_inventory_with_policy(policy)?
-            .iter()
-            .copied()
-            .map(MutableTransferId::Record)
-            .collect::<Vec<_>>(),
-    };
     let mut authorized = Vec::new();
-    for id in ids {
-        let (topic, scope, _, epoch, sealed) = load_verified_mutable(store, policy, verifier, id)?;
-        if !interest.matches(&topic, &scope) {
+    if snapshot.class == MutableClass::Blob {
+        for (id, claim) in &snapshot.blob_claims {
+            let Some(selector) = interest.blob_selector(&claim.topic, &claim.scope) else {
+                continue;
+            };
+            if selector.epoch() != claim.key_epoch
+                || !verifier.is_current_source_route_lineage(
+                    &claim.scope,
+                    claim.key_epoch,
+                    claim.route_lineage,
+                )
+                || !verifier.is_current_blob_physical_lineage(
+                    &claim.scope,
+                    &claim.topic,
+                    claim.key_epoch,
+                    claim.physical_lineage,
+                )
+            {
+                continue;
+            }
+            if let Some((peer, commitments)) = peer {
+                if !matches!(claim.retention, BlobSourceRetention::Completed { .. }) {
+                    continue;
+                }
+                if !verifier.peer_can_route(peer, commitments, &claim.scope, claim.key_epoch)
+                    || !verifier.peer_can_open_blob_content(
+                        peer,
+                        commitments,
+                        &claim.scope,
+                        &claim.topic,
+                        claim.key_epoch,
+                        selector.content_proof(),
+                    )
+                {
+                    continue;
+                }
+            } else if !verifier.can_open_blob_content(&claim.scope, &claim.topic, claim.key_epoch) {
+                continue;
+            }
+            authorized.push(ItemId::new(*id.as_bytes()));
+        }
+        return Ok(InventorySnapshot::new(authorized));
+    }
+    for (id, claim) in &snapshot.claims {
+        if !interest.matches(&claim.topic, &claim.scope, claim.key_epoch) {
             continue;
         }
         if let Some((peer, commitments)) = peer {
-            if !verifier.peer_can_route(peer, commitments, &scope, epoch) {
+            if !verifier.peer_can_route(peer, commitments, &claim.scope, claim.key_epoch) {
                 continue;
             }
         } else {
-            let content_authorized = match id {
+            let content_authorized = match *id {
                 MutableTransferId::State(_) => {
-                    verifier.can_open_state_content(&scope, &topic, epoch)
+                    verifier.can_open_state_content(&claim.scope, &claim.topic, claim.key_epoch)
                 }
                 MutableTransferId::Record(_) => {
-                    verifier.can_open_record_content(&scope, &topic, epoch)
+                    verifier.can_open_record_content(&claim.scope, &claim.topic, claim.key_epoch)
                 }
+                MutableTransferId::Blob(_) => false,
             };
             if !content_authorized {
                 continue;
             }
         }
-        let item = match id {
+        let item = match *id {
             MutableTransferId::State(id) => id.reconciliation_item_id(),
             MutableTransferId::Record(id) => id.reconciliation_item_id(),
+            MutableTransferId::Blob(id) => ItemId::new(*id.as_bytes()),
         };
-        // Keep the exact sealed bytes freshly authenticated even though only
-        // the typed digest enters reconciliation.
-        if sealed.len() > MAX_OBJECT_BYTES {
-            return Err(NodeError::Protocol(
-                "mutable source object exceeds the transfer bound".into(),
-            ));
-        }
         authorized.push(item);
     }
     Ok(InventorySnapshot::new(authorized))
@@ -2821,20 +7265,140 @@ fn mutable_inventory(
 
 fn load_verified_mutable_for_peer(
     store: &Store,
-    policy: &ControlPolicySnapshot,
     verifier: &mut ReferenceEnvelopeSealer,
+    snapshot: &AuthenticatedMutableSenderSnapshot,
     id: MutableTransferId,
     peer: NodeId,
     commitments: &[[u8; 32]],
-    interest: &EventInterest,
+    interest: MutableReceiveInterest<'_>,
 ) -> Result<Vec<u8>, NodeError> {
-    let (topic, scope, _, epoch, sealed) = load_verified_mutable(store, policy, verifier, id)?;
-    if !interest.matches(&topic, &scope) {
+    if let MutableTransferId::Blob(transfer_id) = id {
+        let claim = snapshot.blob_claim(transfer_id).ok_or_else(|| {
+            NodeError::Protocol("outbound Blob transfer lacks its contact snapshot claim".into())
+        })?;
+        if !matches!(claim.retention, BlobSourceRetention::Completed { .. }) {
+            return Err(NodeError::Protocol(
+                "pending Blob source cannot be served as completed inventory".into(),
+            ));
+        }
+        let stored = store
+            .get_blob(transfer_id)?
+            .ok_or_else(|| NodeError::Protocol("authorized Blob transfer is missing".into()))?;
+        let route = verifier.verify_blob(&stored.sealed)?;
+        let BlobContentVerification::ContentVerified {
+            blob,
+            manifest_bytes,
+        } = verifier.verify_blob_content(route, &stored.sealed)?
+        else {
+            return Err(NodeError::Protocol(
+                "outbound Blob source lost its current content grant".into(),
+            ));
+        };
+        let plan = blob.transfer_plan(&manifest_bytes).map_err(|error| {
+            NodeError::Protocol(format!("outbound Blob transfer plan is invalid: {error}"))
+        })?;
+        if plan.manifest().total_len() > MAX_NETWORK_BLOB_BYTES
+            || plan.manifest().chunk_count() > MAX_NETWORK_BLOB_CHUNKS
+            || !claim.matches_verified(&blob, &stored.sealed)
+        {
+            return Err(NodeError::Protocol(
+                "outbound Blob changed after its authenticated contact snapshot".into(),
+            ));
+        }
+        ensure_mutable_active(store, blob.publisher(), blob.scope(), blob.key_epoch())?;
+        verifier.verify_current_blob_lineage(&blob)?;
+        let selector = interest
+            .blob_selector(blob.topic(), blob.scope())
+            .filter(|selector| selector.epoch() == blob.key_epoch())
+            .ok_or_else(|| {
+                NodeError::Protocol(
+                    "outbound Blob is outside the protected exact receive interest".into(),
+                )
+            })?;
+        if !verifier.peer_can_route(peer, commitments, blob.scope(), blob.key_epoch())
+            || !verifier.peer_can_open_blob_content(
+                peer,
+                commitments,
+                blob.scope(),
+                blob.topic(),
+                blob.key_epoch(),
+                selector.content_proof(),
+            )
+        {
+            return Err(NodeError::Protocol(
+                "authenticated peer lacks the outbound Blob route/content grant".into(),
+            ));
+        }
+        if stored.sealed.len() > MAX_OBJECT_BYTES
+            || stored.sealed.len() > MAX_BLOB_NETWORK_SOURCE_BYTES
+        {
+            return Err(NodeError::Protocol(
+                "outbound Blob source exceeds the selected network bound".into(),
+            ));
+        }
+        return Ok(stored.sealed);
+    }
+    let claim = snapshot.claim(id).ok_or_else(|| {
+        NodeError::Protocol("outbound mutable transfer lacks its contact snapshot claim".into())
+    })?;
+    let sealed = match id {
+        MutableTransferId::State(transfer_id) => {
+            let stored = store.get_state(transfer_id)?.ok_or_else(|| {
+                NodeError::Protocol("authorized State transfer is missing".into())
+            })?;
+            let verified = verifier.verify_state(&stored.sealed)?;
+            verify_stored_state_claim(&verified, &stored)?;
+            if !claim.matches_verified_state(&verified, &stored) {
+                return Err(NodeError::Protocol(
+                    "outbound State changed after its authenticated contact snapshot".into(),
+                ));
+            }
+            ensure_mutable_active(
+                store,
+                verified.publisher(),
+                verified.scope(),
+                verified.key_epoch(),
+            )?;
+            stored.sealed
+        }
+        MutableTransferId::Record(transfer_id) => {
+            let stored = store.get_record(transfer_id)?.ok_or_else(|| {
+                NodeError::Protocol("authorized Record transfer is missing".into())
+            })?;
+            let verified = verifier.verify_record(&stored.sealed)?;
+            verify_stored_record_claim(&verified, &stored)?;
+            if !claim.matches_verified_record(&verified, &stored) {
+                return Err(NodeError::Protocol(
+                    "outbound Record changed after its authenticated contact snapshot".into(),
+                ));
+            }
+            ensure_mutable_active(
+                store,
+                verified.publisher(),
+                verified.scope(),
+                verified.key_epoch(),
+            )?;
+            stored.sealed
+        }
+        MutableTransferId::Blob(_) => unreachable!("Blob handled above"),
+    };
+    if sealed.len() > MAX_OBJECT_BYTES {
+        return Err(NodeError::Protocol(
+            "outbound mutable source object exceeds the selected transfer bound".into(),
+        ));
+    }
+    if !verifier.is_current_source_route_lineage(&claim.scope, claim.key_epoch, claim.route_lineage)
+    {
+        return Err(NodeError::Protocol(
+            "outbound mutable source object no longer has current route lineage".into(),
+        ));
+    }
+    if !interest.matches(&claim.topic, &claim.scope, claim.key_epoch) {
         return Err(NodeError::Protocol(
             "outbound mutable source object is outside the protected receive interest".into(),
         ));
     }
-    if !verifier.peer_can_route(peer, commitments, &scope, epoch) {
+    if !verifier.peer_can_route(peer, commitments, &claim.scope, claim.key_epoch) {
         return Err(NodeError::Protocol(
             "authenticated peer lacks the mutable source-object route grant".into(),
         ));
@@ -2846,27 +7410,129 @@ fn load_verified_mutable_for_peer(
 struct MutablePeerAdmission<'a> {
     peer: NodeId,
     commitments: &'a [[u8; 32]],
-    interest: &'a EventInterest,
+    interest: MutableReceiveInterest<'a>,
+}
+
+fn mutable_apply_disposition(
+    outcome: Result<ApplyOutcome, StoreError>,
+) -> Result<MutableApplyDisposition, NodeError> {
+    match outcome {
+        Ok(outcome) if outcome.inserted() => Ok(MutableApplyDisposition::Inserted),
+        Ok(_) => Ok(MutableApplyDisposition::Duplicate),
+        Err(
+            StoreError::ItemLimitExceeded { .. }
+            | StoreError::PayloadByteLimitExceeded { .. }
+            | StoreError::StateProjectionLimitExceeded { .. }
+            | StoreError::RecordProjectionLimitExceeded { .. }
+            | StoreError::StateCausalFrontierLimitExceeded { .. }
+            | StoreError::RecordCausalFrontierLimitExceeded { .. },
+        ) => Ok(MutableApplyDisposition::DeferredCapacity),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn contact_mutable_route_cache(
+    verifier: &ReferenceEnvelopeSealer,
+) -> Result<Arc<AuthenticatedEventRouteCache>, NodeError> {
+    let cache = CONTACT_EVENT_ROUTE_CACHE
+        .try_with(Arc::clone)
+        .map_err(|_| {
+            NodeError::Protocol(
+                "mutable admission lacks its mandatory authenticated route cache".into(),
+            )
+        })?;
+    cache.require_binding(verifier)?;
+    Ok(cache)
+}
+
+fn cache_committed_state_route_claim(
+    store: &Store,
+    guard: &EventLaneGuard,
+    verifier: &ReferenceEnvelopeSealer,
+    route: &RouteVerifiedStateEnvelope,
+    outcome: ApplyOutcome,
+) -> Result<(), NodeError> {
+    let transfer_id = StateTransferId::new(route.envelope_id());
+    let (stored, projection) = store
+        .retained_state_source_with_policy(guard.policy(), transfer_id)?
+        .ok_or_else(|| {
+            NodeError::Protocol(
+                "committed State admission is missing its exact retained source row".into(),
+            )
+        })?;
+    if stored.acceptance_marker != outcome.acceptance_marker() {
+        return Err(NodeError::Protocol(
+            "committed State admission marker differs from its retained source row".into(),
+        ));
+    }
+    let claim = AuthenticatedMutableRouteClaim::from_verified_state(route, &stored, &projection)?;
+    let cache = contact_mutable_route_cache(verifier)?;
+    cache.record_mutable_source_verification();
+    cache.insert_mutable(verifier, claim)
+}
+
+fn cache_committed_record_route_claim(
+    store: &Store,
+    guard: &EventLaneGuard,
+    verifier: &ReferenceEnvelopeSealer,
+    route: &RouteVerifiedRecordEnvelope,
+    outcome: ApplyOutcome,
+) -> Result<(), NodeError> {
+    let transfer_id = RecordTransferId::new(route.envelope_id());
+    let (stored, projection) = store
+        .retained_record_source_with_policy(guard.policy(), transfer_id)?
+        .ok_or_else(|| {
+            NodeError::Protocol(
+                "committed Record admission is missing its exact retained source row".into(),
+            )
+        })?;
+    if stored.acceptance_marker != outcome.acceptance_marker() {
+        return Err(NodeError::Protocol(
+            "committed Record admission marker differs from its retained source row".into(),
+        ));
+    }
+    let claim = AuthenticatedMutableRouteClaim::from_verified_record(route, &stored, &projection)?;
+    let cache = contact_mutable_route_cache(verifier)?;
+    cache.record_mutable_source_verification();
+    cache.insert_mutable(verifier, claim)
 }
 
 fn accept_received_mutable(
     store: &Store,
-    policy: &ControlPolicySnapshot,
+    guard: &EventLaneGuard,
     verifier: &mut ReferenceEnvelopeSealer,
     admission: MutablePeerAdmission<'_>,
     id: MutableTransferId,
     sealed: &[u8],
-) -> Result<bool, NodeError> {
+) -> Result<MutableApplyDisposition, NodeError> {
+    guard.check(store)?;
+    if sealed.len() > MAX_OBJECT_BYTES {
+        return Err(NodeError::Protocol(
+            "received mutable source object exceeds the selected transfer bound".into(),
+        ));
+    }
     match id {
         MutableTransferId::State(expected) => {
             let route = verifier.verify_state(sealed)?;
+            if !verifier.is_current_source_route_lineage(
+                route.scope(),
+                route.key_epoch(),
+                route.route_lineage(),
+            ) {
+                return Err(NodeError::Protocol(
+                    "received State uses historical route lineage".into(),
+                ));
+            }
             if StateTransferId::new(route.envelope_id()) != expected {
                 return Err(NodeError::Protocol(
                     "received State bytes differ from their typed transfer identity".into(),
                 ));
             }
             ensure_mutable_active(store, route.publisher(), route.scope(), route.key_epoch())?;
-            if !admission.interest.matches(route.topic(), route.scope()) {
+            if !admission
+                .interest
+                .matches(route.topic(), route.scope(), route.key_epoch())
+            {
                 return Err(NodeError::Protocol(
                     "received State is outside the protected receive interest".into(),
                 ));
@@ -2881,10 +7547,22 @@ fn accept_received_mutable(
                     "authenticated peer lacks the received State route grant".into(),
                 ));
             }
+            let route_claim = route.clone();
             match verifier.verify_state_content(route, sealed)? {
-                StateContentVerification::ContentVerified { state, .. } => Ok(store
-                    .apply_verified_state_with_policy(policy, &state, sealed)?
-                    .inserted()),
+                StateContentVerification::ContentVerified { state, .. } => {
+                    let outcome =
+                        store.apply_verified_state_with_policy(guard.policy(), &state, sealed);
+                    if let Ok(committed) = outcome.as_ref() {
+                        cache_committed_state_route_claim(
+                            store,
+                            guard,
+                            verifier,
+                            &route_claim,
+                            *committed,
+                        )?;
+                    }
+                    mutable_apply_disposition(outcome)
+                }
                 StateContentVerification::RouteOnly(_) => Err(NodeError::Protocol(
                     "State receive interest lacks a content grant".into(),
                 )),
@@ -2892,13 +7570,25 @@ fn accept_received_mutable(
         }
         MutableTransferId::Record(expected) => {
             let route = verifier.verify_record(sealed)?;
+            if !verifier.is_current_source_route_lineage(
+                route.scope(),
+                route.key_epoch(),
+                route.route_lineage(),
+            ) {
+                return Err(NodeError::Protocol(
+                    "received Record uses historical route lineage".into(),
+                ));
+            }
             if RecordTransferId::new(route.envelope_id()) != expected {
                 return Err(NodeError::Protocol(
                     "received Record bytes differ from their typed transfer identity".into(),
                 ));
             }
             ensure_mutable_active(store, route.publisher(), route.scope(), route.key_epoch())?;
-            if !admission.interest.matches(route.topic(), route.scope()) {
+            if !admission
+                .interest
+                .matches(route.topic(), route.scope(), route.key_epoch())
+            {
                 return Err(NodeError::Protocol(
                     "received Record is outside the protected receive interest".into(),
                 ));
@@ -2913,14 +7603,111 @@ fn accept_received_mutable(
                     "authenticated peer lacks the received Record route grant".into(),
                 ));
             }
+            let route_claim = route.clone();
             match verifier.verify_record_content(route, sealed)? {
-                RecordContentVerification::ContentVerified { record, .. } => Ok(store
-                    .apply_verified_record_with_policy(policy, &record, sealed)?
-                    .inserted()),
+                RecordContentVerification::ContentVerified { record, .. } => {
+                    let outcome =
+                        store.apply_verified_record_with_policy(guard.policy(), &record, sealed);
+                    if let Ok(committed) = outcome.as_ref() {
+                        cache_committed_record_route_claim(
+                            store,
+                            guard,
+                            verifier,
+                            &route_claim,
+                            *committed,
+                        )?;
+                    }
+                    mutable_apply_disposition(outcome)
+                }
                 RecordContentVerification::RouteOnly(_) => Err(NodeError::Protocol(
                     "Record receive interest lacks a content grant".into(),
                 )),
             }
+        }
+        MutableTransferId::Blob(expected) => {
+            if sealed.len() > MAX_BLOB_NETWORK_SOURCE_BYTES {
+                return Err(NodeError::Protocol(
+                    "received Blob source exceeds the selected network bound".into(),
+                ));
+            }
+            let route = verifier.verify_blob(sealed)?;
+            if BlobTransferId::new(route.envelope_id()) != expected {
+                return Err(NodeError::Protocol(
+                    "received Blob bytes differ from their typed transfer identity".into(),
+                ));
+            }
+            ensure_mutable_active(store, route.publisher(), route.scope(), route.key_epoch())?;
+            if !admission
+                .interest
+                .matches(route.topic(), route.scope(), route.key_epoch())
+            {
+                return Err(NodeError::Protocol(
+                    "received Blob is outside the protected exact receive interest".into(),
+                ));
+            }
+            if !verifier.peer_can_route(
+                admission.peer,
+                admission.commitments,
+                route.scope(),
+                route.key_epoch(),
+            ) {
+                return Err(NodeError::Protocol(
+                    "authenticated peer lacks the received Blob route grant".into(),
+                ));
+            }
+            let BlobContentVerification::ContentVerified {
+                blob,
+                manifest_bytes,
+            } = verifier.verify_blob_content(route, sealed)?
+            else {
+                return Err(NodeError::Protocol(
+                    "Blob receive interest lacks the exact current content grant".into(),
+                ));
+            };
+            verifier.verify_current_blob_lineage(&blob)?;
+            let plan = blob.transfer_plan(&manifest_bytes).map_err(|error| {
+                NodeError::Protocol(format!("received Blob transfer plan is invalid: {error}"))
+            })?;
+            if plan.manifest().total_len() > MAX_NETWORK_BLOB_BYTES
+                || plan.manifest().chunk_count() > MAX_NETWORK_BLOB_CHUNKS
+            {
+                return Err(NodeError::Protocol(
+                    "received Blob manifest exceeds selected network bounds".into(),
+                ));
+            }
+            let cache = contact_mutable_route_cache(verifier)?;
+            let _lifecycle = cache.lock_blob_lifecycle()?;
+            guard.check(store)?;
+            let outcome =
+                store.stage_verified_blob_source_with_policy(guard.policy(), &blob, sealed, &plan);
+            let disposition = match outcome {
+                Ok(BlobSourceStageOutcome::Inserted) => MutableApplyDisposition::Inserted,
+                Ok(BlobSourceStageOutcome::Duplicate) => MutableApplyDisposition::Duplicate,
+                Err(StoreError::Blob(
+                    BlobStoreError::NetworkStagingRowLimitExceeded { .. }
+                    | BlobStoreError::NetworkStagingByteLimitExceeded { .. }
+                    | BlobStoreError::DepotByteLimitExceeded { .. }
+                    | BlobStoreError::DepotChunkLimitExceeded { .. }
+                    | BlobStoreError::DepotVariantLimitExceeded { .. },
+                )) => MutableApplyDisposition::DeferredCapacity,
+                Err(error) => return Err(error.into()),
+            };
+            if disposition != MutableApplyDisposition::DeferredCapacity {
+                let projection = store.blob_source_projection(expected)?.ok_or_else(|| {
+                    NodeError::Protocol(
+                        "staged Blob admission lost its state-neutral projection".into(),
+                    )
+                })?;
+                let claim = AuthenticatedBlobRouteClaim::from_verified(
+                    &blob,
+                    sealed,
+                    &projection.source,
+                    projection.retention,
+                )?;
+                cache.record_mutable_source_verification();
+                cache.insert_blob(verifier, claim)?;
+            }
+            Ok(disposition)
         }
     }
 }
@@ -3662,51 +8449,91 @@ async fn read_local_zeroization_response(stream: &mut UnixStream) -> Result<Stri
         .map_err(|_| NodeError::Configuration("local zeroization response is not UTF-8".into()))
 }
 
-fn validate_node_config(config: &NodeConfig) -> Result<BTreeMap<EndpointId, NodeId>, NodeError> {
-    if config.sync_interval.is_zero() {
+fn validate_node_config_fields(
+    sync_interval: Duration,
+    run_for: Option<Duration>,
+    peers: &[MissionExpectedPeer],
+    mutable_interests: &MutableSourceInterests,
+) -> Result<BTreeMap<EndpointId, NodeId>, NodeError> {
+    if sync_interval.is_zero() {
         return Err(NodeError::Configuration(
             "sync interval must be nonzero".into(),
         ));
     }
-    if config.peers.len() > MAX_CONFIGURED_PEERS {
+    if run_for.is_some_and(|duration| Instant::now().checked_add(duration).is_none()) {
+        return Err(NodeError::Configuration(
+            "node run_for exceeds the monotonic clock".into(),
+        ));
+    }
+    if peers.len() > MAX_CONFIGURED_PEERS {
         return Err(NodeError::Configuration(format!(
             "peer count {} exceeds {MAX_CONFIGURED_PEERS}",
-            config.peers.len()
+            peers.len()
         )));
     }
-    for class in [MutableClass::State, MutableClass::Record] {
-        config.mutable_interests.for_class(class)?;
+    for class in MUTABLE_V5_CLASSES {
+        mutable_interests.for_class(class)?;
     }
-    let allowed = config
-        .peers
+    if mutable_interests
+        .blob_selectors()
+        .iter()
+        .any(SourceInterestSelector::include_descendant_scopes)
+    {
+        return Err(NodeError::Configuration(
+            "Blob interests must name exact scopes; descendant scope selectors cannot bind one current content epoch"
+                .into(),
+        ));
+    }
+    let allowed = peers
         .iter()
         .map(|peer| (peer.carrier.id, peer.mission))
         .collect::<BTreeMap<_, _>>();
-    if allowed.len() != config.peers.len() {
+    if allowed.len() != peers.len() {
         return Err(NodeError::Configuration(
             "peer endpoint identities must be unique".into(),
         ));
     }
-    let addresses = config
-        .peers
+    let addresses = peers
         .iter()
         .map(|peer| peer.carrier.address)
         .collect::<BTreeSet<_>>();
-    if addresses.len() != config.peers.len() {
+    if addresses.len() != peers.len() {
         return Err(NodeError::Configuration(
             "peer direct socket addresses must be unique".into(),
         ));
+    }
+    let missions = peers
+        .iter()
+        .map(|peer| peer.mission)
+        .collect::<BTreeSet<_>>();
+    if missions.len() != peers.len() {
+        return Err(NodeError::Configuration(
+            "peer mission identities must be unique".into(),
+        ));
+    }
+    Ok(allowed)
+}
+
+fn validate_node_config(config: &NodeConfig) -> Result<BTreeMap<EndpointId, NodeId>, NodeError> {
+    let allowed = validate_node_config_fields(
+        config.sync_interval,
+        config.run_for,
+        &config.peers,
+        &config.mutable_interests,
+    )?;
+    if let Some(witness) = config.mission.protected_state_witness() {
+        let selected_state = absolute_state_path(&config.state)?;
+        if selected_state != witness {
+            return Err(NodeError::Configuration(
+                "protected mission credentials are bound to another state root".into(),
+            ));
+        }
     }
     let missions = config
         .peers
         .iter()
         .map(|peer| peer.mission)
         .collect::<BTreeSet<_>>();
-    if missions.len() != config.peers.len() {
-        return Err(NodeError::Configuration(
-            "peer mission identities must be unique".into(),
-        ));
-    }
     if missions.contains(&config.mission.identity()) {
         return Err(NodeError::Configuration(
             "a node cannot configure its own mission identity as a peer".into(),
@@ -3723,8 +8550,12 @@ fn execute_selected_event_command(
     command: SelectedEventCommand,
 ) {
     match command {
-        SelectedEventCommand::Publish { request, response } => {
-            let result = application.publish(request);
+        SelectedEventCommand::Publish {
+            request,
+            options,
+            response,
+        } => {
+            let result = application.publish_with_options(request, options);
             let _ = response.send(result);
         }
         SelectedEventCommand::Query { query, response } => {
@@ -3769,8 +8600,148 @@ fn execute_selected_event_command(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LiveControlRefresh {
+    Settled,
+    Deferred,
+}
+
+fn refresh_live_control_state(
+    application: &mut SelectedEventNode,
+    store: &Store,
+    custody_clock: &NodeCustodyClock,
+    event_route_cache: &AuthenticatedEventRouteCache,
+) -> Result<LiveControlRefresh, NodeError> {
+    let Some(policy) = application.refresh_runtime_policy()? else {
+        // An out-of-order authenticated control may already be retained while
+        // its predecessor is still in flight. A fresh live publication is
+        // rejected in that state, while an exact historical retry remains
+        // recoverable; neither disposition makes the healthy actor terminal.
+        return Ok(LiveControlRefresh::Deferred);
+    };
+    cleanup_ineligible_pending_blobs(store, application.runtime_verifier_mut(), event_route_cache)?;
+    prune_authenticated_event_route_cache_to_sender_projection(
+        store,
+        &policy,
+        application.runtime_verifier_mut(),
+        Some(custody_clock.sample()?),
+        event_route_cache,
+    )?;
+    Ok(LiveControlRefresh::Settled)
+}
+
+fn finish_live_control_command(
+    operation: &'static str,
+    local: NodeId,
+    mission_authority: NodeId,
+    publication: Result<ControlPublicationReceipt, NodeError>,
+    refresh: Result<LiveControlRefresh, NodeError>,
+    response: oneshot::Sender<
+        Result<ControlPublicationReceipt, crate::control_admin::ControlAdminError>,
+    >,
+) -> Option<NodeError> {
+    match (publication, refresh) {
+        (Ok(receipt), Ok(LiveControlRefresh::Settled)) => {
+            let _ = response.send(Ok(receipt));
+            None
+        }
+        (Err(error), Ok(_)) => {
+            let _ = response.send(Err(admin_error(operation, error)));
+            None
+        }
+        (Ok(receipt), Ok(LiveControlRefresh::Deferred)) if !receipt.emitted => {
+            let _ = response.send(Ok(receipt));
+            None
+        }
+        (Ok(_), Ok(LiveControlRefresh::Deferred)) => {
+            drop(response);
+            Some(NodeError::Protocol(
+                "new live control publication left the durable policy unsettled".into(),
+            ))
+        }
+        (Ok(receipt), Err(error @ NodeError::Revoked(principal)))
+            if principal == local || principal == mission_authority =>
+        {
+            // The control is already durably committed and activated. Return
+            // that exact receipt before closing admission and tearing down the
+            // actor; never relabel a successful self-revocation as failure.
+            let _ = response.send(Ok(receipt));
+            Some(error)
+        }
+        (_, Err(error)) => {
+            // Dropping the response maps to the handle's fixed
+            // StateUnavailable category while the owner receives the exact
+            // fatal runtime error from `wait`/`shutdown`.
+            drop(response);
+            Some(error)
+        }
+    }
+}
+
+fn execute_selected_control_command(
+    application: &mut SelectedEventNode,
+    store: &Store,
+    mission: &UnprotectedReferenceMission,
+    custody_clock: &NodeCustodyClock,
+    event_route_cache: &AuthenticatedEventRouteCache,
+    command: SelectedControlCommand,
+) -> Option<NodeError> {
+    let local = mission.identity();
+    let mission_authority = mission.mission_authority_id();
+    match command {
+        SelectedControlCommand::PublishRevocation { request, response } => {
+            let publication = publish_revocation_control_in_store(
+                store,
+                mission,
+                request.subject(),
+                request.generation(),
+            );
+            let refresh =
+                refresh_live_control_state(application, store, custody_clock, event_route_cache);
+            finish_live_control_command(
+                "publish revocation",
+                local,
+                mission_authority,
+                publication,
+                refresh,
+                response,
+            )
+        }
+        SelectedControlCommand::PublishScopeRekey { request, response } => {
+            let (registry, minimum_generation, scope, epoch, recipients) = request.parts();
+            let publication = publish_scope_rekey_control_in_store(
+                store,
+                mission,
+                registry,
+                minimum_generation.get(),
+                scope.clone(),
+                epoch.get(),
+                recipients,
+            );
+            let refresh =
+                refresh_live_control_state(application, store, custody_clock, event_route_cache);
+            finish_live_control_command(
+                "publish scope rekey",
+                local,
+                mission_authority,
+                publication,
+                refresh,
+                response,
+            )
+        }
+    }
+}
+
 /// Starts one readiness-driven selected-stack node and its bounded application actor.
 pub async fn start_node(config: NodeConfig) -> Result<RunningNode, NodeError> {
+    start_node_with_forwarding(config, SelectedForwardingConfig::default()).await
+}
+
+/// Starts one selected node with explicit carrier, emission, and durable-admission policy.
+pub async fn start_node_with_forwarding(
+    config: NodeConfig,
+    forwarding: SelectedForwardingConfig,
+) -> Result<RunningNode, NodeError> {
     let identity = config.mission.identity();
     let mission_authority = config.mission.mission_authority_id();
     let (application_sender, application_receiver) = mpsc::channel(APPLICATION_COMMAND_CAPACITY);
@@ -3781,14 +8752,22 @@ pub async fn start_node(config: NodeConfig) -> Result<RunningNode, NodeError> {
         identity,
         mission_authority,
     );
+    let (control_sender, control_receiver) = mpsc::channel(CONTROL_COMMAND_CAPACITY);
+    let selected_controls = SelectedControlHandle::new(control_sender, identity, mission_authority);
     let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
     let (ready_sender, ready_receiver) = oneshot::channel();
-    let task = tokio::spawn(run_node_actor(
+    let emission_policy = Arc::new(LiveEmissionPolicy::new(forwarding.emission_policy()));
+    let task = tokio::spawn(run_node_actor_with_forwarding(
         config,
-        application_receiver,
-        application_admission.clone(),
-        shutdown_receiver,
-        ready_sender,
+        forwarding,
+        emission_policy.clone(),
+        NodeActorChannels::new(
+            application_receiver,
+            application_admission.clone(),
+            control_receiver,
+            shutdown_receiver,
+            ready_sender,
+        ),
     ));
     if ready_receiver.await.is_err() {
         return match task.await.map_err(node_actor_join_error)? {
@@ -3800,7 +8779,9 @@ pub async fn start_node(config: NodeConfig) -> Result<RunningNode, NodeError> {
     }
     Ok(RunningNode {
         selected_events,
+        selected_controls,
         application_admission,
+        emission_policy,
         shutdown: Some(shutdown_sender),
         task: Some(task),
     })
@@ -3811,6 +8792,17 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeReceipt, NodeError> {
     start_node(config).await?.wait().await
 }
 
+/// Runs one selected node with explicit carrier, emission, and durable-admission policy.
+pub async fn run_node_with_forwarding(
+    config: NodeConfig,
+    forwarding: SelectedForwardingConfig,
+) -> Result<NodeReceipt, NodeError> {
+    start_node_with_forwarding(config, forwarding)
+        .await?
+        .wait()
+        .await
+}
+
 #[cfg(all(test, unix))]
 struct RunNodeActorTestControl {
     before_loop_ready: oneshot::Sender<()>,
@@ -3818,6 +8810,37 @@ struct RunNodeActorTestControl {
     zeroization_queued: oneshot::Sender<()>,
 }
 
+struct NodeActorChannels {
+    application_receiver: mpsc::Receiver<SelectedEventCommand>,
+    application_admission: Arc<AtomicBool>,
+    control_receiver: mpsc::Receiver<SelectedControlCommand>,
+    shutdown_receiver: mpsc::Receiver<()>,
+    ready: oneshot::Sender<Vec<SocketAddr>>,
+    #[cfg(all(test, unix))]
+    test_control: Option<RunNodeActorTestControl>,
+}
+
+impl NodeActorChannels {
+    fn new(
+        application_receiver: mpsc::Receiver<SelectedEventCommand>,
+        application_admission: Arc<AtomicBool>,
+        control_receiver: mpsc::Receiver<SelectedControlCommand>,
+        shutdown_receiver: mpsc::Receiver<()>,
+        ready: oneshot::Sender<Vec<SocketAddr>>,
+    ) -> Self {
+        Self {
+            application_receiver,
+            application_admission,
+            control_receiver,
+            shutdown_receiver,
+            ready,
+            #[cfg(all(test, unix))]
+            test_control: None,
+        }
+    }
+}
+
+#[cfg(test)]
 async fn run_node_actor(
     config: NodeConfig,
     application_receiver: mpsc::Receiver<SelectedEventCommand>,
@@ -3825,36 +8848,48 @@ async fn run_node_actor(
     shutdown_receiver: mpsc::Receiver<()>,
     ready: oneshot::Sender<Vec<SocketAddr>>,
 ) -> Result<NodeReceipt, NodeError> {
-    #[cfg(all(test, unix))]
-    let result = run_node_actor_inner(
+    let forwarding = SelectedForwardingConfig::default();
+    let emission_policy = Arc::new(LiveEmissionPolicy::new(forwarding.emission_policy()));
+    let (_control_sender, control_receiver) = mpsc::channel(CONTROL_COMMAND_CAPACITY);
+    run_node_actor_with_forwarding(
         config,
-        application_receiver,
-        application_admission,
-        shutdown_receiver,
-        ready,
-        None,
+        forwarding,
+        emission_policy,
+        NodeActorChannels::new(
+            application_receiver,
+            application_admission,
+            control_receiver,
+            shutdown_receiver,
+            ready,
+        ),
     )
-    .await;
-    #[cfg(not(all(test, unix)))]
-    let result = run_node_actor_inner(
-        config,
-        application_receiver,
-        application_admission,
-        shutdown_receiver,
-        ready,
-    )
-    .await;
-    result
+    .await
+}
+
+async fn run_node_actor_with_forwarding(
+    config: NodeConfig,
+    forwarding: SelectedForwardingConfig,
+    emission_policy: Arc<LiveEmissionPolicy>,
+    channels: NodeActorChannels,
+) -> Result<NodeReceipt, NodeError> {
+    run_node_actor_inner(config, forwarding, emission_policy, channels).await
 }
 
 async fn run_node_actor_inner(
     config: NodeConfig,
-    mut application_receiver: mpsc::Receiver<SelectedEventCommand>,
-    application_admission: Arc<AtomicBool>,
-    mut shutdown_receiver: mpsc::Receiver<()>,
-    ready: oneshot::Sender<Vec<SocketAddr>>,
-    #[cfg(all(test, unix))] mut test_control: Option<RunNodeActorTestControl>,
+    forwarding: SelectedForwardingConfig,
+    emission_policy: Arc<LiveEmissionPolicy>,
+    channels: NodeActorChannels,
 ) -> Result<NodeReceipt, NodeError> {
+    let NodeActorChannels {
+        mut application_receiver,
+        application_admission,
+        mut control_receiver,
+        mut shutdown_receiver,
+        ready,
+        #[cfg(all(test, unix))]
+        mut test_control,
+    } = channels;
     let stop_deadline = config
         .run_for
         .map(|duration| {
@@ -3864,6 +8899,7 @@ async fn run_node_actor_inner(
         })
         .transpose()?;
     let peer_missions = validate_node_config(&config)?;
+    validate_forwarding_config(&forwarding)?;
     let allowed = peer_missions.keys().copied().collect::<BTreeSet<_>>();
     let mission_authority = config.mission.mission_authority_id();
     fs::create_dir_all(&config.state)?;
@@ -3879,25 +8915,59 @@ async fn run_node_actor_inner(
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    let store = Arc::new(Store::open_for_mission(&store_path, mission_authority)?);
+    let store = Arc::new(Store::open_with_limits_for_mission(
+        &store_path,
+        forwarding.store_limits(),
+        mission_authority,
+    )?);
     store.require_process_exclusive_lock()?;
     #[cfg(unix)]
     {
         let store_identity = local_store_identity(&store_path)?;
         require_store_backing_identity(store.backing_identity(), store_identity)?;
     }
-    let mut application_sealer = ReferenceEnvelopeSealer::open(config.mission.fresh_bundle()?)?;
     let policy_lock = Arc::new(RwLock::new(()));
-    // The exact applied control prefix is freshly reauthenticated and replayed
-    // before any persisted carrier identity is created or any socket is bound.
-    replay_applied_controls(&store, &mut application_sealer)?;
-    ensure_principal_active(&store, application_sealer.identity())?;
+    // Prove every retained Event/route source across both the pre-control and
+    // final replayed key views before quota replacement, witness migration, or
+    // custody maintenance can mutate/delete durable Event state. This also
+    // remains before persisted carrier identity or socket creation.
+    let StartupEventVerification {
+        verifier: mut application_sealer,
+        historical_verifier: mut historical_application_sealer,
+        cache: event_route_cache,
+        policy: startup_policy,
+    } = open_startup_event_verifier_and_cache(&store, &config.mission)?;
+    let configured_cursor_peers = peer_missions.values().copied().collect::<Vec<_>>();
+    store.reconcile_mutable_transfer_cursor_peers(&configured_cursor_peers)?;
+    store.reconcile_blob_carrier_fetch_cursor_peers(&configured_cursor_peers)?;
     let application_control_head = store.control_head()?;
+    ensure_principal_active(&store, application_sealer.identity())?;
+    migrate_legacy_event_operation_witnesses(
+        &store,
+        &startup_policy,
+        &mut application_sealer,
+        &mut historical_application_sealer,
+    )?;
+    drop(historical_application_sealer);
+    let global_custody_quota =
+        CustodyQuota::for_store_limits(forwarding.store_limits()).map_err(StoreError::from)?;
+    store.replace_custody_quotas(global_custody_quota, forwarding.scope_quotas())?;
+    let custody_clock = NodeCustodyClock::open(application_sealer.identity())?;
+    drive_custody_maintenance(&store, &custody_clock, forwarding.scope_quotas())?;
+    prune_authenticated_event_route_cache_to_sender_projection(
+        &store,
+        &startup_policy,
+        &application_sealer,
+        Some(custody_clock.sample()?),
+        &event_route_cache,
+    )?;
     let mut application = SelectedEventNode::from_runtime(
         config.mission.clone(),
         store.clone(),
         application_sealer,
         application_control_head,
+        custody_clock.clone(),
+        event_route_cache.clone(),
     );
     let identity = NodeIdentity::load_or_create(&config.state)?;
     let local_id = identity.id();
@@ -3908,16 +8978,59 @@ async fn run_node_actor_inner(
     }
     #[cfg(unix)]
     let zeroization_control = LocalZeroizationControl::bind(&config.state, &store_path)?;
-    let endpoint = Endpoint::bind(identity.secret()?, EndpointConfig::direct(config.bind)).await?;
+    let endpoint_config = EndpointConfig::direct(config.bind);
+    let endpoint = match &forwarding.controlled_relay {
+        Some(routing) if routing.relay_only => {
+            Endpoint::bind_relay_only(identity.secret()?, endpoint_config, routing.relay.clone())
+                .await?
+        }
+        Some(routing) => {
+            Endpoint::bind_with_relay(identity.secret()?, endpoint_config, routing.relay.clone())
+                .await?
+        }
+        None => Endpoint::bind(identity.secret()?, endpoint_config).await?,
+    };
+    let relay_readiness = match &forwarding.controlled_relay {
+        Some(routing) if routing.relay_only => {
+            if let Err(error) = endpoint.wait_relay_ready().await {
+                endpoint.close().await;
+                return Err(error.into());
+            }
+            "required-ready"
+        }
+        Some(_) => "deferred",
+        None => "not-applicable",
+    };
     let (zeroization_sender, mut zeroization_receiver) = mpsc::channel(1);
     let bound_sockets = endpoint.bound_sockets();
-    let sockets = bound_sockets
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
+    let sockets = if bound_sockets.is_empty() {
+        "none".into()
+    } else {
+        bound_sockets
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let (carrier_route, relay_url, relay_trust) = match &forwarding.controlled_relay {
+        Some(routing) => (
+            if routing.relay_only {
+                "controlled-relay-only"
+            } else {
+                "direct-plus-controlled-relay"
+            },
+            routing.relay.url().to_string(),
+            if routing.relay.ca_roots_der().is_empty() {
+                "embedded-webpki"
+            } else {
+                "explicit-der-roots"
+            },
+        ),
+        None => ("direct", "none".into(), "none"),
+    };
+    let provisioning_origin = config.provisioning_origin().receipt_label();
     println!(
-        "READY selected=true pid={} carrier_id={} mission_id={} mission_authority={} sockets={} state={} peers={} application={} mission_auth=hybrid-pq provisioning=unprotected-reference semantics=source-authenticated-event reconciliation_classes=event,state,record controls=source-authenticated-flash commit_before_activate=true content_admission=capability-gated",
+        "READY selected=true pid={} carrier_id={} mission_id={} mission_authority={} sockets={} state={} peers={} application={} carrier_route={} controlled_relay_url={} controlled_relay_trust={} controlled_relay_readiness={} public_relay_fallback=false hosted_discovery=false nat_traversal=not-claimed path_observation=not-authorization mission_auth=hybrid-pq provisioning={} semantics=source-authenticated-event reconciliation_classes={} controls=source-authenticated-flash commit_before_activate=true content_admission=capability-gated",
         std::process::id(),
         local_id,
         format_node_id(config.mission.identity()),
@@ -3925,7 +9038,13 @@ async fn run_node_actor_inner(
         sockets,
         format_path_field(&config.state),
         allowed.len(),
-        config.application.as_str()
+        config.application.as_str(),
+        carrier_route,
+        format_receipt_field(&relay_url),
+        relay_trust,
+        relay_readiness,
+        provisioning_origin,
+        READY_RECONCILIATION_CLASSES,
     );
     // Cancellation before the readiness handoff skips all operational work but
     // still follows the single task/endpoint cleanup path below.
@@ -3978,6 +9097,11 @@ async fn run_node_actor_inner(
         SelectedEventStatusTracker::new(config.peers.iter().map(|peer| peer.mission).collect());
     let mut application_commands_open = true;
     let mut pending_application_command = None::<SelectedEventCommand>;
+    let mut control_commands_open = true;
+    let mut pending_control_command = None::<SelectedControlCommand>;
+    let mut pending_control_lease = None::<ControlPolicyLeaseFuture>;
+    let mut control_commands_since_yield = 0usize;
+    let mut control_yield_required = false;
     let mut application_tick_pending = false;
     let mut application_tick_yield_required = false;
     let mut application_commands_since_yield = 0usize;
@@ -4107,14 +9231,62 @@ async fn run_node_actor_inner(
             }
             _ = shutdown_receiver.recv() => break,
             _ = &mut stop => break,
+            command = control_receiver.recv(),
+                if control_commands_open
+                    && pending_control_command.is_none()
+                    && !control_yield_required => {
+                match command {
+                    Some(command) => {
+                        pending_control_command = Some(command);
+                        pending_control_lease =
+                            Some(Box::pin(policy_lock.clone().write_owned()));
+                    }
+                    None => control_commands_open = false,
+                }
+            }
+            lease = await_control_policy_lease(&mut pending_control_lease),
+                if pending_control_command.is_some() && !control_yield_required => {
+                let _lease = lease;
+                pending_control_lease.take();
+                let command = pending_control_command
+                    .take()
+                    .expect("policy-write lease requires one live control command");
+                if let Some(error) = execute_selected_control_command(
+                    &mut application,
+                    &store,
+                    &config.mission,
+                    &custody_clock,
+                    &event_route_cache,
+                    command,
+                ) {
+                    fatal_error = Some(error);
+                    break;
+                }
+                drop(_lease);
+                control_commands_since_yield += 1;
+                if control_commands_since_yield >= CONTROL_COMMAND_BUDGET {
+                    control_commands_since_yield = 0;
+                    control_yield_required = true;
+                }
+            }
             _ = ticker.tick(), if !application_tick_pending => {
+                control_yield_required = false;
                 application_tick_pending = true;
             }
             _policy_read = policy_lock.clone().read_owned(),
                 if application_tick_pending
                     && !application_tick_yield_required
                     && pending_application_command.is_none() => {
+                control_yield_required = false;
                 application_tick_pending = false;
+                if let Err(error) = drive_custody_maintenance(
+                    &store,
+                    &custody_clock,
+                    forwarding.scope_quotas(),
+                ) {
+                    fatal_error = Some(error);
+                    break;
+                }
                 let application_policy = match application.refresh_runtime_policy() {
                     Ok(policy) => policy,
                     Err(error) => {
@@ -4125,9 +9297,13 @@ async fn run_node_actor_inner(
                 if let Some(application_policy) = application_policy
                     && let Err(error) = drive_sample_application(
                         config.application,
-                        &store,
-                        &application_policy,
-                        application.runtime_verifier_mut(),
+                        SampleApplicationContext {
+                            store: &store,
+                            policy: &application_policy,
+                            sealer: application.runtime_verifier_mut(),
+                            custody_clock: &custody_clock,
+                            event_route_cache: &event_route_cache,
+                        },
                         &mut application_cursor,
                         &mut initial_application_receipt_emitted,
                     )
@@ -4139,6 +9315,16 @@ async fn run_node_actor_inner(
                 // before it may run again. The bottom select arm clears this
                 // after one scheduler turn when no lower-class work is ready.
                 application_tick_yield_required = true;
+                let emission_snapshot = match emission_policy.snapshot() {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        fatal_error = Some(error);
+                        break;
+                    }
+                };
+                if !emission_snapshot.policy.permits_contact_initiation() {
+                    continue;
+                }
                 let peer_count = config.peers.len();
                 if peer_count == 0 {
                     continue;
@@ -4158,19 +9344,30 @@ async fn run_node_actor_inner(
                     let store = store.clone();
                     let endpoint = endpoint.clone();
                     let policy_lock = policy_lock.clone();
+                    let emission_policy = emission_policy.clone();
+                    let custody_clock = custody_clock.clone();
+                    let event_route_cache = event_route_cache.clone();
                     let peer = *peer;
                     let mission = config.mission.clone();
                     let mutable_interests = config.mutable_interests.clone();
+                    let controlled_relay = forwarding.controlled_relay.clone();
                     let task = outbound.spawn(async move {
                         (
                             peer,
-                            sync_once_with_policy(
-                                &store,
+                            sync_once_with_forwarding(
                                 &endpoint,
-                                mission,
-                                peer,
-                                policy_lock,
-                                mutable_interests,
+                                OutboundContact {
+                                    store,
+                                    mission,
+                                    peer,
+                                    policy_lock,
+                                    emission_policy,
+                                    emission_snapshot,
+                                    custody_clock,
+                                    event_route_cache,
+                                    mutable_interests,
+                                    controlled_relay,
+                                },
                             )
                             .await,
                         )
@@ -4185,6 +9382,7 @@ async fn run_node_actor_inner(
                     .is_some_and(SelectedEventCommand::mutates_selectors),
             ), if pending_application_command.is_some()
                 && network_events_since_application >= NETWORK_EVENT_BUDGET => {
+                control_yield_required = false;
                 let _lease = lease;
                 let command = pending_application_command
                     .take()
@@ -4205,6 +9403,7 @@ async fn run_node_actor_inner(
                 }
             }
             accepted = accepted_receiver.recv(), if accept_task.is_some() && inbound.len() < MAX_INBOUND_CONTACTS => {
+                control_yield_required = false;
                 application_tick_yield_required = false;
                 let yield_for_network =
                     account_network_event(&mut network_events_since_application);
@@ -4222,6 +9421,9 @@ async fn run_node_actor_inner(
                         }
                         let store = store.clone();
                         let policy_lock = policy_lock.clone();
+                        let emission_policy = emission_policy.clone();
+                        let custody_clock = custody_clock.clone();
+                        let event_route_cache = event_route_cache.clone();
                         let mission = config.mission.clone();
                         let mutable_interests = config.mutable_interests.clone();
                         let mission_peer = peer_missions
@@ -4231,14 +9433,17 @@ async fn run_node_actor_inner(
                         let task = inbound.spawn(async move {
                             (
                                 peer,
-                                serve_connection(
+                                serve_connection_with_forwarding(InboundContact {
                                     store,
                                     connection,
                                     mission,
-                                    MissionPeerBinding::new(peer, mission_peer),
+                                    peer: MissionPeerBinding::new(peer, mission_peer),
                                     policy_lock,
+                                    emission_policy,
+                                    custody_clock,
+                                    event_route_cache,
                                     mutable_interests,
-                                )
+                                })
                                 .await,
                             )
                         });
@@ -4264,6 +9469,7 @@ async fn run_node_actor_inner(
                 }
             }
             completed = inbound.join_next_with_id(), if !inbound.is_empty() => {
+                control_yield_required = false;
                 application_tick_yield_required = false;
                 let yield_for_network =
                     account_network_event(&mut network_events_since_application);
@@ -4275,9 +9481,17 @@ async fn run_node_actor_inner(
                             fatal_error = Some(error);
                             break;
                         }
+                        if let Err(error) = account_blob_receipt(&mut receipt, &server_receipt) {
+                            fatal_error = Some(error);
+                            break;
+                        }
+                        if let Err(error) = account_path_receipt(&mut receipt, &server_receipt) {
+                            fatal_error = Some(error);
+                            break;
+                        }
                         receipt.contacts += 1;
                         println!(
-                            "CONTACT direction=in carrier_peer={} mission_peer={} rounds={} control_offered={} control_fetched={} control_retained={} control_duplicates={} control_activated={} control_remaining={} offered={} fetched={} inserted={} duplicates={} remaining={} handshake_frames={} handshake_bytes={} protected_frames={} protected_bytes={} mission_auth=hybrid-pq semantics=source-authenticated-event reconciliation_classes=event,state,record controls=source-authenticated-flash content_admission=capability-gated status={}",
+                            "CONTACT direction=in carrier_peer={} mission_peer={} rounds={} control_offered={} control_fetched={} control_retained={} control_duplicates={} control_activated={} control_remaining={} offered={} fetched={} inserted={} duplicates={} remaining={} deferred_event_lanes={} mutable_remaining={} deferred_mutable_lanes={} blob_ranges_fetched={} blob_bytes_fetched={} blob_remaining={} blob_deferred={} handshake_frames={} handshake_bytes={} protected_frames={} protected_bytes={} carrier_path={} carrier_path_transitions={} carrier_path_transitions_saturated={} path_observation=not-authorization mission_auth=hybrid-pq semantics=source-authenticated-event reconciliation_classes={} controls=source-authenticated-flash content_admission=capability-gated status={}",
                             peer,
                             format_node_id(server_receipt.mission_peer.expect("successful mission contact has peer identity")),
                             server_receipt.rounds,
@@ -4292,10 +9506,21 @@ async fn run_node_actor_inner(
                             server_receipt.inserted,
                             server_receipt.duplicates,
                             server_receipt.remaining,
+                            server_receipt.deferred_event_lanes,
+                            server_receipt.mutable_remaining,
+                            server_receipt.deferred_mutable_lanes,
+                            server_receipt.blob_ranges_fetched,
+                            server_receipt.blob_bytes_fetched,
+                            server_receipt.blob_remaining,
+                            server_receipt.blob_deferred,
                             server_receipt.handshake_frames,
                             server_receipt.handshake_bytes,
                             server_receipt.protected_frames,
                             server_receipt.protected_bytes,
+                            carrier_path_name(server_receipt.carrier_path),
+                            server_receipt.carrier_path_transitions,
+                            server_receipt.carrier_path_transitions_saturated,
+                            contact_reconciliation_classes(server_receipt.semantic_version),
                             contact_status(&server_receipt),
                         );
                     }
@@ -4324,6 +9549,7 @@ async fn run_node_actor_inner(
                 }
             }
             completed = outbound.join_next_with_id(), if !outbound.is_empty() => {
+                control_yield_required = false;
                 application_tick_yield_required = false;
                 let yield_for_network =
                     account_network_event(&mut network_events_since_application);
@@ -4335,9 +9561,17 @@ async fn run_node_actor_inner(
                             fatal_error = Some(error);
                             break;
                         }
+                        if let Err(error) = account_blob_receipt(&mut receipt, &peer_receipt) {
+                            fatal_error = Some(error);
+                            break;
+                        }
+                        if let Err(error) = account_path_receipt(&mut receipt, &peer_receipt) {
+                            fatal_error = Some(error);
+                            break;
+                        }
                         receipt.contacts += 1;
                         println!(
-                            "CONTACT direction=out carrier_peer={} mission_peer={} rounds={} control_offered={} control_fetched={} control_retained={} control_duplicates={} control_activated={} control_remaining={} offered={} fetched={} inserted={} duplicates={} remaining={} handshake_frames={} handshake_bytes={} protected_frames={} protected_bytes={} mission_auth=hybrid-pq semantics=source-authenticated-event reconciliation_classes=event,state,record controls=source-authenticated-flash content_admission=capability-gated status={}",
+                            "CONTACT direction=out carrier_peer={} mission_peer={} rounds={} control_offered={} control_fetched={} control_retained={} control_duplicates={} control_activated={} control_remaining={} offered={} fetched={} inserted={} duplicates={} remaining={} deferred_event_lanes={} mutable_remaining={} deferred_mutable_lanes={} blob_ranges_fetched={} blob_bytes_fetched={} blob_remaining={} blob_deferred={} handshake_frames={} handshake_bytes={} protected_frames={} protected_bytes={} carrier_path={} carrier_path_transitions={} carrier_path_transitions_saturated={} path_observation=not-authorization mission_auth=hybrid-pq semantics=source-authenticated-event reconciliation_classes={} controls=source-authenticated-flash content_admission=capability-gated status={}",
                             peer.carrier.id,
                             format_node_id(peer_receipt.mission_peer.expect("successful mission contact has peer identity")),
                             peer_receipt.rounds,
@@ -4352,10 +9586,21 @@ async fn run_node_actor_inner(
                             peer_receipt.inserted,
                             peer_receipt.duplicates,
                             peer_receipt.remaining,
+                            peer_receipt.deferred_event_lanes,
+                            peer_receipt.mutable_remaining,
+                            peer_receipt.deferred_mutable_lanes,
+                            peer_receipt.blob_ranges_fetched,
+                            peer_receipt.blob_bytes_fetched,
+                            peer_receipt.blob_remaining,
+                            peer_receipt.blob_deferred,
                             peer_receipt.handshake_frames,
                             peer_receipt.handshake_bytes,
                             peer_receipt.protected_frames,
                             peer_receipt.protected_bytes,
+                            carrier_path_name(peer_receipt.carrier_path),
+                            peer_receipt.carrier_path_transitions,
+                            peer_receipt.carrier_path_transitions_saturated,
+                            contact_reconciliation_classes(peer_receipt.semantic_version),
                             contact_status(&peer_receipt),
                         );
                     }
@@ -4387,6 +9632,7 @@ async fn run_node_actor_inner(
                 if application_commands_open
                     && pending_application_command.is_none()
                     && network_events_since_application < NETWORK_EVENT_BUDGET => {
+                control_yield_required = false;
                 match command {
                     Some(command) => pending_application_command = Some(command),
                     None => application_commands_open = false,
@@ -4399,6 +9645,7 @@ async fn run_node_actor_inner(
                     .is_some_and(SelectedEventCommand::mutates_selectors),
             ), if pending_application_command.is_some()
                 && network_events_since_application < NETWORK_EVENT_BUDGET => {
+                control_yield_required = false;
                 let _lease = lease;
                 let command = pending_application_command
                     .take()
@@ -4419,7 +9666,9 @@ async fn run_node_actor_inner(
                 }
             }
             _ = tokio::task::yield_now(),
-                if application_tick_pending && application_tick_yield_required => {
+                if control_yield_required
+                    || (application_tick_pending && application_tick_yield_required) => {
+                control_yield_required = false;
                 application_tick_yield_required = false;
             }
             }
@@ -4428,10 +9677,18 @@ async fn run_node_actor_inner(
 
     application_admission.store(false, Ordering::Release);
     application_receiver.close();
+    control_receiver.close();
+    pending_control_lease.take();
     if let Some(command) = pending_application_command.take() {
         command.reject();
     }
     while let Ok(command) = application_receiver.try_recv() {
+        command.reject();
+    }
+    if let Some(command) = pending_control_command.take() {
+        command.reject();
+    }
+    while let Ok(command) = control_receiver.try_recv() {
         command.reject();
     }
     if let Some(task) = zeroization_task.take() {
@@ -4468,11 +9725,16 @@ async fn run_node_actor_inner(
                 receipt.control_highwater = completed.preserved.control_highwater;
                 request.respond("ASTER-ZEROIZE-LOCAL-OK").await?;
                 println!(
-                    "STOP lifecycle=zeroized sync_status=terminal-lockout carrier_id={} mission_id={} contacts={} contact_errors={} opaque_items={} opaque_acceptance_markers={} events={} event_acceptance_markers={} route_cached_events={} controls={} applied_controls={} pending_controls={} control_highwater={} mission_auth=hybrid-pq provisioning=unprotected-reference assurance=bounded-software physical_sanitization=not-claimed",
+                    "STOP lifecycle=zeroized sync_status=terminal-lockout carrier_id={} mission_id={} contacts={} contact_errors={} direct_contacts={} relay_contacts={} unknown_path_contacts={} carrier_path_transitions={} carrier_path_transition_saturations={} path_observation=not-authorization opaque_items={} opaque_acceptance_markers={} events={} event_acceptance_markers={} route_cached_events={} controls={} applied_controls={} pending_controls={} control_highwater={} mission_auth=hybrid-pq provisioning={} assurance=bounded-software physical_sanitization=not-claimed",
                     local_id,
                     format_node_id(config.mission.identity()),
                     receipt.contacts,
                     receipt.contact_errors,
+                    receipt.direct_contacts,
+                    receipt.relay_contacts,
+                    receipt.unknown_path_contacts,
+                    receipt.carrier_path_transitions,
+                    receipt.carrier_path_transition_saturations,
                     receipt.items,
                     receipt.acceptance_markers,
                     receipt.events,
@@ -4482,6 +9744,7 @@ async fn run_node_actor_inner(
                     receipt.applied_controls,
                     receipt.pending_controls,
                     receipt.control_highwater,
+                    provisioning_origin,
                 );
                 return Ok(receipt);
             }
@@ -4498,6 +9761,7 @@ async fn run_node_actor_inner(
     let stats = store.stats()?;
     let event_stats = store.event_stats()?;
     let control_stats = store.control_stats()?;
+    let blob_stats = store.blob_stats()?;
     receipt.items = stats.items;
     receipt.acceptance_markers = stats.acceptance_markers;
     receipt.events = event_stats.events;
@@ -4507,18 +9771,25 @@ async fn run_node_actor_inner(
     receipt.applied_controls = control_stats.applied;
     receipt.pending_controls = control_stats.pending;
     receipt.control_highwater = control_stats.head_sequence;
+    receipt.blobs = blob_stats.publications;
+    receipt.pending_blobs = blob_stats.pending_sources;
     let sync_status = if receipt.contacts == 0 {
         "no_successful_contact"
     } else {
         "contacts_observed"
     };
     println!(
-        "STOP lifecycle=complete sync_status={} carrier_id={} mission_id={} contacts={} contact_errors={} opaque_items={} opaque_acceptance_markers={} events={} event_acceptance_markers={} route_cached_events={} controls={} applied_controls={} pending_controls={} control_highwater={} mission_auth=hybrid-pq provisioning=unprotected-reference semantics=source-authenticated-event reconciliation_classes=event,state,record controls_semantics=source-authenticated-flash",
+        "STOP lifecycle=complete sync_status={} carrier_id={} mission_id={} contacts={} contact_errors={} direct_contacts={} relay_contacts={} unknown_path_contacts={} carrier_path_transitions={} carrier_path_transition_saturations={} path_observation=not-authorization opaque_items={} opaque_acceptance_markers={} events={} event_acceptance_markers={} route_cached_events={} controls={} applied_controls={} pending_controls={} control_highwater={} blobs={} pending_blobs={} blob_ranges_fetched={} blob_bytes_fetched={} blob_remaining={} blob_deferred={} mission_auth=hybrid-pq provisioning={} semantics=source-authenticated-event reconciliation_classes=event,state,record,blob-v5 controls_semantics=source-authenticated-flash",
         sync_status,
         local_id,
         format_node_id(config.mission.identity()),
         receipt.contacts,
         receipt.contact_errors,
+        receipt.direct_contacts,
+        receipt.relay_contacts,
+        receipt.unknown_path_contacts,
+        receipt.carrier_path_transitions,
+        receipt.carrier_path_transition_saturations,
         receipt.items,
         receipt.acceptance_markers,
         receipt.events,
@@ -4528,6 +9799,13 @@ async fn run_node_actor_inner(
         receipt.applied_controls,
         receipt.pending_controls,
         receipt.control_highwater,
+        receipt.blobs,
+        receipt.pending_blobs,
+        receipt.blob_ranges_fetched,
+        receipt.blob_bytes_fetched,
+        receipt.blob_remaining,
+        receipt.blob_deferred,
+        provisioning_origin,
     );
     Ok(receipt)
 }
@@ -4537,7 +9815,7 @@ async fn run_node_actor_inner(
 // every inbound, outbound, control, and application task using this Store.
 #[cfg(test)]
 async fn sync_once(
-    store: &Store,
+    store: Arc<Store>,
     endpoint: &Endpoint,
     mission: UnprotectedReferenceMission,
     peer: MissionExpectedPeer,
@@ -4554,47 +9832,138 @@ async fn sync_once(
     .receipt)
 }
 
+#[cfg(test)]
 async fn sync_once_with_policy(
-    store: &Store,
+    store: Arc<Store>,
     endpoint: &Endpoint,
     mission: UnprotectedReferenceMission,
     peer: MissionExpectedPeer,
     policy_lock: Arc<RwLock<()>>,
     mutable_interests: MutableSourceInterests,
 ) -> Result<CompletedPeerContact, NodeError> {
-    timeout(
-        CONTACT_DEADLINE,
-        sync_session(
+    let emission_policy = Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal));
+    let snapshot = emission_policy.snapshot()?;
+    let StartupEventVerification {
+        verifier: mut cache_verifier,
+        mut historical_verifier,
+        cache: event_route_cache,
+        policy: cache_policy,
+    } = open_startup_event_verifier_and_cache(&store, &mission)?;
+    migrate_legacy_event_operation_witnesses(
+        &store,
+        &cache_policy,
+        &mut cache_verifier,
+        &mut historical_verifier,
+    )?;
+    drop(historical_verifier);
+    drop(cache_verifier);
+    let custody_clock = NodeCustodyClock::open(mission.identity())?;
+    sync_once_with_forwarding(
+        endpoint,
+        OutboundContact {
             store,
-            endpoint,
             mission,
             peer,
             policy_lock,
+            emission_policy,
+            emission_snapshot: snapshot,
+            custody_clock,
+            event_route_cache,
             mutable_interests,
-        ),
+            controlled_relay: None,
+        },
     )
     .await
-    .map_err(|_| NodeError::Protocol("contact exceeded its total deadline".into()))?
+}
+
+struct OutboundContact {
+    store: Arc<Store>,
+    mission: UnprotectedReferenceMission,
+    peer: MissionExpectedPeer,
+    policy_lock: Arc<RwLock<()>>,
+    emission_policy: Arc<LiveEmissionPolicy>,
+    emission_snapshot: EmissionPolicySnapshot,
+    custody_clock: NodeCustodyClock,
+    event_route_cache: Arc<AuthenticatedEventRouteCache>,
+    mutable_interests: MutableSourceInterests,
+    controlled_relay: Option<ControlledRelayRouting>,
+}
+
+async fn sync_once_with_forwarding(
+    endpoint: &Endpoint,
+    contact: OutboundContact,
+) -> Result<CompletedPeerContact, NodeError> {
+    contact.emission_policy.require(contact.emission_snapshot)?;
+    if !contact
+        .emission_snapshot
+        .policy
+        .permits_contact_initiation()
+    {
+        return Err(NodeError::Protocol(
+            "receive-only policy cannot initiate a carrier contact".into(),
+        ));
+    }
+    timeout(CONTACT_DEADLINE, sync_session(endpoint, contact))
+        .await
+        .map_err(|_| NodeError::Protocol("contact exceeded its total deadline".into()))?
 }
 
 async fn sync_session(
-    store: &Store,
     endpoint: &Endpoint,
-    credentials: UnprotectedReferenceMission,
-    peer: MissionExpectedPeer,
-    policy_lock: Arc<RwLock<()>>,
-    mutable_interests: MutableSourceInterests,
+    contact: OutboundContact,
 ) -> Result<CompletedPeerContact, NodeError> {
-    let connection = endpoint.connect(peer.carrier).await?;
-    let result = sync_authenticated_session(
+    let OutboundContact {
         store,
-        &connection,
-        credentials,
+        mission: credentials,
         peer,
         policy_lock,
-        &mutable_interests,
-    )
-    .await;
+        emission_policy,
+        emission_snapshot,
+        custody_clock,
+        event_route_cache,
+        mutable_interests,
+        controlled_relay,
+    } = contact;
+    emission_policy.require(emission_snapshot)?;
+    drive_custody_maintenance(&store, &custody_clock, &[])?;
+    let connection = match controlled_relay {
+        Some(routing) => {
+            let direct_addresses = if routing.relay_only {
+                Vec::new()
+            } else {
+                vec![peer.carrier.address]
+            };
+            let route = PeerRoute::new(
+                peer.carrier.id,
+                direct_addresses,
+                routing.relay.url().clone(),
+            )?;
+            endpoint.connect_route(&route).await?
+        }
+        None => endpoint.connect(peer.carrier).await?,
+    };
+    emission_policy.require(emission_snapshot)?;
+    let guard = ContactEmissionGuard {
+        live: emission_policy,
+        captured: emission_snapshot,
+        custody_clock,
+    };
+    let result = CONTACT_EVENT_ROUTE_CACHE
+        .scope(
+            event_route_cache,
+            CONTACT_EMISSION_GUARD.scope(
+                guard,
+                sync_authenticated_session(
+                    store,
+                    &connection,
+                    credentials,
+                    peer,
+                    policy_lock,
+                    &mutable_interests,
+                ),
+            ),
+        )
+        .await;
     if result.is_err() {
         connection.close();
     }
@@ -4607,7 +9976,7 @@ async fn sync_control_lane(
     mission: &mut MissionSession,
     verifier: &mut ReferenceEnvelopeSealer,
     receipt: &mut PeerReceipt,
-) -> Result<(), NodeError> {
+) -> Result<EmissionPolicySnapshot, NodeError> {
     let local = verifier.identity();
     let peer = mission.peer().mission_id();
     let mut verifier_head = store.control_head()?;
@@ -4616,6 +9985,8 @@ async fn sync_control_lane(
     let limits = ReconciliationLimits::default();
     let mut initiator = Initiator::new(&inventory, limits)?;
     let mut query = initiator.initiate()?;
+    let semantic_v3 = mission.semantic_version() >= MIN_CUSTODY_SEMANTIC_VERSION;
+    let mut remote_emission = None;
     let difference = loop {
         ensure_control_lane_state(store, local, peer, verifier_head)?;
         let response = request_mission_frame(
@@ -4625,10 +9996,21 @@ async fn sync_control_lane(
             receipt,
         )
         .await?;
-        let Frame::ControlInventoryReply(response) = response else {
-            return Err(NodeError::Protocol(
-                "control inventory query received a different response".into(),
-            ));
+        let response = match response {
+            Frame::ControlInventoryReplyV3 {
+                bytes,
+                policy,
+                policy_revision,
+            } if semantic_v3 => {
+                observe_remote_emission_policy(&mut remote_emission, policy, policy_revision)?;
+                bytes
+            }
+            Frame::ControlInventoryReply(bytes) if !semantic_v3 => bytes,
+            _ => {
+                return Err(NodeError::Protocol(
+                    "control inventory query received a version-incompatible response".into(),
+                ));
+            }
         };
         match initiator.reconcile_response(&response)? {
             InitiatorStep::Continue(next) => query = next,
@@ -4653,6 +10035,61 @@ async fn sync_control_lane(
         ));
     }
 
+    let remote_emission = remote_emission.unwrap_or(EmissionPolicySnapshot {
+        policy: EventEmissionPolicy::Normal,
+        revision: 0,
+    });
+
+    if matches!(remote_emission.policy, EventEmissionPolicy::ReceiveOnly) {
+        receipt.rounds = receipt
+            .rounds
+            .checked_add(initiator.rounds())
+            .ok_or_else(|| NodeError::Protocol("combined round count overflow".into()))?;
+        let limit = difference.local_only.len().min(MAX_CONTACT_ITEMS);
+        receipt.controls_remaining = difference
+            .local_only
+            .len()
+            .saturating_sub(limit)
+            .saturating_add(difference.remote_only.len());
+        for id in difference.local_only.iter().take(limit) {
+            ensure_control_lane_state(store, local, peer, verifier_head)?;
+            let bytes = load_verified_control(store, verifier, *id)?;
+            let response = request_mission_frame(
+                connection,
+                mission,
+                Frame::ControlOffer { id: *id, bytes },
+                receipt,
+            )
+            .await?;
+            let Frame::ControlApplyResult {
+                id: applied,
+                retained,
+            } = response
+            else {
+                return Err(NodeError::Protocol(
+                    "receive-only control offer acknowledgement differs".into(),
+                ));
+            };
+            if applied != *id {
+                return Err(NodeError::Protocol(
+                    "receive-only control acknowledgement identifies another transfer".into(),
+                ));
+            }
+            receipt.controls_offered += 1;
+            if !retained {
+                receipt.control_duplicates += 1;
+            }
+        }
+        if request_mission_frame(connection, mission, Frame::ControlFinish, receipt).await?
+            != Frame::ControlFinished
+        {
+            return Err(NodeError::Protocol(
+                "receive-only control finish acknowledgement differs".into(),
+            ));
+        }
+        return Ok(remote_emission);
+    }
+
     let mut reverse = Responder::new(&inventory, limits)?;
     loop {
         ensure_control_lane_state(store, local, peer, verifier_head)?;
@@ -4661,7 +10098,7 @@ async fn sync_control_lane(
             connection,
             mission,
             wire_budget,
-            |frame, _request_wire_len| {
+            |frame, _request_wire_len, _mission| {
                 ensure_control_lane_state(store, local, peer, verifier_head)?;
                 match frame {
                     Frame::ControlDifferenceQuery(query) => Ok((
@@ -4773,7 +10210,7 @@ async fn sync_control_lane(
             "control finish acknowledgement differs".into(),
         ));
     }
-    Ok(())
+    Ok(remote_emission)
 }
 
 async fn sync_event_interests(
@@ -4781,24 +10218,198 @@ async fn sync_event_interests(
     connection: &aster_iroh::Connection,
     mission: &mut MissionSession,
     event_guard: &EventLaneGuard,
+    expected_remote_emission: EmissionPolicySnapshot,
     receipt: &mut PeerReceipt,
-) -> Result<(EventInterest, EventInterest), NodeError> {
+) -> Result<(EventInterestSnapshot, EventInterestSnapshot), NodeError> {
     event_guard.check(store)?;
-    let local_interest = event_guard.interest()?;
-    let response = request_mission_frame(
-        connection,
-        mission,
-        Frame::EventInterest(local_interest.clone()),
-        receipt,
-    )
-    .await?;
-    let Frame::EventInterestReply(peer_interest) = response else {
-        return Err(NodeError::Protocol(
-            "protected Event interest request received another response".into(),
-        ));
+    let local_interest = EventInterestSnapshot::protected(
+        event_guard.interest()?,
+        event_guard.replication_policy().selector_revision(),
+    )?;
+    let semantic_v3 = mission.semantic_version() >= MIN_CUSTODY_SEMANTIC_VERSION;
+    let local_emission = contact_policy_or_normal()?;
+    let request = if semantic_v3 {
+        Frame::EventInterestV3 {
+            interest: local_interest.interest.clone(),
+            selector_revision: local_interest.selector_revision.value(),
+            policy: frame_emission_policy(local_emission.policy),
+            policy_revision: local_emission.revision,
+        }
+    } else {
+        Frame::EventInterest(local_interest.interest.clone())
+    };
+    let response = request_mission_frame(connection, mission, request, receipt).await?;
+    let peer_interest = match response {
+        Frame::EventInterestReplyV3 {
+            interest,
+            selector_revision,
+            policy,
+            policy_revision,
+        } if semantic_v3 => {
+            let mut observed = Some(expected_remote_emission);
+            observe_remote_emission_policy(&mut observed, policy, policy_revision)?;
+            EventInterestSnapshot::protected(interest, selector_revision)?
+        }
+        Frame::EventInterestReply(interest) if !semantic_v3 => {
+            EventInterestSnapshot::legacy(interest)
+        }
+        _ => {
+            return Err(NodeError::Protocol(
+                "protected Event interest request received a version-incompatible response".into(),
+            ));
+        }
     };
     event_guard.check(store)?;
     Ok((local_interest, peer_interest))
+}
+
+#[derive(Debug)]
+enum EventReconciliationOutcome {
+    Complete(CompletedEventReconciliation),
+    Deferred,
+}
+
+#[derive(Debug)]
+struct CompletedEventReconciliation {
+    difference: EventDifference,
+    /// Exact peer-filtered sender universe authenticated by this completed
+    /// reconciliation, present only when this endpoint was the lane's sender.
+    local_sender_inventory: Option<Vec<EventTransferId>>,
+}
+
+impl CompletedEventReconciliation {
+    fn new(
+        difference: EventDifference,
+        inventory: &InventorySnapshot,
+        local_is_sender: bool,
+    ) -> Self {
+        let local_sender_inventory = local_is_sender.then(|| {
+            inventory
+                .iter()
+                .copied()
+                .map(EventTransferId::from_reconciliation_item_id)
+                .collect()
+        });
+        Self {
+            difference,
+            local_sender_inventory,
+        }
+    }
+}
+
+fn settle_authenticated_event_common_set(
+    store: &Store,
+    event_guard: &EventLaneGuard,
+    peer: NodeId,
+    semantic_v3: bool,
+    remote_emission: EmissionPolicySnapshot,
+    receiver_selector_revision: CustodyPeerSelectorRevision,
+    reconciliation: &CompletedEventReconciliation,
+) -> Result<(), NodeError> {
+    let Some(local_sender_inventory) = reconciliation.local_sender_inventory.as_deref() else {
+        return Ok(());
+    };
+    if !semantic_v3 || matches!(remote_emission.policy, EventEmissionPolicy::ReceiveOnly) {
+        return Ok(());
+    }
+    event_guard.check(store)?;
+    let expected_policy = store.custody_policy_revision()?;
+    let _settled = store.settle_authenticated_peer_inventory(
+        peer,
+        local_sender_inventory,
+        &reconciliation.difference.local_only,
+        receiver_selector_revision,
+        expected_policy,
+    )?;
+    event_guard.check(store)
+}
+
+fn reconciliation_exchange_preserves_defer(
+    receipt: &PeerReceipt,
+    request_plaintext_bytes: usize,
+    maximum_response_plaintext_bytes: usize,
+    post_event_semantic: Option<u16>,
+) -> Result<bool, NodeError> {
+    let post_event = post_event_semantic.and_then(post_event_reserve);
+    #[cfg(test)]
+    if TEST_RECONCILIATION_EXCHANGES_BEFORE_DEFER
+        .try_with(|remaining| match remaining.get() {
+            Some(0) => true,
+            Some(count) => {
+                remaining.set(Some(count - 1));
+                false
+            }
+            None => false,
+        })
+        .unwrap_or(false)
+    {
+        return Ok(false);
+    }
+    let used_frames = receipt
+        .handshake_frames
+        .checked_add(receipt.protected_frames)
+        .ok_or_else(|| NodeError::Protocol("contact frame count overflow".into()))?;
+    let required_exchanges = 2usize
+        .checked_add(post_event.map_or(0, |reserve| reserve.exchanges))
+        .ok_or_else(|| NodeError::Protocol("Event reconciliation frame reserve overflow".into()))?;
+    let required_frames = EXCHANGE_FRAMES
+        .checked_mul(required_exchanges)
+        .ok_or_else(|| NodeError::Protocol("Event reconciliation frame reserve overflow".into()))?;
+    let frames_fit = used_frames
+        .checked_add(required_frames)
+        .is_some_and(|frames| frames <= MAX_CONTACT_FRAMES);
+
+    let used_bytes = receipt
+        .handshake_bytes
+        .checked_add(receipt.protected_bytes)
+        .ok_or_else(|| NodeError::Protocol("contact byte count overflow".into()))?;
+    let exchange_bytes = request_plaintext_bytes
+        .checked_add(APPLICATION_PROTECTION_OVERHEAD_BYTES)
+        .and_then(|bytes| bytes.checked_add(maximum_response_plaintext_bytes))
+        .and_then(|bytes| bytes.checked_add(APPLICATION_PROTECTION_OVERHEAD_BYTES))
+        .and_then(|bytes| bytes.checked_add(EVENT_LANE_DEFER_EXCHANGE_BYTES))
+        .and_then(|bytes| bytes.checked_add(post_event.map_or(0, |reserve| reserve.bytes)))
+        .ok_or_else(|| NodeError::Protocol("Event reconciliation byte reserve overflow".into()))?;
+    let bytes_fit = used_bytes
+        .checked_add(exchange_bytes)
+        .is_some_and(|bytes| bytes <= MAX_CONTACT_BYTES);
+    Ok(frames_fit && bytes_fit)
+}
+
+fn reconciliation_query_plaintext_bytes(query_len: usize) -> Result<usize, NodeError> {
+    RECONCILIATION_FRAME_OVERHEAD_BYTES
+        .checked_add(query_len)
+        .ok_or_else(|| NodeError::Protocol("Event reconciliation frame length overflow".into()))
+}
+
+async fn defer_event_lane(
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    direction: EventDirection,
+    receipt: &mut PeerReceipt,
+) -> Result<(), NodeError> {
+    if request_mission_frame(
+        connection,
+        mission,
+        Frame::EventLaneDeferred { direction },
+        receipt,
+    )
+    .await?
+        != (Frame::EventLaneDeferredAck { direction })
+    {
+        return Err(NodeError::Protocol(
+            "Event lane deferral acknowledgement differs".into(),
+        ));
+    }
+    record_event_lane_deferred(receipt)
+}
+
+fn record_event_lane_deferred(receipt: &mut PeerReceipt) -> Result<(), NodeError> {
+    receipt.deferred_event_lanes = receipt
+        .deferred_event_lanes
+        .checked_add(1)
+        .ok_or_else(|| NodeError::Protocol("deferred Event lane count overflow".into()))?;
+    add_unscheduled_events(receipt, 1)
 }
 
 async fn sync_event_reconciliation_lane(
@@ -4807,14 +10418,21 @@ async fn sync_event_reconciliation_lane(
     mission: &mut MissionSession,
     event_verifier: &mut ReferenceEnvelopeSealer,
     lane: DirectedEventLane<'_>,
+    remote_emission: EmissionPolicySnapshot,
     receipt: &mut PeerReceipt,
-) -> Result<EventDifference, NodeError> {
+) -> Result<EventReconciliationOutcome, NodeError> {
     let DirectedEventLane {
         guard: event_guard,
         receiver_interest,
+        receiver_selector_revision: _,
         direction,
     } = lane;
     event_guard.check(store)?;
+    let semantic_v3 = mission.semantic_version() >= MIN_CUSTODY_SEMANTIC_VERSION;
+    let post_event_semantic = (supports_mutable_semantic(mission.semantic_version())
+        && !matches!(remote_emission.policy, EventEmissionPolicy::ReceiveOnly))
+    .then_some(mission.semantic_version());
+    let allow_finite_ttl = semantic_v3 && contact_supports_finite_ttl();
     let inventory = match direction {
         EventDirection::ToSessionResponder => transfer_inventory_for_peer(
             store,
@@ -4823,19 +10441,32 @@ async fn sync_event_reconciliation_lane(
             mission.peer().mission_id(),
             mission.peer_route_grant_commitments(),
             receiver_interest,
+            allow_finite_ttl,
         )?,
         EventDirection::ToSessionInitiator => transfer_inventory_for_receiver(
             store,
             event_guard.replication_policy(),
             event_verifier,
             receiver_interest,
+            allow_finite_ttl,
         )?,
     };
-    let limits = ReconciliationLimits::default();
+    let limits = selected_reconciliation_limits()?;
     let mut initiator = Initiator::new(&inventory, limits)?;
     let mut query = initiator.initiate()?;
     let difference = loop {
         event_guard.check(store)?;
+        if semantic_v3
+            && !reconciliation_exchange_preserves_defer(
+                receipt,
+                reconciliation_query_plaintext_bytes(query.len())?,
+                reconciliation_query_plaintext_bytes(limits.frame_size())?,
+                post_event_semantic,
+            )?
+        {
+            defer_event_lane(connection, mission, direction, receipt).await?;
+            return Ok(EventReconciliationOutcome::Deferred);
+        }
         let response = request_mission_frame(
             connection,
             mission,
@@ -4869,6 +10500,17 @@ async fn sync_event_reconciliation_lane(
     };
     let first_rounds = initiator.rounds();
     event_guard.check(store)?;
+    if semantic_v3
+        && !reconciliation_exchange_preserves_defer(
+            receipt,
+            DIRECTION_ONLY_PLAINTEXT_BYTES,
+            DIRECTION_ONLY_PLAINTEXT_BYTES,
+            post_event_semantic,
+        )?
+    {
+        defer_event_lane(connection, mission, direction, receipt).await?;
+        return Ok(EventReconciliationOutcome::Deferred);
+    }
     if request_mission_frame(
         connection,
         mission,
@@ -4883,7 +10525,22 @@ async fn sync_event_reconciliation_lane(
         ));
     }
 
+    if matches!(remote_emission.policy, EventEmissionPolicy::ReceiveOnly) {
+        receipt.rounds = receipt
+            .rounds
+            .checked_add(first_rounds)
+            .ok_or_else(|| NodeError::Protocol("combined round count overflow".into()))?;
+        return Ok(EventReconciliationOutcome::Complete(
+            CompletedEventReconciliation::new(
+                difference,
+                &inventory,
+                direction == EventDirection::ToSessionResponder,
+            ),
+        ));
+    }
+
     let mut reverse = Responder::new(&inventory, limits)?;
+    let mut deferred = false;
     loop {
         event_guard.check(store)?;
         let wire_budget = exchange_wire_budget(receipt)?;
@@ -4891,7 +10548,7 @@ async fn sync_event_reconciliation_lane(
             connection,
             mission,
             wire_budget,
-            |frame, _request_wire_len| match frame {
+            |frame, _request_wire_len, _mission| match frame {
                 Frame::DifferenceQuery {
                     direction: request_direction,
                     bytes: query,
@@ -4916,6 +10573,13 @@ async fn sync_event_reconciliation_lane(
                 } if request_direction == direction => Err(NodeError::Protocol(
                     "difference bound preceded directional reverse reconciliation".into(),
                 )),
+                Frame::EventLaneDeferred {
+                    direction: request_direction,
+                } if semantic_v3 && request_direction == direction => {
+                    event_guard.check(store)?;
+                    deferred = true;
+                    Ok((Frame::EventLaneDeferredAck { direction }, true))
+                }
                 _ => Err(NodeError::Protocol(
                     "reverse reconciliation crossed Event lanes or phases".into(),
                 )),
@@ -4932,15 +10596,36 @@ async fn sync_event_reconciliation_lane(
         .checked_add(first_rounds)
         .and_then(|rounds| rounds.checked_add(reverse.rounds()))
         .ok_or_else(|| NodeError::Protocol("combined round count overflow".into()))?;
-    Ok(difference)
+    if deferred {
+        record_event_lane_deferred(receipt)?;
+        Ok(EventReconciliationOutcome::Deferred)
+    } else {
+        Ok(EventReconciliationOutcome::Complete(
+            CompletedEventReconciliation::new(
+                difference,
+                &inventory,
+                direction == EventDirection::ToSessionResponder,
+            ),
+        ))
+    }
 }
 
-fn event_transfer_capacity(receipt: &PeerReceipt) -> Result<usize, NodeError> {
+fn event_transfer_capacity(
+    receipt: &PeerReceipt,
+    post_event_semantic: Option<u16>,
+) -> Result<usize, NodeError> {
     let transferred = receipt
         .offered
         .checked_add(receipt.fetched)
         .ok_or_else(|| NodeError::Protocol("contact item count overflow".into()))?;
-    MAX_CONTACT_ITEMS
+    let event_item_bound = MAX_CONTACT_ITEMS
+        .checked_sub(
+            post_event_semantic
+                .and_then(post_event_reserve)
+                .map_or(0, |reserve| reserve.items),
+        )
+        .ok_or_else(|| NodeError::Protocol("mutable item reserve exceeds contact bound".into()))?;
+    event_item_bound
         .checked_sub(transferred)
         .ok_or_else(|| NodeError::Protocol("contact item count exceeds its bound".into()))
 }
@@ -4953,65 +10638,509 @@ fn add_unscheduled_events(receipt: &mut PeerReceipt, remaining: usize) -> Result
     Ok(())
 }
 
-async fn sync_event_transfer_lane(
-    store: &Store,
+fn add_unscheduled_mutable(receipt: &mut PeerReceipt, remaining: usize) -> Result<(), NodeError> {
+    receipt.mutable_remaining = receipt
+        .mutable_remaining
+        .checked_add(remaining)
+        .ok_or_else(|| NodeError::Protocol("remaining mutable object count overflow".into()))?;
+    Ok(())
+}
+
+fn event_lane_remaining_wire(remaining: usize) -> Result<u64, NodeError> {
+    if remaining > MAX_CARDINALITY_LIMIT {
+        return Err(NodeError::Protocol(
+            "Event lane remaining count exceeds the selected cardinality bound".into(),
+        ));
+    }
+    u64::try_from(remaining)
+        .map_err(|_| NodeError::Protocol("Event lane remaining count exceeds u64".into()))
+}
+
+fn event_lane_remaining_since(
+    receipt: &PeerReceipt,
+    remaining_before: usize,
+) -> Result<u64, NodeError> {
+    let lane_remaining = receipt
+        .remaining
+        .checked_sub(remaining_before)
+        .ok_or_else(|| NodeError::Protocol("Event lane remaining count regressed".into()))?;
+    event_lane_remaining_wire(lane_remaining)
+}
+
+async fn finish_v3_event_lane(
     connection: &aster_iroh::Connection,
     mission: &mut MissionSession,
-    event_verifier: &mut ReferenceEnvelopeSealer,
-    lane: DirectedEventLane<'_>,
-    difference: &EventDifference,
+    direction: EventDirection,
+    remaining: u64,
     receipt: &mut PeerReceipt,
 ) -> Result<(), NodeError> {
+    let response = request_mission_frame(
+        connection,
+        mission,
+        Frame::FinishV3 {
+            direction,
+            remaining,
+        },
+        receipt,
+    )
+    .await?;
+    if response
+        != (Frame::FinishedV3 {
+            direction,
+            remaining,
+        })
+    {
+        return Err(NodeError::Protocol(
+            "v3 directional finish acknowledgement differs".into(),
+        ));
+    }
+    Ok(())
+}
+
+struct V3OfferIo<'a> {
+    store: Arc<Store>,
+    connection: &'a aster_iroh::Connection,
+    mission: &'a mut MissionSession,
+    event_guard: &'a EventLaneGuard,
+    exchanges: &'a mut CustodyExchangeSequence,
+    receipt: &'a mut PeerReceipt,
+}
+
+struct V3OfferSource<'a> {
+    peer: NodeId,
+    direction: EventDirection,
+    scheduled: ScheduledCustodyTransfer,
+    verified: &'a RouteVerifiedEventEnvelope,
+    bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum V3OfferOutcome {
+    Applied(bool),
+    Skipped,
+}
+
+#[cfg(test)]
+fn take_test_custody_preopen_race(transfer_id: EventTransferId) -> Option<TestCustodyPreopenRace> {
+    TEST_CUSTODY_PREOPEN_RACES
+        .try_with(|races| {
+            let mut races = races.borrow_mut();
+            let index = races.iter().position(|race| match race {
+                TestCustodyPreopenRace::Expire { .. } => false,
+                TestCustodyPreopenRace::ItemChanged(target)
+                | TestCustodyPreopenRace::LeaseLimitExceeded(target)
+                | TestCustodyPreopenRace::RetryLimitExceeded(target)
+                | TestCustodyPreopenRace::RetryNotDue(target) => *target == transfer_id,
+                TestCustodyPreopenRace::ForceRouteOnly(_) => false,
+                TestCustodyPreopenRace::FinalPolicyChange => false,
+            })?;
+            Some(races.remove(index))
+        })
+        .ok()
+        .flatten()
+}
+
+#[cfg(test)]
+fn apply_test_expiry_before_scheduled_load(transfer_id: EventTransferId) -> Result<(), NodeError> {
+    let tick_ms = TEST_CUSTODY_PREOPEN_RACES
+        .try_with(|races| {
+            let mut races = races.borrow_mut();
+            let index = races.iter().position(|race| {
+                matches!(
+                    race,
+                    TestCustodyPreopenRace::Expire {
+                        transfer_id: target,
+                        ..
+                    } if *target == transfer_id
+                )
+            })?;
+            match races.remove(index) {
+                TestCustodyPreopenRace::Expire { tick_ms, .. } => Some(tick_ms),
+                TestCustodyPreopenRace::ItemChanged(_)
+                | TestCustodyPreopenRace::LeaseLimitExceeded(_)
+                | TestCustodyPreopenRace::RetryLimitExceeded(_)
+                | TestCustodyPreopenRace::RetryNotDue(_)
+                | TestCustodyPreopenRace::ForceRouteOnly(_) => None,
+                TestCustodyPreopenRace::FinalPolicyChange => None,
+            }
+        })
+        .ok()
+        .flatten();
+    if let Some(tick_ms) = tick_ms {
+        CONTACT_EMISSION_GUARD
+            .try_with(|guard| guard.custody_clock.set_injected_tick(tick_ms))
+            .map_err(|_| NodeError::Protocol("custody test hook lacks a contact clock".into()))??;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn apply_test_policy_change_during_final_send() -> Result<(), NodeError> {
+    let change = TEST_CUSTODY_PREOPEN_RACES
+        .try_with(|races| {
+            let mut races = races.borrow_mut();
+            let index = races
+                .iter()
+                .position(|race| matches!(race, TestCustodyPreopenRace::FinalPolicyChange))?;
+            races.remove(index);
+            Some(())
+        })
+        .ok()
+        .flatten()
+        .is_some();
+    if change {
+        CONTACT_EMISSION_GUARD
+            .try_with(|guard| guard.live.update(EventEmissionPolicy::ReceiveOnly))
+            .map_err(|_| {
+                NodeError::Protocol("custody test hook lacks a contact emission guard".into())
+            })??;
+    }
+    Ok(())
+}
+
+fn require_v3_apply_result(
+    response: Frame,
+    expected_direction: EventDirection,
+    expected_transfer: EventTransferId,
+    expected_exchange: u64,
+) -> Result<(bool, EventApplyDisposition), NodeError> {
+    let Frame::ApplyResultV3 {
+        direction,
+        id,
+        exchange_id,
+        inserted,
+        disposition,
+    } = response
+    else {
+        return Err(NodeError::Protocol(
+            "v3 directional offer acknowledgement differs".into(),
+        ));
+    };
+    if direction != expected_direction
+        || id != expected_transfer
+        || exchange_id != expected_exchange
+    {
+        return Err(NodeError::Protocol(
+            "v3 offer acknowledgement crossed Event lanes, exchanges, or items".into(),
+        ));
+    }
+    Ok((inserted, disposition))
+}
+
+fn require_legacy_apply_result(
+    response: Frame,
+    expected_direction: EventDirection,
+    expected_transfer: EventTransferId,
+) -> Result<bool, NodeError> {
+    let Frame::ApplyResult {
+        direction,
+        id,
+        inserted,
+    } = response
+    else {
+        return Err(NodeError::Protocol(
+            "directional offer acknowledgement differs".into(),
+        ));
+    };
+    if direction != expected_direction || id != expected_transfer {
+        return Err(NodeError::Protocol(
+            "offer acknowledgement crossed Event lanes or identifies another item".into(),
+        ));
+    }
+    Ok(inserted)
+}
+
+async fn send_v3_offer(
+    io: V3OfferIo<'_>,
+    source: V3OfferSource<'_>,
+) -> Result<V3OfferOutcome, NodeError> {
+    let V3OfferIo {
+        store,
+        connection,
+        mission,
+        event_guard,
+        exchanges,
+        receipt,
+    } = io;
+    let V3OfferSource {
+        peer,
+        direction,
+        scheduled,
+        verified,
+        bytes,
+    } = source;
+    let transfer_id = scheduled.transfer_id;
+    event_guard.check(&store)?;
+    let exchange_id = exchanges.take()?;
+    #[cfg(test)]
+    let competing_lease = match take_test_custody_preopen_race(transfer_id) {
+        Some(
+            action @ (TestCustodyPreopenRace::ItemChanged(_)
+            | TestCustodyPreopenRace::RetryNotDue(_)),
+        ) => {
+            let sample = contact_custody_sample()?.ok_or_else(|| {
+                NodeError::Protocol("custody test race lacks a local sample".into())
+            })?;
+            let lease = store.begin_custody_send(
+                peer,
+                scheduled.object,
+                scheduled.peer_selector_revision,
+                Some(sample),
+                0,
+                scheduled.policy_revision,
+            )?;
+            if matches!(action, TestCustodyPreopenRace::RetryNotDue(_)) {
+                store.release_transfer_lease(lease.id)?;
+                None
+            } else {
+                Some(lease.id)
+            }
+        }
+        Some(TestCustodyPreopenRace::Expire { .. }) => {
+            unreachable!("expiry is applied before load")
+        }
+        Some(TestCustodyPreopenRace::LeaseLimitExceeded(_)) => {
+            let error = map_preopen_custody_expiry(NodeError::Store(StoreError::Custody(
+                CustodyStoreError::LeaseLimitExceeded {
+                    current: 1,
+                    limit: 1,
+                },
+            )));
+            return match error {
+                NodeError::CustodySendSkipped => Ok(V3OfferOutcome::Skipped),
+                error => Err(error),
+            };
+        }
+        Some(TestCustodyPreopenRace::RetryLimitExceeded(_)) => {
+            let error = map_preopen_custody_expiry(NodeError::Store(StoreError::Custody(
+                CustodyStoreError::RetryLimitExceeded {
+                    current: 1,
+                    limit: 1,
+                },
+            )));
+            return match error {
+                NodeError::CustodySendSkipped => Ok(V3OfferOutcome::Skipped),
+                error => Err(error),
+            };
+        }
+        Some(TestCustodyPreopenRace::FinalPolicyChange) => {
+            unreachable!("final policy change is applied at the carrier-adjacent check")
+        }
+        Some(TestCustodyPreopenRace::ForceRouteOnly(_)) => {
+            unreachable!("route-only receive hook is not a sender pre-open race")
+        }
+        None => None,
+    };
+    let prepared_result = prepare_outbound_custody(
+        store.clone(),
+        mission,
+        OutboundCustodySource {
+            peer,
+            transfer_id,
+            object: scheduled.object,
+            policy_revision: scheduled.policy_revision,
+            verified,
+            exact_len: bytes.len(),
+            exchange_id,
+            peer_selector_revision: scheduled.peer_selector_revision,
+        },
+    );
+    #[cfg(test)]
+    if let Some(lease) = competing_lease {
+        store.release_transfer_lease(lease)?;
+    }
+    let prepared = match prepared_result {
+        Ok(prepared) => prepared,
+        Err(NodeError::CustodySendSkipped) => return Ok(V3OfferOutcome::Skipped),
+        Err(error) => return Err(error),
+    };
+    let exchange = request_mission_frame_built_checked(
+        connection,
+        mission,
+        receipt,
+        |mission| {
+            event_guard.check(&store)?;
+            prepared.build_offer(mission, direction, transfer_id, bytes)
+        },
+        |bound| {
+            event_guard.check(&store)?;
+            prepared.require_final_send(*bound)
+        },
+    )
+    .await;
+    let (response, (_, (age_ms, _))) = match exchange {
+        Ok(exchange) => exchange,
+        Err(NodeError::CustodySendSkipped) => return Ok(V3OfferOutcome::Skipped),
+        Err(error) => return Err(error),
+    };
+    let (inserted, disposition) =
+        require_v3_apply_result(response, direction, transfer_id, exchange_id)?;
+    let receipt_sample = contact_custody_sample()?
+        .ok_or_else(|| NodeError::Protocol("custody receipt lacks a local clock sample".into()))?;
+    prepared.settle_apply(disposition, age_ms, receipt_sample)?;
+    Ok(V3OfferOutcome::Applied(inserted))
+}
+
+struct EventTransferLaneContext<'io, 'lane> {
+    store: &'io Store,
+    lease_store: Arc<Store>,
+    connection: &'io aster_iroh::Connection,
+    mission: &'io mut MissionSession,
+    event_verifier: &'io mut ReferenceEnvelopeSealer,
+    lane: DirectedEventLane<'lane>,
+    remote_emission: EmissionPolicySnapshot,
+    exchanges: &'io mut CustodyExchangeSequence,
+    receipt: &'io mut PeerReceipt,
+}
+
+async fn sync_event_transfer_lane(
+    context: EventTransferLaneContext<'_, '_>,
+    difference: &EventDifference,
+) -> Result<(), NodeError> {
+    let EventTransferLaneContext {
+        store,
+        lease_store,
+        connection,
+        mission,
+        event_verifier,
+        lane,
+        remote_emission,
+        exchanges,
+        receipt,
+    } = context;
     let DirectedEventLane {
         guard: event_guard,
         receiver_interest,
+        receiver_selector_revision,
         direction,
     } = lane;
     let authenticated_peer = mission.peer().mission_id();
     let peer_route_commitments = mission.peer_route_grant_commitments().to_vec();
-    let capacity = event_transfer_capacity(receipt)?;
+    let semantic_v3 = mission.semantic_version() >= MIN_CUSTODY_SEMANTIC_VERSION;
+    let post_event_semantic = (supports_mutable_semantic(mission.semantic_version())
+        && !matches!(remote_emission.policy, EventEmissionPolicy::ReceiveOnly))
+    .then_some(mission.semantic_version());
+    let capacity = event_transfer_capacity(receipt, post_event_semantic)?;
+    let lane_remaining_before = receipt.remaining;
     match direction {
         EventDirection::ToSessionResponder => {
-            let limit = difference.local_only.len().min(capacity);
-            add_unscheduled_events(receipt, difference.local_only.len() - limit)?;
-            for id in difference.local_only.iter().take(limit) {
-                event_guard.check(store)?;
-                let bytes = load_verified_transfer_for_peer(
+            let ordered: Vec<PlannedEventTransfer> = if semantic_v3 {
+                ordered_due_custody_transfers(
                     store,
-                    event_guard.policy(),
-                    event_verifier,
-                    *id,
                     authenticated_peer,
-                    &peer_route_commitments,
-                    receiver_interest,
-                )?;
-                let response = request_mission_frame(
-                    connection,
-                    mission,
-                    Frame::Offer {
-                        direction,
-                        id: *id,
-                        bytes,
-                    },
+                    &difference.local_only,
+                    capacity,
                     receipt,
-                )
-                .await?;
-                let Frame::ApplyResult {
-                    direction: response_direction,
-                    id: applied,
-                    inserted,
-                } = response
-                else {
-                    return Err(NodeError::Protocol(
-                        "directional offer acknowledgement differs".into(),
-                    ));
+                    if matches!(remote_emission.policy, EventEmissionPolicy::ReceiveOnly) {
+                        CustodyReconciliationEvidence::Blind(receiver_selector_revision)
+                    } else {
+                        CustodyReconciliationEvidence::AuthenticatedPeerMissing(
+                            receiver_selector_revision,
+                        )
+                    },
+                    CustodyScheduleReserve {
+                        future_defer: !matches!(
+                            remote_emission.policy,
+                            EventEmissionPolicy::ReceiveOnly
+                        ),
+                        post_event_semantic,
+                    },
+                )?
+                .into_iter()
+                .map(PlannedEventTransfer::Custody)
+                .collect()
+            } else {
+                difference
+                    .local_only
+                    .iter()
+                    .take(capacity)
+                    .copied()
+                    .map(PlannedEventTransfer::Legacy)
+                    .collect()
+            };
+            add_unscheduled_events(receipt, difference.local_only.len() - ordered.len())?;
+            for planned in ordered {
+                let id = planned.transfer_id();
+                event_guard.check(store)?;
+                let loaded = if let Some(scheduled) = planned.custody() {
+                    #[cfg(test)]
+                    apply_test_expiry_before_scheduled_load(id)?;
+                    load_scheduled_transfer_for_peer_with_claims(
+                        store,
+                        event_verifier,
+                        scheduled,
+                        authenticated_peer,
+                        &peer_route_commitments,
+                        receiver_interest,
+                    )
+                } else {
+                    load_verified_transfer_for_peer_with_claims(
+                        store,
+                        event_guard.policy(),
+                        event_verifier,
+                        id,
+                        authenticated_peer,
+                        &peer_route_commitments,
+                        receiver_interest,
+                    )
                 };
-                if response_direction != direction || applied != *id {
-                    return Err(NodeError::Protocol(
-                        "offer acknowledgement crossed Event lanes or identifies another item"
-                            .into(),
-                    ));
-                }
+                let (verified, bytes, _state) = match loaded {
+                    Ok(transfer) => transfer,
+                    Err(NodeError::CustodySendSkipped) => {
+                        add_unscheduled_events(receipt, 1)?;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                let inserted = if semantic_v3 {
+                    match send_v3_offer(
+                        V3OfferIo {
+                            store: lease_store.clone(),
+                            connection,
+                            mission,
+                            event_guard,
+                            exchanges,
+                            receipt,
+                        },
+                        V3OfferSource {
+                            peer: authenticated_peer,
+                            direction,
+                            scheduled: planned.custody().ok_or_else(|| {
+                                NodeError::Protocol(
+                                    "semantic v3 Event offer lacks a custody schedule".into(),
+                                )
+                            })?,
+                            verified: &verified,
+                            bytes,
+                        },
+                    )
+                    .await?
+                    {
+                        V3OfferOutcome::Applied(inserted) => inserted,
+                        V3OfferOutcome::Skipped => {
+                            add_unscheduled_events(receipt, 1)?;
+                            continue;
+                        }
+                    }
+                } else {
+                    if verified.ttl_ms().is_some() && !verified.tombstone() {
+                        return Err(NodeError::Protocol(
+                            "finite-TTL Event cannot be sent on semantic protocol v1/v2".into(),
+                        ));
+                    }
+                    let response = request_mission_frame(
+                        connection,
+                        mission,
+                        Frame::Offer {
+                            direction,
+                            id,
+                            bytes,
+                        },
+                        receipt,
+                    )
+                    .await?;
+                    require_legacy_apply_result(response, direction, id)?
+                };
                 receipt.offered += 1;
                 if !inserted {
                     receipt.duplicates += 1;
@@ -5019,6 +11148,118 @@ async fn sync_event_transfer_lane(
             }
         }
         EventDirection::ToSessionInitiator => {
+            if semantic_v3 {
+                let mut authorization =
+                    TransferAuthorization::new(&difference.remote_only, capacity)?;
+                loop {
+                    event_guard.check(store)?;
+                    let wire_budget = exchange_wire_budget(receipt)?;
+                    let (complete, request_bytes, response_bytes) = respond_mission_frame(
+                        connection,
+                        mission,
+                        wire_budget,
+                        |frame, request_wire_len, mission| match frame {
+                            Frame::OfferV3 {
+                                direction: request_direction,
+                                id,
+                                exchange_id,
+                                custody,
+                                bytes,
+                            } if request_direction == direction && authorization.authorize(id) => {
+                                if bytes.len() > MAX_OBJECT_BYTES {
+                                    return Err(NodeError::Protocol(format!(
+                                        "offered object exceeds {MAX_OBJECT_BYTES} bytes"
+                                    )));
+                                }
+                                check_account(receipt, request_wire_len, 4_096)?;
+                                event_guard.check(store)?;
+                                let apply = accept_received_transfer(
+                                    store,
+                                    event_verifier,
+                                    EventReceiveAuthority {
+                                        peer: authenticated_peer,
+                                        peer_route_commitments: &peer_route_commitments,
+                                        receiver_interest,
+                                        local_replication_policy: event_guard.replication_policy(),
+                                    },
+                                    id,
+                                    &bytes,
+                                    Some(ReceivedCustody {
+                                        mission,
+                                        exchange_id,
+                                        expected_policy_revision: remote_emission.revision,
+                                        wrapper: &custody,
+                                    }),
+                                )?;
+                                if apply.inserted {
+                                    receipt.inserted += 1;
+                                } else {
+                                    receipt.duplicates += 1;
+                                }
+                                receipt.fetched += 1;
+                                event_guard.check(store)?;
+                                Ok((
+                                    Frame::ApplyResultV3 {
+                                        direction,
+                                        id,
+                                        exchange_id,
+                                        inserted: apply.inserted,
+                                        disposition: apply.disposition,
+                                    },
+                                    false,
+                                ))
+                            }
+                            Frame::OfferV3 { .. } => Err(NodeError::Protocol(
+                                "v3 Event offer crossed lanes or was outside the authenticated difference"
+                                    .into(),
+                            )),
+                            Frame::FinishV3 {
+                                direction: request_direction,
+                                remaining,
+                            } if request_direction == direction => {
+                                let expected = event_lane_remaining_wire(
+                                    authorization.finish_remaining(),
+                                )?;
+                                if remaining != expected {
+                                    return Err(NodeError::Protocol(
+                                        "v3 Event finish remaining count differs from the authenticated difference"
+                                            .into(),
+                                    ));
+                                }
+                                add_unscheduled_events(
+                                    receipt,
+                                    usize::try_from(remaining).map_err(|_| {
+                                        NodeError::Protocol(
+                                            "v3 Event finish remaining count exceeds usize".into(),
+                                        )
+                                    })?,
+                                )?;
+                                Ok((
+                                    Frame::FinishedV3 {
+                                        direction,
+                                        remaining,
+                                    },
+                                    true,
+                                ))
+                            }
+                            Frame::Offer { .. }
+                            | Frame::Fetch { .. }
+                            | Frame::Object { .. }
+                            => Err(NodeError::Protocol(
+                                "semantic-v3 receive lane accepts only custody-bound offers".into(),
+                            )),
+                            _ => Err(NodeError::Protocol(
+                                "v3 transfer crossed Event lanes or phases".into(),
+                            )),
+                        },
+                    )
+                    .await?;
+                    account(receipt, request_bytes, response_bytes)?;
+                    if complete {
+                        return Ok(());
+                    }
+                }
+            }
             let limit = difference.remote_only.len().min(capacity);
             add_unscheduled_events(receipt, difference.remote_only.len() - limit)?;
             for id in difference.remote_only.iter().take(limit) {
@@ -5060,7 +11301,10 @@ async fn sync_event_transfer_lane(
                     },
                     received,
                     &bytes,
-                )? {
+                    None,
+                )?
+                .inserted
+                {
                     receipt.inserted += 1;
                 } else {
                     receipt.duplicates += 1;
@@ -5071,7 +11315,17 @@ async fn sync_event_transfer_lane(
         }
     }
     event_guard.check(store)?;
-    if request_mission_frame(connection, mission, Frame::Finish { direction }, receipt).await?
+    if semantic_v3 {
+        finish_v3_event_lane(
+            connection,
+            mission,
+            direction,
+            event_lane_remaining_since(receipt, lane_remaining_before)?,
+            receipt,
+        )
+        .await?;
+    } else if request_mission_frame(connection, mission, Frame::Finish { direction }, receipt)
+        .await?
         != (Frame::Finished { direction })
     {
         return Err(NodeError::Protocol(
@@ -5084,9 +11338,49 @@ async fn sync_event_transfer_lane(
 #[derive(Clone, Copy)]
 struct DirectedMutableLane<'a> {
     guard: &'a EventLaneGuard,
-    receiver_interest: &'a EventInterest,
+    source_snapshot: &'a AuthenticatedMutableSenderSnapshot,
+    receiver_interest: MutableReceiveInterest<'a>,
+    semantic_version: u16,
     class: MutableClass,
     direction: EventDirection,
+}
+
+#[derive(Clone, Copy)]
+enum MutableReceiveInterest<'a> {
+    StateOrRecord(&'a EventInterest),
+    Blob(&'a BlobInterest),
+}
+
+enum OwnedMutableReceiveInterest {
+    StateOrRecord(EventInterest),
+    Blob(BlobInterest),
+}
+
+impl OwnedMutableReceiveInterest {
+    fn borrowed(&self) -> MutableReceiveInterest<'_> {
+        match self {
+            Self::StateOrRecord(interest) => MutableReceiveInterest::StateOrRecord(interest),
+            Self::Blob(interest) => MutableReceiveInterest::Blob(interest),
+        }
+    }
+}
+
+impl MutableReceiveInterest<'_> {
+    fn matches(&self, topic: &Topic, scope: &Scope, epoch: u64) -> bool {
+        match self {
+            Self::StateOrRecord(interest) => interest.matches(topic, scope),
+            Self::Blob(interest) => interest
+                .selector(topic, scope)
+                .is_some_and(|selector| selector.epoch() == epoch),
+        }
+    }
+
+    fn blob_selector(&self, topic: &Topic, scope: &Scope) -> Option<&BlobInterestSelector> {
+        match self {
+            Self::StateOrRecord(_) => None,
+            Self::Blob(interest) => interest.selector(topic, scope),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -5111,12 +11405,693 @@ impl MutableDifference {
             MutableClass::Record => {
                 MutableTransferId::Record(RecordTransferId::from_reconciliation_item_id(id))
             }
+            MutableClass::Blob => MutableTransferId::Blob(BlobTransferId::new(*id.as_bytes())),
         };
         Self {
             local_only: difference.local_only.into_iter().map(convert).collect(),
             remote_only: difference.remote_only.into_iter().map(convert).collect(),
         }
     }
+
+    fn validate(&self, class: MutableClass) -> Result<(), NodeError> {
+        validate_mutable_transfer_ids(&self.local_only, class)?;
+        validate_mutable_transfer_ids(&self.remote_only, class)
+    }
+}
+
+fn validate_mutable_transfer_ids(
+    ids: &[MutableTransferId],
+    class: MutableClass,
+) -> Result<(), NodeError> {
+    if ids.iter().any(|id| id.class() != class) {
+        return Err(NodeError::Protocol(
+            "mutable difference contains another data class".into(),
+        ));
+    }
+    if ids.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(NodeError::Protocol(
+            "mutable difference is not strictly increasing".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn mutable_transfer_selection(
+    difference: &[MutableTransferId],
+    class: MutableClass,
+    cursor: Option<[u8; 32]>,
+    limit: usize,
+) -> Result<Vec<MutableTransferId>, NodeError> {
+    validate_mutable_transfer_ids(difference, class)?;
+    if difference.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+    let start = cursor.map_or(0, |cursor| {
+        difference.partition_point(|id| id.as_bytes() <= &cursor)
+    });
+    Ok(difference[start..]
+        .iter()
+        .chain(difference[..start].iter())
+        .take(limit.min(difference.len()))
+        .copied()
+        .collect())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MutableReconciliationStage {
+    ForwardQuery,
+    InventoryComplete,
+    ReverseQuery,
+    DifferenceBound,
+}
+
+fn mutable_lane_index(class: MutableClass, direction: EventDirection) -> usize {
+    match (class, direction) {
+        (MutableClass::State, EventDirection::ToSessionResponder) => 0,
+        (MutableClass::State, EventDirection::ToSessionInitiator) => 1,
+        (MutableClass::Record, EventDirection::ToSessionResponder) => 2,
+        (MutableClass::Record, EventDirection::ToSessionInitiator) => 3,
+        (MutableClass::Blob, EventDirection::ToSessionResponder) => 4,
+        (MutableClass::Blob, EventDirection::ToSessionInitiator) => 5,
+    }
+}
+
+fn require_mutable_class_semantic(
+    semantic_version: u16,
+    class: MutableClass,
+) -> Result<(), NodeError> {
+    if mutable_classes_for_semantic(semantic_version).contains(&class) {
+        Ok(())
+    } else {
+        Err(NodeError::Protocol(
+            "mutable data class is unavailable under the negotiated semantic version".into(),
+        ))
+    }
+}
+
+fn mutable_source_lane_count(semantic_version: u16) -> Result<usize, NodeError> {
+    let classes = mutable_classes_for_semantic(semantic_version).len();
+    if classes == 0 {
+        return Err(NodeError::Protocol(
+            "mutable reserve requested below semantic v4".into(),
+        ));
+    }
+    classes
+        .checked_mul(2)
+        .ok_or_else(|| NodeError::Protocol("mutable lane count overflow".into()))
+}
+
+fn mutable_class_index(semantic_version: u16, class: MutableClass) -> Result<usize, NodeError> {
+    mutable_classes_for_semantic(semantic_version)
+        .iter()
+        .position(|candidate| *candidate == class)
+        .ok_or_else(|| {
+            NodeError::Protocol(
+                "mutable data class is unavailable under the negotiated semantic version".into(),
+            )
+        })
+}
+
+const fn mutable_transfer_cursor_class(class: MutableClass) -> MutableTransferCursorClass {
+    match class {
+        MutableClass::State => MutableTransferCursorClass::State,
+        MutableClass::Record => MutableTransferCursorClass::Record,
+        MutableClass::Blob => MutableTransferCursorClass::Blob,
+    }
+}
+
+const fn mutable_transfer_cursor_mode(direction: EventDirection) -> MutableTransferCursorMode {
+    match direction {
+        EventDirection::ToSessionResponder => MutableTransferCursorMode::OfferToPeer,
+        EventDirection::ToSessionInitiator => MutableTransferCursorMode::FetchFromPeer,
+    }
+}
+
+fn advance_mutable_transfer_cursor(
+    store: &Store,
+    peer: NodeId,
+    class: MutableClass,
+    direction: EventDirection,
+    expected: Option<[u8; 32]>,
+    id: MutableTransferId,
+) -> Result<bool, NodeError> {
+    if id.class() != class {
+        return Err(NodeError::Protocol(
+            "mutable cursor advance crossed data classes".into(),
+        ));
+    }
+    store
+        .compare_and_advance_mutable_transfer_cursor(
+            peer,
+            mutable_transfer_cursor_class(class),
+            mutable_transfer_cursor_mode(direction),
+            expected,
+            *id.as_bytes(),
+        )
+        .map_err(NodeError::from)
+}
+
+const fn mutable_lane_fetch_result_exchanges(direction: EventDirection) -> usize {
+    match direction {
+        EventDirection::ToSessionResponder => 0,
+        EventDirection::ToSessionInitiator => 1,
+    }
+}
+
+fn mutable_future_fetch_lanes(
+    semantic_version: u16,
+    class: MutableClass,
+    direction: EventDirection,
+) -> Result<usize, NodeError> {
+    require_mutable_class_semantic(semantic_version, class)?;
+    let current = mutable_lane_index(class, direction);
+    let total = mutable_source_lane_count(semantic_version)?;
+    if current >= total {
+        return Err(NodeError::Protocol("mutable lane order differs".into()));
+    }
+    Ok(((current + 1)..total)
+        .filter(|index| index % 2 == 1)
+        .count())
+}
+
+const fn mutable_interest_plaintext_bytes(class: MutableClass) -> usize {
+    match class {
+        MutableClass::Blob => BLOB_INTEREST_PLAINTEXT_MAX_BYTES,
+        MutableClass::State | MutableClass::Record => MUTABLE_INTEREST_PLAINTEXT_MAX_BYTES,
+    }
+}
+
+const fn mutable_interest_exchange_bytes(class: MutableClass) -> usize {
+    match class {
+        MutableClass::Blob => BLOB_INTEREST_EXCHANGE_MAX_BYTES,
+        MutableClass::State | MutableClass::Record => MUTABLE_INTEREST_EXCHANGE_MAX_BYTES,
+    }
+}
+
+fn future_mutable_interest_bytes(
+    semantic_version: u16,
+    class: MutableClass,
+) -> Result<usize, NodeError> {
+    let start = mutable_class_index(semantic_version, class)? + 1;
+    mutable_classes_for_semantic(semantic_version)[start..]
+        .iter()
+        .try_fold(0usize, |total, class| {
+            total
+                .checked_add(mutable_interest_exchange_bytes(*class))
+                .ok_or_else(|| {
+                    NodeError::Protocol("mutable future interest reserve overflow".into())
+                })
+        })
+}
+
+fn mutable_future_reserve(
+    semantic_version: u16,
+    class: MutableClass,
+    direction: EventDirection,
+) -> Result<(usize, usize), NodeError> {
+    require_mutable_class_semantic(semantic_version, class)?;
+    let current = mutable_lane_index(class, direction);
+    let future_lanes = mutable_source_lane_count(semantic_version)?
+        .checked_sub(current.saturating_add(1))
+        .ok_or_else(|| NodeError::Protocol("mutable lane order differs".into()))?;
+    let future_fetch_lanes = mutable_future_fetch_lanes(semantic_version, class, direction)?;
+    let future_interests = mutable_classes_for_semantic(semantic_version)
+        .len()
+        .checked_sub(mutable_class_index(semantic_version, class)?.saturating_add(1))
+        .ok_or_else(|| NodeError::Protocol("mutable class order differs".into()))?;
+    let carrier_exchanges = usize::from(semantic_version >= MIN_BLOB_NETWORK_SEMANTIC_VERSION)
+        * BLOB_CARRIER_CONTACT_RESERVE_EXCHANGES;
+    let carrier_bytes = usize::from(semantic_version >= MIN_BLOB_NETWORK_SEMANTIC_VERSION)
+        * BLOB_CARRIER_CONTACT_RESERVE_BYTES;
+    let exchanges = future_lanes
+        .checked_mul(MUTABLE_LANE_FULL_GUARANTEE_EXCHANGES)
+        .and_then(|count| count.checked_add(future_fetch_lanes))
+        .and_then(|count| count.checked_add(future_interests))
+        .and_then(|count| count.checked_add(carrier_exchanges))
+        .ok_or_else(|| NodeError::Protocol("mutable future frame reserve overflow".into()))?;
+    let future_interest_bytes = future_mutable_interest_bytes(semantic_version, class)?;
+    let bytes = future_lanes
+        .checked_mul(MUTABLE_LANE_FULL_GUARANTEE_BYTES)
+        .and_then(|count| {
+            count.checked_add(future_fetch_lanes * MUTABLE_FETCH_RESULT_EXCHANGE_BYTES)
+        })
+        .and_then(|count| count.checked_add(future_interest_bytes))
+        .and_then(|count| count.checked_add(carrier_bytes))
+        .ok_or_else(|| NodeError::Protocol("mutable future byte reserve overflow".into()))?;
+    Ok((exchanges, bytes))
+}
+
+fn mutable_interest_reserve(
+    semantic_version: u16,
+    class: MutableClass,
+) -> Result<(usize, usize), NodeError> {
+    let remaining_classes = mutable_classes_for_semantic(semantic_version)
+        .len()
+        .checked_sub(mutable_class_index(semantic_version, class)?)
+        .ok_or_else(|| NodeError::Protocol("mutable class order differs".into()))?;
+    let lanes = remaining_classes
+        .checked_mul(2)
+        .ok_or_else(|| NodeError::Protocol("mutable interest lane count overflow".into()))?;
+    let fetch_lanes = remaining_classes;
+    let future_interests = remaining_classes.saturating_sub(1);
+    let carrier_exchanges = usize::from(semantic_version >= MIN_BLOB_NETWORK_SEMANTIC_VERSION)
+        * BLOB_CARRIER_CONTACT_RESERVE_EXCHANGES;
+    let carrier_bytes = usize::from(semantic_version >= MIN_BLOB_NETWORK_SEMANTIC_VERSION)
+        * BLOB_CARRIER_CONTACT_RESERVE_BYTES;
+    let exchanges = lanes
+        .checked_mul(MUTABLE_LANE_FULL_GUARANTEE_EXCHANGES)
+        .and_then(|count| count.checked_add(fetch_lanes))
+        .and_then(|count| count.checked_add(future_interests))
+        .and_then(|count| count.checked_add(carrier_exchanges))
+        .ok_or_else(|| NodeError::Protocol("mutable interest frame reserve overflow".into()))?;
+    let future_interest_bytes = future_mutable_interest_bytes(semantic_version, class)?;
+    let bytes = lanes
+        .checked_mul(MUTABLE_LANE_FULL_GUARANTEE_BYTES)
+        .and_then(|count| count.checked_add(fetch_lanes * MUTABLE_FETCH_RESULT_EXCHANGE_BYTES))
+        .and_then(|count| count.checked_add(future_interest_bytes))
+        .and_then(|count| count.checked_add(carrier_bytes))
+        .ok_or_else(|| NodeError::Protocol("mutable interest byte reserve overflow".into()))?;
+    Ok((exchanges, bytes))
+}
+
+fn mutable_minimal_interest_reserve(
+    semantic_version: u16,
+    class: MutableClass,
+) -> Result<(usize, usize), NodeError> {
+    let remaining_classes = mutable_classes_for_semantic(semantic_version)
+        .len()
+        .checked_sub(mutable_class_index(semantic_version, class)?)
+        .ok_or_else(|| NodeError::Protocol("mutable class order differs".into()))?;
+    let deferred_lanes = remaining_classes
+        .checked_mul(2)
+        .ok_or_else(|| NodeError::Protocol("mutable minimal lane count overflow".into()))?;
+    let future_interests = remaining_classes.saturating_sub(1);
+    let carrier_exchanges = usize::from(semantic_version >= MIN_BLOB_NETWORK_SEMANTIC_VERSION)
+        * BLOB_CARRIER_CONTACT_RESERVE_EXCHANGES;
+    let carrier_bytes = usize::from(semantic_version >= MIN_BLOB_NETWORK_SEMANTIC_VERSION)
+        * BLOB_CARRIER_CONTACT_RESERVE_BYTES;
+    let exchanges = deferred_lanes
+        .checked_add(future_interests)
+        .and_then(|count| count.checked_add(carrier_exchanges))
+        .ok_or_else(|| NodeError::Protocol("mutable minimal frame reserve overflow".into()))?;
+    let future_interest_bytes = future_mutable_interest_bytes(semantic_version, class)?;
+    let bytes = deferred_lanes
+        .checked_mul(MUTABLE_LANE_DEFER_EXCHANGE_BYTES)
+        .and_then(|count| count.checked_add(future_interest_bytes))
+        .and_then(|count| count.checked_add(carrier_bytes))
+        .ok_or_else(|| NodeError::Protocol("mutable minimal byte reserve overflow".into()))?;
+    Ok((exchanges, bytes))
+}
+
+fn mutable_class_can_start(
+    receipt: &PeerReceipt,
+    semantic_version: u16,
+    class: MutableClass,
+) -> Result<bool, NodeError> {
+    let (reserve_exchanges, reserve_bytes) = mutable_interest_reserve(semantic_version, class)?;
+    let plaintext = mutable_interest_plaintext_bytes(class);
+    exchange_preserves_reserve(
+        receipt,
+        plaintext,
+        plaintext,
+        reserve_exchanges,
+        reserve_bytes,
+    )
+}
+
+fn mutable_reconciliation_reserve(
+    semantic_version: u16,
+    class: MutableClass,
+    direction: EventDirection,
+    stage: MutableReconciliationStage,
+    rounds_spent: u32,
+) -> Result<(usize, usize), NodeError> {
+    if rounds_spent > MUTABLE_RECONCILIATION_ROUNDS {
+        return Err(NodeError::Protocol(
+            "mutable reconciliation round accounting exceeds its bound".into(),
+        ));
+    }
+    let remaining_in_phase = usize::try_from(
+        MUTABLE_RECONCILIATION_ROUNDS.saturating_sub(rounds_spent.saturating_add(1)),
+    )
+    .map_err(|_| NodeError::Protocol("mutable reconciliation rounds exceed usize".into()))?;
+    let full_phase = usize::try_from(MUTABLE_RECONCILIATION_ROUNDS)
+        .map_err(|_| NodeError::Protocol("mutable reconciliation rounds exceed usize".into()))?;
+    let remaining_reconciliation = match stage {
+        MutableReconciliationStage::ForwardQuery => remaining_in_phase
+            .checked_add(1)
+            .and_then(|count| count.checked_add(full_phase))
+            .and_then(|count| count.checked_add(1))
+            .ok_or_else(|| NodeError::Protocol("mutable reconciliation reserve overflow".into()))?,
+        MutableReconciliationStage::InventoryComplete => full_phase + 1,
+        MutableReconciliationStage::ReverseQuery => remaining_in_phase + 1,
+        MutableReconciliationStage::DifferenceBound => 0,
+    };
+    let (future_exchanges, future_bytes) =
+        mutable_future_reserve(semantic_version, class, direction)?;
+    let fetch_result_exchanges = mutable_lane_fetch_result_exchanges(direction);
+    let exchanges = remaining_reconciliation
+        .checked_add(2)
+        .and_then(|count| count.checked_add(fetch_result_exchanges))
+        .and_then(|count| count.checked_add(future_exchanges))
+        .ok_or_else(|| {
+            NodeError::Protocol("mutable reconciliation frame reserve overflow".into())
+        })?;
+    let bytes = remaining_reconciliation
+        .checked_mul(MUTABLE_RECONCILIATION_EXCHANGE_MAX_BYTES)
+        .and_then(|count| count.checked_add(MUTABLE_TRANSFER_EXCHANGE_MAX_BYTES))
+        .and_then(|count| {
+            count.checked_add(fetch_result_exchanges * MUTABLE_FETCH_RESULT_EXCHANGE_BYTES)
+        })
+        .and_then(|count| count.checked_add(MUTABLE_FINISH_EXCHANGE_BYTES))
+        .and_then(|count| count.checked_add(future_bytes))
+        .ok_or_else(|| {
+            NodeError::Protocol("mutable reconciliation byte reserve overflow".into())
+        })?;
+    Ok((exchanges, bytes))
+}
+
+fn exchange_preserves_reserve(
+    receipt: &PeerReceipt,
+    request_plaintext_bytes: usize,
+    response_plaintext_bytes: usize,
+    reserve_exchanges: usize,
+    reserve_bytes: usize,
+) -> Result<bool, NodeError> {
+    let used_frames = receipt
+        .handshake_frames
+        .checked_add(receipt.protected_frames)
+        .ok_or_else(|| NodeError::Protocol("contact frame count overflow".into()))?;
+    let required_frames = reserve_exchanges
+        .checked_add(1)
+        .and_then(|count| count.checked_mul(EXCHANGE_FRAMES))
+        .ok_or_else(|| NodeError::Protocol("contact frame reserve overflow".into()))?;
+    let frames_fit = used_frames
+        .checked_add(required_frames)
+        .is_some_and(|frames| frames <= MAX_CONTACT_FRAMES);
+    let used_bytes = receipt
+        .handshake_bytes
+        .checked_add(receipt.protected_bytes)
+        .ok_or_else(|| NodeError::Protocol("contact byte count overflow".into()))?;
+    let required_bytes = request_plaintext_bytes
+        .checked_add(APPLICATION_PROTECTION_OVERHEAD_BYTES)
+        .and_then(|count| count.checked_add(response_plaintext_bytes))
+        .and_then(|count| count.checked_add(APPLICATION_PROTECTION_OVERHEAD_BYTES))
+        .and_then(|count| count.checked_add(reserve_bytes))
+        .ok_or_else(|| NodeError::Protocol("contact byte reserve overflow".into()))?;
+    let bytes_fit = used_bytes
+        .checked_add(required_bytes)
+        .is_some_and(|bytes| bytes <= MAX_CONTACT_BYTES);
+    Ok(frames_fit && bytes_fit)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mutable_reconciliation_exchange_preserves_continuation(
+    receipt: &PeerReceipt,
+    semantic_version: u16,
+    class: MutableClass,
+    direction: EventDirection,
+    stage: MutableReconciliationStage,
+    rounds_spent: u32,
+    request_plaintext_bytes: usize,
+    response_plaintext_bytes: usize,
+) -> Result<bool, NodeError> {
+    let (reserve_exchanges, reserve_bytes) =
+        mutable_reconciliation_reserve(semantic_version, class, direction, stage, rounds_spent)?;
+    exchange_preserves_reserve(
+        receipt,
+        request_plaintext_bytes,
+        response_plaintext_bytes,
+        reserve_exchanges,
+        reserve_bytes,
+    )
+}
+
+fn mutable_reconciliation_plaintext_bytes(bytes: usize) -> Result<usize, NodeError> {
+    MUTABLE_RECONCILIATION_FRAME_OVERHEAD_BYTES
+        .checked_add(bytes)
+        .ok_or_else(|| NodeError::Protocol("mutable reconciliation frame length overflow".into()))
+}
+
+fn record_mutable_lane_deferred(receipt: &mut PeerReceipt) -> Result<(), NodeError> {
+    receipt.deferred_mutable_lanes = receipt
+        .deferred_mutable_lanes
+        .checked_add(1)
+        .ok_or_else(|| NodeError::Protocol("deferred mutable lane count overflow".into()))?;
+    Ok(())
+}
+
+fn acknowledge_mutable_lane_deferred(
+    frame: Frame,
+    class: MutableClass,
+    direction: EventDirection,
+) -> Result<Frame, NodeError> {
+    match frame {
+        Frame::MutableLaneDeferred {
+            class: request_class,
+            direction: request_direction,
+        } if request_class == class && request_direction == direction => {
+            Ok(Frame::MutableLaneDeferredAck { class, direction })
+        }
+        Frame::MutableLaneDeferred { .. } => Err(NodeError::Protocol(
+            "mutable lane deferral crossed classes or directions".into(),
+        )),
+        _ => Err(NodeError::Protocol(
+            "mutable lane deferral phase received another operation".into(),
+        )),
+    }
+}
+
+fn require_mutable_finish(
+    frame: Frame,
+    class: MutableClass,
+    direction: EventDirection,
+    expected_remaining: u64,
+    plan_consumed: bool,
+) -> Result<u64, NodeError> {
+    match frame {
+        Frame::MutableFinish {
+            class: request_class,
+            direction: request_direction,
+            remaining,
+        } if request_class == class
+            && request_direction == direction
+            && remaining == expected_remaining
+            && plan_consumed =>
+        {
+            Ok(remaining)
+        }
+        Frame::MutableFinish { .. } => Err(NodeError::Protocol(
+            "mutable finish count, class, direction, or transfer-plan consumption differs".into(),
+        )),
+        _ => Err(NodeError::Protocol(
+            "mutable finish phase received another operation".into(),
+        )),
+    }
+}
+
+fn acknowledge_mutable_fetch_result(
+    frame: Frame,
+    class: MutableClass,
+    direction: EventDirection,
+    pending_id: MutableTransferId,
+) -> Result<(Frame, MutableApplyDisposition), NodeError> {
+    match frame {
+        Frame::MutableFetchResult {
+            direction: request_direction,
+            id,
+            disposition,
+        } if direction == EventDirection::ToSessionInitiator
+            && request_direction == direction
+            && id.class() == class
+            && id == pending_id =>
+        {
+            Ok((
+                Frame::MutableFetchResultAck {
+                    direction,
+                    id,
+                    disposition,
+                },
+                disposition,
+            ))
+        }
+        Frame::MutableFetchResult { .. } => Err(NodeError::Protocol(
+            "mutable fetch result crossed classes, directions, or identifiers".into(),
+        )),
+        _ => Err(NodeError::Protocol(
+            "pending mutable fetch result phase received another operation".into(),
+        )),
+    }
+}
+
+fn require_mutable_fetch_result_ack(
+    frame: Frame,
+    direction: EventDirection,
+    id: MutableTransferId,
+    disposition: MutableApplyDisposition,
+) -> Result<(), NodeError> {
+    match frame {
+        Frame::MutableFetchResultAck {
+            direction: response_direction,
+            id: response_id,
+            disposition: response_disposition,
+        } if direction == EventDirection::ToSessionInitiator
+            && response_direction == direction
+            && response_id == id
+            && response_disposition == disposition =>
+        {
+            Ok(())
+        }
+        Frame::MutableFetchResultAck { .. } => Err(NodeError::Protocol(
+            "mutable fetch result acknowledgement crossed lanes or changed disposition".into(),
+        )),
+        _ => Err(NodeError::Protocol(
+            "mutable fetch result received another acknowledgement".into(),
+        )),
+    }
+}
+
+#[derive(Debug, Default)]
+struct MutableFetchSettlement {
+    pending: Option<MutableTransferId>,
+    deferred_capacity: usize,
+}
+
+impl MutableFetchSettlement {
+    fn begin(&mut self, id: MutableTransferId) -> Result<(), NodeError> {
+        if self.pending.is_some() {
+            return Err(NodeError::Protocol(
+                "a second mutable fetch preceded settlement of the pending fetch".into(),
+            ));
+        }
+        self.pending = Some(id);
+        Ok(())
+    }
+
+    fn acknowledge(
+        &mut self,
+        frame: Frame,
+        class: MutableClass,
+        direction: EventDirection,
+        receipt: &mut PeerReceipt,
+    ) -> Result<Frame, NodeError> {
+        let pending_id = self.pending.ok_or_else(|| {
+            NodeError::Protocol("mutable fetch result lacks a pending fetch".into())
+        })?;
+        let (acknowledgement, disposition) =
+            acknowledge_mutable_fetch_result(frame, class, direction, pending_id)?;
+        let next_deferred_capacity = match disposition {
+            MutableApplyDisposition::DeferredCapacity => {
+                self.deferred_capacity.checked_add(1).ok_or_else(|| {
+                    NodeError::Protocol("mutable capacity deferral count overflow".into())
+                })?
+            }
+            MutableApplyDisposition::Duplicate | MutableApplyDisposition::Inserted => {
+                self.deferred_capacity
+            }
+        };
+        let next_duplicates = match disposition {
+            MutableApplyDisposition::Duplicate => receipt
+                .duplicates
+                .checked_add(1)
+                .ok_or_else(|| NodeError::Protocol("mutable duplicate count overflow".into()))?,
+            MutableApplyDisposition::Inserted | MutableApplyDisposition::DeferredCapacity => {
+                receipt.duplicates
+            }
+        };
+        self.pending = None;
+        self.deferred_capacity = next_deferred_capacity;
+        receipt.duplicates = next_duplicates;
+        if class == MutableClass::Blob && disposition == MutableApplyDisposition::DeferredCapacity {
+            receipt.blob_deferred = receipt
+                .blob_deferred
+                .checked_add(1)
+                .ok_or_else(|| NodeError::Protocol("Blob deferral count overflow".into()))?;
+        }
+        Ok(acknowledgement)
+    }
+
+    const fn is_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    const fn deferred_capacity(&self) -> usize {
+        self.deferred_capacity
+    }
+}
+
+async fn defer_mutable_lane(
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    class: MutableClass,
+    direction: EventDirection,
+    receipt: &mut PeerReceipt,
+) -> Result<(), NodeError> {
+    let (future_exchanges, future_bytes) =
+        mutable_future_reserve(mission.semantic_version(), class, direction)?;
+    let used_frames = receipt
+        .handshake_frames
+        .checked_add(receipt.protected_frames)
+        .ok_or_else(|| NodeError::Protocol("contact frame count overflow".into()))?;
+    let final_frames = future_exchanges
+        .checked_add(1)
+        .and_then(|count| count.checked_mul(EXCHANGE_FRAMES))
+        .and_then(|count| count.checked_add(used_frames))
+        .ok_or_else(|| NodeError::Protocol("mutable defer frame reserve overflow".into()))?;
+    let used_bytes = receipt
+        .handshake_bytes
+        .checked_add(receipt.protected_bytes)
+        .ok_or_else(|| NodeError::Protocol("contact byte count overflow".into()))?;
+    let final_bytes = used_bytes
+        .checked_add(MUTABLE_LANE_DEFER_EXCHANGE_BYTES)
+        .and_then(|count| count.checked_add(future_bytes))
+        .ok_or_else(|| NodeError::Protocol("mutable defer byte reserve overflow".into()))?;
+    if final_frames > MAX_CONTACT_FRAMES || final_bytes > MAX_CONTACT_BYTES {
+        return Err(NodeError::Protocol(
+            "contact lost the authenticated mutable deferral reserve".into(),
+        ));
+    }
+    let response = request_mission_frame(
+        connection,
+        mission,
+        Frame::MutableLaneDeferred { class, direction },
+        receipt,
+    )
+    .await?;
+    if response != (Frame::MutableLaneDeferredAck { class, direction }) {
+        return Err(NodeError::Protocol(
+            "mutable lane deferral acknowledgement crossed classes or directions".into(),
+        ));
+    }
+    record_mutable_lane_deferred(receipt)
+}
+
+async fn defer_mutable_lane_from_reserved_class_skip(
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    class: MutableClass,
+    direction: EventDirection,
+    receipt: &mut PeerReceipt,
+) -> Result<(), NodeError> {
+    let response = request_mission_frame(
+        connection,
+        mission,
+        Frame::MutableLaneDeferred { class, direction },
+        receipt,
+    )
+    .await?;
+    if response != (Frame::MutableLaneDeferredAck { class, direction }) {
+        return Err(NodeError::Protocol(
+            "mutable lane deferral acknowledgement crossed classes or directions".into(),
+        ));
+    }
+    record_mutable_lane_deferred(receipt)
+}
+
+#[derive(Debug)]
+enum MutableReconciliationOutcome {
+    Complete(MutableDifference),
+    Deferred,
 }
 
 async fn sync_mutable_interests(
@@ -5124,8 +12099,25 @@ async fn sync_mutable_interests(
     mission: &mut MissionSession,
     class: MutableClass,
     local_interest: &EventInterest,
+    full_class: bool,
     receipt: &mut PeerReceipt,
 ) -> Result<EventInterest, NodeError> {
+    let (reserve_exchanges, reserve_bytes) = if full_class {
+        mutable_interest_reserve(mission.semantic_version(), class)?
+    } else {
+        mutable_minimal_interest_reserve(mission.semantic_version(), class)?
+    };
+    if !exchange_preserves_reserve(
+        receipt,
+        MUTABLE_INTEREST_PLAINTEXT_MAX_BYTES,
+        MUTABLE_INTEREST_PLAINTEXT_MAX_BYTES,
+        reserve_exchanges,
+        reserve_bytes,
+    )? {
+        return Err(NodeError::Protocol(
+            "contact lacks the reserved mutable class deferral".into(),
+        ));
+    }
     let response = request_mission_frame(
         connection,
         mission,
@@ -5153,6 +12145,44 @@ async fn sync_mutable_interests(
     Ok(peer_interest)
 }
 
+async fn sync_blob_interests(
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    local_interest: &BlobInterest,
+    full_class: bool,
+    receipt: &mut PeerReceipt,
+) -> Result<BlobInterest, NodeError> {
+    let (reserve_exchanges, reserve_bytes) = if full_class {
+        mutable_interest_reserve(mission.semantic_version(), MutableClass::Blob)?
+    } else {
+        mutable_minimal_interest_reserve(mission.semantic_version(), MutableClass::Blob)?
+    };
+    if !exchange_preserves_reserve(
+        receipt,
+        BLOB_INTEREST_PLAINTEXT_MAX_BYTES,
+        BLOB_INTEREST_PLAINTEXT_MAX_BYTES,
+        reserve_exchanges,
+        reserve_bytes,
+    )? {
+        return Err(NodeError::Protocol(
+            "contact lacks the reserved Blob class deferral".into(),
+        ));
+    }
+    let response = request_mission_frame(
+        connection,
+        mission,
+        Frame::BlobInterest(local_interest.clone()),
+        receipt,
+    )
+    .await?;
+    let Frame::BlobInterestReply(peer_interest) = response else {
+        return Err(NodeError::Protocol(
+            "Blob interest request received another response".into(),
+        ));
+    };
+    Ok(peer_interest)
+}
+
 async fn sync_mutable_reconciliation_lane(
     store: &Store,
     connection: &aster_iroh::Connection,
@@ -5160,40 +12190,48 @@ async fn sync_mutable_reconciliation_lane(
     verifier: &mut ReferenceEnvelopeSealer,
     lane: DirectedMutableLane<'_>,
     receipt: &mut PeerReceipt,
-) -> Result<MutableDifference, NodeError> {
+) -> Result<MutableReconciliationOutcome, NodeError> {
     let DirectedMutableLane {
         guard,
+        source_snapshot,
         receiver_interest,
+        semantic_version,
         class,
         direction,
     } = lane;
     guard.check(store)?;
     let inventory = match direction {
         EventDirection::ToSessionResponder => mutable_inventory(
-            store,
-            guard.policy(),
+            source_snapshot,
             verifier,
-            class,
             receiver_interest,
             Some((
                 mission.peer().mission_id(),
                 mission.peer_route_grant_commitments(),
             )),
         )?,
-        EventDirection::ToSessionInitiator => mutable_inventory(
-            store,
-            guard.policy(),
-            verifier,
-            class,
-            receiver_interest,
-            None,
-        )?,
+        EventDirection::ToSessionInitiator => {
+            mutable_inventory(source_snapshot, verifier, receiver_interest, None)?
+        }
     };
-    let limits = ReconciliationLimits::default();
+    let limits = selected_mutable_reconciliation_limits()?;
     let mut initiator = Initiator::new(&inventory, limits)?;
     let mut query = initiator.initiate()?;
     let difference = loop {
         guard.check(store)?;
+        if !mutable_reconciliation_exchange_preserves_continuation(
+            receipt,
+            semantic_version,
+            class,
+            direction,
+            MutableReconciliationStage::ForwardQuery,
+            initiator.rounds(),
+            mutable_reconciliation_plaintext_bytes(query.len())?,
+            mutable_reconciliation_plaintext_bytes(limits.frame_size())?,
+        )? {
+            defer_mutable_lane(connection, mission, class, direction, receipt).await?;
+            return Ok(MutableReconciliationOutcome::Deferred);
+        }
         let response = request_mission_frame(
             connection,
             mission,
@@ -5229,6 +12267,19 @@ async fn sync_mutable_reconciliation_lane(
     };
     let first_rounds = initiator.rounds();
     guard.check(store)?;
+    if !mutable_reconciliation_exchange_preserves_continuation(
+        receipt,
+        semantic_version,
+        class,
+        direction,
+        MutableReconciliationStage::InventoryComplete,
+        initiator.rounds(),
+        MUTABLE_LANE_PLAINTEXT_BYTES,
+        MUTABLE_LANE_PLAINTEXT_BYTES,
+    )? {
+        defer_mutable_lane(connection, mission, class, direction, receipt).await?;
+        return Ok(MutableReconciliationOutcome::Deferred);
+    }
     if request_mission_frame(
         connection,
         mission,
@@ -5244,11 +12295,15 @@ async fn sync_mutable_reconciliation_lane(
     }
 
     let mut reverse = Responder::new(&inventory, limits)?;
+    let mut deferred = false;
     loop {
         guard.check(store)?;
         let wire_budget = exchange_wire_budget(receipt)?;
-        let (complete, request_bytes, response_bytes) =
-            respond_mission_frame(connection, mission, wire_budget, |frame, _| match frame {
+        let (complete, request_bytes, response_bytes) = respond_mission_frame(
+            connection,
+            mission,
+            wire_budget,
+            |frame, _, _mission| match frame {
                 Frame::MutableDifferenceQuery {
                     class: request_class,
                     direction: request_direction,
@@ -5273,11 +12328,18 @@ async fn sync_mutable_reconciliation_lane(
                 Frame::MutableDifferenceBound { .. } => Err(NodeError::Protocol(
                     "mutable difference bound preceded reconciliation or crossed lanes".into(),
                 )),
+                frame @ Frame::MutableLaneDeferred { .. } => {
+                    let acknowledgement =
+                        acknowledge_mutable_lane_deferred(frame, class, direction)?;
+                    deferred = true;
+                    Ok((acknowledgement, true))
+                }
                 _ => Err(NodeError::Protocol(
                     "mutable reverse reconciliation received an out-of-phase frame".into(),
                 )),
-            })
-            .await?;
+            },
+        )
+        .await?;
         account(receipt, request_bytes, response_bytes)?;
         if complete {
             break;
@@ -5288,7 +12350,1089 @@ async fn sync_mutable_reconciliation_lane(
         .checked_add(first_rounds)
         .and_then(|rounds| rounds.checked_add(reverse.rounds()))
         .ok_or_else(|| NodeError::Protocol("combined round count overflow".into()))?;
-    Ok(difference)
+    if deferred {
+        record_mutable_lane_deferred(receipt)?;
+        Ok(MutableReconciliationOutcome::Deferred)
+    } else {
+        Ok(MutableReconciliationOutcome::Complete(difference))
+    }
+}
+
+fn mutable_lane_remaining_wire(remaining: usize) -> Result<u64, NodeError> {
+    if remaining > MAX_CARDINALITY_LIMIT {
+        return Err(NodeError::Protocol(
+            "mutable lane remaining count exceeds the selected cardinality bound".into(),
+        ));
+    }
+    u64::try_from(remaining)
+        .map_err(|_| NodeError::Protocol("mutable lane remaining count exceeds u64".into()))
+}
+
+fn mutable_transfer_capacity(
+    receipt: &PeerReceipt,
+    semantic_version: u16,
+    class: MutableClass,
+    direction: EventDirection,
+) -> Result<usize, NodeError> {
+    let global = MAX_CONTACT_ITEMS
+        .checked_sub(
+            receipt
+                .offered
+                .checked_add(receipt.fetched)
+                .ok_or_else(|| NodeError::Protocol("contact item count overflow".into()))?,
+        )
+        .ok_or_else(|| NodeError::Protocol("contact item count exceeds its bound".into()))?;
+    if global == 0 {
+        return Ok(0);
+    }
+    let (future_exchanges, future_bytes) =
+        mutable_future_reserve(semantic_version, class, direction)?;
+    let fetch_result_exchanges = mutable_lane_fetch_result_exchanges(direction);
+    let reserve_exchanges = future_exchanges
+        .checked_add(1)
+        .and_then(|count| count.checked_add(fetch_result_exchanges))
+        .ok_or_else(|| NodeError::Protocol("mutable transfer frame reserve overflow".into()))?;
+    let reserve_bytes = future_bytes
+        .checked_add(MUTABLE_FINISH_EXCHANGE_BYTES)
+        .and_then(|count| {
+            count.checked_add(fetch_result_exchanges * MUTABLE_FETCH_RESULT_EXCHANGE_BYTES)
+        })
+        .ok_or_else(|| NodeError::Protocol("mutable transfer byte reserve overflow".into()))?;
+    if exchange_preserves_reserve(
+        receipt,
+        MUTABLE_OBJECT_PLAINTEXT_MAX_BYTES,
+        MUTABLE_APPLY_PLAINTEXT_BYTES,
+        reserve_exchanges,
+        reserve_bytes,
+    )? {
+        Ok(global.min(MUTABLE_LANE_GUARANTEED_ITEMS))
+    } else {
+        Ok(0)
+    }
+}
+
+fn frame_blob_object_id(object: BlobCarrierObjectId) -> Result<BlobObjectId, NodeError> {
+    let bytes = object.as_bytes();
+    let digest: [u8; 32] = bytes[1..].try_into().map_err(|_| {
+        NodeError::Protocol("durable Blob carrier identifier has invalid length".into())
+    })?;
+    Ok(BlobObjectId::new(digest))
+}
+
+fn store_blob_object_id(object: BlobObjectId) -> Result<BlobCarrierObjectId, NodeError> {
+    BlobCarrierObjectId::new(*object.as_bytes()).map_err(|error| StoreError::Blob(error).into())
+}
+
+fn load_pending_blob_plan(
+    store: &Store,
+    verifier: &mut ReferenceEnvelopeSealer,
+    source: BlobTransferId,
+) -> Result<
+    Option<(
+        ContentVerifiedBlobEnvelope,
+        Vec<u8>,
+        VerifiedBlobTransferPlan,
+    )>,
+    NodeError,
+> {
+    let Some(pending) = store.pending_blob_source(source)? else {
+        return Ok(None);
+    };
+    let route = verifier.verify_blob(&pending.sealed)?;
+    if BlobTransferId::new(route.envelope_id()) != source {
+        return Err(NodeError::Protocol(
+            "pending Blob source differs from its durable transfer identity".into(),
+        ));
+    }
+    let BlobContentVerification::ContentVerified {
+        blob,
+        manifest_bytes,
+    } = verifier.verify_blob_content(route, &pending.sealed)?
+    else {
+        return Err(NodeError::Protocol(
+            "pending Blob source lost its exact content grant".into(),
+        ));
+    };
+    let plan = blob.transfer_plan(&manifest_bytes).map_err(|error| {
+        NodeError::Protocol(format!("pending Blob transfer plan is invalid: {error}"))
+    })?;
+    if plan.manifest().total_len() > MAX_NETWORK_BLOB_BYTES
+        || plan.manifest().chunk_count() > MAX_NETWORK_BLOB_CHUNKS
+    {
+        return Err(NodeError::Protocol(
+            "pending Blob plan exceeds selected network bounds".into(),
+        ));
+    }
+    Ok(Some((blob, manifest_bytes, plan)))
+}
+
+fn pending_blob_claim_is_current(
+    store: &Store,
+    verifier: &mut ReferenceEnvelopeSealer,
+    projection: &BlobSourceProjection,
+) -> Result<bool, NodeError> {
+    let cache = contact_mutable_route_cache(verifier)?;
+    let lifecycle = cache.lock_blob_lifecycle()?;
+    let Some(retained) = store.blob_source_projection(projection.transfer_id)? else {
+        if cache.get_blob(verifier, projection.transfer_id)?.is_some() {
+            return Err(NodeError::Protocol(
+                "retired pending Blob source left an authenticated cache claim".into(),
+            ));
+        }
+        return Ok(false);
+    };
+    if retained.retention != BlobSourceRetention::Pending {
+        return Ok(false);
+    }
+    if retained.source != *projection {
+        return Err(NodeError::Protocol(
+            "pending Blob source changed after its state-neutral projection".into(),
+        ));
+    }
+    let claim = cache
+        .get_blob(verifier, projection.transfer_id)?
+        .ok_or_else(|| {
+            NodeError::Protocol(
+                "pending Blob projection lacks its authenticated source claim".into(),
+            )
+        })?;
+    if !claim.matches_projection(projection) || claim.retention != BlobSourceRetention::Pending {
+        return Err(NodeError::Protocol(
+            "pending Blob projection conflicts with its authenticated source claim".into(),
+        ));
+    }
+    let current = verifier.is_current_source_route_lineage(
+        &claim.scope,
+        claim.key_epoch,
+        claim.route_lineage,
+    ) && verifier.is_current_blob_physical_lineage(
+        &claim.scope,
+        &claim.topic,
+        claim.key_epoch,
+        claim.physical_lineage,
+    );
+    if !current && store.abort_pending_blob_source(projection.transfer_id)? {
+        reconcile_blob_cache_after_successful_pending_abort(
+            store, verifier, &cache, &claim, &lifecycle,
+        )?;
+    }
+    Ok(current)
+}
+
+fn reconcile_blob_cache_after_successful_pending_abort(
+    store: &Store,
+    verifier: &mut ReferenceEnvelopeSealer,
+    cache: &AuthenticatedEventRouteCache,
+    aborted_claim: &AuthenticatedBlobRouteClaim,
+    _lifecycle: &std::sync::MutexGuard<'_, ()>,
+) -> Result<(), NodeError> {
+    cache.remove_pending_blob(verifier, aborted_claim)?;
+    let Some(retained) = store.blob_source_projection(aborted_claim.transfer_id)? else {
+        return Ok(());
+    };
+    let sealed = retained_blob_sealed(store, &retained.source, retained.retention)?;
+    let claim = authenticate_blob_source(verifier, &sealed, &retained.source, retained.retention)?;
+    if claim.transfer_id != aborted_claim.transfer_id {
+        return Err(NodeError::Protocol(
+            "post-abort Blob cache reconciliation crossed transfer identities".into(),
+        ));
+    }
+    cache.record_mutable_source_verification();
+    cache.insert_blob(verifier, claim)
+}
+
+fn abort_pending_blob_with_cached_claim(
+    store: &Store,
+    verifier: &mut ReferenceEnvelopeSealer,
+    source: BlobTransferId,
+) -> Result<(), NodeError> {
+    let cache = contact_mutable_route_cache(verifier)?;
+    let lifecycle = cache.lock_blob_lifecycle()?;
+    let claim = cache.get_blob(verifier, source)?.ok_or_else(|| {
+        NodeError::Protocol("pending Blob abort lacks its authenticated cache claim".into())
+    })?;
+    if claim.retention != BlobSourceRetention::Pending {
+        return Err(NodeError::Protocol(
+            "pending Blob abort cache claim is not pending".into(),
+        ));
+    }
+    if store.abort_pending_blob_source(source)? {
+        reconcile_blob_cache_after_successful_pending_abort(
+            store, verifier, &cache, &claim, &lifecycle,
+        )?;
+    }
+    Ok(())
+}
+
+fn cleanup_ineligible_pending_blobs(
+    store: &Store,
+    verifier: &mut ReferenceEnvelopeSealer,
+    cache: &AuthenticatedEventRouteCache,
+) -> Result<usize, NodeError> {
+    cache.require_binding(verifier)?;
+    let mut retained = Vec::new();
+    store.visit_retained_blob_sources(None, |item| {
+        if item.retention == BlobSourceRetention::Pending {
+            retained.push(item.source.clone());
+        }
+    })?;
+    let mut removed = 0usize;
+    for projection in retained {
+        let lifecycle = cache.lock_blob_lifecycle()?;
+        let Some(current) = store.blob_source_projection(projection.transfer_id)? else {
+            if cache.get_blob(verifier, projection.transfer_id)?.is_some() {
+                return Err(NodeError::Protocol(
+                    "retired pending Blob cleanup source left a cache claim".into(),
+                ));
+            }
+            continue;
+        };
+        if current.retention != BlobSourceRetention::Pending {
+            continue;
+        }
+        if current.source != projection {
+            return Err(NodeError::Protocol(
+                "pending Blob cleanup source changed after its projection".into(),
+            ));
+        }
+        let claim = cache
+            .get_blob(verifier, projection.transfer_id)?
+            .ok_or_else(|| {
+                NodeError::Protocol(
+                    "pending Blob cleanup lacks its startup-authenticated source claim".into(),
+                )
+            })?;
+        if claim.retention != BlobSourceRetention::Pending || !claim.matches_projection(&projection)
+        {
+            return Err(NodeError::Protocol(
+                "pending Blob cleanup projection conflicts with its authenticated claim".into(),
+            ));
+        }
+        let active_epoch = store
+            .active_scope_epoch(&claim.scope)?
+            .map_or(1, |(epoch, _)| epoch);
+        let eligible = !store.is_control_principal_revoked(claim.source_publisher)?
+            && claim.key_epoch == active_epoch
+            && verifier.is_current_source_route_lineage(
+                &claim.scope,
+                claim.key_epoch,
+                claim.route_lineage,
+            )
+            && verifier.is_current_blob_physical_lineage(
+                &claim.scope,
+                &claim.topic,
+                claim.key_epoch,
+                claim.physical_lineage,
+            );
+        if !eligible && store.abort_pending_blob_source(projection.transfer_id)? {
+            reconcile_blob_cache_after_successful_pending_abort(
+                store, verifier, cache, &claim, &lifecycle,
+            )?;
+            removed = removed
+                .checked_add(1)
+                .ok_or_else(|| NodeError::Protocol("pending Blob cleanup count overflow".into()))?;
+        }
+    }
+    Ok(removed)
+}
+
+fn blob_apply_capacity_error(error: &StoreError) -> bool {
+    matches!(
+        error,
+        StoreError::ItemLimitExceeded { .. }
+            | StoreError::PayloadByteLimitExceeded { .. }
+            | StoreError::Blob(
+                BlobStoreError::PublicationLimitExceeded { .. }
+                    | BlobStoreError::CausalFrontierLimitExceeded { .. }
+                    | BlobStoreError::DepotByteLimitExceeded { .. }
+                    | BlobStoreError::DepotChunkLimitExceeded { .. }
+                    | BlobStoreError::DepotVariantLimitExceeded { .. }
+                    | BlobStoreError::NetworkStagingRowLimitExceeded { .. }
+                    | BlobStoreError::NetworkStagingByteLimitExceeded { .. }
+            )
+    )
+}
+
+fn blob_terminal_content_error(error: &BlobError) -> bool {
+    matches!(
+        error,
+        BlobError::InvalidChunkSize
+            | BlobError::InvalidMetadata
+            | BlobError::InvalidManifest
+            | BlobError::InvalidChunkIndex
+            | BlobError::LengthOverflow
+            | BlobError::SourceChanged
+            | BlobError::AuthenticationFailed
+    )
+}
+
+fn recover_and_finalize_pending_blob(
+    store: &Store,
+    guard: &EventLaneGuard,
+    verifier: &mut ReferenceEnvelopeSealer,
+    source: BlobTransferId,
+    scheduler: Option<(NodeId, Option<BlobCarrierFetchCursor>)>,
+) -> Result<Option<MutableApplyDisposition>, NodeError> {
+    guard.check(store)?;
+    let Some((blob, manifest_bytes, plan)) = load_pending_blob_plan(store, verifier, source)?
+    else {
+        return Ok(Some(MutableApplyDisposition::Duplicate));
+    };
+    let work = store.pending_blob_carrier_work_with_policy(guard.policy(), source, &plan)?;
+    for status in work.iter().filter(|status| status.complete()) {
+        guard.check(store)?;
+        match store.commit_complete_blob_carrier_with_policy(
+            guard.policy(),
+            source,
+            status.object(),
+            &plan,
+        ) {
+            Ok(BlobCarrierCommitOutcome::Committed | BlobCarrierCommitOutcome::Duplicate) => {}
+            Err(error @ StoreError::Blob(BlobStoreError::Verification(_))) => {
+                if let Some((peer, cursor)) = scheduler {
+                    let _ = store.compare_and_advance_blob_carrier_fetch_cursor(
+                        peer,
+                        cursor,
+                        BlobCarrierFetchCursor::new(source, status.object()),
+                    )?;
+                }
+                store.abort_blob_carrier_prefix(source, status.object())?;
+                return Err(error.into());
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if store.pending_blob_remaining_count_with_policy(guard.policy(), source, &plan)? != 0 {
+        return Ok(None);
+    }
+
+    guard.check(store)?;
+    let depot_completion_result = {
+        let mut depot = store.blob_depot()?;
+        depot.completed_blob(&blob, &manifest_bytes)
+    };
+    let depot_completion = match depot_completion_result {
+        Ok(completion) => completion,
+        Err(
+            error @ StoreError::Blob(
+                BlobStoreError::CompletionMismatch | BlobStoreError::Verification(_),
+            ),
+        ) => {
+            advance_terminal_blob_source_cursor(store, &plan, source, scheduler)?;
+            abort_pending_blob_with_cached_claim(store, verifier, source)?;
+            return Err(error.into());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let content_completion = {
+        let depot = store.blob_depot()?;
+        let mut service = verifier.blob_service_with_store(
+            blob.scope(),
+            blob.topic(),
+            blob.key_epoch(),
+            depot,
+        )?;
+        if let Err(error) = service.install_verified_manifest(&blob, &manifest_bytes) {
+            if blob_terminal_content_error(&error) {
+                drop(service);
+                advance_terminal_blob_source_cursor(store, &plan, source, scheduler)?;
+                abort_pending_blob_with_cached_claim(store, verifier, source)?;
+            }
+            return Err(NodeError::Protocol(format!(
+                "pending Blob manifest activation failed: {error}"
+            )));
+        }
+        match service.verify_blob_content_completion(&blob, &manifest_bytes) {
+            Ok(completion) => completion,
+            Err(error) if blob_terminal_content_error(&error) => {
+                drop(service);
+                advance_terminal_blob_source_cursor(store, &plan, source, scheduler)?;
+                abort_pending_blob_with_cached_claim(store, verifier, source)?;
+                return Err(NodeError::Protocol(format!(
+                    "pending Blob failed terminal content verification: {error}"
+                )));
+            }
+            Err(error) => {
+                return Err(NodeError::Protocol(format!(
+                    "pending Blob content verification was interrupted: {error}"
+                )));
+            }
+        }
+    };
+    let lineage = match verifier.verify_current_blob_lineage(&blob) {
+        Ok(lineage) => lineage,
+        Err(error) => {
+            abort_pending_blob_with_cached_claim(store, verifier, source)?;
+            return Err(error.into());
+        }
+    };
+    let cache = contact_mutable_route_cache(verifier)?;
+    let lifecycle = cache.lock_blob_lifecycle()?;
+    guard.check(store)?;
+    let outcome = match store.apply_verified_blob_with_policy(
+        guard.policy(),
+        &plan,
+        &lineage,
+        &depot_completion,
+        &content_completion,
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) if blob_apply_capacity_error(&error) => {
+            return Ok(Some(MutableApplyDisposition::DeferredCapacity));
+        }
+        Err(error @ StoreError::Blob(BlobStoreError::CompletionMismatch)) => {
+            drop(lifecycle);
+            advance_terminal_blob_source_cursor(store, &plan, source, scheduler)?;
+            abort_pending_blob_with_cached_claim(store, verifier, source)?;
+            return Err(error.into());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let projection = store.blob_source_projection(source)?.ok_or_else(|| {
+        NodeError::Protocol("promoted Blob lost its state-neutral projection".into())
+    })?;
+    let claim = AuthenticatedBlobRouteClaim::from_verified(
+        &blob,
+        &store
+            .get_blob(source)?
+            .ok_or_else(|| NodeError::Protocol("promoted Blob lost exact source bytes".into()))?
+            .sealed,
+        &projection.source,
+        projection.retention,
+    )?;
+    cache.insert_blob(verifier, claim)?;
+    Ok(Some(if outcome.inserted() {
+        MutableApplyDisposition::Inserted
+    } else {
+        MutableApplyDisposition::Duplicate
+    }))
+}
+
+fn advance_terminal_blob_source_cursor(
+    store: &Store,
+    plan: &VerifiedBlobTransferPlan,
+    source: BlobTransferId,
+    scheduler: Option<(NodeId, Option<BlobCarrierFetchCursor>)>,
+) -> Result<(), NodeError> {
+    let Some((peer, cursor)) = scheduler else {
+        return Ok(());
+    };
+    let mut maximum = None;
+    for object in plan.carrier_ids() {
+        let object = BlobCarrierObjectId::new(object.wire_bytes()).map_err(StoreError::Blob)?;
+        maximum = Some(maximum.map_or(object, |current: BlobCarrierObjectId| current.max(object)));
+    }
+    if let Some(object) = maximum {
+        let _ = store.compare_and_advance_blob_carrier_fetch_cursor(
+            peer,
+            cursor,
+            BlobCarrierFetchCursor::new(source, object),
+        )?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct BlobRangeCandidate {
+    source: BlobTransferId,
+    object: BlobCarrierObjectId,
+    total_len: u64,
+    offset: u64,
+    requested_len: u32,
+    proof: [u8; crate::frame::BLOB_CONTENT_PROOF_BYTES],
+}
+
+fn pending_blob_range_candidates(
+    store: &Store,
+    guard: &EventLaneGuard,
+    verifier: &mut ReferenceEnvelopeSealer,
+    local_interest: &BlobInterest,
+) -> Result<Vec<BlobRangeCandidate>, NodeError> {
+    let mut candidates = Vec::new();
+    for projection in store.pending_blob_source_inventory_with_policy(guard.policy())? {
+        let Some(selector) = local_interest.selector(&projection.topic, &projection.scope) else {
+            continue;
+        };
+        if selector.epoch() != projection.epoch {
+            continue;
+        }
+        if !pending_blob_claim_is_current(store, verifier, &projection)? {
+            continue;
+        }
+        let Some((blob, _, plan)) =
+            load_pending_blob_plan(store, verifier, projection.transfer_id)?
+        else {
+            continue;
+        };
+        verifier.verify_current_blob_lineage(&blob)?;
+        for status in store.pending_blob_carrier_work_with_policy(
+            guard.policy(),
+            projection.transfer_id,
+            &plan,
+        )? {
+            let Some(range) = status.exact_complement() else {
+                continue;
+            };
+            let requested_len = u32::try_from(range.end - range.start)
+                .map_err(|_| NodeError::Protocol("Blob range request length exceeds u32".into()))?;
+            candidates.push(BlobRangeCandidate {
+                source: projection.transfer_id,
+                object: status.object(),
+                total_len: status.total_len(),
+                offset: range.start,
+                requested_len,
+                proof: *selector.content_proof(),
+            });
+        }
+    }
+    candidates.sort_unstable_by_key(|candidate| (candidate.source, candidate.object));
+    Ok(candidates)
+}
+
+fn select_blob_range_candidate(
+    candidates: &[BlobRangeCandidate],
+    cursor: Option<BlobCarrierFetchCursor>,
+) -> Option<BlobRangeCandidate> {
+    let after = cursor.and_then(|cursor| {
+        candidates.iter().position(|candidate| {
+            (candidate.source, candidate.object) > (cursor.source(), cursor.object())
+        })
+    });
+    after
+        .and_then(|index| candidates.get(index).copied())
+        .or_else(|| candidates.first().copied())
+}
+
+fn recover_pending_blob_sources(
+    store: &Store,
+    guard: &EventLaneGuard,
+    verifier: &mut ReferenceEnvelopeSealer,
+    local_interest: &BlobInterest,
+    peer: NodeId,
+    cursor: Option<BlobCarrierFetchCursor>,
+) -> Result<(), NodeError> {
+    for projection in store.pending_blob_source_inventory_with_policy(guard.policy())? {
+        if local_interest
+            .selector(&projection.topic, &projection.scope)
+            .is_some_and(|selector| selector.epoch() == projection.epoch)
+        {
+            if !pending_blob_claim_is_current(store, verifier, &projection)? {
+                continue;
+            }
+            let _ = recover_and_finalize_pending_blob(
+                store,
+                guard,
+                verifier,
+                projection.transfer_id,
+                Some((peer, cursor)),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn blob_carrier_remaining(
+    store: &Store,
+    guard: &EventLaneGuard,
+    verifier: &mut ReferenceEnvelopeSealer,
+    local_interest: &BlobInterest,
+) -> Result<usize, NodeError> {
+    let mut remaining =
+        pending_blob_range_candidates(store, guard, verifier, local_interest)?.len();
+    // A fully installed but capacity-deferred source remains outstanding even
+    // though it has no carrier complement. This prevents a false complete
+    // contact status while local semantic promotion is still pending.
+    for projection in store.pending_blob_source_inventory_with_policy(guard.policy())? {
+        let Some(selector) = local_interest.selector(&projection.topic, &projection.scope) else {
+            continue;
+        };
+        if selector.epoch() != projection.epoch {
+            continue;
+        }
+        if !pending_blob_claim_is_current(store, verifier, &projection)? {
+            continue;
+        }
+        let Some((_, _, plan)) = load_pending_blob_plan(store, verifier, projection.transfer_id)?
+        else {
+            continue;
+        };
+        if store.pending_blob_remaining_count_with_policy(
+            guard.policy(),
+            projection.transfer_id,
+            &plan,
+        )? == 0
+        {
+            remaining = remaining
+                .checked_add(1)
+                .ok_or_else(|| NodeError::Protocol("Blob remaining count overflow".into()))?;
+        }
+    }
+    Ok(remaining)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn sync_blob_carrier_lane(
+    store: &Store,
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    verifier: &mut ReferenceEnvelopeSealer,
+    guard: &EventLaneGuard,
+    local_interest: &BlobInterest,
+    _peer_interest: &BlobInterest,
+    receipt: &mut PeerReceipt,
+) -> Result<(), NodeError> {
+    const DIRECTION: EventDirection = EventDirection::ToSessionInitiator;
+    guard.check(store)?;
+    let peer = mission.peer().mission_id();
+    let cursor = store.blob_carrier_fetch_cursor(peer)?;
+    recover_pending_blob_sources(store, guard, verifier, local_interest, peer, cursor)?;
+    let candidates = pending_blob_range_candidates(store, guard, verifier, local_interest)?;
+    if let Some(candidate) = select_blob_range_candidate(&candidates, cursor) {
+        if !exchange_preserves_reserve(
+            receipt,
+            BLOB_RANGE_FETCH_PLAINTEXT_BYTES,
+            BLOB_RANGE_PLAINTEXT_MAX_BYTES,
+            2,
+            BLOB_RANGE_RESULT_EXCHANGE_BYTES + BLOB_CARRIER_FINISH_EXCHANGE_BYTES,
+        )? {
+            return Err(NodeError::Protocol(
+                "contact lost the reserved Blob range settlement boundary".into(),
+            ));
+        }
+        let object_id = frame_blob_object_id(candidate.object)?;
+        guard.check(store)?;
+        let response = request_mission_frame(
+            connection,
+            mission,
+            Frame::BlobRangeFetch {
+                direction: DIRECTION,
+                source_id: candidate.source,
+                object_id,
+                total_len: candidate.total_len,
+                offset: candidate.offset,
+                requested_len: candidate.requested_len,
+                content_proof: candidate.proof,
+            },
+            receipt,
+        )
+        .await?;
+        let Frame::BlobRange {
+            direction,
+            source_id,
+            object_id: returned_object,
+            total_len,
+            offset,
+            requested_len,
+            disposition: range_disposition,
+            bytes,
+        } = response
+        else {
+            return Err(NodeError::Protocol(
+                "Blob range fetch received another response".into(),
+            ));
+        };
+        if direction != DIRECTION
+            || source_id != candidate.source
+            || returned_object != object_id
+            || total_len != candidate.total_len
+            || offset != candidate.offset
+            || requested_len != candidate.requested_len
+        {
+            return Err(NodeError::Protocol(
+                "Blob range response crossed its exact tuple".into(),
+            ));
+        }
+        let (accepted_len, apply_disposition) = match range_disposition {
+            BlobRangeDisposition::Unavailable => {
+                if !bytes.is_empty() {
+                    return Err(NodeError::Protocol(
+                        "unavailable Blob range carried bytes".into(),
+                    ));
+                }
+                (0, BlobRangeApplyDisposition::Unavailable)
+            }
+            BlobRangeDisposition::Data => {
+                if bytes.len() != usize::try_from(candidate.requested_len).expect("u32 fits usize")
+                {
+                    return Err(NodeError::Protocol(
+                        "Blob range payload differs from its exact requested length".into(),
+                    ));
+                }
+                guard.check(store)?;
+                let appended = store.append_blob_carrier_prefix_with_policy(
+                    guard.policy(),
+                    candidate.source,
+                    candidate.object,
+                    candidate.total_len,
+                    candidate.offset,
+                    &bytes,
+                );
+                match appended {
+                    Ok(BlobCarrierAppendOutcome::Duplicate(_)) => {
+                        receipt.duplicates = receipt.duplicates.saturating_add(1);
+                        (0, BlobRangeApplyDisposition::Duplicate)
+                    }
+                    Ok(BlobCarrierAppendOutcome::Appended(status)) => {
+                        receipt.blob_bytes_fetched = receipt
+                            .blob_bytes_fetched
+                            .checked_add(bytes.len())
+                            .ok_or_else(|| {
+                                NodeError::Protocol("Blob byte count overflow".into())
+                            })?;
+                        if status.complete() {
+                            let _ = recover_and_finalize_pending_blob(
+                                store,
+                                guard,
+                                verifier,
+                                candidate.source,
+                                Some((peer, cursor)),
+                            )?;
+                            (candidate.requested_len, BlobRangeApplyDisposition::Complete)
+                        } else {
+                            (candidate.requested_len, BlobRangeApplyDisposition::Partial)
+                        }
+                    }
+                    Err(error) if blob_apply_capacity_error(&error) => {
+                        receipt.blob_deferred = receipt.blob_deferred.saturating_add(1);
+                        (0, BlobRangeApplyDisposition::DeferredCapacity)
+                    }
+                    Err(error @ StoreError::Blob(BlobStoreError::CarrierPrefixConflict)) => {
+                        store.abort_blob_carrier_prefix(candidate.source, candidate.object)?;
+                        return Err(error.into());
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        };
+        if !exchange_preserves_reserve(
+            receipt,
+            BLOB_RANGE_RESULT_PLAINTEXT_BYTES,
+            BLOB_RANGE_RESULT_PLAINTEXT_BYTES,
+            1,
+            BLOB_CARRIER_FINISH_EXCHANGE_BYTES,
+        )? {
+            return Err(NodeError::Protocol(
+                "contact lost the reserved Blob result acknowledgement boundary".into(),
+            ));
+        }
+        let acknowledgement = request_mission_frame(
+            connection,
+            mission,
+            Frame::BlobRangeResult {
+                direction: DIRECTION,
+                source_id: candidate.source,
+                object_id,
+                total_len: candidate.total_len,
+                offset: candidate.offset,
+                accepted_len,
+                disposition: apply_disposition,
+            },
+            receipt,
+        )
+        .await?;
+        if acknowledgement
+            != (Frame::BlobRangeResultAck {
+                direction: DIRECTION,
+                source_id: candidate.source,
+                object_id,
+                total_len: candidate.total_len,
+                offset: candidate.offset,
+                accepted_len,
+                disposition: apply_disposition,
+            })
+        {
+            return Err(NodeError::Protocol(
+                "Blob range result acknowledgement differs".into(),
+            ));
+        }
+        let _ = store.compare_and_advance_blob_carrier_fetch_cursor(
+            peer,
+            cursor,
+            BlobCarrierFetchCursor::new(candidate.source, candidate.object),
+        )?;
+        if matches!(
+            apply_disposition,
+            BlobRangeApplyDisposition::Partial | BlobRangeApplyDisposition::Complete
+        ) {
+            receipt.blob_ranges_fetched = receipt
+                .blob_ranges_fetched
+                .checked_add(1)
+                .ok_or_else(|| NodeError::Protocol("Blob fetched range count overflow".into()))?;
+        }
+    }
+    let cursor_after = store.blob_carrier_fetch_cursor(peer)?;
+    recover_pending_blob_sources(store, guard, verifier, local_interest, peer, cursor_after)?;
+    let remaining = blob_carrier_remaining(store, guard, verifier, local_interest)?;
+    let remaining_wire = u64::try_from(remaining)
+        .map_err(|_| NodeError::Protocol("Blob remaining count exceeds u64".into()))?;
+    let response = request_mission_frame(
+        connection,
+        mission,
+        Frame::BlobCarrierFinish {
+            direction: DIRECTION,
+            remaining: remaining_wire,
+        },
+        receipt,
+    )
+    .await?;
+    if response
+        != (Frame::BlobCarrierFinished {
+            direction: DIRECTION,
+            remaining: remaining_wire,
+        })
+    {
+        return Err(NodeError::Protocol(
+            "Blob carrier finish acknowledgement differs".into(),
+        ));
+    }
+    receipt.blob_remaining = receipt
+        .blob_remaining
+        .checked_add(remaining)
+        .ok_or_else(|| NodeError::Protocol("Blob remaining count overflow".into()))?;
+    add_unscheduled_mutable(receipt, remaining)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn serve_verified_blob_range(
+    store: &Store,
+    guard: &EventLaneGuard,
+    verifier: &mut ReferenceEnvelopeSealer,
+    peer: NodeId,
+    commitments: &[[u8; 32]],
+    peer_interest: &BlobInterest,
+    source: BlobTransferId,
+    object: BlobCarrierObjectId,
+    total_len: u64,
+    offset: u64,
+    requested_len: u32,
+    proof: &[u8; crate::frame::BLOB_CONTENT_PROOF_BYTES],
+) -> Result<Option<Vec<u8>>, NodeError> {
+    guard.check(store)?;
+    let Some(stored) = store.get_blob(source)? else {
+        return Ok(None);
+    };
+    let route = verifier.verify_blob(&stored.sealed)?;
+    if BlobTransferId::new(route.envelope_id()) != source {
+        return Err(NodeError::Protocol(
+            "served Blob source identity changed".into(),
+        ));
+    }
+    let BlobContentVerification::ContentVerified {
+        blob,
+        manifest_bytes,
+    } = verifier.verify_blob_content(route, &stored.sealed)?
+    else {
+        return Err(NodeError::Protocol(
+            "served Blob lost its content grant".into(),
+        ));
+    };
+    let selector = peer_interest
+        .selector(blob.topic(), blob.scope())
+        .filter(|selector| selector.epoch() == blob.key_epoch())
+        .ok_or_else(|| NodeError::Protocol("Blob range is outside peer interest".into()))?;
+    if selector.content_proof() != proof
+        || !verifier.peer_can_route(peer, commitments, blob.scope(), blob.key_epoch())
+        || !verifier.peer_can_open_blob_content(
+            peer,
+            commitments,
+            blob.scope(),
+            blob.topic(),
+            blob.key_epoch(),
+            proof,
+        )
+    {
+        return Err(NodeError::Protocol(
+            "authenticated peer lacks exact Blob range entitlement".into(),
+        ));
+    }
+    ensure_mutable_active(store, blob.publisher(), blob.scope(), blob.key_epoch())?;
+    let lineage = verifier.verify_current_blob_lineage(&blob)?;
+    let plan = blob.transfer_plan(&manifest_bytes).map_err(|error| {
+        NodeError::Protocol(format!("served Blob transfer plan is invalid: {error}"))
+    })?;
+    let expected_total = plan
+        .carrier_total_len(object.as_bytes())
+        .map_err(|error| NodeError::Protocol(format!("served Blob carrier is invalid: {error}")))?;
+    if expected_total != total_len
+        || requested_len == 0
+        || usize::try_from(requested_len).unwrap_or(usize::MAX) > MAX_BLOB_NETWORK_RANGE_BYTES
+        || offset
+            .checked_add(u64::from(requested_len))
+            .is_none_or(|end| end > total_len)
+    {
+        return Err(NodeError::Protocol(
+            "Blob range request tuple is invalid".into(),
+        ));
+    }
+    guard.check(store)?;
+    let result = store.read_completed_blob_carrier_range_with_policy(
+        guard.policy(),
+        &lineage,
+        source,
+        object,
+        offset,
+        usize::try_from(requested_len).expect("u32 fits usize"),
+        &plan,
+    )?;
+    match result {
+        Some((returned_total, bytes))
+            if returned_total == total_len
+                && bytes.len() == usize::try_from(requested_len).expect("u32 fits usize") =>
+        {
+            Ok(Some(bytes))
+        }
+        Some(_) => Err(NodeError::Protocol(
+            "durable Blob range read differed from the authenticated tuple".into(),
+        )),
+        None => Ok(None),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_blob_carrier_lane(
+    store: &Store,
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    verifier: &mut ReferenceEnvelopeSealer,
+    guard: &EventLaneGuard,
+    _local_interest: &BlobInterest,
+    peer_interest: &BlobInterest,
+    receipt: &mut PeerReceipt,
+) -> Result<(), NodeError> {
+    const DIRECTION: EventDirection = EventDirection::ToSessionInitiator;
+    let peer = mission.peer().mission_id();
+    let commitments = mission.peer_route_grant_commitments().to_vec();
+    let mut pending_result = None;
+    loop {
+        guard.check(store)?;
+        let wire_budget = exchange_wire_budget(receipt)?;
+        let (complete, request_bytes, response_bytes) = respond_mission_frame(
+            connection,
+            mission,
+            wire_budget,
+            |frame, _, _mission| match frame {
+                Frame::BlobRangeFetch {
+                    direction,
+                    source_id,
+                    object_id,
+                    total_len,
+                    offset,
+                    requested_len,
+                    content_proof,
+                } if direction == DIRECTION && pending_result.is_none() => {
+                    let object = store_blob_object_id(object_id)?;
+                    let bytes = serve_verified_blob_range(
+                        store,
+                        guard,
+                        verifier,
+                        peer,
+                        &commitments,
+                        peer_interest,
+                        source_id,
+                        object,
+                        total_len,
+                        offset,
+                        requested_len,
+                        &content_proof,
+                    )?;
+                    let disposition = if bytes.is_some() {
+                        BlobRangeDisposition::Data
+                    } else {
+                        BlobRangeDisposition::Unavailable
+                    };
+                    let bytes = bytes.unwrap_or_default();
+                    pending_result = Some((
+                        source_id,
+                        object_id,
+                        total_len,
+                        offset,
+                        requested_len,
+                        disposition,
+                    ));
+                    Ok((
+                        Frame::BlobRange {
+                            direction: DIRECTION,
+                            source_id,
+                            object_id,
+                            total_len,
+                            offset,
+                            requested_len,
+                            disposition,
+                            bytes,
+                        },
+                        false,
+                    ))
+                }
+                Frame::BlobRangeResult {
+                    direction,
+                    source_id,
+                    object_id,
+                    total_len,
+                    offset,
+                    accepted_len,
+                    disposition,
+                } if direction == DIRECTION && pending_result.is_some() => {
+                    let pending = pending_result.take().expect("checked pending result");
+                    if (source_id, object_id, total_len, offset)
+                        != (pending.0, pending.1, pending.2, pending.3)
+                        || match (pending.5, disposition) {
+                            (
+                                BlobRangeDisposition::Unavailable,
+                                BlobRangeApplyDisposition::Unavailable,
+                            ) => accepted_len != 0,
+                            (
+                                BlobRangeDisposition::Data,
+                                BlobRangeApplyDisposition::Partial
+                                | BlobRangeApplyDisposition::Complete,
+                            ) => accepted_len != pending.4,
+                            (
+                                BlobRangeDisposition::Data,
+                                BlobRangeApplyDisposition::Duplicate
+                                | BlobRangeApplyDisposition::DeferredCapacity,
+                            ) => accepted_len != 0,
+                            _ => true,
+                        }
+                    {
+                        return Err(NodeError::Protocol(
+                            "Blob range result differs from pending response".into(),
+                        ));
+                    }
+                    receipt.offered = receipt.offered.saturating_add(1);
+                    Ok((
+                        Frame::BlobRangeResultAck {
+                            direction,
+                            source_id,
+                            object_id,
+                            total_len,
+                            offset,
+                            accepted_len,
+                            disposition,
+                        },
+                        false,
+                    ))
+                }
+                Frame::BlobCarrierFinish {
+                    direction,
+                    remaining,
+                } if direction == DIRECTION && pending_result.is_none() => Ok((
+                    Frame::BlobCarrierFinished {
+                        direction,
+                        remaining,
+                    },
+                    true,
+                )),
+                _ => Err(NodeError::Protocol(
+                    "Blob carrier lane used an unauthorized phase operation".into(),
+                )),
+            },
+        )
+        .await?;
+        account(receipt, request_bytes, response_bytes)?;
+        if complete {
+            return Ok(());
+        }
+    }
 }
 
 async fn sync_mutable_transfer_lane(
@@ -5302,18 +13446,29 @@ async fn sync_mutable_transfer_lane(
 ) -> Result<(), NodeError> {
     let DirectedMutableLane {
         guard,
+        source_snapshot,
         receiver_interest,
+        semantic_version,
         class,
         direction,
     } = lane;
+    difference.validate(class)?;
     let peer = mission.peer().mission_id();
     let commitments = mission.peer_route_grant_commitments().to_vec();
-    let capacity = event_transfer_capacity(receipt)?;
+    let capacity = mutable_transfer_capacity(receipt, semantic_version, class, direction)?;
+    let cursor = store.mutable_transfer_cursor(
+        peer,
+        mutable_transfer_cursor_class(class),
+        mutable_transfer_cursor_mode(direction),
+    )?;
+    let mut transferred = 0usize;
+    let mut deferred_capacity = 0usize;
     match direction {
         EventDirection::ToSessionResponder => {
             let limit = difference.local_only.len().min(capacity);
-            add_unscheduled_events(receipt, difference.local_only.len() - limit)?;
-            for id in difference.local_only.iter().take(limit).copied() {
+            let selected =
+                mutable_transfer_selection(&difference.local_only, class, cursor, limit)?;
+            for id in selected {
                 if id.class() != class {
                     return Err(NodeError::Protocol(
                         "mutable difference contains another data class".into(),
@@ -5322,8 +13477,8 @@ async fn sync_mutable_transfer_lane(
                 guard.check(store)?;
                 let bytes = load_verified_mutable_for_peer(
                     store,
-                    guard.policy(),
                     verifier,
+                    source_snapshot,
                     id,
                     peer,
                     &commitments,
@@ -5343,7 +13498,7 @@ async fn sync_mutable_transfer_lane(
                 let Frame::MutableApplyResult {
                     direction: response_direction,
                     id: applied,
-                    inserted,
+                    disposition,
                 } = response
                 else {
                     return Err(NodeError::Protocol(
@@ -5355,16 +13510,29 @@ async fn sync_mutable_transfer_lane(
                         "mutable offer acknowledgement crossed lanes".into(),
                     ));
                 }
+                let _advanced =
+                    advance_mutable_transfer_cursor(store, peer, class, direction, cursor, id)?;
                 receipt.offered += 1;
-                if !inserted {
-                    receipt.duplicates += 1;
+                match disposition {
+                    MutableApplyDisposition::Inserted => {}
+                    MutableApplyDisposition::Duplicate => receipt.duplicates += 1,
+                    MutableApplyDisposition::DeferredCapacity => {
+                        if class == MutableClass::Blob {
+                            receipt.blob_deferred = receipt.blob_deferred.saturating_add(1);
+                        }
+                        deferred_capacity = deferred_capacity.checked_add(1).ok_or_else(|| {
+                            NodeError::Protocol("mutable capacity deferral count overflow".into())
+                        })?;
+                    }
                 }
+                transferred += 1;
             }
         }
         EventDirection::ToSessionInitiator => {
             let limit = difference.remote_only.len().min(capacity);
-            add_unscheduled_events(receipt, difference.remote_only.len() - limit)?;
-            for id in difference.remote_only.iter().take(limit).copied() {
+            let selected =
+                mutable_transfer_selection(&difference.remote_only, class, cursor, limit)?;
+            for id in selected {
                 if id.class() != class {
                     return Err(NodeError::Protocol(
                         "mutable difference contains another data class".into(),
@@ -5395,9 +13563,9 @@ async fn sync_mutable_transfer_lane(
                     ));
                 }
                 guard.check(store)?;
-                if accept_received_mutable(
+                let disposition = accept_received_mutable(
                     store,
-                    guard.policy(),
+                    guard,
                     verifier,
                     MutablePeerAdmission {
                         peer,
@@ -5406,29 +13574,77 @@ async fn sync_mutable_transfer_lane(
                     },
                     received,
                     &bytes,
-                )? {
-                    receipt.inserted += 1;
-                } else {
-                    receipt.duplicates += 1;
+                )?;
+                let acknowledgement = request_mission_frame(
+                    connection,
+                    mission,
+                    Frame::MutableFetchResult {
+                        direction,
+                        id: received,
+                        disposition,
+                    },
+                    receipt,
+                )
+                .await?;
+                require_mutable_fetch_result_ack(
+                    acknowledgement,
+                    direction,
+                    received,
+                    disposition,
+                )?;
+                let _advanced = advance_mutable_transfer_cursor(
+                    store, peer, class, direction, cursor, received,
+                )?;
+                match disposition {
+                    MutableApplyDisposition::Inserted => receipt.inserted += 1,
+                    MutableApplyDisposition::Duplicate => receipt.duplicates += 1,
+                    MutableApplyDisposition::DeferredCapacity => {
+                        if class == MutableClass::Blob {
+                            receipt.blob_deferred = receipt.blob_deferred.saturating_add(1);
+                        }
+                        deferred_capacity = deferred_capacity.checked_add(1).ok_or_else(|| {
+                            NodeError::Protocol("mutable capacity deferral count overflow".into())
+                        })?;
+                    }
                 }
                 receipt.fetched += 1;
+                transferred += 1;
             }
         }
     }
+    let lane_total = match direction {
+        EventDirection::ToSessionResponder => difference.local_only.len(),
+        EventDirection::ToSessionInitiator => difference.remote_only.len(),
+    };
+    let remaining = lane_total
+        .checked_sub(transferred)
+        .and_then(|remaining| remaining.checked_add(deferred_capacity))
+        .ok_or_else(|| NodeError::Protocol("mutable lane remaining count overflow".into()))?;
+    let remaining_wire = mutable_lane_remaining_wire(remaining)?;
     guard.check(store)?;
-    if request_mission_frame(
+    let response = request_mission_frame(
         connection,
         mission,
-        Frame::MutableFinish { class, direction },
+        Frame::MutableFinish {
+            class,
+            direction,
+            remaining: remaining_wire,
+        },
         receipt,
     )
-    .await?
-        != (Frame::MutableFinished { class, direction })
+    .await?;
+    if response
+        != (Frame::MutableFinished {
+            class,
+            direction,
+            remaining: remaining_wire,
+        })
     {
         return Err(NodeError::Protocol(
             "mutable finish acknowledgement differs".into(),
         ));
     }
+    add_unscheduled_mutable(receipt, remaining)?;
     Ok(())
 }
 
@@ -5439,23 +13655,61 @@ async fn sync_mutable_class(
     verifier: &mut ReferenceEnvelopeSealer,
     contact: MutableClassContact<'_>,
     receipt: &mut PeerReceipt,
-) -> Result<(), NodeError> {
+) -> Result<Option<(BlobInterest, BlobInterest)>, NodeError> {
     let MutableClassContact {
         guard,
         interests,
         class,
     } = contact;
     guard.check(store)?;
-    let local_interest = interests.for_class(class)?;
-    let peer_interest =
-        sync_mutable_interests(connection, mission, class, &local_interest, receipt).await?;
+    let full_class = mutable_class_can_start(receipt, mission.semantic_version(), class)?;
+    let (local_interest, peer_interest) = if class == MutableClass::Blob {
+        let enabled = !matches!(
+            contact_policy_or_normal()?.policy,
+            EventEmissionPolicy::ReceiveOnly
+        );
+        let local = protected_blob_interest(store, verifier, interests, enabled)?;
+        let peer = sync_blob_interests(connection, mission, &local, full_class, receipt).await?;
+        (
+            OwnedMutableReceiveInterest::Blob(local),
+            OwnedMutableReceiveInterest::Blob(peer),
+        )
+    } else {
+        let local = interests.for_class(class)?;
+        let peer =
+            sync_mutable_interests(connection, mission, class, &local, full_class, receipt).await?;
+        (
+            OwnedMutableReceiveInterest::StateOrRecord(local),
+            OwnedMutableReceiveInterest::StateOrRecord(peer),
+        )
+    };
+    if !full_class {
+        for direction in [
+            EventDirection::ToSessionResponder,
+            EventDirection::ToSessionInitiator,
+        ] {
+            defer_mutable_lane_from_reserved_class_skip(
+                connection, mission, class, direction, receipt,
+            )
+            .await?;
+        }
+        return Ok(match (local_interest, peer_interest) {
+            (OwnedMutableReceiveInterest::Blob(local), OwnedMutableReceiveInterest::Blob(peer)) => {
+                Some((local, peer))
+            }
+            _ => None,
+        });
+    }
+    let source_snapshot = cached_mutable_sender_snapshot(store, guard.policy(), verifier, class)?;
     let to_responder = DirectedMutableLane {
         guard,
-        receiver_interest: &peer_interest,
+        source_snapshot: &source_snapshot,
+        receiver_interest: peer_interest.borrowed(),
+        semantic_version: mission.semantic_version(),
         class,
         direction: EventDirection::ToSessionResponder,
     };
-    let difference = sync_mutable_reconciliation_lane(
+    let outcome = sync_mutable_reconciliation_lane(
         store,
         connection,
         mission,
@@ -5464,24 +13718,28 @@ async fn sync_mutable_class(
         receipt,
     )
     .await?;
-    sync_mutable_transfer_lane(
-        store,
-        connection,
-        mission,
-        verifier,
-        to_responder,
-        &difference,
-        receipt,
-    )
-    .await?;
+    if let MutableReconciliationOutcome::Complete(difference) = outcome {
+        sync_mutable_transfer_lane(
+            store,
+            connection,
+            mission,
+            verifier,
+            to_responder,
+            &difference,
+            receipt,
+        )
+        .await?;
+    }
 
     let to_initiator = DirectedMutableLane {
         guard,
-        receiver_interest: &local_interest,
+        source_snapshot: &source_snapshot,
+        receiver_interest: local_interest.borrowed(),
+        semantic_version: mission.semantic_version(),
         class,
         direction: EventDirection::ToSessionInitiator,
     };
-    let difference = sync_mutable_reconciliation_lane(
+    let outcome = sync_mutable_reconciliation_lane(
         store,
         connection,
         mission,
@@ -5490,26 +13748,79 @@ async fn sync_mutable_class(
         receipt,
     )
     .await?;
-    sync_mutable_transfer_lane(
-        store,
-        connection,
-        mission,
-        verifier,
-        to_initiator,
-        &difference,
-        receipt,
-    )
-    .await
+    if let MutableReconciliationOutcome::Complete(difference) = outcome {
+        sync_mutable_transfer_lane(
+            store,
+            connection,
+            mission,
+            verifier,
+            to_initiator,
+            &difference,
+            receipt,
+        )
+        .await?;
+    }
+    Ok(match (local_interest, peer_interest) {
+        (OwnedMutableReceiveInterest::Blob(local), OwnedMutableReceiveInterest::Blob(peer)) => {
+            Some((local, peer))
+        }
+        _ => None,
+    })
+}
+
+async fn sync_mutable_classes(
+    store: &Store,
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    verifier: &mut ReferenceEnvelopeSealer,
+    guard: &EventLaneGuard,
+    interests: &MutableSourceInterests,
+    receipt: &mut PeerReceipt,
+) -> Result<(), NodeError> {
+    if mission.semantic_version() >= MIN_BLOB_NETWORK_SEMANTIC_VERSION {
+        let cache = contact_mutable_route_cache(verifier)?;
+        cleanup_ineligible_pending_blobs(store, verifier, &cache)?;
+        guard.check(store)?;
+    }
+    let mut blob_interests = None;
+    for &class in mutable_classes_for_semantic(mission.semantic_version()) {
+        let exchanged = sync_mutable_class(
+            store,
+            connection,
+            mission,
+            verifier,
+            MutableClassContact {
+                guard,
+                interests,
+                class,
+            },
+            receipt,
+        )
+        .await?;
+        if exchanged.is_some() {
+            blob_interests = exchanged;
+        }
+    }
+    if let Some((local, peer)) = blob_interests {
+        sync_blob_carrier_lane(
+            store, connection, mission, verifier, guard, &local, &peer, receipt,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 async fn sync_authenticated_session(
-    store: &Store,
+    store: Arc<Store>,
     connection: &aster_iroh::Connection,
     credentials: UnprotectedReferenceMission,
     peer: MissionExpectedPeer,
     policy_lock: Arc<RwLock<()>>,
     mutable_interests: &MutableSourceInterests,
 ) -> Result<CompletedPeerContact, NodeError> {
+    let lease_store = store.clone();
+    let store = store.as_ref();
+    require_contact_frame_initiation()?;
     // Mission authentication is deliberately first. No inventory bytes or
     // object operation can reach the carrier before this returns a session.
     let (mut mission, handshake) = initiate_over_iroh_metered(
@@ -5530,7 +13841,7 @@ async fn sync_authenticated_session(
         control_verifier.identity(),
         mission.peer().mission_id(),
     )?;
-    sync_control_lane(
+    let remote_emission = sync_control_lane(
         store,
         connection,
         &mut mission,
@@ -5553,84 +13864,170 @@ async fn sync_authenticated_session(
         mission.peer().mission_id(),
         receipt.controls_remaining,
     )?;
-    let (local_interest, peer_interest) =
-        sync_event_interests(store, connection, &mut mission, &event_guard, &mut receipt).await?;
+    let (local_interest, peer_interest) = sync_event_interests(
+        store,
+        connection,
+        &mut mission,
+        &event_guard,
+        remote_emission,
+        &mut receipt,
+    )
+    .await?;
+    let mut custody_exchanges = CustodyExchangeSequence::new();
 
     // Each receiver's protected interest defines a separate reconciliation
     // universe. Both endpoints independently derive each exact one-way plan.
     let to_responder_lane = DirectedEventLane {
         guard: &event_guard,
-        receiver_interest: &peer_interest,
+        receiver_interest: &peer_interest.interest,
+        receiver_selector_revision: peer_interest.selector_revision,
         direction: EventDirection::ToSessionResponder,
     };
-    let to_responder = sync_event_reconciliation_lane(
+    let to_responder = match sync_event_reconciliation_lane(
         store,
         connection,
         &mut mission,
         &mut event_verifier,
         to_responder_lane,
+        remote_emission,
         &mut receipt,
     )
-    .await?;
-    sync_event_transfer_lane(
+    .await?
+    {
+        EventReconciliationOutcome::Complete(reconciliation) => reconciliation,
+        EventReconciliationOutcome::Deferred => {
+            if !matches!(remote_emission.policy, EventEmissionPolicy::ReceiveOnly) {
+                sync_mutable_classes(
+                    store,
+                    connection,
+                    &mut mission,
+                    &mut event_verifier,
+                    &event_guard,
+                    mutable_interests,
+                    &mut receipt,
+                )
+                .await?;
+            }
+            event_guard.check(store)?;
+            let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
+            let completed = complete_peer_contact(connection, receipt, event_policy);
+            connection.finish_as_initiator().await?;
+            return Ok(completed);
+        }
+    };
+    settle_authenticated_event_common_set(
         store,
-        connection,
-        &mut mission,
-        &mut event_verifier,
-        to_responder_lane,
+        &event_guard,
+        mission.peer().mission_id(),
+        mission.semantic_version() >= MIN_CUSTODY_SEMANTIC_VERSION,
+        remote_emission,
+        to_responder_lane.receiver_selector_revision,
         &to_responder,
-        &mut receipt,
+    )?;
+    sync_event_transfer_lane(
+        EventTransferLaneContext {
+            store,
+            lease_store: lease_store.clone(),
+            connection,
+            mission: &mut mission,
+            event_verifier: &mut event_verifier,
+            lane: to_responder_lane,
+            remote_emission,
+            exchanges: &mut custody_exchanges,
+            receipt: &mut receipt,
+        },
+        &to_responder.difference,
     )
     .await?;
+
+    if matches!(remote_emission.policy, EventEmissionPolicy::ReceiveOnly) {
+        event_guard.check(store)?;
+        let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
+        let completed = complete_peer_contact(connection, receipt, event_policy);
+        connection.finish_as_initiator().await?;
+        return Ok(completed);
+    }
 
     let to_initiator_lane = DirectedEventLane {
         guard: &event_guard,
-        receiver_interest: &local_interest,
+        receiver_interest: &local_interest.interest,
+        receiver_selector_revision: local_interest.selector_revision,
         direction: EventDirection::ToSessionInitiator,
     };
-    let to_initiator = sync_event_reconciliation_lane(
+    let to_initiator = match sync_event_reconciliation_lane(
         store,
         connection,
         &mut mission,
         &mut event_verifier,
         to_initiator_lane,
+        remote_emission,
         &mut receipt,
     )
-    .await?;
-    sync_event_transfer_lane(
+    .await?
+    {
+        EventReconciliationOutcome::Complete(reconciliation) => reconciliation,
+        EventReconciliationOutcome::Deferred => {
+            if !matches!(remote_emission.policy, EventEmissionPolicy::ReceiveOnly) {
+                sync_mutable_classes(
+                    store,
+                    connection,
+                    &mut mission,
+                    &mut event_verifier,
+                    &event_guard,
+                    mutable_interests,
+                    &mut receipt,
+                )
+                .await?;
+            }
+            event_guard.check(store)?;
+            let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
+            let completed = complete_peer_contact(connection, receipt, event_policy);
+            connection.finish_as_initiator().await?;
+            return Ok(completed);
+        }
+    };
+    settle_authenticated_event_common_set(
         store,
-        connection,
-        &mut mission,
-        &mut event_verifier,
-        to_initiator_lane,
+        &event_guard,
+        mission.peer().mission_id(),
+        mission.semantic_version() >= MIN_CUSTODY_SEMANTIC_VERSION,
+        remote_emission,
+        to_initiator_lane.receiver_selector_revision,
         &to_initiator,
+    )?;
+    sync_event_transfer_lane(
+        EventTransferLaneContext {
+            store,
+            lease_store,
+            connection,
+            mission: &mut mission,
+            event_verifier: &mut event_verifier,
+            lane: to_initiator_lane,
+            remote_emission,
+            exchanges: &mut custody_exchanges,
+            receipt: &mut receipt,
+        },
+        &to_initiator.difference,
+    )
+    .await?;
+    sync_mutable_classes(
+        store,
+        connection,
+        &mut mission,
+        &mut event_verifier,
+        &event_guard,
+        mutable_interests,
         &mut receipt,
     )
     .await?;
-    for class in [MutableClass::State, MutableClass::Record] {
-        sync_mutable_class(
-            store,
-            connection,
-            &mut mission,
-            &mut event_verifier,
-            MutableClassContact {
-                guard: &event_guard,
-                interests: mutable_interests,
-                class,
-            },
-            &mut receipt,
-        )
-        .await?;
-    }
     event_guard.check(store)?;
     let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
-    connection.close();
-    Ok(CompletedPeerContact {
-        receipt,
-        event_policy,
-    })
+    let completed = complete_peer_contact(connection, receipt, event_policy);
+    connection.finish_as_initiator().await?;
+    Ok(completed)
 }
 
+#[cfg(test)]
 async fn serve_connection(
     store: Arc<Store>,
     connection: aster_iroh::Connection,
@@ -5639,16 +14036,84 @@ async fn serve_connection(
     policy_lock: Arc<RwLock<()>>,
     mutable_interests: MutableSourceInterests,
 ) -> Result<CompletedPeerContact, NodeError> {
+    let StartupEventVerification {
+        verifier: mut cache_verifier,
+        mut historical_verifier,
+        cache: event_route_cache,
+        policy: cache_policy,
+    } = open_startup_event_verifier_and_cache(&store, &credentials)?;
+    migrate_legacy_event_operation_witnesses(
+        &store,
+        &cache_policy,
+        &mut cache_verifier,
+        &mut historical_verifier,
+    )?;
+    drop(historical_verifier);
+    drop(cache_verifier);
+    let custody_clock = NodeCustodyClock::open(credentials.identity())?;
+    serve_connection_with_forwarding(InboundContact {
+        store,
+        connection,
+        mission: credentials,
+        peer,
+        policy_lock,
+        emission_policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+        custody_clock,
+        event_route_cache,
+        mutable_interests,
+    })
+    .await
+}
+
+struct InboundContact {
+    store: Arc<Store>,
+    connection: aster_iroh::Connection,
+    mission: UnprotectedReferenceMission,
+    peer: MissionPeerBinding,
+    policy_lock: Arc<RwLock<()>>,
+    emission_policy: Arc<LiveEmissionPolicy>,
+    custody_clock: NodeCustodyClock,
+    event_route_cache: Arc<AuthenticatedEventRouteCache>,
+    mutable_interests: MutableSourceInterests,
+}
+
+async fn serve_connection_with_forwarding(
+    contact: InboundContact,
+) -> Result<CompletedPeerContact, NodeError> {
+    let InboundContact {
+        store,
+        connection,
+        mission: credentials,
+        peer,
+        policy_lock,
+        emission_policy,
+        custody_clock,
+        event_route_cache,
+        mutable_interests,
+    } = contact;
+    let emission_snapshot = emission_policy.snapshot()?;
+    drive_custody_maintenance(&store, &custody_clock, &[])?;
+    let guard = ContactEmissionGuard {
+        live: emission_policy,
+        captured: emission_snapshot,
+        custody_clock,
+    };
     let close = connection.clone();
     match timeout(
         CONTACT_DEADLINE,
-        serve_session(
-            store,
-            connection,
-            credentials,
-            peer,
-            policy_lock,
-            mutable_interests,
+        CONTACT_EVENT_ROUTE_CACHE.scope(
+            event_route_cache,
+            CONTACT_EMISSION_GUARD.scope(
+                guard,
+                serve_session(
+                    store,
+                    connection,
+                    credentials,
+                    peer,
+                    policy_lock,
+                    mutable_interests,
+                ),
+            ),
         ),
     )
     .await
@@ -5676,9 +14141,20 @@ async fn serve_control_lane(
 ) -> Result<(), NodeError> {
     let local = verifier.identity();
     let peer = mission.peer().mission_id();
+    let emission = contact_policy_or_normal()?;
+    let semantic_v3 = mission.semantic_version() >= MIN_CUSTODY_SEMANTIC_VERSION;
+    if matches!(emission.policy, EventEmissionPolicy::ReceiveOnly) && !semantic_v3 {
+        return Err(NodeError::Protocol(
+            "receive-only contacts require authenticated semantic protocol v3".into(),
+        ));
+    }
     let mut verifier_head = store.control_head()?;
     ensure_control_lane_state(store, local, peer, verifier_head)?;
-    let inventory = store.control_inventory()?.reconciliation_snapshot();
+    let inventory = if matches!(emission.policy, EventEmissionPolicy::ReceiveOnly) {
+        InventorySnapshot::default()
+    } else {
+        store.control_inventory()?.reconciliation_snapshot()
+    };
     let limits = ReconciliationLimits::default();
     let mut responder = Responder::new(&inventory, limits)?;
 
@@ -5689,13 +14165,22 @@ async fn serve_control_lane(
             connection,
             mission,
             wire_budget,
-            |frame, _request_wire_len| {
+            |frame, _request_wire_len, _mission| {
                 ensure_control_lane_state(store, local, peer, verifier_head)?;
                 match frame {
-                    Frame::ControlInventoryQuery(query) => Ok((
-                        Frame::ControlInventoryReply(responder.reconcile_query(&query)?),
-                        false,
-                    )),
+                    Frame::ControlInventoryQuery(query) => {
+                        let bytes = responder.reconcile_query(&query)?;
+                        let reply = if semantic_v3 {
+                            Frame::ControlInventoryReplyV3 {
+                                bytes,
+                                policy: frame_emission_policy(emission.policy),
+                                policy_revision: emission.revision,
+                            }
+                        } else {
+                            Frame::ControlInventoryReply(bytes)
+                        };
+                        Ok((reply, false))
+                    }
                     Frame::ControlInventoryComplete if responder.rounds() > 0 => {
                         Ok((Frame::ControlInventoryCompleteAck, true))
                     }
@@ -5712,6 +14197,75 @@ async fn serve_control_lane(
         account(receipt, request_bytes, response_bytes)?;
         if complete {
             break;
+        }
+    }
+
+    if matches!(emission.policy, EventEmissionPolicy::ReceiveOnly) {
+        receipt.rounds = receipt
+            .rounds
+            .checked_add(responder.rounds())
+            .ok_or_else(|| NodeError::Protocol("combined round count overflow".into()))?;
+        let mut blind_offers = 0usize;
+        loop {
+            let wire_budget = exchange_wire_budget(receipt)?;
+            let (complete, request_bytes, response_bytes) = respond_mission_frame(
+                connection,
+                mission,
+                wire_budget,
+                |frame, request_wire_len, _mission| match frame {
+                    Frame::ControlOffer { id, bytes } if blind_offers < MAX_CONTACT_ITEMS => {
+                        if bytes.len() > MAX_OBJECT_BYTES {
+                            return Err(NodeError::Protocol(format!(
+                                "offered control exceeds {MAX_OBJECT_BYTES} bytes"
+                            )));
+                        }
+                        check_account(receipt, request_wire_len, 4_096)?;
+                        require_contact_policy_current()?;
+                        let accepted = accept_received_control(store, verifier, peer, id, &bytes)?;
+                        blind_offers += 1;
+                        if let Some(head) = accepted.activated_head {
+                            verifier_head = Some(head);
+                        }
+                        receipt.controls_fetched += 1;
+                        receipt.controls_activated = receipt
+                            .controls_activated
+                            .checked_add(accepted.activated)
+                            .ok_or_else(|| {
+                                NodeError::Protocol("control activation count overflow".into())
+                            })?;
+                        if accepted.retained {
+                            receipt.controls_retained += 1;
+                        } else {
+                            receipt.control_duplicates += 1;
+                        }
+                        ensure_control_lane_state(store, local, peer, verifier_head)?;
+                        Ok((
+                            Frame::ControlApplyResult {
+                                id,
+                                retained: accepted.retained,
+                            },
+                            false,
+                        ))
+                    }
+                    Frame::ControlOffer { .. } => Err(NodeError::Protocol(format!(
+                        "receive-only control offer count exceeds {MAX_CONTACT_ITEMS}"
+                    ))),
+                    Frame::ControlFinish => Ok((Frame::ControlFinished, true)),
+                    Frame::ControlFetch(_) | Frame::ControlObject { .. } => {
+                        Err(NodeError::Protocol(
+                            "receive-only responder never serves control objects".into(),
+                        ))
+                    }
+                    _ => Err(NodeError::Protocol(
+                        "receive-only control phase accepts only blind offers and finish".into(),
+                    )),
+                },
+            )
+            .await?;
+            account(receipt, request_bytes, response_bytes)?;
+            if complete {
+                return Ok(());
+            }
         }
     }
 
@@ -5761,7 +14315,7 @@ async fn serve_control_lane(
             connection,
             mission,
             wire_budget,
-            |frame, request_wire_len| {
+            |frame, request_wire_len, _mission| {
                 ensure_control_lane_state(store, local, peer, verifier_head)?;
                 match frame {
                     Frame::ControlFetch(id) => {
@@ -5838,19 +14392,60 @@ async fn serve_event_interests(
     mission: &mut MissionSession,
     event_guard: &EventLaneGuard,
     receipt: &mut PeerReceipt,
-) -> Result<(EventInterest, EventInterest), NodeError> {
+) -> Result<
+    (
+        EventInterestSnapshot,
+        EventInterestSnapshot,
+        EmissionPolicySnapshot,
+    ),
+    NodeError,
+> {
     event_guard.check(store)?;
-    let local_interest = event_guard.interest()?;
+    let emission = contact_policy_or_normal()?;
+    let semantic_v3 = mission.semantic_version() >= MIN_CUSTODY_SEMANTIC_VERSION;
+    let local_interest = EventInterestSnapshot::protected(
+        event_guard.interest()?,
+        event_guard.replication_policy().selector_revision(),
+    )?;
     let mut peer_interest = None;
+    let mut peer_emission = None;
     let wire_budget = exchange_wire_budget(receipt)?;
     let (complete, request_bytes, response_bytes) = respond_mission_frame(
         connection,
         mission,
         wire_budget,
-        |frame, _request_wire_len| match frame {
-            Frame::EventInterest(interest) => {
-                peer_interest = Some(interest);
-                Ok((Frame::EventInterestReply(local_interest.clone()), true))
+        |frame, _request_wire_len, _mission| match frame {
+            Frame::EventInterestV3 {
+                interest,
+                selector_revision,
+                policy,
+                policy_revision,
+            } if semantic_v3 => {
+                observe_remote_emission_policy(&mut peer_emission, policy, policy_revision)?;
+                peer_interest = Some(EventInterestSnapshot::protected(
+                    interest,
+                    selector_revision,
+                )?);
+                Ok((
+                    Frame::EventInterestReplyV3 {
+                        interest: local_interest.interest.clone(),
+                        selector_revision: local_interest.selector_revision.value(),
+                        policy: frame_emission_policy(emission.policy),
+                        policy_revision: emission.revision,
+                    },
+                    true,
+                ))
+            }
+            Frame::EventInterest(interest) if !semantic_v3 => {
+                peer_interest = Some(EventInterestSnapshot::legacy(interest));
+                peer_emission = Some(EmissionPolicySnapshot {
+                    policy: EventEmissionPolicy::Normal,
+                    revision: 0,
+                });
+                Ok((
+                    Frame::EventInterestReply(local_interest.interest.clone()),
+                    true,
+                ))
             }
             _ => Err(NodeError::Protocol(
                 "Event inventory preceded the protected interest request".into(),
@@ -5870,6 +14465,9 @@ async fn serve_event_interests(
         peer_interest.ok_or_else(|| {
             NodeError::Protocol("protected Event interest request disappeared".into())
         })?,
+        peer_emission.ok_or_else(|| {
+            NodeError::Protocol("protected peer emission snapshot disappeared".into())
+        })?,
     ))
 }
 
@@ -5880,31 +14478,45 @@ async fn serve_event_reconciliation_lane(
     event_verifier: &mut ReferenceEnvelopeSealer,
     lane: DirectedEventLane<'_>,
     receipt: &mut PeerReceipt,
-) -> Result<EventDifference, NodeError> {
+) -> Result<EventReconciliationOutcome, NodeError> {
     let DirectedEventLane {
         guard: event_guard,
         receiver_interest,
+        receiver_selector_revision: _,
         direction,
     } = lane;
     event_guard.check(store)?;
-    let inventory = match direction {
-        EventDirection::ToSessionResponder => transfer_inventory_for_receiver(
-            store,
-            event_guard.replication_policy(),
-            event_verifier,
-            receiver_interest,
-        )?,
-        EventDirection::ToSessionInitiator => transfer_inventory_for_peer(
-            store,
-            event_guard.policy(),
-            event_verifier,
-            mission.peer().mission_id(),
-            mission.peer_route_grant_commitments(),
-            receiver_interest,
-        )?,
+    let emission = contact_policy_or_normal()?;
+    let semantic_v3 = mission.semantic_version() >= MIN_CUSTODY_SEMANTIC_VERSION;
+    let post_event_semantic = (supports_mutable_semantic(mission.semantic_version())
+        && !matches!(emission.policy, EventEmissionPolicy::ReceiveOnly))
+    .then_some(mission.semantic_version());
+    let allow_finite_ttl = semantic_v3 && contact_supports_finite_ttl();
+    let inventory = if matches!(emission.policy, EventEmissionPolicy::ReceiveOnly) {
+        InventorySnapshot::default()
+    } else {
+        match direction {
+            EventDirection::ToSessionResponder => transfer_inventory_for_receiver(
+                store,
+                event_guard.replication_policy(),
+                event_verifier,
+                receiver_interest,
+                allow_finite_ttl,
+            )?,
+            EventDirection::ToSessionInitiator => transfer_inventory_for_peer(
+                store,
+                event_guard.policy(),
+                event_verifier,
+                mission.peer().mission_id(),
+                mission.peer_route_grant_commitments(),
+                receiver_interest,
+                allow_finite_ttl,
+            )?,
+        }
     };
-    let limits = ReconciliationLimits::default();
+    let limits = selected_reconciliation_limits()?;
     let mut responder = Responder::new(&inventory, limits)?;
+    let mut deferred = false;
     loop {
         event_guard.check(store)?;
         let wire_budget = exchange_wire_budget(receipt)?;
@@ -5912,7 +14524,7 @@ async fn serve_event_reconciliation_lane(
             connection,
             mission,
             wire_budget,
-            |frame, _request_wire_len| match frame {
+            |frame, _request_wire_len, _mission| match frame {
                 Frame::InventoryQuery {
                     direction: request_direction,
                     bytes: query,
@@ -5937,6 +14549,13 @@ async fn serve_event_reconciliation_lane(
                 } if request_direction == direction => Err(NodeError::Protocol(
                     "inventory completion preceded directional reconciliation".into(),
                 )),
+                Frame::EventLaneDeferred {
+                    direction: request_direction,
+                } if semantic_v3 && request_direction == direction => {
+                    event_guard.check(store)?;
+                    deferred = true;
+                    Ok((Frame::EventLaneDeferredAck { direction }, true))
+                }
                 _ => Err(NodeError::Protocol(
                     "inventory reconciliation crossed Event lanes or phases".into(),
                 )),
@@ -5949,10 +14568,47 @@ async fn serve_event_reconciliation_lane(
         }
     }
 
+    if deferred {
+        receipt.rounds = receipt
+            .rounds
+            .checked_add(responder.rounds())
+            .ok_or_else(|| NodeError::Protocol("combined round count overflow".into()))?;
+        record_event_lane_deferred(receipt)?;
+        return Ok(EventReconciliationOutcome::Deferred);
+    }
+
+    if matches!(emission.policy, EventEmissionPolicy::ReceiveOnly) {
+        receipt.rounds = receipt
+            .rounds
+            .checked_add(responder.rounds())
+            .ok_or_else(|| NodeError::Protocol("combined round count overflow".into()))?;
+        return Ok(EventReconciliationOutcome::Complete(
+            CompletedEventReconciliation::new(
+                EventDifference {
+                    local_only: Vec::new(),
+                    remote_only: Vec::new(),
+                },
+                &inventory,
+                false,
+            ),
+        ));
+    }
+
     let mut reverse = Initiator::new(&inventory, limits)?;
     let mut query = reverse.initiate()?;
     let difference = loop {
         event_guard.check(store)?;
+        if semantic_v3
+            && !reconciliation_exchange_preserves_defer(
+                receipt,
+                reconciliation_query_plaintext_bytes(query.len())?,
+                reconciliation_query_plaintext_bytes(limits.frame_size())?,
+                post_event_semantic,
+            )?
+        {
+            defer_event_lane(connection, mission, direction, receipt).await?;
+            return Ok(EventReconciliationOutcome::Deferred);
+        }
         let response = request_mission_frame(
             connection,
             mission,
@@ -5985,6 +14641,17 @@ async fn serve_event_reconciliation_lane(
         }
     };
     event_guard.check(store)?;
+    if semantic_v3
+        && !reconciliation_exchange_preserves_defer(
+            receipt,
+            DIRECTION_ONLY_PLAINTEXT_BYTES,
+            DIRECTION_ONLY_PLAINTEXT_BYTES,
+            post_event_semantic,
+        )?
+    {
+        defer_event_lane(connection, mission, direction, receipt).await?;
+        return Ok(EventReconciliationOutcome::Deferred);
+    }
     if request_mission_frame(
         connection,
         mission,
@@ -6003,26 +14670,246 @@ async fn serve_event_reconciliation_lane(
         .checked_add(responder.rounds())
         .and_then(|rounds| rounds.checked_add(reverse.rounds()))
         .ok_or_else(|| NodeError::Protocol("combined round count overflow".into()))?;
-    Ok(difference)
+    Ok(EventReconciliationOutcome::Complete(
+        CompletedEventReconciliation::new(
+            difference,
+            &inventory,
+            direction == EventDirection::ToSessionInitiator,
+        ),
+    ))
 }
 
 async fn serve_event_transfer_lane(
-    store: &Store,
-    connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
-    event_verifier: &mut ReferenceEnvelopeSealer,
-    lane: DirectedEventLane<'_>,
+    context: EventTransferLaneContext<'_, '_>,
     difference: &EventDifference,
-    receipt: &mut PeerReceipt,
 ) -> Result<(), NodeError> {
+    let EventTransferLaneContext {
+        store,
+        lease_store,
+        connection,
+        mission,
+        event_verifier,
+        lane,
+        remote_emission,
+        exchanges,
+        receipt,
+    } = context;
     let DirectedEventLane {
         guard: event_guard,
         receiver_interest,
+        receiver_selector_revision,
         direction,
     } = lane;
-    let capacity = event_transfer_capacity(receipt)?;
-    let mut authorization = TransferAuthorization::for_peer(difference, direction, capacity);
-    add_unscheduled_events(receipt, authorization.remaining)?;
+    let emission = contact_policy_or_normal()?;
+    let semantic_v3 = mission.semantic_version() >= MIN_CUSTODY_SEMANTIC_VERSION;
+    let post_event_semantic = (supports_mutable_semantic(mission.semantic_version())
+        && !matches!(emission.policy, EventEmissionPolicy::ReceiveOnly))
+    .then_some(mission.semantic_version());
+    let capacity = event_transfer_capacity(receipt, post_event_semantic)?;
+    if matches!(emission.policy, EventEmissionPolicy::ReceiveOnly) {
+        if direction != EventDirection::ToSessionResponder {
+            return Err(NodeError::Protocol(
+                "receive-only responder has no outbound Event lane".into(),
+            ));
+        }
+        // Receive-only reconciliation deliberately presents an empty local
+        // universe and never initiates the reverse query needed for the
+        // responder to learn the peer's exact difference. Authorize the
+        // initiator's source-push phase as bounded, unique blind offers; each
+        // source is still independently authenticated and rechecked against
+        // the protected interest, route grant, custody wrapper, and store
+        // policy before admission.
+        let mut blind_offers = BTreeSet::new();
+        let authenticated_peer = mission.peer().mission_id();
+        let peer_route_commitments = mission.peer_route_grant_commitments().to_vec();
+        loop {
+            event_guard.check(store)?;
+            let wire_budget = exchange_wire_budget(receipt)?;
+            let (complete, request_bytes, response_bytes) = respond_mission_frame(
+                connection,
+                mission,
+                wire_budget,
+                |frame, request_wire_len, mission| match frame {
+                    Frame::OfferV3 {
+                        direction: request_direction,
+                        id,
+                        exchange_id,
+                        custody,
+                        bytes,
+                    } if request_direction == direction
+                        && blind_offers.len() < capacity
+                        && blind_offers.insert(id) =>
+                    {
+                        if bytes.len() > MAX_OBJECT_BYTES {
+                            return Err(NodeError::Protocol(format!(
+                                "offered object exceeds {MAX_OBJECT_BYTES} bytes"
+                            )));
+                        }
+                        check_account(receipt, request_wire_len, 4_096)?;
+                        event_guard.check(store)?;
+                        require_contact_policy_current()?;
+                        let apply = accept_received_transfer(
+                            store,
+                            event_verifier,
+                            EventReceiveAuthority {
+                                peer: authenticated_peer,
+                                peer_route_commitments: &peer_route_commitments,
+                                receiver_interest,
+                                local_replication_policy: event_guard.replication_policy(),
+                            },
+                            id,
+                            &bytes,
+                            Some(ReceivedCustody {
+                                mission,
+                                exchange_id,
+                                expected_policy_revision: remote_emission.revision,
+                                wrapper: &custody,
+                            }),
+                        )?;
+                        if apply.inserted {
+                            receipt.inserted += 1;
+                        } else {
+                            receipt.duplicates += 1;
+                        }
+                        receipt.fetched += 1;
+                        event_guard.check(store)?;
+                        Ok((
+                            Frame::ApplyResultV3 {
+                                direction,
+                                id,
+                                exchange_id,
+                                inserted: apply.inserted,
+                                disposition: apply.disposition,
+                            },
+                            false,
+                        ))
+                    }
+                    Frame::OfferV3 { .. } => Err(NodeError::Protocol(
+                        "receive-only v3 Event offer crossed lanes or exceeded its bound".into(),
+                    )),
+                    Frame::FinishV3 {
+                        direction: request_direction,
+                        remaining,
+                    } if request_direction == direction => {
+                        let remaining = usize::try_from(remaining).map_err(|_| {
+                            NodeError::Protocol(
+                                "receive-only v3 remaining count exceeds usize".into(),
+                            )
+                        })?;
+                        let disclosed_total =
+                            blind_offers.len().checked_add(remaining).ok_or_else(|| {
+                                NodeError::Protocol(
+                                    "receive-only v3 lane cardinality overflows".into(),
+                                )
+                            })?;
+                        if disclosed_total > MAX_CARDINALITY_LIMIT {
+                            return Err(NodeError::Protocol(
+                                "receive-only v3 lane exceeds the selected cardinality bound"
+                                    .into(),
+                            ));
+                        }
+                        add_unscheduled_events(receipt, remaining)?;
+                        Ok((
+                            Frame::FinishedV3 {
+                                direction,
+                                remaining: event_lane_remaining_wire(remaining)?,
+                            },
+                            true,
+                        ))
+                    }
+                    Frame::Offer { .. } | Frame::Fetch { .. } | Frame::Object { .. } => {
+                        Err(NodeError::Protocol(
+                            "receive-only responder never serves Event objects".into(),
+                        ))
+                    }
+                    _ => Err(NodeError::Protocol(
+                        "receive-only Event phase accepts only blind offers and finish".into(),
+                    )),
+                },
+            )
+            .await?;
+            account(receipt, request_bytes, response_bytes)?;
+            if complete {
+                return Ok(());
+            }
+        }
+    }
+    if semantic_v3 && direction == EventDirection::ToSessionInitiator {
+        let lane_remaining_before = receipt.remaining;
+        let authenticated_peer = mission.peer().mission_id();
+        let peer_route_commitments = mission.peer_route_grant_commitments().to_vec();
+        let ordered = ordered_due_custody_transfers(
+            store,
+            authenticated_peer,
+            &difference.local_only,
+            capacity,
+            receipt,
+            CustodyReconciliationEvidence::AuthenticatedPeerMissing(receiver_selector_revision),
+            CustodyScheduleReserve {
+                future_defer: false,
+                post_event_semantic,
+            },
+        )?;
+        add_unscheduled_events(receipt, difference.local_only.len() - ordered.len())?;
+        for scheduled in ordered {
+            event_guard.check(store)?;
+            #[cfg(test)]
+            apply_test_expiry_before_scheduled_load(scheduled.transfer_id)?;
+            let loaded = load_scheduled_transfer_for_peer_with_claims(
+                store,
+                event_verifier,
+                scheduled,
+                authenticated_peer,
+                &peer_route_commitments,
+                receiver_interest,
+            );
+            let (verified, bytes, _state) = match loaded {
+                Ok(transfer) => transfer,
+                Err(NodeError::CustodySendSkipped) => {
+                    add_unscheduled_events(receipt, 1)?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let outcome = send_v3_offer(
+                V3OfferIo {
+                    store: lease_store.clone(),
+                    connection,
+                    mission,
+                    event_guard,
+                    exchanges,
+                    receipt,
+                },
+                V3OfferSource {
+                    peer: authenticated_peer,
+                    direction,
+                    scheduled,
+                    verified: &verified,
+                    bytes,
+                },
+            )
+            .await?;
+            let V3OfferOutcome::Applied(inserted) = outcome else {
+                add_unscheduled_events(receipt, 1)?;
+                continue;
+            };
+            receipt.offered += 1;
+            if !inserted {
+                receipt.duplicates += 1;
+            }
+        }
+        event_guard.check(store)?;
+        finish_v3_event_lane(
+            connection,
+            mission,
+            direction,
+            event_lane_remaining_since(receipt, lane_remaining_before)?,
+            receipt,
+        )
+        .await?;
+        return Ok(());
+    }
+    let mut authorization = TransferAuthorization::for_peer(difference, direction, capacity)?;
     let authenticated_peer = mission.peer().mission_id();
     let peer_route_commitments = mission.peer_route_grant_commitments().to_vec();
     loop {
@@ -6032,20 +14919,19 @@ async fn serve_event_transfer_lane(
             connection,
             mission,
             wire_budget,
-            |frame, request_wire_len| match frame {
-                Frame::Offer {
+            |frame, request_wire_len, mission| match frame {
+                Frame::OfferV3 {
                     direction: request_direction,
                     id,
+                    exchange_id,
+                    custody,
                     bytes,
-                } if direction == EventDirection::ToSessionResponder
+                } if semantic_v3
+                    && direction == EventDirection::ToSessionResponder
                     && request_direction == direction =>
                 {
                     event_guard.check(store)?;
-                    authorize_transfer_item(
-                        authorization.offers_from_peer.remove(&id),
-                        receipt,
-                        "offer",
-                    )?;
+                    authorize_transfer_item(authorization.authorize(id), receipt, "v3 offer")?;
                     if bytes.len() > MAX_OBJECT_BYTES {
                         return Err(NodeError::Protocol(format!(
                             "offered object exceeds {MAX_OBJECT_BYTES} bytes"
@@ -6053,7 +14939,7 @@ async fn serve_event_transfer_lane(
                     }
                     check_account(receipt, request_wire_len, 4_096)?;
                     event_guard.check(store)?;
-                    let inserted = accept_received_transfer(
+                    let apply = accept_received_transfer(
                         store,
                         event_verifier,
                         EventReceiveAuthority {
@@ -6064,8 +14950,62 @@ async fn serve_event_transfer_lane(
                         },
                         id,
                         &bytes,
+                        Some(ReceivedCustody {
+                            mission,
+                            exchange_id,
+                            expected_policy_revision: remote_emission.revision,
+                            wrapper: &custody,
+                        }),
                     )?;
-                    if inserted {
+                    if apply.inserted {
+                        receipt.inserted += 1;
+                    } else {
+                        receipt.duplicates += 1;
+                    }
+                    receipt.fetched += 1;
+                    event_guard.check(store)?;
+                    Ok((
+                        Frame::ApplyResultV3 {
+                            direction,
+                            id,
+                            exchange_id,
+                            inserted: apply.inserted,
+                            disposition: apply.disposition,
+                        },
+                        false,
+                    ))
+                }
+                Frame::Offer {
+                    direction: request_direction,
+                    id,
+                    bytes,
+                } if !semantic_v3
+                    && direction == EventDirection::ToSessionResponder
+                    && request_direction == direction =>
+                {
+                    event_guard.check(store)?;
+                    authorize_transfer_item(authorization.authorize(id), receipt, "offer")?;
+                    if bytes.len() > MAX_OBJECT_BYTES {
+                        return Err(NodeError::Protocol(format!(
+                            "offered object exceeds {MAX_OBJECT_BYTES} bytes"
+                        )));
+                    }
+                    check_account(receipt, request_wire_len, 4_096)?;
+                    event_guard.check(store)?;
+                    let apply = accept_received_transfer(
+                        store,
+                        event_verifier,
+                        EventReceiveAuthority {
+                            peer: authenticated_peer,
+                            peer_route_commitments: &peer_route_commitments,
+                            receiver_interest,
+                            local_replication_policy: event_guard.replication_policy(),
+                        },
+                        id,
+                        &bytes,
+                        None,
+                    )?;
+                    if apply.inserted {
                         receipt.inserted += 1;
                     } else {
                         receipt.duplicates += 1;
@@ -6076,7 +15016,7 @@ async fn serve_event_transfer_lane(
                         Frame::ApplyResult {
                             direction,
                             id,
-                            inserted,
+                            inserted: apply.inserted,
                         },
                         false,
                     ))
@@ -6084,16 +15024,13 @@ async fn serve_event_transfer_lane(
                 Frame::Fetch {
                     direction: request_direction,
                     id,
-                } if direction == EventDirection::ToSessionInitiator
+                } if !semantic_v3
+                    && direction == EventDirection::ToSessionInitiator
                     && request_direction == direction =>
                 {
                     event_guard.check(store)?;
-                    authorize_transfer_item(
-                        authorization.fetches_by_peer.remove(&id),
-                        receipt,
-                        "fetch",
-                    )?;
-                    let bytes = load_verified_transfer_for_peer(
+                    authorize_transfer_item(authorization.authorize(id), receipt, "fetch")?;
+                    let (verified, bytes, _) = load_verified_transfer_for_peer_with_claims(
                         store,
                         event_guard.policy(),
                         event_verifier,
@@ -6102,6 +15039,11 @@ async fn serve_event_transfer_lane(
                         &peer_route_commitments,
                         receiver_interest,
                     )?;
+                    if verified.ttl_ms().is_some() && !verified.tombstone() {
+                        return Err(NodeError::Protocol(
+                            "finite-TTL Event cannot be sent on semantic protocol v1/v2".into(),
+                        ));
+                    }
                     receipt.offered += 1;
                     Ok((
                         Frame::Object {
@@ -6112,17 +15054,41 @@ async fn serve_event_transfer_lane(
                         false,
                     ))
                 }
-                Frame::Finish {
+                Frame::FinishV3 {
                     direction: request_direction,
-                } if request_direction == direction && authorization.is_consumed() => {
+                    remaining,
+                } if semantic_v3 && request_direction == direction => {
                     event_guard.check(store)?;
-                    Ok((Frame::Finished { direction }, true))
+                    let expected = event_lane_remaining_wire(authorization.finish_remaining())?;
+                    if remaining != expected {
+                        return Err(NodeError::Protocol(
+                            "v3 Event finish remaining count differs from the authenticated difference"
+                                .into(),
+                        ));
+                    }
+                    add_unscheduled_events(
+                        receipt,
+                        usize::try_from(remaining).map_err(|_| {
+                            NodeError::Protocol(
+                                "v3 Event finish remaining count exceeds usize".into(),
+                            )
+                        })?,
+                    )?;
+                    Ok((
+                        Frame::FinishedV3 {
+                            direction,
+                            remaining,
+                        },
+                        true,
+                    ))
                 }
                 Frame::Finish {
                     direction: request_direction,
-                } if request_direction == direction => Err(NodeError::Protocol(
-                    "finish preceded consumption of the directional transfer plan".into(),
-                )),
+                } if !semantic_v3 && request_direction == direction => {
+                    event_guard.check(store)?;
+                    add_unscheduled_events(receipt, authorization.finish_remaining())?;
+                    Ok((Frame::Finished { direction }, true))
+                }
                 _ => Err(NodeError::Protocol(
                     "transfer crossed Event lanes or used an unauthorized phase operation".into(),
                 )),
@@ -6137,40 +15103,42 @@ async fn serve_event_transfer_lane(
 }
 
 #[derive(Debug)]
-struct MutableTransferAuthorization {
-    offers_from_peer: BTreeSet<MutableTransferId>,
-    fetches_by_peer: BTreeSet<MutableTransferId>,
+struct MutableTransferAuthorization<'a> {
+    allowed: &'a [MutableTransferId],
+    attempted: BTreeSet<MutableTransferId>,
+    quota: usize,
     remaining: usize,
 }
 
-impl MutableTransferAuthorization {
+impl<'a> MutableTransferAuthorization<'a> {
     fn for_peer(
-        difference: &MutableDifference,
+        difference: &'a MutableDifference,
+        class: MutableClass,
         direction: EventDirection,
         capacity: usize,
-    ) -> Self {
-        match direction {
-            EventDirection::ToSessionResponder => {
-                let limit = difference.remote_only.len().min(capacity);
-                Self {
-                    offers_from_peer: difference.remote_only.iter().take(limit).copied().collect(),
-                    fetches_by_peer: BTreeSet::new(),
-                    remaining: difference.remote_only.len() - limit,
-                }
-            }
-            EventDirection::ToSessionInitiator => {
-                let limit = difference.local_only.len().min(capacity);
-                Self {
-                    offers_from_peer: BTreeSet::new(),
-                    fetches_by_peer: difference.local_only.iter().take(limit).copied().collect(),
-                    remaining: difference.local_only.len() - limit,
-                }
-            }
-        }
+    ) -> Result<Self, NodeError> {
+        difference.validate(class)?;
+        let allowed = match direction {
+            EventDirection::ToSessionResponder => difference.remote_only.as_slice(),
+            EventDirection::ToSessionInitiator => difference.local_only.as_slice(),
+        };
+        let quota = allowed.len().min(capacity);
+        Ok(Self {
+            allowed,
+            attempted: BTreeSet::new(),
+            quota,
+            remaining: allowed.len() - quota,
+        })
+    }
+
+    fn authorize(&mut self, id: MutableTransferId) -> bool {
+        self.attempted.len() < self.quota
+            && self.allowed.binary_search(&id).is_ok()
+            && self.attempted.insert(id)
     }
 
     fn is_consumed(&self) -> bool {
-        self.offers_from_peer.is_empty() && self.fetches_by_peer.is_empty()
+        self.attempted.len() == self.quota
     }
 }
 
@@ -6183,8 +15151,11 @@ async fn serve_mutable_interests(
 ) -> Result<EventInterest, NodeError> {
     let wire_budget = exchange_wire_budget(receipt)?;
     let mut peer_interest = None;
-    let (_, request_bytes, response_bytes) =
-        respond_mission_frame(connection, mission, wire_budget, |frame, _| match frame {
+    let (_, request_bytes, response_bytes) = respond_mission_frame(
+        connection,
+        mission,
+        wire_budget,
+        |frame, _, _mission| match frame {
             Frame::MutableInterest {
                 class: request_class,
                 interest,
@@ -6201,12 +15172,40 @@ async fn serve_mutable_interests(
             _ => Err(NodeError::Protocol(
                 "mutable reconciliation preceded its class interest exchange".into(),
             )),
-        })
-        .await?;
+        },
+    )
+    .await?;
     account(receipt, request_bytes, response_bytes)?;
     peer_interest.ok_or_else(|| {
         NodeError::Protocol("mutable source-object interest request disappeared".into())
     })
+}
+
+async fn serve_blob_interests(
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    local_interest: &BlobInterest,
+    receipt: &mut PeerReceipt,
+) -> Result<BlobInterest, NodeError> {
+    let wire_budget = exchange_wire_budget(receipt)?;
+    let mut peer_interest = None;
+    let (_, request_bytes, response_bytes) = respond_mission_frame(
+        connection,
+        mission,
+        wire_budget,
+        |frame, _, _mission| match frame {
+            Frame::BlobInterest(interest) => {
+                peer_interest = Some(interest);
+                Ok((Frame::BlobInterestReply(local_interest.clone()), true))
+            }
+            _ => Err(NodeError::Protocol(
+                "Blob reconciliation preceded its protected interest exchange".into(),
+            )),
+        },
+    )
+    .await?;
+    account(receipt, request_bytes, response_bytes)?;
+    peer_interest.ok_or_else(|| NodeError::Protocol("Blob interest request disappeared".into()))
 }
 
 async fn serve_mutable_reconciliation_lane(
@@ -6216,28 +15215,23 @@ async fn serve_mutable_reconciliation_lane(
     verifier: &mut ReferenceEnvelopeSealer,
     lane: DirectedMutableLane<'_>,
     receipt: &mut PeerReceipt,
-) -> Result<MutableDifference, NodeError> {
+) -> Result<MutableReconciliationOutcome, NodeError> {
     let DirectedMutableLane {
         guard,
+        source_snapshot,
         receiver_interest,
+        semantic_version,
         class,
         direction,
     } = lane;
     guard.check(store)?;
     let inventory = match direction {
-        EventDirection::ToSessionResponder => mutable_inventory(
-            store,
-            guard.policy(),
-            verifier,
-            class,
-            receiver_interest,
-            None,
-        )?,
+        EventDirection::ToSessionResponder => {
+            mutable_inventory(source_snapshot, verifier, receiver_interest, None)?
+        }
         EventDirection::ToSessionInitiator => mutable_inventory(
-            store,
-            guard.policy(),
+            source_snapshot,
             verifier,
-            class,
             receiver_interest,
             Some((
                 mission.peer().mission_id(),
@@ -6245,13 +15239,17 @@ async fn serve_mutable_reconciliation_lane(
             )),
         )?,
     };
-    let limits = ReconciliationLimits::default();
+    let limits = selected_mutable_reconciliation_limits()?;
     let mut responder = Responder::new(&inventory, limits)?;
+    let mut deferred = false;
     loop {
         guard.check(store)?;
         let wire_budget = exchange_wire_budget(receipt)?;
-        let (complete, request_bytes, response_bytes) =
-            respond_mission_frame(connection, mission, wire_budget, |frame, _| match frame {
+        let (complete, request_bytes, response_bytes) = respond_mission_frame(
+            connection,
+            mission,
+            wire_budget,
+            |frame, _, _mission| match frame {
                 Frame::MutableInventoryQuery {
                     class: request_class,
                     direction: request_direction,
@@ -6279,20 +15277,48 @@ async fn serve_mutable_reconciliation_lane(
                 Frame::MutableInventoryComplete { .. } => Err(NodeError::Protocol(
                     "mutable inventory completion preceded reconciliation or crossed lanes".into(),
                 )),
+                frame @ Frame::MutableLaneDeferred { .. } => {
+                    let acknowledgement =
+                        acknowledge_mutable_lane_deferred(frame, class, direction)?;
+                    deferred = true;
+                    Ok((acknowledgement, true))
+                }
                 _ => Err(NodeError::Protocol(
                     "mutable inventory responder received an out-of-phase frame".into(),
                 )),
-            })
-            .await?;
+            },
+        )
+        .await?;
         account(receipt, request_bytes, response_bytes)?;
         if complete {
             break;
         }
     }
+    if deferred {
+        receipt.rounds = receipt
+            .rounds
+            .checked_add(responder.rounds())
+            .ok_or_else(|| NodeError::Protocol("combined round count overflow".into()))?;
+        record_mutable_lane_deferred(receipt)?;
+        return Ok(MutableReconciliationOutcome::Deferred);
+    }
     let mut reverse = Initiator::new(&inventory, limits)?;
     let mut query = reverse.initiate()?;
     let difference = loop {
         guard.check(store)?;
+        if !mutable_reconciliation_exchange_preserves_continuation(
+            receipt,
+            semantic_version,
+            class,
+            direction,
+            MutableReconciliationStage::ReverseQuery,
+            reverse.rounds(),
+            mutable_reconciliation_plaintext_bytes(query.len())?,
+            mutable_reconciliation_plaintext_bytes(limits.frame_size())?,
+        )? {
+            defer_mutable_lane(connection, mission, class, direction, receipt).await?;
+            return Ok(MutableReconciliationOutcome::Deferred);
+        }
         let response = request_mission_frame(
             connection,
             mission,
@@ -6327,6 +15353,19 @@ async fn serve_mutable_reconciliation_lane(
         }
     };
     guard.check(store)?;
+    if !mutable_reconciliation_exchange_preserves_continuation(
+        receipt,
+        semantic_version,
+        class,
+        direction,
+        MutableReconciliationStage::DifferenceBound,
+        reverse.rounds(),
+        MUTABLE_LANE_PLAINTEXT_BYTES,
+        MUTABLE_LANE_PLAINTEXT_BYTES,
+    )? {
+        defer_mutable_lane(connection, mission, class, direction, receipt).await?;
+        return Ok(MutableReconciliationOutcome::Deferred);
+    }
     if request_mission_frame(
         connection,
         mission,
@@ -6345,7 +15384,7 @@ async fn serve_mutable_reconciliation_lane(
         .checked_add(responder.rounds())
         .and_then(|rounds| rounds.checked_add(reverse.rounds()))
         .ok_or_else(|| NodeError::Protocol("combined round count overflow".into()))?;
-    Ok(difference)
+    Ok(MutableReconciliationOutcome::Complete(difference))
 }
 
 async fn serve_mutable_transfer_lane(
@@ -6359,13 +15398,18 @@ async fn serve_mutable_transfer_lane(
 ) -> Result<(), NodeError> {
     let DirectedMutableLane {
         guard,
+        source_snapshot,
         receiver_interest,
+        semantic_version,
         class,
         direction,
     } = lane;
-    let capacity = event_transfer_capacity(receipt)?;
-    let mut authorization = MutableTransferAuthorization::for_peer(difference, direction, capacity);
-    add_unscheduled_events(receipt, authorization.remaining)?;
+    let capacity = mutable_transfer_capacity(receipt, semantic_version, class, direction)?;
+    let mut authorization =
+        MutableTransferAuthorization::for_peer(difference, class, direction, capacity)?;
+    let base_remaining = authorization.remaining;
+    let mut deferred_offers = 0usize;
+    let mut fetch_settlement = MutableFetchSettlement::default();
     let peer = mission.peer().mission_id();
     let commitments = mission.peer_route_grant_commitments().to_vec();
     loop {
@@ -6375,7 +15419,7 @@ async fn serve_mutable_transfer_lane(
             connection,
             mission,
             wire_budget,
-            |frame, request_wire_len| match frame {
+            |frame, request_wire_len, _mission| match frame {
                 Frame::MutableOffer {
                     direction: request_direction,
                     id,
@@ -6385,20 +15429,16 @@ async fn serve_mutable_transfer_lane(
                     && id.class() == class =>
                 {
                     guard.check(store)?;
-                    authorize_transfer_item(
-                        authorization.offers_from_peer.remove(&id),
-                        receipt,
-                        "mutable offer",
-                    )?;
+                    authorize_transfer_item(authorization.authorize(id), receipt, "mutable offer")?;
                     if bytes.len() > MAX_OBJECT_BYTES {
                         return Err(NodeError::Protocol(
                             "offered mutable object exceeds its bound".into(),
                         ));
                     }
                     check_account(receipt, request_wire_len, 4_096)?;
-                    let inserted = accept_received_mutable(
+                    let disposition = accept_received_mutable(
                         store,
-                        guard.policy(),
+                        guard,
                         verifier,
                         MutablePeerAdmission {
                             peer,
@@ -6408,17 +15448,26 @@ async fn serve_mutable_transfer_lane(
                         id,
                         &bytes,
                     )?;
-                    if inserted {
-                        receipt.inserted += 1;
-                    } else {
-                        receipt.duplicates += 1;
+                    match disposition {
+                        MutableApplyDisposition::Inserted => receipt.inserted += 1,
+                        MutableApplyDisposition::Duplicate => receipt.duplicates += 1,
+                        MutableApplyDisposition::DeferredCapacity => {
+                            if class == MutableClass::Blob {
+                                receipt.blob_deferred = receipt.blob_deferred.saturating_add(1);
+                            }
+                            deferred_offers = deferred_offers.checked_add(1).ok_or_else(|| {
+                                NodeError::Protocol(
+                                    "mutable capacity deferral count overflow".into(),
+                                )
+                            })?;
+                        }
                     }
                     receipt.fetched += 1;
                     Ok((
                         Frame::MutableApplyResult {
                             direction,
                             id,
-                            inserted,
+                            disposition,
                         },
                         false,
                     ))
@@ -6428,24 +15477,22 @@ async fn serve_mutable_transfer_lane(
                     id,
                 } if direction == EventDirection::ToSessionInitiator
                     && request_direction == direction
-                    && id.class() == class =>
+                    && id.class() == class
+                    && !fetch_settlement.is_pending() =>
                 {
                     guard.check(store)?;
-                    authorize_transfer_item(
-                        authorization.fetches_by_peer.remove(&id),
-                        receipt,
-                        "mutable fetch",
-                    )?;
+                    authorize_transfer_item(authorization.authorize(id), receipt, "mutable fetch")?;
                     let bytes = load_verified_mutable_for_peer(
                         store,
-                        guard.policy(),
                         verifier,
+                        source_snapshot,
                         id,
                         peer,
                         &commitments,
                         receiver_interest,
                     )?;
                     receipt.offered += 1;
+                    fetch_settlement.begin(id)?;
                     Ok((
                         Frame::MutableObject {
                             direction,
@@ -6455,18 +15502,51 @@ async fn serve_mutable_transfer_lane(
                         false,
                     ))
                 }
-                Frame::MutableFinish {
-                    class: request_class,
-                    direction: request_direction,
-                } if request_class == class
-                    && request_direction == direction
-                    && authorization.is_consumed() =>
+                frame @ Frame::MutableFetchResult { .. }
+                    if direction == EventDirection::ToSessionInitiator
+                        && fetch_settlement.is_pending() =>
                 {
-                    Ok((Frame::MutableFinished { class, direction }, true))
+                    guard.check(store)?;
+                    let acknowledgement =
+                        fetch_settlement.acknowledge(frame, class, direction, receipt)?;
+                    Ok((acknowledgement, false))
                 }
-                Frame::MutableFinish { .. } => Err(NodeError::Protocol(
-                    "mutable finish preceded transfer-plan consumption or crossed lanes".into(),
-                )),
+                frame @ Frame::MutableFinish { .. } => {
+                    let exact_remaining = match direction {
+                        EventDirection::ToSessionResponder => {
+                            base_remaining.checked_add(deferred_offers).ok_or_else(|| {
+                                NodeError::Protocol("mutable offer remaining count overflow".into())
+                            })?
+                        }
+                        EventDirection::ToSessionInitiator => base_remaining
+                            .checked_add(fetch_settlement.deferred_capacity())
+                            .ok_or_else(|| {
+                                NodeError::Protocol("mutable fetch remaining count overflow".into())
+                            })?,
+                    };
+                    let exact_remaining = mutable_lane_remaining_wire(exact_remaining)?;
+                    let remaining = require_mutable_finish(
+                        frame,
+                        class,
+                        direction,
+                        exact_remaining,
+                        authorization.is_consumed() && !fetch_settlement.is_pending(),
+                    )?;
+                    add_unscheduled_mutable(
+                        receipt,
+                        usize::try_from(remaining).map_err(|_| {
+                            NodeError::Protocol("mutable lane remaining count exceeds usize".into())
+                        })?,
+                    )?;
+                    Ok((
+                        Frame::MutableFinished {
+                            class,
+                            direction,
+                            remaining,
+                        },
+                        true,
+                    ))
+                }
                 _ => Err(NodeError::Protocol(
                     "mutable transfer used an unauthorized phase operation".into(),
                 )),
@@ -6487,23 +15567,42 @@ async fn serve_mutable_class(
     verifier: &mut ReferenceEnvelopeSealer,
     contact: MutableClassContact<'_>,
     receipt: &mut PeerReceipt,
-) -> Result<(), NodeError> {
+) -> Result<Option<(BlobInterest, BlobInterest)>, NodeError> {
     let MutableClassContact {
         guard,
         interests,
         class,
     } = contact;
     guard.check(store)?;
-    let local_interest = interests.for_class(class)?;
-    let peer_interest =
-        serve_mutable_interests(connection, mission, class, &local_interest, receipt).await?;
+    let (local_interest, peer_interest) = if class == MutableClass::Blob {
+        let enabled = !matches!(
+            contact_policy_or_normal()?.policy,
+            EventEmissionPolicy::ReceiveOnly
+        );
+        let local = protected_blob_interest(store, verifier, interests, enabled)?;
+        let peer = serve_blob_interests(connection, mission, &local, receipt).await?;
+        (
+            OwnedMutableReceiveInterest::Blob(local),
+            OwnedMutableReceiveInterest::Blob(peer),
+        )
+    } else {
+        let local = interests.for_class(class)?;
+        let peer = serve_mutable_interests(connection, mission, class, &local, receipt).await?;
+        (
+            OwnedMutableReceiveInterest::StateOrRecord(local),
+            OwnedMutableReceiveInterest::StateOrRecord(peer),
+        )
+    };
+    let source_snapshot = cached_mutable_sender_snapshot(store, guard.policy(), verifier, class)?;
     let to_responder = DirectedMutableLane {
         guard,
-        receiver_interest: &local_interest,
+        source_snapshot: &source_snapshot,
+        receiver_interest: local_interest.borrowed(),
+        semantic_version: mission.semantic_version(),
         class,
         direction: EventDirection::ToSessionResponder,
     };
-    let difference = serve_mutable_reconciliation_lane(
+    let outcome = serve_mutable_reconciliation_lane(
         store,
         connection,
         mission,
@@ -6512,24 +15611,28 @@ async fn serve_mutable_class(
         receipt,
     )
     .await?;
-    serve_mutable_transfer_lane(
-        store,
-        connection,
-        mission,
-        verifier,
-        to_responder,
-        &difference,
-        receipt,
-    )
-    .await?;
+    if let MutableReconciliationOutcome::Complete(difference) = outcome {
+        serve_mutable_transfer_lane(
+            store,
+            connection,
+            mission,
+            verifier,
+            to_responder,
+            &difference,
+            receipt,
+        )
+        .await?;
+    }
 
     let to_initiator = DirectedMutableLane {
         guard,
-        receiver_interest: &peer_interest,
+        source_snapshot: &source_snapshot,
+        receiver_interest: peer_interest.borrowed(),
+        semantic_version: mission.semantic_version(),
         class,
         direction: EventDirection::ToSessionInitiator,
     };
-    let difference = serve_mutable_reconciliation_lane(
+    let outcome = serve_mutable_reconciliation_lane(
         store,
         connection,
         mission,
@@ -6538,16 +15641,66 @@ async fn serve_mutable_class(
         receipt,
     )
     .await?;
-    serve_mutable_transfer_lane(
-        store,
-        connection,
-        mission,
-        verifier,
-        to_initiator,
-        &difference,
-        receipt,
-    )
-    .await
+    if let MutableReconciliationOutcome::Complete(difference) = outcome {
+        serve_mutable_transfer_lane(
+            store,
+            connection,
+            mission,
+            verifier,
+            to_initiator,
+            &difference,
+            receipt,
+        )
+        .await?;
+    }
+    Ok(match (local_interest, peer_interest) {
+        (OwnedMutableReceiveInterest::Blob(local), OwnedMutableReceiveInterest::Blob(peer)) => {
+            Some((local, peer))
+        }
+        _ => None,
+    })
+}
+
+async fn serve_mutable_classes(
+    store: &Store,
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    verifier: &mut ReferenceEnvelopeSealer,
+    guard: &EventLaneGuard,
+    interests: &MutableSourceInterests,
+    receipt: &mut PeerReceipt,
+) -> Result<(), NodeError> {
+    if mission.semantic_version() >= MIN_BLOB_NETWORK_SEMANTIC_VERSION {
+        let cache = contact_mutable_route_cache(verifier)?;
+        cleanup_ineligible_pending_blobs(store, verifier, &cache)?;
+        guard.check(store)?;
+    }
+    let mut blob_interests = None;
+    for &class in mutable_classes_for_semantic(mission.semantic_version()) {
+        let exchanged = serve_mutable_class(
+            store,
+            connection,
+            mission,
+            verifier,
+            MutableClassContact {
+                guard,
+                interests,
+                class,
+            },
+            receipt,
+        )
+        .await?;
+        if exchanged.is_some() {
+            blob_interests = exchanged;
+        }
+    }
+    if let Some((local, peer)) = blob_interests {
+        serve_blob_carrier_lane(
+            store, connection, mission, verifier, guard, &local, &peer, receipt,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 async fn serve_session(
@@ -6558,11 +15711,21 @@ async fn serve_session(
     policy_lock: Arc<RwLock<()>>,
     mutable_interests: MutableSourceInterests,
 ) -> Result<CompletedPeerContact, NodeError> {
+    let lease_store = store.clone();
+    require_contact_policy_current()?;
     // No inventory is even loaded until the independent mission handshake and
     // exact configured mission NodeId check both finish.
     let (mut mission, handshake) =
         respond_over_iroh_metered(&connection, credentials.fresh_bundle()?, peer).await?;
     let mut receipt = authenticated_receipt(&connection, &mission, handshake)?;
+    let local_emission = contact_policy_or_normal()?;
+    if matches!(local_emission.policy, EventEmissionPolicy::ReceiveOnly)
+        && mission.semantic_version() < MIN_CUSTODY_SEMANTIC_VERSION
+    {
+        return Err(NodeError::Protocol(
+            "receive-only contacts require authenticated semantic protocol v3".into(),
+        ));
+    }
 
     let policy_write = policy_lock.clone().write_owned().await;
     let mut control_verifier = open_replayed_verifier(&store, &credentials)?;
@@ -6590,7 +15753,7 @@ async fn serve_session(
         mission.peer().mission_id(),
         receipt.controls_remaining,
     )?;
-    let (local_interest, peer_interest) = serve_event_interests(
+    let (local_interest, peer_interest, remote_emission) = serve_event_interests(
         &store,
         &connection,
         &mut mission,
@@ -6598,13 +15761,15 @@ async fn serve_session(
         &mut receipt,
     )
     .await?;
+    let mut custody_exchanges = CustodyExchangeSequence::new();
 
     let to_responder_lane = DirectedEventLane {
         guard: &event_guard,
-        receiver_interest: &local_interest,
+        receiver_interest: &local_interest.interest,
+        receiver_selector_revision: local_interest.selector_revision,
         direction: EventDirection::ToSessionResponder,
     };
-    let to_responder = serve_event_reconciliation_lane(
+    let to_responder = match serve_event_reconciliation_lane(
         &store,
         &connection,
         &mut mission,
@@ -6612,24 +15777,69 @@ async fn serve_session(
         to_responder_lane,
         &mut receipt,
     )
-    .await?;
-    serve_event_transfer_lane(
+    .await?
+    {
+        EventReconciliationOutcome::Complete(reconciliation) => reconciliation,
+        EventReconciliationOutcome::Deferred => {
+            if !matches!(local_emission.policy, EventEmissionPolicy::ReceiveOnly) {
+                serve_mutable_classes(
+                    &store,
+                    &connection,
+                    &mut mission,
+                    &mut event_verifier,
+                    &event_guard,
+                    &mutable_interests,
+                    &mut receipt,
+                )
+                .await?;
+            }
+            event_guard.check(&store)?;
+            let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
+            let completed = complete_peer_contact(&connection, receipt, event_policy);
+            connection.finish_as_responder().await?;
+            return Ok(completed);
+        }
+    };
+    settle_authenticated_event_common_set(
         &store,
-        &connection,
-        &mut mission,
-        &mut event_verifier,
-        to_responder_lane,
+        &event_guard,
+        mission.peer().mission_id(),
+        mission.semantic_version() >= MIN_CUSTODY_SEMANTIC_VERSION,
+        remote_emission,
+        to_responder_lane.receiver_selector_revision,
         &to_responder,
-        &mut receipt,
+    )?;
+    serve_event_transfer_lane(
+        EventTransferLaneContext {
+            store: &store,
+            lease_store: lease_store.clone(),
+            connection: &connection,
+            mission: &mut mission,
+            event_verifier: &mut event_verifier,
+            lane: to_responder_lane,
+            remote_emission,
+            exchanges: &mut custody_exchanges,
+            receipt: &mut receipt,
+        },
+        &to_responder.difference,
     )
     .await?;
 
+    if matches!(local_emission.policy, EventEmissionPolicy::ReceiveOnly) {
+        event_guard.check(&store)?;
+        let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
+        let completed = complete_peer_contact(&connection, receipt, event_policy);
+        connection.finish_as_responder().await?;
+        return Ok(completed);
+    }
+
     let to_initiator_lane = DirectedEventLane {
         guard: &event_guard,
-        receiver_interest: &peer_interest,
+        receiver_interest: &peer_interest.interest,
+        receiver_selector_revision: peer_interest.selector_revision,
         direction: EventDirection::ToSessionInitiator,
     };
-    let to_initiator = serve_event_reconciliation_lane(
+    let to_initiator = match serve_event_reconciliation_lane(
         &store,
         &connection,
         &mut mission,
@@ -6637,39 +15847,68 @@ async fn serve_session(
         to_initiator_lane,
         &mut receipt,
     )
-    .await?;
-    serve_event_transfer_lane(
+    .await?
+    {
+        EventReconciliationOutcome::Complete(reconciliation) => reconciliation,
+        EventReconciliationOutcome::Deferred => {
+            if !matches!(local_emission.policy, EventEmissionPolicy::ReceiveOnly) {
+                serve_mutable_classes(
+                    &store,
+                    &connection,
+                    &mut mission,
+                    &mut event_verifier,
+                    &event_guard,
+                    &mutable_interests,
+                    &mut receipt,
+                )
+                .await?;
+            }
+            event_guard.check(&store)?;
+            let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
+            let completed = complete_peer_contact(&connection, receipt, event_policy);
+            connection.finish_as_responder().await?;
+            return Ok(completed);
+        }
+    };
+    settle_authenticated_event_common_set(
         &store,
-        &connection,
-        &mut mission,
-        &mut event_verifier,
-        to_initiator_lane,
+        &event_guard,
+        mission.peer().mission_id(),
+        mission.semantic_version() >= MIN_CUSTODY_SEMANTIC_VERSION,
+        remote_emission,
+        to_initiator_lane.receiver_selector_revision,
         &to_initiator,
+    )?;
+    serve_event_transfer_lane(
+        EventTransferLaneContext {
+            store: &store,
+            lease_store,
+            connection: &connection,
+            mission: &mut mission,
+            event_verifier: &mut event_verifier,
+            lane: to_initiator_lane,
+            remote_emission,
+            exchanges: &mut custody_exchanges,
+            receipt: &mut receipt,
+        },
+        &to_initiator.difference,
+    )
+    .await?;
+    serve_mutable_classes(
+        &store,
+        &connection,
+        &mut mission,
+        &mut event_verifier,
+        &event_guard,
+        &mutable_interests,
         &mut receipt,
     )
     .await?;
-    for class in [MutableClass::State, MutableClass::Record] {
-        serve_mutable_class(
-            &store,
-            &connection,
-            &mut mission,
-            &mut event_verifier,
-            MutableClassContact {
-                guard: &event_guard,
-                interests: &mutable_interests,
-                class,
-            },
-            &mut receipt,
-        )
-        .await?;
-    }
     event_guard.check(&store)?;
     let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
-    connection.close();
-    Ok(CompletedPeerContact {
-        receipt,
-        event_policy,
-    })
+    let completed = complete_peer_contact(&connection, receipt, event_policy);
+    connection.finish_as_responder().await?;
+    Ok(completed)
 }
 
 #[derive(Debug)]
@@ -6718,10 +15957,10 @@ impl EventDifference {
 }
 
 #[derive(Debug)]
-struct TransferAuthorization {
-    offers_from_peer: BTreeSet<EventTransferId>,
-    fetches_by_peer: BTreeSet<EventTransferId>,
-    remaining: usize,
+struct TransferAuthorization<'a> {
+    allowed: &'a [EventTransferId],
+    seen: BTreeSet<EventTransferId>,
+    limit: usize,
 }
 
 #[derive(Debug)]
@@ -6763,48 +16002,49 @@ impl ControlTransferAuthorization {
     }
 }
 
-impl TransferAuthorization {
+impl<'a> TransferAuthorization<'a> {
     fn for_peer(
-        local_difference: &EventDifference,
+        local_difference: &'a EventDifference,
         direction: EventDirection,
         capacity: usize,
-    ) -> Self {
-        match direction {
+    ) -> Result<Self, NodeError> {
+        let allowed = match direction {
             EventDirection::ToSessionResponder => {
                 // The responder is the receiver, so only initiator-only items
                 // (remote-only from this endpoint's view) may arrive as offers.
-                let limit = local_difference.remote_only.len().min(capacity);
-                Self {
-                    offers_from_peer: local_difference
-                        .remote_only
-                        .iter()
-                        .take(limit)
-                        .copied()
-                        .collect(),
-                    fetches_by_peer: BTreeSet::new(),
-                    remaining: local_difference.remote_only.len() - limit,
-                }
+                local_difference.remote_only.as_slice()
             }
             EventDirection::ToSessionInitiator => {
                 // The initiator is the receiver, so it may fetch only items
                 // local to this responder in the independently derived lane.
-                let limit = local_difference.local_only.len().min(capacity);
-                Self {
-                    offers_from_peer: BTreeSet::new(),
-                    fetches_by_peer: local_difference
-                        .local_only
-                        .iter()
-                        .take(limit)
-                        .copied()
-                        .collect(),
-                    remaining: local_difference.local_only.len() - limit,
-                }
+                local_difference.local_only.as_slice()
             }
-        }
+        };
+        Self::new(allowed, capacity)
     }
 
-    fn is_consumed(&self) -> bool {
-        self.offers_from_peer.is_empty() && self.fetches_by_peer.is_empty()
+    fn new(allowed: &'a [EventTransferId], capacity: usize) -> Result<Self, NodeError> {
+        if !allowed.windows(2).all(|pair| pair[0] < pair[1]) {
+            return Err(NodeError::Protocol(
+                "authenticated Event difference is not strictly ordered".into(),
+            ));
+        }
+        let limit = allowed.len().min(capacity);
+        Ok(Self {
+            allowed,
+            seen: BTreeSet::new(),
+            limit,
+        })
+    }
+
+    fn authorize(&mut self, id: EventTransferId) -> bool {
+        self.seen.len() < self.limit
+            && self.allowed.binary_search(&id).is_ok()
+            && self.seen.insert(id)
+    }
+
+    fn finish_remaining(&self) -> usize {
+        self.allowed.len().saturating_sub(self.seen.len())
     }
 }
 
@@ -6843,16 +16083,63 @@ async fn request_mission_frame(
     request: Frame,
     receipt: &mut PeerReceipt,
 ) -> Result<Frame, NodeError> {
+    Ok(
+        request_mission_frame_checked(connection, mission, request, receipt, || Ok(()))
+            .await?
+            .0,
+    )
+}
+
+async fn request_mission_frame_checked<F, T>(
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    request: Frame,
+    receipt: &mut PeerReceipt,
+    before_socket_send: F,
+) -> Result<(Frame, T), NodeError>
+where
+    F: FnOnce() -> Result<T, NodeError>,
+{
+    let (response, (_, checked)) = request_mission_frame_built_checked(
+        connection,
+        mission,
+        receipt,
+        |_mission| Ok((request, ())),
+        |_| before_socket_send(),
+    )
+    .await?;
+    Ok((response, checked))
+}
+
+async fn request_mission_frame_built_checked<F, G, T, U>(
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    receipt: &mut PeerReceipt,
+    build_immediately_before_send: F,
+    after_outer_seal: G,
+) -> Result<(Frame, (T, U)), NodeError>
+where
+    F: FnOnce(&mut MissionSession) -> Result<(Frame, T), NodeError>,
+    G: FnOnce(&T) -> Result<U, NodeError>,
+{
+    require_contact_frame_initiation()?;
     let wire_budget = exchange_wire_budget(receipt)?;
+    let (request, built) = build_immediately_before_send(mission)?;
     let plaintext = request.encode()?;
     let protected_request = mission.seal_application_frame(&plaintext)?;
-    let protected_response = connection
-        .request_with_total_limit(&protected_request, wire_budget)
+    // The carrier invokes this check after QUIC stream acquisition and
+    // immediately before invoking its first write. No bidirectional-stream
+    // acquisition wait separates this custody/policy recheck from that call.
+    let (protected_response, final_checked) = connection
+        .request_with_total_limit_checked(&protected_request, wire_budget, || {
+            require_contact_frame_initiation()?;
+            after_outer_seal(&built)
+        })
         .await?;
     let response = mission.open_application_frame(&protected_response)?;
     let response = Frame::decode(&response)?;
     account(receipt, protected_request.len(), protected_response.len())?;
-    Ok(response)
+    Ok((response, (built, final_checked)))
 }
 
 async fn respond_mission_frame<F>(
@@ -6862,7 +16149,7 @@ async fn respond_mission_frame<F>(
     handler: F,
 ) -> Result<(bool, usize, usize), NodeError>
 where
-    F: FnOnce(Frame, usize) -> Result<(Frame, bool), NodeError>,
+    F: FnOnce(Frame, usize, &mut MissionSession) -> Result<(Frame, bool), NodeError>,
 {
     let mut application_error = None;
     let mut request_len = None;
@@ -6870,13 +16157,20 @@ where
     let mut complete = None;
     let carrier_result = connection
         .respond_once_with_total_limit(wire_budget, |protected_request| {
+            require_contact_policy_current()
+                .map_err(|_| CarrierError::Transport("live emission policy changed".into()))?;
             request_len = Some(protected_request.len());
             let handled = (|| -> Result<Vec<u8>, NodeError> {
                 let plaintext = mission.open_application_frame(protected_request)?;
                 let frame = Frame::decode(&plaintext)?;
-                let (response, session_complete) = handler(frame, protected_request.len())?;
+                let (response, session_complete) =
+                    handler(frame, protected_request.len(), mission)?;
+                require_contact_frame_response(&response)?;
                 let response = response.encode()?;
                 let protected_response = mission.seal_application_frame(&response)?;
+                // Keep the final revision check adjacent to handing bytes back
+                // to the carrier response path.
+                require_contact_policy_current()?;
                 response_len = Some(protected_response.len());
                 complete = Some(session_complete);
                 Ok(protected_response)
@@ -6923,13 +16217,44 @@ fn authenticated_receipt(
             "mission handshake exceeded the total contact budget".into(),
         ));
     }
+    let path = connection.path_witness();
     Ok(PeerReceipt {
         peer: Some(connection.remote_id()),
         mission_peer: Some(mission.peer().mission_id()),
+        carrier_path: Some(path.selected),
+        carrier_path_transitions: path.transition_count,
+        carrier_path_transitions_saturated: path.transitions_saturated,
+        semantic_version: mission.semantic_version(),
         handshake_frames: handshake.frames,
         handshake_bytes: handshake.bytes,
         ..PeerReceipt::default()
     })
+}
+
+fn complete_peer_contact(
+    connection: &aster_iroh::Connection,
+    mut receipt: PeerReceipt,
+    event_policy: ContactEventPolicy,
+) -> CompletedPeerContact {
+    // Sample only after the mission-authenticated work has completed. This is
+    // bounded carrier telemetry and is deliberately absent from every
+    // authorization, inventory, and admission decision above.
+    let path = connection.path_witness();
+    receipt.carrier_path = Some(path.selected);
+    receipt.carrier_path_transitions = path.transition_count;
+    receipt.carrier_path_transitions_saturated = path.transitions_saturated;
+    CompletedPeerContact {
+        receipt,
+        event_policy,
+    }
+}
+
+const fn carrier_path_name(path: Option<SelectedPath>) -> &'static str {
+    match path {
+        Some(SelectedPath::Direct) => "direct",
+        Some(SelectedPath::Relay) => "relay",
+        Some(SelectedPath::Unknown) | None => "unknown",
+    }
 }
 
 fn exchange_wire_budget(receipt: &PeerReceipt) -> Result<usize, NodeError> {
@@ -6956,7 +16281,12 @@ fn exchange_wire_budget(receipt: &PeerReceipt) -> Result<usize, NodeError> {
 }
 
 const fn contact_status(receipt: &PeerReceipt) -> &'static str {
-    if receipt.remaining == 0 && receipt.controls_remaining == 0 {
+    if receipt.remaining == 0
+        && receipt.controls_remaining == 0
+        && receipt.deferred_event_lanes == 0
+        && receipt.mutable_remaining == 0
+        && receipt.deferred_mutable_lanes == 0
+    {
         "pass"
     } else {
         "partial"
@@ -7317,7 +16647,7 @@ fn run_controlled_n4_demo(
         .arg("1");
     let revoke_receipt = run_demo_authority_process(root, "authority-revoke", revoke)?;
     if !revoke_receipt.contains("status=emitted")
-        || !revoke_receipt.contains("emitted_by=authority-process")
+        || !revoke_receipt.contains("publication_disposition=committed-this-call")
     {
         return Err(NodeError::Demo(
             "authority revocation process omitted its durable emission receipt".into(),
@@ -7357,7 +16687,7 @@ fn run_controlled_n4_demo(
         .arg(member_survivor);
     let rekey_receipt = run_demo_authority_process(root, "authority-rekey", rekey)?;
     if !rekey_receipt.contains("status=emitted")
-        || !rekey_receipt.contains("emitted_by=authority-process")
+        || !rekey_receipt.contains("publication_disposition=committed-this-call")
         || !rekey_receipt.contains("recipients=3")
     {
         return Err(NodeError::Demo(
@@ -8064,13 +17394,10 @@ fn run_demo_phase_internal(
     let active = active.iter().copied().collect::<BTreeSet<_>>();
     // A line's propagation diameter grows with the active cohort. This is an
     // orchestration watchdog, not a throughput target: leave one second per
-    // active node plus two seconds for process startup and QUIC scheduling so
-    // the advertised node range does not inherit the three-node deadline.
-    // The child run-for budget starts before store/control replay and endpoint
-    // binding. Multi-node phases that must prove authenticated contact therefore
-    // need a separate settlement window after slower processes become ready.
-    // Denied and single-node phases do not receive that extra network budget.
-    let run_seconds = demo_phase_run_seconds(active.len(), require_successful_contacts);
+    // active node plus six seconds for process startup and QUIC scheduling so
+    // a loaded CI host can still complete the exact authenticated receipt and
+    // the advertised node range does not inherit a fixed deadline.
+    let run_seconds = demo_run_seconds(active.len());
     for &index in &active {
         let log_path = logs.join(format!("{phase}-node-{index}.log"));
         let error_path = logs.join(format!("{phase}-node-{index}.err"));
@@ -8183,18 +17510,8 @@ fn run_demo_phase_internal(
 fn demo_run_seconds(active_nodes: usize) -> u64 {
     u64::try_from(active_nodes)
         .unwrap_or(u64::MAX)
-        .saturating_add(2)
-        .max(3)
-}
-
-fn demo_phase_run_seconds(active_nodes: usize, require_successful_contacts: bool) -> u64 {
-    demo_run_seconds(active_nodes).saturating_add(
-        if require_successful_contacts && active_nodes > 1 {
-            3
-        } else {
-            0
-        },
-    )
+        .saturating_add(6)
+        .max(7)
 }
 
 fn verify_phase_contacts(
@@ -8304,8 +17621,1983 @@ fn validate_port_block(base: u16, count: usize) -> Result<(), NodeError> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Barrier, mpsc as std_mpsc};
+
     use super::*;
     use crate::mission::initiate_over_iroh;
+    use redb::ReadableTable as _;
+
+    #[test]
+    fn injected_custody_clock_clones_share_one_identity_and_tick_source() {
+        let clock = NodeCustodyClock::injected([0x81; 16], 41, 1);
+        let clone = clock.clone();
+        assert_eq!(clock.sample().expect("first sample").clock_id, [0x81; 16]);
+        assert_eq!(clone.sample().expect("second sample").clock_id, [0x81; 16]);
+        assert_eq!(clock.sample().expect("third sample").tick_ms, 43);
+    }
+
+    #[test]
+    fn finite_ttl_platform_contract_is_linux_suspend_inclusive_only() {
+        assert_eq!(
+            NodeCustodyClock::platform_supports_finite_ttl(),
+            cfg!(target_os = "linux")
+        );
+    }
+
+    #[test]
+    fn selected_event_cardinality_covers_live_route_and_permanent_fence_bounds() {
+        let selected = selected_reconciliation_limits().expect("selected limits");
+        assert_eq!(selected.cardinality(), MAX_CARDINALITY_LIMIT);
+        let reserved = MAX_ROUTE_CACHE_ITEMS
+            .checked_add(MAX_CUSTODY_RETIREMENTS)
+            .expect("fixed inventory reserves");
+        let boundary = u64::try_from(MAX_CARDINALITY_LIMIT)
+            .expect("cardinality fits u64")
+            .checked_sub(reserved)
+            .expect("selected bound covers fixed inventory reserves");
+        let accepted = SelectedForwardingConfig::new(
+            EventEmissionPolicy::Normal,
+            StoreLimits::new(boundary, 1).expect("boundary store limits"),
+        );
+        validate_forwarding_config(&accepted).expect("exact cardinality boundary");
+
+        let oversized = SelectedForwardingConfig::new(
+            EventEmissionPolicy::Normal,
+            StoreLimits::new(boundary + 1, 1).expect("oversized store limits"),
+        );
+        assert!(validate_forwarding_config(&oversized).is_err());
+
+        let overflowing = SelectedForwardingConfig::new(
+            EventEmissionPolicy::Normal,
+            StoreLimits::new(u64::MAX, 1).expect("overflowing store limits"),
+        );
+        assert!(validate_forwarding_config(&overflowing).is_err());
+    }
+
+    #[test]
+    fn mutable_v4_v5_gate_budget_and_status_are_class_separated() {
+        assert!(!supports_mutable_semantic(1));
+        assert!(!supports_mutable_semantic(2));
+        assert!(!supports_mutable_semantic(3));
+        assert!(supports_mutable_semantic(4));
+        assert!(mutable_classes_for_semantic(3).is_empty());
+        assert_eq!(mutable_classes_for_semantic(4), &MUTABLE_V4_CLASSES);
+        assert_eq!(mutable_classes_for_semantic(5), &MUTABLE_V5_CLASSES);
+        assert_eq!(
+            READY_RECONCILIATION_CLASSES,
+            "event,state,record,blob-v5-opt-in"
+        );
+        assert_eq!(contact_reconciliation_classes(1), "event,state,record");
+        assert_eq!(contact_reconciliation_classes(4), "event,state,record");
+        assert_eq!(contact_reconciliation_classes(5), "event,state,record,blob");
+        assert!(!mutable_classes_for_semantic(1).contains(&MutableClass::Blob));
+        assert!(!mutable_classes_for_semantic(2).contains(&MutableClass::Blob));
+        assert!(!mutable_classes_for_semantic(3).contains(&MutableClass::Blob));
+        assert!(!mutable_classes_for_semantic(4).contains(&MutableClass::Blob));
+
+        let limits = selected_mutable_reconciliation_limits().expect("mutable limits");
+        assert_eq!(limits.frame_size(), MUTABLE_RECONCILIATION_FRAME_BYTES);
+        assert_eq!(limits.rounds(), MUTABLE_RECONCILIATION_ROUNDS);
+        assert_eq!(limits.cardinality(), MAX_CARDINALITY_LIMIT);
+        assert_eq!(MUTABLE_FETCH_RESULT_EXCHANGE_BYTES, 184);
+        assert_eq!(MUTABLE_LANE_FULL_GUARANTEE_BYTES, 5_325_117);
+        assert_eq!(MUTABLE_LANE_FULL_GUARANTEE_EXCHANGES, 132);
+        assert_eq!(MUTABLE_CONTACT_RESERVE_BYTES, 21_568_340);
+        assert_eq!(MUTABLE_CONTACT_RESERVE_EXCHANGES, 532);
+        assert_eq!(BLOB_RANGE_FETCH_PLAINTEXT_BYTES, 123);
+        assert_eq!(BLOB_RANGE_PLAINTEXT_MAX_BYTES, 16_480);
+        assert_eq!(BLOB_RANGE_RESULT_PLAINTEXT_BYTES, 92);
+        assert_eq!(BLOB_INTEREST_PLAINTEXT_MAX_BYTES, 76_807);
+        assert_eq!(BLOB_INTEREST_EXCHANGE_MAX_BYTES, 153_718);
+        assert_eq!(BLOB_CARRIER_CONTACT_RESERVE_BYTES, 17_127);
+        assert_eq!(BLOB_CARRIER_CONTACT_RESERVE_EXCHANGES, 3);
+        assert_eq!(
+            post_event_reserve(5),
+            Some(PostEventReserve {
+                exchanges: MUTABLE_V5_CONTACT_RESERVE_EXCHANGES,
+                bytes: MUTABLE_V5_CONTACT_RESERVE_BYTES,
+                items: 7,
+            })
+        );
+        assert_eq!(MAX_CONFIGURED_PEERS, 256);
+        const {
+            assert!(MUTABLE_CONTACT_RESERVE_BYTES < MAX_CONTACT_BYTES);
+            assert!(MUTABLE_CONTACT_RESERVE_EXCHANGES * EXCHANGE_FRAMES < MAX_CONTACT_FRAMES);
+            assert!(MUTABLE_V5_CONTACT_RESERVE_BYTES < MAX_CONTACT_BYTES);
+            assert!(MUTABLE_V5_CONTACT_RESERVE_EXCHANGES * EXCHANGE_FRAMES < MAX_CONTACT_FRAMES);
+        }
+
+        let event_complete_but_mutable_partial = PeerReceipt {
+            mutable_remaining: 1,
+            deferred_mutable_lanes: 1,
+            ..PeerReceipt::default()
+        };
+        assert!(selected_event_contact_complete(
+            &event_complete_but_mutable_partial
+        ));
+        assert_eq!(
+            contact_status(&event_complete_but_mutable_partial),
+            "partial"
+        );
+        let event_complete_but_blob_partial = PeerReceipt {
+            blob_remaining: 1,
+            mutable_remaining: 1,
+            ..PeerReceipt::default()
+        };
+        assert!(selected_event_contact_complete(
+            &event_complete_but_blob_partial
+        ));
+        assert_eq!(contact_status(&event_complete_but_blob_partial), "partial");
+
+        let v3_full_event_capacity =
+            event_transfer_capacity(&PeerReceipt::default(), None).expect("v3 Event capacity");
+        let v4_event_capacity =
+            event_transfer_capacity(&PeerReceipt::default(), Some(4)).expect("v4 Event capacity");
+        let v5_event_capacity =
+            event_transfer_capacity(&PeerReceipt::default(), Some(5)).expect("v5 Event capacity");
+        assert_eq!(v3_full_event_capacity, MAX_CONTACT_ITEMS);
+        assert_eq!(v4_event_capacity, MAX_CONTACT_ITEMS - 4);
+        assert_eq!(v5_event_capacity, MAX_CONTACT_ITEMS - 7);
+    }
+
+    #[test]
+    fn mutable_lane_controls_bind_both_classes_directions_and_remaining() {
+        for class in MUTABLE_V4_CLASSES {
+            for direction in [
+                EventDirection::ToSessionResponder,
+                EventDirection::ToSessionInitiator,
+            ] {
+                assert_eq!(
+                    acknowledge_mutable_lane_deferred(
+                        Frame::MutableLaneDeferred { class, direction },
+                        class,
+                        direction,
+                    )
+                    .expect("matching deferral"),
+                    Frame::MutableLaneDeferredAck { class, direction }
+                );
+                let other_class = match class {
+                    MutableClass::State => MutableClass::Record,
+                    MutableClass::Record => MutableClass::State,
+                    MutableClass::Blob => MutableClass::State,
+                };
+                assert!(
+                    acknowledge_mutable_lane_deferred(
+                        Frame::MutableLaneDeferred { class, direction },
+                        other_class,
+                        direction,
+                    )
+                    .is_err()
+                );
+                let other_direction = match direction {
+                    EventDirection::ToSessionResponder => EventDirection::ToSessionInitiator,
+                    EventDirection::ToSessionInitiator => EventDirection::ToSessionResponder,
+                };
+                assert!(
+                    acknowledge_mutable_lane_deferred(
+                        Frame::MutableLaneDeferred { class, direction },
+                        class,
+                        other_direction,
+                    )
+                    .is_err()
+                );
+
+                assert_eq!(
+                    require_mutable_finish(
+                        Frame::MutableFinish {
+                            class,
+                            direction,
+                            remaining: 7,
+                        },
+                        class,
+                        direction,
+                        7,
+                        true,
+                    )
+                    .expect("matching finish"),
+                    7
+                );
+                assert!(
+                    require_mutable_finish(
+                        Frame::MutableFinish {
+                            class,
+                            direction,
+                            remaining: 8,
+                        },
+                        class,
+                        direction,
+                        7,
+                        true,
+                    )
+                    .is_err()
+                );
+                assert!(
+                    require_mutable_finish(
+                        Frame::MutableFinish {
+                            class,
+                            direction,
+                            remaining: 7,
+                        },
+                        class,
+                        direction,
+                        7,
+                        false,
+                    )
+                    .is_err()
+                );
+                assert!(
+                    require_mutable_finish(
+                        Frame::MutableFinish {
+                            class,
+                            direction,
+                            remaining: 8,
+                        },
+                        class,
+                        direction,
+                        7,
+                        true,
+                    )
+                    .is_err()
+                );
+                assert!(
+                    require_mutable_finish(
+                        Frame::MutableFinish {
+                            class,
+                            direction,
+                            remaining: 6,
+                        },
+                        class,
+                        direction,
+                        7,
+                        true,
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mutable_cursor_selection_uses_strict_successor_then_wrap_and_rejects_bad_order() {
+        let state = |byte| MutableTransferId::State(StateTransferId::new([byte; 32]));
+        let record = |byte| MutableTransferId::Record(RecordTransferId::new([byte; 32]));
+        let ids = vec![state(1), state(2), state(3)];
+
+        assert_eq!(
+            mutable_transfer_selection(&ids, MutableClass::State, None, 2)
+                .expect("selection without cursor"),
+            vec![state(1), state(2)]
+        );
+        assert_eq!(
+            mutable_transfer_selection(&ids, MutableClass::State, Some([1; 32]), 2)
+                .expect("strict successor"),
+            vec![state(2), state(3)]
+        );
+        assert_eq!(
+            mutable_transfer_selection(&ids, MutableClass::State, Some([2; 32]), 2)
+                .expect("successor then wrap"),
+            vec![state(3), state(1)]
+        );
+        assert_eq!(
+            mutable_transfer_selection(&ids, MutableClass::State, Some([3; 32]), 2)
+                .expect("full wrap"),
+            vec![state(1), state(2)]
+        );
+        assert!(
+            mutable_transfer_selection(&[state(2), state(1)], MutableClass::State, None, 1,)
+                .is_err()
+        );
+        assert!(
+            mutable_transfer_selection(&[state(1), state(1)], MutableClass::State, None, 1,)
+                .is_err()
+        );
+        assert!(mutable_transfer_selection(&[record(1)], MutableClass::State, None, 1).is_err());
+    }
+
+    #[test]
+    fn mutable_responder_authorizes_any_unique_difference_member_up_to_exact_quota() {
+        let state = |byte| MutableTransferId::State(StateTransferId::new([byte; 32]));
+        let difference = MutableDifference {
+            local_only: vec![state(1), state(2), state(3)],
+            remote_only: vec![state(4), state(5), state(6)],
+        };
+
+        let mut offers = MutableTransferAuthorization::for_peer(
+            &difference,
+            MutableClass::State,
+            EventDirection::ToSessionResponder,
+            1,
+        )
+        .expect("offer authorization");
+        assert_eq!(offers.remaining, 2);
+        assert!(offers.authorize(state(6)));
+        assert!(offers.is_consumed());
+        assert!(!offers.authorize(state(6)));
+        assert!(!offers.authorize(state(4)));
+
+        let mut fetches = MutableTransferAuthorization::for_peer(
+            &difference,
+            MutableClass::State,
+            EventDirection::ToSessionInitiator,
+            2,
+        )
+        .expect("fetch authorization");
+        assert_eq!(fetches.remaining, 1);
+        assert!(!fetches.authorize(state(9)));
+        assert!(fetches.authorize(state(3)));
+        assert!(!fetches.authorize(state(3)));
+        assert!(!fetches.is_consumed());
+        assert!(fetches.authorize(state(1)));
+        assert!(fetches.is_consumed());
+
+        let unsorted = MutableDifference {
+            local_only: vec![state(2), state(1)],
+            remote_only: Vec::new(),
+        };
+        assert!(
+            MutableTransferAuthorization::for_peer(
+                &unsorted,
+                MutableClass::State,
+                EventDirection::ToSessionInitiator,
+                1,
+            )
+            .is_err()
+        );
+        let duplicate = MutableDifference {
+            local_only: Vec::new(),
+            remote_only: vec![state(4), state(4)],
+        };
+        assert!(
+            MutableTransferAuthorization::for_peer(
+                &duplicate,
+                MutableClass::State,
+                EventDirection::ToSessionResponder,
+                1,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn mutable_fetch_result_requires_exact_pending_tuple_and_echoes_disposition() {
+        let id = MutableTransferId::State(StateTransferId::new([0x41; 32]));
+        let other_id = MutableTransferId::State(StateTransferId::new([0x42; 32]));
+        let cross_class = MutableTransferId::Record(RecordTransferId::new([0x41; 32]));
+        let direction = EventDirection::ToSessionInitiator;
+        let mut receipt = PeerReceipt::default();
+        let mut settlement = MutableFetchSettlement::default();
+        settlement.begin(id).expect("first pending fetch");
+        assert!(settlement.begin(other_id).is_err());
+
+        for wrong in [
+            Frame::MutableFinish {
+                class: MutableClass::State,
+                direction,
+                remaining: 0,
+            },
+            Frame::MutableFetchResult {
+                direction: EventDirection::ToSessionResponder,
+                id,
+                disposition: MutableApplyDisposition::Duplicate,
+            },
+            Frame::MutableFetchResult {
+                direction,
+                id: other_id,
+                disposition: MutableApplyDisposition::Duplicate,
+            },
+            Frame::MutableFetchResult {
+                direction,
+                id: cross_class,
+                disposition: MutableApplyDisposition::Duplicate,
+            },
+        ] {
+            assert!(
+                settlement
+                    .acknowledge(wrong, MutableClass::State, direction, &mut receipt)
+                    .is_err()
+            );
+            assert!(settlement.is_pending());
+        }
+
+        let acknowledgement = settlement
+            .acknowledge(
+                Frame::MutableFetchResult {
+                    direction,
+                    id,
+                    disposition: MutableApplyDisposition::Duplicate,
+                },
+                MutableClass::State,
+                direction,
+                &mut receipt,
+            )
+            .expect("matching result");
+        assert_eq!(receipt.duplicates, 1);
+        assert!(!settlement.is_pending());
+        assert_eq!(
+            acknowledgement,
+            Frame::MutableFetchResultAck {
+                direction,
+                id,
+                disposition: MutableApplyDisposition::Duplicate,
+            }
+        );
+        assert!(
+            settlement
+                .acknowledge(
+                    Frame::MutableFetchResult {
+                        direction,
+                        id,
+                        disposition: MutableApplyDisposition::Duplicate,
+                    },
+                    MutableClass::State,
+                    direction,
+                    &mut receipt,
+                )
+                .is_err()
+        );
+
+        settlement.begin(other_id).expect("next fetch");
+        let deferred_ack = settlement
+            .acknowledge(
+                Frame::MutableFetchResult {
+                    direction,
+                    id: other_id,
+                    disposition: MutableApplyDisposition::DeferredCapacity,
+                },
+                MutableClass::State,
+                direction,
+                &mut receipt,
+            )
+            .expect("deferred result");
+        assert_eq!(settlement.deferred_capacity(), 1);
+        assert_eq!(
+            deferred_ack,
+            Frame::MutableFetchResultAck {
+                direction,
+                id: other_id,
+                disposition: MutableApplyDisposition::DeferredCapacity,
+            }
+        );
+        require_mutable_fetch_result_ack(
+            Frame::MutableFetchResultAck {
+                direction,
+                id: other_id,
+                disposition: MutableApplyDisposition::DeferredCapacity,
+            },
+            direction,
+            other_id,
+            MutableApplyDisposition::DeferredCapacity,
+        )
+        .expect("exact acknowledgement");
+        assert!(
+            require_mutable_fetch_result_ack(
+                Frame::MutableFetchResultAck {
+                    direction,
+                    id: other_id,
+                    disposition: MutableApplyDisposition::DeferredCapacity,
+                },
+                direction,
+                other_id,
+                MutableApplyDisposition::Duplicate,
+            )
+            .is_err()
+        );
+        for wrong in [
+            Frame::MutableFetchResultAck {
+                direction: EventDirection::ToSessionResponder,
+                id: other_id,
+                disposition: MutableApplyDisposition::DeferredCapacity,
+            },
+            Frame::MutableFetchResultAck {
+                direction,
+                id,
+                disposition: MutableApplyDisposition::DeferredCapacity,
+            },
+            Frame::MutableFinished {
+                class: MutableClass::State,
+                direction,
+                remaining: 1,
+            },
+        ] {
+            assert!(
+                require_mutable_fetch_result_ack(
+                    wrong,
+                    direction,
+                    other_id,
+                    MutableApplyDisposition::DeferredCapacity,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn mutable_apply_capacity_classification_keeps_integrity_and_policy_fatal() {
+        for error in [
+            StoreError::ItemLimitExceeded {
+                current: 4_096,
+                limit: 4_096,
+            },
+            StoreError::PayloadByteLimitExceeded {
+                current: 16 * 1024 * 1024,
+                incoming: 1,
+                limit: 16 * 1024 * 1024,
+            },
+            StoreError::StateProjectionLimitExceeded {
+                current: 1_024,
+                limit: 1_024,
+            },
+            StoreError::RecordProjectionLimitExceeded {
+                current: 1_024,
+                limit: 1_024,
+            },
+            StoreError::StateCausalFrontierLimitExceeded {
+                current: 4_096,
+                limit: 4_096,
+            },
+            StoreError::RecordCausalFrontierLimitExceeded {
+                current: 4_096,
+                limit: 4_096,
+            },
+        ] {
+            assert_eq!(
+                mutable_apply_disposition(Err(error)).expect("capacity disposition"),
+                MutableApplyDisposition::DeferredCapacity
+            );
+        }
+        assert_eq!(
+            mutable_apply_disposition(Ok(ApplyOutcome::Inserted {
+                acceptance_marker: 1,
+            }))
+            .expect("inserted disposition"),
+            MutableApplyDisposition::Inserted
+        );
+        assert_eq!(
+            mutable_apply_disposition(Ok(ApplyOutcome::Duplicate {
+                acceptance_marker: 1,
+            }))
+            .expect("duplicate disposition"),
+            MutableApplyDisposition::Duplicate
+        );
+        assert!(matches!(
+            mutable_apply_disposition(Err(StoreError::StatePublisherRevoked([0x91; 32]))),
+            Err(NodeError::Store(StoreError::StatePublisherRevoked(_)))
+        ));
+        assert!(matches!(
+            mutable_apply_disposition(Err(StoreError::StateInvariant("test integrity"))),
+            Err(NodeError::Store(StoreError::StateInvariant(
+                "test integrity"
+            )))
+        ));
+    }
+
+    #[test]
+    fn mutable_full_contact_reserve_guarantees_one_item_in_every_directed_class_lane() {
+        let exact = PeerReceipt {
+            handshake_frames: MAX_CONTACT_FRAMES
+                - MUTABLE_CONTACT_RESERVE_EXCHANGES * EXCHANGE_FRAMES,
+            handshake_bytes: MAX_CONTACT_BYTES - MUTABLE_CONTACT_RESERVE_BYTES,
+            ..PeerReceipt::default()
+        };
+        assert!(mutable_class_can_start(&exact, 4, MutableClass::State).expect("exact reserve"));
+
+        let byte_short = PeerReceipt {
+            handshake_bytes: exact.handshake_bytes + 1,
+            ..exact.clone()
+        };
+        assert!(
+            !mutable_class_can_start(&byte_short, 4, MutableClass::State).expect("short reserve")
+        );
+        let mut skipped = byte_short;
+        record_mutable_lane_deferred(&mut skipped).expect("first class lane deferral");
+        record_mutable_lane_deferred(&mut skipped).expect("second class lane deferral");
+        assert_eq!(skipped.deferred_mutable_lanes, 2);
+        assert_eq!(skipped.remaining, 0);
+        assert_eq!(skipped.deferred_event_lanes, 0);
+        assert!(selected_event_contact_complete(&skipped));
+        assert_eq!(contact_status(&skipped), "partial");
+
+        let mut fair = PeerReceipt {
+            offered: MAX_CONTACT_ITEMS - 4,
+            ..PeerReceipt::default()
+        };
+        for (class, direction) in [
+            (MutableClass::State, EventDirection::ToSessionResponder),
+            (MutableClass::State, EventDirection::ToSessionInitiator),
+            (MutableClass::Record, EventDirection::ToSessionResponder),
+            (MutableClass::Record, EventDirection::ToSessionInitiator),
+        ] {
+            assert_eq!(
+                mutable_transfer_capacity(&fair, 4, class, direction).expect("fair lane capacity"),
+                1
+            );
+            fair.offered += 1;
+        }
+        assert_eq!(fair.offered, MAX_CONTACT_ITEMS);
+    }
+
+    #[test]
+    fn custody_finalization_charge_is_exact_length_bounded_and_ttl_strict() {
+        let tiny_charge = custody_finalization_charge_ms(1).expect("tiny charge");
+        assert_eq!(tiny_charge, CUSTODY_FINALIZATION_FIXED_MS + 1);
+        assert_eq!(
+            custody_finalization_charge_ms(MAX_OBJECT_BYTES as u64).expect("maximum charge"),
+            MAX_CUSTODY_FINALIZATION_CHARGE_MS
+        );
+        assert!(custody_finalization_charge_ms(MAX_OBJECT_BYTES as u64 + 1).is_err());
+        assert!(custody_finalization_charge_ms(u64::MAX).is_err());
+
+        let authenticated = charged_custody_finalization_age(7, 1, Some(7 + tiny_charge + 1))
+            .expect("strictly before TTL");
+        assert_eq!(authenticated, 7 + tiny_charge);
+        assert!(charged_custody_finalization_age(7, 1, Some(authenticated)).is_err());
+        assert!(charged_custody_finalization_age(u64::MAX, 1, None).is_err());
+        assert_eq!(
+            charged_custody_finalization_age(7, 1, None)
+                .expect("durable transfer receives the same bounded age charge"),
+            authenticated
+        );
+        require_finalization_within_charge(authenticated, authenticated)
+            .expect("exact finalization boundary");
+        assert!(require_finalization_within_charge(authenticated + 1, authenticated).is_err());
+    }
+
+    #[test]
+    fn v3_custody_schedule_uses_exact_codec_overheads_and_reserves_finish() {
+        let id = EventTransferId::new([0x5a; 32]);
+        assert_eq!(
+            Frame::OfferV3 {
+                direction: EventDirection::ToSessionResponder,
+                id,
+                exchange_id: 1,
+                custody: vec![0; MAX_CUSTODY_WRAPPER_BYTES],
+                bytes: Vec::new(),
+            }
+            .encode()
+            .expect("maximum-wrapper offer encoding")
+            .len(),
+            OFFER_V3_PLAINTEXT_OVERHEAD_BYTES
+        );
+        assert_eq!(
+            Frame::ApplyResultV3 {
+                direction: EventDirection::ToSessionResponder,
+                id,
+                exchange_id: 1,
+                inserted: true,
+                disposition: EventApplyDisposition::Satisfied,
+            }
+            .encode()
+            .expect("v3 apply-result encoding")
+            .len(),
+            APPLY_RESULT_V3_PLAINTEXT_BYTES
+        );
+        assert_eq!(
+            Frame::Finish {
+                direction: EventDirection::ToSessionResponder,
+            }
+            .encode()
+            .expect("finish encoding")
+            .len(),
+            DIRECTION_ONLY_PLAINTEXT_BYTES
+        );
+        assert_eq!(
+            Frame::FinishV3 {
+                direction: EventDirection::ToSessionResponder,
+                remaining: 7,
+            }
+            .encode()
+            .expect("v3 finish encoding")
+            .len(),
+            FINISH_V3_PLAINTEXT_BYTES
+        );
+        assert_eq!(OFFER_V3_EXCHANGE_OVERHEAD_BYTES, 462);
+        assert_eq!(FINISH_EXCHANGE_BYTES, 132);
+        assert_eq!(EVENT_LANE_DEFER_EXCHANGE_BYTES, 116);
+
+        let frame_limited = PeerReceipt {
+            handshake_frames: MAX_CONTACT_FRAMES - EXCHANGE_FRAMES,
+            ..PeerReceipt::default()
+        };
+        assert_eq!(
+            v3_custody_schedule_budget(&frame_limited, 1, false, None)
+                .expect("exact finish frame reserve")
+                .max_offers,
+            0
+        );
+        let first_lane_frame_limited = PeerReceipt {
+            handshake_frames: MAX_CONTACT_FRAMES - 2 * EXCHANGE_FRAMES,
+            ..PeerReceipt::default()
+        };
+        assert_eq!(
+            v3_custody_schedule_budget(&first_lane_frame_limited, 1, true, None)
+                .expect("first lane reserves its finish and the future defer")
+                .max_offers,
+            0
+        );
+        assert_eq!(
+            v3_custody_schedule_budget(&first_lane_frame_limited, 1, false, None)
+                .expect("last lane reserves only finish")
+                .max_offers,
+            1
+        );
+        let no_finish_frame = PeerReceipt {
+            handshake_frames: MAX_CONTACT_FRAMES - 1,
+            ..PeerReceipt::default()
+        };
+        assert!(v3_custody_schedule_budget(&no_finish_frame, 1, false, None).is_err());
+
+        let byte_limited = PeerReceipt {
+            handshake_bytes: MAX_CONTACT_BYTES - FINISH_EXCHANGE_BYTES,
+            ..PeerReceipt::default()
+        };
+        assert_eq!(
+            v3_custody_schedule_budget(&byte_limited, 1, false, None)
+                .expect("exact finish byte reserve")
+                .offer_wire_bytes,
+            0
+        );
+        assert_eq!(
+            v3_offer_exchange_wire_bytes(7).expect("bounded offer cost"),
+            7 + u64::try_from(OFFER_V3_EXCHANGE_OVERHEAD_BYTES).expect("constant fits u64")
+        );
+    }
+
+    #[test]
+    fn apply_acknowledgements_are_version_and_exchange_bound() {
+        let direction = EventDirection::ToSessionResponder;
+        let id = EventTransferId::new([0x2a; 32]);
+        let v3 = Frame::ApplyResultV3 {
+            direction,
+            id,
+            exchange_id: 41,
+            inserted: true,
+            disposition: EventApplyDisposition::Satisfied,
+        };
+        assert_eq!(
+            require_v3_apply_result(v3, direction, id, 41).expect("bound v3 apply result"),
+            (true, EventApplyDisposition::Satisfied)
+        );
+        assert!(
+            require_v3_apply_result(
+                Frame::ApplyResultV3 {
+                    direction,
+                    id,
+                    exchange_id: 42,
+                    inserted: true,
+                    disposition: EventApplyDisposition::Satisfied,
+                },
+                direction,
+                id,
+                41,
+            )
+            .is_err()
+        );
+        assert!(
+            require_v3_apply_result(
+                Frame::ApplyResult {
+                    direction,
+                    id,
+                    inserted: true,
+                },
+                direction,
+                id,
+                41,
+            )
+            .is_err(),
+            "semantic v3 must not accept the legacy acknowledgement"
+        );
+        assert!(
+            require_legacy_apply_result(
+                Frame::ApplyResultV3 {
+                    direction,
+                    id,
+                    exchange_id: 41,
+                    inserted: true,
+                    disposition: EventApplyDisposition::Satisfied,
+                },
+                direction,
+                id,
+            )
+            .is_err(),
+            "semantic v1/v2 must not accept the v3 acknowledgement"
+        );
+    }
+
+    #[test]
+    fn v3_reconciliation_low_water_preserves_one_authenticated_defer() {
+        let request = reconciliation_query_plaintext_bytes(17).expect("request length");
+        let response = reconciliation_query_plaintext_bytes(DEFAULT_FRAME_SIZE_LIMIT)
+            .expect("maximum selected response length");
+        let required_bytes = request
+            .checked_add(APPLICATION_PROTECTION_OVERHEAD_BYTES)
+            .and_then(|bytes| bytes.checked_add(response))
+            .and_then(|bytes| bytes.checked_add(APPLICATION_PROTECTION_OVERHEAD_BYTES))
+            .and_then(|bytes| bytes.checked_add(EVENT_LANE_DEFER_EXCHANGE_BYTES))
+            .expect("bounded reconciliation exchange");
+        let exact = PeerReceipt {
+            handshake_frames: MAX_CONTACT_FRAMES - 2 * EXCHANGE_FRAMES,
+            handshake_bytes: MAX_CONTACT_BYTES - required_bytes,
+            ..PeerReceipt::default()
+        };
+        assert!(
+            reconciliation_exchange_preserves_defer(&exact, request, response, None)
+                .expect("exact low-water budget")
+        );
+
+        let frame_short = PeerReceipt {
+            handshake_frames: exact.handshake_frames + 1,
+            ..exact.clone()
+        };
+        assert!(
+            !reconciliation_exchange_preserves_defer(&frame_short, request, response, None)
+                .expect("frame low-water decision")
+        );
+        let byte_short = PeerReceipt {
+            handshake_bytes: exact.handshake_bytes + 1,
+            ..exact
+        };
+        assert!(
+            !reconciliation_exchange_preserves_defer(&byte_short, request, response, None)
+                .expect("byte low-water decision")
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_route_cache_warms_once_and_reuses_two_lane_claims() {
+        let state = root("authenticated-route-cache");
+        fs::create_dir_all(&state).expect("cache state");
+        let services = control_test_services([0x82; 32]);
+        let store = Store::open_for_mission(
+            state.join(STORE_FILE),
+            services.other.mission_authority_id(),
+        )
+        .expect("cache store");
+        seed_test_event_subscription(
+            &store,
+            EventSubscriptionMode::Consume,
+            &services.topic,
+            &services.scope,
+            b"cache-consume",
+        );
+        let clock_id = [0x83; 16];
+        let clock = NodeCustodyClock::injected(clock_id, 0, 0);
+        let mut verifier = open_test_sealer(&services.other);
+        let mut published = Vec::new();
+        for (operation, payload) in [
+            (b"cache/one".as_slice(), b"one".as_slice()),
+            (b"cache/two".as_slice(), b"two".as_slice()),
+        ] {
+            published.push(publish_test_custody_event(
+                &store,
+                &mut verifier,
+                TestCustodyPublication {
+                    operation,
+                    topic: &services.topic,
+                    scope: &services.scope,
+                    priority: Priority::Routine,
+                    ttl_ms: None,
+                    sample: CustodySample {
+                        clock_id,
+                        tick_ms: 0,
+                    },
+                    payload,
+                    tombstone: false,
+                },
+            ));
+        }
+        let policy = store.control_policy_snapshot().expect("cache policy");
+        let cache = prewarm_authenticated_event_route_cache(
+            &store,
+            &policy,
+            &mut verifier,
+            Some(clock.sample().expect("cache warm sample")),
+        )
+        .expect("cache prewarm");
+        assert_eq!(cache.source_verifications(), 2);
+
+        let replication = store
+            .event_replication_policy_snapshot()
+            .expect("cache replication policy");
+        let interest = exact_event_interest(&services.topic, &services.scope);
+        let live = Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal));
+        let guard = ContactEmissionGuard {
+            captured: live.snapshot().expect("cache emission snapshot"),
+            live,
+            custody_clock: clock.clone(),
+        };
+        let third = CONTACT_EVENT_ROUTE_CACHE
+            .scope(
+                cache.clone(),
+                CONTACT_EMISSION_GUARD.scope(guard, async {
+                    for _ in 0..2 {
+                        let _sender = transfer_inventory_for_peer(
+                            &store,
+                            &policy,
+                            &mut verifier,
+                            services.member.identity(),
+                            &[],
+                            &interest,
+                            true,
+                        )
+                        .expect("cached sender lane");
+                        assert_eq!(
+                            transfer_inventory_for_receiver(
+                                &store,
+                                &replication,
+                                &mut verifier,
+                                &interest,
+                                true,
+                            )
+                            .expect("cached receiver lane")
+                            .len(),
+                            2
+                        );
+                    }
+                    assert_eq!(cache.source_verifications(), 2);
+
+                    let third = publish_test_custody_event(
+                        &store,
+                        &mut verifier,
+                        TestCustodyPublication {
+                            operation: b"cache/three",
+                            topic: &services.topic,
+                            scope: &services.scope,
+                            priority: Priority::Routine,
+                            ttl_ms: None,
+                            sample: CustodySample {
+                                clock_id,
+                                tick_ms: 0,
+                            },
+                            payload: b"three",
+                            tombstone: false,
+                        },
+                    );
+                    assert_eq!(
+                        transfer_inventory_for_receiver(
+                            &store,
+                            &replication,
+                            &mut verifier,
+                            &interest,
+                            true,
+                        )
+                        .expect("one cache miss is repaired")
+                        .len(),
+                        3
+                    );
+                    assert_eq!(cache.source_verifications(), 3);
+                    let _ = transfer_inventory_for_peer(
+                        &store,
+                        &policy,
+                        &mut verifier,
+                        services.member.identity(),
+                        &[],
+                        &interest,
+                        true,
+                    )
+                    .expect("repaired cache is reused");
+                    assert_eq!(cache.source_verifications(), 3);
+                    third
+                }),
+            )
+            .await;
+
+        let verified = verifier
+            .verify_event(&third.sealed)
+            .expect("promotion source verification");
+        verify_stored_claim(
+            &verified,
+            third.transfer_id,
+            third.semantic_id,
+            &third.header,
+        )
+        .expect("promotion stored claim");
+        let route = AuthenticatedEventRouteClaim::from_verified(
+            &verified,
+            EventTransferState::RouteCached,
+            third.sealed.len(),
+        )
+        .expect("route claim");
+        let accepted = route
+            .clone()
+            .with_object(CustodyObjectKey::event(third.transfer_id));
+        let promotion_cache = AuthenticatedEventRouteCache::empty(&verifier);
+        promotion_cache
+            .insert(&verifier, route.clone())
+            .expect("cache route claim");
+        promotion_cache
+            .insert(&verifier, accepted)
+            .expect("cache route promotion");
+        promotion_cache
+            .insert(&verifier, route)
+            .expect("delayed route insert is a monotonic no-op");
+        assert_eq!(
+            promotion_cache
+                .get(&verifier, third.transfer_id)
+                .expect("promoted claim lookup")
+                .expect("promoted claim")
+                .object,
+            CustodyObjectKey::event(third.transfer_id)
+        );
+
+        let first = &published[0];
+        let first_verified = verifier
+            .verify_event(&first.sealed)
+            .expect("capacity source verification");
+        let preserved = AuthenticatedEventRouteClaim::from_verified(
+            &first_verified,
+            EventTransferState::Accepted,
+            first.sealed.len(),
+        )
+        .expect("preserved capacity claim");
+        let omitted = promotion_cache
+            .get(&verifier, third.transfer_id)
+            .expect("promoted cache read")
+            .expect("promoted capacity claim");
+        let capacity_cache = AuthenticatedEventRouteCache::empty_with_capacity(&verifier, 1);
+        capacity_cache
+            .insert(&verifier, preserved.clone())
+            .expect("fill small cache");
+        capacity_cache
+            .insert(&verifier, omitted)
+            .expect("full cache insertion remains nonfatal");
+        assert_eq!(
+            capacity_cache
+                .get(&verifier, first.transfer_id)
+                .expect("preserved cache read"),
+            Some(preserved),
+            "a full cache must preserve an irreplaceable historical proof"
+        );
+        assert!(
+            capacity_cache
+                .get(&verifier, third.transfer_id)
+                .expect("omitted cache read")
+                .is_none(),
+            "the current-lineage admission may be repaired after projection pruning"
+        );
+
+        drop(store);
+        fs::remove_dir_all(state).expect("cache cleanup");
+    }
+
+    #[tokio::test]
+    async fn authenticated_mutable_cache_reuses_noop_claims_and_verifies_only_new_rows() {
+        let state = root("authenticated-mutable-route-cache");
+        fs::create_dir_all(&state).expect("mutable cache state");
+        let services = control_test_services([0x8a; 32]);
+        let store = Store::open_for_mission(
+            state.join(STORE_FILE),
+            services.other.mission_authority_id(),
+        )
+        .expect("mutable cache store");
+        let mut publisher = open_test_sealer(&services.other);
+        let first_state = publish_test_state(
+            &store,
+            &mut publisher,
+            &services.topic,
+            &services.scope,
+            b"cache/state/one",
+            b"one",
+        );
+        let first_record = publish_test_record(
+            &store,
+            &mut publisher,
+            &services.topic,
+            &services.scope,
+            b"cache/record/one",
+            b"one",
+        );
+        drop(publisher);
+
+        let StartupEventVerification {
+            mut verifier,
+            historical_verifier,
+            cache,
+            policy,
+        } = open_startup_event_verifier_and_cache(&store, &services.other)
+            .expect("startup mutable cache proof");
+        drop(historical_verifier);
+        assert_eq!(cache.mutable_source_verifications(), 2);
+
+        CONTACT_EVENT_ROUTE_CACHE
+            .scope(cache.clone(), async {
+                for _ in 0..2 {
+                    let states = cached_mutable_sender_snapshot(
+                        &store,
+                        &policy,
+                        &mut verifier,
+                        MutableClass::State,
+                    )
+                    .expect("cached State sender snapshot");
+                    assert_eq!(
+                        states
+                            .claim(MutableTransferId::State(first_state))
+                            .map(|claim| claim.transfer_id),
+                        Some(MutableTransferId::State(first_state))
+                    );
+                    let records = cached_mutable_sender_snapshot(
+                        &store,
+                        &policy,
+                        &mut verifier,
+                        MutableClass::Record,
+                    )
+                    .expect("cached Record sender snapshot");
+                    assert_eq!(
+                        records
+                            .claim(MutableTransferId::Record(first_record))
+                            .map(|claim| claim.transfer_id),
+                        Some(MutableTransferId::Record(first_record))
+                    );
+                }
+                assert_eq!(cache.mutable_source_verifications(), 2);
+
+                let second_state = publish_test_state(
+                    &store,
+                    &mut verifier,
+                    &services.topic,
+                    &services.scope,
+                    b"cache/state/two",
+                    b"two",
+                );
+                let changed = cached_mutable_sender_snapshot(
+                    &store,
+                    &policy,
+                    &mut verifier,
+                    MutableClass::State,
+                )
+                .expect("one new State cache miss is repaired");
+                assert!(
+                    changed
+                        .claim(MutableTransferId::State(second_state))
+                        .is_some()
+                );
+                assert_eq!(cache.mutable_source_verifications(), 3);
+                let repeated = cached_mutable_sender_snapshot(
+                    &store,
+                    &policy,
+                    &mut verifier,
+                    MutableClass::State,
+                )
+                .expect("repaired mutable cache is reused");
+                assert!(
+                    repeated
+                        .claim(MutableTransferId::State(second_state))
+                        .is_some()
+                );
+                assert_eq!(cache.mutable_source_verifications(), 3);
+            })
+            .await;
+
+        drop(store);
+        fs::remove_dir_all(state).expect("mutable cache cleanup");
+    }
+
+    #[tokio::test]
+    async fn post_startup_mutable_admission_survives_same_epoch_rekey_and_restart() {
+        let source_state = root("post-startup-mutable-admission-source");
+        let receiver_state = root("post-startup-mutable-admission-receiver");
+        fs::create_dir_all(&source_state).expect("mutable admission source state");
+        fs::create_dir_all(&receiver_state).expect("mutable admission receiver state");
+        let services = control_test_services([0x8b; 32]);
+        let source_store = Store::open_for_mission(
+            source_state.join(STORE_FILE),
+            services.member.mission_authority_id(),
+        )
+        .expect("mutable admission source store");
+        let mut source = open_test_sealer(&services.member);
+        let historical_state = publish_test_state(
+            &source_store,
+            &mut source,
+            &services.topic,
+            &services.scope,
+            b"admission/state/historical",
+            b"historical State",
+        );
+        let historical_record = publish_test_record(
+            &source_store,
+            &mut source,
+            &services.topic,
+            &services.scope,
+            b"admission/record/historical",
+            b"historical Record",
+        );
+        let historical_state_source = source_store
+            .get_state(historical_state)
+            .expect("read historical State")
+            .expect("historical State source");
+        let historical_record_source = source_store
+            .get_record(historical_record)
+            .expect("read historical Record")
+            .expect("historical Record source");
+        drop(source);
+        drop(source_store);
+
+        let receiver_path = receiver_state.join(STORE_FILE);
+        let receiver_store =
+            Store::open_for_mission(&receiver_path, services.other.mission_authority_id())
+                .expect("mutable admission receiver store");
+        let StartupEventVerification {
+            mut verifier,
+            historical_verifier,
+            cache,
+            policy: _,
+        } = open_startup_event_verifier_and_cache(&receiver_store, &services.other)
+            .expect("empty startup mutable proof");
+        drop(historical_verifier);
+        assert_eq!(cache.mutable_source_verifications(), 0);
+
+        // Complete the provider handshake in memory so the admission seam
+        // receives the exact peer identity and opaque route commitments it
+        // requires in production.
+        let (initiator, client_hello) = ReferenceSessionInitiator::start(
+            services
+                .member
+                .fresh_bundle()
+                .expect("source session bundle"),
+        )
+        .expect("start source session");
+        let responder = ReferenceSessionResponder::open(
+            services
+                .other
+                .fresh_bundle()
+                .expect("receiver session bundle"),
+        )
+        .expect("open receiver session");
+        let (responder, server_hello) = responder
+            .receive_client(&client_hello)
+            .expect("receiver authenticates source hello");
+        let (initiator, client_auth) = initiator
+            .receive_server(&server_hello)
+            .expect("source authenticates receiver hello");
+        let (peer_session, server_finished) = responder
+            .receive_client_auth(&client_auth)
+            .expect("receiver authenticates source session");
+        let _source_session = initiator
+            .receive_finished(&server_finished)
+            .expect("source authenticates receiver finish");
+        let authenticated_peer = peer_session.peer_identity();
+        let peer_route_commitments = peer_session.peer_route_grant_commitments().to_vec();
+        assert_eq!(authenticated_peer, services.member.identity());
+        let receive_interest = exact_event_interest(&services.topic, &services.scope);
+
+        let policy_lock = Arc::new(RwLock::new(()));
+        let event_lease = policy_lock.clone().read_owned().await;
+        let lane_guard = EventLaneGuard::capture(
+            event_lease,
+            &receiver_store,
+            verifier.identity(),
+            authenticated_peer,
+            0,
+        )
+        .expect("post-startup mutable admission guard");
+
+        CONTACT_EVENT_ROUTE_CACHE
+            .scope(cache.clone(), async {
+                assert_eq!(
+                    accept_received_mutable(
+                        &receiver_store,
+                        &lane_guard,
+                        &mut verifier,
+                        MutablePeerAdmission {
+                            peer: authenticated_peer,
+                            commitments: &peer_route_commitments,
+                            interest: MutableReceiveInterest::StateOrRecord(&receive_interest),
+                        },
+                        MutableTransferId::State(historical_state),
+                        &historical_state_source.sealed,
+                    )
+                    .expect("accept post-startup historical State"),
+                    MutableApplyDisposition::Inserted
+                );
+
+                // An exact peer retry takes the Duplicate path and must leave
+                // the same admission-time proof installed.
+                assert_eq!(
+                    accept_received_mutable(
+                        &receiver_store,
+                        &lane_guard,
+                        &mut verifier,
+                        MutablePeerAdmission {
+                            peer: authenticated_peer,
+                            commitments: &peer_route_commitments,
+                            interest: MutableReceiveInterest::StateOrRecord(&receive_interest),
+                        },
+                        MutableTransferId::State(historical_state),
+                        &historical_state_source.sealed,
+                    )
+                    .expect("accept duplicate historical State"),
+                    MutableApplyDisposition::Duplicate
+                );
+
+                assert_eq!(
+                    accept_received_mutable(
+                        &receiver_store,
+                        &lane_guard,
+                        &mut verifier,
+                        MutablePeerAdmission {
+                            peer: authenticated_peer,
+                            commitments: &peer_route_commitments,
+                            interest: MutableReceiveInterest::StateOrRecord(&receive_interest),
+                        },
+                        MutableTransferId::Record(historical_record),
+                        &historical_record_source.sealed,
+                    )
+                    .expect("accept post-startup historical Record"),
+                    MutableApplyDisposition::Inserted
+                );
+            })
+            .await;
+        assert_eq!(cache.mutable_source_verifications(), 3);
+        let historical_state_claim = cache
+            .get_mutable(&verifier, MutableTransferId::State(historical_state))
+            .expect("read admitted historical State claim")
+            .expect("admitted historical State claim");
+        assert!(
+            cache
+                .get_mutable(&verifier, MutableTransferId::Record(historical_record))
+                .expect("read admitted historical Record claim")
+                .is_some()
+        );
+        let mut conflicting = historical_state_claim.clone();
+        conflicting.metadata_fingerprint[0] ^= 1;
+        assert!(matches!(
+            cache.insert_mutable(&verifier, conflicting),
+            Err(NodeError::Protocol(message))
+                if message == "authenticated mutable route cache has conflicting exact claims"
+        ));
+
+        // Control activation cannot race the synchronous commit/cache section:
+        // release the exact Event-lane read lease only after both claims exist.
+        drop(lane_guard);
+        let recipients = vec![
+            ScopeRekeyRecipient::member(
+                services.authority.identity(),
+                vec![services.topic.clone()],
+            )
+            .expect("authority rekey recipient"),
+            ScopeRekeyRecipient::member(services.member.identity(), vec![services.topic.clone()])
+                .expect("source rekey recipient"),
+            ScopeRekeyRecipient::member(services.other.identity(), vec![services.topic.clone()])
+                .expect("receiver rekey recipient"),
+        ];
+        let mut authority = open_test_sealer(&services.authority);
+        let (sealed_rekey, _) = authority
+            .seal_chained_scope_rekey_control_from_registry(
+                &services.registry,
+                0,
+                services.scope.clone(),
+                1,
+                recipients,
+                1,
+                None,
+            )
+            .expect("seal first same-epoch mutable rekey");
+        let verified_rekey = verifier
+            .verify_control(&sealed_rekey)
+            .expect("verify first same-epoch mutable rekey");
+        let rekey_outcome = receiver_store
+            .ingest_verified_control(&verified_rekey, &sealed_rekey)
+            .expect("commit first same-epoch mutable rekey");
+        activate_committed_controls(
+            &receiver_store,
+            &mut verifier,
+            rekey_outcome.activated(),
+            None,
+        )
+        .expect("activate first same-epoch mutable rekey");
+        assert!(!verifier.is_current_source_route_lineage(
+            &historical_state_claim.scope,
+            historical_state_claim.key_epoch,
+            historical_state_claim.route_lineage,
+        ));
+
+        // Current-lineage rows prove the first post-rekey snapshot continues;
+        // the historical rows must be withheld without trying to decrypt them.
+        let current_state = publish_test_state(
+            &receiver_store,
+            &mut verifier,
+            &services.topic,
+            &services.scope,
+            b"admission/state/current",
+            b"current State",
+        );
+        let current_record = publish_test_record(
+            &receiver_store,
+            &mut verifier,
+            &services.topic,
+            &services.scope,
+            b"admission/record/current",
+            b"current Record",
+        );
+        let rekey_policy = receiver_store
+            .control_policy_snapshot()
+            .expect("same-epoch mutable policy");
+        CONTACT_EVENT_ROUTE_CACHE
+            .scope(cache.clone(), async {
+                let states = cached_mutable_sender_snapshot(
+                    &receiver_store,
+                    &rekey_policy,
+                    &mut verifier,
+                    MutableClass::State,
+                )
+                .expect("first post-rekey State snapshot continues");
+                assert!(
+                    states
+                        .claim(MutableTransferId::State(historical_state))
+                        .is_none()
+                );
+                assert!(
+                    states
+                        .claim(MutableTransferId::State(current_state))
+                        .is_some()
+                );
+                let records = cached_mutable_sender_snapshot(
+                    &receiver_store,
+                    &rekey_policy,
+                    &mut verifier,
+                    MutableClass::Record,
+                )
+                .expect("first post-rekey Record snapshot continues");
+                assert!(
+                    records
+                        .claim(MutableTransferId::Record(historical_record))
+                        .is_none()
+                );
+                assert!(
+                    records
+                        .claim(MutableTransferId::Record(current_record))
+                        .is_some()
+                );
+            })
+            .await;
+        assert!(
+            cache
+                .get_mutable(&verifier, MutableTransferId::State(historical_state))
+                .expect("historical State cache survives stale sender snapshot")
+                .is_some()
+        );
+        assert!(
+            cache
+                .get_mutable(&verifier, MutableTransferId::Record(historical_record))
+                .expect("historical Record cache survives stale sender snapshot")
+                .is_some()
+        );
+
+        drop(verifier);
+        drop(cache);
+        drop(receiver_store);
+        let reopened =
+            Store::open_for_mission(&receiver_path, services.other.mission_authority_id())
+                .expect("reopen same-epoch mutable receiver");
+        let StartupEventVerification {
+            mut verifier,
+            historical_verifier,
+            cache,
+            policy,
+        } = open_startup_event_verifier_and_cache(&reopened, &services.other)
+            .expect("rebuild same-epoch mutable lineage union");
+        drop(historical_verifier);
+        CONTACT_EVENT_ROUTE_CACHE
+            .scope(cache, async {
+                let states = cached_mutable_sender_snapshot(
+                    &reopened,
+                    &policy,
+                    &mut verifier,
+                    MutableClass::State,
+                )
+                .expect("reopened State snapshot");
+                assert!(
+                    states
+                        .claim(MutableTransferId::State(historical_state))
+                        .is_none()
+                );
+                assert!(
+                    states
+                        .claim(MutableTransferId::State(current_state))
+                        .is_some()
+                );
+                let records = cached_mutable_sender_snapshot(
+                    &reopened,
+                    &policy,
+                    &mut verifier,
+                    MutableClass::Record,
+                )
+                .expect("reopened Record snapshot");
+                assert!(
+                    records
+                        .claim(MutableTransferId::Record(historical_record))
+                        .is_none()
+                );
+                assert!(
+                    records
+                        .claim(MutableTransferId::Record(current_record))
+                        .is_some()
+                );
+            })
+            .await;
+
+        drop(reopened);
+        fs::remove_dir_all(source_state).expect("mutable admission source cleanup");
+        fs::remove_dir_all(receiver_state).expect("mutable admission receiver cleanup");
+    }
+
+    #[tokio::test]
+    async fn same_epoch_rekey_restart_withholds_historical_lineage_and_contact_continues() {
+        const EVENT_OPERATIONS: redb::TableDefinition<&[u8], &[u8]> =
+            redb::TableDefinition::new("aster.event-operations.v1");
+        const METADATA: redb::TableDefinition<&str, u64> =
+            redb::TableDefinition::new("aster.metadata.v1");
+        const EVENT_OPERATION_TOTAL_BYTES: &str = "semantic_event_operation_total_bytes";
+        const HISTORICAL_OPERATION: &[u8] = b"same-epoch/historical";
+        let services = control_test_services([0x84; 32]);
+        let source_state = root("same-epoch-lineage-source");
+        let receiver_state = root("same-epoch-lineage-receiver");
+        fs::create_dir_all(&source_state).expect("source state");
+        fs::create_dir_all(&receiver_state).expect("receiver state");
+        let source_path = source_state.join(STORE_FILE);
+        let receiver_path = receiver_state.join(STORE_FILE);
+        let source_store =
+            Store::open_for_mission(&source_path, services.member.mission_authority_id())
+                .expect("source store");
+        let receiver_store =
+            Store::open_for_mission(&receiver_path, services.other.mission_authority_id())
+                .expect("receiver store");
+        let clock_id = [0x85; 16];
+        let mut source_verifier = open_test_sealer(&services.member);
+        let historical = publish_test_custody_event(
+            &source_store,
+            &mut source_verifier,
+            TestCustodyPublication {
+                operation: HISTORICAL_OPERATION,
+                topic: &services.topic,
+                scope: &services.scope,
+                priority: Priority::Flash,
+                ttl_ms: None,
+                sample: CustodySample {
+                    clock_id,
+                    tick_ms: 0,
+                },
+                payload: b"old-provisioning-lineage",
+                tombstone: false,
+            },
+        );
+        drop(source_verifier);
+        drop(source_store);
+
+        // Recreate the pre-intent v1 operation row while leaving the exact
+        // historical Event representation live and witnessless.
+        let database = redb::Database::open(&source_path).expect("open legacy source fixture");
+        let write = database.begin_write().expect("begin legacy source fixture");
+        let removed_operation_bytes = {
+            let mut operations = write.open_table(EVENT_OPERATIONS).expect("operations");
+            let current = operations
+                .get(HISTORICAL_OPERATION)
+                .expect("read historical operation")
+                .expect("historical operation row")
+                .value()
+                .to_vec();
+            assert_eq!(current[0], 2);
+            assert_eq!(current[33], 0);
+            let mut legacy = Vec::with_capacity(34);
+            legacy.push(1);
+            legacy.extend_from_slice(&current[1..34]);
+            operations
+                .insert(HISTORICAL_OPERATION, legacy.as_slice())
+                .expect("install historical v1 operation");
+            u64::try_from(current.len() - legacy.len()).expect("fixture delta fits u64")
+        };
+        {
+            let mut metadata = write.open_table(METADATA).expect("metadata");
+            let operation_bytes = metadata
+                .get(EVENT_OPERATION_TOTAL_BYTES)
+                .expect("read operation accounting")
+                .expect("operation accounting")
+                .value();
+            metadata
+                .insert(
+                    EVENT_OPERATION_TOTAL_BYTES,
+                    operation_bytes
+                        .checked_sub(removed_operation_bytes)
+                        .expect("legacy operation is smaller"),
+                )
+                .expect("adjust operation accounting");
+        }
+        write.commit().expect("commit historical v1 fixture");
+        drop(database);
+        let source_store =
+            Store::open_for_mission(&source_path, services.member.mission_authority_id())
+                .expect("reopen source before rekey");
+        let mut source_verifier = open_test_sealer(&services.member);
+
+        let recipients = vec![
+            ScopeRekeyRecipient::member(
+                services.authority.identity(),
+                vec![services.topic.clone()],
+            )
+            .expect("authority recipient"),
+            ScopeRekeyRecipient::member(services.member.identity(), vec![services.topic.clone()])
+                .expect("source recipient"),
+            ScopeRekeyRecipient::member(services.other.identity(), vec![services.topic.clone()])
+                .expect("receiver recipient"),
+        ];
+        let mut authority = open_test_sealer(&services.authority);
+        let (sealed_rekey, _) = authority
+            .seal_chained_scope_rekey_control_from_registry(
+                &services.registry,
+                0,
+                services.scope.clone(),
+                1,
+                recipients,
+                1,
+                None,
+            )
+            .expect("seal first same-epoch replacement");
+        let source_control = source_verifier
+            .verify_control(&sealed_rekey)
+            .expect("source verifies replacement");
+        let source_outcome = source_store
+            .ingest_verified_control(&source_control, &sealed_rekey)
+            .expect("source retains replacement");
+        activate_committed_controls(
+            &source_store,
+            &mut source_verifier,
+            source_outcome.activated(),
+            None,
+        )
+        .expect("source activates replacement");
+
+        let mut receiver_verifier = open_test_sealer(&services.other);
+        let receiver_control = receiver_verifier
+            .verify_control(&sealed_rekey)
+            .expect("receiver verifies replacement");
+        let receiver_outcome = receiver_store
+            .ingest_verified_control(&receiver_control, &sealed_rekey)
+            .expect("receiver retains replacement");
+        activate_committed_controls(
+            &receiver_store,
+            &mut receiver_verifier,
+            receiver_outcome.activated(),
+            None,
+        )
+        .expect("receiver activates replacement");
+        seed_test_event_subscription(
+            &receiver_store,
+            EventSubscriptionMode::Consume,
+            &services.topic,
+            &services.scope,
+            b"same-epoch-consume",
+        );
+
+        let current = publish_test_custody_event(
+            &source_store,
+            &mut source_verifier,
+            TestCustodyPublication {
+                operation: b"same-epoch/current",
+                topic: &services.topic,
+                scope: &services.scope,
+                priority: Priority::Routine,
+                ttl_ms: None,
+                sample: CustodySample {
+                    clock_id,
+                    tick_ms: 1,
+                },
+                payload: b"current-replacement-lineage",
+                tombstone: false,
+            },
+        );
+        drop(source_verifier);
+        drop(receiver_verifier);
+        drop(source_store);
+        drop(receiver_store);
+
+        let source_store = Arc::new(
+            Store::open_for_mission(&source_path, services.member.mission_authority_id())
+                .expect("reopen source"),
+        );
+        let receiver_store = Arc::new(
+            Store::open_for_mission(&receiver_path, services.other.mission_authority_id())
+                .expect("reopen receiver"),
+        );
+        let (source_receipt, receiver_receipt) = contact_test_pair(
+            receiver_store.clone(),
+            services.other.clone(),
+            source_store.clone(),
+            services.member.clone(),
+        )
+        .await;
+        assert_eq!(source_receipt.offered, 1);
+        assert_eq!(source_receipt.remaining, 0);
+        assert_eq!(receiver_receipt.fetched, 1);
+        assert_eq!(receiver_receipt.inserted, 1);
+        let source_policy = source_store
+            .control_policy_snapshot()
+            .expect("source policy after historical migration");
+        assert!(
+            source_store
+                .unbound_legacy_event_operations_with_policy(&source_policy, None, MAX_EVENT_PAGE,)
+                .expect("historical legacy recovery scan")
+                .is_empty(),
+            "startup must bind the old-lineage v1 plaintext witness before maintenance"
+        );
+        assert!(
+            receiver_store
+                .get_event(current.transfer_id)
+                .expect("current receiver lookup")
+                .is_some()
+        );
+        assert!(
+            receiver_store
+                .get_event(historical.transfer_id)
+                .expect("historical receiver lookup")
+                .is_none(),
+            "same-epoch historical ciphertext must remain withheld"
+        );
+
+        let (source_repeat, receiver_repeat) = contact_test_pair(
+            receiver_store.clone(),
+            services.other.clone(),
+            source_store.clone(),
+            services.member.clone(),
+        )
+        .await;
+        assert_eq!(source_repeat.offered, 0);
+        assert_eq!(receiver_repeat.fetched, 0);
+
+        drop(source_store);
+        drop(receiver_store);
+        fs::remove_dir_all(source_state).expect("source cleanup");
+        fs::remove_dir_all(receiver_state).expect("receiver cleanup");
+    }
+
+    #[test]
+    fn selected_control_bounds_leave_one_v3_interest_and_defer_exchange() {
+        const HANDSHAKE_FLIGHTS: usize = 4;
+        const SELECTED_HANDSHAKE_FLIGHT_BYTES: u64 = 64 * 1024;
+        const CONTROL_OBJECT_PLAINTEXT_OVERHEAD: u64 = 4 + 1 + 32 + 4;
+        const CONTROL_APPLY_PLAINTEXT_BYTES: u64 = 4 + 1 + 32 + 1;
+
+        let rounds = usize::try_from(ReconciliationLimits::default().rounds())
+            .expect("selected reconciliation rounds fit usize");
+        assert_eq!(rounds, 256);
+        let reconciliation_exchanges = rounds
+            .checked_mul(2)
+            .expect("forward and reverse control reconciliation rounds");
+        let fixed_control_exchanges = 3usize; // inventory complete, difference bound, finish
+        let continuation_exchanges = 2usize; // EventInterest and EventLaneDeferred
+        let frames_before_continuation = HANDSHAKE_FLIGHTS
+            .checked_add(
+                reconciliation_exchanges
+                    .checked_mul(EXCHANGE_FRAMES)
+                    .expect("control reconciliation frames"),
+            )
+            .and_then(|frames| {
+                frames.checked_add(
+                    fixed_control_exchanges
+                        .checked_mul(EXCHANGE_FRAMES)
+                        .expect("fixed control frames"),
+                )
+            })
+            .and_then(|frames| {
+                frames.checked_add(
+                    MAX_CONTACT_ITEMS
+                        .checked_mul(EXCHANGE_FRAMES)
+                        .expect("control transfer frames"),
+                )
+            })
+            .expect("selected pre-Event frame bound");
+        let continuation_frames = continuation_exchanges
+            .checked_mul(EXCHANGE_FRAMES)
+            .expect("Event continuation frames");
+        assert!(
+            MAX_CONTACT_FRAMES - frames_before_continuation >= continuation_frames,
+            "control must leave an EventInterest exchange and one authenticated defer"
+        );
+        assert_eq!(frames_before_continuation + continuation_frames, 8_038);
+
+        // The largest protected control reconciliation frame is the v3
+        // inventory reply: magic, tag, policy, revision, length, and a maximum
+        // negentropy body. Charging that size for both sides of every forward
+        // and reverse round is conservative.
+        let reconciliation_frame_bytes = u64::try_from(
+            4 + 1 + 1 + 8 + 4 + DEFAULT_FRAME_SIZE_LIMIT + APPLICATION_PROTECTION_OVERHEAD_BYTES,
+        )
+        .expect("reconciliation frame bound fits u64");
+        let reconciliation_bytes = u64::try_from(reconciliation_exchanges)
+            .expect("exchange count fits u64")
+            .checked_mul(2)
+            .and_then(|frames| frames.checked_mul(reconciliation_frame_bytes))
+            .expect("control reconciliation byte bound");
+        let fixed_control_bytes = u64::try_from(fixed_control_exchanges)
+            .expect("fixed exchange count fits u64")
+            .checked_mul(
+                u64::try_from(EVENT_LANE_DEFER_EXCHANGE_BYTES)
+                    .expect("direction-only exchange bytes fit u64"),
+            )
+            .expect("fixed control byte bound");
+        let control_transfer_overhead = CONTROL_OBJECT_PLAINTEXT_OVERHEAD
+            .checked_add(
+                u64::try_from(APPLICATION_PROTECTION_OVERHEAD_BYTES)
+                    .expect("protection overhead fits u64"),
+            )
+            .and_then(|bytes| bytes.checked_add(CONTROL_APPLY_PLAINTEXT_BYTES))
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    u64::try_from(APPLICATION_PROTECTION_OVERHEAD_BYTES)
+                        .expect("protection overhead fits u64"),
+                )
+            })
+            .expect("control transfer overhead");
+        assert_eq!(control_transfer_overhead, 183);
+        let control_transfer_bytes = MAX_CONTROL_BYTES
+            .checked_mul(2)
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    u64::try_from(MAX_CONTACT_ITEMS)
+                        .expect("contact item bound fits u64")
+                        .checked_mul(control_transfer_overhead)
+                        .expect("control transfer overhead bound"),
+                )
+            })
+            .expect("control transfer byte bound");
+        let handshake_bytes = u64::try_from(HANDSHAKE_FLIGHTS)
+            .expect("handshake count fits u64")
+            .checked_mul(SELECTED_HANDSHAKE_FLIGHT_BYTES)
+            .expect("handshake byte bound");
+        let event_interest_plaintext = u64::try_from(4 + 1 + 1 + 8 + 8 + MAX_EVENT_INTEREST_BYTES)
+            .expect("Event interest bound fits u64");
+        let event_interest_exchange_bytes = event_interest_plaintext
+            .checked_add(
+                u64::try_from(APPLICATION_PROTECTION_OVERHEAD_BYTES)
+                    .expect("protection overhead fits u64"),
+            )
+            .and_then(|bytes| bytes.checked_mul(2))
+            .expect("Event interest exchange bound");
+        let defer_bytes =
+            u64::try_from(EVENT_LANE_DEFER_EXCHANGE_BYTES).expect("defer exchange bytes fit u64");
+        let bytes_before_continuation = handshake_bytes
+            .checked_add(reconciliation_bytes)
+            .and_then(|bytes| bytes.checked_add(fixed_control_bytes))
+            .and_then(|bytes| bytes.checked_add(control_transfer_bytes))
+            .expect("selected pre-Event byte bound");
+        let continuation_bytes = event_interest_exchange_bytes
+            .checked_add(defer_bytes)
+            .expect("Event continuation byte bound");
+        assert!(
+            u64::try_from(MAX_CONTACT_BYTES)
+                .expect("contact byte limit fits u64")
+                .checked_sub(bytes_before_continuation)
+                .is_some_and(|remaining| remaining >= continuation_bytes),
+            "control must leave byte budget for EventInterest and authenticated defer"
+        );
+    }
+
+    #[test]
+    fn v3_receiver_authorizes_a_priority_winner_beyond_contact_capacity() {
+        let ids = (0..=MAX_CONTACT_ITEMS)
+            .map(|index| {
+                let mut bytes = [0u8; 32];
+                bytes[28..].copy_from_slice(
+                    &u32::try_from(index)
+                        .expect("test index fits u32")
+                        .to_be_bytes(),
+                );
+                EventTransferId::new(bytes)
+            })
+            .collect::<Vec<_>>();
+        let priority_tail = *ids.last().expect("nonempty difference");
+
+        // Initiator source -> responder receiver. The globally priority-ordered
+        // sender may choose the final canonical ID instead of the lexicographic
+        // prefix, and the receiver authorizes it from the full mirror set.
+        let to_responder = EventDifference {
+            local_only: Vec::new(),
+            remote_only: ids.clone(),
+        };
+        let mut responder = TransferAuthorization::for_peer(
+            &to_responder,
+            EventDirection::ToSessionResponder,
+            MAX_CONTACT_ITEMS,
+        )
+        .expect("ordered responder difference");
+        assert_eq!(responder.finish_remaining(), MAX_CONTACT_ITEMS + 1);
+        assert!(responder.authorize(priority_tail));
+        assert!(
+            !responder.authorize(priority_tail),
+            "replay is not authorized"
+        );
+        for id in ids.iter().take(MAX_CONTACT_ITEMS - 1).copied() {
+            assert!(responder.authorize(id));
+        }
+        assert_eq!(responder.finish_remaining(), 1);
+        assert!(
+            !responder.authorize(ids[MAX_CONTACT_ITEMS - 1]),
+            "full-difference membership must not bypass the separate contact cap"
+        );
+
+        // Responder source -> initiator receiver uses the same full-set check
+        // in its v3 source-push branch, independently of canonical ID rank.
+        let mut initiator = TransferAuthorization::new(&ids, MAX_CONTACT_ITEMS)
+            .expect("ordered initiator difference");
+        assert_eq!(initiator.finish_remaining(), MAX_CONTACT_ITEMS + 1);
+        assert!(initiator.authorize(priority_tail));
+        assert!(
+            !initiator.authorize(priority_tail),
+            "replay is not authorized"
+        );
+    }
+
+    #[test]
+    fn protected_emission_snapshot_rejects_zero_and_mid_contact_change() {
+        let mut observed = None;
+        assert!(
+            observe_remote_emission_policy(&mut observed, FrameEmissionPolicy::Normal, 0).is_err()
+        );
+        let captured = observe_remote_emission_policy(
+            &mut observed,
+            FrameEmissionPolicy::AtLeast(Priority::Immediate),
+            7,
+        )
+        .expect("capture protected policy");
+        assert_eq!(captured.revision, 7);
+        assert!(
+            observe_remote_emission_policy(
+                &mut observed,
+                FrameEmissionPolicy::AtLeast(Priority::Immediate),
+                8,
+            )
+            .is_err()
+        );
+
+        let live = Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal));
+        let captured = live.snapshot().expect("local snapshot");
+        let guard = ContactEmissionGuard {
+            live: live.clone(),
+            captured,
+            custody_clock: NodeCustodyClock::injected([0x82; 16], 0, 0),
+        };
+        live.update(EventEmissionPolicy::ReceiveOnly)
+            .expect("mid-contact update");
+        assert!(matches!(
+            guard.require_response(&Frame::ControlObject {
+                id: ControlTransferId::new([0x83; 32]),
+                bytes: vec![1],
+            }),
+            Err(NodeError::EmissionPolicyChanged)
+        ));
+        let receive_only = Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::ReceiveOnly));
+        let guard = ContactEmissionGuard {
+            captured: receive_only.snapshot().expect("receive-only snapshot"),
+            live: receive_only,
+            custody_clock: NodeCustodyClock::injected([0x84; 16], 0, 0),
+        };
+        assert!(
+            guard
+                .require_response(&Frame::ControlObject {
+                    id: ControlTransferId::new([0x85; 32]),
+                    bytes: vec![1],
+                })
+                .is_err()
+        );
+    }
 
     struct IssuedMission {
         credentials: UnprotectedReferenceMission,
@@ -8335,6 +19627,84 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[test]
+    fn blob_interest_uses_static_epoch_one_exact_proof_and_receive_only_discloses_none() {
+        let mut issued = issue_missions(1);
+        let mission = issued.pop().expect("issued Blob-interest mission");
+        let state = root("blob-interest-proof");
+        fs::create_dir_all(&state).expect("Blob-interest state");
+        let store = Store::open_for_mission(
+            state.join(STORE_FILE),
+            mission.credentials.mission_authority_id(),
+        )
+        .expect("Blob-interest store");
+        let sealer = open_test_sealer(&mission.credentials);
+        let scope = Scope::new("test/runtime-contact").expect("Blob scope");
+        let topic = Topic::new("opaque").expect("Blob topic");
+        assert_eq!(store.active_scope_epoch(&scope).expect("scope epoch"), None);
+        let configured =
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                topic.clone(),
+                scope.clone(),
+                false,
+            )]);
+        let interest = protected_blob_interest(&store, &sealer, &configured, true)
+            .expect("protected Blob interest");
+        assert_eq!(interest.len(), 1);
+        let selector = interest.selector(&topic, &scope).expect("exact selector");
+        assert_eq!(selector.epoch(), 1);
+        assert_eq!(
+            selector.content_proof(),
+            sealer
+                .mint_blob_peer_content_proof(&scope, &topic, 1)
+                .expect("epoch-one proof")
+                .as_wire_bytes()
+        );
+        assert!(
+            protected_blob_interest(&store, &sealer, &configured, false)
+                .expect("ReceiveOnly Blob interest")
+                .is_empty()
+        );
+        let unauthorized =
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                Topic::new("not-granted").expect("unauthorized topic"),
+                scope,
+                false,
+            )]);
+        assert!(
+            protected_blob_interest(&store, &sealer, &unauthorized, true)
+                .expect("unauthorized selector is omitted")
+                .is_empty()
+        );
+        drop(store);
+        fs::remove_dir_all(state).expect("Blob-interest cleanup");
+    }
+
+    #[test]
+    fn blob_capacity_classifier_is_exact_and_includes_causal_frontier() {
+        for error in [
+            StoreError::Blob(BlobStoreError::CausalFrontierLimitExceeded {
+                current: 1,
+                limit: 1,
+            }),
+            StoreError::Blob(BlobStoreError::NetworkStagingRowLimitExceeded {
+                current: 1,
+                incoming: 1,
+                limit: 1,
+            }),
+            StoreError::Blob(BlobStoreError::DepotByteLimitExceeded {
+                current: 1,
+                incoming: 1,
+                limit: 1,
+            }),
+        ] {
+            assert!(blob_apply_capacity_error(&error));
+        }
+        assert!(!blob_apply_capacity_error(&StoreError::Blob(
+            BlobStoreError::CompletionMismatch
+        )));
     }
 
     fn exact_event_interest(topic: &Topic, scope: &Scope) -> EventInterest {
@@ -8376,6 +19746,140 @@ mod tests {
             .into_iter()
             .find(SocketAddr::is_ipv4)
             .expect("IPv4 loopback binding")
+    }
+
+    async fn run_test_mutable_contact(
+        client_store: Arc<Store>,
+        server_store: Arc<Store>,
+        client_mission: &IssuedMission,
+        server_mission: &IssuedMission,
+        interests: MutableSourceInterests,
+    ) -> (PeerReceipt, PeerReceipt) {
+        let server = Endpoint::bind(
+            aster_iroh::SecretKey::generate(),
+            EndpointConfig::direct("127.0.0.1:0".parse().expect("server address")),
+        )
+        .await
+        .expect("server endpoint");
+        let client = Endpoint::bind(
+            aster_iroh::SecretKey::generate(),
+            EndpointConfig::direct("127.0.0.1:0".parse().expect("client address")),
+        )
+        .await
+        .expect("client endpoint");
+        let server_task = tokio::spawn({
+            let server = server.clone();
+            let store = server_store;
+            let credentials = server_mission.credentials.clone();
+            let allowed = BTreeSet::from([client.id()]);
+            let peer = MissionPeerBinding::new(client.id(), client_mission.identity);
+            let interests = interests.clone();
+            async move {
+                let connection = server.accept(&allowed).await.expect("accept carrier");
+                serve_connection(
+                    store,
+                    connection,
+                    credentials,
+                    peer,
+                    Arc::new(RwLock::new(())),
+                    interests,
+                )
+                .await
+            }
+        });
+        let client_contact = sync_once_with_policy(
+            client_store,
+            &client,
+            client_mission.credentials.clone(),
+            MissionExpectedPeer {
+                carrier: ExpectedPeer {
+                    id: server.id(),
+                    address: loopback(&server),
+                },
+                mission: server_mission.identity,
+            },
+            Arc::new(RwLock::new(())),
+            interests,
+        )
+        .await
+        .expect("real Iroh mutable client contact");
+        let server_contact = server_task
+            .await
+            .expect("server task")
+            .expect("real Iroh mutable server contact");
+        client.close().await;
+        server.close().await;
+        (client_contact.receipt, server_contact.receipt)
+    }
+
+    fn assert_mutable_convergence(
+        store: &Store,
+        policy: &ControlPolicySnapshot,
+        topic: &Topic,
+        scope: &Scope,
+        expected_state: StateTransferId,
+        expected_records: &[RecordTransferId],
+        expected_record_current: RecordTransferId,
+    ) {
+        assert_eq!(
+            store
+                .state_inventory_with_policy(policy)
+                .expect("converged State inventory")
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![expected_state]
+        );
+        let state_plan = store
+            .prepare_state_projection_with_policy(policy, topic, scope, b"asset/network-state")
+            .expect("converged State projection");
+        assert_eq!(state_plan.candidates().len(), 1);
+        assert_eq!(
+            state_plan
+                .current()
+                .map(|candidate| candidate.state().transfer_id),
+            Some(expected_state)
+        );
+        store
+            .require_state_projection_plan_with_policy(policy, &state_plan)
+            .expect("stable exact State projection");
+
+        let mut expected_records = expected_records.to_vec();
+        expected_records.sort_unstable();
+        assert_eq!(
+            store
+                .record_inventory_with_policy(policy)
+                .expect("converged Record inventory")
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            expected_records
+        );
+        let record_plan = store
+            .prepare_record_projection_with_policy(policy, topic, scope, b"asset/network-record")
+            .expect("converged Record projection");
+        let mut candidate_ids = record_plan
+            .candidates()
+            .iter()
+            .map(|candidate| candidate.record().transfer_id)
+            .collect::<Vec<_>>();
+        candidate_ids.sort_unstable();
+        assert_eq!(candidate_ids, expected_records);
+        let mut head_ids = record_plan
+            .heads()
+            .map(|candidate| candidate.record().transfer_id)
+            .collect::<Vec<_>>();
+        head_ids.sort_unstable();
+        assert_eq!(head_ids, expected_records);
+        assert_eq!(
+            record_plan
+                .current()
+                .map(|candidate| candidate.record().transfer_id),
+            Some(expected_record_current)
+        );
+        store
+            .require_record_projection_plan_with_policy(policy, &record_plan)
+            .expect("stable exact Record projection");
     }
 
     #[tokio::test]
@@ -8456,6 +19960,7 @@ mod tests {
             StateContentVerification::ContentVerified { state, .. } => state,
             StateContentVerification::RouteOnly(_) => panic!("client has State content grant"),
         };
+        let state_transfer_id = StateTransferId::new(state.envelope_id());
         client_store
             .commit_reserved_state_with_policy(
                 &client_policy,
@@ -8491,6 +19996,8 @@ mod tests {
             RecordContentVerification::ContentVerified { record, .. } => record,
             RecordContentVerification::RouteOnly(_) => panic!("client has Record content grant"),
         };
+        let client_record_transfer_id = RecordTransferId::new(client_record.envelope_id());
+        let client_record_semantic_id = client_record.item_id();
         client_store
             .commit_reserved_record_with_policy(
                 &client_policy,
@@ -8526,6 +20033,8 @@ mod tests {
             RecordContentVerification::ContentVerified { record, .. } => record,
             RecordContentVerification::RouteOnly(_) => panic!("server has Record content grant"),
         };
+        let server_record_transfer_id = RecordTransferId::new(server_record.envelope_id());
+        let server_record_semantic_id = server_record.item_id();
         server_store
             .commit_reserved_record_with_policy(
                 &server_policy,
@@ -8568,7 +20077,7 @@ mod tests {
             }
         });
         let client_contact = sync_once_with_policy(
-            &client_store,
+            client_store.clone(),
             &client,
             client_mission.credentials.clone(),
             MissionExpectedPeer {
@@ -8589,37 +20098,524 @@ mod tests {
             .expect("server mutable contact");
         assert_eq!(contact_status(&client_contact.receipt), "pass");
         assert_eq!(contact_status(&server_contact.receipt), "pass");
-
-        assert_eq!(
-            server_store
-                .state_inventory_with_policy(&server_policy)
-                .expect("server State inventory")
-                .len(),
-            1
-        );
+        let expected_records = [client_record_transfer_id, server_record_transfer_id];
+        let expected_record_current = if client_record_semantic_id > server_record_semantic_id {
+            client_record_transfer_id
+        } else {
+            server_record_transfer_id
+        };
         for (store, policy) in [
             (&*client_store, &client_policy),
             (&*server_store, &server_policy),
         ] {
-            assert_eq!(
-                store
-                    .record_inventory_with_policy(policy)
-                    .expect("converged Record inventory")
-                    .len(),
-                2
+            assert_mutable_convergence(
+                store,
+                policy,
+                &topic,
+                &scope,
+                state_transfer_id,
+                &expected_records,
+                expected_record_current,
             );
-            let plan = store
-                .prepare_record_projection_with_policy(
-                    policy,
-                    &topic,
-                    &scope,
-                    b"asset/network-record",
-                )
-                .expect("converged Record projection");
-            assert_eq!(plan.heads().count(), 2);
+        }
+
+        client.close().await;
+        server.close().await;
+        drop(client_store);
+        drop(server_store);
+
+        let client_store = Store::open_for_mission(client_root.join(STORE_FILE), authority)
+            .expect("reopen client");
+        let server_store = Store::open_for_mission(server_root.join(STORE_FILE), authority)
+            .expect("reopen server");
+        for store in [&client_store, &server_store] {
+            let policy = store
+                .control_policy_snapshot()
+                .expect("reopened settled policy");
+            assert_mutable_convergence(
+                store,
+                &policy,
+                &topic,
+                &scope,
+                state_transfer_id,
+                &expected_records,
+                expected_record_current,
+            );
         }
         drop(client_store);
         drop(server_store);
+        fs::remove_dir_all(client_root).expect("remove client root");
+        fs::remove_dir_all(server_root).expect("remove server root");
+    }
+
+    #[tokio::test]
+    async fn real_iroh_mutable_capacity_defers_both_directions_then_progresses_after_reopen() {
+        let mut issued = issue_missions(2);
+        let client_mission = issued.remove(0);
+        let server_mission = issued.remove(0);
+        let topic = Topic::new("opaque").expect("mutable topic");
+        let scope = Scope::new("test/runtime-contact").expect("mutable scope");
+        let interests = MutableSourceInterests::new(
+            vec![SourceInterestSelector::new(
+                topic.clone(),
+                scope.clone(),
+                false,
+            )],
+            vec![SourceInterestSelector::new(
+                topic.clone(),
+                scope.clone(),
+                false,
+            )],
+        );
+        let client_root = root("mutable-capacity-client");
+        let server_root = root("mutable-capacity-server");
+        fs::create_dir_all(&client_root).expect("client root");
+        fs::create_dir_all(&server_root).expect("server root");
+        let client_path = client_root.join(STORE_FILE);
+        let server_path = server_root.join(STORE_FILE);
+        let authority = client_mission.credentials.mission_authority_id();
+        assert_eq!(authority, server_mission.credentials.mission_authority_id());
+        let constrained_limits = StoreLimits::new(
+            MAX_CONTROL_ITEMS + CUSTODY_EMERGENCY_ITEM_RESERVE + 1,
+            DEFAULT_MAX_TOTAL_PAYLOAD_BYTES,
+        )
+        .expect("one ordinary-item store limits");
+        let client_store = Arc::new(
+            Store::open_with_limits_for_mission(&client_path, constrained_limits, authority)
+                .expect("constrained client store"),
+        );
+        let server_store = Arc::new(
+            Store::open_with_limits_for_mission(&server_path, constrained_limits, authority)
+                .expect("constrained server store"),
+        );
+        let mut client_sealer = ReferenceEnvelopeSealer::open(
+            client_mission
+                .credentials
+                .fresh_bundle()
+                .expect("client bundle"),
+        )
+        .expect("client sealer");
+        let mut server_sealer = ReferenceEnvelopeSealer::open(
+            server_mission
+                .credentials
+                .fresh_bundle()
+                .expect("server bundle"),
+        )
+        .expect("server sealer");
+        let state_id = publish_test_state(
+            &client_store,
+            &mut client_sealer,
+            &topic,
+            &scope,
+            b"asset/network-state",
+            b"state",
+        );
+        let record_id = publish_test_record(
+            &server_store,
+            &mut server_sealer,
+            &topic,
+            &scope,
+            b"asset/network-record",
+            b"record",
+        );
+        drop((client_sealer, server_sealer));
+
+        let (client_partial, server_partial) = run_test_mutable_contact(
+            client_store.clone(),
+            server_store.clone(),
+            &client_mission,
+            &server_mission,
+            interests.clone(),
+        )
+        .await;
+        assert_eq!(
+            client_partial.mutable_remaining,
+            server_partial.mutable_remaining
+        );
+        for receipt in [&client_partial, &server_partial] {
+            assert_eq!(contact_status(receipt), "partial");
+            assert_eq!(receipt.mutable_remaining, 2);
+            assert_eq!(receipt.deferred_mutable_lanes, 0);
+            assert_eq!(receipt.inserted, 0);
+            assert_eq!(receipt.duplicates, 0);
+            assert_eq!(receipt.offered, 1);
+            assert_eq!(receipt.fetched, 1);
+        }
+        let client_policy = client_store
+            .control_policy_snapshot()
+            .expect("client constrained policy");
+        let server_policy = server_store
+            .control_policy_snapshot()
+            .expect("server constrained policy");
+        assert!(
+            client_store
+                .record_inventory_with_policy(&client_policy)
+                .expect("client deferred Record inventory")
+                .is_empty()
+        );
+        assert!(
+            server_store
+                .state_inventory_with_policy(&server_policy)
+                .expect("server deferred State inventory")
+                .is_empty()
+        );
+        drop((client_store, server_store));
+
+        // The capacity rejection committed no partial mutable or causal state.
+        for path in [&client_path, &server_path] {
+            let reopened = Store::open_with_limits_for_mission(path, constrained_limits, authority)
+                .expect("stable constrained reopen after deferral");
+            assert_eq!(
+                reopened.state_stats().expect("reopened State stats").states
+                    + reopened
+                        .record_stats()
+                        .expect("reopened Record stats")
+                        .records,
+                1
+            );
+        }
+
+        // A later contact with available capacity must schedule the exact same
+        // authenticated differences and converge without duplicate accounting.
+        let client_store = Arc::new(
+            Store::open_for_mission(&client_path, authority).expect("expanded client reopen"),
+        );
+        let server_store = Arc::new(
+            Store::open_for_mission(&server_path, authority).expect("expanded server reopen"),
+        );
+        let (client_complete, server_complete) = run_test_mutable_contact(
+            client_store.clone(),
+            server_store.clone(),
+            &client_mission,
+            &server_mission,
+            interests,
+        )
+        .await;
+        for receipt in [&client_complete, &server_complete] {
+            assert_eq!(contact_status(receipt), "pass");
+            assert_eq!(receipt.mutable_remaining, 0);
+            assert_eq!(receipt.deferred_mutable_lanes, 0);
+            assert_eq!(receipt.inserted, 1);
+            assert_eq!(receipt.duplicates, 0);
+        }
+        for store in [&*client_store, &*server_store] {
+            let policy = store
+                .control_policy_snapshot()
+                .expect("converged mutable policy");
+            assert_mutable_convergence(
+                store,
+                &policy,
+                &topic,
+                &scope,
+                state_id,
+                &[record_id],
+                record_id,
+            );
+        }
+        drop((client_store, server_store));
+
+        for path in [&client_path, &server_path] {
+            let reopened =
+                Store::open_for_mission(path, authority).expect("stable converged mutable reopen");
+            let policy = reopened
+                .control_policy_snapshot()
+                .expect("reopened converged policy");
+            assert_mutable_convergence(
+                &reopened,
+                &policy,
+                &topic,
+                &scope,
+                state_id,
+                &[record_id],
+                record_id,
+            );
+        }
+        fs::remove_dir_all(client_root).expect("remove client root");
+        fs::remove_dir_all(server_root).expect("remove server root");
+    }
+
+    #[tokio::test]
+    async fn real_iroh_mutable_cursors_prevent_offer_and_fetch_starvation_across_reopen() {
+        let mut issued = issue_missions(2);
+        let client_mission = issued.remove(0);
+        let server_mission = issued.remove(0);
+        let topic = Topic::new("opaque").expect("mutable topic");
+        let scope = Scope::new("test/runtime-contact").expect("mutable scope");
+        let interests = MutableSourceInterests::new(
+            vec![SourceInterestSelector::new(
+                topic.clone(),
+                scope.clone(),
+                false,
+            )],
+            Vec::new(),
+        );
+        let client_root = root("mutable-cursor-starvation-client");
+        let server_root = root("mutable-cursor-starvation-server");
+        fs::create_dir_all(&client_root).expect("client root");
+        fs::create_dir_all(&server_root).expect("server root");
+        let client_path = client_root.join(STORE_FILE);
+        let server_path = server_root.join(STORE_FILE);
+        let authority = client_mission.credentials.mission_authority_id();
+        assert_eq!(authority, server_mission.credentials.mission_authority_id());
+
+        let client_seed = Store::open_for_mission(&client_path, authority).expect("client seed");
+        let server_seed = Store::open_for_mission(&server_path, authority).expect("server seed");
+        let mut client_sealer = ReferenceEnvelopeSealer::open(
+            client_mission
+                .credentials
+                .fresh_bundle()
+                .expect("client bundle"),
+        )
+        .expect("client sealer");
+        let mut server_sealer = ReferenceEnvelopeSealer::open(
+            server_mission
+                .credentials
+                .fresh_bundle()
+                .expect("server bundle"),
+        )
+        .expect("server sealer");
+        let (client_poison, client_small) = publish_ordered_starvation_states(
+            &client_seed,
+            &mut client_sealer,
+            &topic,
+            &scope,
+            "client",
+        );
+        let (server_poison, server_small) = publish_ordered_starvation_states(
+            &server_seed,
+            &mut server_sealer,
+            &topic,
+            &scope,
+            "server",
+        );
+        assert!(client_poison < client_small);
+        assert!(server_poison < server_small);
+        let client_local_bytes = client_seed
+            .state_stats()
+            .expect("client seed stats")
+            .total_sealed_bytes;
+        let server_local_bytes = server_seed
+            .state_stats()
+            .expect("server seed stats")
+            .total_sealed_bytes;
+        let client_small_bytes = u64::try_from(
+            client_seed
+                .get_state(client_small)
+                .expect("client small lookup")
+                .expect("client small State")
+                .sealed
+                .len(),
+        )
+        .expect("client small sealed length");
+        let server_small_bytes = u64::try_from(
+            server_seed
+                .get_state(server_small)
+                .expect("server small lookup")
+                .expect("server small State")
+                .sealed
+                .len(),
+        )
+        .expect("server small sealed length");
+        drop((client_seed, server_seed, client_sealer, server_sealer));
+
+        let ordinary_items = 3;
+        let client_limits = StoreLimits::new(
+            MAX_CONTROL_ITEMS + CUSTODY_EMERGENCY_ITEM_RESERVE + ordinary_items,
+            MAX_CONTROL_BYTES
+                + CUSTODY_EMERGENCY_BYTE_RESERVE
+                + client_local_bytes
+                + server_small_bytes,
+        )
+        .expect("client starvation limits");
+        let server_limits = StoreLimits::new(
+            MAX_CONTROL_ITEMS + CUSTODY_EMERGENCY_ITEM_RESERVE + ordinary_items,
+            MAX_CONTROL_BYTES
+                + CUSTODY_EMERGENCY_BYTE_RESERVE
+                + server_local_bytes
+                + client_small_bytes,
+        )
+        .expect("server starvation limits");
+
+        let client_store = Arc::new(
+            Store::open_with_limits_for_mission(&client_path, client_limits, authority)
+                .expect("constrained client reopen"),
+        );
+        let server_store = Arc::new(
+            Store::open_with_limits_for_mission(&server_path, server_limits, authority)
+                .expect("constrained server reopen"),
+        );
+        let (client_first, server_first) = run_test_mutable_contact(
+            client_store.clone(),
+            server_store.clone(),
+            &client_mission,
+            &server_mission,
+            interests.clone(),
+        )
+        .await;
+        assert_eq!(
+            client_first.mutable_remaining,
+            server_first.mutable_remaining
+        );
+        for receipt in [&client_first, &server_first] {
+            assert_eq!(contact_status(receipt), "partial");
+            assert_eq!(receipt.mutable_remaining, 4);
+            assert_eq!(receipt.inserted, 0);
+            assert_eq!(receipt.offered, 1);
+            assert_eq!(receipt.fetched, 1);
+        }
+        assert!(
+            client_store
+                .get_state(server_small)
+                .expect("client first lookup")
+                .is_none()
+        );
+        assert!(
+            server_store
+                .get_state(client_small)
+                .expect("server first lookup")
+                .is_none()
+        );
+        assert_eq!(
+            client_store
+                .mutable_transfer_cursor(
+                    server_mission.identity,
+                    MutableTransferCursorClass::State,
+                    MutableTransferCursorMode::OfferToPeer,
+                )
+                .expect("first offer cursor"),
+            Some(*client_poison.as_bytes())
+        );
+        assert_eq!(
+            client_store
+                .mutable_transfer_cursor(
+                    server_mission.identity,
+                    MutableTransferCursorClass::State,
+                    MutableTransferCursorMode::FetchFromPeer,
+                )
+                .expect("first fetch cursor"),
+            Some(*server_poison.as_bytes())
+        );
+        drop((client_store, server_store));
+
+        let client_store = Arc::new(
+            Store::open_with_limits_for_mission(&client_path, client_limits, authority)
+                .expect("client cursor reopen"),
+        );
+        let server_store = Arc::new(
+            Store::open_with_limits_for_mission(&server_path, server_limits, authority)
+                .expect("server cursor reopen"),
+        );
+        let (client_second, server_second) = run_test_mutable_contact(
+            client_store.clone(),
+            server_store.clone(),
+            &client_mission,
+            &server_mission,
+            interests.clone(),
+        )
+        .await;
+        assert_eq!(
+            client_second.mutable_remaining,
+            server_second.mutable_remaining
+        );
+        for receipt in [&client_second, &server_second] {
+            assert_eq!(contact_status(receipt), "partial");
+            assert_eq!(receipt.mutable_remaining, 2);
+            assert_eq!(receipt.inserted, 1);
+            assert_eq!(receipt.duplicates, 0);
+        }
+        assert!(
+            client_store
+                .get_state(server_small)
+                .expect("client successor lookup")
+                .is_some()
+        );
+        assert!(
+            server_store
+                .get_state(client_small)
+                .expect("server successor lookup")
+                .is_some()
+        );
+        assert_eq!(
+            client_store
+                .mutable_transfer_cursor(
+                    server_mission.identity,
+                    MutableTransferCursorClass::State,
+                    MutableTransferCursorMode::OfferToPeer,
+                )
+                .expect("successor offer cursor"),
+            Some(*client_small.as_bytes())
+        );
+        assert_eq!(
+            client_store
+                .mutable_transfer_cursor(
+                    server_mission.identity,
+                    MutableTransferCursorClass::State,
+                    MutableTransferCursorMode::FetchFromPeer,
+                )
+                .expect("successor fetch cursor"),
+            Some(*server_small.as_bytes())
+        );
+        drop((client_store, server_store));
+
+        let client_store = Arc::new(
+            Store::open_with_limits_for_mission(&client_path, client_limits, authority)
+                .expect("client wrap reopen"),
+        );
+        let server_store = Arc::new(
+            Store::open_with_limits_for_mission(&server_path, server_limits, authority)
+                .expect("server wrap reopen"),
+        );
+        let (client_third, server_third) = run_test_mutable_contact(
+            client_store.clone(),
+            server_store.clone(),
+            &client_mission,
+            &server_mission,
+            interests,
+        )
+        .await;
+        assert_eq!(
+            client_third.mutable_remaining,
+            server_third.mutable_remaining
+        );
+        for receipt in [&client_third, &server_third] {
+            assert_eq!(contact_status(receipt), "partial");
+            assert_eq!(receipt.mutable_remaining, 2);
+            assert_eq!(receipt.inserted, 0);
+        }
+        assert!(
+            client_store
+                .get_state(server_poison)
+                .expect("client wrapped poison lookup")
+                .is_none()
+        );
+        assert!(
+            server_store
+                .get_state(client_poison)
+                .expect("server wrapped poison lookup")
+                .is_none()
+        );
+        assert_eq!(
+            client_store
+                .mutable_transfer_cursor(
+                    server_mission.identity,
+                    MutableTransferCursorClass::State,
+                    MutableTransferCursorMode::OfferToPeer,
+                )
+                .expect("wrapped offer cursor"),
+            Some(*client_poison.as_bytes())
+        );
+        assert_eq!(
+            client_store
+                .mutable_transfer_cursor(
+                    server_mission.identity,
+                    MutableTransferCursorClass::State,
+                    MutableTransferCursorMode::FetchFromPeer,
+                )
+                .expect("wrapped fetch cursor"),
+            Some(*server_poison.as_bytes())
+        );
+        drop((client_store, server_store));
+
         fs::remove_dir_all(client_root).expect("remove client root");
         fs::remove_dir_all(server_root).expect("remove server root");
     }
@@ -8637,19 +20633,32 @@ mod tests {
             ..PeerReceipt::default()
         };
         let control_inventory = InventorySnapshot::default();
+        let semantic_v3 = mission.semantic_version() >= MIN_CUSTODY_SEMANTIC_VERSION;
+        let mut remote_emission = None;
         let mut control_initiator =
             Initiator::new(&control_inventory, limits).expect("control initiator");
         let mut control_query = control_initiator.initiate().expect("control query");
         loop {
-            let Frame::ControlInventoryReply(response) = request_mission_frame(
+            let response_frame = request_mission_frame(
                 connection,
                 mission,
                 Frame::ControlInventoryQuery(control_query),
                 &mut receipt,
             )
             .await
-            .expect("control inventory response") else {
-                panic!("control inventory response frame differs");
+            .expect("control inventory response");
+            let response = match response_frame {
+                Frame::ControlInventoryReplyV3 {
+                    bytes,
+                    policy,
+                    policy_revision,
+                } if semantic_v3 => {
+                    observe_remote_emission_policy(&mut remote_emission, policy, policy_revision)
+                        .expect("protected remote emission policy");
+                    bytes
+                }
+                Frame::ControlInventoryReply(bytes) if !semantic_v3 => bytes,
+                response => panic!("control inventory response frame differs: {response:?}"),
             };
             match control_initiator
                 .reconcile_response(&response)
@@ -8678,17 +20687,19 @@ mod tests {
         loop {
             let wire_budget = exchange_wire_budget(&receipt).expect("control wire budget");
             let (complete, request_bytes, response_bytes) =
-                respond_mission_frame(connection, mission, wire_budget, |frame, _| match frame {
-                    Frame::ControlDifferenceQuery(query) => Ok((
-                        Frame::ControlDifferenceReply(control_reverse.reconcile_query(&query)?),
-                        false,
-                    )),
-                    Frame::ControlDifferenceBound if control_reverse.rounds() > 0 => {
-                        Ok((Frame::ControlDifferenceBoundAck, true))
+                respond_mission_frame(connection, mission, wire_budget, |frame, _, _mission| {
+                    match frame {
+                        Frame::ControlDifferenceQuery(query) => Ok((
+                            Frame::ControlDifferenceReply(control_reverse.reconcile_query(&query)?),
+                            false,
+                        )),
+                        Frame::ControlDifferenceBound if control_reverse.rounds() > 0 => {
+                            Ok((Frame::ControlDifferenceBoundAck, true))
+                        }
+                        _ => Err(NodeError::Protocol(
+                            "test control reverse phase differs".into(),
+                        )),
                     }
-                    _ => Err(NodeError::Protocol(
-                        "test control reverse phase differs".into(),
-                    )),
                 })
                 .await
                 .expect("control reverse response");
@@ -8704,20 +20715,43 @@ mod tests {
             Frame::ControlFinished
         );
 
-        assert!(matches!(
-            request_mission_frame(
-                connection,
-                mission,
-                Frame::EventInterest(interest),
-                &mut receipt,
-            )
-            .await
-            .expect("protected interest response"),
-            Frame::EventInterestReply(interest) if interest.is_empty()
-        ));
+        let interest_request = if semantic_v3 {
+            let selector_revision = u64::try_from(interest.len()).expect("selector revision");
+            Frame::EventInterestV3 {
+                interest,
+                selector_revision,
+                policy: FrameEmissionPolicy::Normal,
+                policy_revision: 1,
+            }
+        } else {
+            Frame::EventInterest(interest)
+        };
+        let interest_response =
+            request_mission_frame(connection, mission, interest_request, &mut receipt)
+                .await
+                .expect("protected interest response");
+        match interest_response {
+            Frame::EventInterestReplyV3 {
+                interest,
+                selector_revision,
+                policy,
+                policy_revision,
+            } if semantic_v3 => {
+                let mut observed = remote_emission;
+                observe_remote_emission_policy(&mut observed, policy, policy_revision)
+                    .expect("stable remote emission policy");
+                assert!(
+                    selector_revision >= u64::try_from(interest.len()).expect("selector count")
+                );
+                assert!(interest.is_empty());
+            }
+            Frame::EventInterestReply(interest) if !semantic_v3 => assert!(interest.is_empty()),
+            response => panic!("protected interest response frame differs: {response:?}"),
+        }
 
         let direction = EventDirection::ToSessionResponder;
-        let mut initiator = Initiator::new(&inventory, limits).expect("initiator");
+        let event_limits = selected_reconciliation_limits().expect("selected Event limits");
+        let mut initiator = Initiator::new(&inventory, event_limits).expect("initiator");
         let mut query = initiator.initiate().expect("initial query");
         loop {
             let Frame::InventoryReply {
@@ -8760,27 +20794,29 @@ mod tests {
             .expect("inventory complete"),
             Frame::InventoryCompleteAck { direction }
         );
-        let mut reverse = Responder::new(&inventory, limits).expect("reverse responder");
+        let mut reverse = Responder::new(&inventory, event_limits).expect("reverse responder");
         loop {
             let wire_budget = exchange_wire_budget(&receipt).expect("wire budget");
             let (complete, request_bytes, response_bytes) =
-                respond_mission_frame(connection, mission, wire_budget, |frame, _| match frame {
-                    Frame::DifferenceQuery {
-                        direction: request_direction,
-                        bytes: query,
-                    } if request_direction == direction => Ok((
-                        Frame::DifferenceReply {
-                            direction,
-                            bytes: reverse.reconcile_query(&query)?,
-                        },
-                        false,
-                    )),
-                    Frame::DifferenceBound {
-                        direction: request_direction,
-                    } if request_direction == direction && reverse.rounds() > 0 => {
-                        Ok((Frame::DifferenceBoundAck { direction }, true))
+                respond_mission_frame(connection, mission, wire_budget, |frame, _, _mission| {
+                    match frame {
+                        Frame::DifferenceQuery {
+                            direction: request_direction,
+                            bytes: query,
+                        } if request_direction == direction => Ok((
+                            Frame::DifferenceReply {
+                                direction,
+                                bytes: reverse.reconcile_query(&query)?,
+                            },
+                            false,
+                        )),
+                        Frame::DifferenceBound {
+                            direction: request_direction,
+                        } if request_direction == direction && reverse.rounds() > 0 => {
+                            Ok((Frame::DifferenceBoundAck { direction }, true))
+                        }
+                        _ => Err(NodeError::Protocol("test reverse phase differs".into())),
                     }
-                    _ => Err(NodeError::Protocol("test reverse phase differs".into())),
                 })
                 .await
                 .expect("reverse response");
@@ -8799,7 +20835,7 @@ mod tests {
         direction: EventDirection,
         receipt: &mut PeerReceipt,
     ) {
-        let limits = ReconciliationLimits::default();
+        let limits = selected_reconciliation_limits().expect("selected Event limits");
         let mut initiator = Initiator::new(&inventory, limits).expect("lane initiator");
         let mut query = initiator.initiate().expect("lane initial query");
         loop {
@@ -8850,25 +20886,27 @@ mod tests {
         loop {
             let wire_budget = exchange_wire_budget(receipt).expect("lane wire budget");
             let (complete, request_bytes, response_bytes) =
-                respond_mission_frame(connection, mission, wire_budget, |frame, _| match frame {
-                    Frame::DifferenceQuery {
-                        direction: request_direction,
-                        bytes: query,
-                    } if request_direction == direction => Ok((
-                        Frame::DifferenceReply {
-                            direction,
-                            bytes: reverse.reconcile_query(&query)?,
-                        },
-                        false,
-                    )),
-                    Frame::DifferenceBound {
-                        direction: request_direction,
-                    } if request_direction == direction && reverse.rounds() > 0 => {
-                        Ok((Frame::DifferenceBoundAck { direction }, true))
+                respond_mission_frame(connection, mission, wire_budget, |frame, _, _mission| {
+                    match frame {
+                        Frame::DifferenceQuery {
+                            direction: request_direction,
+                            bytes: query,
+                        } if request_direction == direction => Ok((
+                            Frame::DifferenceReply {
+                                direction,
+                                bytes: reverse.reconcile_query(&query)?,
+                            },
+                            false,
+                        )),
+                        Frame::DifferenceBound {
+                            direction: request_direction,
+                        } if request_direction == direction && reverse.rounds() > 0 => {
+                            Ok((Frame::DifferenceBoundAck { direction }, true))
+                        }
+                        _ => Err(NodeError::Protocol(
+                            "test directional reverse phase differs".into(),
+                        )),
                     }
-                    _ => Err(NodeError::Protocol(
-                        "test directional reverse phase differs".into(),
-                    )),
                 })
                 .await
                 .expect("lane reverse response");
@@ -8876,6 +20914,73 @@ mod tests {
             if complete {
                 break;
             }
+        }
+    }
+
+    async fn defer_empty_mutable_classes(
+        connection: &aster_iroh::Connection,
+        mission: &mut MissionSession,
+        receipt: &mut PeerReceipt,
+    ) {
+        for &class in mutable_classes_for_semantic(mission.semantic_version()) {
+            let (request, expected) = if class == MutableClass::Blob {
+                (
+                    Frame::BlobInterest(BlobInterest::empty()),
+                    Frame::BlobInterestReply(BlobInterest::empty()),
+                )
+            } else {
+                (
+                    Frame::MutableInterest {
+                        class,
+                        interest: EventInterest::empty(),
+                    },
+                    Frame::MutableInterestReply {
+                        class,
+                        interest: EventInterest::empty(),
+                    },
+                )
+            };
+            assert_eq!(
+                request_mission_frame(connection, mission, request, receipt)
+                    .await
+                    .expect("empty mutable interest exchange"),
+                expected,
+            );
+            for direction in [
+                EventDirection::ToSessionResponder,
+                EventDirection::ToSessionInitiator,
+            ] {
+                assert_eq!(
+                    request_mission_frame(
+                        connection,
+                        mission,
+                        Frame::MutableLaneDeferred { class, direction },
+                        receipt,
+                    )
+                    .await
+                    .expect("empty mutable lane deferral"),
+                    Frame::MutableLaneDeferredAck { class, direction }
+                );
+            }
+        }
+        if mission.semantic_version() >= MIN_BLOB_NETWORK_SEMANTIC_VERSION {
+            assert_eq!(
+                request_mission_frame(
+                    connection,
+                    mission,
+                    Frame::BlobCarrierFinish {
+                        direction: EventDirection::ToSessionInitiator,
+                        remaining: 0,
+                    },
+                    receipt,
+                )
+                .await
+                .expect("empty Blob carrier finish"),
+                Frame::BlobCarrierFinished {
+                    direction: EventDirection::ToSessionInitiator,
+                    remaining: 0,
+                }
+            );
         }
     }
 
@@ -9541,6 +21646,7 @@ mod tests {
             mission_authority,
         );
         let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
+        let (_control_sender, control_receiver) = mpsc::channel(CONTROL_COMMAND_CAPACITY);
         let (ready_sender, ready_receiver) = oneshot::channel();
         let (before_loop_ready_sender, before_loop_ready_receiver) = oneshot::channel();
         let (before_loop_release_sender, before_loop_release_receiver) = oneshot::channel();
@@ -9558,15 +21664,20 @@ mod tests {
                 run_for: Some(run_for),
                 application: NodeApplication::Relay,
             },
-            application_receiver,
-            application_admission.clone(),
-            shutdown_receiver,
-            ready_sender,
-            Some(RunNodeActorTestControl {
-                before_loop_ready: before_loop_ready_sender,
-                before_loop_release: before_loop_release_receiver,
-                zeroization_queued: zeroization_queued_sender,
-            }),
+            SelectedForwardingConfig::default(),
+            Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+            NodeActorChannels {
+                application_receiver,
+                application_admission: application_admission.clone(),
+                control_receiver,
+                shutdown_receiver,
+                ready: ready_sender,
+                test_control: Some(RunNodeActorTestControl {
+                    before_loop_ready: before_loop_ready_sender,
+                    before_loop_release: before_loop_release_receiver,
+                    zeroization_queued: zeroization_queued_sender,
+                }),
+            },
         ));
         timeout(Duration::from_secs(5), ready_receiver)
             .await
@@ -10436,27 +22547,41 @@ mod tests {
     }
 
     fn control_test_services(seed: [u8; 32]) -> ControlTestServices {
+        control_test_services_with_additional_scope(seed, None)
+    }
+
+    fn control_test_services_with_additional_scope(
+        seed: [u8; 32],
+        additional_scope: Option<Scope>,
+    ) -> ControlTestServices {
         let scope = Scope::new("test/selected-control").expect("control scope");
         let topic = Topic::new("control-event").expect("control topic");
         let access = ProvisioningAccess::member(scope.clone(), vec![1], vec![topic.clone()])
             .expect("control access");
+        let mut accesses = vec![access];
+        if let Some(additional_scope) = additional_scope {
+            accesses.push(
+                ProvisioningAccess::member(additional_scope, vec![1], vec![topic.clone()])
+                    .expect("additional control-test access"),
+            );
+        }
         let mut provisioner = ReferenceProvisioner::from_seed(seed).expect("control provisioner");
         let authority_bytes = provisioner
-            .issue_control_authority(1, std::slice::from_ref(&access))
+            .issue_control_authority(1, &accesses)
             .expect("issue authority")
             .to_bytes()
             .expect("encode authority");
         let authority = UnprotectedReferenceMission::from_bytes(authority_bytes)
             .expect("parse authority mission");
         let member_bytes = provisioner
-            .issue_node(2, std::slice::from_ref(&access))
+            .issue_node(2, &accesses)
             .expect("issue member")
             .to_bytes()
             .expect("encode member");
         let member =
             UnprotectedReferenceMission::from_bytes(member_bytes).expect("parse member mission");
         let other_bytes = provisioner
-            .issue_node(3, std::slice::from_ref(&access))
+            .issue_node(3, &accesses)
             .expect("issue other")
             .to_bytes()
             .expect("encode other");
@@ -10466,7 +22591,7 @@ mod tests {
             .export_rekey_registry()
             .expect("signed registry");
         let excluded_bytes = provisioner
-            .issue_node(4, std::slice::from_ref(&access))
+            .issue_node(4, &accesses)
             .expect("issue excluded registry member")
             .to_bytes()
             .expect("encode excluded");
@@ -10490,6 +22615,710 @@ mod tests {
     fn open_test_sealer(mission: &UnprotectedReferenceMission) -> ReferenceEnvelopeSealer {
         ReferenceEnvelopeSealer::open(mission.fresh_bundle().expect("fresh test bundle"))
             .expect("open test sealer")
+    }
+
+    struct RuntimeTestUnprotector {
+        calls: usize,
+        plaintext: Option<Vec<u8>>,
+    }
+
+    impl ProvisioningUnprotector for RuntimeTestUnprotector {
+        fn unprotect(
+            &mut self,
+            _protected: &[u8],
+            _max_plaintext_len: usize,
+        ) -> Result<UnprotectedProvisioning, ProvisioningProtectionError> {
+            self.calls += 1;
+            UnprotectedProvisioning::new(
+                self.plaintext
+                    .take()
+                    .expect("test protection provider is called once"),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn protected_live_controls_refresh_policy_retry_exactly_and_close_on_shutdown() {
+        use std::num::NonZeroU64;
+
+        use crate::{
+            application::{ApplicationErrorKind, EventPublishRequest},
+            control_admin::{
+                ControlAdminErrorKind, RegistryGenerationWitness, RevocationRequest,
+                ScopeRekeyRequest,
+            },
+        };
+
+        let state = root("protected-live-controls");
+        let services = control_test_services([0xc8; 32]);
+        let authority_bytes = services
+            .authority
+            .fresh_bundle()
+            .expect("authority bundle")
+            .to_bytes()
+            .expect("encode authority bundle");
+        let mut provider = RuntimeTestUnprotector {
+            calls: 0,
+            plaintext: Some(authority_bytes),
+        };
+        let config = NodeConfig::from_protected_bytes(
+            &state,
+            b"provider-authenticated-runtime-envelope",
+            NodeConfigOptions::new(
+                SocketAddr::from(([127, 0, 0, 1], 0)),
+                Duration::from_secs(60),
+            ),
+            &mut provider,
+        )
+        .expect("construct protected runtime config");
+        assert_eq!(provider.calls, 1);
+        assert_eq!(
+            config.provisioning_origin(),
+            MissionProvisioningOrigin::ProtectedArtifact
+        );
+        assert!(!state.exists(), "bootstrap must not create durable state");
+
+        let running = start_node(config)
+            .await
+            .expect("start protected authority runtime");
+        let controls = running.selected_controls();
+        let events = running.selected_events();
+        assert_eq!(controls.identity(), services.authority.identity());
+        assert_eq!(
+            controls.mission_authority(),
+            services.authority.mission_authority_id()
+        );
+
+        let recipients = vec![
+            ScopeRekeyRecipient::member(
+                services.authority.identity(),
+                vec![services.topic.clone()],
+            )
+            .expect("authority recipient"),
+            ScopeRekeyRecipient::member(services.member.identity(), vec![services.topic.clone()])
+                .expect("member recipient"),
+        ];
+        let rekey = controls
+            .publish_scope_rekey(
+                ScopeRekeyRequest::new(
+                    services.registry.clone(),
+                    RegistryGenerationWitness::new(NonZeroU64::new(1).expect("nonzero")),
+                    services.scope.clone(),
+                    NonZeroU64::new(2).expect("nonzero"),
+                    recipients.clone(),
+                )
+                .expect("bounded rekey request"),
+            )
+            .await
+            .expect("publish live rekey");
+        assert!(rekey.emitted);
+        assert_eq!(rekey.activated, 1);
+
+        let mut reversed = recipients;
+        reversed.reverse();
+        let exact_rekey = controls
+            .publish_scope_rekey(
+                ScopeRekeyRequest::new(
+                    services.registry.clone(),
+                    RegistryGenerationWitness::new(NonZeroU64::new(u64::MAX).expect("nonzero")),
+                    services.scope.clone(),
+                    NonZeroU64::new(2).expect("nonzero"),
+                    reversed,
+                )
+                .expect("exact retry request"),
+            )
+            .await
+            .expect("exact live rekey retry");
+        assert!(!exact_rekey.emitted);
+        assert_eq!(exact_rekey.transfer_id, rekey.transfer_id);
+        assert_eq!(exact_rekey.sequence, rekey.sequence);
+
+        let published = events
+            .publish(EventPublishRequest {
+                operation_key: b"post-live-rekey-publish".to_vec(),
+                predecessor: None,
+                topic: services.topic.clone(),
+                scope: services.scope.clone(),
+                priority: Priority::Immediate,
+                logical_key: b"live-control-policy-refresh".to_vec(),
+                payload: b"epoch two application bytes".to_vec(),
+                tombstone: false,
+            })
+            .await
+            .expect("application verifier observes live rekey before response");
+        assert!(published.inserted);
+
+        let revoke_request = RevocationRequest::new(
+            services.other.identity(),
+            NonZeroU64::new(1).expect("nonzero"),
+        );
+        let revocation = controls
+            .publish_revocation(revoke_request)
+            .await
+            .expect("publish live revocation");
+        assert!(revocation.emitted);
+        let exact_revocation = controls
+            .publish_revocation(revoke_request)
+            .await
+            .expect("exact revocation retry");
+        assert!(!exact_revocation.emitted);
+        assert_eq!(exact_revocation.transfer_id, revocation.transfer_id);
+
+        let retained_controls = controls.clone();
+        let retained_events = events.clone();
+        let receipt = running
+            .shutdown()
+            .await
+            .expect("graceful protected shutdown");
+        assert_eq!(receipt.events, 1);
+        assert_eq!(receipt.controls, 2);
+        assert_eq!(receipt.applied_controls, 2);
+        assert_eq!(
+            retained_controls
+                .publish_revocation(RevocationRequest::new(
+                    services.excluded.identity(),
+                    NonZeroU64::new(1).expect("nonzero"),
+                ))
+                .await
+                .expect_err("closed actor rejects retained control handle")
+                .kind(),
+            ControlAdminErrorKind::StateUnavailable
+        );
+        assert_eq!(
+            retained_events
+                .status()
+                .await
+                .expect_err("closed actor rejects retained Event handle")
+                .kind(),
+            ApplicationErrorKind::StateUnavailable
+        );
+        fs::remove_dir_all(state).expect("cleanup protected live state");
+    }
+
+    #[tokio::test]
+    async fn live_control_pending_gap_returns_policy_unsettled_and_preserves_exact_retry() {
+        use std::num::NonZeroU64;
+
+        use crate::control_admin::{ControlAdminErrorKind, RevocationRequest};
+
+        let state = root("live-control-pending-gap");
+        fs::create_dir_all(&state).expect("state root");
+        let services = control_test_services([0xca; 32]);
+        let store = Arc::new(
+            Store::open_for_mission(
+                state.join(STORE_FILE),
+                services.authority.mission_authority_id(),
+            )
+            .expect("authority store"),
+        );
+        store
+            .require_process_exclusive_lock()
+            .expect("exclusive live store");
+
+        let historical = publish_revocation_control_in_store(
+            &store,
+            &services.authority,
+            services.excluded.identity(),
+            1,
+        )
+        .expect("publish historical control");
+        assert!(historical.emitted);
+        assert_eq!(historical.sequence, 1);
+
+        let StartupEventVerification {
+            verifier,
+            historical_verifier,
+            cache: event_route_cache,
+            policy: _,
+        } = open_startup_event_verifier_and_cache(&store, &services.authority)
+            .expect("open actor-equivalent Event state");
+        drop(historical_verifier);
+        let application_head = store.control_head().expect("historical control head");
+        let custody_clock = NodeCustodyClock::injected([0xca; 16], 1, 1);
+        let mut application = SelectedEventNode::from_runtime(
+            services.authority.clone(),
+            store.clone(),
+            verifier,
+            application_head,
+            custody_clock.clone(),
+            event_route_cache.clone(),
+        );
+
+        let (head_sequence, head_id) = application_head.expect("nonempty historical head");
+        let mut authority = open_replayed_verifier(&store, &services.authority)
+            .expect("replay historical authority state");
+        let missing = authority
+            .seal_chained_revocation_control(
+                services.other.identity(),
+                1,
+                head_sequence + 1,
+                Some(*head_id.as_bytes()),
+            )
+            .expect("seal missing predecessor");
+        let missing_id = ControlTransferId::new(
+            authority
+                .verify_control(&missing)
+                .expect("verify missing predecessor")
+                .envelope_id(),
+        );
+        let pending = authority
+            .seal_chained_revocation_control(
+                services.member.identity(),
+                1,
+                head_sequence + 2,
+                Some(*missing_id.as_bytes()),
+            )
+            .expect("seal out-of-order successor");
+        let verified_pending = authority
+            .verify_control(&pending)
+            .expect("verify out-of-order successor");
+        let pending_outcome = store
+            .ingest_verified_control(&verified_pending, &pending)
+            .expect("retain out-of-order successor");
+        assert!(matches!(pending_outcome, ControlOutcome::Pending { .. }));
+        assert_eq!(store.control_stats().expect("pending stats").pending, 1);
+
+        let (fresh_response, fresh_received) = oneshot::channel();
+        let fresh_fatal = execute_selected_control_command(
+            &mut application,
+            &store,
+            &services.authority,
+            &custody_clock,
+            &event_route_cache,
+            SelectedControlCommand::PublishRevocation {
+                request: RevocationRequest::new(
+                    services.excluded.identity(),
+                    NonZeroU64::new(2).expect("nonzero"),
+                ),
+                response: fresh_response,
+            },
+        );
+        assert!(
+            fresh_fatal.is_none(),
+            "a policy gap is a deferred live state, not an actor failure"
+        );
+        let fresh_error = fresh_received
+            .await
+            .expect("fresh caller receives explicit policy result")
+            .expect_err("fresh publication cannot cross a pending gap");
+        assert_eq!(fresh_error.kind(), ControlAdminErrorKind::PolicyUnsettled);
+        assert_eq!(fresh_error.operation(), "publish revocation");
+
+        let (retry_response, retry_received) = oneshot::channel();
+        let retry_fatal = execute_selected_control_command(
+            &mut application,
+            &store,
+            &services.authority,
+            &custody_clock,
+            &event_route_cache,
+            SelectedControlCommand::PublishRevocation {
+                request: RevocationRequest::new(
+                    services.excluded.identity(),
+                    NonZeroU64::new(1).expect("nonzero"),
+                ),
+                response: retry_response,
+            },
+        );
+        assert!(
+            retry_fatal.is_none(),
+            "an exact historical retry remains nonfatal while policy is deferred"
+        );
+        let recovered = retry_received
+            .await
+            .expect("historical caller receives an explicit result")
+            .expect("recover historical receipt through pending gap");
+        assert_eq!(
+            recovered,
+            ControlPublicationReceipt {
+                emitted: false,
+                activated: 0,
+                ..historical
+            }
+        );
+        assert!(
+            application
+                .refresh_runtime_policy()
+                .expect("actor-equivalent state remains usable")
+                .is_none(),
+            "the retained gap continues to defer policy-dependent work"
+        );
+
+        let mut receiver = open_replayed_verifier(&store, &services.authority)
+            .expect("replay receiver before predecessor arrives");
+        let accepted = accept_received_control(
+            &store,
+            &mut receiver,
+            services.authority.identity(),
+            missing_id,
+            &missing,
+        )
+        .expect("accept missing predecessor and activate suffix");
+        assert!(accepted.retained);
+        assert_eq!(accepted.activated, 2);
+        assert_eq!(store.control_stats().expect("settled stats").pending, 0);
+        assert_eq!(
+            refresh_live_control_state(
+                &mut application,
+                &store,
+                &custody_clock,
+                &event_route_cache,
+            )
+            .expect("refresh after predecessor arrival"),
+            LiveControlRefresh::Settled
+        );
+
+        let (settled_response, settled_received) = oneshot::channel();
+        let settled_fatal = execute_selected_control_command(
+            &mut application,
+            &store,
+            &services.authority,
+            &custody_clock,
+            &event_route_cache,
+            SelectedControlCommand::PublishRevocation {
+                request: RevocationRequest::new(
+                    services.excluded.identity(),
+                    NonZeroU64::new(2).expect("nonzero"),
+                ),
+                response: settled_response,
+            },
+        );
+        assert!(settled_fatal.is_none());
+        let settled = settled_received
+            .await
+            .expect("settled caller receives an explicit result")
+            .expect("fresh control succeeds after predecessor arrival");
+        assert!(settled.emitted);
+        assert_eq!(settled.sequence, 4);
+
+        drop(application);
+        drop(receiver);
+        drop(authority);
+        drop(store);
+        fs::remove_dir_all(state).expect("cleanup pending live-control state");
+    }
+
+    #[tokio::test]
+    async fn saturated_cloned_live_control_retries_do_not_starve_event_status_or_publish() {
+        use std::{
+            num::NonZeroU64,
+            sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        };
+
+        use crate::{application::EventPublishRequest, control_admin::RevocationRequest};
+
+        let state = root("saturated-live-control-retries");
+        let services = control_test_services([0xcb; 32]);
+        let identity = services.authority.identity();
+        let mission_authority = services.authority.mission_authority_id();
+        let (application_sender, application_receiver) =
+            mpsc::channel(APPLICATION_COMMAND_CAPACITY);
+        let application_admission = Arc::new(AtomicBool::new(true));
+        let events = SelectedEventHandle::new(
+            application_sender,
+            application_admission.clone(),
+            identity,
+            mission_authority,
+        );
+        let (control_sender, control_receiver) = mpsc::channel(CONTROL_COMMAND_CAPACITY);
+        let controls =
+            SelectedControlHandle::new(control_sender.clone(), identity, mission_authority);
+        let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
+        let (ready_sender, ready_receiver) = oneshot::channel();
+        let forwarding = SelectedForwardingConfig::default();
+        let emission_policy = Arc::new(LiveEmissionPolicy::new(forwarding.emission_policy()));
+        let actor = tokio::spawn(run_node_actor_with_forwarding(
+            NodeConfig {
+                state: state.clone(),
+                bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                mission: services.authority.clone(),
+                peers: Vec::new(),
+                mutable_interests: Default::default(),
+                sync_interval: Duration::from_secs(60),
+                run_for: None,
+                application: NodeApplication::Relay,
+            },
+            forwarding,
+            emission_policy,
+            NodeActorChannels::new(
+                application_receiver,
+                application_admission.clone(),
+                control_receiver,
+                shutdown_receiver,
+                ready_sender,
+            ),
+        ));
+        timeout(Duration::from_secs(10), ready_receiver)
+            .await
+            .expect("live-control pressure actor readiness deadline")
+            .expect("live-control pressure actor readiness");
+
+        let request = RevocationRequest::new(
+            services.other.identity(),
+            NonZeroU64::new(1).expect("nonzero"),
+        );
+        let first = timeout(Duration::from_secs(5), controls.publish_revocation(request))
+            .await
+            .expect("initial live control deadline")
+            .expect("publish initial live control");
+        assert!(first.emitted);
+
+        let stop_pressure = Arc::new(AtomicBool::new(false));
+        let retry_successes = Arc::new(AtomicUsize::new(0));
+        let mut retry_tasks = JoinSet::new();
+        for _ in 0..CONTROL_COMMAND_BUDGET * 4 {
+            let controls = controls.clone();
+            let stop_pressure = stop_pressure.clone();
+            let retry_successes = retry_successes.clone();
+            retry_tasks.spawn(async move {
+                while !stop_pressure.load(AtomicOrdering::Acquire) {
+                    let receipt = controls
+                        .publish_revocation(request)
+                        .await
+                        .expect("exact live control retry under pressure");
+                    assert!(!receipt.emitted);
+                    assert_eq!(receipt.transfer_id, first.transfer_id);
+                    retry_successes.fetch_add(1, AtomicOrdering::AcqRel);
+                }
+            });
+        }
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if retry_successes.load(AtomicOrdering::Acquire) >= CONTROL_COMMAND_BUDGET * 2
+                    && control_sender.capacity() == 0
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("cloned retry callers saturate the bounded control queue");
+
+        let status_events = events.clone();
+        let publish_events = events.clone();
+        let topic = services.topic.clone();
+        let scope = services.scope.clone();
+        let (status, published) = timeout(Duration::from_secs(5), async move {
+            tokio::join!(
+                status_events.status(),
+                publish_events.publish(EventPublishRequest {
+                    operation_key: b"control-pressure-event-publish".to_vec(),
+                    predecessor: None,
+                    topic,
+                    scope,
+                    priority: Priority::Immediate,
+                    logical_key: b"control-pressure".to_vec(),
+                    payload: b"application progress remains bounded".to_vec(),
+                    tombstone: false,
+                })
+            )
+        })
+        .await
+        .expect("Event status and publish must not be starved by control retries");
+        status.expect("status progresses through saturated control retries");
+        assert!(
+            published
+                .expect("publish progresses through saturated control retries")
+                .inserted
+        );
+
+        stop_pressure.store(true, AtomicOrdering::Release);
+        timeout(Duration::from_secs(10), async {
+            while let Some(result) = retry_tasks.join_next().await {
+                result.expect("live control retry pressure task");
+            }
+        })
+        .await
+        .expect("retry pressure tasks drain while actor remains live");
+        assert!(retry_successes.load(AtomicOrdering::Acquire) >= CONTROL_COMMAND_BUDGET * 2);
+
+        shutdown_sender
+            .send(())
+            .await
+            .expect("request clean pressure-actor shutdown");
+        let receipt = timeout(Duration::from_secs(10), actor)
+            .await
+            .expect("pressure actor shutdown deadline")
+            .expect("pressure actor task")
+            .expect("clean pressure actor shutdown");
+        assert_eq!(receipt.controls, 1);
+        assert_eq!(receipt.applied_controls, 1);
+        assert_eq!(receipt.pending_controls, 0);
+        assert_eq!(receipt.events, 1);
+        assert!(!application_admission.load(Ordering::Acquire));
+
+        drop(events);
+        drop(controls);
+        drop(control_sender);
+        fs::remove_dir_all(state).expect("cleanup saturated live-control state");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_enqueued_live_control_remains_actor_owned_and_exactly_retryable() {
+        use std::num::NonZeroU64;
+
+        use crate::control_admin::RevocationRequest;
+
+        let state = root("cancelled-enqueued-live-control");
+        let services = control_test_services([0xcc; 32]);
+        let identity = services.authority.identity();
+        let mission_authority = services.authority.mission_authority_id();
+        let (application_sender, application_receiver) =
+            mpsc::channel(APPLICATION_COMMAND_CAPACITY);
+        let application_admission = Arc::new(AtomicBool::new(true));
+        let (control_sender, control_receiver) = mpsc::channel(CONTROL_COMMAND_CAPACITY);
+        let controls =
+            SelectedControlHandle::new(control_sender.clone(), identity, mission_authority);
+        let (_shutdown_sender, shutdown_receiver) = mpsc::channel(1);
+        let (ready_sender, ready_receiver) = oneshot::channel();
+        let (before_loop_ready, before_loop_received) = oneshot::channel();
+        let (before_loop_release, release_received) = oneshot::channel();
+        let (zeroization_queued, _zeroization_received) = oneshot::channel();
+        let forwarding = SelectedForwardingConfig::default();
+        let emission_policy = Arc::new(LiveEmissionPolicy::new(forwarding.emission_policy()));
+        let actor = tokio::spawn(run_node_actor_inner(
+            NodeConfig {
+                state: state.clone(),
+                bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                mission: services.authority.clone(),
+                peers: Vec::new(),
+                mutable_interests: Default::default(),
+                sync_interval: Duration::from_secs(60),
+                run_for: None,
+                application: NodeApplication::Relay,
+            },
+            forwarding,
+            emission_policy,
+            NodeActorChannels {
+                application_receiver,
+                application_admission: application_admission.clone(),
+                control_receiver,
+                shutdown_receiver,
+                ready: ready_sender,
+                test_control: Some(RunNodeActorTestControl {
+                    before_loop_ready,
+                    before_loop_release: release_received,
+                    zeroization_queued,
+                }),
+            },
+        ));
+        timeout(Duration::from_secs(10), ready_receiver)
+            .await
+            .expect("paused actor readiness deadline")
+            .expect("paused actor readiness");
+        timeout(Duration::from_secs(5), before_loop_received)
+            .await
+            .expect("actor reaches deterministic pre-loop pause")
+            .expect("pre-loop pause remains connected");
+
+        let request = RevocationRequest::new(identity, NonZeroU64::new(1).expect("nonzero"));
+        let cancelled = tokio::spawn({
+            let controls = controls.clone();
+            async move { controls.publish_revocation(request).await }
+        });
+        timeout(Duration::from_secs(5), async {
+            while control_sender.capacity() != 0 {
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("control command is enqueued before caller cancellation");
+        cancelled.abort();
+        assert!(
+            cancelled
+                .await
+                .expect_err("cancelled caller task cannot complete")
+                .is_cancelled()
+        );
+
+        before_loop_release
+            .send(())
+            .expect("release actor after caller cancellation");
+        let actor_error = timeout(Duration::from_secs(10), actor)
+            .await
+            .expect("cancelled self-revocation actor teardown deadline")
+            .expect("cancelled self-revocation actor task")
+            .expect_err("actor must close after committing self-revocation");
+        assert!(matches!(actor_error, NodeError::Revoked(principal) if principal == identity));
+        assert!(!application_admission.load(Ordering::Acquire));
+
+        let store = Store::open_for_mission(state.join(STORE_FILE), mission_authority)
+            .expect("reopen cancelled self-revocation store");
+        let (durable_sequence, durable_transfer) = store
+            .control_head()
+            .expect("read cancelled self-revocation head")
+            .expect("cancelled self-revocation committed a durable head");
+        let stats = store.control_stats().expect("cancelled command stats");
+        assert_eq!(stats.controls, 1);
+        assert_eq!(stats.applied, 1);
+        assert_eq!(stats.pending, 0);
+        drop(store);
+
+        let recovered =
+            publish_revocation_control(&state, &services.authority, identity, request.generation())
+                .expect("stopped exact retry recovers cancelled caller receipt");
+        assert!(!recovered.emitted);
+        assert_eq!(recovered.sequence, durable_sequence);
+        assert_eq!(recovered.transfer_id, durable_transfer);
+
+        drop(application_sender);
+        drop(controls);
+        drop(control_sender);
+        fs::remove_dir_all(state).expect("cleanup cancelled live-control state");
+    }
+
+    #[tokio::test]
+    async fn live_self_revocation_returns_receipt_before_actor_teardown() {
+        use std::num::NonZeroU64;
+
+        use crate::control_admin::{ControlAdminErrorKind, RevocationRequest};
+
+        let state = root("live-self-revocation");
+        let services = control_test_services([0xc9; 32]);
+        let local = services.authority.identity();
+        let running = start_node(NodeConfig::new(
+            &state,
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            services.authority.clone(),
+        ))
+        .await
+        .expect("start authority runtime");
+        let controls = running.selected_controls();
+        let receipt = controls
+            .publish_revocation(RevocationRequest::new(
+                local,
+                NonZeroU64::new(1).expect("nonzero"),
+            ))
+            .await
+            .expect("self-revocation returns committed receipt");
+        assert!(receipt.emitted);
+        assert_eq!(receipt.activated, 1);
+
+        let actor_error = timeout(Duration::from_secs(10), running.wait())
+            .await
+            .expect("self-revoked actor stops promptly")
+            .expect_err("self-revoked actor fails closed");
+        assert!(matches!(actor_error, NodeError::Revoked(principal) if principal == local));
+        assert_eq!(
+            controls
+                .publish_revocation(RevocationRequest::new(
+                    services.other.identity(),
+                    NonZeroU64::new(1).expect("nonzero"),
+                ))
+                .await
+                .expect_err("post-teardown control is rejected")
+                .kind(),
+            ControlAdminErrorKind::StateUnavailable
+        );
+        let store = Store::open_for_mission(
+            state.join(STORE_FILE),
+            services.authority.mission_authority_id(),
+        )
+        .expect("reopen self-revoked store");
+        assert_eq!(store.control_stats().expect("control stats").applied, 1);
+        drop(store);
+        fs::remove_dir_all(state).expect("cleanup self-revocation state");
     }
 
     fn seal_test_revoke_then_rekey(
@@ -10605,10 +23434,378 @@ mod tests {
         EventTransferId::new(event.envelope_id())
     }
 
+    struct TestCustodyPublication<'a> {
+        operation: &'a [u8],
+        topic: &'a Topic,
+        scope: &'a Scope,
+        priority: Priority,
+        ttl_ms: Option<u64>,
+        sample: CustodySample,
+        payload: &'a [u8],
+        tombstone: bool,
+    }
+
+    fn publish_test_custody_event(
+        store: &Store,
+        sealer: &mut ReferenceEnvelopeSealer,
+        publication: TestCustodyPublication<'_>,
+    ) -> StoredEvent {
+        let TestCustodyPublication {
+            operation,
+            topic,
+            scope,
+            priority,
+            ttl_ms,
+            sample,
+            payload,
+            tombstone,
+        } = publication;
+        let operation = EventOperationKey::new(operation.to_vec()).expect("operation key");
+        let policy = store.control_policy_snapshot().expect("settled policy");
+        publish_selected_event_once(
+            store,
+            &policy,
+            sealer,
+            SelectedEventPublish {
+                operation: &operation,
+                predecessor: None,
+                topic,
+                scope,
+                priority,
+                ttl_ms,
+                custody_sample: Some(sample),
+                logical_key: payload,
+                payload,
+                tombstone,
+            },
+        )
+        .expect("publish custody Event")
+        .0
+    }
+
+    fn publish_test_state(
+        store: &Store,
+        sealer: &mut ReferenceEnvelopeSealer,
+        topic: &Topic,
+        scope: &Scope,
+        logical_key: &[u8],
+        payload: &[u8],
+    ) -> StateTransferId {
+        let policy = store
+            .control_policy_snapshot()
+            .expect("settled State policy");
+        let reservation = store
+            .reserve_state_with_policy(&policy, sealer.identity(), topic, scope)
+            .expect("State reservation");
+        let header = reservation
+            .header(
+                Priority::Routine,
+                logical_key.to_vec(),
+                u64::try_from(payload.len()).expect("State payload length"),
+                false,
+                1,
+            )
+            .expect("State header");
+        let sealed = sealer
+            .seal_state(&header, payload)
+            .expect("seal test State")
+            .bytes;
+        let route = sealer.verify_state(&sealed).expect("verify test State");
+        let state = match sealer
+            .verify_state_content(route, &sealed)
+            .expect("verify test State content")
+        {
+            StateContentVerification::ContentVerified { state, .. } => state,
+            StateContentVerification::RouteOnly(_) => panic!("test State lacks content grant"),
+        };
+        let transfer_id = StateTransferId::new(state.envelope_id());
+        store
+            .commit_reserved_state_with_policy(&policy, &reservation, &state, &sealed)
+            .expect("commit test State");
+        transfer_id
+    }
+
+    fn publish_ordered_starvation_states(
+        store: &Store,
+        sealer: &mut ReferenceEnvelopeSealer,
+        topic: &Topic,
+        scope: &Scope,
+        label: &str,
+    ) -> (StateTransferId, StateTransferId) {
+        let policy = store
+            .control_policy_snapshot()
+            .expect("settled starvation policy");
+        let poison_payload = vec![0xa5; 4 * 1024];
+        let poison = (0..4_096u32)
+            .find_map(|attempt| {
+                let reservation = store
+                    .reserve_state_with_policy(&policy, sealer.identity(), topic, scope)
+                    .expect("poison State reservation");
+                let logical_key = format!("cursor/{label}/poison/{attempt}").into_bytes();
+                let header = reservation
+                    .header(
+                        Priority::Routine,
+                        logical_key,
+                        u64::try_from(poison_payload.len()).expect("poison payload length"),
+                        false,
+                        1,
+                    )
+                    .expect("poison State header");
+                let sealed = sealer
+                    .seal_state(&header, &poison_payload)
+                    .expect("seal poison State")
+                    .bytes;
+                let route = sealer
+                    .verify_state(&sealed)
+                    .expect("verify poison State route");
+                let state = match sealer
+                    .verify_state_content(route, &sealed)
+                    .expect("verify poison State content")
+                {
+                    StateContentVerification::ContentVerified { state, .. } => state,
+                    StateContentVerification::RouteOnly(_) => {
+                        panic!("test poison State lacks content grant")
+                    }
+                };
+                let id = StateTransferId::new(state.envelope_id());
+                if id.as_bytes()[0] > 0x40 {
+                    return None;
+                }
+                store
+                    .commit_reserved_state_with_policy(&policy, &reservation, &state, &sealed)
+                    .expect("commit poison State");
+                Some(id)
+            })
+            .expect("bounded poison search finds a low transfer ID");
+
+        let small_payload = [0x5a];
+        let small = (0..4_096u32)
+            .find_map(|attempt| {
+                let reservation = store
+                    .reserve_state_with_policy(&policy, sealer.identity(), topic, scope)
+                    .expect("small State reservation");
+                let logical_key = format!("cursor/{label}/small/{attempt}").into_bytes();
+                let header = reservation
+                    .header(
+                        Priority::Routine,
+                        logical_key,
+                        u64::try_from(small_payload.len()).expect("small payload length"),
+                        false,
+                        1,
+                    )
+                    .expect("small State header");
+                let sealed = sealer
+                    .seal_state(&header, &small_payload)
+                    .expect("seal small State")
+                    .bytes;
+                let route = sealer
+                    .verify_state(&sealed)
+                    .expect("verify small State route");
+                let state = match sealer
+                    .verify_state_content(route, &sealed)
+                    .expect("verify small State content")
+                {
+                    StateContentVerification::ContentVerified { state, .. } => state,
+                    StateContentVerification::RouteOnly(_) => {
+                        panic!("test small State lacks content grant")
+                    }
+                };
+                let id = StateTransferId::new(state.envelope_id());
+                if id <= poison {
+                    return None;
+                }
+                store
+                    .commit_reserved_state_with_policy(&policy, &reservation, &state, &sealed)
+                    .expect("commit small State");
+                Some(id)
+            })
+            .expect("bounded small search finds a successor transfer ID");
+        (poison, small)
+    }
+
+    fn publish_test_record(
+        store: &Store,
+        sealer: &mut ReferenceEnvelopeSealer,
+        topic: &Topic,
+        scope: &Scope,
+        logical_key: &[u8],
+        payload: &[u8],
+    ) -> RecordTransferId {
+        let policy = store
+            .control_policy_snapshot()
+            .expect("settled Record policy");
+        let reservation = store
+            .reserve_record_with_policy(&policy, sealer.identity(), topic, scope)
+            .expect("Record reservation");
+        let header = reservation
+            .header(
+                Priority::Routine,
+                logical_key.to_vec(),
+                u64::try_from(payload.len()).expect("Record payload length"),
+                false,
+                1,
+            )
+            .expect("Record header");
+        let sealed = sealer
+            .seal_record(&header, payload)
+            .expect("seal test Record")
+            .bytes;
+        let route = sealer.verify_record(&sealed).expect("verify test Record");
+        let record = match sealer
+            .verify_record_content(route, &sealed)
+            .expect("verify test Record content")
+        {
+            RecordContentVerification::ContentVerified { record, .. } => record,
+            RecordContentVerification::RouteOnly(_) => panic!("test Record lacks content grant"),
+        };
+        let transfer_id = RecordTransferId::new(record.envelope_id());
+        store
+            .commit_reserved_record_with_policy(&policy, &reservation, &record, &sealed)
+            .expect("commit test Record");
+        transfer_id
+    }
+
+    #[test]
+    fn delayed_same_clock_send_uses_the_store_normalized_checkpoint() {
+        let state = root("normalized-custody-send-checkpoint");
+        fs::create_dir_all(&state).expect("state root");
+        let services = control_test_services([0x62; 32]);
+        let store = Arc::new(
+            Store::open_for_mission(
+                state.join(STORE_FILE),
+                services.member.mission_authority_id(),
+            )
+            .expect("open mission store"),
+        );
+        let mut sealer = open_test_sealer(&services.member);
+        let clock_id = [0x63; 16];
+        let event = publish_test_custody_event(
+            &store,
+            &mut sealer,
+            TestCustodyPublication {
+                operation: b"normalized/send",
+                topic: &services.topic,
+                scope: &services.scope,
+                priority: Priority::Priority,
+                ttl_ms: Some(10_000),
+                sample: CustodySample {
+                    clock_id,
+                    tick_ms: 0,
+                },
+                payload: b"normalized",
+                tombstone: false,
+            },
+        );
+        let revision = store
+            .custody_policy_revision()
+            .expect("custody policy revision");
+        let key = CustodyObjectKey::event(event.transfer_id);
+        let delayed = CustodyLeaseGuard::begin(
+            store.clone(),
+            services.other.identity(),
+            key,
+            CustodyPeerSelectorRevision::new(0),
+            CustodySample {
+                clock_id,
+                tick_ms: 100,
+            },
+            revision,
+        )
+        .expect("begin delayed send");
+        let advancing = store
+            .begin_custody_send(
+                services.excluded.identity(),
+                key,
+                CustodyPeerSelectorRevision::new(0),
+                Some(CustodySample {
+                    clock_id,
+                    tick_ms: 101,
+                }),
+                0,
+                revision,
+            )
+            .expect("advance the same clock on another contact");
+        store
+            .release_transfer_lease(advancing.id)
+            .expect("release advancing lease");
+
+        let authorization = delayed
+            .require_send(
+                CustodySample {
+                    clock_id,
+                    tick_ms: 100,
+                },
+                revision,
+            )
+            .expect("normalize delayed sample");
+        assert_eq!(
+            authorization.sample,
+            Some(CustodySample {
+                clock_id,
+                tick_ms: 101,
+            })
+        );
+        assert_eq!(authorization.age_ms, 101);
+        drop(delayed);
+        drop(store);
+        fs::remove_dir_all(state).expect("cleanup");
+    }
+
+    #[test]
+    fn future_event_epoch_is_inactive_before_scope_activation() {
+        let state = root("future-event-epoch-inactive");
+        fs::create_dir_all(&state).expect("state root");
+        let scope = Scope::new("test/future-event-epoch").expect("scope");
+        let topic = Topic::new("future-event").expect("topic");
+        let access = ProvisioningAccess::member(scope.clone(), vec![1, 2], vec![topic.clone()])
+            .expect("future epoch provisioning");
+        let mut provisioner = ReferenceProvisioner::from_seed([0x5a; 32]).expect("provisioner");
+        let bytes = provisioner
+            .issue_node(7, &[access])
+            .expect("issue future-capable member")
+            .to_bytes()
+            .expect("encode mission");
+        let mission =
+            UnprotectedReferenceMission::from_bytes(bytes).expect("parse future-capable mission");
+        let mut sealer = open_test_sealer(&mission);
+        let store = Store::open_for_mission(state.join(STORE_FILE), mission.mission_authority_id())
+            .expect("open store");
+        let reservation = store
+            .reserve_event(sealer.identity(), &topic, &scope)
+            .expect("reserve Event");
+        let payload = b"not active yet";
+        let header = reservation
+            .header(
+                Priority::Routine,
+                b"future".to_vec(),
+                None,
+                payload.len() as u64,
+                false,
+                2,
+            )
+            .expect("future header");
+        let sealed = sealer
+            .seal_event(&header, payload)
+            .expect("seal provisioned future epoch");
+        let verified = sealer
+            .verify_event(&sealed.bytes)
+            .expect("verify future epoch source");
+        assert!(event_is_inactive(&store, &verified).expect("inactive check"));
+        let error = ensure_event_epoch_active(&store, &verified)
+            .expect_err("future epoch must not be exposed before activation");
+        assert!(
+            error
+                .to_string()
+                .contains("is not the active scope epoch 1")
+        );
+        drop(store);
+        fs::remove_dir_all(state).expect("cleanup");
+    }
+
     async fn contact_test_pair(
         server_store: Arc<Store>,
         server_mission: UnprotectedReferenceMission,
-        client_store: &Store,
+        client_store: Arc<Store>,
         client_mission: UnprotectedReferenceMission,
     ) -> (PeerReceipt, PeerReceipt) {
         let server = Endpoint::bind(
@@ -10665,6 +23862,1282 @@ mod tests {
         (client_receipt, server_receipt.receipt)
     }
 
+    fn publish_test_blob(
+        store: &Store,
+        sealer: &mut ReferenceEnvelopeSealer,
+        topic: &Topic,
+        scope: &Scope,
+        epoch: u64,
+        plaintext: &[u8],
+    ) -> BlobTransferId {
+        let prepared = aster_mesh::prepare_blob(
+            &mut std::io::Cursor::new(plaintext),
+            aster_mesh::SELECTED_BLOB_CHUNK_SIZE,
+            aster_mesh::BlobMetadata::new(Some("application/octet-stream".into()), Vec::new())
+                .expect("Blob metadata"),
+        )
+        .expect("prepare test Blob");
+        let finished = {
+            let depot = store.blob_depot().expect("Blob depot");
+            let mut service = sealer
+                .blob_service_with_store(scope, topic, epoch, depot)
+                .expect("Blob service");
+            let manifest = service
+                .install_prepared(&prepared)
+                .expect("install prepared Blob");
+            let progress = service
+                .encrypt_some(
+                    &mut std::io::Cursor::new(plaintext),
+                    &manifest,
+                    prepared.chunk_count(),
+                )
+                .expect("encrypt test Blob");
+            assert!(progress.complete);
+            service.finish_manifest(&manifest).expect("finish Blob")
+        };
+        let policy = store.control_policy_snapshot().expect("Blob policy");
+        let reservation = store
+            .reserve_blob_with_policy(&policy, sealer.identity(), topic, scope)
+            .expect("reserve Blob");
+        let header = reservation
+            .header(
+                Priority::Routine,
+                finished.route_commitment(),
+                u64::try_from(finished.manifest_bytes().len()).expect("manifest length"),
+                epoch,
+            )
+            .expect("Blob header");
+        let sealed = sealer
+            .seal_blob_manifest(&header, finished.manifest_bytes())
+            .expect("seal Blob source");
+        let route = sealer
+            .verify_blob(&sealed.bytes)
+            .expect("verify Blob route");
+        let BlobContentVerification::ContentVerified { blob, .. } = sealer
+            .verify_blob_content(route, &sealed.bytes)
+            .expect("verify Blob content")
+        else {
+            panic!("publisher lacks Blob content grant");
+        };
+        let completion = store
+            .blob_depot()
+            .and_then(|mut depot| depot.completed_blob(&blob, finished.manifest_bytes()))
+            .expect("Blob depot completion");
+        let mut operation_bytes = b"runtime-blob-e2e/".to_vec();
+        operation_bytes.extend_from_slice(&Sha256::digest(plaintext));
+        let operation =
+            aster_redb_store::BlobOperationKey::new(operation_bytes).expect("Blob operation");
+        let intent = aster_redb_store::BlobPublicationIntent::new(
+            sealer.identity(),
+            topic.clone(),
+            scope.clone(),
+            Priority::Routine,
+            prepared.id(),
+        )
+        .expect("Blob intent");
+        store
+            .commit_reserved_blob_once_with_policy(
+                &policy,
+                &aster_redb_store::BlobOperationRequest::new(&operation, &intent),
+                &reservation,
+                &blob,
+                &sealed.bytes,
+                &completion,
+            )
+            .expect("commit test Blob")
+            .blob()
+            .transfer_id
+    }
+
+    fn completed_test_blob_plan(
+        store: &Store,
+        sealer: &mut ReferenceEnvelopeSealer,
+        source: BlobTransferId,
+    ) -> VerifiedBlobTransferPlan {
+        let stored = store
+            .get_blob(source)
+            .expect("completed test Blob lookup")
+            .expect("completed test Blob");
+        let route = sealer
+            .verify_blob(&stored.sealed)
+            .expect("verify completed test Blob route");
+        let BlobContentVerification::ContentVerified {
+            blob,
+            manifest_bytes,
+        } = sealer
+            .verify_blob_content(route, &stored.sealed)
+            .expect("verify completed test Blob content")
+        else {
+            panic!("completed test Blob lost content access");
+        };
+        blob.transfer_plan(&manifest_bytes)
+            .expect("completed test Blob plan")
+    }
+
+    fn stage_test_pending_blob(
+        store: &Store,
+        cache: &AuthenticatedEventRouteCache,
+        mission: &UnprotectedReferenceMission,
+        source: BlobTransferId,
+        sealed: &[u8],
+    ) -> AuthenticatedBlobRouteClaim {
+        let mut verifier = open_test_sealer(mission);
+        let route = verifier
+            .verify_blob(sealed)
+            .expect("verify pending test Blob route");
+        assert_eq!(BlobTransferId::new(route.envelope_id()), source);
+        let BlobContentVerification::ContentVerified {
+            blob,
+            manifest_bytes,
+        } = verifier
+            .verify_blob_content(route, sealed)
+            .expect("verify pending test Blob content")
+        else {
+            panic!("pending test Blob lost content access");
+        };
+        let plan = blob
+            .transfer_plan(&manifest_bytes)
+            .expect("pending test Blob plan");
+        let policy = store
+            .control_policy_snapshot()
+            .expect("pending test Blob policy");
+        let _lifecycle = cache
+            .lock_blob_lifecycle()
+            .expect("pending test Blob lifecycle lock");
+        assert!(matches!(
+            store
+                .stage_verified_blob_source_with_policy(&policy, &blob, sealed, &plan)
+                .expect("stage pending test Blob"),
+            BlobSourceStageOutcome::Inserted | BlobSourceStageOutcome::Duplicate
+        ));
+        let projection = store
+            .blob_source_projection(source)
+            .expect("pending test Blob projection lookup")
+            .expect("pending test Blob projection");
+        assert_eq!(projection.retention, BlobSourceRetention::Pending);
+        let claim = AuthenticatedBlobRouteClaim::from_verified(
+            &blob,
+            sealed,
+            &projection.source,
+            projection.retention,
+        )
+        .expect("pending test Blob claim");
+        cache
+            .insert_blob(&verifier, claim.clone())
+            .expect("cache pending test Blob claim");
+        claim
+    }
+
+    async fn blob_contact_test_pair(
+        server_store: Arc<Store>,
+        server_mission: UnprotectedReferenceMission,
+        server_interests: MutableSourceInterests,
+        client_store: Arc<Store>,
+        client_mission: UnprotectedReferenceMission,
+        client_interests: MutableSourceInterests,
+    ) -> (PeerReceipt, PeerReceipt) {
+        let server_cache = test_event_route_cache(&server_store, &server_mission);
+        let client_cache = test_event_route_cache(&client_store, &client_mission);
+        let server = Endpoint::bind(
+            aster_iroh::SecretKey::generate(),
+            EndpointConfig::direct("127.0.0.1:0".parse().expect("server address")),
+        )
+        .await
+        .expect("server endpoint");
+        let client = Endpoint::bind(
+            aster_iroh::SecretKey::generate(),
+            EndpointConfig::direct("127.0.0.1:0".parse().expect("client address")),
+        )
+        .await
+        .expect("client endpoint");
+        let server_policy = Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal));
+        let client_policy = Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal));
+        let server_mission_id = server_mission.identity();
+        let server_task = tokio::spawn({
+            let endpoint = server.clone();
+            let peer = MissionPeerBinding::new(client.id(), client_mission.identity());
+            let allowed = BTreeSet::from([client.id()]);
+            async move {
+                let connection = endpoint
+                    .accept(&allowed)
+                    .await
+                    .expect("accept Blob carrier");
+                serve_connection_with_forwarding(InboundContact {
+                    store: server_store,
+                    connection,
+                    mission: server_mission,
+                    peer,
+                    policy_lock: Arc::new(RwLock::new(())),
+                    emission_policy: server_policy,
+                    custody_clock: NodeCustodyClock::injected([0xb1; 16], 0, 0),
+                    event_route_cache: server_cache,
+                    mutable_interests: server_interests,
+                })
+                .await
+            }
+        });
+        let snapshot = client_policy.snapshot().expect("client policy snapshot");
+        let client_receipt = sync_once_with_forwarding(
+            &client,
+            OutboundContact {
+                store: client_store,
+                mission: client_mission,
+                peer: MissionExpectedPeer {
+                    carrier: ExpectedPeer {
+                        id: server.id(),
+                        address: loopback(&server),
+                    },
+                    mission: server_mission_id,
+                },
+                policy_lock: Arc::new(RwLock::new(())),
+                emission_policy: client_policy,
+                emission_snapshot: snapshot,
+                custody_clock: NodeCustodyClock::injected([0xb2; 16], 0, 0),
+                event_route_cache: client_cache,
+                mutable_interests: client_interests,
+                controlled_relay: None,
+            },
+        )
+        .await
+        .expect("Blob client contact");
+        let server_receipt = server_task
+            .await
+            .expect("Blob server task")
+            .expect("Blob server contact");
+        client.close().await;
+        server.close().await;
+        (client_receipt.receipt, server_receipt.receipt)
+    }
+
+    #[tokio::test]
+    async fn blob_source_carrier_reopen_resumes_exact_complement_from_different_peer() {
+        let mut missions = issue_missions(3);
+        let c = missions.pop().expect("mission C");
+        let b = missions.pop().expect("mission B");
+        let a = missions.pop().expect("mission A");
+        let authority = a.credentials.mission_authority_id();
+        assert_eq!(b.credentials.mission_authority_id(), authority);
+        assert_eq!(c.credentials.mission_authority_id(), authority);
+        let scope = Scope::new("test/runtime-contact").expect("Blob scope");
+        let topic = Topic::new("opaque").expect("Blob topic");
+        let interests = || {
+            MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                topic.clone(),
+                scope.clone(),
+                false,
+            )])
+        };
+        let a_state = root("blob-e2e-a");
+        let b_state = root("blob-e2e-b");
+        let c_state = root("blob-e2e-c");
+        for state in [&a_state, &b_state, &c_state] {
+            fs::create_dir_all(state).expect("Blob E2E state");
+        }
+        let a_store = Arc::new(
+            Store::open_for_mission(a_state.join(STORE_FILE), authority).expect("store A"),
+        );
+        let b_store = Arc::new(
+            Store::open_for_mission(b_state.join(STORE_FILE), authority).expect("store B"),
+        );
+        let c_path = c_state.join(STORE_FILE);
+        let c_store = Arc::new(Store::open_for_mission(&c_path, authority).expect("store C"));
+        let mut a_sealer = open_test_sealer(&a.credentials);
+        let plaintext = vec![0x5a; 96 * 1024];
+        let source = publish_test_blob(&a_store, &mut a_sealer, &topic, &scope, 1, &plaintext);
+
+        let mut b_ranges = 0usize;
+        for _ in 0..16 {
+            let (client, _) = blob_contact_test_pair(
+                a_store.clone(),
+                a.credentials.clone(),
+                interests(),
+                b_store.clone(),
+                b.credentials.clone(),
+                interests(),
+            )
+            .await;
+            b_ranges += client.blob_ranges_fetched;
+            if b_store.blob_stats().expect("B Blob stats").publications == 1 {
+                break;
+            }
+        }
+        assert!(b_ranges > 1, "B must converge through bounded ranges");
+        assert_eq!(
+            b_store
+                .blob_stats()
+                .expect("B completed Blob stats")
+                .publications,
+            1
+        );
+
+        let (c_first, _) = blob_contact_test_pair(
+            a_store.clone(),
+            a.credentials.clone(),
+            interests(),
+            c_store.clone(),
+            c.credentials.clone(),
+            interests(),
+        )
+        .await;
+        assert_eq!(c_first.fetched, 1, "C fetches the source exactly once");
+        assert_eq!(c_first.blob_ranges_fetched, 1);
+        assert_eq!(
+            c_store
+                .blob_stats()
+                .expect("C partial Blob stats")
+                .publications,
+            0,
+            "staged Blob source is not application-visible"
+        );
+        let pending = c_store
+            .pending_blob_source(source)
+            .expect("C pending source lookup")
+            .expect("C pending source");
+        let progressed = pending
+            .carriers
+            .iter()
+            .find_map(|carrier| {
+                c_store
+                    .blob_carrier_prefix_status(source, carrier.object)
+                    .expect("C prefix status")
+                    .filter(|status| status.prefix_len() > 0)
+            })
+            .expect("C durable partial prefix");
+        let prefix_before_reopen = progressed.prefix_len();
+        let progressed_object = progressed.object();
+
+        drop(a_store);
+        drop(c_store);
+        let c_store =
+            Arc::new(Store::open_for_mission(&c_path, authority).expect("reopen store C"));
+        let reopened = c_store
+            .blob_carrier_prefix_status(source, progressed_object)
+            .expect("reopened C prefix")
+            .expect("reopened prefix survives");
+        assert_eq!(reopened.prefix_len(), prefix_before_reopen);
+
+        let (c_resume, _) = blob_contact_test_pair(
+            b_store.clone(),
+            b.credentials.clone(),
+            interests(),
+            c_store.clone(),
+            c.credentials.clone(),
+            interests(),
+        )
+        .await;
+        assert_eq!(
+            c_resume.fetched, 0,
+            "different completed peer must not retransmit the staged source"
+        );
+        assert_eq!(c_resume.blob_ranges_fetched, 1);
+        let after_resume = c_store
+            .blob_carrier_prefix_status(source, progressed_object)
+            .expect("resumed C prefix status");
+        if let Some(status) = after_resume {
+            assert_eq!(
+                status.prefix_len(),
+                prefix_before_reopen + u64::try_from(c_resume.blob_bytes_fetched).unwrap(),
+                "different peer starts at the exact durable complement"
+            );
+        }
+
+        for _ in 0..16 {
+            if c_store
+                .blob_stats()
+                .expect("C convergence stats")
+                .publications
+                == 1
+            {
+                break;
+            }
+            let (client, _) = blob_contact_test_pair(
+                b_store.clone(),
+                b.credentials.clone(),
+                interests(),
+                c_store.clone(),
+                c.credentials.clone(),
+                interests(),
+            )
+            .await;
+            assert_eq!(client.fetched, 0, "resumed C never refetches the source");
+        }
+        let final_stats = c_store.blob_stats().expect("C final Blob stats");
+        assert_eq!(final_stats.publications, 1);
+        assert_eq!(final_stats.pending_sources, 0);
+        assert_eq!(final_stats.carrier_prefixes, 0);
+        assert_eq!(
+            c_store.blob_inventory().expect("C Blob inventory"),
+            vec![source]
+        );
+        let stored = c_store
+            .get_blob(source)
+            .expect("C completed Blob lookup")
+            .expect("C completed Blob");
+        let mut c_sealer = open_test_sealer(&c.credentials);
+        let route = c_sealer
+            .verify_blob(&stored.sealed)
+            .expect("C verifies completed Blob route");
+        let BlobContentVerification::ContentVerified {
+            blob,
+            manifest_bytes,
+        } = c_sealer
+            .verify_blob_content(route, &stored.sealed)
+            .expect("C verifies completed Blob content")
+        else {
+            panic!("C completed Blob lost content grant");
+        };
+        let depot = c_store.blob_depot().expect("C completed Blob depot");
+        let mut service = c_sealer
+            .blob_service_with_store(&scope, &topic, 1, depot)
+            .expect("C completed Blob service");
+        service
+            .install_verified_manifest(&blob, &manifest_bytes)
+            .expect("C activates completed Blob manifest");
+        let mut output = Vec::new();
+        service
+            .reader_for_verified(&blob)
+            .and_then(|mut reader| reader.stream_into(&mut output))
+            .expect("C streams completed Blob plaintext");
+        assert_eq!(output, plaintext);
+        drop(service);
+
+        drop(b_store);
+        drop(c_store);
+        for state in [a_state, b_state, c_state] {
+            fs::remove_dir_all(state).expect("Blob E2E cleanup");
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum PendingBlobInvalidation {
+        SameEpochLineage,
+        EpochAdvance,
+        PublisherRevocation,
+    }
+
+    #[tokio::test]
+    async fn stale_pending_blob_cleanup_reclaims_exact_cache_and_depot_state() {
+        for (seed, invalidation, label, current_epoch) in [
+            (
+                [0xc1; 32],
+                PendingBlobInvalidation::SameEpochLineage,
+                "same-epoch-lineage",
+                1,
+            ),
+            (
+                [0xc2; 32],
+                PendingBlobInvalidation::EpochAdvance,
+                "epoch-advance",
+                2,
+            ),
+            (
+                [0xc3; 32],
+                PendingBlobInvalidation::PublisherRevocation,
+                "publisher-revocation",
+                1,
+            ),
+        ] {
+            let services = control_test_services(seed);
+            let authority_id = services.authority.mission_authority_id();
+            let authority_peer = services.authority.identity();
+            let source_id = services.member.identity();
+            let source_state = root(&format!("blob-cleanup-{label}-source"));
+            let receiver_state = root(&format!("blob-cleanup-{label}-receiver"));
+            fs::create_dir_all(&source_state).expect("stale Blob source state");
+            fs::create_dir_all(&receiver_state).expect("stale Blob receiver state");
+            let source_store = Arc::new(
+                Store::open_for_mission(source_state.join(STORE_FILE), authority_id)
+                    .expect("stale Blob source store"),
+            );
+            let receiver_path = receiver_state.join(STORE_FILE);
+            let receiver_store = Arc::new(
+                Store::open_for_mission(&receiver_path, authority_id)
+                    .expect("stale Blob receiver store"),
+            );
+            let mut source_sealer = open_test_sealer(&services.member);
+            let source = publish_test_blob(
+                &source_store,
+                &mut source_sealer,
+                &services.topic,
+                &services.scope,
+                1,
+                &vec![0x6d; 96 * 1024],
+            );
+            let interests = || {
+                MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
+                    services.topic.clone(),
+                    services.scope.clone(),
+                    false,
+                )])
+            };
+            let (partial, _) = blob_contact_test_pair(
+                source_store.clone(),
+                services.member.clone(),
+                interests(),
+                receiver_store.clone(),
+                services.other.clone(),
+                interests(),
+            )
+            .await;
+            assert_eq!(partial.fetched, 1, "{label} stages one exact source");
+            assert_eq!(partial.blob_ranges_fetched, 1);
+            let staged = receiver_store
+                .blob_stats()
+                .expect("stale Blob staged stats");
+            assert_eq!(staged.publications, 0);
+            assert_eq!(staged.pending_sources, 1);
+            assert_eq!(staged.carrier_prefixes, 1);
+            assert!(staged.network_staging_bytes > 0);
+            assert!(staged.reserved_file_bytes > 0);
+
+            let mut authority = open_test_sealer(&services.authority);
+            let control = match invalidation {
+                PendingBlobInvalidation::SameEpochLineage
+                | PendingBlobInvalidation::EpochAdvance => {
+                    let recipients = vec![
+                        ScopeRekeyRecipient::member(
+                            services.authority.identity(),
+                            vec![services.topic.clone()],
+                        )
+                        .expect("authority Blob rekey recipient"),
+                        ScopeRekeyRecipient::member(
+                            services.member.identity(),
+                            vec![services.topic.clone()],
+                        )
+                        .expect("source Blob rekey recipient"),
+                        ScopeRekeyRecipient::member(
+                            services.other.identity(),
+                            vec![services.topic.clone()],
+                        )
+                        .expect("receiver Blob rekey recipient"),
+                    ];
+                    authority
+                        .seal_chained_scope_rekey_control_from_registry(
+                            &services.registry,
+                            0,
+                            services.scope.clone(),
+                            current_epoch,
+                            recipients,
+                            1,
+                            None,
+                        )
+                        .expect("seal stale-pending Blob rekey")
+                        .0
+                }
+                PendingBlobInvalidation::PublisherRevocation => authority
+                    .seal_chained_revocation_control(source_id, 1, 1, None)
+                    .expect("seal stale-pending Blob publisher revocation"),
+            };
+            let control_id = ControlTransferId::new(
+                authority
+                    .verify_control(&control)
+                    .expect("verify stale-pending control")
+                    .envelope_id(),
+            );
+            let mut receiver_verifier = open_test_sealer(&services.other);
+            let accepted = accept_received_control(
+                &receiver_store,
+                &mut receiver_verifier,
+                authority_peer,
+                control_id,
+                &control,
+            )
+            .expect("activate stale-pending control");
+            assert_eq!(accepted.activated, 1);
+
+            drop(receiver_store);
+            let receiver_store =
+                Store::open_for_mission(&receiver_path, authority_id).expect("reopen stale store");
+            let mut startup =
+                open_startup_event_verifier_and_cache(&receiver_store, &services.other)
+                    .expect("startup cleans stale pending Blob");
+            let cleaned = receiver_store
+                .blob_stats()
+                .expect("cleaned pending Blob stats");
+            assert_eq!(cleaned.publications, 0);
+            assert_eq!(
+                cleaned.variants, 1,
+                "{label} retains the exact unfinished lineage fence"
+            );
+            assert_eq!(cleaned.committed_chunks, 0);
+            assert_eq!(cleaned.committed_file_bytes, 0);
+            assert_eq!(cleaned.pending_sources, 0);
+            assert_eq!(cleaned.carrier_prefixes, 0);
+            assert_eq!(cleaned.network_staging_bytes, 0);
+            assert_eq!(cleaned.reserved_file_bytes, 0);
+            assert!(
+                startup
+                    .cache
+                    .get_blob(&startup.verifier, source)
+                    .expect("inspect exact cleaned Blob claim")
+                    .is_none(),
+                "{label} removes the exact non-durable cache claim"
+            );
+
+            let valid = publish_test_blob(
+                &receiver_store,
+                &mut startup.verifier,
+                &services.topic,
+                &services.scope,
+                current_epoch,
+                b"valid Blob work after exact stale cleanup",
+            );
+            assert_eq!(
+                receiver_store
+                    .blob_stats()
+                    .expect("post-cleanup valid Blob stats")
+                    .publications,
+                1,
+                "{label} does not poison later Blob work"
+            );
+            drop(startup);
+            drop(receiver_store);
+
+            let receiver_store =
+                Store::open_for_mission(&receiver_path, authority_id).expect("second clean reopen");
+            let reopened = open_startup_event_verifier_and_cache(&receiver_store, &services.other)
+                .expect("cleaned Blob store remains restartable");
+            assert!(
+                reopened
+                    .cache
+                    .get_blob(&reopened.verifier, source)
+                    .expect("inspect old source after second reopen")
+                    .is_none()
+            );
+            assert!(
+                matches!(
+                    reopened
+                        .cache
+                        .get_blob(&reopened.verifier, valid)
+                        .expect("inspect valid source after second reopen")
+                        .expect("valid source remains authenticated")
+                        .retention,
+                    BlobSourceRetention::Completed { .. }
+                ),
+                "valid source remains completed after the second reopen"
+            );
+            assert_eq!(
+                receiver_store
+                    .blob_stats()
+                    .expect("second clean reopen stats")
+                    .pending_sources,
+                0
+            );
+
+            drop(reopened);
+            drop(source_store);
+            drop(receiver_store);
+            for state in [source_state, receiver_state] {
+                fs::remove_dir_all(state).expect("stale Blob cleanup state removal");
+            }
+        }
+    }
+
+    #[test]
+    fn pending_blob_abort_reconciles_concurrent_exact_restage_without_restart() {
+        let mut missions = issue_missions(2);
+        let receiver = missions.pop().expect("abort-race receiver mission");
+        let source_mission = missions.pop().expect("abort-race source mission");
+        let authority = source_mission.credentials.mission_authority_id();
+        let source_state = root("blob-abort-race-source");
+        let receiver_state = root("blob-abort-race-receiver");
+        fs::create_dir_all(&source_state).expect("abort-race source state");
+        fs::create_dir_all(&receiver_state).expect("abort-race receiver state");
+        let source_store = Store::open_for_mission(source_state.join(STORE_FILE), authority)
+            .expect("abort-race source store");
+        let receiver_store = Arc::new(
+            Store::open_for_mission(receiver_state.join(STORE_FILE), authority)
+                .expect("abort-race receiver store"),
+        );
+        let topic = Topic::new("opaque").expect("abort-race topic");
+        let scope = Scope::new("test/runtime-contact").expect("abort-race scope");
+        let mut source_sealer = open_test_sealer(&source_mission.credentials);
+        let source = publish_test_blob(
+            &source_store,
+            &mut source_sealer,
+            &topic,
+            &scope,
+            1,
+            &[0x73; 32 * 1024],
+        );
+        let sealed = source_store
+            .get_blob(source)
+            .expect("abort-race source lookup")
+            .expect("abort-race source")
+            .sealed;
+        let mut receiver_verifier = open_test_sealer(&receiver.credentials);
+        let cache = Arc::new(
+            AuthenticatedEventRouteCache::empty_for_store(&receiver_verifier, &receiver_store)
+                .expect("abort-race cache"),
+        );
+        let old_claim = stage_test_pending_blob(
+            &receiver_store,
+            &cache,
+            &receiver.credentials,
+            source,
+            &sealed,
+        );
+
+        let after_abort = Arc::new(Barrier::new(2));
+        let after_restage = Arc::new(Barrier::new(2));
+        let restage = {
+            let store = receiver_store.clone();
+            let cache = cache.clone();
+            let mission = receiver.credentials.clone();
+            let sealed = sealed.clone();
+            let after_abort = after_abort.clone();
+            let after_restage = after_restage.clone();
+            thread::spawn(move || {
+                after_abort.wait();
+                let claim = stage_test_pending_blob(&store, &cache, &mission, source, &sealed);
+                after_restage.wait();
+                claim
+            })
+        };
+        assert!(
+            receiver_store
+                .abort_pending_blob_source(source)
+                .expect("durable abort before concurrent restage")
+        );
+        after_abort.wait();
+        after_restage.wait();
+        let restaged_claim = restage.join().expect("concurrent exact restage");
+        assert_eq!(restaged_claim, old_claim);
+
+        // This is the audited interleaving: the durable row and identical
+        // cache claim were restaged after abort but before removal of the old
+        // claim. Reconciliation must remove-then-freshly-prove the live row.
+        {
+            let lifecycle = cache
+                .lock_blob_lifecycle()
+                .expect("post-abort lifecycle lock");
+            reconcile_blob_cache_after_successful_pending_abort(
+                &receiver_store,
+                &mut receiver_verifier,
+                &cache,
+                &old_claim,
+                &lifecycle,
+            )
+            .expect("post-abort cache reconciliation");
+        }
+        let projection = receiver_store
+            .blob_source_projection(source)
+            .expect("restaged projection lookup")
+            .expect("restaged projection remains durable");
+        let cached = cache
+            .get_blob(&receiver_verifier, source)
+            .expect("restaged cache lookup")
+            .expect("restaged cache claim restored");
+        assert_eq!(projection.retention, BlobSourceRetention::Pending);
+        assert!(cached.matches_projection(&projection.source));
+        assert_eq!(cached.retention, BlobSourceRetention::Pending);
+        assert_eq!(
+            cleanup_ineligible_pending_blobs(&receiver_store, &mut receiver_verifier, &cache,)
+                .expect("subsequent cleanup sees a coherent pending claim"),
+            0
+        );
+
+        // The opposite ordering is also sound: a restage after the complete
+        // abort/cache transition installs its own durable and cached claim.
+        {
+            let lifecycle = cache
+                .lock_blob_lifecycle()
+                .expect("second abort lifecycle lock");
+            assert!(
+                receiver_store
+                    .abort_pending_blob_source(source)
+                    .expect("second durable abort")
+            );
+            reconcile_blob_cache_after_successful_pending_abort(
+                &receiver_store,
+                &mut receiver_verifier,
+                &cache,
+                &cached,
+                &lifecycle,
+            )
+            .expect("complete abort transition before restage");
+        }
+        assert!(
+            receiver_store
+                .pending_blob_source(source)
+                .expect("post-abort pending lookup")
+                .is_none()
+        );
+        assert!(
+            cache
+                .get_blob(&receiver_verifier, source)
+                .expect("post-abort cache lookup")
+                .is_none()
+        );
+        let after_transition = stage_test_pending_blob(
+            &receiver_store,
+            &cache,
+            &receiver.credentials,
+            source,
+            &sealed,
+        );
+        assert!(
+            cache
+                .get_blob(&receiver_verifier, source)
+                .expect("after-transition cache lookup")
+                .is_some_and(|claim| claim == after_transition)
+        );
+        assert_eq!(
+            cleanup_ineligible_pending_blobs(&receiver_store, &mut receiver_verifier, &cache,)
+                .expect("after-transition cleanup remains live"),
+            0
+        );
+
+        drop(source_store);
+        drop(receiver_store);
+        for state in [source_state, receiver_state] {
+            fs::remove_dir_all(state).expect("abort-race cleanup");
+        }
+    }
+
+    #[test]
+    fn blob_lifecycle_lock_serializes_delayed_projection_insert_and_abort() {
+        let mut missions = issue_missions(2);
+        let receiver = missions.pop().expect("lifecycle receiver mission");
+        let source_mission = missions.pop().expect("lifecycle source mission");
+        let authority = source_mission.credentials.mission_authority_id();
+        let source_state = root("blob-lifecycle-source");
+        let receiver_state = root("blob-lifecycle-receiver");
+        fs::create_dir_all(&source_state).expect("lifecycle source state");
+        fs::create_dir_all(&receiver_state).expect("lifecycle receiver state");
+        let source_store = Store::open_for_mission(source_state.join(STORE_FILE), authority)
+            .expect("lifecycle source store");
+        let receiver_store = Arc::new(
+            Store::open_for_mission(receiver_state.join(STORE_FILE), authority)
+                .expect("lifecycle receiver store"),
+        );
+        let topic = Topic::new("opaque").expect("lifecycle topic");
+        let scope = Scope::new("test/runtime-contact").expect("lifecycle scope");
+        let mut source_sealer = open_test_sealer(&source_mission.credentials);
+        let source = publish_test_blob(
+            &source_store,
+            &mut source_sealer,
+            &topic,
+            &scope,
+            1,
+            &[0x6c; 32 * 1024],
+        );
+        let sealed = source_store
+            .get_blob(source)
+            .expect("lifecycle source lookup")
+            .expect("lifecycle source")
+            .sealed;
+        let verifier = open_test_sealer(&receiver.credentials);
+        let cache = Arc::new(
+            AuthenticatedEventRouteCache::empty_for_store(&verifier, &receiver_store)
+                .expect("lifecycle cache"),
+        );
+
+        let (projection_ready_tx, projection_ready_rx) = std_mpsc::sync_channel(0);
+        let (allow_cache_insert_tx, allow_cache_insert_rx) = std_mpsc::sync_channel(0);
+        let admission = {
+            let store = receiver_store.clone();
+            let cache = cache.clone();
+            let mission = receiver.credentials.clone();
+            let sealed = sealed.clone();
+            thread::spawn(move || {
+                let mut verifier = open_test_sealer(&mission);
+                let route = verifier
+                    .verify_blob(&sealed)
+                    .expect("verify delayed lifecycle route");
+                let BlobContentVerification::ContentVerified {
+                    blob,
+                    manifest_bytes,
+                } = verifier
+                    .verify_blob_content(route, &sealed)
+                    .expect("verify delayed lifecycle content")
+                else {
+                    panic!("delayed lifecycle Blob lost content access");
+                };
+                let plan = blob
+                    .transfer_plan(&manifest_bytes)
+                    .expect("delayed lifecycle plan");
+                let policy = store
+                    .control_policy_snapshot()
+                    .expect("delayed lifecycle policy");
+                let _lifecycle = cache
+                    .lock_blob_lifecycle()
+                    .expect("delayed admission lifecycle lock");
+                assert!(matches!(
+                    store
+                        .stage_verified_blob_source_with_policy(&policy, &blob, &sealed, &plan)
+                        .expect("delayed lifecycle stage"),
+                    BlobSourceStageOutcome::Inserted
+                ));
+                let projection = store
+                    .blob_source_projection(source)
+                    .expect("delayed lifecycle projection lookup")
+                    .expect("delayed lifecycle projection");
+                let claim = AuthenticatedBlobRouteClaim::from_verified(
+                    &blob,
+                    &sealed,
+                    &projection.source,
+                    projection.retention,
+                )
+                .expect("delayed lifecycle claim");
+                projection_ready_tx
+                    .send(())
+                    .expect("report delayed lifecycle projection");
+                allow_cache_insert_rx
+                    .recv()
+                    .expect("release delayed lifecycle cache insert");
+                cache
+                    .insert_blob(&verifier, claim.clone())
+                    .expect("delayed lifecycle cache insert");
+                claim
+            })
+        };
+        projection_ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("delayed admission reaches its projection");
+
+        let (abort_started_tx, abort_started_rx) = std_mpsc::sync_channel(0);
+        let (abort_done_tx, abort_done_rx) = std_mpsc::channel();
+        let abort = {
+            let store = receiver_store.clone();
+            let cache = cache.clone();
+            let mission = receiver.credentials.clone();
+            thread::spawn(move || {
+                let mut verifier = open_test_sealer(&mission);
+                abort_started_tx
+                    .send(())
+                    .expect("report serialized abort start");
+                let lifecycle = cache
+                    .lock_blob_lifecycle()
+                    .expect("serialized abort lifecycle lock");
+                let claim = cache
+                    .get_blob(&verifier, source)
+                    .expect("serialized abort claim lookup")
+                    .expect("admission inserted before serialized abort");
+                assert!(
+                    store
+                        .abort_pending_blob_source(source)
+                        .expect("serialized durable abort")
+                );
+                reconcile_blob_cache_after_successful_pending_abort(
+                    &store,
+                    &mut verifier,
+                    &cache,
+                    &claim,
+                    &lifecycle,
+                )
+                .expect("serialized abort cache reconciliation");
+                abort_done_tx
+                    .send(())
+                    .expect("report serialized abort completion");
+            })
+        };
+        abort_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("serialized abort starts");
+        assert!(matches!(
+            abort_done_rx.recv_timeout(Duration::from_millis(100)),
+            Err(std_mpsc::RecvTimeoutError::Timeout)
+        ));
+        allow_cache_insert_tx
+            .send(())
+            .expect("release delayed cache insertion");
+        admission.join().expect("delayed admission thread");
+        abort_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("serialized abort completes after admission");
+        abort.join().expect("serialized abort thread");
+
+        let mut receiver_verifier = open_test_sealer(&receiver.credentials);
+        assert!(
+            receiver_store
+                .blob_source_projection(source)
+                .expect("post-race source projection")
+                .is_none()
+        );
+        assert!(
+            cache
+                .get_blob(&receiver_verifier, source)
+                .expect("post-race cache lookup")
+                .is_none()
+        );
+        assert_eq!(cache.blob_claim_count(), 0, "abort leaves no cache orphan");
+
+        let restaged = stage_test_pending_blob(
+            &receiver_store,
+            &cache,
+            &receiver.credentials,
+            source,
+            &sealed,
+        );
+        assert_eq!(
+            cache.blob_claim_count(),
+            1,
+            "restage consumes one cache slot"
+        );
+        assert_eq!(
+            cleanup_ineligible_pending_blobs(&receiver_store, &mut receiver_verifier, &cache,)
+                .expect("post-race cleanup"),
+            0
+        );
+        let policy = receiver_store
+            .control_policy_snapshot()
+            .expect("post-race contact policy");
+        let projection = receiver_store
+            .pending_blob_source_inventory_with_policy(&policy)
+            .expect("post-race contact inventory")
+            .into_iter()
+            .find(|projection| projection.transfer_id == source)
+            .expect("post-race contact sees restaged source");
+        let contact_claim = repair_blob_sender_cache_miss(
+            &receiver_store,
+            &mut receiver_verifier,
+            &cache,
+            &projection,
+        )
+        .expect("post-race contact cache check")
+        .expect("post-race contact retains exact source");
+        assert_eq!(contact_claim, restaged);
+
+        drop(source_store);
+        drop(receiver_store);
+        for state in [source_state, receiver_state] {
+            fs::remove_dir_all(state).expect("Blob lifecycle cleanup");
+        }
+    }
+
+    #[test]
+    fn terminal_blob_poison_advances_scheduler_past_source_to_later_candidate() {
+        let mut missions = issue_missions(2);
+        let peer = missions.pop().expect("scheduler peer mission");
+        let owner = missions.pop().expect("scheduler owner mission");
+        let state = root("terminal-blob-poison-fairness");
+        fs::create_dir_all(&state).expect("terminal Blob fairness state");
+        let store = Store::open_for_mission(
+            state.join(STORE_FILE),
+            owner.credentials.mission_authority_id(),
+        )
+        .expect("terminal Blob fairness store");
+        let topic = Topic::new("opaque").expect("terminal Blob topic");
+        let scope = Scope::new("test/runtime-contact").expect("terminal Blob scope");
+        let mut sealer = open_test_sealer(&owner.credentials);
+        let (poison_source, poison_plan, manifest_last, maximum) = (0u8..32)
+            .find_map(|salt| {
+                let plaintext = vec![salt; 96 * 1024];
+                let source = publish_test_blob(&store, &mut sealer, &topic, &scope, 1, &plaintext);
+                let plan = completed_test_blob_plan(&store, &mut sealer, source);
+                let carriers = plan
+                    .carrier_ids()
+                    .map(|object| {
+                        BlobCarrierObjectId::new(object.wire_bytes())
+                            .expect("terminal fairness carrier ID")
+                    })
+                    .collect::<Vec<_>>();
+                let manifest_last = carriers.last().copied()?;
+                let maximum = carriers.iter().copied().max()?;
+                (carriers.len() > 1 && manifest_last != maximum).then_some((
+                    source,
+                    plan,
+                    manifest_last,
+                    maximum,
+                ))
+            })
+            .expect("deterministic multi-carrier plan with manifest-last below maximum");
+        let later_source = BlobTransferId::new([0xff; 32]);
+        assert!(poison_source < later_source);
+        let mut later_object_bytes = [0xff; 33];
+        later_object_bytes[0] = 2;
+        let later_object = BlobCarrierObjectId::new(later_object_bytes).expect("later carrier ID");
+        let peer_id = peer.credentials.identity();
+
+        advance_terminal_blob_source_cursor(
+            &store,
+            &poison_plan,
+            poison_source,
+            Some((peer_id, None)),
+        )
+        .expect("terminal poison advances its scheduler cursor");
+        let cursor = store
+            .blob_carrier_fetch_cursor(peer_id)
+            .expect("terminal poison cursor")
+            .expect("terminal poison persisted a cursor");
+        assert_eq!(cursor.source(), poison_source);
+        assert_ne!(manifest_last, maximum);
+        assert_eq!(cursor.object(), maximum);
+
+        let mut candidates = vec![
+            BlobRangeCandidate {
+                source: poison_source,
+                object: manifest_last,
+                total_len: 1,
+                offset: 0,
+                requested_len: 1,
+                proof: [0x41; crate::frame::BLOB_CONTENT_PROOF_BYTES],
+            },
+            BlobRangeCandidate {
+                source: later_source,
+                object: later_object,
+                total_len: 1,
+                offset: 0,
+                requested_len: 1,
+                proof: [0x42; crate::frame::BLOB_CONTENT_PROOF_BYTES],
+            },
+        ];
+        candidates.sort_unstable_by_key(|candidate| (candidate.source, candidate.object));
+        let selected =
+            select_blob_range_candidate(&candidates, Some(cursor)).expect("later candidate");
+        assert_eq!(selected.source, later_source);
+        assert_eq!(selected.object, later_object);
+
+        drop(store);
+        fs::remove_dir_all(state).expect("terminal Blob fairness cleanup");
+    }
+
+    struct TestForwardingNode {
+        store: Arc<Store>,
+        mission: UnprotectedReferenceMission,
+        policy: Arc<LiveEmissionPolicy>,
+        clock: NodeCustodyClock,
+        reconciliation_exchanges_before_defer: Option<usize>,
+        preopen_custody_races: Vec<TestCustodyPreopenRace>,
+    }
+
+    fn test_event_route_cache(
+        store: &Store,
+        mission: &UnprotectedReferenceMission,
+    ) -> Arc<AuthenticatedEventRouteCache> {
+        open_startup_event_verifier_and_cache(store, mission)
+            .expect("prewarm Event route cache")
+            .cache
+    }
+
+    async fn with_test_contact_hooks<F>(
+        exchanges_before_defer: Option<usize>,
+        preopen_custody_races: Vec<TestCustodyPreopenRace>,
+        future: F,
+    ) -> F::Output
+    where
+        F: std::future::Future,
+    {
+        let future = TEST_CUSTODY_PREOPEN_RACES
+            .scope(std::cell::RefCell::new(preopen_custody_races), future);
+        if let Some(exchanges) = exchanges_before_defer {
+            TEST_RECONCILIATION_EXCHANGES_BEFORE_DEFER
+                .scope(std::cell::Cell::new(Some(exchanges)), future)
+                .await
+        } else {
+            future.await
+        }
+    }
+
+    async fn contact_test_pair_with_forwarding_results(
+        server_node: TestForwardingNode,
+        client_node: TestForwardingNode,
+    ) -> (
+        Result<CompletedPeerContact, NodeError>,
+        Result<CompletedPeerContact, NodeError>,
+    ) {
+        let TestForwardingNode {
+            store: server_store,
+            mission: server_mission,
+            policy: server_policy,
+            clock: server_clock,
+            reconciliation_exchanges_before_defer: server_defer,
+            preopen_custody_races: server_races,
+        } = server_node;
+        let TestForwardingNode {
+            store: client_store,
+            mission: client_mission,
+            policy: client_policy,
+            clock: client_clock,
+            reconciliation_exchanges_before_defer: client_defer,
+            preopen_custody_races: client_races,
+        } = client_node;
+        let server_event_route_cache = test_event_route_cache(&server_store, &server_mission);
+        let client_event_route_cache = test_event_route_cache(&client_store, &client_mission);
+        let server = Endpoint::bind(
+            aster_iroh::SecretKey::generate(),
+            EndpointConfig::direct("127.0.0.1:0".parse().expect("server address")),
+        )
+        .await
+        .expect("server endpoint");
+        let client = Endpoint::bind(
+            aster_iroh::SecretKey::generate(),
+            EndpointConfig::direct("127.0.0.1:0".parse().expect("client address")),
+        )
+        .await
+        .expect("client endpoint");
+        let server_task = tokio::spawn({
+            let server = server.clone();
+            let store = server_store;
+            let credentials = server_mission.clone();
+            let allowed = BTreeSet::from([client.id()]);
+            let peer = MissionPeerBinding::new(client.id(), client_mission.identity());
+            async move {
+                let connection = server.accept(&allowed).await.expect("accept carrier");
+                with_test_contact_hooks(
+                    server_defer,
+                    server_races,
+                    serve_connection_with_forwarding(InboundContact {
+                        store,
+                        connection,
+                        mission: credentials,
+                        peer,
+                        policy_lock: Arc::new(RwLock::new(())),
+                        emission_policy: server_policy,
+                        custody_clock: server_clock,
+                        event_route_cache: server_event_route_cache,
+                        mutable_interests: MutableSourceInterests::default(),
+                    }),
+                )
+                .await
+            }
+        });
+        let snapshot = client_policy.snapshot().expect("client policy snapshot");
+        let client_receipt = with_test_contact_hooks(
+            client_defer,
+            client_races,
+            sync_once_with_forwarding(
+                &client,
+                OutboundContact {
+                    store: client_store,
+                    mission: client_mission,
+                    peer: MissionExpectedPeer {
+                        carrier: ExpectedPeer {
+                            id: server.id(),
+                            address: loopback(&server),
+                        },
+                        mission: server_mission.identity(),
+                    },
+                    policy_lock: Arc::new(RwLock::new(())),
+                    emission_policy: client_policy,
+                    emission_snapshot: snapshot,
+                    custody_clock: client_clock,
+                    event_route_cache: client_event_route_cache,
+                    mutable_interests: MutableSourceInterests::default(),
+                    controlled_relay: None,
+                },
+            ),
+        )
+        .await;
+        let server_receipt = server_task.await.expect("server task");
+        client.close().await;
+        server.close().await;
+        (client_receipt, server_receipt)
+    }
+
+    async fn contact_test_pair_with_forwarding(
+        server_node: TestForwardingNode,
+        client_node: TestForwardingNode,
+    ) -> (PeerReceipt, PeerReceipt) {
+        let (client, server) =
+            contact_test_pair_with_forwarding_results(server_node, client_node).await;
+        (
+            client.expect("client contact").receipt,
+            server.expect("server contact").receipt,
+        )
+    }
+
     fn expected_peer(seed: u64, port: u16) -> MissionExpectedPeer {
         let mut secret = [0u8; 32];
         secret[..8].copy_from_slice(&seed.to_le_bytes());
@@ -10699,6 +25172,853 @@ mod tests {
             "offer",
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn receive_only_v3_accepts_finite_priority_push_without_disclosing_local_objects() {
+        let carry_scope = Scope::new("test/selected-control/carry").expect("Carry scope");
+        let services =
+            control_test_services_with_additional_scope([0xa7; 32], Some(carry_scope.clone()));
+        let server_mission = services.member.clone();
+        let client_mission = services.other.clone();
+        let scope = services.scope.clone();
+        let topic = services.topic.clone();
+        let server_state = root("receive-only-v3-server");
+        let client_state = root("receive-only-v3-client");
+        fs::create_dir_all(&server_state).expect("server state");
+        fs::create_dir_all(&client_state).expect("client state");
+        let authority = server_mission.mission_authority_id();
+        let server_store = Arc::new(
+            Store::open_for_mission(server_state.join(STORE_FILE), authority)
+                .expect("server store"),
+        );
+        let client_store = Arc::new(
+            Store::open_for_mission(client_state.join(STORE_FILE), authority)
+                .expect("client store"),
+        );
+        seed_test_event_subscription(
+            &server_store,
+            EventSubscriptionMode::Consume,
+            &topic,
+            &scope,
+            b"receive-only-consume",
+        );
+        seed_test_event_subscription(
+            &server_store,
+            EventSubscriptionMode::Carry,
+            &topic,
+            &carry_scope,
+            b"receive-only-carry",
+        );
+        seed_test_event_subscription(
+            &client_store,
+            EventSubscriptionMode::Consume,
+            &topic,
+            &scope,
+            b"normal-consume",
+        );
+        let server_clock_id = [0xb1; 16];
+        let client_clock_id = [0xb2; 16];
+        let mut server_sealer = open_test_sealer(&server_mission);
+        let mut authority_sealer = open_test_sealer(&services.authority);
+        let local_control = authority_sealer
+            .seal_chained_revocation_control(services.excluded.identity(), 1, 1, None)
+            .expect("seal harmless local-only control");
+        let local_control_id = ControlTransferId::new(
+            authority_sealer
+                .verify_control(&local_control)
+                .expect("verify local-only control")
+                .envelope_id(),
+        );
+        let accepted_control = accept_received_control(
+            &server_store,
+            &mut server_sealer,
+            services.authority.identity(),
+            local_control_id,
+            &local_control,
+        )
+        .expect("accept local-only control");
+        assert_eq!(accepted_control.activated, 1);
+        let local_only = publish_test_custody_event(
+            &server_store,
+            &mut server_sealer,
+            TestCustodyPublication {
+                operation: b"server/local-only",
+                topic: &topic,
+                scope: &scope,
+                priority: Priority::Flash,
+                ttl_ms: None,
+                sample: CustodySample {
+                    clock_id: server_clock_id,
+                    tick_ms: 0,
+                },
+                payload: b"must-not-be-disclosed",
+                tombstone: false,
+            },
+        );
+        let mut client_sealer = open_test_sealer(&client_mission);
+        let routine = publish_test_custody_event(
+            &client_store,
+            &mut client_sealer,
+            TestCustodyPublication {
+                operation: b"client/routine",
+                topic: &topic,
+                scope: &scope,
+                priority: Priority::Routine,
+                ttl_ms: None,
+                sample: CustodySample {
+                    clock_id: client_clock_id,
+                    tick_ms: 0,
+                },
+                payload: b"below-floor",
+                tombstone: false,
+            },
+        );
+        let priority = publish_test_custody_event(
+            &client_store,
+            &mut client_sealer,
+            TestCustodyPublication {
+                operation: b"client/priority",
+                topic: &topic,
+                scope: &scope,
+                priority: Priority::Priority,
+                ttl_ms: Some(10_000),
+                sample: CustodySample {
+                    clock_id: client_clock_id,
+                    tick_ms: 0,
+                },
+                payload: b"priority-finite",
+                tombstone: false,
+            },
+        );
+        let immediate = publish_test_custody_event(
+            &client_store,
+            &mut client_sealer,
+            TestCustodyPublication {
+                operation: b"client/immediate",
+                topic: &topic,
+                scope: &scope,
+                priority: Priority::Immediate,
+                ttl_ms: Some(10_000),
+                sample: CustodySample {
+                    clock_id: client_clock_id,
+                    tick_ms: 0,
+                },
+                payload: b"immediate-finite",
+                tombstone: false,
+            },
+        );
+        let carried = publish_test_custody_event(
+            &client_store,
+            &mut client_sealer,
+            TestCustodyPublication {
+                operation: b"client/carried",
+                topic: &topic,
+                scope: &carry_scope,
+                priority: Priority::Flash,
+                ttl_ms: None,
+                sample: CustodySample {
+                    clock_id: client_clock_id,
+                    tick_ms: 0,
+                },
+                payload: b"blind-carry-satisfied",
+                tombstone: false,
+            },
+        );
+        let server_policy = Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::ReceiveOnly));
+        let client_policy = Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::at_least(
+            Priority::Priority,
+        )));
+        let (client_receipt, server_receipt) = contact_test_pair_with_forwarding(
+            TestForwardingNode {
+                store: server_store.clone(),
+                mission: server_mission.clone(),
+                policy: server_policy.clone(),
+                clock: NodeCustodyClock::injected(server_clock_id, 1, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            },
+            TestForwardingNode {
+                store: client_store.clone(),
+                mission: client_mission.clone(),
+                policy: client_policy.clone(),
+                clock: NodeCustodyClock::injected(client_clock_id, 1, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            },
+        )
+        .await;
+
+        assert_eq!(client_receipt.offered, 3, "only eligible priorities push");
+        assert_eq!(server_receipt.fetched, 3);
+        assert_eq!(server_receipt.inserted, 3);
+        assert_eq!(server_receipt.offered, 0);
+        assert_eq!(server_receipt.controls_offered, 0);
+        assert_eq!(
+            server_store
+                .control_stats()
+                .expect("server controls")
+                .controls,
+            1
+        );
+        assert_eq!(
+            client_store
+                .control_stats()
+                .expect("client controls")
+                .controls,
+            0
+        );
+        assert!(
+            client_store
+                .get_event(local_only.transfer_id)
+                .expect("client local-only lookup")
+                .is_none(),
+            "receive-only responder disclosed a local Event"
+        );
+        assert!(
+            server_store
+                .get_event(routine.transfer_id)
+                .expect("below-floor lookup")
+                .is_none(),
+            "AtLeast transmitted a below-floor Event"
+        );
+        let received_immediate = server_store
+            .get_event(immediate.transfer_id)
+            .expect("immediate lookup")
+            .expect("immediate received");
+        let received_priority = server_store
+            .get_event(priority.transfer_id)
+            .expect("priority lookup")
+            .expect("priority received");
+        let server_control_policy = server_store
+            .control_policy_snapshot()
+            .expect("server policy for carried Event");
+        assert!(matches!(
+            server_store
+                .get_transfer_with_policy(&server_control_policy, carried.transfer_id)
+                .expect("blind Carry exact lookup"),
+            Some(StoredEventTransfer::RouteCached(_))
+        ));
+        assert!(
+            received_immediate.acceptance_marker < received_priority.acceptance_marker,
+            "source-authenticated priority must override publication/FIFO order"
+        );
+
+        let (repeat_client, repeat_server) = contact_test_pair_with_forwarding(
+            TestForwardingNode {
+                store: server_store.clone(),
+                mission: server_mission.clone(),
+                policy: server_policy.clone(),
+                clock: NodeCustodyClock::injected(server_clock_id, 2, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            },
+            TestForwardingNode {
+                store: client_store.clone(),
+                mission: client_mission.clone(),
+                policy: client_policy.clone(),
+                clock: NodeCustodyClock::injected(client_clock_id, 2, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            },
+        )
+        .await;
+        assert_eq!(
+            repeat_client.offered, 0,
+            "blind scheduling must honor receipts"
+        );
+        assert_eq!(repeat_server.fetched, 0);
+        assert_eq!(repeat_server.inserted, 0);
+
+        // The selector contents stay mode-hidden when Carry becomes Consume,
+        // but the protected opaque revision changes. Reopen both stores to
+        // prove the durable blind receipt is scoped to that exact revision:
+        // the old route-only transfer is offered once for promotion, then the
+        // replacement revision is suppressed normally.
+        drop(server_store);
+        drop(client_store);
+        let server_store = Arc::new(
+            Store::open_for_mission(server_state.join(STORE_FILE), authority)
+                .expect("reopen receive-only server"),
+        );
+        let client_store = Arc::new(
+            Store::open_for_mission(client_state.join(STORE_FILE), authority)
+                .expect("reopen normal client"),
+        );
+        let prior_selector_revision = server_store
+            .event_replication_policy_snapshot()
+            .expect("Carry selector policy")
+            .selector_revision();
+        seed_test_event_subscription(
+            &server_store,
+            EventSubscriptionMode::Consume,
+            &topic,
+            &carry_scope,
+            b"receive-only-carry-to-consume",
+        );
+        let consume_selector_revision = server_store
+            .event_replication_policy_snapshot()
+            .expect("Consume selector policy")
+            .selector_revision();
+        assert_eq!(consume_selector_revision, prior_selector_revision + 1);
+        client_policy
+            .update(EventEmissionPolicy::at_least(Priority::Flash))
+            .expect("narrow promotion contact to the carried transfer");
+
+        let (promotion_client, promotion_server) = contact_test_pair_with_forwarding(
+            TestForwardingNode {
+                store: server_store.clone(),
+                mission: server_mission.clone(),
+                policy: server_policy.clone(),
+                clock: NodeCustodyClock::injected(server_clock_id, 3, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            },
+            TestForwardingNode {
+                store: client_store.clone(),
+                mission: client_mission.clone(),
+                policy: client_policy.clone(),
+                clock: NodeCustodyClock::injected(client_clock_id, 3, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            },
+        )
+        .await;
+        assert_eq!(promotion_client.offered, 1);
+        assert_eq!(promotion_server.fetched, 1);
+        let promoted_policy = server_store
+            .control_policy_snapshot()
+            .expect("promoted server policy");
+        assert!(matches!(
+            server_store
+                .get_transfer_with_policy(&promoted_policy, carried.transfer_id)
+                .expect("promoted blind Carry lookup"),
+            Some(StoredEventTransfer::Accepted(_))
+        ));
+
+        let (promoted_repeat_client, promoted_repeat_server) = contact_test_pair_with_forwarding(
+            TestForwardingNode {
+                store: server_store.clone(),
+                mission: server_mission.clone(),
+                policy: server_policy.clone(),
+                clock: NodeCustodyClock::injected(server_clock_id, 4, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            },
+            TestForwardingNode {
+                store: client_store.clone(),
+                mission: client_mission.clone(),
+                policy: client_policy,
+                clock: NodeCustodyClock::injected(client_clock_id, 4, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            },
+        )
+        .await;
+        assert_eq!(promoted_repeat_client.offered, 0);
+        assert_eq!(promoted_repeat_server.fetched, 0);
+
+        let endpoint = Endpoint::bind(
+            aster_iroh::SecretKey::generate(),
+            EndpointConfig::direct("127.0.0.1:0".parse().expect("receive-only address")),
+        )
+        .await
+        .expect("receive-only endpoint");
+        let snapshot = server_policy.snapshot().expect("receive-only snapshot");
+        let attempted_clock = NodeCustodyClock::injected(server_clock_id, 2, 0);
+        let event_route_cache = test_event_route_cache(&server_store, &server_mission);
+        let error = sync_once_with_forwarding(
+            &endpoint,
+            OutboundContact {
+                store: server_store.clone(),
+                mission: server_mission,
+                peer: expected_peer(0xcafe, 65_000),
+                policy_lock: Arc::new(RwLock::new(())),
+                emission_policy: server_policy,
+                emission_snapshot: snapshot,
+                custody_clock: attempted_clock,
+                event_route_cache,
+                mutable_interests: MutableSourceInterests::default(),
+                controlled_relay: None,
+            },
+        )
+        .await
+        .expect_err("receive-only node must not initiate contact");
+        assert!(
+            matches!(error, NodeError::Protocol(message) if message.contains("cannot initiate"))
+        );
+        endpoint.close().await;
+        drop(server_store);
+        drop(client_store);
+        fs::remove_dir_all(server_state).expect("server cleanup");
+        fs::remove_dir_all(client_state).expect("client cleanup");
+    }
+
+    #[tokio::test]
+    async fn v3_final_send_overrun_leaks_no_offer_to_the_peer() {
+        let services = control_test_services([0x6f; 32]);
+        let server_state = root("v3-final-send-overrun-server");
+        let client_state = root("v3-final-send-overrun-client");
+        fs::create_dir_all(&server_state).expect("server state");
+        fs::create_dir_all(&client_state).expect("client state");
+        let server_store = Arc::new(
+            Store::open_for_mission(
+                server_state.join(STORE_FILE),
+                services.member.mission_authority_id(),
+            )
+            .expect("server store"),
+        );
+        let client_store = Arc::new(
+            Store::open_for_mission(
+                client_state.join(STORE_FILE),
+                services.other.mission_authority_id(),
+            )
+            .expect("client store"),
+        );
+        seed_test_event_subscription(
+            &server_store,
+            EventSubscriptionMode::Consume,
+            &services.topic,
+            &services.scope,
+            b"overrun-consume",
+        );
+        let clock_id = [0x70; 16];
+        let mut client_sealer = open_test_sealer(&services.other);
+        let source = publish_test_custody_event(
+            &client_store,
+            &mut client_sealer,
+            TestCustodyPublication {
+                operation: b"overrun/source",
+                topic: &services.topic,
+                scope: &services.scope,
+                priority: Priority::Immediate,
+                ttl_ms: Some(10_000_000),
+                sample: CustodySample {
+                    clock_id,
+                    tick_ms: 0,
+                },
+                payload: b"must-not-reach-peer",
+                tombstone: false,
+            },
+        );
+        let (client, server) = contact_test_pair_with_forwarding_results(
+            TestForwardingNode {
+                store: server_store.clone(),
+                mission: services.member.clone(),
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::ReceiveOnly)),
+                clock: NodeCustodyClock::injected([0x71; 16], 0, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            },
+            TestForwardingNode {
+                store: client_store.clone(),
+                mission: services.other.clone(),
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                clock: NodeCustodyClock::injected(
+                    clock_id,
+                    0,
+                    MAX_CUSTODY_FINALIZATION_CHARGE_MS + 1,
+                ),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            },
+        )
+        .await;
+        let client_error = client.expect_err("carrier-adjacent custody check must reject overrun");
+        assert!(
+            matches!(client_error, NodeError::Protocol(message) if message.contains(
+                "finalization exceeded its authenticated age charge"
+            ))
+        );
+        if let Ok(completed) = server {
+            assert_eq!(completed.receipt.inserted, 0);
+            assert_eq!(completed.receipt.fetched, 0);
+        }
+        assert!(
+            server_store
+                .get_event(source.transfer_id)
+                .expect("peer Event lookup")
+                .is_none(),
+            "carrier callback rejection must occur before any OfferV3 byte reaches the peer"
+        );
+        drop(server_store);
+        drop(client_store);
+        fs::remove_dir_all(server_state).expect("server cleanup");
+        fs::remove_dir_all(client_state).expect("client cleanup");
+    }
+
+    #[tokio::test]
+    async fn v3_final_send_rechecks_policy_after_durable_authorization() {
+        let services = control_test_services([0x79; 32]);
+        let server_state = root("v3-final-send-policy-server");
+        let client_state = root("v3-final-send-policy-client");
+        fs::create_dir_all(&server_state).expect("server state");
+        fs::create_dir_all(&client_state).expect("client state");
+        let server_store = Arc::new(
+            Store::open_for_mission(
+                server_state.join(STORE_FILE),
+                services.member.mission_authority_id(),
+            )
+            .expect("server store"),
+        );
+        let client_store = Arc::new(
+            Store::open_for_mission(
+                client_state.join(STORE_FILE),
+                services.other.mission_authority_id(),
+            )
+            .expect("client store"),
+        );
+        seed_test_event_subscription(
+            &server_store,
+            EventSubscriptionMode::Consume,
+            &services.topic,
+            &services.scope,
+            b"final-policy-consume",
+        );
+        let clock_id = [0x7a; 16];
+        let mut client_sealer = open_test_sealer(&services.other);
+        let source = publish_test_custody_event(
+            &client_store,
+            &mut client_sealer,
+            TestCustodyPublication {
+                operation: b"final-policy/source",
+                topic: &services.topic,
+                scope: &services.scope,
+                priority: Priority::Immediate,
+                ttl_ms: Some(10_000_000),
+                sample: CustodySample {
+                    clock_id,
+                    tick_ms: 0,
+                },
+                payload: b"policy-change-must-not-reach-peer",
+                tombstone: false,
+            },
+        );
+        let client_policy = Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal));
+        let (client, server) = contact_test_pair_with_forwarding_results(
+            TestForwardingNode {
+                store: server_store.clone(),
+                mission: services.member.clone(),
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::ReceiveOnly)),
+                clock: NodeCustodyClock::injected([0x7b; 16], 0, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            },
+            TestForwardingNode {
+                store: client_store.clone(),
+                mission: services.other.clone(),
+                policy: client_policy.clone(),
+                clock: NodeCustodyClock::injected(clock_id, 0, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: vec![TestCustodyPreopenRace::FinalPolicyChange],
+            },
+        )
+        .await;
+        assert!(matches!(
+            client.expect_err("final emission revision change must reject the send"),
+            NodeError::EmissionPolicyChanged
+        ));
+        if let Ok(completed) = server {
+            assert_eq!(completed.receipt.inserted, 0);
+            assert_eq!(completed.receipt.fetched, 0);
+        }
+        assert_eq!(
+            client_policy.snapshot().expect("changed policy").policy,
+            EventEmissionPolicy::ReceiveOnly
+        );
+        assert!(
+            server_store
+                .get_event(source.transfer_id)
+                .expect("peer Event lookup")
+                .is_none(),
+            "the final revision check must reject before any OfferV3 byte reaches the peer"
+        );
+        drop(server_store);
+        drop(client_store);
+        fs::remove_dir_all(server_state).expect("server cleanup");
+        fs::remove_dir_all(client_state).expect("client cleanup");
+    }
+
+    #[tokio::test]
+    async fn v3_event_lane_defer_closes_inventory_reverse_and_second_lane_cleanly() {
+        let services = control_test_services([0x72; 32]);
+        let server_state = root("v3-lane-defer-server");
+        let client_state = root("v3-lane-defer-client");
+        fs::create_dir_all(&server_state).expect("server state");
+        fs::create_dir_all(&client_state).expect("client state");
+        let server_store = Arc::new(
+            Store::open_for_mission(
+                server_state.join(STORE_FILE),
+                services.member.mission_authority_id(),
+            )
+            .expect("server store"),
+        );
+        let client_store = Arc::new(
+            Store::open_for_mission(
+                client_state.join(STORE_FILE),
+                services.other.mission_authority_id(),
+            )
+            .expect("client store"),
+        );
+        seed_test_event_subscription(
+            &server_store,
+            EventSubscriptionMode::Consume,
+            &services.topic,
+            &services.scope,
+            b"defer-server",
+        );
+        seed_test_event_subscription(
+            &client_store,
+            EventSubscriptionMode::Consume,
+            &services.topic,
+            &services.scope,
+            b"defer-client",
+        );
+        let server_policy = Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal));
+        let client_policy = Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal));
+        let server_clock = NodeCustodyClock::injected([0x73; 16], 0, 0);
+        let client_clock = NodeCustodyClock::injected([0x74; 16], 0, 0);
+
+        for (server_defer, client_defer, phase) in [
+            (None, Some(1), "inventory"),
+            (Some(1), None, "reverse"),
+            (None, Some(2), "second-lane"),
+        ] {
+            let (client, server) = contact_test_pair_with_forwarding_results(
+                TestForwardingNode {
+                    store: server_store.clone(),
+                    mission: services.member.clone(),
+                    policy: server_policy.clone(),
+                    clock: server_clock.clone(),
+                    reconciliation_exchanges_before_defer: server_defer,
+                    preopen_custody_races: Vec::new(),
+                },
+                TestForwardingNode {
+                    store: client_store.clone(),
+                    mission: services.other.clone(),
+                    policy: client_policy.clone(),
+                    clock: client_clock.clone(),
+                    reconciliation_exchanges_before_defer: client_defer,
+                    preopen_custody_races: Vec::new(),
+                },
+            )
+            .await;
+            let client = client.unwrap_or_else(|error| panic!("{phase} client defer: {error}"));
+            let server = server.unwrap_or_else(|error| panic!("{phase} server defer: {error}"));
+            assert_eq!(client.receipt.deferred_event_lanes, 1, "{phase}");
+            assert_eq!(server.receipt.deferred_event_lanes, 1, "{phase}");
+            assert!(client.receipt.remaining >= 1, "{phase}");
+            assert!(server.receipt.remaining >= 1, "{phase}");
+            assert_eq!(contact_status(&client.receipt), "partial", "{phase}");
+            assert_eq!(contact_status(&server.receipt), "partial", "{phase}");
+        }
+
+        drop(server_store);
+        drop(client_store);
+        fs::remove_dir_all(server_state).expect("server cleanup");
+        fs::remove_dir_all(client_state).expect("client cleanup");
+    }
+
+    #[tokio::test]
+    async fn v3_preopen_stale_work_skips_and_later_durable_offer_stays_synchronized() {
+        let services = control_test_services([0x75; 32]);
+        let server_state = root("v3-preopen-skip-server");
+        let client_state = root("v3-preopen-skip-client");
+        fs::create_dir_all(&server_state).expect("server state");
+        fs::create_dir_all(&client_state).expect("client state");
+        let server_store = Arc::new(
+            Store::open_for_mission(
+                server_state.join(STORE_FILE),
+                services.member.mission_authority_id(),
+            )
+            .expect("server store"),
+        );
+        let client_store = Arc::new(
+            Store::open_for_mission(
+                client_state.join(STORE_FILE),
+                services.other.mission_authority_id(),
+            )
+            .expect("client store"),
+        );
+        seed_test_event_subscription(
+            &server_store,
+            EventSubscriptionMode::Consume,
+            &services.topic,
+            &services.scope,
+            b"skip-consume",
+        );
+        let clock_id = [0x76; 16];
+        let mut sealer = open_test_sealer(&services.other);
+        let expired = publish_test_custody_event(
+            &client_store,
+            &mut sealer,
+            TestCustodyPublication {
+                operation: b"skip/expired",
+                topic: &services.topic,
+                scope: &services.scope,
+                priority: Priority::Flash,
+                ttl_ms: Some(100),
+                sample: CustodySample {
+                    clock_id,
+                    tick_ms: 0,
+                },
+                payload: b"expires-after-schedule",
+                tombstone: false,
+            },
+        );
+        let changed = publish_test_custody_event(
+            &client_store,
+            &mut sealer,
+            TestCustodyPublication {
+                operation: b"skip/item-changed",
+                topic: &services.topic,
+                scope: &services.scope,
+                priority: Priority::Immediate,
+                ttl_ms: None,
+                sample: CustodySample {
+                    clock_id,
+                    tick_ms: 0,
+                },
+                payload: b"competing-lease",
+                tombstone: false,
+            },
+        );
+        let lease_limited = publish_test_custody_event(
+            &client_store,
+            &mut sealer,
+            TestCustodyPublication {
+                operation: b"skip/lease-limit",
+                topic: &services.topic,
+                scope: &services.scope,
+                priority: Priority::Immediate,
+                ttl_ms: None,
+                sample: CustodySample {
+                    clock_id,
+                    tick_ms: 0,
+                },
+                payload: b"lease-limit",
+                tombstone: false,
+            },
+        );
+        let retry_limited = publish_test_custody_event(
+            &client_store,
+            &mut sealer,
+            TestCustodyPublication {
+                operation: b"skip/retry-limit",
+                topic: &services.topic,
+                scope: &services.scope,
+                priority: Priority::Priority,
+                ttl_ms: None,
+                sample: CustodySample {
+                    clock_id,
+                    tick_ms: 0,
+                },
+                payload: b"retry-limit",
+                tombstone: false,
+            },
+        );
+        let retry = publish_test_custody_event(
+            &client_store,
+            &mut sealer,
+            TestCustodyPublication {
+                operation: b"skip/retry-not-due",
+                topic: &services.topic,
+                scope: &services.scope,
+                priority: Priority::Priority,
+                ttl_ms: None,
+                sample: CustodySample {
+                    clock_id,
+                    tick_ms: 0,
+                },
+                payload: b"retry-not-due",
+                tombstone: false,
+            },
+        );
+        let durable = publish_test_custody_event(
+            &client_store,
+            &mut sealer,
+            TestCustodyPublication {
+                operation: b"skip/durable",
+                topic: &services.topic,
+                scope: &services.scope,
+                priority: Priority::Routine,
+                ttl_ms: None,
+                sample: CustodySample {
+                    clock_id,
+                    tick_ms: 0,
+                },
+                payload: b"durable-success",
+                tombstone: false,
+            },
+        );
+
+        let (client, server) = contact_test_pair_with_forwarding_results(
+            TestForwardingNode {
+                store: server_store.clone(),
+                mission: services.member.clone(),
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::ReceiveOnly)),
+                clock: NodeCustodyClock::injected([0x77; 16], 0, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            },
+            TestForwardingNode {
+                store: client_store.clone(),
+                mission: services.other.clone(),
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                clock: NodeCustodyClock::injected(clock_id, 0, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: vec![
+                    TestCustodyPreopenRace::Expire {
+                        transfer_id: expired.transfer_id,
+                        tick_ms: 100,
+                    },
+                    TestCustodyPreopenRace::ItemChanged(changed.transfer_id),
+                    TestCustodyPreopenRace::LeaseLimitExceeded(lease_limited.transfer_id),
+                    TestCustodyPreopenRace::RetryLimitExceeded(retry_limited.transfer_id),
+                    TestCustodyPreopenRace::RetryNotDue(retry.transfer_id),
+                ],
+            },
+        )
+        .await;
+        let (client, server) = match (client, server) {
+            (Ok(client), Ok(server)) => (client, server),
+            (client, server) => {
+                panic!("pre-open skip contact failed: client={client:?}, server={server:?}")
+            }
+        };
+        assert_eq!(client.receipt.offered, 1);
+        assert_eq!(client.receipt.remaining, 5);
+        assert_eq!(server.receipt.fetched, 1);
+        assert_eq!(server.receipt.inserted, 1);
+        // The no-disclosure responder cannot enumerate skipped work itself;
+        // semantic v3 binds the sender's lane-local report in FinishV3 and the
+        // responder echoes it before recording the peer-reported remainder.
+        assert_eq!(server.receipt.remaining, 5);
+        assert!(
+            server_store
+                .get_event(durable.transfer_id)
+                .expect("durable receiver lookup")
+                .is_some()
+        );
+        for skipped in [
+            expired.transfer_id,
+            changed.transfer_id,
+            lease_limited.transfer_id,
+            retry_limited.transfer_id,
+            retry.transfer_id,
+        ] {
+            assert!(
+                server_store
+                    .get_event(skipped)
+                    .expect("skipped receiver lookup")
+                    .is_none()
+            );
+        }
+
+        drop(server_store);
+        drop(client_store);
+        fs::remove_dir_all(server_state).expect("server cleanup");
+        fs::remove_dir_all(client_state).expect("client cleanup");
     }
 
     #[tokio::test]
@@ -10745,10 +26065,14 @@ mod tests {
             Store::open_for_mission(server_state.join(STORE_FILE), authority)
                 .expect("server store"),
         );
-        let beta_store = Store::open_for_mission(beta_state.join(STORE_FILE), authority)
-            .expect("beta receiver store");
-        let empty_store = Store::open_for_mission(empty_state.join(STORE_FILE), authority)
-            .expect("empty receiver store");
+        let beta_store = Arc::new(
+            Store::open_for_mission(beta_state.join(STORE_FILE), authority)
+                .expect("beta receiver store"),
+        );
+        let empty_store = Arc::new(
+            Store::open_for_mission(empty_state.join(STORE_FILE), authority)
+                .expect("empty receiver store"),
+        );
         seed_test_event_subscription(
             &server_store,
             EventSubscriptionMode::Consume,
@@ -10788,6 +26112,7 @@ mod tests {
                 &server_policy,
                 &mut server_sealer,
                 &beta_interest,
+                true,
             )
             .expect("beta-filtered inventory"),
             InventorySnapshot::new(vec![beta_id.reconciliation_item_id()]),
@@ -10798,6 +26123,7 @@ mod tests {
                 &server_policy,
                 &mut server_sealer,
                 &EventInterest::empty(),
+                true,
             )
             .expect("empty inventory")
             .is_empty(),
@@ -10807,7 +26133,7 @@ mod tests {
         let (beta_receipt, beta_server_receipt) = contact_test_pair(
             server_store.clone(),
             server_mission.clone(),
-            &beta_store,
+            beta_store.clone(),
             beta_mission,
         )
         .await;
@@ -10832,7 +26158,7 @@ mod tests {
         let (empty_receipt, empty_server_receipt) = contact_test_pair(
             server_store.clone(),
             server_mission,
-            &empty_store,
+            empty_store.clone(),
             empty_mission,
         )
         .await;
@@ -10890,8 +26216,10 @@ mod tests {
             Store::open_for_mission(server_state.join(STORE_FILE), authority)
                 .expect("mode server store"),
         );
-        let receiver_store = Store::open_for_mission(receiver_state.join(STORE_FILE), authority)
-            .expect("mode receiver store");
+        let receiver_store = Arc::new(
+            Store::open_for_mission(receiver_state.join(STORE_FILE), authority)
+                .expect("mode receiver store"),
+        );
         seed_test_event_subscription(
             &receiver_store,
             EventSubscriptionMode::Carry,
@@ -10925,7 +26253,7 @@ mod tests {
         let (carry_receipt, _) = contact_test_pair(
             server_store.clone(),
             server_mission.clone(),
-            &receiver_store,
+            receiver_store.clone(),
             receiver_mission.clone(),
         )
         .await;
@@ -10955,6 +26283,15 @@ mod tests {
                 .expect("content-capable receiver opens Carry bytes"),
             EventContentVerification::ContentVerified { .. }
         ));
+        let (carry_repeat, carry_repeat_server) = contact_test_pair(
+            server_store.clone(),
+            server_mission.clone(),
+            receiver_store.clone(),
+            receiver_mission.clone(),
+        )
+        .await;
+        assert_eq!(carry_repeat.fetched, 0);
+        assert_eq!(carry_repeat_server.offered, 0);
         stale_guard
             .check(&receiver_store)
             .expect("unchanged Carry guard remains current");
@@ -11032,9 +26369,9 @@ mod tests {
         );
         let (consume_receipt, _) = contact_test_pair(
             server_store.clone(),
-            server_mission,
-            &receiver_store,
-            receiver_mission,
+            server_mission.clone(),
+            receiver_store.clone(),
+            receiver_mission.clone(),
         )
         .await;
         assert_eq!(consume_receipt.fetched, 2);
@@ -11052,6 +26389,15 @@ mod tests {
                 .expect("Consume exact transfer"),
             Some(StoredEventTransfer::Accepted(_))
         ));
+        let (consume_repeat, consume_repeat_server) = contact_test_pair(
+            server_store.clone(),
+            server_mission,
+            receiver_store.clone(),
+            receiver_mission,
+        )
+        .await;
+        assert_eq!(consume_repeat.fetched, 0);
+        assert_eq!(consume_repeat_server.offered, 0);
         assert!(matches!(
             receiver_store
                 .get_transfer_with_policy(current_policy.control_policy(), carried_id)
@@ -11064,6 +26410,245 @@ mod tests {
         for state in [server_state, receiver_state] {
             fs::remove_dir_all(state).expect("cleanup mode test state");
         }
+    }
+
+    #[tokio::test]
+    async fn v3_pending_content_acceptance_retries_and_common_set_settles_after_reopen() {
+        let scope = Scope::new("test/pending-content-acceptance").expect("pending scope");
+        let topic = Topic::new("pending-content").expect("pending topic");
+        let member_access = ProvisioningAccess::member(scope.clone(), vec![1], vec![topic.clone()])
+            .expect("member access");
+        let seed = [0x4d; 32];
+        let mut provisioner = ReferenceProvisioner::from_seed(seed).expect("provisioner");
+        let source_mission = UnprotectedReferenceMission::from_bytes(
+            provisioner
+                .issue_node(1, std::slice::from_ref(&member_access))
+                .and_then(|bundle| bundle.to_bytes())
+                .expect("source bundle"),
+        )
+        .expect("source mission");
+        let receiver_mission = UnprotectedReferenceMission::from_bytes(
+            provisioner
+                .issue_node(2, &[member_access])
+                .and_then(|bundle| bundle.to_bytes())
+                .expect("receiver bundle"),
+        )
+        .expect("receiver mission");
+        assert_eq!(
+            source_mission.mission_authority_id(),
+            receiver_mission.mission_authority_id()
+        );
+
+        let source_state = root("pending-content-source");
+        let receiver_state = root("pending-content-receiver");
+        for state in [&source_state, &receiver_state] {
+            fs::create_dir_all(state).expect("pending-content state");
+        }
+        let source_path = source_state.join(STORE_FILE);
+        let authority = source_mission.mission_authority_id();
+        let source_store =
+            Arc::new(Store::open_for_mission(&source_path, authority).expect("source store"));
+        let receiver_store = Arc::new(
+            Store::open_for_mission(receiver_state.join(STORE_FILE), authority)
+                .expect("receiver store"),
+        );
+        seed_test_event_subscription(
+            &receiver_store,
+            EventSubscriptionMode::Consume,
+            &topic,
+            &scope,
+            b"pending-consume",
+        );
+        let mut source_sealer = open_test_sealer(&source_mission);
+        let common_id = publish_test_epoch_one_event(
+            &source_store,
+            &mut source_sealer,
+            &topic,
+            &scope,
+            b"pending-common",
+        );
+        let due_id = publish_test_epoch_one_event(
+            &source_store,
+            &mut source_sealer,
+            &topic,
+            &scope,
+            b"pending-due",
+        );
+        let source_clock_id = [0x4e; 16];
+        let receiver_clock_id = [0x4f; 16];
+
+        let (first_receiver, first_source) = contact_test_pair_with_forwarding(
+            TestForwardingNode {
+                store: source_store.clone(),
+                mission: source_mission.clone(),
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                clock: NodeCustodyClock::injected(source_clock_id, 0, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            },
+            TestForwardingNode {
+                store: receiver_store.clone(),
+                mission: receiver_mission.clone(),
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                clock: NodeCustodyClock::injected(receiver_clock_id, 0, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: vec![
+                    TestCustodyPreopenRace::ForceRouteOnly(common_id),
+                    TestCustodyPreopenRace::ForceRouteOnly(due_id),
+                ],
+            },
+        )
+        .await;
+        assert_eq!(first_receiver.fetched, 2);
+        assert_eq!(first_receiver.inserted, 2);
+        assert_eq!(first_source.offered, 2);
+        drop(source_store);
+        let first_stats = Store::inspect_existing(&source_path)
+            .expect("source custody after pending replies")
+            .custody_stats;
+        assert_eq!(first_stats.peer_receipts, 0);
+        assert_eq!(first_stats.retries, 2);
+        let receiver_event_stats = receiver_store
+            .event_stats()
+            .expect("receiver route-only stats");
+        assert_eq!(receiver_event_stats.events, 0);
+        assert_eq!(receiver_event_stats.route_cached, 2);
+
+        let source_store = Arc::new(
+            Store::open_for_mission(&source_path, authority).expect("reopen pending source"),
+        );
+
+        // One exact transfer becomes accepted independently. The following
+        // normal reconciliation proves it common and settles only that retry;
+        // the other transfer remains missing but is not yet due.
+        let receiver_policy = receiver_store
+            .event_replication_policy_snapshot()
+            .expect("receiver Consume policy");
+        let common_bytes = match receiver_store
+            .get_transfer_with_policy(receiver_policy.control_policy(), common_id)
+            .expect("common route transfer")
+        {
+            Some(StoredEventTransfer::RouteCached(event)) => event.sealed,
+            _ => panic!("pending common Event is not route-cached"),
+        };
+        let mut receiver_member = open_test_sealer(&receiver_mission);
+        let common_route = receiver_member
+            .verify_event(&common_bytes)
+            .expect("member verifies common route");
+        let EventContentVerification::ContentVerified {
+            event: common_event,
+            ..
+        } = receiver_member
+            .verify_event_content(common_route, &common_bytes)
+            .expect("member opens common content")
+        else {
+            panic!("content-key arrival did not open the common Event");
+        };
+        receiver_store
+            .apply_verified_event_with_replication_policy(
+                &receiver_policy,
+                &common_event,
+                &common_bytes,
+            )
+            .expect("independently promote common Event");
+
+        let (immediate_receiver, immediate_source) = contact_test_pair_with_forwarding(
+            TestForwardingNode {
+                store: source_store.clone(),
+                mission: source_mission.clone(),
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                clock: NodeCustodyClock::injected(source_clock_id, 0, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            },
+            TestForwardingNode {
+                store: receiver_store.clone(),
+                mission: receiver_mission.clone(),
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                clock: NodeCustodyClock::injected(receiver_clock_id, 0, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            },
+        )
+        .await;
+        assert_eq!(immediate_receiver.fetched, 0);
+        assert_eq!(immediate_source.offered, 0);
+        drop(source_store);
+        let common_stats = Store::inspect_existing(&source_path)
+            .expect("source custody after common settlement")
+            .custody_stats;
+        assert_eq!(common_stats.peer_receipts, 1);
+        assert_eq!(common_stats.retries, 1);
+        let source_store = Arc::new(
+            Store::open_for_mission(&source_path, authority)
+                .expect("reopen source after common settlement"),
+        );
+
+        let (due_receiver, due_source) = contact_test_pair_with_forwarding(
+            TestForwardingNode {
+                store: source_store.clone(),
+                mission: source_mission.clone(),
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                clock: NodeCustodyClock::injected(source_clock_id, 1_000, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            },
+            TestForwardingNode {
+                store: receiver_store.clone(),
+                mission: receiver_mission.clone(),
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                clock: NodeCustodyClock::injected(receiver_clock_id, 1_000, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            },
+        )
+        .await;
+        assert_eq!(due_receiver.fetched, 1);
+        assert_eq!(due_receiver.inserted, 1);
+        assert_eq!(due_source.offered, 1);
+        assert!(matches!(
+            receiver_store
+                .get_transfer_with_policy(receiver_policy.control_policy(), due_id)
+                .expect("due Event after content-key arrival"),
+            Some(StoredEventTransfer::Accepted(_))
+        ));
+        drop(source_store);
+        let due_stats = Store::inspect_existing(&source_path)
+            .expect("source custody after due acceptance")
+            .custody_stats;
+        assert_eq!(due_stats.peer_receipts, 2);
+        assert_eq!(due_stats.retries, 0);
+        let source_store = Arc::new(
+            Store::open_for_mission(&source_path, authority)
+                .expect("reopen source after due acceptance"),
+        );
+
+        let (repeat_receiver, repeat_source) = contact_test_pair_with_forwarding(
+            TestForwardingNode {
+                store: source_store.clone(),
+                mission: source_mission,
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                clock: NodeCustodyClock::injected(source_clock_id, 1_001, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            },
+            TestForwardingNode {
+                store: receiver_store.clone(),
+                mission: receiver_mission,
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                clock: NodeCustodyClock::injected(receiver_clock_id, 1_001, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            },
+        )
+        .await;
+        assert_eq!(repeat_receiver.fetched, 0);
+        assert_eq!(repeat_source.offered, 0);
+
+        drop(source_store);
+        drop(receiver_store);
+        fs::remove_dir_all(source_state).expect("source cleanup");
+        fs::remove_dir_all(receiver_state).expect("receiver cleanup");
     }
 
     #[tokio::test]
@@ -11225,14 +26810,47 @@ mod tests {
         .expect("commit rekey intent");
         assert!(first.emitted);
 
-        // This is the crash-after-commit path: a new Store/provider instance
-        // reseals randomly, authenticates the registry again, and reports
-        // Existing only after the canonical durable intent matches exactly.
+        // Simulate an honest pre-Step4 local publication: metadata-v1 retained
+        // the exact sealed control and intent, but not authenticated recipient IDs.
+        {
+            const CONTROL_RECORDS: redb::TableDefinition<&[u8], &[u8]> =
+                redb::TableDefinition::new("aster.mission-controls.v1");
+            let database =
+                redb::Database::open(state.join(STORE_FILE)).expect("open legacy control fixture");
+            let write = database.begin_write().expect("legacy control write");
+            let encoded = write
+                .open_table(CONTROL_RECORDS)
+                .expect("control records")
+                .get(first.transfer_id.as_bytes().as_slice())
+                .expect("read control row")
+                .expect("committed control row")
+                .value()
+                .to_vec();
+            let mut legacy = encoded[..encoded.len() - (1 + 2 + 32 * recipients.len())].to_vec();
+            legacy[0] = 1;
+            write
+                .open_table(CONTROL_RECORDS)
+                .expect("control records")
+                .insert(first.transfer_id.as_bytes().as_slice(), legacy.as_slice())
+                .expect("downgrade recipient metadata");
+            write.commit().expect("commit legacy fixture");
+        }
+        assert_eq!(
+            Store::inspect_existing(state.join(STORE_FILE))
+                .expect("inspect legacy control")
+                .control_stats
+                .scope_rekey_recipient_backfills_required,
+            1
+        );
+
+        // This is the crash-after-commit path. The impossible high-water floor
+        // proves the durable exact match returns before registry authentication,
+        // reservation, fresh key generation, or randomized resealing.
         let exact_retry = publish_scope_rekey_control(
             &state,
             &services.authority,
             &services.registry,
-            0,
+            u64::MAX,
             services.scope.clone(),
             2,
             recipients.clone(),
@@ -11241,6 +26859,13 @@ mod tests {
         assert!(!exact_retry.emitted);
         assert_eq!(exact_retry.transfer_id, first.transfer_id);
         assert_eq!(exact_retry.sequence, first.sequence);
+        assert_eq!(
+            Store::inspect_existing(state.join(STORE_FILE))
+                .expect("inspect migrated control")
+                .control_stats
+                .scope_rekey_recipient_backfills_required,
+            0
+        );
 
         let reordered_retry = publish_scope_rekey_control(
             &state,
@@ -11298,6 +26923,257 @@ mod tests {
         fs::remove_dir_all(state).expect("cleanup");
     }
 
+    #[test]
+    fn content_only_revoked_rekey_recipient_is_rejected_before_publication() {
+        let state = root("rekey-revoked-content-only-recipient");
+        let services = control_test_services([0xb5; 32]);
+        let revoked_recipient = services.member.identity();
+        let revocation =
+            publish_revocation_control(&state, &services.authority, revoked_recipient, 1)
+                .expect("publish recipient revocation");
+        assert!(revocation.emitted);
+        let before = Store::inspect_existing(state.join(STORE_FILE))
+            .expect("inspect before rejected rekey")
+            .control_stats;
+
+        let error = publish_scope_rekey_control(
+            &state,
+            &services.authority,
+            &services.registry,
+            0,
+            services.scope.clone(),
+            2,
+            vec![
+                ScopeRekeyRecipient::route_only(services.authority.identity()),
+                ScopeRekeyRecipient::content_only(revoked_recipient, vec![services.topic.clone()])
+                    .expect("content-only recipient"),
+            ],
+        )
+        .expect_err("revoked content-only recipient must fail before publication");
+        assert!(matches!(
+            error,
+            NodeError::Store(StoreError::ControlRecipientRevoked(node))
+                if node == revoked_recipient
+        ));
+        let store = Store::open_for_mission(
+            state.join(STORE_FILE),
+            services.authority.mission_authority_id(),
+        )
+        .expect("reopen stable store");
+        assert_eq!(store.control_stats().expect("stable stats"), before);
+        assert_eq!(
+            store.control_head().expect("stable head"),
+            Some((revocation.sequence, revocation.transfer_id))
+        );
+        assert_eq!(
+            store
+                .active_scope_epoch(&services.scope)
+                .expect("no rejected epoch"),
+            None
+        );
+        drop(store);
+        fs::remove_dir_all(state).expect("cleanup");
+    }
+
+    #[test]
+    fn self_revocation_returns_commit_receipt_and_historical_retries_precede_liveness() {
+        let state = root("self-revocation-historical-retries");
+        let services = control_test_services([0xb6; 32]);
+        let recipients = vec![
+            ScopeRekeyRecipient::member(
+                services.authority.identity(),
+                vec![services.topic.clone()],
+            )
+            .expect("authority recipient"),
+            ScopeRekeyRecipient::member(services.member.identity(), vec![services.topic.clone()])
+                .expect("member recipient"),
+        ];
+        let rekey = publish_scope_rekey_control(
+            &state,
+            &services.authority,
+            &services.registry,
+            0,
+            services.scope.clone(),
+            2,
+            recipients.clone(),
+        )
+        .expect("publish pre-revocation rekey");
+        assert!(rekey.emitted);
+
+        let local = services.authority.identity();
+        let revocation = publish_revocation_control(&state, &services.authority, local, 1)
+            .expect("self-revocation returns its committed receipt");
+        assert!(revocation.emitted);
+        assert_eq!(revocation.activated, 1);
+
+        let exact_revocation = publish_revocation_control(&state, &services.authority, local, 1)
+            .expect("exact self-revocation retry precedes liveness");
+        assert!(!exact_revocation.emitted);
+        assert_eq!(exact_revocation.transfer_id, revocation.transfer_id);
+        assert_eq!(exact_revocation.sequence, revocation.sequence);
+
+        let exact_rekey = publish_scope_rekey_control(
+            &state,
+            &services.authority,
+            &services.registry,
+            u64::MAX,
+            services.scope.clone(),
+            2,
+            recipients.clone(),
+        )
+        .expect("exact historical rekey retry precedes liveness and provider high-water");
+        assert!(!exact_rekey.emitted);
+        assert_eq!(exact_rekey.transfer_id, rekey.transfer_id);
+
+        assert!(matches!(
+            publish_revocation_control(&state, &services.authority, local, 2),
+            Err(NodeError::Revoked(node)) if node == local
+        ));
+        assert!(matches!(
+            publish_scope_rekey_control(
+                &state,
+                &services.authority,
+                &services.registry_next,
+                0,
+                services.scope.clone(),
+                3,
+                recipients,
+            ),
+            Err(NodeError::Revoked(node)) if node == local
+        ));
+        let inspection =
+            Store::inspect_existing(state.join(STORE_FILE)).expect("inspect committed controls");
+        assert_eq!(inspection.control_stats.controls, 2);
+        assert_eq!(inspection.control_stats.applied, 2);
+        assert_eq!(inspection.control_stats.pending, 0);
+        fs::remove_dir_all(state).expect("cleanup");
+    }
+
+    #[test]
+    fn historical_local_control_receipts_survive_later_highwaters_but_remote_rows_do_not() {
+        let state = root("historical-local-control-receipts");
+        let services = control_test_services([0xa9; 32]);
+        let recipients = vec![
+            ScopeRekeyRecipient::member(
+                services.authority.identity(),
+                vec![services.topic.clone()],
+            )
+            .expect("authority recipient"),
+            ScopeRekeyRecipient::member(services.member.identity(), vec![services.topic.clone()])
+                .expect("member recipient"),
+        ];
+        let epoch_two = publish_scope_rekey_control(
+            &state,
+            &services.authority,
+            &services.registry,
+            0,
+            services.scope.clone(),
+            2,
+            recipients.clone(),
+        )
+        .expect("publish epoch two");
+        let epoch_three = publish_scope_rekey_control(
+            &state,
+            &services.authority,
+            &services.registry_next,
+            0,
+            services.scope.clone(),
+            3,
+            recipients.clone(),
+        )
+        .expect("publish epoch three");
+        assert!(epoch_two.emitted && epoch_three.emitted);
+
+        let subject = services.other.identity();
+        let generation_one = publish_revocation_control(&state, &services.authority, subject, 1)
+            .expect("publish generation one");
+        let generation_two = publish_revocation_control(&state, &services.authority, subject, 2)
+            .expect("publish generation two");
+        assert!(generation_one.emitted && generation_two.emitted);
+
+        let epoch_two_retry = publish_scope_rekey_control(
+            &state,
+            &services.authority,
+            &services.registry,
+            u64::MAX,
+            services.scope.clone(),
+            2,
+            recipients.iter().cloned().rev().collect(),
+        )
+        .expect("historical epoch retry bypasses current registry high-water");
+        assert!(!epoch_two_retry.emitted);
+        assert_eq!(epoch_two_retry.transfer_id, epoch_two.transfer_id);
+
+        let generation_one_retry =
+            publish_revocation_control(&state, &services.authority, subject, 1)
+                .expect("historical revocation retry");
+        assert!(!generation_one_retry.emitted);
+        assert_eq!(generation_one_retry.transfer_id, generation_one.transfer_id);
+
+        assert!(matches!(
+            publish_scope_rekey_control(
+                &state,
+                &services.authority,
+                &services.registry_next,
+                0,
+                services.scope.clone(),
+                2,
+                recipients,
+            ),
+            Err(NodeError::Store(
+                StoreError::ControlPublicationIntentConflict { .. }
+            ))
+        ));
+        let inspection = Store::inspect_existing(state.join(STORE_FILE))
+            .expect("inspect historical local receipts");
+        assert_eq!(inspection.control_stats.controls, 4);
+        assert_eq!(inspection.control_stats.applied, 4);
+        assert_eq!(inspection.control_stats.reservation_receipts, 4);
+        drop(inspection);
+        Store::open_for_mission(
+            state.join(STORE_FILE),
+            services.authority.mission_authority_id(),
+        )
+        .expect("reopen historical receipt store");
+        let retry_after_reopen =
+            publish_revocation_control(&state, &services.authority, subject, 1)
+                .expect("historical revocation retry after reopen");
+        assert_eq!(retry_after_reopen.transfer_id, generation_one.transfer_id);
+        assert!(!retry_after_reopen.emitted);
+        fs::remove_dir_all(&state).expect("cleanup historical receipt state");
+
+        let remote_state = root("remote-control-is-not-local-receipt");
+        fs::create_dir_all(&remote_state).expect("remote receipt state root");
+        let remote_services = control_test_services([0xaa; 32]);
+        let remote_subject = remote_services.other.identity();
+        let mut signer = open_test_sealer(&remote_services.authority);
+        let sealed = signer
+            .seal_chained_revocation_control(remote_subject, 1, 1, None)
+            .expect("seal remote-equivalent control");
+        let verified = signer
+            .verify_control(&sealed)
+            .expect("verify remote control");
+        let store = Store::open_for_mission(
+            remote_state.join(STORE_FILE),
+            remote_services.authority.mission_authority_id(),
+        )
+        .expect("remote receipt store");
+        store
+            .ingest_verified_control(&verified, &sealed)
+            .expect("ingest without local reservation");
+        drop(store);
+        assert!(matches!(
+            publish_revocation_control(
+                &remote_state,
+                &remote_services.authority,
+                remote_subject,
+                1,
+            ),
+            Err(NodeError::Protocol(message)) if message == CONTROL_PUBLICATION_CONFLICT
+        ));
+        fs::remove_dir_all(remote_state).expect("cleanup remote receipt state");
+    }
+
     #[tokio::test]
     async fn same_contact_rekey_uses_authenticated_peer_identity_for_member_route_and_exclusion() {
         let authority_state = root("same-contact-rekey-authority");
@@ -11350,11 +27226,13 @@ mod tests {
         let event =
             publish_test_epoch_two_event(&authority_store, &mut authority_verifier, &services);
 
-        let member_store = Store::open_for_mission(
-            member_state.join(STORE_FILE),
-            open_test_sealer(&services.member).mission_authority_id(),
-        )
-        .expect("member store");
+        let member_store = Arc::new(
+            Store::open_for_mission(
+                member_state.join(STORE_FILE),
+                open_test_sealer(&services.member).mission_authority_id(),
+            )
+            .expect("member store"),
+        );
         seed_test_event_subscription(
             &member_store,
             EventSubscriptionMode::Consume,
@@ -11365,7 +27243,7 @@ mod tests {
         let (member_receipt, _) = contact_test_pair(
             authority_store.clone(),
             services.authority.clone(),
-            &member_store,
+            member_store.clone(),
             services.member.clone(),
         )
         .await;
@@ -11399,11 +27277,13 @@ mod tests {
             EventContentVerification::ContentVerified { .. }
         ));
 
-        let route_store = Store::open_for_mission(
-            route_state.join(STORE_FILE),
-            open_test_sealer(&services.other).mission_authority_id(),
-        )
-        .expect("route-only store");
+        let route_store = Arc::new(
+            Store::open_for_mission(
+                route_state.join(STORE_FILE),
+                open_test_sealer(&services.other).mission_authority_id(),
+            )
+            .expect("route-only store"),
+        );
         seed_test_event_subscription(
             &route_store,
             EventSubscriptionMode::Carry,
@@ -11414,7 +27294,7 @@ mod tests {
         let (route_receipt, _) = contact_test_pair(
             authority_store.clone(),
             services.authority.clone(),
-            &route_store,
+            route_store.clone(),
             services.other.clone(),
         )
         .await;
@@ -11448,11 +27328,13 @@ mod tests {
             EventContentVerification::RouteOnly(_)
         ));
 
-        let excluded_store = Store::open_for_mission(
-            excluded_state.join(STORE_FILE),
-            open_test_sealer(&services.excluded).mission_authority_id(),
-        )
-        .expect("excluded store");
+        let excluded_store = Arc::new(
+            Store::open_for_mission(
+                excluded_state.join(STORE_FILE),
+                open_test_sealer(&services.excluded).mission_authority_id(),
+            )
+            .expect("excluded store"),
+        );
         seed_test_event_subscription(
             &excluded_store,
             EventSubscriptionMode::Carry,
@@ -11463,7 +27345,7 @@ mod tests {
         let (excluded_receipt, _) = contact_test_pair(
             authority_store.clone(),
             services.authority.clone(),
-            &excluded_store,
+            excluded_store.clone(),
             services.excluded.clone(),
         )
         .await;
@@ -11513,6 +27395,7 @@ mod tests {
                 services.member.identity(),
                 &[],
                 &receiver_interest,
+                true,
             )
             .expect("member dynamic inventory")
             .len(),
@@ -11526,6 +27409,7 @@ mod tests {
                 services.other.identity(),
                 &[],
                 &receiver_interest,
+                true,
             )
             .expect("route dynamic inventory")
             .len(),
@@ -11539,6 +27423,7 @@ mod tests {
                 services.excluded.identity(),
                 &[],
                 &receiver_interest,
+                true,
             )
             .expect("excluded dynamic inventory")
             .is_empty()
@@ -11685,8 +27570,10 @@ mod tests {
                 },
                 event_id,
                 &sealed.bytes,
+                None,
             )
             .expect("authority accepts active source Event")
+            .inserted
         );
 
         let revocation = authority
@@ -11720,6 +27607,7 @@ mod tests {
                 relay.identity(),
                 &[],
                 &receiver_interest,
+                true,
             )
             .expect("relay inventory after source revocation")
             .is_empty(),
@@ -11743,6 +27631,7 @@ mod tests {
             },
             event_id,
             &sealed.bytes,
+            None,
         )
         .expect_err("valid relay cannot reintroduce revoked-source bytes to a member");
         assert!(matches!(
@@ -11764,6 +27653,7 @@ mod tests {
             },
             event_id,
             &sealed.bytes,
+            None,
         )
         .expect_err("valid relay cannot reintroduce revoked-source bytes");
         assert!(matches!(
@@ -11893,9 +27783,10 @@ mod tests {
             .commit_reserved_event_with_policy(&policy, &reservation, &event, &sealed.bytes)
             .expect("commit Event after authority revocation");
         let transfer_id = EventTransferId::new(event.envelope_id());
-        let peer_store =
+        let peer_store = Arc::new(
             Store::open_for_mission(peer_state.join(STORE_FILE), member.mission_authority_id())
-                .expect("nonrevoked peer store");
+                .expect("nonrevoked peer store"),
+        );
         seed_test_event_subscription(
             &peer_store,
             EventSubscriptionMode::Consume,
@@ -11906,7 +27797,7 @@ mod tests {
         let (client_receipt, server_receipt) = contact_test_pair(
             store.clone(),
             services.member.clone(),
-            &peer_store,
+            peer_store.clone(),
             services.other.clone(),
         )
         .await;
@@ -12273,10 +28164,16 @@ mod tests {
         let rollback_verified = member
             .verify_control(&rollback)
             .expect("verify rollback candidate");
-        let rollback_error = store
+        let rollback_outcome = store
             .ingest_verified_control(&rollback_verified, &rollback)
-            .expect_err("revocation generation rollback must fail");
-        assert!(matches!(rollback_error, StoreError::ControlRollback));
+            .expect("authenticated rollback is rejected without aborting the transaction");
+        assert!(matches!(
+            rollback_outcome,
+            ControlOutcome::Rejected {
+                reason: ControlRejectionReason::EffectRollback,
+                ..
+            }
+        ));
         assert_eq!(
             store.control_head().expect("final head"),
             Some((2, second_id))
@@ -12411,21 +28308,33 @@ mod tests {
             matching_interest.clone(),
         )
         .await;
-        assert_eq!(
-            request_mission_frame(
+        if mission.semantic_version() >= MIN_CUSTODY_SEMANTIC_VERSION {
+            finish_v3_event_lane(
                 &connection,
                 &mut mission,
-                Frame::Finish {
-                    direction: EventDirection::ToSessionResponder,
-                },
+                EventDirection::ToSessionResponder,
+                0,
                 &mut receipt,
             )
             .await
-            .expect("finish empty responder receive lane"),
-            Frame::Finished {
-                direction: EventDirection::ToSessionResponder,
-            }
-        );
+            .expect("finish empty responder receive lane");
+        } else {
+            assert_eq!(
+                request_mission_frame(
+                    &connection,
+                    &mut mission,
+                    Frame::Finish {
+                        direction: EventDirection::ToSessionResponder,
+                    },
+                    &mut receipt,
+                )
+                .await
+                .expect("finish empty responder receive lane"),
+                Frame::Finished {
+                    direction: EventDirection::ToSessionResponder,
+                }
+            );
+        }
         reconcile_equal_event_lane(
             &connection,
             &mut mission,
@@ -12434,30 +28343,71 @@ mod tests {
             &mut receipt,
         )
         .await;
-        let client_error = request_mission_frame(
-            &connection,
-            &mut mission,
-            Frame::Fetch {
-                direction: EventDirection::ToSessionInitiator,
-                id: hidden_id,
-            },
-            &mut receipt,
-        )
-        .await
-        .expect_err("out-of-scope hidden Event must not be fetchable");
-        assert!(matches!(
-            client_error,
-            NodeError::Carrier(_) | NodeError::Mission(_)
-        ));
-        let server_error = server_task
+        if mission.semantic_version() >= MIN_CUSTODY_SEMANTIC_VERSION {
+            let wire_budget = exchange_wire_budget(&receipt).expect("v3 finish wire budget");
+            let (complete, request_bytes, response_bytes) = respond_mission_frame(
+                &connection,
+                &mut mission,
+                wire_budget,
+                |frame, _, _mission| match frame {
+                    Frame::FinishV3 {
+                        direction: EventDirection::ToSessionInitiator,
+                        remaining: 0,
+                    } => Ok((
+                        Frame::FinishedV3 {
+                            direction: EventDirection::ToSessionInitiator,
+                            remaining: 0,
+                        },
+                        true,
+                    )),
+                    other => Err(NodeError::Protocol(format!(
+                        "out-of-scope v3 sender emitted an object-bearing frame: {other:?}"
+                    ))),
+                },
+            )
             .await
-            .expect("server task")
-            .expect_err("server must reject hidden fetch");
-        assert!(
-            server_error
-                .to_string()
-                .contains("outside this authenticated contact's negotiated difference")
-        );
+            .expect("complete source-push lane without disclosure");
+            assert!(complete);
+            account(&mut receipt, request_bytes, response_bytes).expect("account v3 finish");
+            defer_empty_mutable_classes(&connection, &mut mission, &mut receipt).await;
+            // This low-level client drives the protocol without
+            // `sync_authenticated_session`, so it must perform the initiator's
+            // completion handshake after consuming the final response.
+            connection
+                .finish_as_initiator()
+                .await
+                .expect("finish low-level initiator");
+            server_task
+                .await
+                .expect("server task")
+                .expect("source-push contact must finish without disclosing the hidden ID");
+        } else {
+            let client_error = request_mission_frame(
+                &connection,
+                &mut mission,
+                Frame::Fetch {
+                    direction: EventDirection::ToSessionInitiator,
+                    id: hidden_id,
+                },
+                &mut receipt,
+            )
+            .await
+            .expect_err("out-of-scope hidden Event must not be fetchable");
+            assert!(matches!(
+                client_error,
+                NodeError::Carrier(_) | NodeError::Mission(_)
+            ));
+            let server_error = server_task
+                .await
+                .expect("server task")
+                .expect_err("server must reject hidden fetch");
+            assert!(
+                server_error
+                    .to_string()
+                    .contains("outside this authenticated contact's negotiated difference"),
+                "unexpected server rejection: {server_error}"
+            );
+        }
         assert_eq!(server_store.event_count().expect("server Event count"), 1);
         client.close().await;
         server.close().await;
@@ -12477,6 +28427,7 @@ mod tests {
                 &server_policy,
                 &mut server_sealer,
                 &matching_interest,
+                true,
             )
             .expect("local receiver baseline"),
             InventorySnapshot::new(vec![hidden_id.reconciliation_item_id()]),
@@ -12527,8 +28478,10 @@ mod tests {
             Store::open_for_mission(server_root.join(STORE_FILE), server_authority)
                 .expect("server store"),
         );
-        let client_store = Store::open_for_mission(client_root.join(STORE_FILE), client_authority)
-            .expect("client store");
+        let client_store = Arc::new(
+            Store::open_for_mission(client_root.join(STORE_FILE), client_authority)
+                .expect("client store"),
+        );
         let server_task = tokio::spawn({
             let server = server.clone();
             let server_store = server_store.clone();
@@ -12550,7 +28503,7 @@ mod tests {
             }
         });
         let client_error = sync_once(
-            &client_store,
+            client_store.clone(),
             &client,
             client_mission.credentials,
             MissionExpectedPeer {
@@ -12621,6 +28574,66 @@ mod tests {
         let state = root("inspect-absent");
         assert!(inspect_store(&state).is_err());
         assert!(!state.exists());
+    }
+
+    #[tokio::test]
+    async fn startup_replaces_exact_scope_custody_quota_configuration() {
+        let state = root("custody-quota-replacement");
+        let mission = test_mission();
+        let scoped =
+            CustodyQuota::for_scope(Scope::new("test/runtime").expect("scope"), 8, 8 * 1024)
+                .expect("scope quota");
+        let configured = SelectedForwardingConfig::default()
+            .with_scope_quota(scoped)
+            .expect("configured quota");
+        run_node_with_forwarding(
+            NodeConfig {
+                state: state.clone(),
+                bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                mission: mission.clone(),
+                peers: Vec::new(),
+                mutable_interests: MutableSourceInterests::default(),
+                sync_interval: Duration::from_millis(1),
+                run_for: Some(Duration::from_millis(5)),
+                application: NodeApplication::Relay,
+            },
+            configured,
+        )
+        .await
+        .expect("run with exact scope quota");
+        assert_eq!(
+            Store::inspect_existing(state.join(STORE_FILE))
+                .expect("inspect configured quotas")
+                .custody_stats
+                .quotas,
+            2,
+            "global plus one exact scope quota must be durable"
+        );
+
+        run_node_with_forwarding(
+            NodeConfig {
+                state: state.clone(),
+                bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                mission,
+                peers: Vec::new(),
+                mutable_interests: MutableSourceInterests::default(),
+                sync_interval: Duration::from_millis(1),
+                run_for: Some(Duration::from_millis(5)),
+                application: NodeApplication::Relay,
+            },
+            SelectedForwardingConfig::default(),
+        )
+        .await
+        .expect("restart with empty exact scope quota list");
+        assert_eq!(
+            Store::inspect_existing(state.join(STORE_FILE))
+                .expect("inspect replaced quotas")
+                .custody_stats
+                .quotas,
+            1,
+            "empty config must clear stale scope overrides"
+        );
+        fs::remove_dir_all(state).expect("cleanup quota replacement state");
     }
 
     #[tokio::test]
@@ -12759,16 +28772,22 @@ mod tests {
             .expect("mission-bound store");
         let operation = ping_operation_key().expect("Ping operation key");
         let policy = store.control_policy_snapshot().expect("settled policy");
-
+        let custody_sample = CustodySample {
+            clock_id: [0x51; 16],
+            tick_ms: 1,
+        };
         let (inserted, first) = {
             let (event, inserted) = publish_event_once(
                 &store,
                 &policy,
                 &mut sealer,
-                &operation,
-                None,
-                DEMO_PING_LOGICAL_KEY.to_vec(),
-                DEMO_PING_PAYLOAD,
+                DemoEventPublish {
+                    operation: &operation,
+                    predecessor: None,
+                    custody_sample,
+                    logical_key: DEMO_PING_LOGICAL_KEY.to_vec(),
+                    payload: DEMO_PING_PAYLOAD,
+                },
             )
             .expect("publish Ping");
             (inserted, event)
@@ -12778,10 +28797,13 @@ mod tests {
             &store,
             &policy,
             &mut sealer,
-            &operation,
-            None,
-            DEMO_PING_LOGICAL_KEY.to_vec(),
-            DEMO_PING_PAYLOAD,
+            DemoEventPublish {
+                operation: &operation,
+                predecessor: None,
+                custody_sample,
+                logical_key: DEMO_PING_LOGICAL_KEY.to_vec(),
+                payload: DEMO_PING_PAYLOAD,
+            },
         )
         .expect("authenticate durable operation replay");
         assert!(!replay_inserted);
@@ -12791,10 +28813,13 @@ mod tests {
             &store,
             &policy,
             &mut sealer,
-            &operation,
-            None,
-            DEMO_PING_LOGICAL_KEY.to_vec(),
-            b"ASTER_SAMPLE_PING_TAMPERED",
+            DemoEventPublish {
+                operation: &operation,
+                predecessor: None,
+                custody_sample,
+                logical_key: DEMO_PING_LOGICAL_KEY.to_vec(),
+                payload: b"ASTER_SAMPLE_PING_TAMPERED",
+            },
         )
         .expect_err("durable operation with another payload must fail closed");
         assert!(
@@ -12823,6 +28848,8 @@ mod tests {
             topic: &services.topic,
             scope: &services.scope,
             priority: Priority::Priority,
+            ttl_ms: None,
+            custody_sample: None,
             logical_key: b"asset",
             payload: b"ready",
             tombstone: false,
@@ -12882,6 +28909,54 @@ mod tests {
     }
 
     #[test]
+    fn revoked_publisher_cannot_replay_an_existing_application_operation() {
+        let state = root("revoked-existing-application-operation");
+        fs::create_dir_all(&state).expect("state root");
+        let services = control_test_services([0xc5; 32]);
+        let mut member = open_test_sealer(&services.member);
+        let store = Store::open_for_mission(state.join(STORE_FILE), member.mission_authority_id())
+            .expect("member store");
+        let operation =
+            EventOperationKey::new(b"application/revoked/retry".to_vec()).expect("operation key");
+        let request = || SelectedEventPublish {
+            operation: &operation,
+            predecessor: None,
+            topic: &services.topic,
+            scope: &services.scope,
+            priority: Priority::Priority,
+            ttl_ms: None,
+            custody_sample: None,
+            logical_key: b"asset",
+            payload: b"ready",
+            tombstone: false,
+        };
+        let policy = store.control_policy_snapshot().expect("initial policy");
+        publish_selected_event_once(&store, &policy, &mut member, request())
+            .expect("publish before revocation");
+
+        let mut authority = open_test_sealer(&services.authority);
+        let revoked = authority
+            .seal_chained_revocation_control(services.member.identity(), 1, 1, None)
+            .expect("seal member revocation");
+        let verified = member.verify_control(&revoked).expect("verify revocation");
+        let outcome = store
+            .ingest_verified_control(&verified, &revoked)
+            .expect("commit revocation");
+        activate_committed_controls(&store, &mut member, outcome.activated(), None)
+            .expect("activate revocation");
+        let policy = store.control_policy_snapshot().expect("revoked policy");
+        let error = publish_selected_event_once(&store, &policy, &mut member, request())
+            .expect_err("revoked publisher must not replay an old operation");
+        assert!(matches!(
+            error,
+            NodeError::Store(StoreError::EventPublisherRevoked(identity))
+                if identity == services.member.identity()
+        ));
+        assert_eq!(store.event_count().expect("Event count"), 1);
+        fs::remove_dir_all(state).expect("cleanup");
+    }
+
+    #[test]
     fn line_topology_has_no_unregistered_end_to_end_edge() {
         assert_eq!(neighbors(0, 4), vec![1]);
         assert_eq!(neighbors(1, 4), vec![0, 2]);
@@ -12890,13 +28965,10 @@ mod tests {
 
     #[test]
     fn demo_watchdog_scales_with_line_diameter() {
-        assert_eq!(demo_run_seconds(1), 3);
-        assert_eq!(demo_run_seconds(3), 5);
-        assert_eq!(demo_run_seconds(8), 10);
-        assert_eq!(demo_run_seconds(32), 34);
-        assert_eq!(demo_phase_run_seconds(3, true), 8);
-        assert_eq!(demo_phase_run_seconds(3, false), 5);
-        assert_eq!(demo_phase_run_seconds(1, true), 3);
+        assert_eq!(demo_run_seconds(1), 7);
+        assert_eq!(demo_run_seconds(3), 9);
+        assert_eq!(demo_run_seconds(8), 14);
+        assert_eq!(demo_run_seconds(32), 38);
     }
 
     #[test]

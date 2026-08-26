@@ -274,7 +274,7 @@ pub struct LabMetrics {
     pub durable_progress_preserved: bool,
     /// Configured virtual useful bit rate.
     pub configured_bits_per_second: u64,
-    /// Exact drops per complete directional [`LOSS_WINDOW_FRAMES`] window.
+    /// Exact drops per complete directional `LOSS_WINDOW_FRAMES` window.
     pub configured_loss_per_mille: u16,
     /// Window over which the configured loss count is exact.
     pub loss_window_frames: u16,

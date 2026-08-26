@@ -9,20 +9,23 @@
 use std::{fmt, fs, path::Path, sync::Arc};
 
 use aster_mesh::{
-    CausalStamp, NodeId, Priority, ReferenceEnvelopeSealer, Scope, StateContentVerification, Topic,
+    CausalStamp, NodeId, Priority, ReferenceEnvelopeSealer, RouteVerifiedStateEnvelope, Scope,
+    StateContentVerification, Topic,
 };
 use aster_redb_store::{
     ControlPolicySnapshot, ControlTransferId, StateOperationKey, StateOperationRequest,
-    StateProjectionPlan, StatePublicationIntent, StateSemanticId,
+    StateProjectionPlan, StatePublicationIntent, StateSemanticId, StateSenderProjection,
     StateVersionDisposition as StoreStateDisposition, Store, StoredState,
 };
 
 use super::{ApplicationError, ApplicationErrorKind, application_error};
 use crate::{
+    frame::MAX_OBJECT_BYTES,
     mission::UnprotectedReferenceMission,
     runtime::{
-        STORE_FILE, ensure_principal_active, ensure_state_accepts_normal_operation,
-        open_replayed_verifier, refresh_application_policy,
+        AuthenticatedEventRouteCache, STORE_FILE, StartupEventVerification,
+        ensure_principal_active, ensure_state_accepts_normal_operation,
+        open_startup_event_verifier_and_cache, refresh_application_policy,
     },
 };
 
@@ -101,9 +104,10 @@ pub struct StateQuery {
     pub logical_key: Vec<u8>,
     /// Include all currently active retained concurrent and superseded versions.
     ///
-    /// Versions made inactive by revocation or a later scope epoch remain
-    /// durable and are freshly verified, but are not exposed as application
-    /// results.
+    /// Versions made inactive by revocation, a later scope epoch, or a
+    /// same-epoch route-key replacement remain durable but are not exposed as
+    /// application results. Their exact source proof is retained in the
+    /// bounded startup cache; current-lineage results are freshly opened.
     pub include_recoverable_versions: bool,
 }
 
@@ -127,8 +131,9 @@ pub struct StateItem {
 ///
 /// A current tombstone remains visible as `Some(StateItem { tombstone: true,
 /// .. })`; deletion is never collapsed into an unauthenticated absence.
-/// Revoked and stale-epoch versions are excluded only after fresh source and
-/// content verification agrees with the current policy-bound plan.
+/// The Store's numeric policy reduction is verified independently from the
+/// stricter current-lineage application reduction. Revoked, stale-epoch, and
+/// cache-proven superseded-lineage versions are never exposed as plaintext.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StateProjection {
     pub current: Option<StateItem>,
@@ -136,9 +141,11 @@ pub struct StateProjection {
 }
 
 struct VerifiedStateCandidate {
-    item: StateItem,
+    id: StateId,
+    item: Option<StateItem>,
     stamp: CausalStamp,
     store_disposition: Option<StoreStateDisposition>,
+    policy_active: bool,
     active: bool,
 }
 
@@ -153,15 +160,18 @@ pub struct SelectedStateNode {
     mission: UnprotectedReferenceMission,
     store: Arc<Store>,
     verifier: ReferenceEnvelopeSealer,
+    historical_verifier: ReferenceEnvelopeSealer,
     verifier_head: Option<(u64, ControlTransferId)>,
+    source_route_cache: Arc<AuthenticatedEventRouteCache>,
 }
 
 impl SelectedStateNode {
     /// Opens the explicitly unprotected reference provisioning path.
     ///
     /// Terminal state is rejected before mission bytes are loaded. The exact
-    /// store is mission-bound and process-locked, then every committed control
-    /// is replayed before State operations become available.
+    /// store is mission-bound and process-locked, every retained exact source
+    /// is proved across ordered control replay, then the current verifier and
+    /// bounded route-lineage cache become available to State operations.
     pub fn open_unprotected_reference(
         state: impl AsRef<Path>,
         mission_bundle: impl AsRef<Path>,
@@ -177,7 +187,12 @@ impl SelectedStateNode {
         store
             .require_process_exclusive_lock()
             .map_err(|error| application_error("state open", error.into()))?;
-        let verifier = open_replayed_verifier(&store, &mission)
+        let StartupEventVerification {
+            verifier,
+            historical_verifier,
+            cache: source_route_cache,
+            policy: _,
+        } = open_startup_event_verifier_and_cache(&store, &mission)
             .map_err(|error| application_error("state open", error))?;
         ensure_principal_active(&store, verifier.identity())
             .map_err(|error| application_error("state open", error))?;
@@ -188,7 +203,9 @@ impl SelectedStateNode {
             mission,
             store: Arc::new(store),
             verifier,
+            historical_verifier,
             verifier_head,
+            source_route_cache,
         };
         selected.current_policy("state open")?;
         Ok(selected)
@@ -218,6 +235,12 @@ impl SelectedStateNode {
             payload,
             tombstone,
         } = request;
+        if payload.len() > MAX_OBJECT_BYTES {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::ResourceLimit,
+                "state publish",
+            ));
+        }
         let operation = StateOperationKey::new(operation_key)
             .map_err(|error| application_error("state publish", error.into()))?;
         let intent = StatePublicationIntent::new(
@@ -260,6 +283,12 @@ impl SelectedStateNode {
             .verifier
             .seal_state(&header, &payload)
             .map_err(|error| application_error("state publish", error.into()))?;
+        if sealed.bytes.len() > MAX_OBJECT_BYTES {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::ResourceLimit,
+                "state publish",
+            ));
+        }
         let route = self
             .verifier
             .verify_state(&sealed.bytes)
@@ -302,7 +331,7 @@ impl SelectedStateNode {
             )
             .map_err(|error| application_error("state publish", error.into()))?;
         let state = outcome.state();
-        self.verify_publication_result(&intent, &payload, state)?;
+        self.verify_publication_result(&policy, &intent, &payload, state, outcome.inserted())?;
         Ok(StatePublishResult {
             id: StateId::from_store(state.semantic_id),
             publisher: state.header.stamp.dot.publisher,
@@ -315,14 +344,99 @@ impl SelectedStateNode {
 
     fn verify_publication_result(
         &mut self,
+        policy: &ControlPolicySnapshot,
+        intent: &StatePublicationIntent,
+        payload: &[u8],
+        stored: &StoredState,
+        inserted: bool,
+    ) -> Result<(), ApplicationError> {
+        let route = match self.verifier.verify_state(&stored.sealed) {
+            Ok(route) => route,
+            Err(error) if inserted => {
+                return Err(application_error("state publish", error.into()));
+            }
+            Err(_) => {
+                return self.verify_historical_publication_result(policy, intent, payload, stored);
+            }
+        };
+        Self::verify_publication_route(
+            &self.store,
+            &mut self.verifier,
+            intent,
+            payload,
+            stored,
+            route,
+        )
+    }
+
+    fn verify_historical_publication_result(
+        &mut self,
+        policy: &ControlPolicySnapshot,
         intent: &StatePublicationIntent,
         payload: &[u8],
         stored: &StoredState,
     ) -> Result<(), ApplicationError> {
+        let projection = self
+            .store
+            .retained_state_sender_inventory_with_policy(policy)
+            .map_err(|error| application_error("state publish", error.into()))?
+            .into_iter()
+            .find(|projection| projection.transfer_id() == stored.transfer_id)
+            .ok_or_else(|| {
+                ApplicationError::new(ApplicationErrorKind::Integrity, "state publish")
+            })?;
+        if projection.semantic_id() != stored.semantic_id
+            || projection.publisher() != stored.header.stamp.dot.publisher
+            || projection.topic() != &stored.header.topic
+            || projection.scope() != &stored.header.scope
+            || projection.key_epoch() != stored.header.key_epoch
+            || projection.exact_len()
+                != u64::try_from(stored.sealed.len()).map_err(|_| {
+                    ApplicationError::new(ApplicationErrorKind::Integrity, "state publish")
+                })?
+            || projection.acceptance_marker() != stored.acceptance_marker
+            || self
+                .source_route_cache
+                .is_current_state_sender_projection(&self.verifier, &projection)
+                .map_err(|error| application_error("state publish", error))?
+        {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::Integrity,
+                "state publish",
+            ));
+        }
         let route = self
-            .verifier
+            .historical_verifier
             .verify_state(&stored.sealed)
             .map_err(|error| application_error("state publish", error.into()))?;
+        if self.verifier.is_current_source_route_lineage(
+            route.scope(),
+            route.key_epoch(),
+            route.route_lineage(),
+        ) {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::Integrity,
+                "state publish",
+            ));
+        }
+        Self::verify_publication_route(
+            &self.store,
+            &mut self.historical_verifier,
+            intent,
+            payload,
+            stored,
+            route,
+        )
+    }
+
+    fn verify_publication_route(
+        store: &Store,
+        verifier: &mut ReferenceEnvelopeSealer,
+        intent: &StatePublicationIntent,
+        payload: &[u8],
+        stored: &StoredState,
+        route: RouteVerifiedStateEnvelope,
+    ) -> Result<(), ApplicationError> {
         if route.envelope_id() != *stored.transfer_id.as_bytes()
             || route.item_id() != *stored.semantic_id.as_bytes()
             || route.header() != &stored.header
@@ -340,8 +454,7 @@ impl SelectedStateNode {
                 "state publish",
             ));
         }
-        if self
-            .store
+        if store
             .is_control_principal_revoked(route.publisher())
             .map_err(|error| application_error("state publish", error.into()))?
         {
@@ -350,8 +463,7 @@ impl SelectedStateNode {
                 "state publish",
             ));
         }
-        let current_epoch = self
-            .store
+        let current_epoch = store
             .active_scope_epoch(route.scope())
             .map_err(|error| application_error("state publish", error.into()))?
             .map_or(1, |(epoch, _)| epoch);
@@ -361,22 +473,15 @@ impl SelectedStateNode {
                 "state publish",
             ));
         }
-        if !self
-            .verifier
-            .can_route_state(route.scope(), route.key_epoch())
-            || !self.verifier.can_open_state_content(
-                route.scope(),
-                route.topic(),
-                route.key_epoch(),
-            )
+        if !verifier.can_route_state(route.scope(), route.key_epoch())
+            || !verifier.can_open_state_content(route.scope(), route.topic(), route.key_epoch())
         {
             return Err(ApplicationError::new(
                 ApplicationErrorKind::Integrity,
                 "state publish",
             ));
         }
-        match self
-            .verifier
+        match verifier
             .verify_state_content(route, &stored.sealed)
             .map_err(|error| application_error("state publish", error.into()))?
         {
@@ -444,6 +549,10 @@ impl SelectedStateNode {
         }
 
         let mut candidates = Vec::with_capacity(plan.candidates().len());
+        let retained_projections = self
+            .store
+            .retained_state_sender_inventory_with_policy(plan.control_policy())
+            .map_err(|error| application_error("state query", error.into()))?;
         let mut previous = None;
         for candidate in plan.candidates() {
             let state = candidate.state();
@@ -455,50 +564,82 @@ impl SelectedStateNode {
                 ));
             }
             previous = Some(id);
-            let (item, active) = self.open_state_candidate(query, state)?;
+            let sender_projection = retained_projections
+                .iter()
+                .find(|projection| projection.transfer_id() == state.transfer_id)
+                .ok_or_else(|| {
+                    ApplicationError::new(ApplicationErrorKind::Integrity, "state query")
+                })?;
+            let (item, policy_active, active) =
+                self.open_state_candidate(query, state, sender_projection)?;
             candidates.push(VerifiedStateCandidate {
+                id,
                 stamp: state.header.stamp.clone(),
                 item,
                 store_disposition: candidate.disposition(),
+                policy_active,
                 active,
             });
         }
 
-        let causal_candidates = candidates
+        let policy_candidates = candidates
             .iter()
-            .map(|candidate| (candidate.item.id, &candidate.stamp, candidate.active))
+            .map(|candidate| (candidate.id, &candidate.stamp, candidate.policy_active))
             .collect::<Vec<_>>();
-        let (current_index, dispositions) = recompute_state_dispositions(&causal_candidates);
+        let (policy_current_index, policy_dispositions) =
+            recompute_state_dispositions(&policy_candidates);
         let plan_current = plan
             .current()
             .map(|candidate| StateId::from_store(candidate.state().semantic_id));
-        let verified_current = current_index.map(|index| candidates[index].item.id);
-        if plan_current != verified_current {
+        let verified_policy_current = policy_current_index.map(|index| candidates[index].id);
+        if plan_current != verified_policy_current {
             return Err(ApplicationError::new(
                 ApplicationErrorKind::Integrity,
                 "state query",
             ));
         }
 
-        for (candidate, disposition) in candidates.iter_mut().zip(dispositions) {
+        for (candidate, disposition) in candidates.iter().zip(policy_dispositions) {
             if candidate.store_disposition != disposition.map(StateVersionDisposition::into_store) {
                 return Err(ApplicationError::new(
                     ApplicationErrorKind::Integrity,
                     "state query",
                 ));
             }
+        }
+
+        let current_candidates = candidates
+            .iter()
+            .map(|candidate| (candidate.id, &candidate.stamp, candidate.active))
+            .collect::<Vec<_>>();
+        let (current_index, dispositions) = recompute_state_dispositions(&current_candidates);
+        for (candidate, disposition) in candidates.iter_mut().zip(dispositions) {
             if let Some(disposition) = disposition {
-                candidate.item.disposition = disposition;
+                candidate
+                    .item
+                    .as_mut()
+                    .ok_or_else(|| {
+                        ApplicationError::new(ApplicationErrorKind::Integrity, "state query")
+                    })?
+                    .disposition = disposition;
             }
         }
 
-        let current = current_index.map(|index| candidates[index].item.clone());
+        let current = current_index
+            .map(|index| {
+                candidates[index].item.clone().ok_or_else(|| {
+                    ApplicationError::new(ApplicationErrorKind::Integrity, "state query")
+                })
+            })
+            .transpose()?;
         let recoverable = if query.include_recoverable_versions {
             candidates
                 .into_iter()
                 .enumerate()
                 .filter_map(|(index, candidate)| {
-                    (candidate.active && Some(index) != current_index).then_some(candidate.item)
+                    (candidate.active && Some(index) != current_index)
+                        .then_some(candidate.item)
+                        .flatten()
                 })
                 .collect()
         } else {
@@ -514,11 +655,66 @@ impl SelectedStateNode {
         &mut self,
         query: &StateQuery,
         stored: &StoredState,
-    ) -> Result<(StateItem, bool), ApplicationError> {
-        let route = self
-            .verifier
-            .verify_state(&stored.sealed)
-            .map_err(|error| application_error("state query", error.into()))?;
+        projection: &StateSenderProjection,
+    ) -> Result<(Option<StateItem>, bool, bool), ApplicationError> {
+        let route = match self.verifier.verify_state(&stored.sealed) {
+            Ok(route) => route,
+            Err(_) => {
+                if stored.header.topic != query.topic
+                    || stored.header.scope != query.scope
+                    || stored.header.logical_key != query.logical_key
+                    || stored.header.ttl_ms.is_some()
+                {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::Integrity,
+                        "state query",
+                    ));
+                }
+                if projection.semantic_id() != stored.semantic_id
+                    || projection.publisher() != stored.header.stamp.dot.publisher
+                    || projection.topic() != &stored.header.topic
+                    || projection.scope() != &stored.header.scope
+                    || projection.key_epoch() != stored.header.key_epoch
+                    || projection.exact_len()
+                        != u64::try_from(stored.sealed.len()).map_err(|_| {
+                            ApplicationError::new(ApplicationErrorKind::Integrity, "state query")
+                        })?
+                    || projection.acceptance_marker() != stored.acceptance_marker
+                {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::Integrity,
+                        "state query",
+                    ));
+                }
+                let revoked = self
+                    .store
+                    .is_control_principal_revoked(projection.publisher())
+                    .map_err(|error| application_error("state query", error.into()))?;
+                let current_epoch = self
+                    .store
+                    .active_scope_epoch(projection.scope())
+                    .map_err(|error| application_error("state query", error.into()))?
+                    .map_or(1, |(epoch, _)| epoch);
+                if projection.key_epoch() > current_epoch {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::Integrity,
+                        "state query",
+                    ));
+                }
+                let policy_active = !revoked && projection.key_epoch() == current_epoch;
+                let current = self
+                    .source_route_cache
+                    .is_current_state_sender_projection(&self.verifier, projection)
+                    .map_err(|error| application_error("state query", error))?;
+                if current {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::Integrity,
+                        "state query",
+                    ));
+                }
+                return Ok((None, policy_active, false));
+            }
+        };
         if route.envelope_id() != *stored.transfer_id.as_bytes()
             || route.item_id() != *stored.semantic_id.as_bytes()
             || route.header() != &stored.header
@@ -547,7 +743,13 @@ impl SelectedStateNode {
                 "state query",
             ));
         }
-        let active = !revoked && route.key_epoch() == current_epoch;
+        let policy_active = !revoked && route.key_epoch() == current_epoch;
+        let active = policy_active
+            && self.verifier.is_current_source_route_lineage(
+                route.scope(),
+                route.key_epoch(),
+                route.route_lineage(),
+            );
         if !self
             .verifier
             .can_route_state(route.scope(), route.key_epoch())
@@ -581,7 +783,7 @@ impl SelectedStateNode {
             }
         };
         Ok((
-            StateItem {
+            Some(StateItem {
                 id: StateId::from_store(stored.semantic_id),
                 publisher: stored.header.stamp.dot.publisher,
                 publisher_counter: stored.header.stamp.dot.counter,
@@ -593,7 +795,8 @@ impl SelectedStateNode {
                 tombstone: stored.header.tombstone,
                 acceptance_marker: stored.acceptance_marker,
                 disposition: StateVersionDisposition::Superseded,
-            },
+            }),
+            policy_active,
             active,
         ))
     }
@@ -684,7 +887,9 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    use aster_mesh::{Dot, ProvisioningAccess, ReferenceProvisioner, VersionVector};
+    use aster_mesh::{
+        Dot, ProvisioningAccess, ReferenceProvisioner, ScopeRekeyRecipient, VersionVector,
+    };
 
     use super::*;
     use crate::application::{EventPublishRequest, EventQuery, SelectedEventNode};
@@ -737,6 +942,96 @@ mod tests {
         );
     }
 
+    struct StateRekeyServices {
+        control_authority: ReferenceEnvelopeSealer,
+        registry: Vec<u8>,
+        authority: NodeId,
+        selected_identity: NodeId,
+    }
+
+    fn persist_rekeyable_mission(root: &TestRoot) -> StateRekeyServices {
+        let scope = Scope::new("mission/apps").expect("scope");
+        let state = Topic::new("ops.state").expect("topic");
+        let events = Topic::new("ops.events").expect("topic");
+        let access =
+            ProvisioningAccess::member(scope, vec![1], vec![state, events]).expect("member access");
+        let mut provisioner =
+            ReferenceProvisioner::from_seed([0x74; 32]).expect("rekey provisioner");
+        let control_authority = provisioner
+            .issue_control_authority(60, std::slice::from_ref(&access))
+            .and_then(ReferenceEnvelopeSealer::open)
+            .expect("control authority");
+        let selected_bytes = provisioner
+            .issue_node(1, std::slice::from_ref(&access))
+            .expect("issue selected node")
+            .to_bytes()
+            .expect("encode selected mission");
+        let selected_mission = UnprotectedReferenceMission::from_bytes(selected_bytes.clone())
+            .expect("parse selected mission");
+        let selected_identity = ReferenceEnvelopeSealer::open(
+            selected_mission
+                .fresh_bundle()
+                .expect("fresh selected bundle"),
+        )
+        .expect("inspect selected identity")
+        .identity();
+        let registry = provisioner.export_rekey_registry().expect("rekey registry");
+        drop(
+            UnprotectedReferenceMission::persist(root.mission_path(), selected_bytes)
+                .expect("persist rekeyable mission"),
+        );
+        StateRekeyServices {
+            authority: control_authority.mission_authority_id(),
+            control_authority,
+            registry,
+            selected_identity,
+        }
+    }
+
+    fn apply_same_epoch_rekey(root: &TestRoot, services: &mut StateRekeyServices) {
+        let recipients = vec![
+            ScopeRekeyRecipient::member(
+                services.control_authority.identity(),
+                vec![Topic::new("ops.state").expect("State topic")],
+            )
+            .expect("authority recipient"),
+            ScopeRekeyRecipient::member(
+                services.selected_identity,
+                vec![Topic::new("ops.state").expect("State topic")],
+            )
+            .expect("selected recipient"),
+        ];
+        let (sealed, _) = services
+            .control_authority
+            .seal_chained_scope_rekey_control_from_registry(
+                &services.registry,
+                0,
+                Scope::new("mission/apps").expect("scope"),
+                1,
+                recipients,
+                1,
+                None,
+            )
+            .expect("seal same-epoch rekey");
+        let verified = services
+            .control_authority
+            .verify_control(&sealed)
+            .expect("verify same-epoch rekey");
+        let store = Store::open_for_mission(root.path().join(STORE_FILE), services.authority)
+            .expect("open store for rekey");
+        let outcome = store
+            .ingest_verified_control(&verified, &sealed)
+            .expect("commit same-epoch rekey");
+        assert_eq!(outcome.activated().len(), 1);
+        assert_eq!(
+            store
+                .active_scope_epoch(&Scope::new("mission/apps").expect("scope"))
+                .expect("active epoch")
+                .map(|(epoch, _)| epoch),
+            Some(1)
+        );
+    }
+
     fn selected_node(root: &TestRoot) -> SelectedStateNode {
         if !root.mission_path().exists() {
             persist_mission(root);
@@ -764,6 +1059,52 @@ mod tests {
             logical_key: b"asset-7".to_vec(),
             include_recoverable_versions: recoverable,
         }
+    }
+
+    fn payload_for_exact_sealed_size(node: &mut SelectedStateNode, target: usize) -> Vec<u8> {
+        let template = request(b"state/size-probe", b"");
+        let policy = node.current_policy("state size probe").expect("policy");
+        let epoch = node
+            .store
+            .active_scope_epoch(&template.scope)
+            .expect("active epoch")
+            .map_or(1, |(epoch, _)| epoch);
+        let reservation = node
+            .store
+            .reserve_state_with_policy(&policy, node.identity(), &template.topic, &template.scope)
+            .expect("State size-probe reservation");
+        let probe_header = reservation
+            .header(
+                template.priority,
+                template.logical_key.clone(),
+                0,
+                false,
+                epoch,
+            )
+            .expect("State size-probe header");
+        let probe = node
+            .verifier
+            .seal_state(&probe_header, b"")
+            .expect("seal State size probe");
+        let payload_len = target
+            .checked_sub(probe.bytes.len())
+            .expect("target exceeds State envelope overhead");
+        let payload = vec![0x5a; payload_len];
+        let header = reservation
+            .header(
+                template.priority,
+                template.logical_key,
+                u64::try_from(payload.len()).expect("payload length"),
+                false,
+                epoch,
+            )
+            .expect("State boundary header");
+        let sealed = node
+            .verifier
+            .seal_state(&header, &payload)
+            .expect("seal State boundary payload");
+        assert_eq!(sealed.bytes.len(), target);
+        payload
     }
 
     #[test]
@@ -899,6 +1240,144 @@ mod tests {
         );
         assert_eq!(projection.recoverable.len(), 1);
         assert_eq!(projection.recoverable[0].id, first.id);
+    }
+
+    #[test]
+    fn same_epoch_rekey_withholds_old_state_and_replacement_is_restart_stable() {
+        let root = TestRoot::new("same-epoch-lineage");
+        let mut services = persist_rekeyable_mission(&root);
+        let old_request = request(b"state/pre-rekey", b"old route");
+        let old = {
+            let mut node = selected_node(&root);
+            node.publish(old_request.clone())
+                .expect("publish pre-rekey State")
+        };
+
+        apply_same_epoch_rekey(&root, &mut services);
+        let replacement = {
+            let mut reopened = selected_node(&root);
+            let hidden = reopened
+                .query(query(true))
+                .expect("cache-proven old State is safely withheld");
+            assert!(hidden.current.is_none());
+            assert!(hidden.recoverable.is_empty());
+
+            let replay = reopened
+                .publish(old_request)
+                .expect("exact State retry survives same-epoch rekey");
+            assert!(!replay.inserted);
+            assert_eq!(replay.id, old.id);
+            assert_eq!(replay.publisher_counter, old.publisher_counter);
+            assert_eq!(replay.acceptance_marker, old.acceptance_marker);
+
+            let replacement = reopened
+                .publish(request(b"state/post-rekey", b"current route"))
+                .expect("publish post-rekey State");
+            assert_ne!(replacement.id, old.id);
+            let projection = reopened.query(query(true)).expect("current projection");
+            assert_eq!(
+                projection.current.as_ref().map(|item| item.id),
+                Some(replacement.id)
+            );
+            assert_eq!(
+                projection
+                    .current
+                    .as_ref()
+                    .map(|item| item.payload.as_slice()),
+                Some(b"current route".as_slice())
+            );
+            assert!(projection.recoverable.is_empty());
+            replacement
+        };
+
+        let mut restarted = selected_node(&root);
+        let projection = restarted
+            .query(query(true))
+            .expect("restart-stable lineage filtering");
+        assert_eq!(
+            projection.current.as_ref().map(|item| item.id),
+            Some(replacement.id)
+        );
+        assert!(projection.recoverable.is_empty());
+    }
+
+    #[test]
+    fn state_sealed_wire_boundary_is_inclusive_and_oversize_is_restart_atomic() {
+        let root = TestRoot::new("sealed-wire-boundary");
+        let exact;
+        let exact_payload;
+        {
+            let mut node = selected_node(&root);
+            let payload_over_wire = vec![0x41; MAX_OBJECT_BYTES + 1];
+            let error = node
+                .publish(request(
+                    b"state/payload-over-wire-limit",
+                    &payload_over_wire,
+                ))
+                .expect_err("payload larger than the wire object bound");
+            assert_eq!(error.kind(), ApplicationErrorKind::ResourceLimit);
+
+            exact_payload = payload_for_exact_sealed_size(&mut node, MAX_OBJECT_BYTES);
+            exact = node
+                .publish(request(b"state/exact-wire-limit", &exact_payload))
+                .expect("exact-bound State");
+            assert!(exact.inserted);
+            assert_eq!(exact.publisher_counter, 1);
+
+            let oversized = payload_for_exact_sealed_size(&mut node, MAX_OBJECT_BYTES + 1);
+            let error = node
+                .publish(request(b"state/oversized-wire-limit", &oversized))
+                .expect_err("oversized sealed State");
+            assert_eq!(error.kind(), ApplicationErrorKind::ResourceLimit);
+            assert_eq!(error.operation(), "state publish");
+            assert_eq!(
+                error.to_string(),
+                "selected application state publish failed: selected data resource limit reached"
+            );
+
+            let projection = node.query(query(true)).expect("unchanged projection");
+            assert_eq!(
+                projection.current.as_ref().map(|item| item.id),
+                Some(exact.id)
+            );
+            assert_eq!(
+                projection
+                    .current
+                    .as_ref()
+                    .map(|item| item.payload.as_slice()),
+                Some(exact_payload.as_slice())
+            );
+            assert!(projection.recoverable.is_empty());
+        }
+
+        let mut reopened = selected_node(&root);
+        let projection = reopened.query(query(true)).expect("reopened projection");
+        assert_eq!(
+            projection.current.as_ref().map(|item| item.id),
+            Some(exact.id)
+        );
+        assert_eq!(
+            projection
+                .current
+                .as_ref()
+                .map(|item| item.payload.as_slice()),
+            Some(exact_payload.as_slice())
+        );
+        assert!(projection.recoverable.is_empty());
+
+        let replacement = reopened
+            .publish(request(b"state/oversized-wire-limit", b"small replacement"))
+            .expect("rejected operation key remains unbound");
+        assert!(replacement.inserted);
+        assert_eq!(replacement.publisher_counter, 2);
+        let preflight_replacement = reopened
+            .publish(request(
+                b"state/payload-over-wire-limit",
+                b"small preflight replacement",
+            ))
+            .expect("preflight-rejected operation key remains unbound");
+        assert!(preflight_replacement.inserted);
+        assert_eq!(preflight_replacement.publisher_counter, 3);
     }
 
     #[test]

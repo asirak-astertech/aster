@@ -6675,7 +6675,7 @@ mod tests {
                     .receipts
                     .iter()
                     .any(|(_, version, receipt)| {
-                        *version == wire::SEMANTIC_PROTOCOL_V2
+                        *version == wire::SEMANTIC_PROTOCOL_V5
                             && receipt.object_id == object_id
                             && receipt.complete
                     })
@@ -6693,7 +6693,7 @@ mod tests {
                 .receipts
                 .iter()
                 .any(|(_, version, receipt)| {
-                    *version == wire::SEMANTIC_PROTOCOL_V2
+                    *version == wire::SEMANTIC_PROTOCOL_V5
                         && receipt.object_id == object_id
                         && receipt.complete
                 }),
@@ -9844,7 +9844,7 @@ mod tests {
         driver.queue_sync_message(&receipt).unwrap();
         let receipt_sequence = driver.outbox.front().unwrap().sequence;
 
-        driver.retire_completed_want_and_refill_window(913, wire::SEMANTIC_PROTOCOL_V2, completed);
+        driver.retire_completed_want_and_refill_window(913, wire::SEMANTIC_PROTOCOL_V5, completed);
 
         assert!(!driver.retries.contains_key(&RetryKey::Want(913, completed)));
         let accelerated = &driver.deferred_wants[&sleeping_old];
@@ -9913,7 +9913,7 @@ mod tests {
             .unwrap();
         let receipt_sequence = driver.outbox.front().unwrap().sequence;
 
-        driver.retire_completed_want_and_refill_window(914, wire::SEMANTIC_PROTOCOL_V2, completed);
+        driver.retire_completed_want_and_refill_window(914, wire::SEMANTIC_PROTOCOL_V5, completed);
 
         assert!(!driver.retries.contains_key(&RetryKey::Want(914, completed)));
         let accelerated = &driver.retries[&RetryKey::Want(914, sleeping_old)];

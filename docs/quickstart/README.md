@@ -34,6 +34,7 @@ Choose the API closest to your application:
 | Rust (selected live Event slice) | `aster_node::start_node` + `SelectedEventHandle` | [Selected Event API](selected-event-api.md) |
 | ConnectRPC client (alpha live Event slice) | local `aster.application.v1alpha1` schema | [Local ConnectRPC agent](connect-agent.md) |
 | Rust (selected stopped Event slice) | `aster-node::application::SelectedEventNode` | [Selected Event API](selected-event-api.md#one-authority-two-application-modes) |
+| Rust (selected live or stopped control administration) | `aster_node::SelectedControlHandle` or `aster_node::SelectedControlAdmin` | [Selected Event API](selected-event-api.md#publish-controls-through-the-live-actor) |
 | Rust (selected stopped State slice) | `aster-node::application::SelectedStateNode` | [Selected State API](selected-state-api.md) |
 | Rust (selected stopped Record slice) | `aster-node::application::SelectedRecordNode` | [Selected Record API](selected-record-api.md) |
 | Rust (selected stopped Blob slice) | `aster-node::application::SelectedBlobNode` | [Selected Blob API](selected-blob-api.md) |
@@ -59,9 +60,13 @@ content through an encrypted local depot without exposing source-envelope or
 provider internals. The language examples
 remain intentionally offline exercises. After one works, continue with
 [Carriers and contacts](../transports.md) to understand live synchronization.
-The fixture path is unprotected compatibility/test ingestion. Rust now exposes
-a provider-owned protection boundary, but no operational provider or protected
-C, Go, or Python entry point is shipped; see
+The fixture path is unprotected compatibility/test ingestion. Caller-composed
+Rust `NodeConfig`, stopped `SelectedEventNode`, and stopped
+`SelectedControlAdmin` compose the provider-owned artifact boundary or opaque
+SecretStore-reference load seam, and a running node exposes the privileged
+`SelectedControlHandle`. No production backend, protected stock CLI,
+cross-process administration, coordinated destroy workflow, or protected C,
+Go, or Python entry point is shipped; see
 [ADR 0013](../decisions/0013-protected-provisioning-boundary.md).
 
 ## Shared toolchain prerequisite

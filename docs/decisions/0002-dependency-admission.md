@@ -144,3 +144,31 @@ correctness. All versions and transitive sources are locked and audited subject
 only to the explicit active pilot exceptions above and the disabled, lock-only
 scanner disposition in
 [Decision 0026](0026-lock-only-hickory-advisories.md).
+
+## Historical clarification — 2026-08-25
+
+The present-tense Iroh rejection above records the 2026-08-18 dependency state
+and remains unchanged as historical rationale. It is no longer a statement that
+no bounded implementation exists. [Decision 0028](0028-selected-stack-implementation-boundary.md)
+subsequently authorized Iroh 1.0.3 for active selected-stack implementation,
+and signed code commit `b0a1203f4f24c05edd31e5ce1ea0f3b7f9bd2f52`
+adds one explicitly controlled Iroh relay route with exact TLS trust, no hosted
+lookup, no public/default relay substitution, no insecure trust mode, and no
+port mapping.
+
+That implementation authority is not dependency or release admission. The
+missing security-process disposition; exact enabled-graph and license
+treatment, including `CDLA-Permissive-2.0` and `Unlicense`; SBOM;
+supported-target evidence; support owner; advisory disposition;
+independent interoperability, physical acceptance, and release authorization
+remain open. Current software tests therefore cannot be cited as a
+production-security or production-relay approval.
+
+The normal `aster-node` graph already reaches Iroh's client-side `iroh-relay`
+dependency but enables neither `iroh-relay/server` nor its `test-utils`
+feature. The optional `aster-iroh/test-utils` feature is dev/all-feature test
+surface: it enables the self-hosted relay fixture, the server/test feature
+graph, and associated server/ACME packages. The new direct `rustls` 0.23.43
+edge reuses an already locked package/version. Those distinctions keep server
+code out of the normal node graph; they do not waive review of the expanded
+test/lock graph or admit any dependency for a shipped relay server.

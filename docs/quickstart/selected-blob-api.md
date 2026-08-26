@@ -1,16 +1,22 @@
 # Selected Blob API quickstart
 
-This is the shortest path to Aster's **selected local Blob streaming surface**.
+This is the shortest path to Aster's **selected stopped Blob streaming surface**
+and the separate semantic-v5 direct transfer boundary for already-durable
+Blobs.
 It opens the selected mission-bound store while no runtime owns it, streams a
 nonempty file into an encrypted crash-resumable depot, commits one
 source-authenticated publication, and streams the freshly verified bytes back
 to a caller-owned output.
 
-This first Blob slice is deliberately stopped and local. It does not put Blob
-on the selected Event/State/Record reconciliation wire and has no live handle, subscription,
-relay, remote chunk transfer, or language binding. The example demonstrates
-local durability, bounded-memory streaming, and exact retry—not mesh delivery,
-any-peer resume, physical sanitization, or acceptance completion.
+The application facade remains deliberately stopped/exclusive: Blob has no live
+handle, subscription, or selected-node language binding. Separately, semantic
+v5 now reconciles already-durable Blob sources and direct carrier ranges between
+current content-capable peers. The default offer is `[5, 4, 3, 2, 1]`; v1-v4
+emit zero Blob frames, and stable wire/ABI, source, manifest, and `ASTRBT01`
+formats remain version 1. The runnable example below demonstrates local
+durability, bounded-memory streaming, and exact retry. The network section then
+states the opt-in runtime boundary; it does not claim a live Blob application
+API, route-only relay, physical sanitization, or release acceptance.
 
 ## Run the example
 
@@ -85,6 +91,69 @@ let read = blobs.read_into(
 )?;
 assert_eq!(read.id, published.id);
 ```
+
+## Opt in to semantic-v5 transfer
+
+The runtime does not infer Blob receive intent from State/Record interests. Add
+an exact Blob selector to `NodeConfig::mutable_interests`; descendant scope is
+rejected for Blob because one selector must bind one current content epoch:
+
+```rust
+let mutable_interests = MutableSourceInterests::new(state, record).with_blob(vec![
+    SourceInterestSelector::new(blob_topic, blob_scope, false),
+]);
+```
+
+The provider turns that exact topic/scope and the current epoch into an opaque
+32-byte peer proof inside the protected v5 contact. Every Blob inventory,
+source, and range send requires the authenticated peer to have both the current
+content proof and current route authorization and to remain nonrevoked.
+Route-only peers cannot use the selected Blob lane. The source-envelope and
+complete manifest plan reconcile first; carrier requests begin only after that
+pending source is durably staged.
+
+Each carrier request extends one exact contiguous prefix by at most 16 KiB. The
+prefix is peer-neutral: its durable key is the source transfer ID plus strict
+kind-2 carrier ID, not the peer or session, so after runtime/store/provider-cache
+teardown and reopen any other eligible content peer can continue at the first
+missing byte. The requester's
+Finish remaining count is echoed for sequencing only; each exact Result/Ack
+tuple binds the accepted prefix.
+
+Network admission is bounded to 64 MiB of plaintext and 1,024 chunks. Pending
+source/manifest/prefix state is bounded to 10,000 rows and 64 MiB. A pending
+source, partial prefix, and even carrier-complete depot are not an ordinary Blob
+publication. Visibility appears only after the exact depot completion, a fresh
+provider pass that decrypts/authenticates every chunk and whole Blob, and a
+fresh current route/physical-lineage proof agree in one redb promotion
+transaction.
+
+Same-epoch key replacement invalidates old peer proofs and withholds old rows,
+but it is not a transparent physical replacement. Redb rejects another physical
+lineage for the same `(BlobID, content group, numeric epoch)` with
+`PhysicalLineageConflict`; republishing or resuming that Blob requires advancing
+the numeric epoch.
+
+Terminal or stale cleanup therefore does not erase the last physical-lineage
+witness. It removes the pending source, prefixes, chunks, file bytes, finalized
+digest, and all reserved/committed byte accounting, but retains one internal
+unfinished `BLOB_IMPORTS` row. That row is not a publication and cannot be read
+or served; it remains charged to the existing variant cap. An exact-lineage
+retry can refill it, while a different lineage at the same numeric epoch still
+fails and must advance the epoch.
+
+Source/store/cache transitions are locally serialized. A successful abort
+removes the old authenticated claim, rereads durable source state, and freshly
+authenticates any exact concurrent restage before restoring its claim. Terminal
+multi-carrier scheduling advances past the lexicographically greatest carrier
+ID, not the last manifest record.
+
+Normal and `AtLeast` run the v5 lane because `AtLeast` filters Event only.
+`ReceiveOnly` advertises, requests, stages, promotes, and counts zero Blob work.
+The selected slice still has no route-only Blob relay/custody, live Blob handle
+or subscription, Blob TTL/expiry/GC, metadata-independent whole-byte identity
+or deduplication, 100+ MiB/RSS or resource acceptance, physical carrier,
+mixed-implementation, or release receipt.
 
 `publish` requires a seekable source because it makes two bounded passes. The
 first computes the whole-content and per-chunk digests with one bounded,
@@ -206,6 +275,9 @@ alongside Event, State, Record, control, and route-cache rows. Separate
 per-chunk metadata rows, and epoch-specific import variants. The latter two
 include unfinished resumable imports, so abandoned but structurally valid
 staging consumes admission until a future explicit-GC policy is implemented.
+That count includes the non-public unfinished physical-lineage fence retained
+after terminal or stale network cleanup, even though it has no chunks or byte
+reservation.
 The defaults are 512 MiB, 100,000 chunk rows, and 4,096 variants. These limits
 do not account for redb allocation, directory blocks, snapshots, backups, swap,
 an attacker-created population of unrelated directory entries, or every host

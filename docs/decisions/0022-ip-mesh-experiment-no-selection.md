@@ -1,15 +1,15 @@
 # Decision 0022: Do not select an IP mesh substrate from Proposal 0001
 
-> ****
 
 - Status: accepted — no production profile selected
 - Date: 2026-08-21
 - Results: [Proposal 0001 result](../proposals/0001-ip-mesh-vertical-slice-results.md)
 - Preserves: Decisions [0002](0002-dependency-admission.md),
   [0007](0007-ip-and-btle-links.md),
-  [0014](0014-total-assurance-build-vs-buy.md),
-  [0015](0015-library-backed-mechanism-reduction.md), and
-  [0016](0016-tokio-relay-host-boundary.md)
+  0014 (“Build versus buy is governed by total assurance cost”;  not part of this repository artifact),
+  0015 (“Delete custom mechanism behind narrow library-backed seams”; not part of this repository artifact), and
+  0016 (“Tokio owns relay host I/O and scheduling”; not
+  part of this repository artifact)
 
 ## Context
 

@@ -2,13 +2,13 @@
 
 - Specification version: 0.1.0-draft.1
 - Stable wire/cryptographic profile: `1`, suite `0x0001`
-- Negotiated semantic versions: default/highest `2`, compatibility `1`
+- Negotiated semantic versions: default/highest `5`, compatibility `4`, `3`, `2`, and `1`
 - Status: normative for the implemented reference profile
-- Date: 2026-08-19
+- Date: 2026-08-25
 
 The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY**
 are normative. This document defines the base fixed binary security objects
-emitted or accepted by the reference profile. The semantic-version-2 batch
+emitted or accepted by the reference profile. The semantic-version-2/3/v4/v5 batch
 additions are defined normatively in [protocol.md](protocol.md) §6.1; together,
 these sections are the interoperability authority for the fixed bytes. Rust
 types and local database rows are not wire formats.
@@ -61,8 +61,8 @@ HD(domain, input) =
 `domain` is the exact case-sensitive ASCII byte string shown. `SHA-256(x)`
 without `HD` means ordinary SHA-256 over exactly `x` and adds no prefix.
 
-The provisioning KDF used by credentials, source envelopes, controls, and
-custody wrappers is:
+The provisioning KDF used by credentials, source envelopes, controls, and the
+legacy `ASTRFWD1` forwarding-custody wrapper is:
 
 ```text
 PKDF(root32, label, context, N) =
@@ -129,15 +129,16 @@ that 32-byte value itself is the input to both signature algorithms.
 | Provisioning bundle | `"ASTRPB03"` | unprotected local provisioning-inner format; not a network object |
 | Rekey recipient registry | `"ASTRRKR1"` | signed administrative artifact; at most 16 MiB; not a mesh replication object |
 | Authority credential body | none; embedded with `b32` | network security object; embedded bound 16 KiB |
-| Singleton source envelope | `"ASTRENV2"` | network/stable-store format-2 object; semantic versions 1 and 2 |
-| Compact batch source envelope | `"ASTRENV3"`, kind `1` | semantic-version-2 network/stable-store format-3 object; exact bytes in [protocol.md](protocol.md) §6.1 |
-| Source-batch proof | `"ASTRENV3"`, kind `3` | semantic-version-2 network/stable-store format-3 object; exact bytes in [protocol.md](protocol.md) §6.1 |
+| Singleton source envelope | `"ASTRENV2"` | network/stable-store format-2 object; semantic versions 1, 2, 3, 4, and 5 |
+| Compact batch source envelope | `"ASTRENV3"`, kind `1` | semantic-version-2/3/v4/v5 network/stable-store format-3 object; exact bytes in [protocol.md](protocol.md) §6.1 |
+| Source-batch proof | `"ASTRENV3"`, kind `3` | semantic-version-2/3/v4/v5 network/stable-store format-3 object; exact bytes in [protocol.md](protocol.md) §6.1 |
 | Revocation control | source-envelope kind `2`, protected `"ASTRCA02"` | delegated-control format 2 inside `ASTRENV2` |
 | Scope-epoch control | source-envelope kind `3`, protected `"ASTRCA02"` | delegated-control format 2 inside `ASTRENV2` |
-| Bridge authorization | `"ASTRBA01"`, protected ObjectKind `4` | semantic-version-2 authorization format 2; at most 65,536 bytes total |
-| Bridge route wrapper | `"ASTRBW01"`, protected ObjectKind `5` | semantic-version-2 wrapper format 1; at most 524,322 bytes total |
+| Bridge authorization | `"ASTRBA01"`, protected ObjectKind `4` | semantic-version-2/3/v4/v5 authorization format 2; at most 65,536 bytes total |
+| Bridge route wrapper | `"ASTRBW01"`, protected ObjectKind `5` | semantic-version-2/3/v4/v5 wrapper format 1; at most 524,322 bytes total |
 | Bridge edge enrollment | `"ASTRBE01"` | provider-authenticated administrative capability; at most 32 KiB; not a mesh replication object |
-| Custody wrapper | `"ASTRFWD1"` | network, per forwarding hop; protected body at most 64 KiB including tag |
+| Legacy per-hop forwarding wrapper | `"ASTRFWD1"` | provider-owned network object; protected body at most 64 KiB including tag |
+| Semantic-v3-format custody claim, used by v3/v4/v5 | `"ASTRCU03"` inside `"ASTRFR01"` | exact 150-byte plaintext; exact current outer record 202 bytes, hard bound 256 bytes |
 | Handshake flight | `"ASTRHS01"` | network, at most 64 KiB per flight |
 | Protected transport frame | `"ASTRFR01"` | network; plaintext at most 16 MiB |
 | Blob manifest | `"ASTRBM01"` | canonical source-authenticated object, at most 1 MiB |
@@ -338,8 +339,10 @@ each counter MUST be nonzero, and the context entry for the publishing identity,
 if present, MUST be less than `publisher_counter`. `event_sequence` MUST be
 present and nonzero exactly for Event; it MUST be absent for every other class.
 
-`ttl_ms` is a duration. An absent value is durable. Zero is syntactically valid
-but is already expired and therefore is not eligible for delivery or forwarding.
+`ttl_ms` is a duration. An absent value is durable. For non-tombstone data, zero
+is syntactically valid but already expired and therefore is not eligible for
+delivery or forwarding. A tombstone is a durable retained marker regardless of
+its optional TTL value; TTL does not make that marker ineligible.
 `declared_content_len` MUST equal the payload length. A tombstone MUST have zero
 payload length, and Blob MUST NOT be a tombstone.
 
@@ -492,11 +495,11 @@ Blob route commitment from being substituted without invalidating the source
 signature.
 
 No multi-item batch certificate, proof, or credential cache reference is encoded
-inside an `ASTRENV2` format-2 object. Semantic-version-2 sessions also support
-the separate `ASTRENV3` format-3 source-batch proof and compact item
-representations defined in [protocol.md](protocol.md) §6.1. Those bytes MUST NOT
+inside an `ASTRENV2` format-2 object. Semantic-version-2, semantic-version-3,
+semantic-version-4, and semantic-version-5 sessions also support the separate `ASTRENV3` format-3 source-batch proof and
+compact item representations defined in [protocol.md](protocol.md) §6.1. Those bytes MUST NOT
 be inserted into or reinterpreted as an `ASTRENV2` object; format 2 remains the
-singleton fallback for semantic-version-2 peers and the only source-envelope
+singleton fallback for semantic-version-2/3/v4/v5 peers and the only source-envelope
 format accepted by semantic version 1.
 
 ## 6. Authority control objects
@@ -776,12 +779,13 @@ generation in independent durable state and supply it as the minimum generation
 on import; using the zero-minimum convenience import after losing that state
 does not provide rollback detection.
 
-### 6.2 Semantic-v2 bridge delegated control authentication
+### 6.2 Semantic-v2/v3/v4/v5 bridge delegated control authentication
 
-A semantic-version-2 ObjectKind `4` bridge authorization uses authorization
-format `2`. Its protected plaintext begins with the following canonical fields;
-the enabled-only policy fields retain the bounds in [protocol.md](protocol.md)
-§12:
+A semantic-version-2, semantic-version-3, semantic-version-4, or
+semantic-version-5 ObjectKind `4` bridge authorization
+uses authorization format `2`. Its protected plaintext begins with the
+following canonical fields; the enabled-only policy fields retain the bounds in
+[protocol.md](protocol.md) §12:
 
 ```text
 object_kind                       u8 = 4
@@ -857,7 +861,7 @@ outbound work while retaining the authenticated history needed for recovery and
 audit. A revoked-signing pending suffix is rejected and removed under the same
 reissue-from-the-last-head rule as ordinary controls.
 
-## 7. Per-hop custody wrapper
+## 7. Legacy per-hop forwarding wrapper
 
 Forwarding metadata is deliberately outside the stable source envelope. The
 wrapper is:
@@ -912,6 +916,60 @@ nondecreasing lower bound. A forwarding node adds only elapsed time that it can
 measure with local monotonic continuity; this format contains no wall-clock
 timestamp and cannot account for an unmeasured powered-off interval.
 
+This provider-owned wrapper is not the semantic-v3-format session custody claim below.
+It embeds a credential and hybrid forwarding signature, but it does not encode
+the source TTL or priority, exact transfer length, per-hop monotonic sample and
+delta, live emission-policy revision, or authenticated session transcript ID.
+No decoder may reinterpret one format as the other.
+
+### 7.1 Semantic-v3-format session custody claim
+
+A selected semantic-v3, semantic-v4, or semantic-v5 Event or RouteEvent offer carries exactly one custody
+claim encrypted as an `ASTRFR01` record from §9. The application AAD is the
+exact ASCII string `"aster/custody-wrapper/v3"`, distinct from normal transport
+frames. The plaintext is exactly 150 bytes:
+
+```text
+magic                    "ASTRCU03"          8
+claim_format_version     u16 = 1              2
+semantic_version         u16 = 3              2
+session_id               32 bytes            32
+transfer_id              32 bytes            32
+exact_len                u64                   8
+exchange_id              u64                   8
+policy_revision          u64                   8
+prior_age_ms             u64                   8
+sample_clock_id          16 bytes            16
+sample_tick_ms           u64                   8
+hop_delta_ms             u64                   8
+source_priority          u8                    1
+source_ttl_present       u8                    1
+source_ttl_ms            u64                   8
+```
+
+`session_id` MUST equal the completed handshake `FinalTranscriptHash`.
+`transfer_id` is the exact Event/RouteEvent transfer SHA-256. `exact_len` and
+`policy_revision` MUST be nonzero; `exchange_id = 0` is canonical and valid.
+The selected runtime supplies its live emission-policy revision as
+`policy_revision`. `source_priority` MUST be `0..3`. When
+`source_ttl_present = 0`, `source_ttl_ms` MUST be zero; when it is `1`, every
+`u64` value, including immediate-expiry zero, is canonical. Other presence
+values fail.
+
+The authenticated forwarding age is the checked sum
+`prior_age_ms + hop_delta_ms`; overflow fails. The receiver MUST compare the
+transfer ID, exact length, exchange ID, source priority, and optional source TTL
+with the live exchange and freshly source-verified header before constructing a
+verified custody capability. The directional §9 channel authenticates the
+session, sequence, nonce, and distinct AAD and rejects replay, cross-session
+substitution, tampering, or use before semantic version 3. The embedded
+`semantic_version` field deliberately remains the custody-format minimum `3`
+inside a v4 session; the completed handshake transcript and traffic keys bind
+the actually negotiated v4 session. With the current §9
+encoding the complete record is exactly 202 bytes; implementations MUST reject
+an empty record or one larger than 256 bytes. Stable source bytes remain in the
+ordinary peer-neutral transfer path and are not embedded in this claim.
+
 ## 8. Handshake flights and transcript
 
 The reference adjacency handshake has four flights. Every flight starts with the
@@ -956,8 +1014,9 @@ anonymous_mission_proof         AEAD with ciphertext exactly 16 bytes
 ```
 
 Both offer lists MUST be nonempty, nonzero, duplicate-free, and in strictly
-descending numeric order. The default semantic-version list is `[2, 1]` and a
-v1-only compatibility initiator sends `[1]`. The suite list contains only
+descending numeric order. The default semantic-version list is `[5, 4, 3, 2, 1]`; a
+v2 compatibility initiator may send `[2, 1]`, and a v1-only compatibility
+initiator sends `[1]`. The suite list contains only
 `[0x0001]`. An honest responder selects the highest common semantic version and
 its locally preferred complete common suite.
 
@@ -1012,7 +1071,7 @@ cause a fresh response; deployments MUST rate-limit handshake work.
 After the kind-`2` prefix:
 
 ```text
-selected_semantic_version       u16 = 1 or 2
+selected_semantic_version       u16 = 1, 2, or 3
 selected_suite_id               u16 = 0x0001
 responder_nonce                 32 fresh random bytes
 responder_p256_ephemeral        b16(exactly 33 bytes)
@@ -1294,6 +1353,109 @@ the window.
 `ServerFinished` is not a record and consumes no transport sequence; its direct
 AEAD is specified in §8.6. The first normal protected frame in each direction
 therefore uses sequence zero.
+
+### 9.1 Semantic-v4 selected State/Record mechanics plaintext
+
+The selected-node mechanics plaintext is protected as the ordinary §9
+application record with AAD `"aster/transport-frame/v1"`. Semantics v4 and v5 add no
+new outer record, source envelope, or suite. Every selected mechanics plaintext
+starts with `"ASM\x01" || tag u8`. The mutable tags are invalid unless the
+completed session negotiated semantic version `4` or `5`; class `3` is valid
+only at v5, and v1-v3 Event-compatible sessions reject every mutable class.
+
+The common mutable fields are:
+
+```text
+class       u8: 1 State, 2 Record, 3 Blob source under semantic v5
+direction   u8: 1 ToSessionInitiator, 2 ToSessionResponder
+transfer_id 32 bytes; its typed class MUST equal class
+disposition u8: 0 Duplicate, 1 Inserted, 2 DeferredCapacity
+remaining   u64; at most the selected reconciliation cardinality bound
+```
+
+The mutable tag registry is closed:
+
+| Tags | Plaintext after `"ASM\x01" || tag` |
+|---|---|
+| `0x69` Interest, `0x6a` InterestReply | `class || canonical bounded interest` |
+| `0x71` InventoryQuery, `0x72` InventoryReply, `0x75` DifferenceQuery, `0x76` DifferenceReply | `class || direction || b32(negentropy frame)`; frame at most 16 KiB |
+| `0x73` InventoryComplete, `0x74` InventoryCompleteAck, `0x77` DifferenceBound, `0x78` DifferenceBoundAck, `0x79` LaneDeferred, `0x7a` LaneDeferredAck | `class || direction` |
+| `0x81` Fetch | `class || direction || transfer_id` |
+| `0x82` Object, `0x83` Offer | `class || direction || transfer_id || b32(source envelope)`; object at most 1 MiB |
+| `0x84` ApplyResult | `class || direction || transfer_id || disposition` |
+| `0x85` FetchResult, `0x86` FetchResultAck | `class || direction || transfer_id || disposition` |
+| `0x91` Finish, `0x92` Finished | `class || direction || remaining` |
+
+`FetchResult` and `FetchResultAck` are each exactly 40 plaintext bytes. An
+acknowledgement MUST echo the exact class, direction, transfer ID, and
+disposition and MUST precede another Fetch or Finish on that lane. Finish and
+Finished are each exactly 15 plaintext bytes and MUST echo the exact remaining
+count. Truncation, trailing bytes, unknown class/direction/disposition, a typed
+ID/class mismatch, or an out-of-order or changed result/acknowledgement fails
+the contact. The exact sequencing, capacity meaning, fairness cursor, mode
+behavior, and finite-TTL rejection are normative in
+[protocol.md](protocol.md) §9.1.
+
+### 9.2 Semantic-v5 selected Blob mechanics plaintext
+
+Semantic v5 reuses the protected §9 record and the mutable source grammar
+above with `class = 3` for Blob source envelopes. It reserves separate exact
+Blob interest and carrier-range tags; v1-v4 sessions reject all of them. Source
+and carrier formats remain `ASTRENV2`/`ASTRENV3` and `ASTRBT01` version 1.
+
+BlobInterest (`0x6b`) and BlobInterestReply (`0x6c`) encode:
+
+```text
+selector_count u16, 0..256
+selectors selector_count times, strictly increasing by exact topic/scope:
+  topic         b16(UTF-8), 1..128 bytes
+  scope         b16(UTF-8), 1..128 bytes; exact, never descendants
+  epoch         u64
+  content_proof 32 opaque provider-owned bytes
+```
+
+The encoded interest body is at most 76,802 bytes, so each protected plaintext
+including `"ASM\x01" || tag` is at most 76,807 bytes. One maximum-size interest
+plus reply exchange is exactly 153,718 bytes after two 52-byte protected-record
+overheads. An empty list means receive no Blob. Repeated exact topic/scope
+selectors, noncanonical order, trailing bytes, or a proof of any other length
+fail before source reconciliation.
+
+Every range tuple is:
+
+```text
+direction     u8: 1 ToSessionInitiator, 2 ToSessionResponder
+source_id     32-byte exact Blob source transfer ID
+object_id     33 bytes: kind 2 || 32-byte carrier digest
+total_len     u64, nonzero
+offset        u64, less than total_len
+range_len     u32, 1..16384; offset + range_len <= total_len
+```
+
+BlobRangeFetch (`0xa1`) appends the requester's exact 32-byte current content
+proof to that tuple. BlobRange (`0xa2`) appends a disposition byte (`1` Data,
+`2` Unavailable) and `b32(bytes)`; Data has exactly `range_len` bytes and
+Unavailable has none. BlobRangeResult (`0xa5`) and BlobRangeResultAck (`0xa6`)
+replace `range_len` with `accepted_len` and append disposition `1` Partial, `2`
+Complete, `3` Duplicate, `4` DeferredCapacity, or `5` Unavailable. Partial and
+Complete accept 1..16,384 bytes; Complete ends exactly at `total_len`, Partial
+does not, and the other dispositions accept zero. Result and acknowledgement
+are each exactly 92 plaintext bytes.
+
+BlobCarrierFinish (`0xb1`) and BlobCarrierFinished (`0xb2`) encode `direction ||
+remaining u64`; each is exactly 14 plaintext bytes and `remaining` is at most
+the selected reconciliation cardinality bound. Finished echoes the requester's
+remaining count for sequencing only; it is not independent proof of requester
+disk state. The exact per-range Result/Ack tuples bind accepted durable-prefix
+progress. The exact authorization,
+sequencing, source-before-carrier, peer-neutral durable-prefix, completion, and
+policy rules are normative in [protocol.md](protocol.md) §9.2.
+
+The runtime reserves exactly 17,127 protected bytes for one full carrier-range
+settlement: one 123-byte Fetch, one maximum 16,480-byte Range, two 92-byte
+Result/Ack plaintexts, two 14-byte Finish/Finished plaintexts, and 52 bytes of
+record protection for each of the six frames. This is three exchanges and does
+not change any codec limit.
 
 ## 10. Blob manifest and chunk cryptography
 
@@ -1595,6 +1757,18 @@ sealed source envelope and require both the exact authenticated
 bytes alone is insufficient; a different route root or chunk count is a hard
 failure.
 
+The selected semantic-v5 redb composition uses a narrower, nonportable local
+layout: it atomically stages an exact authenticated source plan, then persists
+one contiguous prefix per `(source transfer ID, kind-2 carrier ID)`. Prefix
+ownership is peer- and session-neutral. Ordinary Blob publication rows remain
+absent until every carrier is complete, depot completion agrees, a fresh
+provider content-completion pass verifies every AEAD/plaintext/chunk/whole-Blob
+binding, and a fresh current route/physical-lineage proof agrees in one
+promotion transaction. The selected staging ceilings are 64 MiB and 10,000
+rows; network admission additionally caps plaintext at 64 MiB, chunks at 1,024,
+and each requested prefix extension at 16 KiB. These are local selected-store
+invariants, not new stable envelope bytes.
+
 ## 11. Required rejection behavior and format boundaries
 
 A conforming decoder rejects before semantic dispatch when any fixed magic,
@@ -1603,13 +1777,12 @@ cross-field length, hash, AEAD tag, required signature, or trailing-byte rule
 above fails. Authentication errors exposed to an unauthenticated peer SHOULD be
 indistinguishable.
 
-Semantic-version-2 multi-item source authentication and inclusion proofs are
+Semantic-version-2/3/v4/v5 multi-item source authentication and inclusion proofs are
 implemented as the separate `ASTRENV3` format-3 objects defined normatively in
 [protocol.md](protocol.md) §6.1. They are not unresolved extensions to
 `ASTRENV2` and MUST be rejected by semantic-version-1 sessions.
 
-The following bytes are intentionally not invented by this draft because the
-reference implementation does not contain them:
+The following are intentionally not specified as portable wire encodings:
 
 - broadcast capsules, cookies, resumption tickets,
   or authority-signed downgrade authorizations; and

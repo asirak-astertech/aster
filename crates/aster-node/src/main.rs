@@ -3,18 +3,24 @@ use std::{
     env,
     fs::OpenOptions,
     io::{self, Read},
+    num::NonZeroU64,
     path::{Path, PathBuf},
     process::ExitCode,
     time::Duration,
 };
 
+use aster_iroh::{
+    MAX_RELAY_CA_ROOT_BYTES, MAX_RELAY_CA_ROOT_TOTAL_BYTES, MAX_RELAY_CA_ROOTS,
+    MAX_RELAY_URL_BYTES, PinnedRelay,
+};
 use aster_mesh::{Scope, ScopeRekeyRecipient, Topic};
 use aster_node::{
     DemoScenario, MissionExpectedPeer, MutableSourceInterests, NodeApplication, NodeConfig,
-    NodeIdentity, SourceInterestSelector, ensure_state_accepts_normal_operation,
-    format_control_transfer_id, format_path_field, format_receipt_field, inspect_store,
-    mission::UnprotectedReferenceMission, parse_item_id, parse_node_id, publish_revocation_control,
-    publish_scope_rekey_control, put_opaque, run_demo_scenario, run_node, zeroize_node,
+    NodeIdentity, RegistryGenerationWitness, RevocationRequest, ScopeRekeyRequest,
+    SelectedControlAdmin, SelectedForwardingConfig, SourceInterestSelector,
+    ensure_state_accepts_normal_operation, format_control_transfer_id, format_path_field,
+    format_receipt_field, inspect_store, mission::UnprotectedReferenceMission, parse_item_id,
+    parse_node_id, put_opaque, run_demo_scenario, run_node, run_node_with_forwarding, zeroize_node,
 };
 
 const MAX_PUT_BYTES: u64 = 1024 * 1024;
@@ -101,13 +107,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let mission_bundle =
                 arguments.required_path("--mission-bundle-unprotected-reference")?;
             let subject = parse_node_id(&arguments.required("--subject")?)?;
-            let generation = arguments.required("--generation")?.parse()?;
+            let generation = arguments.required("--generation")?.parse::<NonZeroU64>()?;
+            let request = RevocationRequest::new(subject, generation);
             arguments.finish()?;
-            ensure_state_accepts_normal_operation(&state)?;
-            let mission = UnprotectedReferenceMission::load(&mission_bundle)?;
-            let receipt = publish_revocation_control(&state, &mission, subject, generation)?;
+            let admin = SelectedControlAdmin::open_unprotected_reference(&state, mission_bundle)?;
+            let receipt = admin.publish_revocation(request)?;
             println!(
-                "CONTROL status={} kind=revocation transfer_id={} sequence={} subject={} generation={} activated={} source_authenticated=true commit_before_activate=true emitted_by=authority-process",
+                "CONTROL status={} kind=revocation transfer_id={} sequence={} subject={} generation={} activated={} source_authenticated=true commit_before_activate=true publication_disposition={}",
                 if receipt.emitted {
                     "emitted"
                 } else {
@@ -116,8 +122,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 format_control_transfer_id(receipt.transfer_id),
                 receipt.sequence,
                 aster_node::format_node_id(subject),
-                generation,
+                generation.get(),
                 receipt.activated,
+                if receipt.emitted {
+                    "committed-this-call"
+                } else {
+                    "recovered-same-signer"
+                },
             );
         }
         "control-rekey" => {
@@ -125,30 +136,30 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let mission_bundle =
                 arguments.required_path("--mission-bundle-unprotected-reference")?;
             let registry_path = arguments.required_path("--signed-public-registry")?;
-            let minimum_registry_generation = arguments
-                .optional("--minimum-registry-generation")?
-                .map_or(Ok(0u64), |value| value.parse())?;
+            let minimum_registry_generation = RegistryGenerationWitness::new(
+                arguments
+                    .required("--minimum-registry-generation")?
+                    .parse::<NonZeroU64>()?,
+            );
             let scope = Scope::new(arguments.required("--scope")?)?;
-            let epoch = arguments.required("--epoch")?.parse()?;
+            let epoch = arguments.required("--epoch")?.parse::<NonZeroU64>()?;
             let route_recipients = arguments.repeated("--route-recipient")?;
             let member_recipients = arguments.repeated("--member-recipient")?;
             arguments.finish()?;
             let recipients = parse_rekey_recipients(route_recipients, member_recipients)?;
             let registry = read_registry_source(&registry_path)?;
-            ensure_state_accepts_normal_operation(&state)?;
-            let mission = UnprotectedReferenceMission::load(&mission_bundle)?;
             let recipient_count = recipients.len();
-            let receipt = publish_scope_rekey_control(
-                &state,
-                &mission,
-                &registry,
+            let request = ScopeRekeyRequest::new(
+                registry,
                 minimum_registry_generation,
                 scope.clone(),
                 epoch,
                 recipients,
             )?;
+            let admin = SelectedControlAdmin::open_unprotected_reference(&state, mission_bundle)?;
+            let receipt = admin.publish_scope_rekey(request)?;
             println!(
-                "CONTROL status={} kind=scope-rekey transfer_id={} sequence={} scope={} epoch={} recipients={} activated={} source_authenticated=true recipient_filtered=true commit_before_activate=true emitted_by=authority-process",
+                "CONTROL status={} kind=scope-rekey transfer_id={} sequence={} scope={} epoch={} recipients={} activated={} source_authenticated=true recipient_filtered=true commit_before_activate=true publication_disposition={}",
                 if receipt.emitted {
                     "emitted"
                 } else {
@@ -157,9 +168,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 format_control_transfer_id(receipt.transfer_id),
                 receipt.sequence,
                 scope.as_str(),
-                epoch,
+                epoch.get(),
                 recipient_count,
                 receipt.activated,
+                if receipt.emitted {
+                    "committed-this-call"
+                } else {
+                    "recovered-same-signer"
+                },
             );
         }
         "node" => {
@@ -167,8 +183,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let bind = arguments.required("--bind")?.parse()?;
             let mission_bundle =
                 arguments.required_path("--mission-bundle-unprotected-reference")?;
-            ensure_state_accepts_normal_operation(&state)?;
-            let mission = UnprotectedReferenceMission::load(&mission_bundle)?;
             let peers = arguments.repeated("--peer")?;
             let peers = peers
                 .iter()
@@ -183,6 +197,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .repeated("--record-interest")?
                 .iter()
                 .map(|value| parse_source_interest(value, "Record"))
+                .collect::<Result<Vec<_>, _>>()?;
+            let blob_interests = arguments
+                .repeated("--blob-interest")?
+                .iter()
+                .map(|value| parse_source_interest(value, "Blob"))
                 .collect::<Result<Vec<_>, _>>()?;
             let run_for = arguments
                 .optional("--run-for")?
@@ -199,18 +218,53 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .map_or(Ok(NodeApplication::Relay), |value| {
                     NodeApplication::parse(&value)
                 })?;
-            arguments.finish()?;
-            run_node(NodeConfig {
+            let controlled_relay_url = arguments.optional_once("--controlled-relay-url")?;
+            let controlled_relay_trust = arguments.optional_once("--controlled-relay-trust")?;
+            let controlled_relay_ca_der = arguments
+                .repeated("--controlled-relay-ca-der")?
+                .into_iter()
+                .map(PathBuf::from)
+                .collect::<Vec<_>>();
+            let controlled_relay_only = arguments.switch("--controlled-relay-only")?;
+            arguments.finish_redacted()?;
+            let controlled_relay = parse_controlled_relay(
+                controlled_relay_url,
+                controlled_relay_trust,
+                controlled_relay_ca_der,
+                controlled_relay_only,
+            )?;
+            ensure_state_accepts_normal_operation(&state)?;
+            let mission = UnprotectedReferenceMission::load(&mission_bundle)?;
+            let config = NodeConfig {
                 state,
                 bind,
                 mission,
                 peers,
-                mutable_interests: MutableSourceInterests::new(state_interests, record_interests),
+                mutable_interests: MutableSourceInterests::new(state_interests, record_interests)
+                    .with_blob(blob_interests),
                 sync_interval: interval,
                 run_for,
                 application,
-            })
-            .await?;
+            };
+            match controlled_relay {
+                Some((relay, true)) => {
+                    run_node_with_forwarding(
+                        config,
+                        SelectedForwardingConfig::default().with_controlled_relay_only(relay),
+                    )
+                    .await?;
+                }
+                Some((relay, false)) => {
+                    run_node_with_forwarding(
+                        config,
+                        SelectedForwardingConfig::default().with_controlled_relay(relay),
+                    )
+                    .await?;
+                }
+                None => {
+                    run_node(config).await?;
+                }
+            }
         }
         "zeroize" => {
             let state = arguments.required_path("--state")?;
@@ -383,6 +437,79 @@ fn parse_rekey_recipients(
     Ok(recipients)
 }
 
+fn parse_controlled_relay(
+    url: Option<String>,
+    trust: Option<String>,
+    ca_paths: Vec<PathBuf>,
+    relay_only: bool,
+) -> Result<Option<(PinnedRelay, bool)>, Box<dyn std::error::Error>> {
+    let Some(url) = url else {
+        if trust.is_some() || !ca_paths.is_empty() || relay_only {
+            return Err(
+                "controlled relay trust, CA roots, and relay-only mode require --controlled-relay-url"
+                    .into(),
+            );
+        }
+        return Ok(None);
+    };
+    let trust = trust.ok_or(
+        "--controlled-relay-url requires explicit --controlled-relay-trust webpki|der-roots",
+    )?;
+    if url.len() > MAX_RELAY_URL_BYTES {
+        return Err(format!("controlled relay URL exceeds {MAX_RELAY_URL_BYTES} bytes").into());
+    }
+    let url = url.parse()?;
+    let relay = match trust.as_str() {
+        "webpki" => {
+            if !ca_paths.is_empty() {
+                return Err(
+                    "--controlled-relay-ca-der is incompatible with webpki relay trust".into(),
+                );
+            }
+            PinnedRelay::new(url)?
+        }
+        "der-roots" => {
+            if ca_paths.is_empty() {
+                return Err(
+                    "der-roots relay trust requires at least one --controlled-relay-ca-der".into(),
+                );
+            }
+            if ca_paths.len() > MAX_RELAY_CA_ROOTS {
+                return Err(format!(
+                    "controlled relay CA root count {} exceeds {MAX_RELAY_CA_ROOTS}",
+                    ca_paths.len()
+                )
+                .into());
+            }
+            let mut roots = Vec::with_capacity(ca_paths.len());
+            let mut total = 0usize;
+            for path in ca_paths {
+                let root = read_regular_bounded(
+                    &path,
+                    u64::try_from(MAX_RELAY_CA_ROOT_BYTES)
+                        .expect("relay CA root byte bound fits u64"),
+                    "controlled relay DER CA root",
+                )?;
+                total = total
+                    .checked_add(root.len())
+                    .ok_or("controlled relay CA root total exceeds the platform address space")?;
+                if total > MAX_RELAY_CA_ROOT_TOTAL_BYTES {
+                    return Err(format!(
+                        "controlled relay CA roots total {total} bytes exceeds {MAX_RELAY_CA_ROOT_TOTAL_BYTES}"
+                    )
+                    .into());
+                }
+                roots.push(root);
+            }
+            PinnedRelay::with_ca_roots(url, roots)?
+        }
+        _ => {
+            return Err("controlled relay trust must be webpki or der-roots".into());
+        }
+    };
+    Ok(Some((relay, relay_only)))
+}
+
 fn parse_source_interest(
     value: &str,
     class: &str,
@@ -415,13 +542,17 @@ fn print_help() {
            aster control-rekey --state DIR \\
              --mission-bundle-unprotected-reference FILE \\
              --signed-public-registry FILE --scope SCOPE --epoch N \\
-             [--minimum-registry-generation N] \\
+             --minimum-registry-generation NONZERO_N \\
              [--route-recipient MISSION_NODE_ID_HEX64 ...] \\
              [--member-recipient MISSION_NODE_ID_HEX64=TOPIC[,TOPIC...] ...]\n\
            aster node --state DIR --bind IP:PORT \\
              --mission-bundle-unprotected-reference FILE \\
              [--peer CARRIER_ID@IP:PORT=MISSION_NODE_ID_HEX64 ...] \\
              [--state-interest TOPIC@SCOPE ...] [--record-interest TOPIC@SCOPE ...] \\
+             [--blob-interest TOPIC@SCOPE ...] \\
+             [--controlled-relay-url HTTPS_URL \\
+              --controlled-relay-trust webpki|der-roots \\
+              [--controlled-relay-ca-der FILE ...] [--controlled-relay-only]] \\
              [--sync-ms N] [--run-for SEC] \
              [--application relay|ping-emitter|epoch2-ping-emitter|pong-responder]\n\
            aster demo --nodes N --root DIR [--base-port PORT] \
@@ -431,12 +562,19 @@ fn print_help() {
          checks. On Unix the explicitly named unprotected-reference bundle requires owner-only\n\
          permissions; unsupported platforms fail closed. It is NOT production-secure at-rest\n\
          provisioning, and the selected Iroh carrier identity is not mission authorization.\n\
+         Controlled relay routing is an explicit single-URL opt-in. WebPKI uses embedded roots;\n\
+         der-roots requires bounded explicit DER CA files. No insecure TLS, hosted lookup, or public\n\
+         relay fallback is enabled. The operator-supplied initial route set is bounded; authenticated\n\
+         Iroh NAT negotiation may add direct paths after connection. --controlled-relay-only disables\n\
+         IP transport. Carrier path and transition fields are bounded observations, never\n\
+         authorization; NAT acceptance remains explicitly unclaimed.\n\
          Authority commands use the existing recipient-filtered aster-core control format and\n\
          reserve/seal/verify/commit controls idempotently before provider activation. Node/demo\n\
          contacts reconcile those mission-wide Flash controls in a distinct lane before carrying\n\
          exact source-sealed Aster objects. Events follow durable application Consume/Carry\n\
-         selectors. Repeatable --state-interest and --record-interest values opt the receiver into\n\
-         exact topic/scope State and Record lanes; an empty class interest means receive-none.\n\
+         selectors. Repeatable --state-interest, --record-interest, and --blob-interest values opt\n\
+         the receiver into exact topic/scope source lanes; an empty class interest means\n\
+         receive-none. Blob source and resumable carrier phases require semantic v5.\n\
          Record ingest retains concurrent revisions and never executes application merge code.\n\
          The demo defaults to the N-instance ping-pong scenario;\n\
          the explicit control scenario requires exactly four role-bound nodes. Concurrent demos\n\
@@ -444,8 +582,9 @@ fn print_help() {
          convenience. Semantic admission\n\
          and application reaction require successful content authentication; payload-blind relays\n\
          retain only bounded route-verified bytes. The put command remains an isolated opaque\n\
-         compatibility lane and is never advertised by Event reconciliation. Finite-TTL remote\n\
-         dissemination remains fail-closed until authenticated cumulative custody age is wired.\n\
+         compatibility lane and is never advertised by Event reconciliation. Semantic v3 binds\n\
+         finite-TTL dissemination to authenticated cumulative custody age, exact source claims,\n\
+         quotas, and final send checks; production finite-TTL clocks are currently Linux-only.\n\
          Zeroize is an irreversible same-UID local operator hook. It durably locks the exact\n\
          state before destroying mission/carrier key contents through retained file descriptors\n\
          and preserves mesh data rows.\n\
@@ -492,6 +631,13 @@ impl Arguments {
         Ok(Some(self.values.remove(index)))
     }
 
+    fn optional_once(&mut self, flag: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
+        if self.values.iter().filter(|value| *value == flag).count() > 1 {
+            return Err(format!("{flag} may be specified at most once").into());
+        }
+        self.optional(flag)
+    }
+
     fn repeated(&mut self, flag: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         let mut output = Vec::new();
         while let Some(value) = self.optional(flag)? {
@@ -500,11 +646,31 @@ impl Arguments {
         Ok(output)
     }
 
+    fn switch(&mut self, flag: &str) -> Result<bool, Box<dyn std::error::Error>> {
+        let matches = self.values.iter().filter(|value| *value == flag).count();
+        if matches > 1 {
+            return Err(format!("{flag} may be specified at most once").into());
+        }
+        let Some(index) = self.values.iter().position(|value| value == flag) else {
+            return Ok(false);
+        };
+        self.values.remove(index);
+        Ok(true)
+    }
+
     fn finish(self) -> Result<(), Box<dyn std::error::Error>> {
         if self.values.is_empty() {
             Ok(())
         } else {
             Err(format!("unexpected arguments: {}", self.values.join(" ")).into())
+        }
+    }
+
+    fn finish_redacted(self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.values.is_empty() {
+            Ok(())
+        } else {
+            Err("unexpected, duplicate, or valueless node argument".into())
         }
     }
 }
@@ -608,6 +774,125 @@ mod tests {
 
         assert!(parse_source_interest("sensors", "Record").is_err());
         assert!(parse_source_interest("sensors@mission@alpha", "Record").is_err());
+    }
+
+    #[test]
+    fn help_advertises_opt_in_semantic_v5_blob_reconciliation() {
+        let source = include_str!("main.rs");
+        assert!(source.contains("[--blob-interest TOPIC@SCOPE ...]"));
+        assert!(source.contains("Blob source and resumable carrier phases require semantic v5."));
+    }
+
+    #[test]
+    fn controlled_relay_flags_are_inseparable_and_trust_is_explicit() {
+        let error = parse_controlled_relay(None, Some("webpki".into()), Vec::new(), false)
+            .expect_err("relay trust without URL must fail");
+        assert!(error.to_string().contains("--controlled-relay-url"));
+
+        let error = parse_controlled_relay(
+            Some("https://relay.example.invalid".into()),
+            None,
+            Vec::new(),
+            false,
+        )
+        .expect_err("relay URL without trust must fail");
+        assert!(error.to_string().contains("--controlled-relay-trust"));
+
+        let error = parse_controlled_relay(
+            Some("https://relay.example.invalid".into()),
+            Some("webpki".into()),
+            vec![PathBuf::from("must-not-be-read.der")],
+            false,
+        )
+        .expect_err("WebPKI plus explicit roots is ambiguous");
+        assert!(error.to_string().contains("incompatible"));
+
+        let secret = "trust-secret-must-not-appear";
+        let error = parse_controlled_relay(
+            Some("https://relay.example.invalid".into()),
+            Some(secret.into()),
+            Vec::new(),
+            false,
+        )
+        .expect_err("unknown relay trust mode must fail without echoing its value");
+        assert!(error.to_string().contains("webpki or der-roots"));
+        assert!(!error.to_string().contains(secret));
+
+        let oversized_secret = "oversized-secret-must-not-appear";
+        let oversized_url = oversized_secret.repeat(
+            MAX_RELAY_URL_BYTES
+                .checked_div(oversized_secret.len())
+                .expect("nonempty secret")
+                + 1,
+        );
+        let error = parse_controlled_relay(
+            Some(oversized_url),
+            Some("webpki".into()),
+            Vec::new(),
+            false,
+        )
+        .expect_err("oversized relay URL must fail before URL parsing");
+        assert!(error.to_string().contains("controlled relay URL exceeds"));
+        assert!(!error.to_string().contains(oversized_secret));
+
+        let (relay, relay_only) = parse_controlled_relay(
+            Some("https://relay.example.invalid".into()),
+            Some("webpki".into()),
+            Vec::new(),
+            true,
+        )
+        .expect("valid bounded WebPKI relay")
+        .expect("configured relay");
+        assert!(relay.ca_roots_der().is_empty());
+        assert!(relay_only);
+    }
+
+    #[test]
+    fn relay_only_switch_rejects_duplicate_ambiguity() {
+        let mut arguments = Arguments::new(
+            ["--controlled-relay-only", "--controlled-relay-only"]
+                .into_iter()
+                .map(str::to_owned),
+        );
+        let error = arguments
+            .switch("--controlled-relay-only")
+            .expect_err("duplicate switch must fail");
+        assert!(error.to_string().contains("at most once"));
+    }
+
+    #[test]
+    fn controlled_relay_value_duplicates_are_rejected_without_echoing_values() {
+        let secret = "https://user:do-not-log@relay.invalid/?token=do-not-log";
+        let mut arguments = Arguments::new(
+            [
+                "--controlled-relay-url",
+                "https://relay.example.invalid",
+                "--controlled-relay-url",
+                secret,
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+        let error = arguments
+            .optional_once("--controlled-relay-url")
+            .expect_err("duplicate relay URL must fail");
+        assert!(error.to_string().contains("at most once"));
+        assert!(!error.to_string().contains("do-not-log"));
+
+        let error = Arguments::new([secret.to_owned()].into_iter())
+            .finish_redacted()
+            .expect_err("unexpected node argument must be redacted");
+        assert!(!error.to_string().contains("do-not-log"));
+    }
+
+    #[test]
+    fn help_advertises_bounded_controlled_relay_without_authority_claims() {
+        let source = include_str!("main.rs");
+        assert!(source.contains("--controlled-relay-trust webpki|der-roots"));
+        assert!(source.contains("[--controlled-relay-ca-der FILE ...]"));
+        assert!(source.contains("operator-supplied initial route set is bounded"));
+        assert!(source.contains("authenticated Iroh NAT negotiation may add direct paths"));
+        assert!(source.contains("NAT acceptance remains explicitly unclaimed"));
     }
 
     #[cfg(unix)]
