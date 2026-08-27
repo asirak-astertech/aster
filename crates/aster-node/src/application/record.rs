@@ -1,15 +1,23 @@
-//! High-level stopped-state surface for source-authenticated Record projections.
+//! High-level live and stopped-state surfaces for source-authenticated Record projections.
 //!
-//! The application handle is deliberately stopped/exclusive. It shares the
-//! exact mission-bound store, control policy, provider, and causal ledger with
-//! the selected Event and State surfaces. A separately running node can
-//! reconcile its durable Record objects through the class-specific Record lane
-//! when the receiver declares an exact source interest. Network ingest never
-//! executes application merge code: conflicts remain explicit until an
-//! application submits a guarded successor that observes the complete sibling
-//! set it inspected.
+//! The cloneable live handle reaches the running node's sole application
+//! authority through its bounded actor. The stopped/exclusive facade shares
+//! the exact mission-bound store, control policy, provider, and causal ledger
+//! with the selected Event and State surfaces. A running node reconciles its
+//! durable Record objects through the class-specific Record lane when the
+//! receiver declares an exact source interest. Network ingest never executes
+//! application merge code: conflicts remain explicit until an application
+//! submits a guarded successor that observes the complete sibling set it
+//! inspected.
 
-use std::{fmt, fs, path::Path, sync::Arc};
+use std::{
+    fmt, fs,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use aster_mesh::{
     CausalStamp, NodeId, Priority, RecordContentVerification, ReferenceEnvelopeSealer,
@@ -21,15 +29,20 @@ use aster_redb_store::{
     RecordSemanticId, RecordSenderProjection, RecordVersionDisposition as StoreRecordDisposition,
     Store, StoredRecord,
 };
+use tokio::sync::{mpsc, oneshot};
 
-use super::{ApplicationError, ApplicationErrorKind, application_error};
+use super::{
+    ApplicationError, ApplicationErrorKind, SelectedApplicationCommand, actor_unavailable,
+    application_error,
+};
 use crate::{
     frame::MAX_OBJECT_BYTES,
     mission::UnprotectedReferenceMission,
     runtime::{
         AuthenticatedEventRouteCache, STORE_FILE, StartupEventVerification,
-        ensure_principal_active, ensure_state_accepts_normal_operation,
-        open_startup_event_verifier_and_cache, refresh_application_policy,
+        cache_authenticated_record_route_claim, ensure_principal_active,
+        ensure_state_accepts_normal_operation, open_startup_event_verifier_and_cache,
+        refresh_application_policy,
     },
 };
 
@@ -236,11 +249,140 @@ struct VerifiedRecordCandidate {
     active: bool,
 }
 
+struct RecordPublicationRouteContext<'a> {
+    store: &'a Store,
+    policy: &'a ControlPolicySnapshot,
+    source_route_cache: &'a AuthenticatedEventRouteCache,
+    verifier: &'a mut ReferenceEnvelopeSealer,
+}
+
+/// Cloneable live Record handle backed by the running node's sole authority.
+#[derive(Clone)]
+pub struct SelectedRecordHandle {
+    commands: mpsc::Sender<SelectedApplicationCommand>,
+    admission: Arc<AtomicBool>,
+    identity: NodeId,
+    mission_authority: NodeId,
+}
+
+impl SelectedRecordHandle {
+    pub(crate) fn new(
+        commands: mpsc::Sender<SelectedApplicationCommand>,
+        admission: Arc<AtomicBool>,
+        identity: NodeId,
+        mission_authority: NodeId,
+    ) -> Self {
+        Self {
+            commands,
+            admission,
+            identity,
+            mission_authority,
+        }
+    }
+
+    /// Authenticated local Record publisher identity.
+    pub const fn identity(&self) -> NodeId {
+        self.identity
+    }
+
+    /// Stable mission authority bound to the live store.
+    pub const fn mission_authority(&self) -> NodeId {
+        self.mission_authority
+    }
+
+    /// Durably publishes one ordinary Record version through the running node actor.
+    pub async fn publish(
+        &self,
+        request: RecordPublishRequest,
+    ) -> Result<RecordPublishResult, ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedRecordCommand::Publish { request, response },
+            received,
+            "record publish",
+        )
+        .await
+    }
+
+    /// Queries one freshly verified Record projection through the running node actor.
+    pub async fn query(&self, query: RecordQuery) -> Result<RecordProjection, ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedRecordCommand::Query { query, response },
+            received,
+            "record query",
+        )
+        .await
+    }
+
+    /// Resolves an inspected conflict through the running node actor.
+    pub async fn resolve(
+        &self,
+        request: RecordResolveRequest,
+    ) -> Result<RecordPublishResult, ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedRecordCommand::Resolve { request, response },
+            received,
+            "record resolve",
+        )
+        .await
+    }
+
+    async fn send<T>(
+        &self,
+        command: SelectedRecordCommand,
+        received: oneshot::Receiver<Result<T, ApplicationError>>,
+        operation: &'static str,
+    ) -> Result<T, ApplicationError> {
+        if !self.admission.load(Ordering::Acquire) {
+            return Err(actor_unavailable(operation));
+        }
+        self.commands
+            .send(SelectedApplicationCommand::Record(command))
+            .await
+            .map_err(|_| actor_unavailable(operation))?;
+        received.await.map_err(|_| actor_unavailable(operation))?
+    }
+}
+
+pub(crate) enum SelectedRecordCommand {
+    Publish {
+        request: RecordPublishRequest,
+        response: oneshot::Sender<Result<RecordPublishResult, ApplicationError>>,
+    },
+    Query {
+        query: RecordQuery,
+        response: oneshot::Sender<Result<RecordProjection, ApplicationError>>,
+    },
+    Resolve {
+        request: RecordResolveRequest,
+        response: oneshot::Sender<Result<RecordPublishResult, ApplicationError>>,
+    },
+}
+
+impl SelectedRecordCommand {
+    pub(crate) fn reject(self) {
+        match self {
+            Self::Publish { response, .. } => {
+                _ = response.send(Err(actor_unavailable("record publish")));
+            }
+            Self::Query { response, .. } => {
+                _ = response.send(Err(actor_unavailable("record query")));
+            }
+            Self::Resolve { response, .. } => {
+                _ = response.send(Err(actor_unavailable("record resolve")));
+            }
+        }
+    }
+}
+
 /// Exclusive stopped-state handle over selected Record projections.
 ///
 /// The handle owns the same process-exclusive mission-bound redb writer as the
-/// Event facade, State facade, and live runtime. Record reconciliation and
-/// automatic merging are deliberately absent from this local slice.
+/// Event facade, State facade, and live runtime. [`SelectedRecordHandle`]
+/// reaches this same composition through the actor; automatic merging remains
+/// deliberately absent.
 pub struct SelectedRecordNode {
     mission: UnprotectedReferenceMission,
     store: Arc<Store>,
@@ -295,6 +437,24 @@ impl SelectedRecordNode {
         };
         selected.current_policy("record open")?;
         Ok(selected)
+    }
+
+    pub(crate) fn from_runtime(
+        mission: UnprotectedReferenceMission,
+        store: Arc<Store>,
+        verifier: ReferenceEnvelopeSealer,
+        historical_verifier: ReferenceEnvelopeSealer,
+        verifier_head: Option<(u64, ControlTransferId)>,
+        source_route_cache: Arc<AuthenticatedEventRouteCache>,
+    ) -> Self {
+        Self {
+            mission,
+            store,
+            verifier,
+            historical_verifier,
+            verifier_head,
+            source_route_cache,
+        }
     }
 
     /// Authenticated local Record publisher identity.
@@ -611,8 +771,12 @@ impl SelectedRecordNode {
             }
         };
         Self::verify_publication_route(
-            &self.store,
-            &mut self.verifier,
+            RecordPublicationRouteContext {
+                store: &self.store,
+                policy,
+                source_route_cache: &self.source_route_cache,
+                verifier: &mut self.verifier,
+            },
             intent,
             payload,
             stored,
@@ -671,8 +835,12 @@ impl SelectedRecordNode {
             ));
         }
         Self::verify_publication_route(
-            &self.store,
-            &mut self.historical_verifier,
+            RecordPublicationRouteContext {
+                store: &self.store,
+                policy,
+                source_route_cache: &self.source_route_cache,
+                verifier: &mut self.historical_verifier,
+            },
             intent,
             payload,
             stored,
@@ -682,14 +850,19 @@ impl SelectedRecordNode {
     }
 
     fn verify_publication_route(
-        store: &Store,
-        verifier: &mut ReferenceEnvelopeSealer,
+        context: RecordPublicationRouteContext<'_>,
         intent: &RecordPublicationIntent,
         payload: &[u8],
         stored: &StoredRecord,
         route: RouteVerifiedRecordEnvelope,
         operation: &'static str,
     ) -> Result<(), ApplicationError> {
+        let RecordPublicationRouteContext {
+            store,
+            policy,
+            source_route_cache,
+            verifier,
+        } = context;
         if route.envelope_id() != *stored.transfer_id.as_bytes()
             || route.item_id() != *stored.semantic_id.as_bytes()
             || route.header() != &stored.header
@@ -735,15 +908,25 @@ impl SelectedRecordNode {
             ));
         }
         match verifier
-            .verify_record_content(route, &stored.sealed)
+            .verify_record_content(route.clone(), &stored.sealed)
             .map_err(|error| application_error(operation, error.into()))?
         {
             RecordContentVerification::ContentVerified {
                 record,
                 payload: opened,
-            } if opened == payload => record
-                .verify_exact_payload(payload)
-                .map_err(|error| application_error(operation, error.into())),
+            } if opened == payload => {
+                record
+                    .verify_exact_payload(payload)
+                    .map_err(|error| application_error(operation, error.into()))?;
+                cache_authenticated_record_route_claim(
+                    store,
+                    policy,
+                    source_route_cache,
+                    verifier,
+                    &route,
+                )
+                .map_err(|error| application_error(operation, error))
+            }
             RecordContentVerification::ContentVerified { .. }
             | RecordContentVerification::RouteOnly(_) => Err(ApplicationError::new(
                 ApplicationErrorKind::Integrity,
@@ -1238,7 +1421,10 @@ mod tests {
     use std::{
         fs,
         path::{Path, PathBuf},
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicU64, Ordering},
+        },
     };
 
     use aster_mesh::{
@@ -1252,6 +1438,70 @@ mod tests {
     use crate::application::{SelectedStateNode, StateQuery};
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+
+    #[tokio::test]
+    async fn live_handle_and_actor_rejection_fail_closed() {
+        let (commands, _receiver) = mpsc::channel(1);
+        let identity = [0x41; 32];
+        let mission_authority = [0x42; 32];
+        let handle = SelectedRecordHandle::new(
+            commands,
+            Arc::new(AtomicBool::new(false)),
+            identity,
+            mission_authority,
+        );
+        let cloned = handle.clone();
+        assert_eq!(cloned.identity(), identity);
+        assert_eq!(cloned.mission_authority(), mission_authority);
+
+        let query = RecordQuery {
+            topic: Topic::new("ops.record").expect("topic"),
+            scope: Scope::new("mission/apps").expect("scope"),
+            logical_key: b"closed".to_vec(),
+            include_superseded_versions: false,
+        };
+        let closed = handle.query(query.clone()).await.expect_err("closed actor");
+        assert_eq!(closed.kind(), ApplicationErrorKind::StateUnavailable);
+        assert_eq!(closed.operation(), "record query");
+
+        let publish = RecordPublishRequest {
+            operation_key: b"closed-publish".to_vec(),
+            topic: query.topic.clone(),
+            scope: query.scope.clone(),
+            priority: Priority::Priority,
+            logical_key: query.logical_key.clone(),
+            payload: b"closed payload".to_vec(),
+            tombstone: false,
+        };
+        let closed = handle
+            .publish(publish.clone())
+            .await
+            .expect_err("closed actor publication");
+        assert_eq!(closed.kind(), ApplicationErrorKind::StateUnavailable);
+        assert_eq!(closed.operation(), "record publish");
+
+        let (response, received) = oneshot::channel();
+        SelectedRecordCommand::Publish {
+            request: publish,
+            response,
+        }
+        .reject();
+        let rejected = received
+            .await
+            .expect("actor publication rejection response")
+            .expect_err("rejected publication command");
+        assert_eq!(rejected.kind(), ApplicationErrorKind::StateUnavailable);
+        assert_eq!(rejected.operation(), "record publish");
+
+        let (response, received) = oneshot::channel();
+        SelectedRecordCommand::Query { query, response }.reject();
+        let rejected = received
+            .await
+            .expect("actor rejection response")
+            .expect_err("rejected command");
+        assert_eq!(rejected.kind(), ApplicationErrorKind::StateUnavailable);
+        assert_eq!(rejected.operation(), "record query");
+    }
 
     struct TestRoot(PathBuf);
 

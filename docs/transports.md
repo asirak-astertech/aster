@@ -23,7 +23,7 @@ durable state, reconciliation, and carrier mechanics have separate owners.
 
 ```mermaid
 flowchart LR
-    App["Application"] --> API["Live Event or stopped data API"]
+    App["Application"] --> API["Live Event/State/Record or stopped data API"]
     API --> Node["aster-node<br/>composition and lifecycle"]
     Authority["Authority input"] --> Node
     Node --> Security["Mission, control, and source verification"]
@@ -47,12 +47,13 @@ State, Record, and Blob state. The sibling depot stores bounded Blob
 ciphertext; redb owns its committed-file markers and publication authority.
 `aster-node` is the only selected composition root.
 
-The selected runtime networks Event, State, and Record. Under semantic v5 it
-also transfers already-durable Blob sources and bounded carrier prefixes
-directly between content-capable peers; Blob application access remains local
-and stopped. The broader semantic implementation remains the migration source
-for behavior that has not yet moved into this composition, and it is retained
-until replacements pass equivalent tests.
+The selected runtime networks Event, State, and Record and exposes cloneable
+live Rust handles for all three through one bounded actor command lane. Under
+semantic v5 it also transfers already-durable Blob sources and bounded carrier
+prefixes directly between content-capable peers; Blob application access
+remains local and stopped. The broader semantic implementation remains the
+migration source for behavior that has not yet moved into this composition, and
+it is retained until replacements pass equivalent tests.
 
 ## Capability boundary
 
@@ -60,7 +61,7 @@ until replacements pass equivalent tests.
 |---|---|---|
 | Selected direct Iroh | Manually admitted exact endpoint ID and socket, authenticated direct UDP/QUIC, and bounded exchange | A retained one-host cone software-namespace cell observed Direct and exact Event delivery across two NAT routers with static operator-known mappings. Carrier authentication is not mission or control/source authorization; discovery/punching, dynamic or representative NAT, physical-network acceptance, and multi-carrier failover remain open. |
 | Selected controlled Iroh relay | One operator-pinned HTTPS relay with explicit trust, either alongside the initial direct locator or with IP disabled | A retained one-host restrictive software-namespace cell blocked direct traffic, observed Relay, and delivered one exact Event through the controlled relay. It is not a temporal direct-first/fallback chronology, representative or physical NAT, public or independently operated relay, an Aster payload-blind relay, State/Record/Blob-over-relay acceptance, or release authorization. |
-| Selected node and CLI | Networked Event and State/Record reconciliation, semantic-v5 direct Blob source/carrier transfer, live Event API, stopped State/Record/Blob APIs, payload-blind Event relay, restart/idempotency, and bounded Unix zeroization | Reference provisioning, no live State/Record/Blob APIs, no route-only Blob relay/custody, no Blob-over-controlled-relay acceptance, finite State/Record/Blob TTL and non-Linux finite Event custody, generalized control administration, or production authorization |
+| Selected node and CLI | Networked Event and State/Record reconciliation, semantic-v5 direct Blob source/carrier transfer, live Event/State/Record Rust APIs, stopped Event/State/Record/Blob facades, payload-blind Event relay, restart/idempotency, and bounded Unix zeroization | Reference provisioning, no live Blob API, no State/Record subscriptions or selected-node language bindings, no route-only Blob relay/custody, no Blob-over-controlled-relay acceptance, finite State/Record/Blob TTL and non-Linux finite Event custody, generalized control administration, or production authorization |
 | Current semantic in-memory link | Full high-level host contact, authentication, reconciliation, resume, and failure tests | It is a test carrier and is not wired to the selected composition |
 | Current semantic UDP/IP | Nonblocking link, manual endpoint mapping, protected local discovery, rendezvous helpers, opaque relay components | Migration onto the selected node; full host acceptance on physical or operational networks |
 | Current semantic NAT/rendezvous and relay | Bounded rendezvous, endpoint-punching, and opaque-relay helpers with local software tests | Selected-node integration and a two-device representative-NAT direct/fallback result |
@@ -152,14 +153,22 @@ route grants remain an upper bound on inventory and Offer; the receiver's
 mission-protected canonical Consume/Carry interest narrows each direction
 further, and empty interest means receive-none. Content grants gate semantic
 acceptance and reaction; revoked mission principals fail closed.
-The live selected Event handle composes high-level operations and bounded
-authenticated last-contact status with this path. `LastContactComplete` reports
-only the most recent bounded negotiation with each active configured peer; it
-does not assert global convergence. Live State/Record/Blob application handles,
-route-only Blob relay/custody, Blob-over-controlled-relay acceptance,
-generalized control administration, repeated multi-scope lifecycle, finite
-State/Record/Blob TTL, non-Linux finite Event custody, and protected provisioning
-remain to be composed.
+The live selected Event, State, and Record handles compose high-level operations
+with this path through the running actor's shared bounded command lane. Event's
+`LastContactComplete` reports only the most recent bounded negotiation with each
+active configured peer; it does not assert State/Record or global convergence.
+A [retained bounded receipt](implementation/evidence/selected-live-mutable-2ccfba0.json)
+publishes State and conflicting Record revisions while peerless, later
+reconciles them over direct loopback Iroh, queries both peers through live
+handles, and resolves/retries the guarded Record conflict across restart. Its
+four direct `CONTACT` records are paired and account for 5/5/5 selected-item
+offer/fetch/insert totals with zero Event/control/Blob counters. This is
+same-implementation one-host evidence, not physical, NAT/relay, BTLE, scale,
+resource, mixed-implementation, or release acceptance. A live Blob handle,
+State/Record subscriptions and selected-node bindings, route-only Blob
+relay/custody, Blob-over-controlled-relay acceptance, generalized control
+administration, repeated multi-scope lifecycle, finite State/Record/Blob TTL,
+non-Linux finite Event custody, and protected provisioning remain to be composed.
 The mission bundle is owner-only on Unix but explicitly unprotected-reference
 at rest; other platforms fail closed because that owner-only contract cannot be
 verified.

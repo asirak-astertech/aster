@@ -29,13 +29,28 @@ deployment contract.
 ## Selected production-lane boundary
 
 The recipes below use the broader semantic language bindings. The selected
-`aster-node` application boundary is deliberately different: Event has live and
-stopped Rust handles; State and Record have exclusive stopped Rust handles but
-their already durable objects reconcile over protected semantic-v4/v5 contacts;
-Blob also has a stopped Rust facade, while semantic v5 separately transfers its
+`aster-node` application boundary is deliberately different: Event, State, and
+Record have cloneable live Rust handles backed by the running actor; all three
+also retain exclusive stopped Rust facades. State and Record live commands
+share Event's bounded actor lane and the same mission-bound store authority,
+while their objects reconcile over protected semantic-v4/v5 contacts. Blob has
+only a stopped Rust facade, while semantic v5 separately transfers its
 already-durable objects directly between current content-capable peers. The
 selected handshake offers `[5, 4, 3, 2, 1]`. Event keeps v1-v5 compatibility;
 v1-v3 contain no State/Record mechanics and v1-v4 emit zero Blob frames.
+
+`RunningNode::selected_state()` exposes async `publish` and `query`;
+`RunningNode::selected_records()` exposes async `publish`, `query`, and guarded
+`resolve`. Clones use one bounded Event/State/Record command queue rather than
+opening another writer. Graceful shutdown and live zeroization close admission,
+so retained handles fail with sanitized `StateUnavailable`. Durable
+State/Record subscriptions, ConnectRPC/C/Go/Python selected-node bindings,
+finite TTL, live Blob access, and representative physical/mixed-implementation
+acceptance remain open. A
+[retained bounded live-path receipt](implementation/evidence/selected-live-mutable-2ccfba0.json)
+covers peerless State/Record publication, direct convergence, conflict
+resolution, restart, and closed-handle behavior on one same-implementation
+loopback host; it is not representative or release acceptance.
 
 Selected State/Record lanes are separated by class and receiver direction. They
 use Offer `MutableApplyResult`, Fetch `MutableFetchResult` plus required

@@ -287,3 +287,43 @@ The v5 lane is direct content-capable only, source-before-carrier, bounded to
 visibility. Route-only Blob relay/custody, TTL/GC, pure-byte deduplication,
 large/RSS/physical/mixed/release acceptance, and selected-node language
 bindings remain outside the public boundary.
+
+## Live State/Record application and retained acceptance amendment (2026-08-26)
+
+This amendment supersedes the earlier present-tense statements that selected
+State and Record have no live application handle or retained live-path receipt.
+Those statements remain above as the dated boundaries of the stopped and
+network-mechanics slices; they are not descriptions of the current composition.
+
+`RunningNode::selected_state()` now returns a cloneable `SelectedStateHandle`,
+and `RunningNode::selected_records()` returns a cloneable
+`SelectedRecordHandle`. Publish, query, and guarded Record resolution commands
+share the running actor's one bounded Event/State/Record lane and its sole
+mission-bound store/policy authority. Clones do not open a writer. Graceful
+shutdown and live zeroization close admission before authority release, and
+retained handles fail with sanitized `StateUnavailable`. The exclusive stopped
+facades remain available only while no live actor owns the store.
+
+The [retained canonical receipt](../implementation/evidence/selected-live-mutable-2ccfba0.json)
+is 5,660 bytes with SHA-256
+`299a3c3b8d1685deb5980ed091797f7d46119562b67c3d853b94d8552c83b67a`
+and binds the execution to good-signature source commit `2ccfba0`. Two distinct
+participants publish State and Record while peerless, then run four paired
+direct `CONTACT` records with exact aggregate 5/5/5 selected-item
+offer/fetch/insert accounting. The six actor lifetimes never exceed two
+concurrent actors. State preserves the max-ID-current/other-concurrent projection
+across restart. Record preserves two siblings, rejects an ordinary
+conflict-collapsing publish, resolves under the exact guard, supersedes both
+originals, retries without insertion, and preserves the result across restart.
+Six graceful shutdowns and four closed retained handles pass; Event, control,
+and Blob counters remain zero.
+
+This is bounded one-host, same-implementation loopback evidence. The
+source-to-execution link is operator-attested, not cryptographically proven or
+reproducible, and the participant secret artifacts are inspected by metadata
+only. The amendment does not claim physical hosts, NAT or Internet operation,
+controlled/public relay, BTLE, independent interoperability, scale beyond two,
+resource thresholds, long-duration operation, live Event or Blob application
+acceptance, or release authorization. State/Record durable subscriptions,
+selected-node bindings, finite TTL/forwarding age, relay/multi-hop acceptance,
+expiry, garbage collection, and automatic Record merge remain open.

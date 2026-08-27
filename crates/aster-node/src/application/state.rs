@@ -1,12 +1,20 @@
-//! High-level stopped-state surface for source-authenticated State projections.
+//! High-level live and stopped-state surfaces for source-authenticated State projections.
 //!
-//! The application handle is intentionally stopped/exclusive. It shares the
-//! mission-bound store, control policy, source-envelope provider, and causal
-//! ledger with the selected Event surface. A separately running node can
-//! reconcile its durable State objects through the class-specific State lane
-//! when the receiver declares an exact source interest.
+//! The cloneable live handle reaches the running node's sole application
+//! authority through its bounded actor. The stopped/exclusive facade shares
+//! the mission-bound store, control policy, source-envelope provider, and
+//! causal ledger with the selected Event surface. A running node reconciles
+//! its durable State objects through the class-specific State lane when the
+//! receiver declares an exact source interest.
 
-use std::{fmt, fs, path::Path, sync::Arc};
+use std::{
+    fmt, fs,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use aster_mesh::{
     CausalStamp, NodeId, Priority, ReferenceEnvelopeSealer, RouteVerifiedStateEnvelope, Scope,
@@ -17,15 +25,20 @@ use aster_redb_store::{
     StateProjectionPlan, StatePublicationIntent, StateSemanticId, StateSenderProjection,
     StateVersionDisposition as StoreStateDisposition, Store, StoredState,
 };
+use tokio::sync::{mpsc, oneshot};
 
-use super::{ApplicationError, ApplicationErrorKind, application_error};
+use super::{
+    ApplicationError, ApplicationErrorKind, SelectedApplicationCommand, actor_unavailable,
+    application_error,
+};
 use crate::{
     frame::MAX_OBJECT_BYTES,
     mission::UnprotectedReferenceMission,
     runtime::{
         AuthenticatedEventRouteCache, STORE_FILE, StartupEventVerification,
-        ensure_principal_active, ensure_state_accepts_normal_operation,
-        open_startup_event_verifier_and_cache, refresh_application_policy,
+        cache_authenticated_state_route_claim, ensure_principal_active,
+        ensure_state_accepts_normal_operation, open_startup_event_verifier_and_cache,
+        refresh_application_policy,
     },
 };
 
@@ -149,13 +162,120 @@ struct VerifiedStateCandidate {
     active: bool,
 }
 
+struct StatePublicationRouteContext<'a> {
+    store: &'a Store,
+    policy: &'a ControlPolicySnapshot,
+    source_route_cache: &'a AuthenticatedEventRouteCache,
+    verifier: &'a mut ReferenceEnvelopeSealer,
+}
+
+/// Cloneable live State handle backed by the running node's sole authority.
+#[derive(Clone)]
+pub struct SelectedStateHandle {
+    commands: mpsc::Sender<SelectedApplicationCommand>,
+    admission: Arc<AtomicBool>,
+    identity: NodeId,
+    mission_authority: NodeId,
+}
+
+impl SelectedStateHandle {
+    pub(crate) fn new(
+        commands: mpsc::Sender<SelectedApplicationCommand>,
+        admission: Arc<AtomicBool>,
+        identity: NodeId,
+        mission_authority: NodeId,
+    ) -> Self {
+        Self {
+            commands,
+            admission,
+            identity,
+            mission_authority,
+        }
+    }
+
+    /// Authenticated local State publisher identity.
+    pub const fn identity(&self) -> NodeId {
+        self.identity
+    }
+
+    /// Stable mission authority bound to the live store.
+    pub const fn mission_authority(&self) -> NodeId {
+        self.mission_authority
+    }
+
+    /// Durably publishes one State version through the running node actor.
+    pub async fn publish(
+        &self,
+        request: StatePublishRequest,
+    ) -> Result<StatePublishResult, ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedStateCommand::Publish { request, response },
+            received,
+            "state publish",
+        )
+        .await
+    }
+
+    /// Queries one freshly verified State projection through the running node actor.
+    pub async fn query(&self, query: StateQuery) -> Result<StateProjection, ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedStateCommand::Query { query, response },
+            received,
+            "state query",
+        )
+        .await
+    }
+
+    async fn send<T>(
+        &self,
+        command: SelectedStateCommand,
+        received: oneshot::Receiver<Result<T, ApplicationError>>,
+        operation: &'static str,
+    ) -> Result<T, ApplicationError> {
+        if !self.admission.load(Ordering::Acquire) {
+            return Err(actor_unavailable(operation));
+        }
+        self.commands
+            .send(SelectedApplicationCommand::State(command))
+            .await
+            .map_err(|_| actor_unavailable(operation))?;
+        received.await.map_err(|_| actor_unavailable(operation))?
+    }
+}
+
+pub(crate) enum SelectedStateCommand {
+    Publish {
+        request: StatePublishRequest,
+        response: oneshot::Sender<Result<StatePublishResult, ApplicationError>>,
+    },
+    Query {
+        query: StateQuery,
+        response: oneshot::Sender<Result<StateProjection, ApplicationError>>,
+    },
+}
+
+impl SelectedStateCommand {
+    pub(crate) fn reject(self) {
+        match self {
+            Self::Publish { response, .. } => {
+                _ = response.send(Err(actor_unavailable("state publish")));
+            }
+            Self::Query { response, .. } => {
+                _ = response.send(Err(actor_unavailable("state query")));
+            }
+        }
+    }
+}
+
 /// Exclusive stopped-state handle over the selected State projection.
 ///
 /// The handle takes the same process-exclusive mission-bound redb writer as
 /// the Event facade and live runtime. It therefore cannot observe or mutate
 /// around their policy snapshots. Stop this handle before running the network
-/// actor; the actor can then reconcile these durable State objects without
-/// exposing a live State application handle.
+/// actor; [`SelectedStateHandle`] then reaches the same composition through
+/// that actor.
 pub struct SelectedStateNode {
     mission: UnprotectedReferenceMission,
     store: Arc<Store>,
@@ -209,6 +329,24 @@ impl SelectedStateNode {
         };
         selected.current_policy("state open")?;
         Ok(selected)
+    }
+
+    pub(crate) fn from_runtime(
+        mission: UnprotectedReferenceMission,
+        store: Arc<Store>,
+        verifier: ReferenceEnvelopeSealer,
+        historical_verifier: ReferenceEnvelopeSealer,
+        verifier_head: Option<(u64, ControlTransferId)>,
+        source_route_cache: Arc<AuthenticatedEventRouteCache>,
+    ) -> Self {
+        Self {
+            mission,
+            store,
+            verifier,
+            historical_verifier,
+            verifier_head,
+            source_route_cache,
+        }
     }
 
     /// Authenticated local State publisher identity.
@@ -360,8 +498,12 @@ impl SelectedStateNode {
             }
         };
         Self::verify_publication_route(
-            &self.store,
-            &mut self.verifier,
+            StatePublicationRouteContext {
+                store: &self.store,
+                policy,
+                source_route_cache: &self.source_route_cache,
+                verifier: &mut self.verifier,
+            },
             intent,
             payload,
             stored,
@@ -420,8 +562,12 @@ impl SelectedStateNode {
             ));
         }
         Self::verify_publication_route(
-            &self.store,
-            &mut self.historical_verifier,
+            StatePublicationRouteContext {
+                store: &self.store,
+                policy,
+                source_route_cache: &self.source_route_cache,
+                verifier: &mut self.historical_verifier,
+            },
             intent,
             payload,
             stored,
@@ -430,13 +576,18 @@ impl SelectedStateNode {
     }
 
     fn verify_publication_route(
-        store: &Store,
-        verifier: &mut ReferenceEnvelopeSealer,
+        context: StatePublicationRouteContext<'_>,
         intent: &StatePublicationIntent,
         payload: &[u8],
         stored: &StoredState,
         route: RouteVerifiedStateEnvelope,
     ) -> Result<(), ApplicationError> {
+        let StatePublicationRouteContext {
+            store,
+            policy,
+            source_route_cache,
+            verifier,
+        } = context;
         if route.envelope_id() != *stored.transfer_id.as_bytes()
             || route.item_id() != *stored.semantic_id.as_bytes()
             || route.header() != &stored.header
@@ -482,15 +633,25 @@ impl SelectedStateNode {
             ));
         }
         match verifier
-            .verify_state_content(route, &stored.sealed)
+            .verify_state_content(route.clone(), &stored.sealed)
             .map_err(|error| application_error("state publish", error.into()))?
         {
             StateContentVerification::ContentVerified {
                 state,
                 payload: opened,
-            } if opened == payload => state
-                .verify_exact_payload(payload)
-                .map_err(|error| application_error("state publish", error.into())),
+            } if opened == payload => {
+                state
+                    .verify_exact_payload(payload)
+                    .map_err(|error| application_error("state publish", error.into()))?;
+                cache_authenticated_state_route_claim(
+                    store,
+                    policy,
+                    source_route_cache,
+                    verifier,
+                    &route,
+                )
+                .map_err(|error| application_error("state publish", error))
+            }
             StateContentVerification::ContentVerified { .. }
             | StateContentVerification::RouteOnly(_) => Err(ApplicationError::new(
                 ApplicationErrorKind::Integrity,
@@ -884,7 +1045,10 @@ mod tests {
     use std::{
         fs,
         path::{Path, PathBuf},
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicU64, Ordering},
+        },
     };
 
     use aster_mesh::{
@@ -895,6 +1059,70 @@ mod tests {
     use crate::application::{EventPublishRequest, EventQuery, SelectedEventNode};
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+
+    #[tokio::test]
+    async fn live_handle_and_actor_rejection_fail_closed() {
+        let (commands, _receiver) = mpsc::channel(1);
+        let identity = [0x31; 32];
+        let mission_authority = [0x32; 32];
+        let handle = SelectedStateHandle::new(
+            commands,
+            Arc::new(AtomicBool::new(false)),
+            identity,
+            mission_authority,
+        );
+        let cloned = handle.clone();
+        assert_eq!(cloned.identity(), identity);
+        assert_eq!(cloned.mission_authority(), mission_authority);
+
+        let query = StateQuery {
+            topic: Topic::new("ops.state").expect("topic"),
+            scope: Scope::new("mission/apps").expect("scope"),
+            logical_key: b"closed".to_vec(),
+            include_recoverable_versions: false,
+        };
+        let closed = handle.query(query.clone()).await.expect_err("closed actor");
+        assert_eq!(closed.kind(), ApplicationErrorKind::StateUnavailable);
+        assert_eq!(closed.operation(), "state query");
+
+        let publish = StatePublishRequest {
+            operation_key: b"closed-publish".to_vec(),
+            topic: query.topic.clone(),
+            scope: query.scope.clone(),
+            priority: Priority::Priority,
+            logical_key: query.logical_key.clone(),
+            payload: b"closed payload".to_vec(),
+            tombstone: false,
+        };
+        let closed = handle
+            .publish(publish.clone())
+            .await
+            .expect_err("closed actor publication");
+        assert_eq!(closed.kind(), ApplicationErrorKind::StateUnavailable);
+        assert_eq!(closed.operation(), "state publish");
+
+        let (response, received) = oneshot::channel();
+        SelectedStateCommand::Publish {
+            request: publish,
+            response,
+        }
+        .reject();
+        let rejected = received
+            .await
+            .expect("actor publication rejection response")
+            .expect_err("rejected publication command");
+        assert_eq!(rejected.kind(), ApplicationErrorKind::StateUnavailable);
+        assert_eq!(rejected.operation(), "state publish");
+
+        let (response, received) = oneshot::channel();
+        SelectedStateCommand::Query { query, response }.reject();
+        let rejected = received
+            .await
+            .expect("actor rejection response")
+            .expect_err("rejected command");
+        assert_eq!(rejected.kind(), ApplicationErrorKind::StateUnavailable);
+        assert_eq!(rejected.operation(), "state query");
+    }
 
     struct TestRoot(PathBuf);
 
