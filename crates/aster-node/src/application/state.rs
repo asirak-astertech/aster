@@ -1,11 +1,16 @@
 //! High-level live and stopped-state surfaces for source-authenticated State projections.
 //!
 //! The cloneable live handle reaches the running node's sole application
-//! authority through its bounded actor. The stopped/exclusive facade shares
-//! the mission-bound store, control policy, source-envelope provider, and
-//! causal ledger with the selected Event surface. A running node reconciles
-//! its durable State objects through the class-specific State lane when the
-//! receiver declares an exact source interest.
+//! authority through its bounded actor. Both surfaces publish and query State,
+//! and expose a durable at-least-once positive-current-version queue. The queue
+//! is not a materialized projection feed and emits no synthetic withdrawal when
+//! authorization leaves an exact key without a visible current version. The
+//! stopped/exclusive facade shares the mission-bound store,
+//! control policy, source-envelope provider, and causal ledger with the selected
+//! Event surface. A running node reconciles durable State objects through the
+//! class-specific State lane when its configured receive policy declares a
+//! matching source interest; application subscriptions do not replace that
+//! network policy in this slice.
 
 use std::{
     fmt, fs,
@@ -21,9 +26,13 @@ use aster_mesh::{
     StateContentVerification, Topic,
 };
 use aster_redb_store::{
-    ControlPolicySnapshot, ControlTransferId, StateOperationKey, StateOperationRequest,
+    ControlPolicySnapshot, ControlTransferId, MAX_STATE_POLL_DELIVERIES,
+    MAX_STATE_SUBSCRIPTION_SCAN, StateDeliveryAck as StoreStateDeliveryAck,
+    StateDeliveryToken as StoreStateDeliveryToken, StateOperationKey, StateOperationRequest,
     StateProjectionPlan, StatePublicationIntent, StateSemanticId, StateSenderProjection,
-    StateVersionDisposition as StoreStateDisposition, Store, StoredState,
+    StateSubscriptionId as StoreStateSubscriptionId, StateSubscriptionKey,
+    StateSubscriptionPollSelection, StateSubscriptionRemoveOutcome, StateSubscriptionSpec,
+    StateVersionDisposition as StoreStateDisposition, Store, StoreError, StoredState,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -42,6 +51,17 @@ use crate::{
     },
 };
 
+/// Maximum number of projected State heads returned by one poll.
+pub const MAX_SELECTED_STATE_DELIVERIES: usize = MAX_STATE_POLL_DELIVERIES;
+
+/// Maximum retained State candidates freshly authenticated by one poll.
+pub const MAX_SELECTED_STATE_SUBSCRIPTION_SCAN: usize = MAX_STATE_SUBSCRIPTION_SCAN;
+
+/// Canonical byte length of an opaque [`StateDeliveryToken`].
+pub const STATE_DELIVERY_TOKEN_BYTES: usize = aster_redb_store::STATE_DELIVERY_TOKEN_BYTES;
+
+const MAX_SELECTED_STATE_PLAN_RETRIES: usize = 4;
+
 /// Source-authenticated semantic identity of one State version.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct StateId([u8; 32]);
@@ -59,6 +79,10 @@ impl StateId {
 
     fn from_store(id: StateSemanticId) -> Self {
         Self(*id.as_bytes())
+    }
+
+    fn into_store(self) -> StateSemanticId {
+        StateSemanticId::new(self.0)
     }
 }
 
@@ -153,6 +177,177 @@ pub struct StateProjection {
     pub recoverable: Vec<StateItem>,
 }
 
+/// Stable mission-local identity of one durable State subscription.
+///
+/// This local ledger identity grants no route or content authority. The
+/// selected node intersects its receive intent with current mission policy and
+/// freshly authenticates every State candidate before delivery.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct StateSubscriptionId([u8; 32]);
+
+impl StateSubscriptionId {
+    /// Constructs an identifier from its complete durable bytes.
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the complete durable identifier bytes.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    fn from_store(id: StoreStateSubscriptionId) -> Self {
+        Self(*id.as_bytes())
+    }
+
+    fn into_store(self) -> StoreStateSubscriptionId {
+        StoreStateSubscriptionId::from_bytes(self.0)
+    }
+}
+
+impl fmt::Display for StateSubscriptionId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Idempotent creation request for one durable positive-current-version subscription.
+///
+/// The selector covers every logical key in the selected topic and scope.
+/// Descendant scopes remain distinct projection groups. Subscription intent
+/// cannot expand current route or content authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StateSubscriptionRequest {
+    pub operation_key: Vec<u8>,
+    pub topic: Topic,
+    pub scope: Scope,
+    pub include_descendant_scopes: bool,
+}
+
+/// Result of creating or replaying one durable State subscription request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StateSubscription {
+    pub id: StateSubscriptionId,
+    pub inserted: bool,
+}
+
+/// One bounded at-least-once positive-current-version delivery poll.
+///
+/// `scan_limit` bounds the complete matching retained candidate set freshly
+/// authenticated by one poll. Poll fails closed when that full projection
+/// snapshot exceeds the bound; it never advances through a partial candidate
+/// set. `has_more` reports additional verified, unacknowledged current heads
+/// beyond `delivery_limit`. An empty result is not a Current-to-None withdrawal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StatePollRequest {
+    pub subscription: StateSubscriptionId,
+    pub delivery_limit: usize,
+    pub scan_limit: usize,
+}
+
+impl StatePollRequest {
+    fn validate(self) -> Result<Self, ApplicationError> {
+        if self.delivery_limit == 0
+            || self.delivery_limit > MAX_SELECTED_STATE_DELIVERIES
+            || self.scan_limit == 0
+            || self.scan_limit > MAX_SELECTED_STATE_SUBSCRIPTION_SCAN
+        {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::InvalidRequest,
+                "state poll",
+            ));
+        }
+        Ok(self)
+    }
+}
+
+/// Opaque acknowledgement identity for one exact State delivery tenure and retry.
+///
+/// Tokens originate in [`StateDelivery`] and may be restored from their
+/// canonical bytes. They bind the subscription incarnation, State identity,
+/// current tenure, and issued retry so a delayed acknowledgement cannot consume
+/// later work.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct StateDeliveryToken(StoreStateDeliveryToken);
+
+impl StateDeliveryToken {
+    /// Restores a canonical opaque token previously obtained from [`Self::as_bytes`].
+    ///
+    /// A structurally valid token is still accepted only when acknowledgement
+    /// verifies its exact subscription and State binding.
+    pub fn from_bytes(bytes: [u8; STATE_DELIVERY_TOKEN_BYTES]) -> Result<Self, ApplicationError> {
+        StoreStateDeliveryToken::from_bytes(bytes)
+            .map(Self::from_store)
+            .map_err(|_| {
+                ApplicationError::new(ApplicationErrorKind::InvalidRequest, "state delivery token")
+            })
+    }
+
+    /// Returns the canonical opaque bytes for durable application transport.
+    pub fn as_bytes(&self) -> &[u8; STATE_DELIVERY_TOKEN_BYTES] {
+        self.0.as_bytes()
+    }
+
+    fn from_store(token: StoreStateDeliveryToken) -> Self {
+        Self(token)
+    }
+
+    fn into_store(self) -> StoreStateDeliveryToken {
+        self.0
+    }
+
+    #[cfg(test)]
+    fn inert_for_command_rejection() -> Self {
+        let mut bytes = [0_u8; STATE_DELIVERY_TOKEN_BYTES];
+        bytes[0] = 1;
+        bytes[8] = 1;
+        bytes[16] = 1;
+        bytes[24] = 1;
+        Self::from_bytes(bytes).expect("canonical inert delivery token")
+    }
+}
+
+/// One positive current State version whose retry was committed before return.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StateDelivery {
+    /// Freshly authenticated deterministic current head for one exact key.
+    pub state: StateItem,
+    /// Nonzero durable at-least-once attempt number.
+    pub attempt: u64,
+    /// Exact opaque token required to acknowledge this delivery.
+    pub token: StateDeliveryToken,
+}
+
+/// Bounded positive-current-version delivery result.
+///
+/// An empty page means there is no unacknowledged positive Current version. It
+/// is not a complete projection snapshot and does not signal that a previously
+/// authorized current value was withdrawn.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StateDeliveryPage {
+    pub deliveries: Vec<StateDelivery>,
+    pub has_more: bool,
+}
+
+/// Idempotent acknowledgement disposition for one projected State head.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StateAcknowledgement {
+    Acknowledged,
+    AlreadyAcknowledged,
+}
+
+/// Idempotent disposition from withdrawing one durable State selector.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StateUnsubscribe {
+    /// This call removed the selector and its delivery ledger.
+    Removed,
+    /// The exact selector was already absent.
+    AlreadyAbsent,
+}
+
 struct VerifiedStateCandidate {
     id: StateId,
     item: Option<StateItem>,
@@ -160,6 +355,21 @@ struct VerifiedStateCandidate {
     store_disposition: Option<StoreStateDisposition>,
     policy_active: bool,
     active: bool,
+}
+
+struct VerifiedStateSubscriptionCandidate {
+    id: StateId,
+    stored: StoredState,
+    item: Option<StateItem>,
+    stamp: CausalStamp,
+    active: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StateSubscriptionCandidateDisposition {
+    Current,
+    Noncurrent,
+    Inactive,
 }
 
 struct StatePublicationRouteContext<'a> {
@@ -228,6 +438,72 @@ impl SelectedStateHandle {
         .await
     }
 
+    /// Idempotently creates one durable projected-State delivery subscription.
+    pub async fn subscribe(
+        &self,
+        request: StateSubscriptionRequest,
+    ) -> Result<StateSubscription, ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedStateCommand::Subscribe { request, response },
+            received,
+            "state subscribe",
+        )
+        .await
+    }
+
+    /// Polls freshly authenticated positive Current versions with at-least-once delivery.
+    pub async fn poll(
+        &self,
+        request: StatePollRequest,
+    ) -> Result<StateDeliveryPage, ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedStateCommand::Poll { request, response },
+            received,
+            "state poll",
+        )
+        .await
+    }
+
+    /// Idempotently acknowledges one exact token-bound State delivery.
+    pub async fn acknowledge(
+        &self,
+        subscription: StateSubscriptionId,
+        state: StateId,
+        token: StateDeliveryToken,
+    ) -> Result<StateAcknowledgement, ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedStateCommand::Acknowledge {
+                subscription,
+                state,
+                token,
+                response,
+            },
+            received,
+            "state acknowledge",
+        )
+        .await
+    }
+
+    /// Idempotently removes one State selector and its delivery ledger.
+    pub async fn unsubscribe(
+        &self,
+        subscription: StateSubscriptionId,
+    ) -> Result<StateUnsubscribe, ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedStateCommand::Unsubscribe {
+                subscription,
+                response,
+            },
+            received,
+            "state unsubscribe",
+        )
+        .await
+    }
+
     async fn send<T>(
         &self,
         command: SelectedStateCommand,
@@ -254,9 +530,31 @@ pub(crate) enum SelectedStateCommand {
         query: StateQuery,
         response: oneshot::Sender<Result<StateProjection, ApplicationError>>,
     },
+    Subscribe {
+        request: StateSubscriptionRequest,
+        response: oneshot::Sender<Result<StateSubscription, ApplicationError>>,
+    },
+    Poll {
+        request: StatePollRequest,
+        response: oneshot::Sender<Result<StateDeliveryPage, ApplicationError>>,
+    },
+    Acknowledge {
+        subscription: StateSubscriptionId,
+        state: StateId,
+        token: StateDeliveryToken,
+        response: oneshot::Sender<Result<StateAcknowledgement, ApplicationError>>,
+    },
+    Unsubscribe {
+        subscription: StateSubscriptionId,
+        response: oneshot::Sender<Result<StateUnsubscribe, ApplicationError>>,
+    },
 }
 
 impl SelectedStateCommand {
+    pub(crate) const fn mutates_selectors(&self) -> bool {
+        matches!(self, Self::Subscribe { .. } | Self::Unsubscribe { .. })
+    }
+
     pub(crate) fn reject(self) {
         match self {
             Self::Publish { response, .. } => {
@@ -264,6 +562,18 @@ impl SelectedStateCommand {
             }
             Self::Query { response, .. } => {
                 _ = response.send(Err(actor_unavailable("state query")));
+            }
+            Self::Subscribe { response, .. } => {
+                _ = response.send(Err(actor_unavailable("state subscribe")));
+            }
+            Self::Poll { response, .. } => {
+                _ = response.send(Err(actor_unavailable("state poll")));
+            }
+            Self::Acknowledge { response, .. } => {
+                _ = response.send(Err(actor_unavailable("state acknowledge")));
+            }
+            Self::Unsubscribe { response, .. } => {
+                _ = response.send(Err(actor_unavailable("state unsubscribe")));
             }
         }
     }
@@ -658,6 +968,324 @@ impl SelectedStateNode {
                 "state publish",
             )),
         }
+    }
+
+    /// Idempotently creates one durable projected-State delivery subscription.
+    ///
+    /// The selector covers all logical keys in the selected topic/scope. It is
+    /// local application-delivery intent only; configured mutable interests
+    /// remain the network receive policy in this slice.
+    pub fn subscribe(
+        &mut self,
+        request: StateSubscriptionRequest,
+    ) -> Result<StateSubscription, ApplicationError> {
+        let StateSubscriptionRequest {
+            operation_key,
+            topic,
+            scope,
+            include_descendant_scopes,
+        } = request;
+        let key = StateSubscriptionKey::new(operation_key)
+            .map_err(|error| application_error("state subscribe", error.into()))?;
+        let policy = self.current_policy("state subscribe")?;
+        let epoch = self
+            .store
+            .active_scope_epoch(&scope)
+            .map_err(|error| application_error("state subscribe", error.into()))?
+            .map_or(1, |(epoch, _)| epoch);
+        if !self.verifier.can_route_state(&scope, epoch)
+            || !self.verifier.can_open_state_content(&scope, &topic, epoch)
+        {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::RequestRejected,
+                "state subscribe",
+            ));
+        }
+        let outcome = self
+            .store
+            .create_state_subscription_with_policy(
+                &policy,
+                &key,
+                StateSubscriptionSpec {
+                    topic,
+                    scope,
+                    include_descendant_scopes,
+                },
+            )
+            .map_err(|error| application_error("state subscribe", error.into()))?;
+        Ok(StateSubscription {
+            id: StateSubscriptionId::from_store(outcome.id),
+            inserted: outcome.inserted,
+        })
+    }
+
+    /// Polls deterministic positive Current versions with durable at-least-once attempts.
+    ///
+    /// Preparation returns the complete matching retained snapshot, including
+    /// acknowledged candidates. Every exact source is freshly authenticated;
+    /// current/noncurrent/inactive reduction is then supplied to the privileged
+    /// store commit, which atomically rechecks the complete plan before attempts
+    /// advance. A committed noncurrent/inactive classification retires an
+    /// acknowledgement's suppression tenure, so the same semantic version can
+    /// be delivered with a new token if a later poll selects it as Current again.
+    /// No delivery is synthesized for a Current-to-None authorization change.
+    pub fn poll(
+        &mut self,
+        request: StatePollRequest,
+    ) -> Result<StateDeliveryPage, ApplicationError> {
+        let request = request.validate()?;
+        for _ in 0..MAX_SELECTED_STATE_PLAN_RETRIES {
+            let policy = self.current_policy("state poll")?;
+            let plan = self
+                .store
+                .prepare_state_subscription_poll_with_policy(
+                    &policy,
+                    request.subscription.into_store(),
+                    request.delivery_limit,
+                    request.scan_limit,
+                )
+                .map_err(|error| application_error("state poll", error.into()))?;
+            if plan.subscription() != request.subscription.into_store() {
+                return Err(ApplicationError::new(
+                    ApplicationErrorKind::Integrity,
+                    "state poll",
+                ));
+            }
+            let spec = plan.spec();
+            let retained_projections = self
+                .store
+                .retained_state_sender_inventory_with_policy(&policy)
+                .map_err(|error| application_error("state poll", error.into()))?;
+            let mut verified = Vec::with_capacity(plan.candidates().len());
+            let mut groups =
+                std::collections::BTreeMap::<(Topic, Scope, Vec<u8>), Vec<usize>>::new();
+            let mut seen = std::collections::BTreeSet::new();
+
+            for candidate in plan.candidates() {
+                if candidate
+                    .pending_attempt()
+                    .is_some_and(|attempt| attempt == 0)
+                    || candidate
+                        .acknowledged_attempt()
+                        .is_some_and(|attempt| attempt == 0)
+                    || (candidate.pending_attempt().is_some()
+                        && candidate.acknowledged_attempt().is_some())
+                {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::Integrity,
+                        "state poll",
+                    ));
+                }
+                let stored = candidate.state();
+                let id = StateId::from_store(stored.semantic_id);
+                if !seen.insert(id) {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::Integrity,
+                        "state poll",
+                    ));
+                }
+                let scope_matches = if spec.include_descendant_scopes {
+                    spec.scope.contains(&stored.header.scope)
+                } else {
+                    spec.scope == stored.header.scope
+                };
+                if spec.topic != stored.header.topic || !scope_matches {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::Integrity,
+                        "state poll",
+                    ));
+                }
+                let sender_projection = retained_projections
+                    .iter()
+                    .find(|projection| projection.transfer_id() == stored.transfer_id)
+                    .ok_or_else(|| {
+                        ApplicationError::new(ApplicationErrorKind::Integrity, "state poll")
+                    })?;
+                let query = StateQuery {
+                    topic: stored.header.topic.clone(),
+                    scope: stored.header.scope.clone(),
+                    logical_key: stored.header.logical_key.clone(),
+                    include_recoverable_versions: true,
+                };
+                let (item, _policy_active, active) = self
+                    .open_state_candidate(&query, stored, sender_projection)
+                    .map_err(|error| ApplicationError::new(error.kind(), "state poll"))?;
+                if active && item.is_none() {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::Integrity,
+                        "state poll",
+                    ));
+                }
+                let index = verified.len();
+                groups
+                    .entry((
+                        stored.header.topic.clone(),
+                        stored.header.scope.clone(),
+                        stored.header.logical_key.clone(),
+                    ))
+                    .or_default()
+                    .push(index);
+                verified.push(VerifiedStateSubscriptionCandidate {
+                    id,
+                    stored: stored.clone(),
+                    item,
+                    stamp: stored.header.stamp.clone(),
+                    active,
+                });
+            }
+
+            let mut dispositions =
+                vec![StateSubscriptionCandidateDisposition::Inactive; verified.len()];
+            for indexes in groups.values() {
+                let candidates = indexes
+                    .iter()
+                    .map(|index| {
+                        let candidate = &verified[*index];
+                        (candidate.id, &candidate.stamp, candidate.active)
+                    })
+                    .collect::<Vec<_>>();
+                let (current, reduced) = recompute_state_dispositions(&candidates);
+                for (group_index, disposition) in reduced.into_iter().enumerate() {
+                    let index = indexes[group_index];
+                    dispositions[index] = match disposition {
+                        Some(StateVersionDisposition::Current) => {
+                            if Some(group_index) != current {
+                                return Err(ApplicationError::new(
+                                    ApplicationErrorKind::Integrity,
+                                    "state poll",
+                                ));
+                            }
+                            StateSubscriptionCandidateDisposition::Current
+                        }
+                        Some(
+                            StateVersionDisposition::Concurrent
+                            | StateVersionDisposition::Superseded,
+                        ) => StateSubscriptionCandidateDisposition::Noncurrent,
+                        None => StateSubscriptionCandidateDisposition::Inactive,
+                    };
+                    if let Some(item) = verified[index].item.as_mut() {
+                        if let Some(disposition) = disposition {
+                            item.disposition = disposition;
+                        }
+                    } else if disposition.is_some() {
+                        return Err(ApplicationError::new(
+                            ApplicationErrorKind::Integrity,
+                            "state poll",
+                        ));
+                    }
+                }
+            }
+
+            let mut selection = StateSubscriptionPollSelection::default();
+            let mut opened_current = std::collections::BTreeMap::new();
+            for (candidate, disposition) in verified.into_iter().zip(dispositions) {
+                match disposition {
+                    StateSubscriptionCandidateDisposition::Current => {
+                        selection.current.push(candidate.id.into_store());
+                        let item = candidate.item.ok_or_else(|| {
+                            ApplicationError::new(ApplicationErrorKind::Integrity, "state poll")
+                        })?;
+                        if item.disposition != StateVersionDisposition::Current
+                            || opened_current
+                                .insert(candidate.id, (candidate.stored, item))
+                                .is_some()
+                        {
+                            return Err(ApplicationError::new(
+                                ApplicationErrorKind::Integrity,
+                                "state poll",
+                            ));
+                        }
+                    }
+                    StateSubscriptionCandidateDisposition::Noncurrent => {
+                        selection.noncurrent.push(candidate.id.into_store());
+                    }
+                    StateSubscriptionCandidateDisposition::Inactive => {
+                        selection.inactive.push(candidate.id.into_store());
+                    }
+                }
+            }
+
+            let committed = match self
+                .store
+                .commit_state_subscription_poll_with_policy(&policy, &plan, &selection)
+            {
+                Ok(committed) => committed,
+                Err(
+                    StoreError::StateSubscriptionPlanChanged
+                    | StoreError::StateSelectorGenerationChanged
+                    | StoreError::ControlPolicyChanged,
+                ) => continue,
+                Err(error) => return Err(application_error("state poll", error.into())),
+            };
+            let mut deliveries = Vec::with_capacity(committed.deliveries.len());
+            for delivery in committed.deliveries {
+                let id = StateId::from_store(delivery.state.semantic_id);
+                let (verified_state, item) = opened_current.remove(&id).ok_or_else(|| {
+                    ApplicationError::new(ApplicationErrorKind::Integrity, "state poll")
+                })?;
+                if delivery.state != verified_state || delivery.attempt == 0 {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::Integrity,
+                        "state poll",
+                    ));
+                }
+                deliveries.push(StateDelivery {
+                    state: item,
+                    attempt: delivery.attempt,
+                    token: StateDeliveryToken::from_store(delivery.token),
+                });
+            }
+            return Ok(StateDeliveryPage {
+                deliveries,
+                has_more: committed.has_more,
+            });
+        }
+        Err(ApplicationError::new(
+            ApplicationErrorKind::PolicyUnsettled,
+            "state poll",
+        ))
+    }
+
+    /// Idempotently acknowledges one exact token-bound State delivery.
+    pub fn acknowledge(
+        &mut self,
+        subscription: StateSubscriptionId,
+        state: StateId,
+        token: StateDeliveryToken,
+    ) -> Result<StateAcknowledgement, ApplicationError> {
+        let policy = self.current_policy("state acknowledge")?;
+        match self
+            .store
+            .acknowledge_state_delivery_with_policy(
+                &policy,
+                subscription.into_store(),
+                state.into_store(),
+                token.into_store(),
+            )
+            .map_err(|error| application_error("state acknowledge", error.into()))?
+        {
+            StoreStateDeliveryAck::Acknowledged => Ok(StateAcknowledgement::Acknowledged),
+            StoreStateDeliveryAck::AlreadyAcknowledged => {
+                Ok(StateAcknowledgement::AlreadyAcknowledged)
+            }
+        }
+    }
+
+    /// Idempotently removes one durable State selector and its delivery ledger.
+    pub fn unsubscribe(
+        &mut self,
+        subscription: StateSubscriptionId,
+    ) -> Result<StateUnsubscribe, ApplicationError> {
+        let policy = self.current_policy("state unsubscribe")?;
+        let StateSubscriptionRemoveOutcome { removed, .. } = self
+            .store
+            .remove_state_subscription_with_policy(&policy, subscription.into_store())
+            .map_err(|error| application_error("state unsubscribe", error.into()))?;
+        Ok(if removed {
+            StateUnsubscribe::Removed
+        } else {
+            StateUnsubscribe::AlreadyAbsent
+        })
     }
 
     /// Returns the deterministic, freshly verified projection for one exact key.
@@ -1101,6 +1729,46 @@ mod tests {
         assert_eq!(closed.kind(), ApplicationErrorKind::StateUnavailable);
         assert_eq!(closed.operation(), "state publish");
 
+        let subscription_request = StateSubscriptionRequest {
+            operation_key: b"closed-subscription".to_vec(),
+            topic: query.topic.clone(),
+            scope: query.scope.clone(),
+            include_descendant_scopes: false,
+        };
+        let closed = handle
+            .subscribe(subscription_request.clone())
+            .await
+            .expect_err("closed actor subscription");
+        assert_eq!(closed.kind(), ApplicationErrorKind::StateUnavailable);
+        assert_eq!(closed.operation(), "state subscribe");
+        let subscription = StateSubscriptionId::from_bytes([0x33; 32]);
+        let closed = handle
+            .poll(StatePollRequest {
+                subscription,
+                delivery_limit: 1,
+                scan_limit: 1,
+            })
+            .await
+            .expect_err("closed actor poll");
+        assert_eq!(closed.kind(), ApplicationErrorKind::StateUnavailable);
+        assert_eq!(closed.operation(), "state poll");
+        let closed = handle
+            .acknowledge(
+                subscription,
+                StateId::from_bytes([0x34; 32]),
+                StateDeliveryToken::inert_for_command_rejection(),
+            )
+            .await
+            .expect_err("closed actor acknowledgement");
+        assert_eq!(closed.kind(), ApplicationErrorKind::StateUnavailable);
+        assert_eq!(closed.operation(), "state acknowledge");
+        let closed = handle
+            .unsubscribe(subscription)
+            .await
+            .expect_err("closed actor unsubscribe");
+        assert_eq!(closed.kind(), ApplicationErrorKind::StateUnavailable);
+        assert_eq!(closed.operation(), "state unsubscribe");
+
         let (response, received) = oneshot::channel();
         SelectedStateCommand::Publish {
             request: publish,
@@ -1122,6 +1790,64 @@ mod tests {
             .expect_err("rejected command");
         assert_eq!(rejected.kind(), ApplicationErrorKind::StateUnavailable);
         assert_eq!(rejected.operation(), "state query");
+
+        let (response, received) = oneshot::channel();
+        SelectedStateCommand::Subscribe {
+            request: subscription_request,
+            response,
+        }
+        .reject();
+        let rejected = received
+            .await
+            .expect("actor subscription rejection response")
+            .expect_err("rejected subscription command");
+        assert_eq!(rejected.kind(), ApplicationErrorKind::StateUnavailable);
+        assert_eq!(rejected.operation(), "state subscribe");
+
+        let (response, received) = oneshot::channel();
+        SelectedStateCommand::Poll {
+            request: StatePollRequest {
+                subscription,
+                delivery_limit: 1,
+                scan_limit: 1,
+            },
+            response,
+        }
+        .reject();
+        let rejected = received
+            .await
+            .expect("actor poll rejection response")
+            .expect_err("rejected poll command");
+        assert_eq!(rejected.kind(), ApplicationErrorKind::StateUnavailable);
+        assert_eq!(rejected.operation(), "state poll");
+
+        let (response, received) = oneshot::channel();
+        SelectedStateCommand::Acknowledge {
+            subscription,
+            state: StateId::from_bytes([0x35; 32]),
+            token: StateDeliveryToken::inert_for_command_rejection(),
+            response,
+        }
+        .reject();
+        let rejected = received
+            .await
+            .expect("actor acknowledgement rejection response")
+            .expect_err("rejected acknowledgement command");
+        assert_eq!(rejected.kind(), ApplicationErrorKind::StateUnavailable);
+        assert_eq!(rejected.operation(), "state acknowledge");
+
+        let (response, received) = oneshot::channel();
+        SelectedStateCommand::Unsubscribe {
+            subscription,
+            response,
+        }
+        .reject();
+        let rejected = received
+            .await
+            .expect("actor unsubscribe rejection response")
+            .expect_err("rejected unsubscribe command");
+        assert_eq!(rejected.kind(), ApplicationErrorKind::StateUnavailable);
+        assert_eq!(rejected.operation(), "state unsubscribe");
     }
 
     struct TestRoot(PathBuf);
@@ -1406,6 +2132,58 @@ mod tests {
             dispositions,
             vec![None, Some(StateVersionDisposition::Current)]
         );
+
+        // A later branch can supersede the deterministic concurrent winner
+        // without observing the other maximum. The earlier semantic version
+        // then becomes Current again even though the retained history grows
+        // monotonically: A -> B -> A is a valid projection sequence.
+        let a_id = StateId::from_bytes([0x20; 32]);
+        let b_id = StateId::from_bytes([0x30; 32]);
+        let c_id = StateId::from_bytes([0x10; 32]);
+        let a = CausalStamp {
+            dot: Dot {
+                publisher: [0x41; 32],
+                counter: 1,
+            },
+            context: VersionVector::default(),
+        };
+        let b = CausalStamp {
+            dot: Dot {
+                publisher: [0x42; 32],
+                counter: 1,
+            },
+            context: VersionVector::default(),
+        };
+        let mut c_context = VersionVector::default();
+        c_context.observe(b.dot);
+        let c = CausalStamp {
+            dot: Dot {
+                publisher: b.dot.publisher,
+                counter: 2,
+            },
+            context: c_context,
+        };
+        let (winner, before_branch) =
+            recompute_state_dispositions(&[(a_id, &a, true), (b_id, &b, true)]);
+        assert_eq!(winner, Some(1));
+        assert_eq!(
+            before_branch,
+            vec![
+                Some(StateVersionDisposition::Concurrent),
+                Some(StateVersionDisposition::Current),
+            ]
+        );
+        let (returned, after_branch) =
+            recompute_state_dispositions(&[(a_id, &a, true), (b_id, &b, true), (c_id, &c, true)]);
+        assert_eq!(returned, Some(0));
+        assert_eq!(
+            after_branch,
+            vec![
+                Some(StateVersionDisposition::Current),
+                Some(StateVersionDisposition::Superseded),
+                Some(StateVersionDisposition::Concurrent),
+            ]
+        );
     }
 
     #[test]
@@ -1471,14 +2249,287 @@ mod tests {
     }
 
     #[test]
+    fn state_subscription_reduces_redelivers_acknowledges_and_reopens() {
+        let root = TestRoot::new("subscription");
+        let subscription_request = StateSubscriptionRequest {
+            operation_key: b"subscriptions/state/asset".to_vec(),
+            topic: Topic::new("ops.state").expect("topic"),
+            scope: Scope::new("mission/apps").expect("scope"),
+            include_descendant_scopes: false,
+        };
+        let (subscription, current, first_current_token) = {
+            let mut node = selected_node(&root);
+            let first = node
+                .publish(request(b"state/subscription/first", b"ready"))
+                .expect("first State");
+            let subscription = node
+                .subscribe(subscription_request.clone())
+                .expect("create State subscription");
+            assert!(subscription.inserted);
+            let replay = node
+                .subscribe(subscription_request.clone())
+                .expect("replay State subscription");
+            assert_eq!(replay.id, subscription.id);
+            assert!(!replay.inserted);
+
+            let first_page = node
+                .poll(StatePollRequest {
+                    subscription: subscription.id,
+                    delivery_limit: MAX_SELECTED_STATE_DELIVERIES,
+                    scan_limit: MAX_SELECTED_STATE_SUBSCRIPTION_SCAN,
+                })
+                .expect("first State poll");
+            assert_eq!(first_page.deliveries.len(), 1);
+            assert_eq!(first_page.deliveries[0].state.id, first.id);
+            assert_eq!(first_page.deliveries[0].attempt, 1);
+            assert_eq!(
+                first_page.deliveries[0].state.disposition,
+                StateVersionDisposition::Current
+            );
+            let first_token = first_page.deliveries[0].token;
+
+            let current = node
+                .publish(request(b"state/subscription/current", b"moving"))
+                .expect("superseding State");
+            let replacement = node
+                .poll(StatePollRequest {
+                    subscription: subscription.id,
+                    delivery_limit: MAX_SELECTED_STATE_DELIVERIES,
+                    scan_limit: MAX_SELECTED_STATE_SUBSCRIPTION_SCAN,
+                })
+                .expect("replacement State poll");
+            assert_eq!(replacement.deliveries.len(), 1);
+            assert_eq!(replacement.deliveries[0].state.id, current.id);
+            assert_eq!(replacement.deliveries[0].attempt, 1);
+            assert_ne!(replacement.deliveries[0].state.id, first.id);
+            let swapped = node
+                .acknowledge(subscription.id, current.id, first_token)
+                .expect_err("a token cannot acknowledge a different State");
+            assert_eq!(swapped.kind(), ApplicationErrorKind::InvalidRequest);
+            assert_eq!(swapped.operation(), "state acknowledge");
+            let stale = node
+                .acknowledge(subscription.id, first.id, first_token)
+                .expect_err("an unacknowledged retired tenure token is stale");
+            assert_eq!(stale.kind(), ApplicationErrorKind::InvalidRequest);
+            assert_eq!(stale.operation(), "state acknowledge");
+            (subscription, current, replacement.deliveries[0].token)
+        };
+
+        let mut reopened = selected_node(&root);
+        let repeated = reopened
+            .poll(StatePollRequest {
+                subscription: subscription.id,
+                delivery_limit: MAX_SELECTED_STATE_DELIVERIES,
+                scan_limit: MAX_SELECTED_STATE_SUBSCRIPTION_SCAN,
+            })
+            .expect("repeat unacknowledged current State");
+        assert_eq!(repeated.deliveries.len(), 1);
+        assert_eq!(repeated.deliveries[0].state.id, current.id);
+        assert_eq!(repeated.deliveries[0].attempt, 2);
+        assert_ne!(repeated.deliveries[0].token, first_current_token);
+        let repeated_token = repeated.deliveries[0].token;
+        assert_eq!(
+            StateDeliveryToken::from_bytes(*repeated_token.as_bytes())
+                .expect("restore opaque State delivery token"),
+            repeated_token
+        );
+        let malformed = StateDeliveryToken::from_bytes([0_u8; STATE_DELIVERY_TOKEN_BYTES])
+            .expect_err("reject malformed State delivery token");
+        assert_eq!(malformed.kind(), ApplicationErrorKind::InvalidRequest);
+        assert_eq!(malformed.operation(), "state delivery token");
+        assert_eq!(
+            reopened
+                .acknowledge(subscription.id, current.id, repeated_token)
+                .expect("acknowledge current State"),
+            StateAcknowledgement::Acknowledged
+        );
+        assert_eq!(
+            reopened
+                .acknowledge(subscription.id, current.id, repeated_token)
+                .expect("idempotent State acknowledgement"),
+            StateAcknowledgement::AlreadyAcknowledged
+        );
+        assert!(
+            reopened
+                .poll(StatePollRequest {
+                    subscription: subscription.id,
+                    delivery_limit: MAX_SELECTED_STATE_DELIVERIES,
+                    scan_limit: MAX_SELECTED_STATE_SUBSCRIPTION_SCAN,
+                })
+                .expect("empty after State acknowledgement")
+                .deliveries
+                .is_empty()
+        );
+
+        let mut deletion = request(b"state/subscription/delete", b"");
+        deletion.tombstone = true;
+        let tombstone = reopened.publish(deletion).expect("State tombstone");
+        let deletion = reopened
+            .poll(StatePollRequest {
+                subscription: subscription.id,
+                delivery_limit: MAX_SELECTED_STATE_DELIVERIES,
+                scan_limit: MAX_SELECTED_STATE_SUBSCRIPTION_SCAN,
+            })
+            .expect("tombstone delivery");
+        assert_eq!(deletion.deliveries.len(), 1);
+        assert_eq!(deletion.deliveries[0].state.id, tombstone.id);
+        assert!(deletion.deliveries[0].state.tombstone);
+        assert!(deletion.deliveries[0].state.payload.is_empty());
+        assert_eq!(deletion.deliveries[0].attempt, 1);
+        let removed_incarnation_token = deletion.deliveries[0].token;
+
+        assert_eq!(
+            reopened
+                .unsubscribe(subscription.id)
+                .expect("remove State subscription"),
+            StateUnsubscribe::Removed
+        );
+        assert_eq!(
+            reopened
+                .unsubscribe(subscription.id)
+                .expect("idempotent remove State subscription"),
+            StateUnsubscribe::AlreadyAbsent
+        );
+        let recreated = reopened
+            .subscribe(subscription_request)
+            .expect("recreate removed State subscription");
+        assert!(recreated.inserted);
+        assert_eq!(recreated.id, subscription.id);
+        let redelivered = reopened
+            .poll(StatePollRequest {
+                subscription: recreated.id,
+                delivery_limit: MAX_SELECTED_STATE_DELIVERIES,
+                scan_limit: MAX_SELECTED_STATE_SUBSCRIPTION_SCAN,
+            })
+            .expect("recreated subscription starts a fresh ledger");
+        assert_eq!(redelivered.deliveries.len(), 1);
+        assert_eq!(redelivered.deliveries[0].state.id, tombstone.id);
+        assert_eq!(redelivered.deliveries[0].attempt, 1);
+        assert_ne!(redelivered.deliveries[0].token, removed_incarnation_token);
+        let recreated_token = redelivered.deliveries[0].token;
+        let stale = reopened
+            .acknowledge(recreated.id, tombstone.id, removed_incarnation_token)
+            .expect_err("removed subscription incarnation token is stale");
+        assert_eq!(stale.kind(), ApplicationErrorKind::InvalidRequest);
+        assert_eq!(stale.operation(), "state acknowledge");
+        let retried = reopened
+            .poll(StatePollRequest {
+                subscription: recreated.id,
+                delivery_limit: MAX_SELECTED_STATE_DELIVERIES,
+                scan_limit: MAX_SELECTED_STATE_SUBSCRIPTION_SCAN,
+            })
+            .expect("stale token leaves recreated delivery pending");
+        assert_eq!(retried.deliveries.len(), 1);
+        assert_eq!(retried.deliveries[0].state.id, tombstone.id);
+        assert_eq!(retried.deliveries[0].attempt, 2);
+        assert_ne!(retried.deliveries[0].token, recreated_token);
+        assert_eq!(
+            reopened
+                .acknowledge(recreated.id, tombstone.id, recreated_token)
+                .expect("an earlier retry token in the current tenure remains valid"),
+            StateAcknowledgement::Acknowledged
+        );
+        assert_eq!(
+            reopened
+                .acknowledge(recreated.id, tombstone.id, recreated_token)
+                .expect("recreated delivery acknowledgement is idempotent"),
+            StateAcknowledgement::AlreadyAcknowledged
+        );
+    }
+
+    #[test]
+    fn state_subscription_rejects_conflicts_bounds_and_unauthorized_intent() {
+        let root = TestRoot::new("subscription-errors");
+        let mut node = selected_node(&root);
+        let request = StateSubscriptionRequest {
+            operation_key: b"subscriptions/state/errors".to_vec(),
+            topic: Topic::new("ops.state").expect("topic"),
+            scope: Scope::new("mission/apps").expect("scope"),
+            include_descendant_scopes: false,
+        };
+        let subscription = node.subscribe(request.clone()).expect("subscription");
+
+        let mut conflict = request;
+        conflict.include_descendant_scopes = true;
+        let error = node
+            .subscribe(conflict)
+            .expect_err("changed State selector operation");
+        assert_eq!(error.kind(), ApplicationErrorKind::Conflict);
+        assert_eq!(error.operation(), "state subscribe");
+
+        for invalid in [
+            StatePollRequest {
+                subscription: subscription.id,
+                delivery_limit: 0,
+                scan_limit: 1,
+            },
+            StatePollRequest {
+                subscription: subscription.id,
+                delivery_limit: MAX_SELECTED_STATE_DELIVERIES + 1,
+                scan_limit: 1,
+            },
+            StatePollRequest {
+                subscription: subscription.id,
+                delivery_limit: 1,
+                scan_limit: 0,
+            },
+            StatePollRequest {
+                subscription: subscription.id,
+                delivery_limit: 1,
+                scan_limit: MAX_SELECTED_STATE_SUBSCRIPTION_SCAN + 1,
+            },
+        ] {
+            let error = node.poll(invalid).expect_err("invalid State poll bound");
+            assert_eq!(error.kind(), ApplicationErrorKind::InvalidRequest);
+            assert_eq!(error.operation(), "state poll");
+        }
+
+        let unauthorized = node
+            .subscribe(StateSubscriptionRequest {
+                operation_key: b"subscriptions/state/unauthorized".to_vec(),
+                topic: Topic::new("private.state").expect("topic"),
+                scope: Scope::new("mission/apps").expect("scope"),
+                include_descendant_scopes: false,
+            })
+            .expect_err("unauthorized State subscription");
+        assert_eq!(unauthorized.kind(), ApplicationErrorKind::RequestRejected);
+        assert_eq!(unauthorized.operation(), "state subscribe");
+    }
+
+    #[test]
     fn same_epoch_rekey_withholds_old_state_and_replacement_is_restart_stable() {
         let root = TestRoot::new("same-epoch-lineage");
         let mut services = persist_rekeyable_mission(&root);
         let old_request = request(b"state/pre-rekey", b"old route");
-        let old = {
+        let (old, subscription, old_token) = {
             let mut node = selected_node(&root);
-            node.publish(old_request.clone())
-                .expect("publish pre-rekey State")
+            let old = node
+                .publish(old_request.clone())
+                .expect("publish pre-rekey State");
+            let subscription = node
+                .subscribe(StateSubscriptionRequest {
+                    operation_key: b"state/rekey/subscription".to_vec(),
+                    topic: old_request.topic.clone(),
+                    scope: old_request.scope.clone(),
+                    include_descendant_scopes: false,
+                })
+                .expect("subscribe before same-epoch rekey");
+            let page = node
+                .poll(StatePollRequest {
+                    subscription: subscription.id,
+                    delivery_limit: MAX_SELECTED_STATE_DELIVERIES,
+                    scan_limit: MAX_SELECTED_STATE_SUBSCRIPTION_SCAN,
+                })
+                .expect("deliver pre-rekey State");
+            assert_eq!(page.deliveries.len(), 1);
+            assert_eq!(page.deliveries[0].state.id, old.id);
+            let token = page.deliveries[0].token;
+            assert_eq!(
+                node.acknowledge(subscription.id, old.id, token)
+                    .expect("acknowledge pre-rekey State"),
+                StateAcknowledgement::Acknowledged
+            );
+            (old, subscription, token)
         };
 
         apply_same_epoch_rekey(&root, &mut services);
@@ -1489,6 +2540,21 @@ mod tests {
                 .expect("cache-proven old State is safely withheld");
             assert!(hidden.current.is_none());
             assert!(hidden.recoverable.is_empty());
+            let empty = reopened
+                .poll(StatePollRequest {
+                    subscription: subscription.id,
+                    delivery_limit: MAX_SELECTED_STATE_DELIVERIES,
+                    scan_limit: MAX_SELECTED_STATE_SUBSCRIPTION_SCAN,
+                })
+                .expect("authorization loss has no synthetic withdrawal delivery");
+            assert!(empty.deliveries.is_empty());
+            assert!(!empty.has_more);
+            assert_eq!(
+                reopened
+                    .acknowledge(subscription.id, old.id, old_token)
+                    .expect("retired acknowledged tenure remains idempotent"),
+                StateAcknowledgement::AlreadyAcknowledged
+            );
 
             let replay = reopened
                 .publish(old_request)
@@ -1515,6 +2581,26 @@ mod tests {
                 Some(b"current route".as_slice())
             );
             assert!(projection.recoverable.is_empty());
+            let replacement_page = reopened
+                .poll(StatePollRequest {
+                    subscription: subscription.id,
+                    delivery_limit: MAX_SELECTED_STATE_DELIVERIES,
+                    scan_limit: MAX_SELECTED_STATE_SUBSCRIPTION_SCAN,
+                })
+                .expect("deliver authorized post-rekey State");
+            assert_eq!(replacement_page.deliveries.len(), 1);
+            assert_eq!(replacement_page.deliveries[0].state.id, replacement.id);
+            assert_ne!(replacement_page.deliveries[0].token, old_token);
+            assert_eq!(
+                reopened
+                    .acknowledge(
+                        subscription.id,
+                        replacement.id,
+                        replacement_page.deliveries[0].token,
+                    )
+                    .expect("acknowledge post-rekey State"),
+                StateAcknowledgement::Acknowledged
+            );
             replacement
         };
 

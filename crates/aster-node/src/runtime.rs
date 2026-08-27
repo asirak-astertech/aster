@@ -10077,6 +10077,26 @@ fn execute_selected_state_command(
         SelectedStateCommand::Query { query, response } => {
             let _ = response.send(application.query(query));
         }
+        SelectedStateCommand::Subscribe { request, response } => {
+            let _ = response.send(application.subscribe(request));
+        }
+        SelectedStateCommand::Poll { request, response } => {
+            let _ = response.send(application.poll(request));
+        }
+        SelectedStateCommand::Acknowledge {
+            subscription,
+            state,
+            token,
+            response,
+        } => {
+            let _ = response.send(application.acknowledge(subscription, state, token));
+        }
+        SelectedStateCommand::Unsubscribe {
+            subscription,
+            response,
+        } => {
+            let _ = response.send(application.unsubscribe(subscription));
+        }
     }
 }
 
@@ -27235,8 +27255,10 @@ mod tests {
     #[tokio::test]
     async fn live_selected_state_and_record_are_durable_idempotent_and_close_admission() {
         use crate::application::{
-            ApplicationErrorKind, RecordPublishRequest, RecordQuery, StatePublishRequest,
-            StateQuery,
+            ApplicationErrorKind, MAX_SELECTED_STATE_DELIVERIES,
+            MAX_SELECTED_STATE_SUBSCRIPTION_SCAN, RecordPublishRequest, RecordQuery,
+            StateAcknowledgement, StatePollRequest, StatePublishRequest, StateQuery,
+            StateSubscriptionRequest, StateUnsubscribe,
         };
 
         let state = root("live-selected-mutable-actor");
@@ -27355,6 +27377,51 @@ mod tests {
         assert_eq!(current_state.payload, b"live State payload");
         assert!(state_projection.recoverable.is_empty());
 
+        let state_subscription = selected_state
+            .subscribe(StateSubscriptionRequest {
+                operation_key: b"runtime-live-state-subscription".to_vec(),
+                topic: state_query.topic.clone(),
+                scope: state_query.scope.clone(),
+                include_descendant_scopes: false,
+            })
+            .await
+            .expect("subscribe to retained State while live");
+        assert!(state_subscription.inserted);
+        let state_delivery = selected_state
+            .poll(StatePollRequest {
+                subscription: state_subscription.id,
+                delivery_limit: MAX_SELECTED_STATE_DELIVERIES,
+                scan_limit: MAX_SELECTED_STATE_SUBSCRIPTION_SCAN,
+            })
+            .await
+            .expect("poll State through live actor");
+        assert_eq!(state_delivery.deliveries.len(), 1);
+        assert_eq!(state_delivery.deliveries[0].state.id, published_state.id);
+        assert_eq!(state_delivery.deliveries[0].attempt, 1);
+        let state_delivery_token = state_delivery.deliveries[0].token;
+        assert_eq!(
+            selected_state
+                .acknowledge(
+                    state_subscription.id,
+                    published_state.id,
+                    state_delivery_token,
+                )
+                .await
+                .expect("acknowledge State through live actor"),
+            StateAcknowledgement::Acknowledged
+        );
+        assert_eq!(
+            selected_state
+                .acknowledge(
+                    state_subscription.id,
+                    published_state.id,
+                    state_delivery_token,
+                )
+                .await
+                .expect("repeat State acknowledgement through live actor"),
+            StateAcknowledgement::AlreadyAcknowledged
+        );
+
         let record_query = RecordQuery {
             topic,
             scope,
@@ -27383,6 +27450,19 @@ mod tests {
             .expect_err("closed actor rejects retained State handle");
         assert_eq!(state_closed.kind(), ApplicationErrorKind::StateUnavailable);
         assert_eq!(state_closed.operation(), "state query");
+        let state_poll_closed = retained_state
+            .poll(StatePollRequest {
+                subscription: state_subscription.id,
+                delivery_limit: MAX_SELECTED_STATE_DELIVERIES,
+                scan_limit: MAX_SELECTED_STATE_SUBSCRIPTION_SCAN,
+            })
+            .await
+            .expect_err("closed actor rejects retained State subscription handle");
+        assert_eq!(
+            state_poll_closed.kind(),
+            ApplicationErrorKind::StateUnavailable
+        );
+        assert_eq!(state_poll_closed.operation(), "state poll");
         let record_closed = retained_records
             .query(record_query.clone())
             .await
@@ -27412,6 +27492,33 @@ mod tests {
                 .expect("retained State after restart")
                 .id,
             published_state.id
+        );
+        let reopened_state_handle = reopened.selected_state();
+        assert!(
+            reopened_state_handle
+                .poll(StatePollRequest {
+                    subscription: state_subscription.id,
+                    delivery_limit: MAX_SELECTED_STATE_DELIVERIES,
+                    scan_limit: MAX_SELECTED_STATE_SUBSCRIPTION_SCAN,
+                })
+                .await
+                .expect("acknowledged State subscription survives restart")
+                .deliveries
+                .is_empty()
+        );
+        assert_eq!(
+            reopened_state_handle
+                .unsubscribe(state_subscription.id)
+                .await
+                .expect("unsubscribe State through live actor"),
+            StateUnsubscribe::Removed
+        );
+        assert_eq!(
+            reopened_state_handle
+                .unsubscribe(state_subscription.id)
+                .await
+                .expect("repeat State unsubscribe through live actor"),
+            StateUnsubscribe::AlreadyAbsent
         );
         assert_eq!(
             reopened

@@ -23,9 +23,11 @@
 
 mod blob;
 mod custody;
+mod state_subscription;
 
 pub use blob::*;
 pub use custody::*;
+pub use state_subscription::*;
 
 use std::error::Error;
 use std::fmt;
@@ -92,6 +94,10 @@ const STATE_BYTES: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.semantic-state-bytes.v1");
 const STATE_ACCEPTANCE_MARKERS: TableDefinition<&[u8], u64> =
     TableDefinition::new("aster.semantic-state-markers.v1");
+// Marker order is the audited inverse used to construct complete bounded State
+// subscription snapshots. Neither direction is cryptographic authority.
+pub(crate) const STATE_ACCEPTANCE_ORDER: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("aster.semantic-state-acceptance-order.v1");
 const STATE_SEMANTIC_ITEMS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.semantic-state-items.v1");
 const STATE_GROUP_VERSIONS: TableDefinition<&[u8], &[u8]> =
@@ -548,6 +554,11 @@ pub struct StateSemanticId([u8; 32]);
 impl StateSemanticId {
     /// Constructs a semantic State identifier from complete bytes.
     pub const fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Constructs a semantic State identifier from complete durable bytes.
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
 
@@ -3163,6 +3174,8 @@ pub struct StoreInspection {
     pub blob_stats: BlobStoreStats,
     /// Event receive-selector and pending-delivery counts from the same transaction.
     pub event_subscription_stats: EventSubscriptionStats,
+    /// State application-delivery selector and ledger counts from the same transaction.
+    pub state_subscription_stats: StateSubscriptionStats,
     /// Mission-wide Flash control counts from the same audited read transaction.
     pub control_stats: ControlStoreStats,
     /// Mission-bound custody, quota, lease, retry, and retirement counts.
@@ -3335,6 +3348,42 @@ pub enum StoreError {
     StateProjectionLimitExceeded { current: usize, limit: usize },
     /// A prepared State projection no longer matches durable structure or policy.
     StateProjectionPlanChanged,
+    /// A durable State subscription operation key was empty or over its bound.
+    InvalidStateSubscriptionKey { length: usize },
+    /// The dedicated durable State subscription cap was reached.
+    StateSubscriptionLimitExceeded { current: u64, limit: u64 },
+    /// The dedicated unacknowledged State delivery cap was reached.
+    StatePendingDeliveryLimitExceeded { current: u64, limit: u64 },
+    /// The durable State acknowledgement-receipt cap was reached.
+    StateAcknowledgementReceiptLimitExceeded { current: u64, limit: u64 },
+    /// Pending and acknowledged State delivery rows exhausted their shared bound.
+    StateDeliveryLedgerLimitExceeded { current: u64, limit: u64 },
+    /// A State subscription operation key was replayed with another specification.
+    StateSubscriptionConflict,
+    /// The requested durable State subscription does not exist.
+    StateSubscriptionNotFound,
+    /// One bounded State subscription poll limit was invalid.
+    StateSubscriptionPollLimitExceeded { requested: usize, maximum: usize },
+    /// A prepared State poll no longer matches its exact snapshot or ledger.
+    StateSubscriptionPlanChanged,
+    /// A selected State was never durably delivered by this subscription.
+    StateDeliveryNotFound,
+    /// Opaque State delivery-token bytes have an unknown version or zero counter.
+    InvalidStateDeliveryToken,
+    /// A State delivery token is not bound to the supplied subscription and State.
+    StateDeliveryTokenBindingMismatch,
+    /// The durable State delivery-attempt counter is exhausted.
+    StateDeliveryAttemptExhausted,
+    /// The durable State current-projection tenure counter is exhausted.
+    StateDeliveryTenureExhausted,
+    /// An acknowledgement token belongs to another tenure of the stable subscription ID.
+    StateSubscriptionIncarnationChanged { current: u64, received: u64 },
+    /// An acknowledgement token belongs to another current-projection tenure.
+    StateDeliveryTenureChanged { current: u64, received: u64 },
+    /// An acknowledgement token names an attempt not issued in its tenure.
+    StateDeliveryAttemptChanged { current: u64, received: u64 },
+    /// The durable State selector generation changed after poll preparation.
+    StateSelectorGenerationChanged,
     /// A durable State table or index disagreed with its paired authority row.
     StateInvariant(&'static str),
     /// A State publisher was revoked by the applied mission-control prefix.
@@ -3686,6 +3735,67 @@ impl fmt::Display for StoreError {
             ),
             Self::StateProjectionPlanChanged => {
                 formatter.write_str("durable State projection changed; prepare and verify again")
+            }
+            Self::InvalidStateSubscriptionKey { length } => write!(
+                formatter,
+                "State subscription key length {length} is outside 1..={MAX_STATE_SUBSCRIPTION_KEY_BYTES}"
+            ),
+            Self::StateSubscriptionLimitExceeded { current, limit } => write!(
+                formatter,
+                "State subscription count {current} is at dedicated limit {limit}"
+            ),
+            Self::StatePendingDeliveryLimitExceeded { current, limit } => write!(
+                formatter,
+                "pending State delivery count {current} is at dedicated limit {limit}"
+            ),
+            Self::StateAcknowledgementReceiptLimitExceeded { current, limit } => write!(
+                formatter,
+                "State acknowledgement receipt count {current} is at dedicated limit {limit}"
+            ),
+            Self::StateDeliveryLedgerLimitExceeded { current, limit } => write!(
+                formatter,
+                "combined pending and acknowledged State delivery count {current} exceeds shared limit {limit}"
+            ),
+            Self::StateSubscriptionConflict => formatter
+                .write_str("State subscription retry differs from its durable specification"),
+            Self::StateSubscriptionNotFound => {
+                formatter.write_str("durable State subscription was not found")
+            }
+            Self::StateSubscriptionPollLimitExceeded { requested, maximum } => write!(
+                formatter,
+                "State subscription poll request {requested} exceeds maximum {maximum}"
+            ),
+            Self::StateSubscriptionPlanChanged => {
+                formatter.write_str("durable State subscription poll state changed; prepare again")
+            }
+            Self::StateDeliveryNotFound => {
+                formatter.write_str("semantic State was not delivered by this subscription")
+            }
+            Self::InvalidStateDeliveryToken => {
+                formatter.write_str("State delivery token bytes are invalid")
+            }
+            Self::StateDeliveryTokenBindingMismatch => formatter
+                .write_str("State delivery token is bound to another subscription or State"),
+            Self::StateDeliveryAttemptExhausted => {
+                formatter.write_str("State delivery attempt counter is exhausted")
+            }
+            Self::StateDeliveryTenureExhausted => {
+                formatter.write_str("State delivery tenure counter is exhausted")
+            }
+            Self::StateSubscriptionIncarnationChanged { current, received } => write!(
+                formatter,
+                "State subscription incarnation changed from token {received} to {current}"
+            ),
+            Self::StateDeliveryTenureChanged { current, received } => write!(
+                formatter,
+                "State delivery tenure changed from token {received} to {current}"
+            ),
+            Self::StateDeliveryAttemptChanged { current, received } => write!(
+                formatter,
+                "State delivery token attempt {received} was not issued through {current}"
+            ),
+            Self::StateSelectorGenerationChanged => {
+                formatter.write_str("durable State receive-selector state changed")
             }
             Self::StateInvariant(reason) => {
                 write!(
@@ -10569,6 +10679,15 @@ impl Store {
         write
             .open_table(STATE_ACCEPTANCE_MARKERS)?
             .insert(prepared.transfer_id.as_bytes().as_slice(), marker)?;
+        if write
+            .open_table(STATE_ACCEPTANCE_ORDER)?
+            .insert(marker, prepared.transfer_id.as_bytes().as_slice())?
+            .is_some()
+        {
+            return Err(StoreError::StateInvariant(
+                "State acceptance marker is already indexed to another transfer",
+            ));
+        }
         write.open_table(STATES)?.insert(
             prepared.transfer_id.as_bytes().as_slice(),
             prepared.encoded_metadata.as_slice(),
@@ -15265,11 +15384,32 @@ struct StateAuditSnapshot {
     domain_publishers: std::collections::BTreeMap<Vec<u8>, std::collections::BTreeSet<NodeId>>,
 }
 
-fn audit_state_tables(write: &redb::WriteTransaction) -> Result<StateAuditSnapshot, StoreError> {
-    preflight_state_schema_group(write)?;
+fn audit_state_tables(
+    write: &redb::WriteTransaction,
+) -> Result<(StateAuditSnapshot, bool), StoreError> {
+    let exact_legacy_current_extensions = preflight_state_schema_group(write)?;
+    if write
+        .list_multimap_tables()?
+        .any(|table| table.name() == STATE_ACCEPTANCE_ORDER.name())
+    {
+        return Err(StoreError::StateInvariant(
+            "State acceptance-order index has the wrong table kind",
+        ));
+    }
+    let acceptance_order_existed = write
+        .list_tables()?
+        .any(|table| table.name() == STATE_ACCEPTANCE_ORDER.name());
+    if !acceptance_order_existed
+        && !state_subscription::state_subscription_schema_wholly_absent_write(write)?
+    {
+        return Err(StoreError::StateInvariant(
+            "State acceptance-order index is missing from current schema",
+        ));
+    }
     let states = write.open_table(STATES)?;
     let state_bytes = write.open_table(STATE_BYTES)?;
     let state_markers = write.open_table(STATE_ACCEPTANCE_MARKERS)?;
+    let mut state_acceptance_order = write.open_table(STATE_ACCEPTANCE_ORDER)?;
     let state_semantic_items = write.open_table(STATE_SEMANTIC_ITEMS)?;
     let state_groups = write.open_table(STATE_GROUP_VERSIONS)?;
     let state_operations = write.open_table(STATE_OPERATIONS)?;
@@ -15330,6 +15470,35 @@ fn audit_state_tables(write: &redb::WriteTransaction) -> Result<StateAuditSnapsh
             return Err(StoreError::StateInvariant(
                 "State acceptance markers must be nonzero and unique",
             ));
+        }
+        let ordered_transfer = state_acceptance_order
+            .get(marker)?
+            .map(|value| value.value().to_vec());
+        match ordered_transfer {
+            Some(ordered_transfer) => {
+                let ordered_transfer =
+                    parse_state_transfer_id("State acceptance-order table", &ordered_transfer)?;
+                if ordered_transfer != transfer_id {
+                    return Err(StoreError::StateInvariant(
+                        "State acceptance-order index differs from its forward marker",
+                    ));
+                }
+            }
+            None if acceptance_order_existed => {
+                return Err(StoreError::StateInvariant(
+                    "State acceptance-order index is missing an accepted State",
+                ));
+            }
+            None => {
+                if state_acceptance_order
+                    .insert(marker, transfer_id.as_bytes().as_slice())?
+                    .is_some()
+                {
+                    return Err(StoreError::StateInvariant(
+                        "State acceptance marker is already indexed to another transfer",
+                    ));
+                }
+            }
         }
         let indexed_transfer = state_semantic_items
             .get(metadata.semantic_id.as_bytes().as_slice())?
@@ -15487,6 +15656,36 @@ fn audit_state_tables(write: &redb::WriteTransaction) -> Result<StateAuditSnapsh
             ));
         }
     }
+    if state_acceptance_order.len()? != snapshot.count {
+        return Err(StoreError::StateInvariant(
+            "State acceptance-order index has missing or orphan rows",
+        ));
+    }
+    for row in state_acceptance_order.iter()? {
+        let (marker, transfer) = row?;
+        let marker = marker.value();
+        if marker == 0 {
+            return Err(StoreError::StateInvariant(
+                "State acceptance-order index contains a zero marker",
+            ));
+        }
+        let transfer_id =
+            parse_state_transfer_id("State acceptance-order table", transfer.value())?;
+        if states.get(transfer_id.as_bytes().as_slice())?.is_none() {
+            return Err(StoreError::StateInvariant(
+                "State acceptance-order index points to a missing accepted State",
+            ));
+        }
+        if state_markers
+            .get(transfer_id.as_bytes().as_slice())?
+            .map(|value| value.value())
+            != Some(marker)
+        {
+            return Err(StoreError::StateInvariant(
+                "State acceptance-order index differs from its forward marker",
+            ));
+        }
+    }
     if state_semantic_items.len()? != snapshot.count {
         return Err(StoreError::StateInvariant(
             "State semantic item index has missing or orphan rows",
@@ -15567,10 +15766,10 @@ fn audit_state_tables(write: &redb::WriteTransaction) -> Result<StateAuditSnapsh
         audit_or_initialize_counter(&mut metadata, STATE_OPERATION_COUNT, operation_count)?;
         audit_or_initialize_counter(&mut metadata, STATE_OPERATION_TOTAL_BYTES, operation_bytes)?;
     }
-    Ok(snapshot)
+    Ok((snapshot, exact_legacy_current_extensions))
 }
 
-fn preflight_state_schema_group(write: &redb::WriteTransaction) -> Result<(), StoreError> {
+fn preflight_state_schema_group(write: &redb::WriteTransaction) -> Result<bool, StoreError> {
     let state_tables = [
         STATES.name(),
         STATE_BYTES.name(),
@@ -15579,10 +15778,9 @@ fn preflight_state_schema_group(write: &redb::WriteTransaction) -> Result<(), St
         STATE_GROUP_VERSIONS.name(),
         STATE_OPERATIONS.name(),
     ];
-    if write
-        .list_multimap_tables()?
-        .any(|table| state_tables.contains(&table.name()))
-    {
+    if write.list_multimap_tables()?.any(|table| {
+        state_tables.contains(&table.name()) || table.name() == STATE_ACCEPTANCE_ORDER.name()
+    }) {
         return Err(StoreError::StateInvariant(
             "mission-scoped State schema has the wrong table kind",
         ));
@@ -15606,7 +15804,15 @@ fn preflight_state_schema_group(write: &redb::WriteTransaction) -> Result<(), St
         ]
     };
     let present_metadata = metadata_presence.iter().filter(|present| **present).count();
+    let acceptance_order_present = table_names.contains(STATE_ACCEPTANCE_ORDER.name());
+    let subscription_schema_absent =
+        state_subscription::state_subscription_schema_wholly_absent_write(write)?;
     if present_tables == 0 && present_metadata == 0 {
+        if acceptance_order_present || !subscription_schema_absent {
+            return Err(StoreError::StateInvariant(
+                "mission-scoped State schema group is incomplete",
+            ));
+        }
         write.open_table(STATES)?;
         write.open_table(STATE_BYTES)?;
         write.open_table(STATE_ACCEPTANCE_MARKERS)?;
@@ -15619,14 +15825,23 @@ fn preflight_state_schema_group(write: &redb::WriteTransaction) -> Result<(), St
         metadata.insert(LAST_STATE_ACCEPTANCE_MARKER, 0)?;
         metadata.insert(STATE_OPERATION_COUNT, 0)?;
         metadata.insert(STATE_OPERATION_TOTAL_BYTES, 0)?;
-        return Ok(());
+        return Ok(true);
     }
     if present_tables != state_tables.len() || present_metadata != metadata_presence.len() {
         return Err(StoreError::StateInvariant(
             "mission-scoped State schema group is incomplete",
         ));
     }
-    Ok(())
+    match (acceptance_order_present, subscription_schema_absent) {
+        (false, true) => Ok(true),
+        (true, false) => Ok(false),
+        (true, true) => Err(StoreError::StateInvariant(
+            "State subscription schema group is incomplete",
+        )),
+        (false, false) => Err(StoreError::StateInvariant(
+            "State acceptance-order index is missing from current schema",
+        )),
+    }
 }
 
 fn preflight_record_schema_group(write: &redb::WriteTransaction) -> Result<(), StoreError> {
@@ -15977,7 +16192,7 @@ fn audit_semantic_tables(
     // Opening every table here is the non-destructive schema extension for old
     // stores. Existing v1 opaque item/effect bytes remain untouched and use a
     // disjoint caller-controlled key namespace.
-    let mut state_audit = audit_state_tables(write)?;
+    let (mut state_audit, exact_legacy_state_extensions) = audit_state_tables(write)?;
     audit_record_tables(write, &mut state_audit)?;
     let blob_audit = blob::audit_blob_tables_write(write, &mut state_audit)?;
     let wrong_multimap_tables = write
@@ -16689,6 +16904,7 @@ fn audit_semantic_tables(
     drop(route_claims);
     drop(_domain);
     audit_event_subscription_tables(write)?;
+    state_subscription::audit_state_subscription_tables(write, exact_legacy_state_extensions)?;
     Ok(blob_audit.stats)
 }
 
@@ -20177,10 +20393,9 @@ fn inspect_state_readable(
         STATE_GROUP_VERSIONS.name(),
         STATE_OPERATIONS.name(),
     ];
-    if read
-        .list_multimap_tables()?
-        .any(|table| state_tables.contains(&table.name()))
-    {
+    if read.list_multimap_tables()?.any(|table| {
+        state_tables.contains(&table.name()) || table.name() == STATE_ACCEPTANCE_ORDER.name()
+    }) {
         return Err(StoreError::StateInvariant(
             "mission-scoped State schema has the wrong table kind",
         ));
@@ -20202,6 +20417,13 @@ fn inspect_state_readable(
         metadata.get(STATE_OPERATION_TOTAL_BYTES)?.is_some(),
     ];
     if present == 0 && metadata_presence.iter().all(|present| !present) {
+        if table_names.contains(STATE_ACCEPTANCE_ORDER.name())
+            || !state_subscription::state_subscription_schema_wholly_absent_read(read)?
+        {
+            return Err(StoreError::StateInvariant(
+                "mission-scoped State schema group is incomplete",
+            ));
+        }
         return Ok((StateStoreStats::default(), StateAuditSnapshot::default()));
     }
     if present != state_tables.len() || metadata_presence.iter().any(|present| !present) {
@@ -20213,6 +20435,17 @@ fn inspect_state_readable(
     let states = read.open_table(STATES)?;
     let state_bytes = read.open_table(STATE_BYTES)?;
     let state_markers = read.open_table(STATE_ACCEPTANCE_MARKERS)?;
+    let acceptance_order_present = table_names.contains(STATE_ACCEPTANCE_ORDER.name());
+    if !acceptance_order_present
+        && !state_subscription::state_subscription_schema_wholly_absent_read(read)?
+    {
+        return Err(StoreError::StateInvariant(
+            "State acceptance-order index is missing from current schema",
+        ));
+    }
+    let state_acceptance_order = acceptance_order_present
+        .then(|| read.open_table(STATE_ACCEPTANCE_ORDER))
+        .transpose()?;
     let state_semantic_items = read.open_table(STATE_SEMANTIC_ITEMS)?;
     let state_groups = read.open_table(STATE_GROUP_VERSIONS)?;
     let state_operations = read.open_table(STATE_OPERATIONS)?;
@@ -20304,6 +20537,20 @@ fn inspect_state_readable(
             return Err(StoreError::StateInvariant(
                 "State acceptance markers must be nonzero and unique",
             ));
+        }
+        if let Some(state_acceptance_order) = &state_acceptance_order {
+            let ordered_transfer = state_acceptance_order
+                .get(marker)?
+                .map(|value| parse_state_transfer_id("State acceptance-order table", value.value()))
+                .transpose()?
+                .ok_or(StoreError::StateInvariant(
+                    "State acceptance-order index is missing an accepted State",
+                ))?;
+            if ordered_transfer != transfer_id {
+                return Err(StoreError::StateInvariant(
+                    "State acceptance-order index differs from its forward marker",
+                ));
+            }
         }
         let indexed = state_semantic_items
             .get(state.semantic_id.as_bytes().as_slice())?
@@ -20440,6 +20687,38 @@ fn inspect_state_readable(
         let (key, _) = row?;
         if states.get(key.value())?.is_none() {
             return Err(StoreError::StateInvariant("State marker is orphaned"));
+        }
+    }
+    if let Some(state_acceptance_order) = &state_acceptance_order {
+        if state_acceptance_order.len()? != snapshot.count {
+            return Err(StoreError::StateInvariant(
+                "State acceptance-order index has missing or orphan rows",
+            ));
+        }
+        for row in state_acceptance_order.iter()? {
+            let (marker, transfer) = row?;
+            let marker = marker.value();
+            if marker == 0 {
+                return Err(StoreError::StateInvariant(
+                    "State acceptance-order index contains a zero marker",
+                ));
+            }
+            let transfer_id =
+                parse_state_transfer_id("State acceptance-order table", transfer.value())?;
+            if states.get(transfer_id.as_bytes().as_slice())?.is_none() {
+                return Err(StoreError::StateInvariant(
+                    "State acceptance-order index points to a missing accepted State",
+                ));
+            }
+            if state_markers
+                .get(transfer_id.as_bytes().as_slice())?
+                .map(|value| value.value())
+                != Some(marker)
+            {
+                return Err(StoreError::StateInvariant(
+                    "State acceptance-order index differs from its forward marker",
+                ));
+            }
         }
     }
     for row in state_semantic_items.iter()? {
@@ -21963,6 +22242,7 @@ fn inspect_readable(
         )?;
     }
     let event_subscription_stats = event_subscription_stats_read(&read)?;
+    let state_subscription_stats = state_subscription::inspect_state_subscription_tables(&read)?;
     let control_stats = inspect_control_tables(&read, mission_authority)?.unwrap_or_default();
     let aggregate_items = [
         ITEM_COUNT,
@@ -22002,6 +22282,7 @@ fn inspect_readable(
         record_stats,
         blob_stats,
         event_subscription_stats,
+        state_subscription_stats,
         control_stats,
         custody_stats,
         mission_authority,
@@ -22566,6 +22847,9 @@ mod tests {
         let mut markers = write
             .open_table(STATE_ACCEPTANCE_MARKERS)
             .expect("State markers");
+        let mut acceptance_order = write
+            .open_table(STATE_ACCEPTANCE_ORDER)
+            .expect("State acceptance order");
         let mut semantics = write
             .open_table(STATE_SEMANTIC_ITEMS)
             .expect("State semantic items");
@@ -22605,6 +22889,9 @@ mod tests {
             markers
                 .insert(transfer_id.as_bytes().as_slice(), index + 1)
                 .expect("insert State fixture marker");
+            acceptance_order
+                .insert(index + 1, transfer_id.as_bytes().as_slice())
+                .expect("insert State fixture acceptance order");
             semantics
                 .insert(
                     semantic_id.as_bytes().as_slice(),
@@ -22617,7 +22904,15 @@ mod tests {
             dots.insert(dot_key.as_slice(), semantic_id.as_bytes().as_slice())
                 .expect("insert State fixture dot");
         }
-        drop((states, bytes, markers, semantics, groups, dots));
+        drop((
+            states,
+            bytes,
+            markers,
+            acceptance_order,
+            semantics,
+            groups,
+            dots,
+        ));
         write
             .open_table(PUBLISHER_HIGH_WATER)
             .expect("publisher high-water")
@@ -32712,6 +33007,21 @@ mod tests {
             write
                 .delete_table(STATE_OPERATIONS)
                 .expect("delete State operations");
+            write
+                .delete_table(STATE_ACCEPTANCE_ORDER)
+                .expect("delete post-legacy State acceptance order");
+            write
+                .delete_table(state_subscription::STATE_SUBSCRIPTIONS)
+                .expect("delete post-legacy State subscriptions");
+            write
+                .delete_table(state_subscription::STATE_SUBSCRIPTION_PENDING)
+                .expect("delete post-legacy State pending deliveries");
+            write
+                .delete_table(state_subscription::STATE_DELIVERY_ACKNOWLEDGEMENTS)
+                .expect("delete post-legacy State acknowledgements");
+            write
+                .delete_table(state_subscription::STATE_DELIVERY_CURSORS)
+                .expect("delete post-legacy State delivery cursors");
             {
                 let mut metadata = write.open_table(METADATA).expect("metadata");
                 for field in [
@@ -32720,6 +33030,11 @@ mod tests {
                     LAST_STATE_ACCEPTANCE_MARKER,
                     STATE_OPERATION_COUNT,
                     STATE_OPERATION_TOTAL_BYTES,
+                    state_subscription::STATE_SUBSCRIPTION_COUNT,
+                    state_subscription::STATE_PENDING_DELIVERY_COUNT,
+                    state_subscription::STATE_ACKNOWLEDGEMENT_COUNT,
+                    state_subscription::STATE_DELIVERY_CURSOR_COUNT,
+                    state_subscription::STATE_SELECTOR_GENERATION,
                 ] {
                     metadata.remove(field).expect("remove State counter");
                 }
@@ -32790,6 +33105,919 @@ mod tests {
                     0
                 );
             }
+        }
+    }
+
+    #[test]
+    fn state_subscription_replay_conflict_and_selector_race_fail_closed() {
+        assert!(matches!(
+            StateSubscriptionKey::new(Vec::new()),
+            Err(StoreError::InvalidStateSubscriptionKey { length: 0 })
+        ));
+        assert!(matches!(
+            StateSubscriptionKey::new(vec![0; MAX_STATE_SUBSCRIPTION_KEY_BYTES + 1]),
+            Err(StoreError::InvalidStateSubscriptionKey { .. })
+        ));
+
+        let file = TestFile::new("State subscription replay and race");
+        let mut services = state_services(0xba);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("open store");
+        let policy = store.control_policy_snapshot().expect("settled policy");
+        let key = StateSubscriptionKey::new(b"application/state".to_vec()).expect("key");
+        let spec = StateSubscriptionSpec {
+            topic: state_topic(),
+            scope: state_scope(),
+            include_descendant_scopes: false,
+        };
+        let created = store
+            .create_state_subscription_with_policy(&policy, &key, spec.clone())
+            .expect("create State subscription");
+        assert!(created.inserted);
+        assert_eq!(
+            store
+                .create_state_subscription_with_policy(&policy, &key, spec.clone())
+                .expect("exact create retry"),
+            StateSubscriptionCreateOutcome {
+                id: created.id,
+                inserted: false,
+            }
+        );
+        let mut conflicting = spec.clone();
+        conflicting.include_descendant_scopes = true;
+        assert!(matches!(
+            store.create_state_subscription_with_policy(&policy, &key, conflicting),
+            Err(StoreError::StateSubscriptionConflict)
+        ));
+
+        let reservation = store
+            .reserve_state_with_policy(
+                &policy,
+                services.first.identity(),
+                &state_topic(),
+                &state_scope(),
+            )
+            .expect("reserve State");
+        let (state, sealed, _) = reserved_state(
+            &mut services.first,
+            &mut services.reader,
+            &reservation,
+            b"asset/race",
+            b"one",
+            false,
+            1,
+        );
+        store
+            .commit_reserved_state(&reservation, &state, &sealed)
+            .expect("commit State");
+        let plan = store
+            .prepare_state_subscription_poll_with_policy(&policy, created.id, 1, 8)
+            .expect("prepare full snapshot");
+        let semantic_id = StateSemanticId::from_bytes(state.item_id());
+        let selection = StateSubscriptionPollSelection {
+            current: vec![semantic_id],
+            noncurrent: Vec::new(),
+            inactive: Vec::new(),
+        };
+
+        let second_key =
+            StateSubscriptionKey::new(b"application/state/race".to_vec()).expect("second key");
+        let second = store
+            .create_state_subscription_with_policy(&policy, &second_key, spec)
+            .expect("mutate selector generation");
+        assert!(matches!(
+            store.commit_state_subscription_poll_with_policy(&policy, &plan, &selection),
+            Err(StoreError::StateSelectorGenerationChanged)
+        ));
+        store
+            .remove_state_subscription_with_policy(&policy, second.id)
+            .expect("remove racing selector");
+        assert_eq!(
+            store.state_subscription_stats().expect("selector stats"),
+            StateSubscriptionStats {
+                subscriptions: 1,
+                pending_deliveries: 0,
+                acknowledged_deliveries: 0,
+                delivery_cursors: 0,
+                selector_generation: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn state_subscription_retries_current_heads_suppresses_ancestors_and_purges_ledgers() {
+        let file = TestFile::new("State subscription durable delivery");
+        let mut services = state_services(0xbb);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("open store");
+        let policy = store.control_policy_snapshot().expect("settled policy");
+        let key = StateSubscriptionKey::new(b"application/current-state".to_vec()).expect("key");
+        let spec = StateSubscriptionSpec {
+            topic: state_topic(),
+            scope: state_scope(),
+            include_descendant_scopes: false,
+        };
+        let subscription = store
+            .create_state_subscription_with_policy(&policy, &key, spec.clone())
+            .expect("create subscription")
+            .id;
+
+        let first_reservation = store
+            .reserve_state_with_policy(
+                &policy,
+                services.first.identity(),
+                &state_topic(),
+                &state_scope(),
+            )
+            .expect("reserve ancestor");
+        let (first, first_sealed, _) = reserved_state(
+            &mut services.first,
+            &mut services.reader,
+            &first_reservation,
+            b"asset/lineage",
+            b"ancestor",
+            false,
+            1,
+        );
+        store
+            .commit_reserved_state(&first_reservation, &first, &first_sealed)
+            .expect("commit ancestor");
+        let first_id = StateSemanticId::from_bytes(first.item_id());
+        let first_plan = store
+            .prepare_state_subscription_poll_with_policy(&policy, subscription, 1, 8)
+            .expect("prepare ancestor");
+        assert_eq!(first_plan.candidates().len(), 1);
+        assert_eq!(first_plan.candidates()[0].pending_attempt(), None);
+        let first_selection = StateSubscriptionPollSelection {
+            current: vec![first_id],
+            noncurrent: Vec::new(),
+            inactive: Vec::new(),
+        };
+        let stale_first_plan = first_plan.clone();
+        let first_page = store
+            .commit_state_subscription_poll_with_policy(&policy, &first_plan, &first_selection)
+            .expect("commit ancestor attempt");
+        assert_eq!(first_page.deliveries[0].attempt, 1);
+        let old_a_attempt_one = first_page.deliveries[0].token;
+        assert!(matches!(
+            store.commit_state_subscription_poll_with_policy(
+                &policy,
+                &stale_first_plan,
+                &first_selection,
+            ),
+            Err(StoreError::StateSubscriptionPlanChanged)
+        ));
+        drop(store);
+
+        let store = Store::open_for_mission(&file.0, services.authority).expect("reopen retry");
+        let policy = store.control_policy_snapshot().expect("reopen policy");
+        let retry_plan = store
+            .prepare_state_subscription_poll_with_policy(&policy, subscription, 1, 8)
+            .expect("prepare durable retry");
+        assert_eq!(retry_plan.candidates()[0].pending_attempt(), Some(1));
+        let retry_page = store
+            .commit_state_subscription_poll_with_policy(&policy, &retry_plan, &first_selection)
+            .expect("commit durable retry");
+        assert_eq!(retry_page.deliveries[0].attempt, 2);
+        assert_eq!(
+            store
+                .acknowledge_state_delivery_with_policy(
+                    &policy,
+                    subscription,
+                    first_id,
+                    old_a_attempt_one,
+                )
+                .expect("ack ancestor"),
+            StateDeliveryAck::Acknowledged
+        );
+
+        let successor_reservation = store
+            .reserve_state_with_policy(
+                &policy,
+                services.first.identity(),
+                &state_topic(),
+                &state_scope(),
+            )
+            .expect("reserve successor");
+        assert!(successor_reservation.context().observes(first.dot()));
+        let (successor, successor_sealed, _) = reserved_state(
+            &mut services.first,
+            &mut services.reader,
+            &successor_reservation,
+            b"asset/lineage",
+            b"successor",
+            false,
+            1,
+        );
+        store
+            .commit_reserved_state(&successor_reservation, &successor, &successor_sealed)
+            .expect("commit successor");
+        let successor_id = StateSemanticId::from_bytes(successor.item_id());
+        let successor_plan = store
+            .prepare_state_subscription_poll_with_policy(&policy, subscription, 1, 8)
+            .expect("prepare successor snapshot");
+        assert_eq!(successor_plan.candidates().len(), 2);
+        assert_eq!(
+            successor_plan.candidates()[0].acknowledged_attempt(),
+            Some(2)
+        );
+        let successor_selection = StateSubscriptionPollSelection {
+            current: vec![successor_id],
+            noncurrent: vec![first_id],
+            inactive: Vec::new(),
+        };
+        let successor_page = store
+            .commit_state_subscription_poll_with_policy(
+                &policy,
+                &successor_plan,
+                &successor_selection,
+            )
+            .expect("deliver only successor");
+        assert_eq!(successor_page.deliveries.len(), 1);
+        assert_eq!(successor_page.deliveries[0].state.semantic_id, successor_id);
+        assert_eq!(successor_page.deliveries[0].attempt, 1);
+        assert_eq!(
+            old_a_attempt_one.incarnation(),
+            successor_page.deliveries[0].token.incarnation()
+        );
+        assert_eq!(
+            old_a_attempt_one.tenure(),
+            successor_page.deliveries[0].token.tenure()
+        );
+        assert_eq!(
+            old_a_attempt_one.attempt(),
+            successor_page.deliveries[0].token.attempt()
+        );
+        assert!(matches!(
+            store.acknowledge_state_delivery_with_policy(
+                &policy,
+                subscription,
+                successor_id,
+                old_a_attempt_one,
+            ),
+            Err(StoreError::StateDeliveryTokenBindingMismatch)
+        ));
+        assert_eq!(
+            store
+                .state_subscription_stats()
+                .expect("cross-State token swap leaves successor pending"),
+            StateSubscriptionStats {
+                subscriptions: 1,
+                pending_deliveries: 1,
+                acknowledged_deliveries: 0,
+                delivery_cursors: 2,
+                selector_generation: 1,
+            }
+        );
+        assert!(matches!(
+            store.prepare_state_subscription_poll_with_policy(&policy, subscription, 1, 1),
+            Err(StoreError::StateSubscriptionPollLimitExceeded {
+                requested: 2,
+                maximum: 1,
+            })
+        ));
+        let old_incarnation_attempt_one = successor_page.deliveries[0].token;
+        drop(store);
+
+        let store = Store::open_for_mission(&file.0, services.authority).expect("reopen successor");
+        let policy = store
+            .control_policy_snapshot()
+            .expect("successor retry policy");
+        let successor_retry_plan = store
+            .prepare_state_subscription_poll_with_policy(&policy, subscription, 1, 8)
+            .expect("prepare successor retry");
+        assert_eq!(
+            successor_retry_plan
+                .candidates()
+                .iter()
+                .find(|candidate| candidate.state().semantic_id == successor_id)
+                .expect("successor candidate")
+                .pending_attempt(),
+            Some(1)
+        );
+        let successor_retry = store
+            .commit_state_subscription_poll_with_policy(
+                &policy,
+                &successor_retry_plan,
+                &successor_selection,
+            )
+            .expect("commit successor retry");
+        assert_eq!(successor_retry.deliveries[0].attempt, 2);
+        assert_eq!(
+            store
+                .acknowledge_state_delivery_with_policy(
+                    &policy,
+                    subscription,
+                    successor_id,
+                    successor_retry.deliveries[0].token,
+                )
+                .expect("ack successor"),
+            StateDeliveryAck::Acknowledged
+        );
+        assert_eq!(
+            store
+                .acknowledge_state_delivery_with_policy(
+                    &policy,
+                    subscription,
+                    successor_id,
+                    successor_retry.deliveries[0].token,
+                )
+                .expect("idempotent successor ack"),
+            StateDeliveryAck::AlreadyAcknowledged
+        );
+        let settled_plan = store
+            .prepare_state_subscription_poll_with_policy(&policy, subscription, 1, 8)
+            .expect("prepare fully acknowledged snapshot");
+        let settled = store
+            .commit_state_subscription_poll_with_policy(
+                &policy,
+                &settled_plan,
+                &successor_selection,
+            )
+            .expect("commit ancestor-suppressed snapshot");
+        assert!(settled.deliveries.is_empty());
+        assert!(!settled.has_more);
+        assert_eq!(
+            store
+                .state_subscription_stats()
+                .expect("acknowledged stats"),
+            StateSubscriptionStats {
+                subscriptions: 1,
+                pending_deliveries: 0,
+                acknowledged_deliveries: 1,
+                delivery_cursors: 2,
+                selector_generation: 1,
+            }
+        );
+
+        let reactivate_ancestor_selection = StateSubscriptionPollSelection {
+            current: vec![first_id],
+            noncurrent: Vec::new(),
+            inactive: vec![successor_id],
+        };
+        let reactivate_ancestor_plan = store
+            .prepare_state_subscription_poll_with_policy(&policy, subscription, 1, 8)
+            .expect("prepare acknowledged ancestor reactivation");
+        let reactivate_ancestor = store
+            .commit_state_subscription_poll_with_policy(
+                &policy,
+                &reactivate_ancestor_plan,
+                &reactivate_ancestor_selection,
+            )
+            .expect("reactivate acknowledged ancestor");
+        assert_eq!(reactivate_ancestor.deliveries.len(), 1);
+        assert_eq!(
+            reactivate_ancestor.deliveries[0].state.semantic_id,
+            first_id
+        );
+        assert_eq!(reactivate_ancestor.deliveries[0].attempt, 1);
+        assert_eq!(
+            reactivate_ancestor.deliveries[0].token.tenure(),
+            old_a_attempt_one.tenure() + 1
+        );
+        assert_eq!(
+            store
+                .acknowledge_state_delivery_with_policy(
+                    &policy,
+                    subscription,
+                    first_id,
+                    old_a_attempt_one,
+                )
+                .expect("late acknowledged-tenure token is idempotent"),
+            StateDeliveryAck::AlreadyAcknowledged
+        );
+        assert_eq!(
+            store
+                .state_subscription_stats()
+                .expect("reactivated ancestor remains pending"),
+            StateSubscriptionStats {
+                subscriptions: 1,
+                pending_deliveries: 1,
+                acknowledged_deliveries: 0,
+                delivery_cursors: 2,
+                selector_generation: 1,
+            }
+        );
+        let unacknowledged_ancestor_tenure = reactivate_ancestor.deliveries[0].token;
+
+        let reactivate_successor_plan = store
+            .prepare_state_subscription_poll_with_policy(&policy, subscription, 1, 8)
+            .expect("prepare successor reactivation");
+        let reactivate_successor = store
+            .commit_state_subscription_poll_with_policy(
+                &policy,
+                &reactivate_successor_plan,
+                &successor_selection,
+            )
+            .expect("retire unacknowledged ancestor tenure");
+        assert_eq!(reactivate_successor.deliveries.len(), 1);
+        assert_eq!(
+            reactivate_successor.deliveries[0].state.semantic_id,
+            successor_id
+        );
+        assert_eq!(reactivate_successor.deliveries[0].attempt, 1);
+
+        let reactivate_ancestor_again_plan = store
+            .prepare_state_subscription_poll_with_policy(&policy, subscription, 1, 8)
+            .expect("prepare second ancestor reactivation");
+        let reactivate_ancestor_again = store
+            .commit_state_subscription_poll_with_policy(
+                &policy,
+                &reactivate_ancestor_again_plan,
+                &reactivate_ancestor_selection,
+            )
+            .expect("reactivate ancestor in a fresh tenure");
+        assert_eq!(reactivate_ancestor_again.deliveries.len(), 1);
+        assert_eq!(
+            reactivate_ancestor_again.deliveries[0].state.semantic_id,
+            first_id
+        );
+        assert_eq!(reactivate_ancestor_again.deliveries[0].attempt, 1);
+        assert_eq!(
+            reactivate_ancestor_again.deliveries[0].token.tenure(),
+            unacknowledged_ancestor_tenure.tenure() + 1
+        );
+        assert!(matches!(
+            store.acknowledge_state_delivery_with_policy(
+                &policy,
+                subscription,
+                first_id,
+                unacknowledged_ancestor_tenure,
+            ),
+            Err(StoreError::StateDeliveryTenureChanged {
+                current,
+                received,
+            }) if current == reactivate_ancestor_again.deliveries[0].token.tenure()
+                && received == unacknowledged_ancestor_tenure.tenure()
+        ));
+        assert_eq!(
+            store
+                .state_subscription_stats()
+                .expect("stale unacknowledged tenure leaves fresh tenure pending"),
+            StateSubscriptionStats {
+                subscriptions: 1,
+                pending_deliveries: 1,
+                acknowledged_deliveries: 0,
+                delivery_cursors: 2,
+                selector_generation: 1,
+            }
+        );
+        assert_eq!(
+            store
+                .acknowledge_state_delivery_with_policy(
+                    &policy,
+                    subscription,
+                    first_id,
+                    reactivate_ancestor_again.deliveries[0].token,
+                )
+                .expect("acknowledge fresh ancestor tenure"),
+            StateDeliveryAck::Acknowledged
+        );
+        assert_eq!(
+            store
+                .state_subscription_stats()
+                .expect("fresh ancestor tenure acknowledged"),
+            StateSubscriptionStats {
+                subscriptions: 1,
+                pending_deliveries: 0,
+                acknowledged_deliveries: 1,
+                delivery_cursors: 2,
+                selector_generation: 1,
+            }
+        );
+
+        assert!(
+            store
+                .remove_state_subscription_with_policy(&policy, subscription)
+                .expect("purge subscription")
+                .removed
+        );
+        assert_eq!(
+            store.state_subscription_stats().expect("purged stats"),
+            StateSubscriptionStats {
+                subscriptions: 0,
+                pending_deliveries: 0,
+                acknowledged_deliveries: 0,
+                delivery_cursors: 0,
+                selector_generation: 2,
+            }
+        );
+        let recreated = store
+            .create_state_subscription_with_policy(&policy, &key, spec)
+            .expect("recreate same stable identity");
+        assert_eq!(recreated.id, subscription);
+        let replay_plan = store
+            .prepare_state_subscription_poll_with_policy(&policy, subscription, 1, 8)
+            .expect("prepare after receipt purge");
+        assert!(
+            replay_plan
+                .candidates()
+                .iter()
+                .all(|candidate| candidate.acknowledged_attempt().is_none())
+        );
+        let replay = store
+            .commit_state_subscription_poll_with_policy(&policy, &replay_plan, &successor_selection)
+            .expect("redeliver current after recreate");
+        assert_eq!(replay.deliveries[0].attempt, 1);
+        assert_eq!(old_incarnation_attempt_one.attempt(), 1);
+        assert_eq!(replay.deliveries[0].token.attempt(), 1);
+        assert_ne!(
+            old_incarnation_attempt_one.incarnation(),
+            replay.deliveries[0].token.incarnation()
+        );
+        assert!(matches!(
+            store.acknowledge_state_delivery_with_policy(
+                &policy,
+                subscription,
+                successor_id,
+                old_incarnation_attempt_one,
+            ),
+            Err(StoreError::StateSubscriptionIncarnationChanged { .. })
+        ));
+        assert_eq!(
+            store
+                .state_subscription_stats()
+                .expect("stale ABA ack stats"),
+            StateSubscriptionStats {
+                subscriptions: 1,
+                pending_deliveries: 1,
+                acknowledged_deliveries: 0,
+                delivery_cursors: 1,
+                selector_generation: 3,
+            }
+        );
+        let successor_marker = replay.deliveries[0].state.acceptance_marker;
+        drop(store);
+
+        {
+            let database = Database::open(&file.0).expect("open corrupt ledger");
+            let write = database.begin_write().expect("corrupt ledger write");
+            let mut key_bytes = [0u8; 40];
+            key_bytes[..32].copy_from_slice(subscription.as_bytes());
+            key_bytes[32..].copy_from_slice(&successor_marker.to_be_bytes());
+            let mut malformed = Vec::with_capacity(49);
+            malformed.push(1);
+            malformed.extend_from_slice(successor_id.as_bytes());
+            malformed.extend_from_slice(&1u64.to_be_bytes());
+            malformed.extend_from_slice(&0u64.to_be_bytes());
+            write
+                .open_table(state_subscription::STATE_SUBSCRIPTION_PENDING)
+                .expect("pending table")
+                .insert(key_bytes.as_slice(), malformed.as_slice())
+                .expect("corrupt pending attempt");
+            write.commit().expect("commit ledger corruption");
+        }
+        for result in [
+            Store::inspect_existing(&file.0).map(|_| ()),
+            Store::open_for_mission(&file.0, services.authority).map(|_| ()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(StoreError::StateInvariant(
+                    "State pending-delivery tenure or attempt count is zero"
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn state_acceptance_order_migrates_exact_legacy_absence_and_rejects_corruption() {
+        let file = TestFile::new("State acceptance order migration");
+        let mut services = state_services(0xbc);
+        let (first_stored, second_stored) = {
+            let store =
+                Store::open_for_mission(&file.0, services.authority).expect("open State store");
+            let policy = store.control_policy_snapshot().expect("settled policy");
+            let first_reservation = store
+                .reserve_state_with_policy(
+                    &policy,
+                    services.first.identity(),
+                    &state_topic(),
+                    &state_scope(),
+                )
+                .expect("reserve first State");
+            let (first, first_sealed, _) = reserved_state(
+                &mut services.first,
+                &mut services.reader,
+                &first_reservation,
+                b"asset/order/one",
+                b"one",
+                false,
+                1,
+            );
+            store
+                .commit_reserved_state(&first_reservation, &first, &first_sealed)
+                .expect("commit first State");
+            let second_reservation = store
+                .reserve_state_with_policy(
+                    &policy,
+                    services.first.identity(),
+                    &state_topic(),
+                    &state_scope(),
+                )
+                .expect("reserve second State");
+            let (second, second_sealed, _) = reserved_state(
+                &mut services.first,
+                &mut services.reader,
+                &second_reservation,
+                b"asset/order/two",
+                b"two",
+                false,
+                1,
+            );
+            store
+                .commit_reserved_state(&second_reservation, &second, &second_sealed)
+                .expect("commit second State");
+            (
+                store
+                    .state_by_semantic_id(StateSemanticId::from_bytes(first.item_id()))
+                    .expect("read first State")
+                    .expect("first State row"),
+                store
+                    .state_by_semantic_id(StateSemanticId::from_bytes(second.item_id()))
+                    .expect("read second State")
+                    .expect("second State row"),
+            )
+        };
+        {
+            let database = Database::open(&file.0).expect("open legacy simulation");
+            let write = database.begin_write().expect("legacy simulation write");
+            write
+                .delete_table(STATE_ACCEPTANCE_ORDER)
+                .expect("remove post-legacy State index");
+            write
+                .delete_table(state_subscription::STATE_SUBSCRIPTIONS)
+                .expect("remove post-legacy State subscriptions");
+            write
+                .delete_table(state_subscription::STATE_SUBSCRIPTION_PENDING)
+                .expect("remove post-legacy State pending deliveries");
+            write
+                .delete_table(state_subscription::STATE_DELIVERY_ACKNOWLEDGEMENTS)
+                .expect("remove post-legacy State acknowledgements");
+            write
+                .delete_table(state_subscription::STATE_DELIVERY_CURSORS)
+                .expect("remove post-legacy State delivery cursors");
+            {
+                let mut metadata = write.open_table(METADATA).expect("legacy metadata");
+                for field in [
+                    state_subscription::STATE_SUBSCRIPTION_COUNT,
+                    state_subscription::STATE_PENDING_DELIVERY_COUNT,
+                    state_subscription::STATE_ACKNOWLEDGEMENT_COUNT,
+                    state_subscription::STATE_DELIVERY_CURSOR_COUNT,
+                    state_subscription::STATE_SELECTOR_GENERATION,
+                ] {
+                    metadata
+                        .remove(field)
+                        .expect("remove post-legacy subscription metadata");
+                }
+            }
+            write.commit().expect("commit legacy simulation");
+        }
+        assert_eq!(
+            Store::inspect_existing(&file.0)
+                .expect("legacy State store remains read-only inspectable")
+                .state_stats
+                .states,
+            2
+        );
+        drop(
+            Store::open_for_mission(&file.0, services.authority)
+                .expect("writable open backfills State acceptance order"),
+        );
+        {
+            let database = redb::Builder::new()
+                .open_read_only(&file.0)
+                .expect("read migrated State store");
+            let read = database.begin_read().expect("read transaction");
+            let order = read
+                .open_table(STATE_ACCEPTANCE_ORDER)
+                .expect("migrated State order");
+            assert_eq!(
+                order
+                    .get(1)
+                    .expect("first order row")
+                    .expect("first row")
+                    .value(),
+                first_stored.transfer_id.as_bytes().as_slice()
+            );
+            assert_eq!(
+                order
+                    .get(2)
+                    .expect("second order row")
+                    .expect("second row")
+                    .value(),
+                second_stored.transfer_id.as_bytes().as_slice()
+            );
+        }
+        {
+            let database = Database::open(&file.0).expect("open corrupt State index");
+            let write = database.begin_write().expect("corrupt State index write");
+            write
+                .open_table(STATE_ACCEPTANCE_ORDER)
+                .expect("State acceptance order")
+                .insert(1, second_stored.transfer_id.as_bytes().as_slice())
+                .expect("misindex first marker");
+            write.commit().expect("commit corrupt State order");
+        }
+        for result in [
+            Store::inspect_existing(&file.0).map(|_| ()),
+            Store::open_for_mission(&file.0, services.authority).map(|_| ()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(StoreError::StateInvariant(
+                    "State acceptance-order index differs from its forward marker"
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn current_state_subscription_schema_rejects_missing_acceptance_order() {
+        let file = TestFile::new("current State acceptance order deletion");
+        let mut services = state_services(0xbd);
+        let store =
+            Store::open_for_mission(&file.0, services.authority).expect("open current State store");
+        let policy = store.control_policy_snapshot().expect("settled policy");
+        let subscription = store
+            .create_state_subscription_with_policy(
+                &policy,
+                &StateSubscriptionKey::new(b"application/current-order".to_vec())
+                    .expect("subscription key"),
+                StateSubscriptionSpec {
+                    topic: state_topic(),
+                    scope: state_scope(),
+                    include_descendant_scopes: false,
+                },
+            )
+            .expect("create current subscription")
+            .id;
+        let reservation = store
+            .reserve_state_with_policy(
+                &policy,
+                services.first.identity(),
+                &state_topic(),
+                &state_scope(),
+            )
+            .expect("reserve subscribed State");
+        let (state, sealed, _) = reserved_state(
+            &mut services.first,
+            &mut services.reader,
+            &reservation,
+            b"asset/current-order",
+            b"current",
+            false,
+            1,
+        );
+        store
+            .commit_reserved_state(&reservation, &state, &sealed)
+            .expect("commit subscribed State");
+        let semantic_id = StateSemanticId::from_bytes(state.item_id());
+        let plan = store
+            .prepare_state_subscription_poll_with_policy(&policy, subscription, 1, 8)
+            .expect("prepare current-schema delivery");
+        let page = store
+            .commit_state_subscription_poll_with_policy(
+                &policy,
+                &plan,
+                &StateSubscriptionPollSelection {
+                    current: vec![semantic_id],
+                    noncurrent: Vec::new(),
+                    inactive: Vec::new(),
+                },
+            )
+            .expect("commit current-schema delivery");
+        assert_eq!(page.deliveries.len(), 1);
+        drop(store);
+
+        {
+            let database = Database::open(&file.0).expect("open current-schema corruption");
+            let write = database
+                .begin_write()
+                .expect("current-schema corruption write");
+            write
+                .delete_table(STATE_ACCEPTANCE_ORDER)
+                .expect("delete current-schema State acceptance order");
+            write.commit().expect("commit current-schema corruption");
+        }
+        for result in [
+            Store::inspect_existing(&file.0).map(|_| ()),
+            Store::open_for_mission(&file.0, services.authority).map(|_| ()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(StoreError::StateInvariant(
+                    "State acceptance-order index is missing from current schema"
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn current_state_schema_rejects_whole_base_deletion() {
+        let file = TestFile::new("current whole State base deletion");
+        let services = state_services(0xbe);
+        drop(
+            Store::open_for_mission(&file.0, services.authority)
+                .expect("open empty current State store"),
+        );
+        {
+            let database = Database::open(&file.0).expect("open base-schema corruption");
+            let write = database
+                .begin_write()
+                .expect("base-schema corruption write");
+            write.delete_table(STATES).expect("delete State metadata");
+            write.delete_table(STATE_BYTES).expect("delete State bytes");
+            write
+                .delete_table(STATE_ACCEPTANCE_MARKERS)
+                .expect("delete State acceptance markers");
+            write
+                .delete_table(STATE_SEMANTIC_ITEMS)
+                .expect("delete State semantic index");
+            write
+                .delete_table(STATE_GROUP_VERSIONS)
+                .expect("delete State group index");
+            write
+                .delete_table(STATE_OPERATIONS)
+                .expect("delete State operations");
+            {
+                let mut metadata = write.open_table(METADATA).expect("base metadata");
+                for field in [
+                    STATE_ITEM_COUNT,
+                    STATE_TOTAL_BYTES,
+                    LAST_STATE_ACCEPTANCE_MARKER,
+                    STATE_OPERATION_COUNT,
+                    STATE_OPERATION_TOTAL_BYTES,
+                ] {
+                    metadata.remove(field).expect("remove State base metadata");
+                }
+            }
+            write.commit().expect("commit base-schema corruption");
+        }
+        for result in [
+            Store::inspect_existing(&file.0).map(|_| ()),
+            Store::open_for_mission(&file.0, services.authority).map(|_| ()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(StoreError::StateInvariant(
+                    "mission-scoped State schema group is incomplete"
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn current_state_schema_rejects_whole_subscription_deletion() {
+        let file = TestFile::new("current whole State subscription deletion");
+        let services = state_services(0xbf);
+        drop(
+            Store::open_for_mission(&file.0, services.authority)
+                .expect("open empty current State store"),
+        );
+        {
+            let database = Database::open(&file.0).expect("open subscription-schema corruption");
+            let write = database
+                .begin_write()
+                .expect("subscription-schema corruption write");
+            write
+                .delete_table(state_subscription::STATE_SUBSCRIPTIONS)
+                .expect("delete State subscriptions");
+            write
+                .delete_table(state_subscription::STATE_SUBSCRIPTION_PENDING)
+                .expect("delete State pending deliveries");
+            write
+                .delete_table(state_subscription::STATE_DELIVERY_ACKNOWLEDGEMENTS)
+                .expect("delete State acknowledgements");
+            write
+                .delete_table(state_subscription::STATE_DELIVERY_CURSORS)
+                .expect("delete State delivery cursors");
+            {
+                let mut metadata = write.open_table(METADATA).expect("subscription metadata");
+                for field in [
+                    state_subscription::STATE_SUBSCRIPTION_COUNT,
+                    state_subscription::STATE_PENDING_DELIVERY_COUNT,
+                    state_subscription::STATE_ACKNOWLEDGEMENT_COUNT,
+                    state_subscription::STATE_DELIVERY_CURSOR_COUNT,
+                    state_subscription::STATE_SELECTOR_GENERATION,
+                ] {
+                    metadata
+                        .remove(field)
+                        .expect("remove State subscription metadata");
+                }
+            }
+            write
+                .commit()
+                .expect("commit subscription-schema corruption");
+        }
+        for result in [
+            Store::inspect_existing(&file.0).map(|_| ()),
+            Store::open_for_mission(&file.0, services.authority).map(|_| ()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(StoreError::StateInvariant(
+                    "State subscription schema group is incomplete"
+                ))
+            ));
         }
     }
 

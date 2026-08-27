@@ -1,11 +1,11 @@
 # Selected State API quickstart
 
 This is the shortest path to Aster's **selected State projection**. A running
-node exposes cloneable async publish/query handles, and the same composition
-retains an exclusive stopped facade for maintenance or applications that do not
-need networking. Both return the deterministic current value plus optional
-recoverable history without exposing envelopes, cryptographic keys, sealed
-bytes, or reducer internals.
+node exposes cloneable async publish, query, and durable delivery-subscription
+handles, and the same composition retains an exclusive stopped facade for
+maintenance or applications that do not need networking. Both return the
+deterministic current value plus optional recoverable history without exposing
+envelopes, cryptographic keys, sealed bytes, or reducer internals.
 
 `RunningNode::selected_state()` returns `SelectedStateHandle`. Its clones send
 commands through the actor's one bounded Event/State/Record lane; they do not
@@ -14,12 +14,16 @@ facade and owns the mission-bound writer exclusively. State reconciles over a
 semantic-v4/v5 mission-authenticated, class- and direction-specific Negentropy
 lane when the receiver configures an exact topic/scope interest.
 
-Durable State subscriptions, selected-node ConnectRPC/C/Go/Python bindings,
-finite TTL, tombstone retention duration, expiry, compaction, garbage
-collection, broader relay acceptance, representative physical/mixed-
-implementation evidence, and release authorization remain open. The selected
-store rejects every finite-TTL State object; there is no forwarding-age path to
-enable yet.
+Durable positive-current-version application delivery is available through the
+selected Rust surface. It is not a synthetic-withdrawal or materialized-view
+feed. Configured `NodeConfig` State interests remain the network receive
+policy in this slice; subscriptions do not dynamically replace them. Dynamic
+network selectors, State/node contact status, Record/Blob delivery, selected-
+node ConnectRPC/C/Go/Python bindings, finite TTL, tombstone retention duration,
+expiry, compaction, garbage collection, broader relay acceptance,
+representative physical/mixed-implementation evidence, and release
+authorization remain open. The selected store rejects every finite-TTL State
+object; there is no forwarding-age path to enable yet.
 
 ## Run the stopped example
 
@@ -100,6 +104,82 @@ secret artifacts. Retained handle clones therefore fail closed with sanitized
 `StateUnavailable`; they never reopen the store or continue on a stale policy.
 Event, State, and Record clones share one bounded command queue, and contacts
 remain governed by the same actor-owned policy/store authority.
+
+## Deliver positive current State versions durably
+
+A State subscription selects every logical key under one exact topic/scope
+filter. Polling returns at most one freshly authenticated positive `Current`
+version per logical key when that version has unacknowledged work. Concurrent
+losers, superseded ancestors, inactive versions, and acknowledged heads still
+participate in the causal reduction. If a committed poll later classifies an
+acknowledged version as noncurrent or inactive, its suppression tenure retires;
+the same semantic version receives a new opaque token if a still-later poll
+selects it as `Current` again. A current tombstone remains an explicit
+empty-payload version rather than unauthenticated absence.
+
+```rust
+let subscription = states
+    .subscribe(StateSubscriptionRequest {
+        operation_key: b"my-app/state-subscription/assets".to_vec(),
+        topic: topic.clone(),
+        scope: scope.clone(),
+        include_descendant_scopes: false,
+    })
+    .await?;
+
+let page = states
+    .poll(StatePollRequest {
+        subscription: subscription.id,
+        delivery_limit: MAX_SELECTED_STATE_DELIVERIES,
+        scan_limit: MAX_SELECTED_STATE_SUBSCRIPTION_SCAN,
+    })
+    .await?;
+
+for delivery in page.deliveries {
+    assert_eq!(delivery.state.disposition, StateVersionDisposition::Current);
+    process_current_version(&delivery.state, delivery.attempt)?;
+    states
+        .acknowledge(subscription.id, delivery.state.id, delivery.token)
+        .await?;
+}
+```
+
+The operation key identifies the selector across process restarts. An exact
+retry returns the same subscription with `inserted=false`; changing its topic,
+scope, or descendant flag fails as a conflict. Delivery attempts are incremented
+in the same durable transaction that records the pending result. If the process
+stops before acknowledgement and that version remains Current, reopening and
+polling returns it with a larger attempt number. Acknowledgement and unsubscribe
+are both idempotent. Each delivery carries the opaque token required for acknowledgement;
+the token binds the subscription incarnation, exact State, current tenure, and
+retry. Applications may persist or transport its canonical `as_bytes()` form
+and restore it with `StateDeliveryToken::from_bytes`; after a crash they may
+instead poll again and acknowledge the newly issued retry token. A token from
+an older acknowledged tenure remains an idempotent replay
+without consuming a later tenure, while an unacknowledged stale-tenure or
+removed-and-recreated subscription token is rejected.
+
+`scan_limit` bounds the complete matching candidate set that must be freshly
+authenticated to compute the projection. If that complete matching set exceeds
+that bound, polling fails without advancing attempts; it never computes a
+current value from a partial snapshot. `has_more` instead means additional
+verified, unacknowledged current heads remain beyond `delivery_limit`.
+
+This is a positive-current-version queue, not a materialized projection or
+transition feed. An empty page means only that no positive Current version is
+currently deliverable; it does not mean the selected keys have no authorized
+current value, and it does not invalidate a value previously processed by the
+application. Revocation, rekey, or route-lineage replacement can make an exact
+`StateQuery` return `current: None` without producing a synthetic withdrawal.
+Applications that require the exact authorized projection at use time must
+query the known logical key. The queue does not report transitions that occur
+and reverse entirely between committed polls.
+
+The subscription is application-delivery intent, not network or cryptographic
+authority. Configure the corresponding State receive interest on networked
+receivers, and keep authorization in the mission bundle. Every poll still
+rechecks current control policy, source authenticity, content authority, route
+lineage, and the complete causal projection before returning plaintext.
 
 Focused current-code automation covers peerless durability, exact retry,
 restart, shutdown admission, and protected same-epoch rekey recovery:
