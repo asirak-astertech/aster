@@ -20,11 +20,12 @@ import sys
 from typing import Any
 
 
-RAW_SCHEMA = "aster-selected-live-mutable-raw/v1"
-CLAIM = "selected-live-state-record-one-host-direct-iroh-two-actor-acceptance"
+RAW_SCHEMA = "aster-selected-live-mutable-raw/v2"
+CLAIM = "selected-live-state-causal-successor-tombstone-record-one-host-direct-iroh-two-actor-acceptance"
 BINARY_NAME = "aster-live-mutable-acceptance"
 MAX_STDOUT_BYTES = 8 * 1024 * 1024
 MAX_TRANSCRIPT_BYTES = 64 * 1024
+TRANSCRIPT_RECORDS = 48
 RUN_TIMEOUT_SECONDS = 180
 BUILD_TIMEOUT_SECONDS = 900
 SIGNER_FINGERPRINT = re.compile(r"(?:[0-9A-F]{40,64}|SHA256:[A-Za-z0-9+/]{43})\Z")
@@ -44,6 +45,11 @@ ADMITTED_PATHS = tuple(
             "Cargo.toml",
             "Cargo.lock",
             "mise.toml",
+            "crates/aster-core/Cargo.toml",
+            "crates/aster-core/src/lib.rs",
+            "crates/aster-core/src/causal.rs",
+            "crates/aster-core/src/source_state.rs",
+            "crates/aster-core/src/crypto/reference.rs",
             "crates/aster-node/Cargo.toml",
             "crates/aster-node/src/lib.rs",
             "crates/aster-node/src/application.rs",
@@ -51,6 +57,8 @@ ADMITTED_PATHS = tuple(
             "crates/aster-node/src/application/record.rs",
             "crates/aster-node/src/runtime.rs",
             "crates/aster-node/examples/live_mutable_acceptance.rs",
+            "crates/aster-redb-store/Cargo.toml",
+            "crates/aster-redb-store/src/lib.rs",
             "tools/run-selected-live-mutable.py",
             "tools/check-selected-live-mutable-receipt.py",
             "tools/test-selected-live-mutable-receipt.py",
@@ -458,7 +466,7 @@ def extract_transcript(stdout_path: Path) -> bytes:
             if not line.endswith(b"\n") or line.endswith(b"\r\n"):
                 raise RunnerFailure()
             records.append(line)
-    if len(records) != 40:
+    if len(records) != TRANSCRIPT_RECORDS:
         raise RunnerFailure()
     transcript = b"".join(records)
     if len(transcript) == 0 or len(transcript) > MAX_TRANSCRIPT_BYTES:

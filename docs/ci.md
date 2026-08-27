@@ -480,32 +480,38 @@ cargo test --locked -p aster-node runtime::tests::run_for_preempts_a_saturated_a
 python3 tools/test-selected-live-mutable-receipt.py
 ```
 
-The separate
-[`selected-live-mutable-2ccfba0.json`](implementation/evidence/selected-live-mutable-2ccfba0.json)
-canonical receipt is 5,660 bytes with SHA-256
-`299a3c3b8d1685deb5980ed091797f7d46119562b67c3d853b94d8552c83b67a`
-and binds the run to good-signature source commit `2ccfba0`. Its two distinct
+The separate v2
+[`selected-live-mutable-6cabb4c.json`](implementation/evidence/selected-live-mutable-6cabb4c.json)
+canonical receipt is 7,752 bytes with SHA-256
+`054945ecf94e8bfba1b130f6a5f47e9b1e0e17ad69f3b1472085a1d10f05eeaa`
+and binds the run to good-signature source commit `6cabb4c`. Its two distinct
 participants and mission identities execute six actor lifetimes with at most
-two concurrent. They publish State and Record while peerless, then four
-paired direct `CONTACT` records account exactly for 5/5/5 selected items
+two concurrent. They publish State and Record while peerless, then eight direct
+`CONTACT` records account exactly for 7/7/7 selected items
 offered/fetched/inserted, zero remaining work, and zero Event/control/Blob
-counters. State selects the maximum ID as `Current`, retains the other as
-`Concurrent`, and reproduces the projection after restart. Record retains two
-conflict siblings, rejects an ordinary publish without changing them, resolves
-only under the exact guard, supersedes both originals, retries without another
-insert, converges, and reproduces the result after restart. Six graceful
-shutdowns complete, and four retained State/Record handles fail closed.
+counters. State first selects the maximum of two heads as `Current` and retains
+the other as `Concurrent`. A node-a successor observes and supersedes both;
+after node-b observes that successor, its authenticated empty tombstone observes
+and supersedes all three predecessors. Both actors select the tombstone as
+current, and one immediate peerless restart reproduces the exact four-version
+projection. Record retains two conflict siblings, rejects an ordinary publish
+without changing them, resolves only under the exact guard, supersedes both
+originals, retries without another insert, converges, and reproduces the result
+after restart. Six graceful shutdowns complete, and four retained State/Record
+handles fail closed.
 
 The receipt records an operator-attested source/binary/execution link, not a
 cryptographic or reproducible-build proof, and validates participant secret
 artifacts by metadata only without opening, reading, or hashing their contents.
-It is one-host same-implementation loopback evidence. It supplies no physical,
-NAT/Internet, controlled/public-relay, BTLE, independent-implementation, scale
-beyond two, resource-threshold, long-duration, Event/Blob-live, or release
-acceptance. Durable State/Record subscriptions, selected-node bindings, finite
-TTL, expiry/garbage collection, and automatic registered-policy Record merge
-remain open. Its zero Blob counters do not evidence the newer live Blob
-mechanism, which still lacks a retained execution receipt.
+State causal observation and publication order are producer-attested. This is
+one-host same-implementation loopback evidence, and the restart is one
+immediate peerless reopen—not indefinite tombstone retention, compaction,
+garbage collection, or delete-wins. It supplies no physical, NAT/Internet,
+controlled/public-relay, BTLE, independent-implementation, scale beyond two,
+resource-threshold, long-duration, Event/Blob-live, or release acceptance.
+Durable State/Record subscriptions, selected-node bindings, finite TTL, and
+automatic registered-policy Record merge remain open. Its zero Blob counters
+do not evidence the newer live Blob mechanism.
 
 The semantic-v5 direct Blob gate is additive to the earlier stopped/local Blob
 gate. It must cover all Blob interest/source/range/result/ack/finish frame bytes,

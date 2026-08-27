@@ -160,6 +160,7 @@ LIVE_MUTABLE_SLICE = (
     "tools/run-selected-live-mutable.py; "
     "tools/check-selected-live-mutable-receipt.py; "
     "tools/test-selected-live-mutable-receipt.py; "
+    "docs/implementation/evidence/selected-live-mutable-6cabb4c.json; "
     "docs/quickstart/selected-state-api.md; "
     "docs/quickstart/selected-record-api.md"
 )
@@ -419,8 +420,8 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     "DM-1-05": selected_claim(
         "observed-bounded",
         "aster-node",
-        f"{RECEIPT}; {LIVE_MUTABLE_RECEIPT}; {LIVE_BLOB_RECEIPT}; stopped and restarted processes reconciled exact source-sealed Event inventories and reused durable reaction operations; two live peers separately published State and Record while peerless, later reconciled five exact mutable items over direct Iroh, and retained the converged State and resolved Record projections after peerless restart; a separate live Blob publisher committed while peerless, seeded a replica, and a receiver retained one-range progress across graceful reopen before the distinct replica supplied the exact remaining complement and the final peerless reopen reproduced the authenticated pages",
-        "Verify the stakeholder-set extended or day-scale disconnection interval, OS-process crash or power-loss recovery, route-only or arbitrary-peer custody, physical systems, generalized policy, mixed implementations, and requirement scale.",
+        f"{RECEIPT}; {LIVE_MUTABLE_SLICE}; {LIVE_MUTABLE_RECEIPT}; {LIVE_BLOB_RECEIPT}; stopped and restarted processes reconciled exact source-sealed Event inventories and reused durable reaction operations; two live peers separately published concurrent State and Record versions while peerless, then eight positive direct-only contacts transferred seven exact mutable items and converged both actors on one State tombstone over three superseded predecessors plus one resolved Record over two superseded siblings before one immediate peerless restart reproduced both exact projections; a separate live Blob publisher committed while peerless, seeded a replica, and a receiver retained one-range progress across graceful reopen before the distinct replica supplied the exact remaining complement and the final peerless reopen reproduced the authenticated pages",
+        "The mutable causal observation/publication order is producer-attested, and its restart covers one immediate graceful peerless reopen rather than an extended retention interval, OS-process crash, power loss, compaction, or garbage collection. Verify the stakeholder-set extended or day-scale disconnection interval, route-only or arbitrary-peer custody, physical systems, generalized policy, mixed implementations, and requirement scale.",
     ),
     "DM-2-14": selected_claim(
         "implemented-uncredited",
@@ -443,14 +444,14 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     "DM-5.1-01": selected_claim(
         "implemented-uncredited",
         "aster-core + aster-redb-store + aster-node",
-        f"{STATE_LOCAL_SLICE}; {MUTABLE_NETWORK_SLICE}; {LIVE_MUTABLE_SLICE}; {LIVE_MUTABLE_RECEIPT}; SelectedStateNode and the actor-owned cloneable SelectedStateHandle source-seal and durably publish bounded State versions, query one exact topic/scope/logical-key projection without exposing sealed representations or provider internals, and reconcile explicit interests under semantic-v4/v5 class/direction lanes; the retained two-peer run exercised peerless live publication, exact retry, direct reconciliation, concurrent projection, handle closure, and restart projection",
-        "The retained run is one same-implementation, one-host, two-participant observation and does not establish causal-successor dominance, a durable State delivery subscription, language bindings, selected relay cache, finite TTL, physical carriers, mixed implementations, scale, or release acceptance. Selected finite State TTL remains structurally rejected.",
+        f"{STATE_LOCAL_SLICE}; {MUTABLE_NETWORK_SLICE}; {LIVE_MUTABLE_SLICE}; {LIVE_MUTABLE_RECEIPT}; SelectedStateNode and the actor-owned cloneable SelectedStateHandle source-seal and durably publish bounded State versions, query one exact topic/scope/logical-key projection without exposing sealed representations or provider internals, and reconcile explicit interests under semantic-v4/v5 class/direction lanes; the retained two-peer run exercised peerless concurrent publication, exact retry, direct reconciliation, deterministic concurrent projection, a non-tombstone successor that observed both initial heads, an empty authenticated tombstone that observed the successor as its one active head and all three prior versions, handle closure, and exact final projection after one immediate peerless restart",
+        "The retained run is one same-implementation, one-host, two-participant observation; its causal observation/publication order is producer-attested, and restart covers one immediate graceful peerless reopen rather than indefinite tombstone retention, compaction, or garbage collection. A durable State delivery subscription, language bindings, selected relay cache, finite TTL, physical carriers, mixed implementations, scale, and release acceptance remain open. Selected finite State TTL remains structurally rejected.",
     ),
     "DM-5.1-02": selected_claim(
-        "implemented-uncredited",
+        "observed-bounded",
         "aster-core + aster-redb-store + aster-node",
-        f"{STATE_LOCAL_SLICE}; {MUTABLE_NETWORK_SLICE}; authenticated State dots and causal context share the selected Event publisher frontier, the store retains causal maxima and dominated versions, the facade independently recomputes the exact-key projection, one durable version reaches an interested independent store over real Iroh, and class/frontier saturation defers transactionally without pruning",
-        "Current tests cover local causal projection, same-epoch old-lineage withholding from ordinary current projection/query and network inventory/transfer with exact same-operation recovery only through strict cached/projection/historical verification, one same-implementation transfer, and capacity/fairness progress. Divergent State convergence, multi-hop/partition behavior, independent interoperability, scale, and retained acceptance remain open.",
+        f"{STATE_LOCAL_SLICE}; {MUTABLE_NETWORK_SLICE}; {LIVE_MUTABLE_SLICE}; {LIVE_MUTABLE_RECEIPT}; authenticated State dots and causal context share the selected Event publisher frontier, and the retained run first kept two peerless publications as exact Current/Concurrent maxima, then projected node-a's counter-four successor as Current with both observed initial versions Superseded on both actors, and finally projected node-b's counter-three empty tombstone as Current with the successor and both originals Superseded on both actors and after one immediate peerless restart",
+        "This is one exact four-version, same-implementation, one-host, two-participant direct-Iroh schedule. The causal observation/query-before-publication order is producer-attested rather than independently reconstructed from public causal vectors, and restart covers one immediate graceful peerless reopen rather than an extended retention, compaction, or garbage-collection interval. Multi-hop and longer partitions, competing successors or tombstones, independent interoperability, physical systems, scale, and release acceptance remain open.",
     ),
     "DM-5.1-04": selected_claim(
         "observed-bounded", "aster-core + aster-redb-store + aster-node",
@@ -565,8 +566,8 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     "DM-5.2-01": selected_claim(
         "observed-bounded",
         "aster-node",
-        f"{RECEIPT}; {LIVE_MUTABLE_RECEIPT}; {LIVE_BLOB_RECEIPT}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; retained Event lines converged exact transfers, the retained live mutable run reconciled two concurrent State versions plus two disconnected Record revisions, and the retained live Blob run transferred one peerless-published two-chunk object through a seeded replica, retained a receiver prefix across graceful reopen, resumed the exact complement from that distinct eligible content peer, and reproduced authenticated pages after final reopen",
-        "The retained observations are same-implementation, one-host, at-most-three-participant, brief cases and are not all-reachable-node or long-partition results. Multiple-scope lifecycle, route-only Blob custody, arbitrary-peer continuation, crash or power-loss recovery, mixed implementations, physical links, requirement scale, and release authorization remain open.",
+        f"{RECEIPT}; {LIVE_MUTABLE_SLICE}; {LIVE_MUTABLE_RECEIPT}; {LIVE_BLOB_RECEIPT}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; retained Event lines converged exact transfers; the retained live mutable run used eight positive direct-only zero-error contacts to transfer seven exact items and converge both actors on the same four-version State projection with an authenticated tombstone Current and three predecessors Superseded plus the same three-version Record projection with the guarded resolution Current and two siblings Superseded, then reproduced both projections after one immediate peerless restart; the retained live Blob run transferred one peerless-published two-chunk object through a seeded replica, retained a receiver prefix across graceful reopen, resumed the exact complement from that distinct eligible content peer, and reproduced authenticated pages after final reopen",
+        "The retained observations are same-implementation, one-host, at-most-three-participant, brief cases and are not all-reachable-node or long-partition results. Mutable causal observation/publication order is producer-attested, and its restart is one immediate graceful peerless reopen rather than crash, power-loss, or indefinite retention evidence. Multiple-scope lifecycle, route-only Blob custody, arbitrary-peer continuation, mixed implementations, physical links, requirement scale, and release authorization remain open.",
     ),
     "DM-5.2-02": selected_claim(
         "implemented-uncredited",
@@ -593,14 +594,14 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     ),
     "DM-5.2-09": selected_claim(
         "observed-bounded", "aster-core + aster-redb-store + aster-node",
-        f"{RECEIPT}; {LIVE_MUTABLE_RECEIPT}; {MUTABLE_NETWORK_SLICE}; an isolated peerless destination publishes causally observing Pong and the durable store rejects dot equivocation; the retained live mutable run preserved two disconnected Record publications as concurrent heads, then a guarded successor observed both sibling IDs and moved both originals into recoverable superseded history across restart",
-        "The new receipt proves concurrent Record distinction and a successor that explicitly observes both heads, but not a causally later State successor; verify broader sequential/concurrent State and Blob projections, long partitions, independent interoperability, physical systems, and scale.",
+        f"{RECEIPT}; {LIVE_MUTABLE_SLICE}; {LIVE_MUTABLE_RECEIPT}; {MUTABLE_NETWORK_SLICE}; an isolated peerless destination publishes causally observing Pong and the durable store rejects dot equivocation; the retained live mutable run distinguished two disconnected State publications as concurrent Current/Concurrent maxima, then made a counter-four successor that observed both exact heads supersede both, and made a counter-three tombstone that observed the successor as its one active head and all three earlier versions supersede all three; the same run separately retained two disconnected Record heads until one guarded successor observed both",
+        "The retained State proof is one exact two-publisher sequence whose query/observation/publication order is producer-attested; public receipt fields do not expose the causal vector itself, and only the final tombstone projection is checked across one immediate graceful peerless restart. Verify competing successors and tombstones, broader sequential/concurrent projections, long and multi-hop partitions, independent interoperability, physical systems, and scale.",
     ),
     "DM-5.2-10": selected_claim(
         "implemented-uncredited",
         "aster-core + aster-negentropy + aster-node",
-        f"{RECEIPT}; {MUTABLE_NETWORK_SLICE}; Event, State, and Record counters/context are authoritative while class-specific exact transfer IDs reconcile with Negentropy timestamp zero",
-        "Verify tombstone propagation, a future State/Record finite-TTL forwarding-age design (currently rejected), long partitions, and long-running operation without trustworthy time.",
+        f"{RECEIPT}; {LIVE_MUTABLE_SLICE}; {LIVE_MUTABLE_RECEIPT}; {MUTABLE_NETWORK_SLICE}; Event, State, and Record authenticated counters/context are authoritative while class-specific exact transfer IDs reconcile with Negentropy timestamp zero; the retained run projected initial concurrent State, a causally observing successor, and a causally observing tombstone from authenticated counter/context and semantic-ID facts rather than wall-clock order",
+        "The retained run does not inject clock skew or independently reconstruct its producer-attested causal observation/publication order. Verify adversarial clock behavior, a future State/Record finite-TTL forwarding-age design (currently rejected), long partitions, and long-running operation without trustworthy time.",
     ),
     "DM-5.2-13": selected_claim(
         "implemented-uncredited",
@@ -614,6 +615,12 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
         f"{EVENT_SLICE}; {MUTABLE_NETWORK_SLICE}; Event order plus State/Record causal projection use authenticated counters/context, not the Negentropy timestamp field",
         "Broader tombstone/conflict cases, Blob, long partitions, and complete independent wire behavior remain to be verified.",
     ),
+    "DM-5.2-15": selected_claim(
+        "observed-bounded",
+        "aster-core + aster-redb-store + aster-node",
+        f"{STATE_LOCAL_SLICE}; {MUTABLE_NETWORK_SLICE}; {LIVE_MUTABLE_SLICE}; {LIVE_MUTABLE_RECEIPT}; after node-b's exact query observed node-a's causal successor, node-b published one authenticated zero-byte State tombstone at publisher counter three whose context bound one active head and all three prior versions; both connected actors returned the exact four-version projection with that tombstone Current and the successor plus both originals Superseded, its exact retry inserted nothing, and two views after one immediate peerless restart reproduced the same projection",
+        "This proves one direct propagation and immediate graceful-restart observation on one same-implementation host with two participants. The query/observation/publication order is producer-attested, and the restart does not establish tombstone retention duration, compaction, garbage collection, crash or power-loss recovery, or a delete-wins rule. Concurrent deletion/update races, multi-hop and long partitions, physical systems, mixed implementations, scale, and release acceptance remain open.",
+    ),
     "DM-5.2-18": selected_claim(
         "implemented-uncredited",
         "aster-negentropy + aster-node",
@@ -621,16 +628,16 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
         "Publish total-size-versus-difference cost evidence across all four classes at requirement scale, physical links, and mixed implementations.",
     ),
     "DM-5.3-01": selected_claim(
-        "implemented-uncredited",
+        "observed-bounded",
         "aster-core + aster-redb-store + aster-node",
-        f"{STATE_LOCAL_SLICE}; {MUTABLE_NETWORK_SLICE}; an active version whose authenticated context observes another version's dot dominates it, causal maxima remain active, exact-key query returns the deterministic current, and remote ingest retains the same authenticated causal facts",
-        "State crosses same-implementation direct contacts and capacity-deferred work later progresses, but divergent/concurrent State network convergence, expiry/garbage collection, independent interoperability, scale, and retained acceptance remain open.",
+        f"{STATE_LOCAL_SLICE}; {MUTABLE_NETWORK_SLICE}; {LIVE_MUTABLE_SLICE}; {LIVE_MUTABLE_RECEIPT}; an active version whose authenticated context observes another version's dot dominates it; after both actors first retained two concurrent maxima, node-a's counter-four successor observed both and became Current with both originals Superseded, then node-b's counter-three tombstone observed the successor as its one active head and all three prior versions and became Current with all three Superseded on both actors and after one immediate peerless restart",
+        "This is one exact four-version, same-implementation, one-host, two-participant direct-Iroh schedule. Its query/causal-observation/publication order is producer-attested, and restart covers only one immediate graceful peerless reopen, not tombstone retention duration, expiry, compaction, or garbage collection. Competing successors or deletion races, multi-hop and longer partitions, independent interoperability, physical systems, scale, and release acceptance remain open.",
     ),
     "DM-5.3-02": selected_claim(
         "observed-bounded",
         "aster-core + aster-redb-store + aster-node",
-        f"{STATE_LOCAL_SLICE}; {MUTABLE_NETWORK_SLICE}; {LIVE_MUTABLE_SLICE}; {LIVE_MUTABLE_RECEIPT}; two peerless live publishers created concurrent State maxima, both actors converged on the greatest complete authenticated semantic State ID as Current with the other maximum explicitly Concurrent, and both peerless restart views reproduced that projection",
-        "This is one two-value, same-implementation, one-host direct-Iroh tie-break. No delete-wins rule or causally later State successor is inferred; mixed-implementation, relay, physical, adversarial-scale, long-duration, and release acceptance remain open.",
+        f"{STATE_LOCAL_SLICE}; {MUTABLE_NETWORK_SLICE}; {LIVE_MUTABLE_SLICE}; {LIVE_MUTABLE_RECEIPT}; two peerless live publishers created concurrent State maxima and both initial connected views selected the greatest complete authenticated semantic State ID as Current with the other maximum explicitly Concurrent; the later exact successor and tombstone phases instead superseded every causally observed predecessor, separating the concurrent semantic-ID tie-break from causal dominance",
+        "This is one two-value, same-implementation, one-host direct-Iroh tie-break. The later causal observation/publication order is producer-attested, and only the final tombstone projection receives one immediate graceful peerless-restart check. No delete-wins rule, larger concurrent set, mixed-implementation, relay, physical, adversarial-scale, long-duration, or release acceptance is established.",
     ),
     "DM-5.3-06": selected_claim(
         "observed-bounded",

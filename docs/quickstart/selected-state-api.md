@@ -15,10 +15,11 @@ semantic-v4/v5 mission-authenticated, class- and direction-specific Negentropy
 lane when the receiver configures an exact topic/scope interest.
 
 Durable State subscriptions, selected-node ConnectRPC/C/Go/Python bindings,
-finite TTL, expiry, garbage collection, broader relay acceptance,
-representative physical/mixed-implementation evidence, and release authorization
-remain open. The selected store rejects every finite-TTL State object; there is
-no forwarding-age path to enable yet.
+finite TTL, tombstone retention duration, expiry, compaction, garbage
+collection, broader relay acceptance, representative physical/mixed-
+implementation evidence, and release authorization remain open. The selected
+store rejects every finite-TTL State object; there is no forwarding-age path to
+enable yet.
 
 ## Run the stopped example
 
@@ -156,22 +157,30 @@ cargo test --locked -p aster-node \
   -- --exact
 ```
 
-A separate [retained live mutable receipt](../implementation/evidence/selected-live-mutable-2ccfba0.json)
-is a 5,660-byte canonical projection (SHA-256
-`299a3c3b8d1685deb5980ed091797f7d46119562b67c3d853b94d8552c83b67a`)
-bound to signed source `2ccfba0`. Two same-implementation participants ran six
+A separate [retained v2 live mutable receipt](../implementation/evidence/selected-live-mutable-6cabb4c.json)
+is a 7,752-byte canonical projection (SHA-256
+`054945ecf94e8bfba1b130f6a5f47e9b1e0e17ad69f3b1472085a1d10f05eeaa`)
+bound to signed source `6cabb4c`. Two same-implementation participants ran six
 actor lifetimes with at most two concurrent and published State and Record while
-peerless. Four direct `CONTACT` records formed paired equal accounting with
-aggregate 5/5/5 selected items offered/fetched/inserted. The two State
-publications produced the max-ID `Current`/other `Concurrent` projection in four
-connected-and-restart views. Six graceful shutdowns completed, four retained
-handles closed, and Event/control/Blob counters stayed zero.
+peerless. Eight direct `CONTACT` records account for aggregate 7/7/7 selected
+items offered/fetched/inserted. The initial two State publications produce the
+exact max-ID `Current`/other `Concurrent` projection. A node-a successor then
+observes and supersedes both heads. Only after node-b observes that successor
+does node-b publish an authenticated empty tombstone that observes and
+supersedes all three predecessors. Both actors select the tombstone as current,
+and one immediate peerless restart reproduces that exact four-version
+projection. Six graceful shutdowns completed, four retained handles closed,
+and Event/control/Blob counters stayed zero.
 
 The receipt's source-to-execution link is operator-attested, not
 cryptographically proven or reproducible, and secret artifacts were inspected
-by metadata only. It is one-host loopback evidence, not physical, NAT/relay,
-BTLE, mixed-implementation, scale, resource, long-duration, Event/Blob-live, or
-release acceptance. Additional current-code regressions cover exact
+by metadata only. The ordered State observation/publication chain is
+producer-attested. It is one-host same-implementation loopback evidence, and
+the restart is one immediate peerless reopen—not indefinite tombstone
+retention, compaction, garbage collection, delete-wins, physical or mixed
+implementations, NAT/relay, BTLE, scale, resource, long-duration,
+Event/Blob-live, or release acceptance. Additional current-code regressions
+cover exact
 result/acknowledgement, capacity deferral, and fair rotation. Same-epoch old
 lineage is withheld from ordinary current projection/query and network
 inventory/transfer; only an exact idempotent publish retry may recover its
@@ -280,7 +289,9 @@ If that version is current, `projection.current` remains `Some(StateItem)` with
 `tombstone == true`. The facade never turns authenticated deletion into an
 indistinguishable absence. Concurrent edits and tombstones follow the same
 semantic-ID tie-break; this slice has no special delete-wins rule. Retention is
-bounded, but expiry and garbage collection are not implemented by this slice.
+not duration-bounded by this slice: storage capacity is bounded by row, byte,
+per-key version, and operation-ledger quotas, while tombstone retention
+duration, expiry, compaction, and garbage collection remain open.
 
 ## Follow the verification boundary
 

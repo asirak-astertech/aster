@@ -68,11 +68,13 @@ The selected implementation deliberately exposes different maturity levels:
 - **State and Record** have cloneable live Rust handles backed by the running
   actor plus exclusive stopped-node facades, and reconcile directly between
   selected nodes under explicit interests. A
-  [retained bounded receipt](implementation/evidence/selected-live-mutable-2ccfba0.json)
-  covers peerless publication, direct convergence, explicit concurrent State
-  projection, explicit Record conflict/resolution, restart, and handle closure
-  on one loopback host. Their subscriptions, selected-node bindings, finite TTL,
-  and representative physical/mixed acceptance remain open.
+  [retained bounded v2 receipt](implementation/evidence/selected-live-mutable-6cabb4c.json)
+  covers peerless publication, direct convergence, exact concurrent State
+  heads, a causally later successor, a visible authenticated tombstone through
+  one immediate peerless restart, explicit Record conflict/resolution, and
+  handle closure on one loopback host. Their subscriptions, selected-node
+  bindings, finite TTL, tombstone retention duration/garbage collection, and
+  representative physical/mixed acceptance remain open.
 - **Blob** has a cloneable `RunningNode::selected_blobs()` Rust handle for
   peerless-capable durable regular-file publication and authenticated reads of
   at most one 64-KiB, zeroize-on-drop plaintext page. Its exclusive stopped
@@ -95,16 +97,21 @@ representative or physical NAT, public Internet or public/default relay,
 independent implementation, State/Record/Blob relay, complete-MVP, or release
 evidence.
 
-The live mutable receipt is a 5,660-byte canonical projection with SHA-256
-`299a3c3b8d1685deb5980ed091797f7d46119562b67c3d853b94d8552c83b67a`,
-bound to signed source `2ccfba0`. Its two participants ran six actor lifetimes
-with at most two concurrent, four paired direct `CONTACT` records and aggregate
-5/5/5 selected-item offer/fetch/insert counts, six graceful shutdowns, four
-closed retained handles, and zero Event/control/Blob counters. This is one-host,
-same-implementation loopback evidence with an operator-attested,
-non-reproducible source-to-execution link and metadata-only secret inspection;
-it is not physical, NAT/relay, BTLE, independent-implementation, scale,
-resource, long-duration, release, or Event/Blob-live acceptance. In particular,
+The live mutable receipt is a 7,752-byte canonical projection with SHA-256
+`054945ecf94e8bfba1b130f6a5f47e9b1e0e17ad69f3b1472085a1d10f05eeaa`,
+bound to signed source `6cabb4c`. Its two participants ran six actor lifetimes
+with at most two concurrent, eight direct `CONTACT` records and aggregate 7/7/7
+selected-item offer/fetch/insert counts, six graceful shutdowns, four closed
+retained handles, and zero Event/control/Blob counters. The State proof starts
+with two exact concurrent heads, advances through a successor that observes and
+supersedes both, then through an empty tombstone that observes and supersedes
+all three predecessors and remains current at both actors and one immediate
+peerless restart. This is a producer-attested ordered, one-host,
+same-implementation loopback chain with an operator-attested, non-reproducible
+source-to-execution link and metadata-only secret inspection; it is not proof
+of indefinite tombstone retention, garbage collection, delete-wins, physical
+or mixed implementations, NAT/relay, BTLE, scale, resource bounds,
+long-duration operation, release, or Event/Blob-live acceptance. In particular,
 its zero Blob counters do not evidence the newer live Blob handle.
 
 A separate [retained 10,728-byte v2 live-Blob receipt](implementation/evidence/selected-live-blob-044d90f.json)

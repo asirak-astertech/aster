@@ -33020,6 +33020,9 @@ mod tests {
                 &state_scope(),
             )
             .expect("reserve tombstone");
+        assert!(tombstone_reservation.context().observes(first.dot()));
+        assert!(tombstone_reservation.context().observes(second.dot()));
+        assert!(tombstone_reservation.context().observes(successor.dot()));
         let (tombstone, tombstone_sealed, _) = reserved_state(
             &mut services.first,
             &mut services.reader,
@@ -33041,13 +33044,21 @@ mod tests {
             )
             .expect("project tombstone");
         assert_eq!(projected.candidates().len(), 4);
-        assert!(
+        let current_tombstone = projected.current().expect("current tombstone");
+        assert_eq!(
+            current_tombstone.state.semantic_id,
+            StateSemanticId::new(tombstone.item_id())
+        );
+        assert!(current_tombstone.state.header.tombstone);
+        assert_eq!(
             projected
-                .current()
-                .expect("current tombstone")
-                .state
-                .header
-                .tombstone
+                .candidates()
+                .iter()
+                .filter(|candidate| {
+                    candidate.disposition() == Some(StateVersionDisposition::Superseded)
+                })
+                .count(),
+            3
         );
         for candidate in projected.candidates() {
             let (verified, _) = content_state(&mut services.reader, &candidate.state.sealed);

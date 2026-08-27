@@ -17,7 +17,7 @@
   sanitized receipt, replay boundary, and nonclaims in
   [Selected Iroh namespace-NAT retained receipt](#selected-iroh-nat-retained-receipt)
 - Selected live State/Record retained-receipt source freeze: signed commit
-  `2ccfba0d18bf8d8221ab11fb485b32fcf6270272`; exact immutable source,
+  `6cabb4cefaf6200c4642abddeb6f559dab043295`; exact immutable source,
   owner-restricted raw custody, sanitized receipt, replay boundary, and
   nonclaims in [Selected live State and Record retained receipt](#selected-live-state-and-record-retained-receipt)
 - Selected live Blob retained-receipt source freeze: signed commit
@@ -147,32 +147,41 @@ items.
 unique rows, valid selected states, exact selected-status containment, and the
 conservative generated claim boundary.
 
-The current generated totals are 65 `implemented-uncredited`, 57
-`observed-bounded`, and 226 `open` rows. The exact selected-mapping count is
-126 and is validated from the generated trace. The selected live State/Record
-receipt moves `DM-5.1-09`, `DM-5.3-02`, and `DM-5.3-06` through `DM-5.3-10`
-from `implemented-uncredited` to `observed-bounded`, moves `DM-11-06` and
-`DM-11-07` from `open` to `implemented-uncredited`, and moves `DM-12-04` from
-`open` to `observed-bounded`. It also broadens retained evidence without status
-movement for `DM-1-05`, `DM-5.1-01`, `DM-5.1-08`, `DM-5.2-01`, `DM-5.2-09`,
-`DM-7-11`, `DM-7-16`, `DM-7-17`, `DM-8-01`, and `DM-8-02`.
+The current generated totals are 63 `implemented-uncredited`, 60
+`observed-bounded`, and 225 `open` rows. The exact selected-mapping count is
+127 and is validated from the generated trace. The current v2 selected live
+State/Record receipt supersedes v1. Across those two versions, the receipt
+family moves `DM-5.1-02`, `DM-5.1-09`, `DM-5.3-01`, `DM-5.3-02`, and
+`DM-5.3-06` through `DM-5.3-10` from `implemented-uncredited` to
+`observed-bounded`; moves `DM-5.2-15` and `DM-12-04` from `open` to
+`observed-bounded`; and moves `DM-11-06` and `DM-11-07` from `open` to
+`implemented-uncredited`. V2 newly supplies the movements for `DM-5.1-02`,
+`DM-5.2-15`, and `DM-5.3-01`. It also broadens retained evidence without
+status movement for `DM-1-05`, `DM-5.1-01`, `DM-5.1-08`, `DM-5.2-01`,
+`DM-5.2-09`, `DM-7-11`, `DM-7-16`, `DM-7-17`, `DM-8-01`, and `DM-8-02`.
 
 The receipt exercises actor-owned live State and Record publication/query on a
 common bounded command lane, peerless publication, exact noninserting retry,
 explicit receiver interests, mission-authenticated direct-Iroh reconciliation,
 concurrent State tie-break, Record sibling annotation, no-discard ordinary
-publish failure, exact-guard resolution, superseded history, graceful handle
-closure, and peerless restart projection. The existing semantic-v4/v5 lanes
+publish failure, exact-guard resolution, a causally later State successor, an
+authenticated empty State tombstone propagated only after the successor was
+observed, superseded history, graceful handle closure, and peerless restart
+projection. The existing semantic-v4/v5 lanes
 continue to acknowledge exact Apply/Fetch outcomes before the next attempt,
 report exact Finish remainder, type capacity deferral, and fairly rotate durable
 peer/class/local Offer/Fetch cursors within the 256-peer/1,024-row bound. Each
 mutable object remains capped at 1 MiB and each class at 4,096 rows/16 MiB.
-The new receipt deliberately does not move `DM-5.1-02` or `DM-5.3-01`: it
-proves two concurrent State maxima and their deterministic ID tie-break, not a
-causally later State successor that dominates its predecessor. State and Record
-still have no durable application delivery subscription. Longer partitions,
-relay custody, automatic registered-policy merge (`DM-5.3-05`), mixed
-implementations, physical systems, scale, and release acceptance remain open.
+The v2 receipt proves, within its bounded producer-attested and checker-bound
+sequence, two concurrent State maxima, deterministic ID tie-break, a successor
+whose authenticated context observes both initial versions, and a later empty
+tombstone whose context observes the successor. It does not establish
+indefinite tombstone retention, compaction or garbage-collection behavior, or
+a delete-wins rule. `DM-5.1-01` remains `implemented-uncredited`, and
+`DM-5.2-16` and `DM-5.2-17` remain `open`. State and Record still have no
+durable application delivery subscription. Longer partitions, relay custody,
+automatic registered-policy merge (`DM-5.3-05`), mixed implementations,
+physical systems, scale, and release acceptance remain open.
 
 Across the superseded v1 and current v2 live Blob receipts, `DM-5.1-10`
 through `DM-5.1-13`, `DM-5.2-19` through `DM-5.2-22`, and `DM-7-16` are now
@@ -312,7 +321,7 @@ not completion percentages: `implemented-uncredited` means a partial mechanism
 exists, and `observed-bounded` means only the stated environment and claim
 boundary passed.
 
-All 57 rows with an external gate are included within the 226 `open` rows:
+All 57 rows with an external gate are included within the 225 `open` rows:
 `gate_kind` is an independent ownership dimension, not a fourth selected status.
 The generator validates the trace totals; this family roll-up is the human
 summary of that same CSV.
@@ -322,7 +331,7 @@ summary of that same CSV.
 | DM-1 Project brief | 0 | 3 | 4 | 7 |
 | DM-2 Scope | 1 | 0 | 13 | 14 |
 | DM-3 Operating environment | 0 | 1 | 12 | 13 |
-| DM-5 Functional requirements | 43 | 27 | 52 | 122 |
+| DM-5 Functional requirements | 41 | 30 | 51 | 122 |
 | DM-6 Security requirements | 3 | 18 | 15 | 36 |
 | DM-7 Developer experience | 6 | 3 | 12 | 21 |
 | DM-8 Implementation constraints | 0 | 2 | 17 | 19 |
@@ -332,7 +341,7 @@ summary of that same CSV.
 | DM-12 Acceptance criteria | 0 | 2 | 9 | 11 |
 | DM-13 Deliverables | 1 | 0 | 10 | 11 |
 | DM-14 Open design items | 0 | 0 | 23 | 23 |
-| **Total** | **65** | **57** | **226** | **348** |
+| **Total** | **63** | **60** | **225** | **348** |
 
 The selected lane is strongest today in bounded Event synchronization and
 security ordering: real-process direct contacts, one controlled connectivity-
@@ -342,7 +351,8 @@ source authentication, mission-before-inventory, control-before-Event,
 durable Consume/Carry receive intent, protected receiver-directed filtering,
 live high-level Event operations and last-contact status, freshly verified gap
 inspection, actor-owned live State publication/query and deterministic
-concurrent projection, actor-owned live Record publication/query, explicit
+concurrent projection followed by causal-successor and immediate tombstone
+projection, actor-owned live Record publication/query, explicit
 conflict annotation and exact-guard resolution, class-specific State/Record
 reconciliation with a retained bounded direct-Iroh conflict observation,
 actor-owned live Blob publication and authenticated zeroize-on-drop paged reads
@@ -383,10 +393,14 @@ Against the six-item high-leverage closure sequence:
    the actor. The Record handle preserves and annotates every causal head,
    rejects ordinary publish across an unresolved conflict, and commits only an
    exact-guard application-reviewed successor. The retained two-participant run
-   proves concurrent State tie-break, two-head Record preservation, guarded
-   resolution, superseded history, exact retry, direct synchronization, and
-   restart projection. It does not prove causal State dominance, longer
-   partitions, relays, physical or mixed implementations, scale, or release.
+   proves concurrent State tie-break, a causally later successor that
+   supersedes both initial versions, propagation of a later authenticated empty
+   tombstone, two-head Record preservation, guarded resolution, superseded
+   history, exact retry, direct synchronization, and immediate peerless restart
+   projection. The causal observation/publication order is producer-attested
+   and checker-bound; the receipt does not prove indefinite tombstone
+   retention, garbage collection, delete-wins behavior, longer partitions,
+   relays, physical or mixed implementations, scale, or release.
    Historical stopped `SelectedBlobNode` remains available. Current
    `RunningNode::selected_blobs()` returns a cloneable actor-owned handle that
    admits a nonempty regular file under the selected 64-MiB/1,024-chunk bound,
@@ -869,10 +883,10 @@ column.
 
 | Requirement | Current state | Production-lane implementation | Credit and remaining gap |
 |---|---|---|---|
-| `DM-1-03`, `DM-1-04`, `DM-1-05` peer flow, temporal relay, and resynchronization | `observed-bounded` | `aster-node` + typed Event/State/Record/Blob sources + redb + Negentropy + Iroh | Earlier retained Event flows committed Ping/Pong peerless and exact-forwarded through isolated edges. The live mutable receipt separately published State and Record with zero peerless contacts, later reconciled five exact mutable items, and reproduced converged State plus resolved Record projections after peerless restart. The retained live Blob run separately published one two-chunk object peerless, retained interrupted progress across graceful receiver reopen, continued from a different eligible peer, and reproduced authenticated pages after final reopen. Physical systems, longer custody, process/crash recovery, arbitrary-peer or route-only Blob relay/resume, generalized policy, mixed implementations, and scale remain open. |
+| `DM-1-03`, `DM-1-04`, `DM-1-05` peer flow, temporal relay, and resynchronization | `observed-bounded` | `aster-node` + typed Event/State/Record/Blob sources + redb + Negentropy + Iroh | Earlier retained Event flows committed Ping/Pong peerless and exact-forwarded through isolated edges. The live mutable v2 receipt separately published State and Record with zero peerless contacts, later reconciled seven exact mutable items, and reproduced the tombstone-current State plus resolved Record projections after peerless restart. The retained live Blob run separately published one two-chunk object peerless, retained interrupted progress across graceful receiver reopen, continued from a different eligible peer, and reproduced authenticated pages after final reopen. Physical systems, longer custody, process/crash recovery, arbitrary-peer or route-only Blob relay/resume, generalized policy, mixed implementations, and scale remain open. |
 | `DM-2-14` adopting-program key policy | `implemented-uncredited` | Existing control formats plus typed bounded live `SelectedControlHandle` and stopped `SelectedControlAdmin`, exact recipient-filtered planning, and atomic redb publication intent | Rust callers can choose one revocation or one scope/epoch and exact recipient/topic policy through sanitized requests; live publication serializes under the actor policy-write authority and refreshes policy before response. This is not generalized policy governance: no production backend, protected stock CLI/bindings, cross-process admin IPC, registry issuance/recovery, automatic/atomic revoke-plus-rekey workflow, or additional key-management mechanism is shipped. |
 | `DM-3-11`, `DM-11-18`, `DM-11-19` pre-mission provisioning/identity/keying | `open` | Protected-artifact and opaque-reference live `NodeConfig` plus stopped Rust opens and provider-neutral SecretStore contracts | Current Rust construction validates bounded options and terminal state before one provider/loader call or state creation and binds credentials to one absolute lexical state pathname. This mechanism is not the operational window or complete MVP: the stock CLI remains unprotected-reference, and identity/key issuance, production backend, recovery/backup/rollback policy, inode/symlink/rename/rollback binding, selected-node bindings, coordinated destruction, admitted-module/FIPS decision, and retained operational evidence remain absent. |
-| `DM-5.1-01`, `DM-5.1-02` State class and convergence | `implemented-uncredited` | Typed source-authenticated State capabilities, bounded redb versions/operations, shared Event-State causal frontier, stopped `SelectedStateNode`, actor-owned `SelectedStateHandle`, and semantic-v4/v5 class/direction runtime reconciliation | The retained live run covers peerless publication, exact retry, explicit-interest direct reconciliation, deterministic two-maximum projection, handle closure, and restart projection. Current tests separately cover sequential/tombstone projection, exact mutable outcomes, capacity deferral, cursor rotation, and current-lineage replacement. The receipt does not prove a causally later State successor, so `DM-5.1-02` and `DM-5.3-01` gain no status. Durable delivery subscription, longer partitions, relay custody, independent interoperability, scale, physical systems, and bindings remain open. |
+| `DM-5.1-01`, `DM-5.1-02` State class and convergence | `implemented-uncredited` / `observed-bounded` | Typed source-authenticated State capabilities, bounded redb versions/operations, shared Event-State causal frontier, stopped `SelectedStateNode`, actor-owned `SelectedStateHandle`, and semantic-v4/v5 class/direction runtime reconciliation | The retained v2 run covers peerless publication, exact retry, explicit-interest direct reconciliation, deterministic two-maximum projection, a node-a counter-4 successor whose authenticated context contains both initial heads and versions, a node-b counter-3 tombstone published only after querying that successor, handle closure, and immediate peerless restart projection. `DM-5.1-02` is therefore observed within this boundary; the broader State-class obligation in `DM-5.1-01` remains implemented-uncredited. Durable delivery subscription, longer partitions, relay custody, independent interoperability, scale, physical systems, and bindings remain open. |
 | `DM-5.1-04` Event support | `observed-bounded` | Existing `aster-core` Event envelope ported through selected redb/runtime, with live and stopped high-level projections | The retained sample seals, persists, reconciles, verifies, and reacts to Event. Current-code live-handle tests publish, query, consume, and later synchronize arbitrary authorized Events, but they are not a retained PR-C acceptance receipt. Other data classes and independent wire interoperability remain open. |
 | `DM-5.1-05` through `DM-5.1-07` Event immutability, order, and gaps | `implemented-uncredited` | Authenticated Event sequence/dot, semantic and exact-transfer indexes, publisher/topic/scope positions, and a public bounded verified gap view | Gap pages freshly verify every observed anchor and race-recheck their exact policy-bound store plan. No gap means only that locally observed verified positions are contiguous; it does not prove publisher completeness or convergence. Cross-process missing-position and independent interoperability evidence remain open. |
 | `DM-5.1-08`, `DM-5.1-09` Record class and disconnected concurrency mechanism | `implemented-uncredited` / `observed-bounded` | Typed source-authenticated Record capabilities, bounded redb revisions/operations, shared causal frontier, stopped `SelectedRecordNode`, actor-owned `SelectedRecordHandle`, and semantic-v4/v5 class/direction runtime reconciliation | The retained live run created revisions on two peerless stores, reconciled both exact inventories, exposed the same annotated two-head conflict on both actors, rejected ordinary publication without change, guarded resolution across both siblings, and reproduced the resolved projection after restart. There is no durable Record delivery subscription; longer partitions, relays, mixed implementations, scale, bindings, physical systems, and release acceptance remain open. |
@@ -882,9 +896,10 @@ column.
 | `DM-5.2-01` eventual convergence | `observed-bounded` | Class-specific Negentropy difference over exact Event transfer IDs in v1-v5, State/Record transfer IDs in v4/v5, and Blob source IDs in v5, plus mission-bound redb | Retained Event receipts cover temporal forwarding; the live mutable receipt covers bounded two-peer direct reconciliation, and the live Blob v2 receipt covers a bounded three-peer direct seed/interruption/reopen/different-peer continuation plus final peerless reopen. These are not all-reachable-node or long-partition results. Route-only Blob custody, arbitrary-peer resume, mixed implementations, physical links, requirement scale, and release acceptance remain open. |
 | `DM-5.2-02` subscribed in-scope convergence | `implemented-uncredited` | Durable canonical Event Consume/Carry selectors, v4/v5 class-separated State/Record interests, and v5 exact Blob selectors carrying a peer-bound current content proof, all projected as protected receiver interests and intersected with route authority | The retained mutable run used exact reciprocal State/Record interests and delivered only the selected mutable items; current tests add Event and one bounded Blob. Normal and AtLeast run mutable lanes and may run v5 Blob transfer, while ReceiveOnly discloses neither. The bounded observations are not all-reachable-node or global convergence; repeated multi-scope lifecycle, longer partitions, route-only Blob relay, physical peers, scale, mixed implementations, and a retained four-class receipt remain open. |
 | `DM-5.2-06` through `DM-5.2-08` delivery, duplicate suppression, and idempotent outcome | `implemented-uncredited` / `observed-bounded` | Exact transfer acceptance, durable operation-keyed publication, an at-least-once Event pending ledger, and separate v4 Offer `MutableApplyResult` and Fetch `MutableFetchResult`/required `MutableFetchResultAck` before the next attempt, plus exact Finish remainder | Live and stopped Event poll freshly re-verify source/content authorization. Current-code real processes synchronize, poll, ack, and preserve the Event ack across receiver restart; mutable acknowledgements instead govern durable protocol satisfaction and do not create State/Record application delivery. The retained receipt still covers the built-in Event reaction only; unacknowledged process-crash retry, every external crash point, bindings, and independent implementations remain open. |
-| `DM-5.2-09`, `DM-5.2-10`, `DM-5.2-13`, `DM-5.2-14` causality and clock-independent correctness | `observed-bounded` / `implemented-uncredited` | Authenticated dots/context, atomic Event-State-Record-Blob causal frontier/high-water, Pong observation of Ping, causal projections, class-specific Negentropy timestamp zero, and monotonic semantic-v3-format Event custody age inherited by v4/v5 | Earlier retained Event evidence binds Pong to observed Ping. The retained mutable run preserves two disconnected Record heads as concurrent, then requires the guarded successor to observe both sibling IDs; State selects between concurrent maxima by authenticated semantic ID, not wall time. It does not prove a causally later State successor. Blob causal convergence, finite State/Record/Blob TTL, non-Linux Event TTL, long-running operation, and independent interoperability remain open. |
+| `DM-5.2-09`, `DM-5.2-10`, `DM-5.2-13`, `DM-5.2-14` causality and clock-independent correctness | `observed-bounded` / `implemented-uncredited` | Authenticated dots/context, atomic Event-State-Record-Blob causal frontier/high-water, Pong observation of Ping, causal projections, class-specific Negentropy timestamp zero, and monotonic semantic-v3-format Event custody age inherited by v4/v5 | Earlier retained Event evidence binds Pong to observed Ping. The retained mutable run preserves two disconnected Record heads as concurrent, then requires the guarded successor to observe both sibling IDs; State first selects between concurrent maxima by authenticated semantic ID rather than wall time, then projects an authenticated successor that observes both initial versions. The causal ordering is producer-attested and the exact identities, counters, observed sets, and dispositions are checker-bound. Blob causal convergence, finite State/Record/Blob TTL, non-Linux Event TTL, long-running operation, and independent interoperability remain open. |
+| `DM-5.2-15` deletion propagation as tombstones | `observed-bounded` | Authenticated State tombstones use the ordinary signed causal context, immutable State transfer, retained reducer history, and semantic-v4/v5 direct reconciliation | After node-b queried the converged node-a counter-4 successor, node-b published a counter-3 empty authenticated tombstone. Both connected actors projected it Current with all three predecessors Superseded, and two immediate peerless restart views reproduced the exact four-version projection. The sequence is producer-attested and checker-bound; it does not establish delete-wins against an unobserved concurrent value, indefinite retention, compaction or garbage collection, longer partitions, relay propagation, or independent interoperability. `DM-5.2-16` and `DM-5.2-17` remain open. |
 | `DM-5.2-18` difference-proportional synchronization | `implemented-uncredited` | Bounded class-specific Negentropy exact-ID reconciliation for Event in v1-v5, State/Record in v4/v5, and Blob source plans in v5; Blob carrier work requests only the exact missing contiguous complement | Equal Event inventory transferred nothing; current-code mutable and Blob automation bounds each attempt and rotates durable cursors fairly. Total-size-versus-difference cost evidence across all four classes at requirement scale remains open. |
-| `DM-5.3-01`, `DM-5.3-02` State causal resolution and concurrent tie-break | `implemented-uncredited` / `observed-bounded` | Freshly verified exact-key causal maxima; authenticated context dominance; greatest complete semantic State ID current; retained `Concurrent`/`Superseded` history; immutable-fact v4/v5 ingest with current source lineage; actor-owned live query | The retained run created two peerless concurrent State maxima, converged both actors on the greatest complete semantic ID as Current with the other Concurrent, and reproduced both restart views. This moves only the tie-break row. Causal-successor dominance remains current-code local automation, so `DM-5.3-01` and `DM-5.1-02` stay implemented. Mixed implementations, expiry/GC, relays, physical systems, adversarial scale, and release acceptance remain open. |
+| `DM-5.3-01`, `DM-5.3-02` State causal resolution and concurrent tie-break | `observed-bounded` | Freshly verified exact-key causal maxima; authenticated context dominance; greatest complete semantic State ID current; retained `Concurrent`/`Superseded` history; immutable-fact v4/v5 ingest with current source lineage; actor-owned live query | The retained v2 run first converged two peerless concurrent State maxima on both actors with the greatest complete semantic ID Current and the other Concurrent. A later node-a successor carried the exact two initial heads and versions, became Current on both actors, and left both predecessors Superseded; the later tombstone then became Current with all three predecessors Superseded, including after immediate peerless restart. This moves causal resolution as well as the already-observed tie-break row. Mixed implementations, indefinite retention/GC, relays, physical systems, adversarial scale, and release acceptance remain open. |
 | `DM-5.3-04` Blob preservation outside causal merge | `implemented-uncredited` | Immutable Blob bytes/identity metadata remain outside State/Record reducers; multiple stopped or live signed source publications may reference one exact completed depot variant; live reads select a freshly authenticated current publication; semantic-v5 staging stays outside ordinary publication indexes until exact completion | The retained one-publisher run rejected changed-source operation reuse and preserved the immutable publication; it is not adversarial multi-writer or merge-conflict evidence. Blob subscription/status, route-only custody, retention/GC policy, pure-byte identity, large/RSS/physical/resource scale, mixed implementations, and release authorization remain open. |
 | `DM-5.3-06` through `DM-5.3-10` Record sibling preservation, annotation, API, no-discard, and recoverable history | `observed-bounded` | Freshly verified exact-key causal heads; actor-owned live `RecordConflict`; sorted sibling IDs and opaque exact guard; atomically guarded successor; optional superseded history; merge-free v4/v5 ingest | The retained two-peer run preserves both disconnected revisions on both actors, exposes both annotated sibling IDs, rejects ordinary publication without change, resolves only under the exact complete guard, converges on the successor, and reproduces both superseded originals after restart. Automatic registered-policy merge (`DM-5.3-05`), durable delivery subscriptions, explicit-policy GC, bindings, longer partitions/relays, mixed implementations, scale, physical systems, and release acceptance remain open. |
 | `DM-5.4-01`, `DM-5.4-05`, `DM-5.4-09`, `DM-5.4-10`, `DM-5.4-12` through `DM-5.4-19`, `DM-5.4-21`, `DM-5.4-22` selected priority, TTL, and constrained operation | `implemented-uncredited` | Source-authenticated Event priority/TTL; semantic-v3-format cumulative custody inherited by v4/v5; Linux expiry; bounded scheduler/retry/retirement; Normal/AtLeast/ReceiveOnly startup and live policy | Current automation covers charged Event age/expiry boundaries, priority order, stale-work/final-send races, v3/v4/v5 custody inheritance, and receive-only inbound. Normal and AtLeast run v4/v5 mutable reconciliation and may run v5 Blob work because AtLeast is strictly an Event threshold; ReceiveOnly initiates/discloses no mutable or Blob work. Selected finite State/Record/Blob TTL is rejected/open. Priority count/names, `DM-5.4-11` generic global eviction, optional defaults/caps/overrides, non-Linux Event TTL, physical RF silence, scale, mixed implementations, and retained acceptance remain open. |
@@ -1158,35 +1173,40 @@ release, or release authorization. `DM-5.8-08` and the physical release gate
 
 ## Selected live State and Record retained receipt
 
-On 2026-08-26, the selected live State/Record composition at signed source
-commit `2ccfba0d18bf8d8221ab11fb485b32fcf6270272` and tree
-`a07c7530ebee60d07c71c20a87febe8b9b360fa8` passed the
-`aster-selected-live-mutable-receipt/v1` contract. The source signature
+On 2026-08-27, the selected live State/Record composition at signed source
+commit `6cabb4cefaf6200c4642abddeb6f559dab043295` and tree
+`e6c8577f77035f6a0c0891a0beb084e52debe53e` passed the
+`aster-selected-live-mutable-receipt/v2` contract. The source signature
 verified Good for ED25519 fingerprint
 `SHA256:wDJcS5jorC5+Dm3vvXdMrW/f38sqIl20hJXrt5B8s9E`.
 The checked-in canonical
-[`aster-selected-live-mutable-receipt/v1` receipt](evidence/selected-live-mutable-2ccfba0.json)
-is exactly 5,660 bytes with SHA-256
+[`aster-selected-live-mutable-receipt/v2` receipt](evidence/selected-live-mutable-6cabb4c.json)
+is exactly 7,752 bytes with SHA-256
+`054945ecf94e8bfba1b130f6a5f47e9b1e0e17ad69f3b1472085a1d10f05eeaa`.
+It explicitly supersedes the v1 receipt at source
+`2ccfba0d18bf8d8221ab11fb485b32fcf6270272`, whose canonical SHA-256 was
 `299a3c3b8d1685deb5980ed091797f7d46119562b67c3d853b94d8552c83b67a`.
-The source-bound checker at that freeze is 97,276 bytes with SHA-256
-`0b74826a28695fe44b0536bd5e037c4c33feb8acbc30c0d81a24d309dcaaea9d`;
-its fail-closed test corpus passed 81/81.
+The source-bound checker is 108,731 bytes with SHA-256
+`4281cc547f145e1b1423aa61a529cb5017762f1e5c2c0730454220607796bdf7`;
+the independently admitted fail-closed test oracle is 85,670 bytes with
+SHA-256
+`42f6043a4cbe35a39404bf63ed3e2a153d86b2e14b70e00bb6fb65983894cc42`.
 
 The runner verified the signed, clean source before build, after build, and
 after execution. It invoked exactly:
 
 ```text
 cargo build --release --locked -p aster-node --example live_mutable_acceptance
-/private/tmp/aster-selected-live-mutable-2ccfba0-final/binary/aster-live-mutable-acceptance /private/tmp/aster-selected-live-mutable-2ccfba0-final
+/private/tmp/aster-selected-live-mutable-6cabb4c-final/binary/aster-live-mutable-acceptance /private/tmp/aster-selected-live-mutable-6cabb4c-final
 ```
 
-The copied Cargo release-profile executable is 12,001,136 bytes with SHA-256
-`47ca5e7aededa352604bb8c308def90c46237f594b9eb9be10cc22936afbed60`.
-The exact run exited zero. Its stdout is 27,894 bytes/56 lines with SHA-256
-`6282598b162fb06141de1ff1a327e6247999388156ab8a82b4430d681abe5ed7`;
-stderr is exactly empty. The public 40-record transcript is 13,860 bytes with
+The copied Cargo release-profile executable is 12,280,032 bytes with SHA-256
+`34e7a2a888737170486d44dc154dab08592c2cdbb9778b9c6df71b7c2f4e6c11`.
+The exact run exited zero. Its stdout is 40,330 bytes/68 lines with SHA-256
+`484434e27d86e441f7f516be3c604dc52fc9ebab5035f9ee0b0d0bffbe2778bc`;
+stderr is exactly empty. The public 48-record transcript is 20,774 bytes with
 SHA-256
-`26eaa243e60fd5cb2add736555a33699000e7602129422c24be2436b33a61821`.
+`9171d6078d9a6692cba2598f1c3a2e7b2bb1c3b9bb3d35341a8cd3172ee5b805`.
 The canonical receipt excludes exact participant identifiers, paths, ports,
 PIDs, and payload bytes; payloads appear only as SHA-256 commitments.
 
@@ -1199,26 +1219,39 @@ The retained acceptance facts are exact and bounded:
   actors concurrently. All six shut down gracefully; four retained State/Record
   handle clones closed with the actor; and both UDP binds were reacquired after
   final shutdown.
-- Both participants published one State value and one Record revision while
-  peerless. Peerless and restart phases recorded zero contacts. Four exact
-  publication retries inserted nothing.
-- Four connected contact receipts were positive, direct-only, paired exactly,
-  and error-free. Selected mutable accounting recorded five offered, five
-  fetched, and five inserted items, zero duplicates, zero deferred or remaining
-  mutable/Event work, and zero Event, control, or Blob transfer counters.
-- Both live State projections selected the greatest complete authenticated
-  semantic State ID as Current and retained the other concurrent maximum; both
-  peerless restart projections reproduced that result. This is concurrent
-  tie-break evidence, not causal-successor dominance evidence.
-- Both live Record projections exposed the same two sibling IDs and exact
-  conflict guard. Ordinary publish returned Conflict without insertion or
-  sibling change. Guarded resolution observed both siblings, exact resolution
-  retry inserted nothing, both connected projections converged, and both
-  peerless restart projections retained the successor plus both superseded
-  originals.
+- Both participants published one initial State value and one Record revision
+  while peerless. Peerless and restart phases recorded zero contacts. Six exact
+  publication retries and two exact Record-resolution retries inserted nothing.
+- Each connected actor completed four contacts, producing eight paired
+  positive, direct-only, error-free `CONTACT` lines. Selected mutable accounting
+  aggregated exactly seven offered, seven fetched, and seven inserted items,
+  zero duplicates, and zero deferred or remaining mutable/Event work. Event and
+  control counters were zero. All Blob source, operation, acceptance, depot,
+  range, cursor, staging, remaining, deferred, and lifecycle counters were also
+  zero, including the newer Blob lifecycle fields on every `STOP` record.
+- Both initial connected State projections selected the greatest complete
+  authenticated semantic State ID as Current and retained the other concurrent
+  maximum as Concurrent. Node-a then published its counter-4 non-tombstone
+  successor with the exact two initial heads and versions in its observed sets;
+  two connected projections made it Current and marked both initial versions
+  Superseded.
+- Only after node-b queried that successor did node-b publish its counter-3
+  empty authenticated tombstone with the successor as its exact observed head
+  and all three earlier versions in its observed-version set. Two connected
+  projections and two immediate peerless restart projections made that
+  tombstone Current and retained the successor plus both initial versions as
+  exactly three Superseded predecessors.
+  The empty payload commitment is
+  `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+- Preserving the v1 Record behavior, both live projections exposed the same two
+  sibling IDs and exact conflict guard. Ordinary publish returned Conflict
+  without insertion or sibling change. The node-a counter-3 guarded resolution
+  observed both siblings; exact resolution retry inserted nothing, both
+  connected projections converged, and both peerless restart projections
+  retained the successor plus both superseded originals.
 
 The complete raw root remains outside source control at
-`/private/tmp/aster-selected-live-mutable-2ccfba0-final` on the validating host. Its
+`/private/tmp/aster-selected-live-mutable-6cabb4c-final` on the validating host. Its
 seven directories, including the root, are owner-only `0700`. Its exact
 inventory contains 11 regular files with one link each and no aliases: one
 copied executable, four public terminal/metadata files, and, for each of two
@@ -1237,22 +1270,22 @@ commit:
 ```sh
 python3 tools/run-selected-live-mutable.py \
   --source /Users/megamind/code/aster \
-  --raw-root /private/tmp/aster-selected-live-mutable-2ccfba0-final
+  --raw-root /private/tmp/aster-selected-live-mutable-6cabb4c-final
 
 python3 tools/check-selected-live-mutable-receipt.py - \
-  --raw-root /private/tmp/aster-selected-live-mutable-2ccfba0-final \
+  --raw-root /private/tmp/aster-selected-live-mutable-6cabb4c-final \
   --source /Users/megamind/code/aster \
-  --output /private/tmp/aster-live-mutable-projection-2ccfba0/selected-live-mutable-receipt.json
+  --output /private/tmp/aster-live-mutable-projection-6cabb4c/selected-live-mutable-receipt.json
 
 python3 tools/check-selected-live-mutable-receipt.py - \
-  --raw-root /private/tmp/aster-selected-live-mutable-2ccfba0-final \
+  --raw-root /private/tmp/aster-selected-live-mutable-6cabb4c-final \
   --source /Users/megamind/code/aster \
-  --output /private/tmp/aster-live-mutable-projection-2ccfba0-b/selected-live-mutable-receipt.json
+  --output /private/tmp/aster-live-mutable-projection-6cabb4c-b/selected-live-mutable-receipt.json
 
-cmp /private/tmp/aster-live-mutable-projection-2ccfba0/selected-live-mutable-receipt.json \
-  /private/tmp/aster-live-mutable-projection-2ccfba0-b/selected-live-mutable-receipt.json
+cmp /private/tmp/aster-live-mutable-projection-6cabb4c/selected-live-mutable-receipt.json \
+  /private/tmp/aster-live-mutable-projection-6cabb4c-b/selected-live-mutable-receipt.json
 shasum -a 256 \
-  /private/tmp/aster-live-mutable-projection-2ccfba0/selected-live-mutable-receipt.json
+  /private/tmp/aster-live-mutable-projection-6cabb4c/selected-live-mutable-receipt.json
 ```
 
 Future review must use a separate clean checkout detached at the exact signed
@@ -1262,9 +1295,9 @@ as follows:
 
 ```sh
 python3 tools/check-selected-live-mutable-receipt.py \
-  --raw-root /private/tmp/aster-selected-live-mutable-2ccfba0-final \
-  --source /path/to/aster-source-worktree-detached-at-2ccfba0 \
-  docs/implementation/evidence/selected-live-mutable-2ccfba0.json
+  --raw-root /private/tmp/aster-selected-live-mutable-6cabb4c-final \
+  --source /path/to/aster-source-worktree-detached-at-6cabb4c \
+  docs/implementation/evidence/selected-live-mutable-6cabb4c.json
 ```
 
 The receipt's source-to-binary-to-execution link is explicitly
@@ -1275,16 +1308,25 @@ claim distinct physical hosts, NAT or Internet traversal, a controlled or
 public relay, BTLE, independent-implementation interoperability, scale beyond
 two participants, resource thresholds or a long-duration soak, Event or Blob
 live-application acceptance, a reproducible build, a product release, or
-release authorization.
+release authorization. The exact State causal observation and publication
+order is producer-attested and checker-bound: the checker binds the transcript
+shape, identities, publisher counters, payload commitments, observed
+head/version sets, projections, and dispositions, but the retained result is
+not an independent causality observer. The single immediate peerless reopen
+does not claim indefinite tombstone retention, compaction or garbage
+collection, or delete-wins semantics against an unobserved concurrent value.
 
-The receipt moves exactly `DM-5.1-09`, `DM-5.3-02`, and `DM-5.3-06` through
-`DM-5.3-10` from `implemented-uncredited` to `observed-bounded`; moves
-`DM-11-06` and `DM-11-07` from `open` to `implemented-uncredited`; and moves
-`DM-12-04` from `open` to `observed-bounded`. It strengthens, without moving,
+The superseded v1 receipt moved exactly `DM-5.1-09`, `DM-5.3-02`, and
+`DM-5.3-06` through `DM-5.3-10` from `implemented-uncredited` to
+`observed-bounded`; moved `DM-11-06` and `DM-11-07` from `open` to
+`implemented-uncredited`; and moved `DM-12-04` from `open` to
+`observed-bounded`. It strengthened, without moving,
 `DM-1-05`, `DM-5.1-01`, `DM-5.1-08`, `DM-5.2-01`, `DM-5.2-09`, `DM-7-11`,
-`DM-7-16`, `DM-7-17`, `DM-8-01`, and `DM-8-02`. It does not move
-`DM-5.1-02` or `DM-5.3-01`, because no causally later State successor is part
-of the retained scenario.
+`DM-7-16`, `DM-7-17`, `DM-8-01`, and `DM-8-02`. V2 preserves those movements
+and strengthened mappings and newly moves `DM-5.1-02` and
+`DM-5.3-01` from `implemented-uncredited` to `observed-bounded` and
+`DM-5.2-15` from `open` to `observed-bounded`. It leaves `DM-5.1-01`
+`implemented-uncredited` and `DM-5.2-16` and `DM-5.2-17` `open`.
 
 ## Selected live Blob retained receipt
 
@@ -1831,8 +1873,10 @@ exposure boundary.
 At that prior frozen slice there was no State reconciliation frame, carrier
 path, live handle, or retained execution root. It moved only `DM-5.1-01`,
 `DM-5.1-02`, `DM-5.3-01`, and `DM-5.3-02` to
-`implemented-uncredited` and added no `observed-bounded` credit. The newer
-network test above does not change those four statuses.
+`implemented-uncredited` and added no `observed-bounded` credit. That statement
+is historical to the stopped slice: the later retained live v2 receipt moves
+`DM-5.1-02` and `DM-5.3-01` to `observed-bounded`, while `DM-5.1-01` remains
+`implemented-uncredited`; `DM-5.3-02` was already moved by v1.
 
 ## Prior selected Record stopped-slice automated evidence
 

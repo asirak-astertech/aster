@@ -53,11 +53,17 @@ caller-owned source files remain outside node zeroization. Durable State/Record
 subscriptions, Blob subscription or convergence status, ConnectRPC/C/Go/Python
 selected-node bindings, finite TTL, and representative physical or
 mixed-implementation acceptance remain open. A
-[retained bounded live-path receipt](implementation/evidence/selected-live-mutable-2ccfba0.json)
-covers peerless State/Record publication, direct convergence, conflict
-resolution, restart, and closed-handle behavior on one same-implementation
-loopback host; its zero Blob counters make it neither live-Blob evidence nor
-representative/release acceptance.
+[retained 7,752-byte v2 live-path receipt](implementation/evidence/selected-live-mutable-6cabb4c.json)
+(SHA-256
+`054945ecf94e8bfba1b130f6a5f47e9b1e0e17ad69f3b1472085a1d10f05eeaa`,
+signed source `6cabb4c`) covers peerless State/Record publication, direct
+convergence, exact concurrent State heads, a causal successor, an authenticated
+empty tombstone that remains current through one immediate peerless restart,
+Record conflict resolution, and closed-handle behavior. This is a
+producer-attested ordered, one-host, same-implementation loopback chain—not
+indefinite tombstone retention, garbage collection, delete-wins, physical or
+mixed implementations, scale, or release acceptance. Its zero Blob counters
+make it neither live-Blob evidence nor a claim about the newer Blob mechanism.
 
 Selected State/Record lanes are separated by class and receiver direction. They
 use Offer `MutableApplyResult`, Fetch `MutableFetchResult` plus required

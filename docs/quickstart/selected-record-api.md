@@ -177,24 +177,28 @@ cargo test --locked -p aster-node \
 ```
 
 No application merge callback runs during ingest. A separate
-[retained live mutable receipt](../implementation/evidence/selected-live-mutable-2ccfba0.json)
-is a 5,660-byte canonical projection (SHA-256
-`299a3c3b8d1685deb5980ed091797f7d46119562b67c3d853b94d8552c83b67a`)
-bound to signed source `2ccfba0`. Its two peerless Record publications become
+[retained v2 live mutable receipt](../implementation/evidence/selected-live-mutable-6cabb4c.json)
+is a 7,752-byte canonical projection (SHA-256
+`054945ecf94e8bfba1b130f6a5f47e9b1e0e17ad69f3b1472085a1d10f05eeaa`)
+bound to signed source `6cabb4c`. Its two peerless Record publications become
 two explicit conflict siblings. An ordinary publish is rejected without
 changing them; guarded resolution observes both, supersedes both originals,
 exactly retries without insertion, converges at both actors, and survives
 restart across four resolved/restart views. The enclosing two-participant run
-uses six actor lifetimes with at most two concurrent, four paired direct
-`CONTACT` records, aggregate 5/5/5 selected-item offer/fetch/insert counts, six
+uses six actor lifetimes with at most two concurrent, eight direct `CONTACT`
+records, aggregate 7/7/7 selected-item offer/fetch/insert counts, six
 graceful shutdowns, four closed retained handles, and zero Event/control/Blob
-counters.
+counters. Its State side also proves exact concurrent heads, a causal successor,
+and an authenticated empty tombstone current at both actors and through one
+immediate peerless restart.
 
 The source-to-execution link is operator-attested, not cryptographically proven
-or reproducible, and secret artifacts were inspected by metadata only. This is
-one-host same-implementation loopback evidence, not physical, NAT/relay, BTLE,
-mixed-implementation, scale, resource, long-duration, Event/Blob-live, or
-release acceptance. Current-code regressions also cover exact
+or reproducible, and secret artifacts were inspected by metadata only. The
+ordered State observation/publication chain is producer-attested. This is
+one-host same-implementation loopback evidence, not indefinite tombstone
+retention, garbage collection, delete-wins, physical or mixed implementations,
+NAT/relay, BTLE, scale, resource, long-duration, Event/Blob-live, or release
+acceptance. Current-code regressions also cover exact
 result/acknowledgement, capacity deferral, and fair rotation. Same-epoch old
 lineage is withheld from ordinary current projection/query and network
 inventory/transfer; only an exact idempotent publish/resolution retry may recover

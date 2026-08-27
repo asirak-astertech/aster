@@ -27,15 +27,43 @@ if SPEC is None or SPEC.loader is None:
 CHECKER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(CHECKER)
 
-ORACLE_RECEIPT_SCHEMA = "aster-selected-live-mutable-receipt/v1"
-ORACLE_RAW_SCHEMA = "aster-selected-live-mutable-raw/v1"
-ORACLE_TRANSCRIPT_SCHEMA = "aster-selected-live-mutable-transcript/v1"
-ORACLE_CLAIM = "selected-live-state-record-one-host-direct-iroh-two-actor-acceptance"
+RUNNER_PATH = Path(__file__).with_name("run-selected-live-mutable.py")
+RUNNER_SPEC = importlib.util.spec_from_file_location("selected_live_mutable_runner", RUNNER_PATH)
+if RUNNER_SPEC is None or RUNNER_SPEC.loader is None:
+    raise RuntimeError(f"cannot load {RUNNER_PATH}")
+RUNNER = importlib.util.module_from_spec(RUNNER_SPEC)
+RUNNER_SPEC.loader.exec_module(RUNNER)
+
+ORACLE_RECEIPT_SCHEMA = "aster-selected-live-mutable-receipt/v2"
+ORACLE_RAW_SCHEMA = "aster-selected-live-mutable-raw/v2"
+ORACLE_TRANSCRIPT_SCHEMA = "aster-selected-live-mutable-transcript/v2"
+ORACLE_CLAIM = "selected-live-state-causal-successor-tombstone-record-one-host-direct-iroh-two-actor-acceptance"
+ORACLE_TRANSCRIPT_RECORDS = 48
+ORACLE_SUPERSEDED_SCHEMA = "aster-selected-live-mutable-receipt/v1"
+ORACLE_SUPERSEDED_SOURCE_COMMIT = "2ccfba0d18bf8d8221ab11fb485b32fcf6270272"
+ORACLE_SUPERSEDED_RECEIPT_SHA256 = (
+    "299a3c3b8d1685deb5980ed091797f7d46119562b67c3d853b94d8552c83b67a"
+)
 ORACLE_TRANSCRIPT_KEY_SCHEMA_SHA256 = (
-    "1a8269a1fbdf5f492711d673df19ae24c116eea8ba73143d53af37a80473e384"
+    "613dae481f5a71a1d87962ed6a9d251b4a7d5a5c59a030486e402f722bf0f72d"
 )
 ORACLE_TERMINAL_KEY_SCHEMA_SHA256 = (
-    "f73ba1c44a3a0bddb723653e5e26db48a1c5c8a97f13b7d28f0bb23891cde3c8"
+    "6cce95bbb1024560db205339f0e70a2b75b8e3b93f9c43b548a23c49abfcb617"
+)
+ORACLE_NEW_STOP_BLOB_FIELDS = (
+    "blob_acceptance_markers",
+    "blob_last_acceptance_marker",
+    "blob_sealed_bytes",
+    "blob_operations",
+    "blob_operation_bytes",
+    "blob_variants",
+    "blob_finalized_variants",
+    "blob_committed_chunks",
+    "blob_committed_file_bytes",
+    "blob_reserved_file_bytes",
+    "blob_carrier_prefixes",
+    "blob_carrier_fetch_cursors",
+    "blob_network_staging_bytes",
 )
 ORACLE_BUILD_ARGV = (
     "cargo",
@@ -53,6 +81,11 @@ ORACLE_ADMITTED_PATHS = tuple(
             "Cargo.lock",
             "Cargo.toml",
             "mise.toml",
+            "crates/aster-core/Cargo.toml",
+            "crates/aster-core/src/causal.rs",
+            "crates/aster-core/src/crypto/reference.rs",
+            "crates/aster-core/src/lib.rs",
+            "crates/aster-core/src/source_state.rs",
             "crates/aster-node/Cargo.toml",
             "crates/aster-node/examples/live_mutable_acceptance.rs",
             "crates/aster-node/src/application.rs",
@@ -60,6 +93,8 @@ ORACLE_ADMITTED_PATHS = tuple(
             "crates/aster-node/src/application/state.rs",
             "crates/aster-node/src/lib.rs",
             "crates/aster-node/src/runtime.rs",
+            "crates/aster-redb-store/Cargo.toml",
+            "crates/aster-redb-store/src/lib.rs",
             "tools/check-selected-live-mutable-receipt.py",
             "tools/run-selected-live-mutable.py",
             "tools/test-selected-live-mutable-receipt.py",
@@ -72,7 +107,29 @@ ORACLE_PAYLOAD_HASHES = {
     ("record", "node-a"): "ea7e65181655ebe13372e8b1d740c2114675ce2d85ba511074158ef1b971e34d",
     ("record", "node-b"): "0572316ec50701364d0e721db4197d4c15667411949b9821ae72c52dd6003ba3",
     ("resolution", "node-a"): "4b631dc38a7dc95cf0d35bc24ff0cdf94bfa9e84aad297bcc1af81fa8970afb3",
+    ("successor", "node-a"): "d1604822c53bec359621ef55529767e3e3a586634f8e0218d4a2eea3730e581c",
+    ("tombstone", "node-b"): "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
 }
+ORACLE_LIMITATIONS = (
+    "operator-attested-source-binary-execution-link-not-cryptographically-proven",
+    "selected-admitted-source-list-is-not-a-complete-reproducible-build-closure",
+    "one-host-loopback-same-implementation-observation",
+    "participant-secret-artifacts-validated-by-metadata-only",
+    "state-causal-observation-and-publication-order-are-producer-attested",
+    "restart-observes-one-immediate-peerless-reopen-not-indefinite-tombstone-retention",
+)
+ORACLE_NONCLAIMS = (
+    "distinct-physical-hosts",
+    "nat-or-internet-path",
+    "controlled-or-public-relay",
+    "btle-carrier",
+    "independent-implementation-interoperability",
+    "scale-beyond-two-participants",
+    "resource-thresholds-or-long-duration-soak",
+    "event-or-blob-live-application-acceptance",
+    "reproducible-build-or-cryptographic-source-to-execution-provenance",
+    "tombstone-retention-duration-compaction-or-garbage-collection",
+)
 ORACLE_RECORD_TYPES = (
     "RUN",
     "PARTICIPANT",
@@ -102,10 +159,18 @@ ORACLE_RECORD_TYPES = (
     "RECORD_RESOLUTION_RETRY",
     "RECORD_RESOLVED",
     "RECORD_RESOLVED",
+    "STATE_SUCCESSOR_PUBLICATION",
+    "STATE_SUCCESSOR_RETRY",
+    "STATE_CAUSAL_VIEW",
+    "STATE_CAUSAL_VIEW",
+    "STATE_TOMBSTONE_PUBLICATION",
+    "STATE_TOMBSTONE_RETRY",
+    "STATE_CAUSAL_VIEW",
+    "STATE_CAUSAL_VIEW",
     "SHUTDOWN",
     "SHUTDOWN",
-    "STATE_VIEW",
-    "STATE_VIEW",
+    "STATE_CAUSAL_VIEW",
+    "STATE_CAUSAL_VIEW",
     "RECORD_RESOLVED",
     "RECORD_RESOLVED",
     "RECORD_RESOLUTION_RETRY",
@@ -159,6 +224,8 @@ class Fixture:
             "node-b": identifier("record-b"),
         }
         self.resolution_id = identifier("record-resolution")
+        self.successor_id = identifier("state-successor")
+        self.tombstone_id = identifier("state-tombstone")
         self.secret = b"S" * CHECKER.IDENTITY_BYTES
         self.binary = b"\x7fELFsynthetic-live-mutable-release\n"
         self.source = {
@@ -271,6 +338,80 @@ class Fixture:
                 "concurrent", self.item("state", concurrent_owner, concurrent_id, 1)
             ),
             "concurrent_disposition": "concurrent",
+        }
+
+    def causal_publication(
+        self,
+        kind: str,
+        participant: str,
+        publication_id: str,
+        counter: int,
+        observed_heads: list[str],
+        observed_versions: list[str],
+        *,
+        tombstone: bool,
+    ) -> dict[str, str]:
+        return {
+            "participant": participant,
+            "observed_heads": ",".join(observed_heads),
+            "observed_versions": ",".join(observed_versions),
+            "id": publication_id,
+            "publisher": self.missions[participant],
+            "counter": str(counter),
+            "payload_sha256": ORACLE_PAYLOAD_HASHES[(kind, participant)],
+            "tombstone": str(tombstone).lower(),
+            "inserted": "true",
+        }
+
+    def state_version(
+        self,
+        kind: str,
+        participant: str,
+        publication_id: str,
+        counter: int,
+        *,
+        tombstone: bool,
+    ) -> dict[str, str]:
+        return {
+            **self.item(kind, participant, publication_id, counter),
+            "tombstone": str(tombstone).lower(),
+        }
+
+    def causal_state_view(
+        self,
+        phase: str,
+        participant: str,
+        current: dict[str, str],
+        superseded: list[dict[str, str]],
+    ) -> dict[str, str]:
+        ordered = sorted(superseded, key=lambda item: item["id"])
+        return {
+            "phase": phase,
+            "participant": participant,
+            **self.item_fields(
+                "current",
+                {
+                    key: current[key]
+                    for key in ("id", "publisher", "counter", "payload_sha256")
+                },
+            ),
+            "current_disposition": "current",
+            "current_tombstone": current["tombstone"],
+            "superseded_count": str(len(ordered)),
+            "superseded": ",".join(item["id"] for item in ordered),
+            "superseded_publishers": ",".join(
+                item["publisher"] for item in ordered
+            ),
+            "superseded_counters": ",".join(item["counter"] for item in ordered),
+            "superseded_payload_sha256": ",".join(
+                item["payload_sha256"] for item in ordered
+            ),
+            "superseded_dispositions": ",".join(
+                "superseded" for _item in ordered
+            ),
+            "superseded_tombstones": ",".join(
+                item["tombstone"] for item in ordered
+            ),
         }
 
     def conflict(self, participant: str) -> dict[str, str]:
@@ -484,13 +625,111 @@ class Fixture:
                     self.resolved("connected", participant),
                 )
             )
+        initial_state_versions = [
+            self.state_version(
+                "state",
+                participant,
+                self.state_ids[participant],
+                1,
+                tombstone=False,
+            )
+            for participant in ("node-a", "node-b")
+        ]
+        initial_state_ids = sorted(self.state_ids.values())
+        successor = self.state_version(
+            "successor", "node-a", self.successor_id, 4, tombstone=False
+        )
+        records.append(
+            tsv(
+                "STATE_SUCCESSOR_PUBLICATION",
+                CHECKER.CAUSAL_PUBLICATION_KEYS,
+                self.causal_publication(
+                    "successor",
+                    "node-a",
+                    self.successor_id,
+                    4,
+                    initial_state_ids,
+                    initial_state_ids,
+                    tombstone=False,
+                ),
+            )
+        )
+        records.append(
+            tsv(
+                "STATE_SUCCESSOR_RETRY",
+                CHECKER.RETRY_KEYS,
+                {
+                    "participant": "node-a",
+                    "original_id": self.successor_id,
+                    "retry_id": self.successor_id,
+                    "inserted": "false",
+                },
+            )
+        )
+        for participant in ("node-a", "node-b"):
+            records.append(
+                tsv(
+                    "STATE_CAUSAL_VIEW",
+                    CHECKER.STATE_CAUSAL_VIEW_KEYS,
+                    self.causal_state_view(
+                        "successor", participant, successor, initial_state_versions
+                    ),
+                )
+            )
+        pre_tombstone_versions = [*initial_state_versions, successor]
+        tombstone = self.state_version(
+            "tombstone", "node-b", self.tombstone_id, 3, tombstone=True
+        )
+        records.append(
+            tsv(
+                "STATE_TOMBSTONE_PUBLICATION",
+                CHECKER.CAUSAL_PUBLICATION_KEYS,
+                self.causal_publication(
+                    "tombstone",
+                    "node-b",
+                    self.tombstone_id,
+                    3,
+                    [self.successor_id],
+                    sorted(item["id"] for item in pre_tombstone_versions),
+                    tombstone=True,
+                ),
+            )
+        )
+        records.append(
+            tsv(
+                "STATE_TOMBSTONE_RETRY",
+                CHECKER.RETRY_KEYS,
+                {
+                    "participant": "node-b",
+                    "original_id": self.tombstone_id,
+                    "retry_id": self.tombstone_id,
+                    "inserted": "false",
+                },
+            )
+        )
+        for participant in ("node-a", "node-b"):
+            records.append(
+                tsv(
+                    "STATE_CAUSAL_VIEW",
+                    CHECKER.STATE_CAUSAL_VIEW_KEYS,
+                    self.causal_state_view(
+                        "tombstone", participant, tombstone, pre_tombstone_versions
+                    ),
+                )
+            )
         for participant in ("node-a", "node-b"):
             records.append(
                 tsv("SHUTDOWN", CHECKER.SHUTDOWN_KEYS, self.shutdown("connected", participant))
             )
         for participant in ("node-a", "node-b"):
             records.append(
-                tsv("STATE_VIEW", CHECKER.STATE_VIEW_KEYS, self.state_view("restart", participant))
+                tsv(
+                    "STATE_CAUSAL_VIEW",
+                    CHECKER.STATE_CAUSAL_VIEW_KEYS,
+                    self.causal_state_view(
+                        "restart", participant, tombstone, pre_tombstone_versions
+                    ),
+                )
             )
         for participant in ("node-a", "node-b"):
             records.append(
@@ -533,7 +772,7 @@ class Fixture:
                     "status": "pass",
                     "secret_values_emitted": "false",
                     "payload_representation": "sha256_only",
-                    "records": "40",
+                    "records": "48",
                     "actor_lifetimes": "6",
                     "maximum_concurrent_actors": "2",
                     "graceful_shutdowns": "6",
@@ -585,9 +824,9 @@ class Fixture:
             for key in CHECKER.CONTACT_KEYS[3:26] + CHECKER.CONTACT_KEYS[27:28]
         }
         reconciliation = (
-            {"offered": "3", "fetched": "2", "inserted": "2"}
+            {"offered": "4", "fetched": "3", "inserted": "3"}
             if local == "node-a"
-            else {"offered": "2", "fetched": "3", "inserted": "3"}
+            else {"offered": "3", "fetched": "4", "inserted": "4"}
         )
         numeric.update(
             {
@@ -621,7 +860,7 @@ class Fixture:
 
     def stop(self, participant: str, phase: str) -> str:
         contacts = "1" if phase == "connected" else "0"
-        numeric = {key: "0" for key in CHECKER.STOP_KEYS[4:11] + CHECKER.STOP_KEYS[12:27]}
+        numeric = {key: "0" for key in CHECKER.STOP_NUMERIC_FIELDS}
         numeric.update({"contacts": contacts, "direct_contacts": contacts})
         return terminal(
             "STOP",
@@ -767,13 +1006,20 @@ class SelectedLiveMutableReceiptTests(unittest.TestCase):
         self.assertEqual(CHECKER.RAW_SCHEMA, ORACLE_RAW_SCHEMA)
         self.assertEqual(CHECKER.TRANSCRIPT_SCHEMA, ORACLE_TRANSCRIPT_SCHEMA)
         self.assertEqual(CHECKER.CLAIM, ORACLE_CLAIM)
+        self.assertEqual(CHECKER.TRANSCRIPT_RECORDS, ORACLE_TRANSCRIPT_RECORDS)
+        self.assertEqual(RUNNER.TRANSCRIPT_RECORDS, ORACLE_TRANSCRIPT_RECORDS)
+        self.assertEqual(CHECKER.OLD_RECEIPT_SOURCE_COMMIT, ORACLE_SUPERSEDED_SOURCE_COMMIT)
+        self.assertEqual(CHECKER.OLD_RECEIPT_SHA256, ORACLE_SUPERSEDED_RECEIPT_SHA256)
         self.assertEqual(tuple(CHECKER.EXPECTED_BUILD_ARGV), ORACLE_BUILD_ARGV)
         self.assertEqual(CHECKER.ADMITTED_SOURCE_PATHS, ORACLE_ADMITTED_PATHS)
         self.assertEqual(CHECKER.PAYLOAD_HASHES, ORACLE_PAYLOAD_HASHES)
+        self.assertEqual(tuple(CHECKER.LIMITATIONS), ORACLE_LIMITATIONS)
+        self.assertEqual(tuple(CHECKER.NONCLAIMS), ORACLE_NONCLAIMS)
         self.assertEqual(
             tuple(record_type for record_type, _keys in CHECKER.EXPECTED_SEQUENCE),
             ORACLE_RECORD_TYPES,
         )
+
         transcript_key_schema = "\n".join(
             record_type + "\0" + "\0".join(keys)
             for record_type, keys in CHECKER.EXPECTED_SEQUENCE
@@ -793,6 +1039,22 @@ class SelectedLiveMutableReceiptTests(unittest.TestCase):
         self.assertEqual(
             hashlib.sha256(terminal_key_schema).hexdigest(),
             ORACLE_TERMINAL_KEY_SCHEMA_SHA256,
+        )
+        self.assertEqual(
+            tuple(
+                field
+                for field in CHECKER.STOP_KEYS
+                if field in ORACLE_NEW_STOP_BLOB_FIELDS
+            ),
+            ORACLE_NEW_STOP_BLOB_FIELDS,
+        )
+        self.assertTrue(
+            set(ORACLE_NEW_STOP_BLOB_FIELDS).issubset(CHECKER.STOP_NUMERIC_FIELDS)
+        )
+        self.assertTrue(
+            set(ORACLE_NEW_STOP_BLOB_FIELDS).issubset(
+                CHECKER.STOP_EXCLUDED_ZERO_FIELDS
+            )
         )
         self.assertEqual(
             CHECKER.RUN_KEYS,
@@ -822,6 +1084,13 @@ class SelectedLiveMutableReceiptTests(unittest.TestCase):
             ),
         )
 
+    def test_runner_extracts_the_exact_v2_transcript(self) -> None:
+        expected = ("\n".join(self.fixture.transcript_lines) + "\n").encode("ascii")
+        self.assertEqual(
+            RUNNER.extract_transcript(self.fixture.root / "stdout.log"),
+            expected,
+        )
+
     def test_valid_projection_is_deterministic_bounded_and_sanitized(self) -> None:
         first = self.fixture.receipt()
         second = self.fixture.receipt()
@@ -835,9 +1104,9 @@ class SelectedLiveMutableReceiptTests(unittest.TestCase):
             parsed["acceptance"]["connected_reconciliation"],
             {
                 "selected_item_transfer": {
-                    "offered": 5,
-                    "fetched": 5,
-                    "inserted": 5,
+                    "offered": 7,
+                    "fetched": 7,
+                    "inserted": 7,
                     "duplicates": 0,
                 },
                 "remaining": {"event": 0, "mutable": 0},
@@ -846,6 +1115,50 @@ class SelectedLiveMutableReceiptTests(unittest.TestCase):
                 "control_counters": "all-zero",
                 "blob_counters": "all-zero",
                 "contact_stop_aggregation": "exact",
+            },
+        )
+        self.assertEqual(
+            parsed["supersedes"],
+            {
+                "schema": ORACLE_SUPERSEDED_SCHEMA,
+                "source_commit": ORACLE_SUPERSEDED_SOURCE_COMMIT,
+                "receipt_sha256": ORACLE_SUPERSEDED_RECEIPT_SHA256,
+            },
+        )
+        self.assertEqual(
+            parsed["acceptance"]["state"],
+            {
+                "publications": 4,
+                "initial_publications": 2,
+                "initial_reducer": "max-id-current-other-concurrent",
+                "initial_connected_views": 2,
+                "causal_observed_head_and_version_sets": "exact",
+                "successor": {
+                    "publications": 1,
+                    "publisher_role": "node-a",
+                    "publisher_counter": 4,
+                    "observed_heads": 2,
+                    "observed_versions": 2,
+                    "current_tombstone": False,
+                    "superseded_predecessors": 2,
+                    "network_views": 2,
+                },
+                "tombstone": {
+                    "publications": 1,
+                    "publisher_role": "node-b",
+                    "publisher_counter": 3,
+                    "empty_payload_sha256": ORACLE_PAYLOAD_HASHES[
+                        ("tombstone", "node-b")
+                    ],
+                    "observed_heads": 1,
+                    "observed_versions": 3,
+                    "current_tombstone": True,
+                    "superseded_predecessors": 3,
+                    "network_views": 2,
+                    "peerless_restart_views": 2,
+                    "retention_scope": "one-immediate-peerless-restart-observation",
+                },
+                "causal_views": 6,
             },
         )
         self.assertNotIn(os.fsencode(self.fixture.root), first)
@@ -923,8 +1236,189 @@ class SelectedLiveMutableReceiptTests(unittest.TestCase):
         self.assert_rejected("inconsistent current_id")
 
     def test_state_restart_view_is_independently_checked(self) -> None:
-        self.fixture.mutate_transcript(31, "concurrent_disposition", "superseded")
-        self.assert_rejected("STATE_VIEW restart")
+        self.fixture.mutate_transcript(39, "superseded_dispositions", "current,current,current")
+        self.assert_rejected("STATE_CAUSAL_VIEW restart")
+
+    def test_successor_must_observe_exact_sorted_initial_heads(self) -> None:
+        self.fixture.mutate_transcript(28, "observed_heads", self.fixture.state_ids["node-a"])
+        self.assert_rejected("STATE_SUCCESSOR_PUBLICATION.observed_heads")
+
+    def test_successor_must_observe_exact_sorted_initial_versions(self) -> None:
+        reversed_versions = ",".join(sorted(self.fixture.state_ids.values(), reverse=True))
+        self.fixture.mutate_transcript(28, "observed_versions", reversed_versions)
+        self.assert_rejected("STATE_SUCCESSOR_PUBLICATION.observed_versions")
+
+    def test_successor_publisher_counter_and_payload_are_exact(self) -> None:
+        self.fixture.mutate_transcript(28, "counter", "3")
+        self.assert_rejected("STATE_SUCCESSOR_PUBLICATION.counter")
+
+    def test_successor_publisher_is_node_a(self) -> None:
+        self.fixture.mutate_transcript(28, "publisher", self.fixture.missions["node-b"])
+        self.assert_rejected("STATE_SUCCESSOR_PUBLICATION.publisher")
+
+    def test_successor_payload_hash_is_exact(self) -> None:
+        self.fixture.mutate_transcript(28, "payload_sha256", "0" * 64)
+        self.assert_rejected("STATE_SUCCESSOR_PUBLICATION.payload_sha256")
+
+    def test_successor_publication_must_insert(self) -> None:
+        self.fixture.mutate_transcript(28, "inserted", "false")
+        self.assert_rejected("STATE_SUCCESSOR_PUBLICATION.inserted")
+
+    def test_successor_is_not_a_tombstone(self) -> None:
+        self.fixture.mutate_transcript(28, "tombstone", "true")
+        self.assert_rejected("STATE_SUCCESSOR_PUBLICATION.tombstone")
+
+    def test_successor_identity_must_not_overlap_any_prior_publication(self) -> None:
+        self.fixture.mutate_transcript(28, "id", self.fixture.resolution_id)
+        self.assert_rejected("successor identity overlaps")
+
+    def test_successor_retry_is_exact_and_noninserting(self) -> None:
+        self.fixture.mutate_transcript(29, "inserted", "true")
+        self.assert_rejected("STATE_SUCCESSOR_RETRY")
+
+    def test_successor_retry_preserves_the_successor_identity(self) -> None:
+        self.fixture.mutate_transcript(29, "retry_id", identifier("other-successor"))
+        self.assert_rejected("STATE_SUCCESSOR_RETRY")
+
+    def test_successor_current_is_checked_on_both_network_peers(self) -> None:
+        self.fixture.mutate_transcript(31, "current_id", self.fixture.state_ids["node-a"])
+        self.assert_rejected("STATE_CAUSAL_VIEW successor node-b")
+
+    def test_successor_view_requires_both_exact_superseded_versions(self) -> None:
+        self.fixture.mutate_transcript(30, "superseded", self.fixture.state_ids["node-a"])
+        self.assert_rejected("STATE_CAUSAL_VIEW successor node-a")
+
+    def test_successor_view_requires_exact_current_metadata(self) -> None:
+        self.fixture.mutate_transcript(30, "current_publisher", self.fixture.missions["node-b"])
+        self.assert_rejected("STATE_CAUSAL_VIEW successor node-a")
+
+    def test_successor_view_requires_current_disposition(self) -> None:
+        self.fixture.mutate_transcript(30, "current_disposition", "superseded")
+        self.assert_rejected("STATE_CAUSAL_VIEW successor node-a.current_disposition")
+
+    def test_successor_view_requires_superseded_cardinality(self) -> None:
+        self.fixture.mutate_transcript(30, "superseded_count", "1")
+        self.assert_rejected("STATE_CAUSAL_VIEW successor node-a.superseded_count")
+
+    def test_successor_view_binds_parallel_publisher_counter_and_payload_sets(self) -> None:
+        self.fixture.mutate_transcript(
+            30,
+            "superseded_counters",
+            "1,2",
+        )
+        self.assert_rejected("STATE_CAUSAL_VIEW successor node-a.superseded_counters")
+
+    def test_successor_view_binds_superseded_publishers(self) -> None:
+        duplicate = ",".join([self.fixture.missions["node-a"]] * 2)
+        self.fixture.mutate_transcript(30, "superseded_publishers", duplicate)
+        self.assert_rejected("STATE_CAUSAL_VIEW successor node-a.superseded_publishers")
+
+    def test_successor_view_binds_superseded_payload_hashes(self) -> None:
+        self.fixture.mutate_transcript(
+            30, "superseded_payload_sha256", ",".join(["0" * 64] * 2)
+        )
+        self.assert_rejected("STATE_CAUSAL_VIEW successor node-a.superseded_payload_sha256")
+
+    def test_successor_view_binds_current_and_superseded_tombstone_flags(self) -> None:
+        self.fixture.mutate_transcript(30, "current_tombstone", "true")
+        self.assert_rejected("STATE_CAUSAL_VIEW successor node-a.current_tombstone")
+
+    def test_successor_predecessors_are_not_tombstones(self) -> None:
+        self.fixture.mutate_transcript(30, "superseded_tombstones", "true,false")
+        self.assert_rejected("STATE_CAUSAL_VIEW successor node-a.superseded_tombstones")
+
+    def test_tombstone_must_observe_only_the_successor_head(self) -> None:
+        self.fixture.mutate_transcript(32, "observed_heads", self.fixture.state_ids["node-a"])
+        self.assert_rejected("STATE_TOMBSTONE_PUBLICATION.observed_heads")
+
+    def test_tombstone_must_observe_all_three_prior_versions(self) -> None:
+        self.fixture.mutate_transcript(32, "observed_versions", self.fixture.successor_id)
+        self.assert_rejected("STATE_TOMBSTONE_PUBLICATION.observed_versions")
+
+    def test_tombstone_publisher_and_counter_are_exact(self) -> None:
+        self.fixture.mutate_transcript(32, "publisher", self.fixture.missions["node-a"])
+        self.assert_rejected("STATE_TOMBSTONE_PUBLICATION.publisher")
+
+    def test_tombstone_counter_follows_node_b_record_publication(self) -> None:
+        self.fixture.mutate_transcript(32, "counter", "4")
+        self.assert_rejected("STATE_TOMBSTONE_PUBLICATION.counter")
+
+    def test_tombstone_uses_the_sha256_of_an_empty_payload(self) -> None:
+        self.fixture.mutate_transcript(32, "payload_sha256", "0" * 64)
+        self.assert_rejected("STATE_TOMBSTONE_PUBLICATION.payload_sha256")
+
+    def test_tombstone_publication_flag_is_exact(self) -> None:
+        self.fixture.mutate_transcript(32, "tombstone", "false")
+        self.assert_rejected("STATE_TOMBSTONE_PUBLICATION.tombstone")
+
+    def test_tombstone_publication_must_insert(self) -> None:
+        self.fixture.mutate_transcript(32, "inserted", "false")
+        self.assert_rejected("STATE_TOMBSTONE_PUBLICATION.inserted")
+
+    def test_tombstone_identity_must_not_overlap_prior_versions(self) -> None:
+        self.fixture.mutate_transcript(32, "id", self.fixture.resolution_id)
+        self.assert_rejected("identity domains overlap")
+
+    def test_tombstone_retry_is_exact_and_noninserting(self) -> None:
+        self.fixture.mutate_transcript(33, "retry_id", identifier("wrong-tombstone-retry"))
+        self.assert_rejected("STATE_TOMBSTONE_RETRY")
+
+    def test_tombstone_retry_must_not_reinsert(self) -> None:
+        self.fixture.mutate_transcript(33, "inserted", "true")
+        self.assert_rejected("STATE_TOMBSTONE_RETRY")
+
+    def test_tombstone_current_is_checked_on_both_network_peers(self) -> None:
+        self.fixture.mutate_transcript(35, "current_tombstone", "false")
+        self.assert_rejected("STATE_CAUSAL_VIEW tombstone node-b.current_tombstone")
+
+    def test_tombstone_view_requires_all_three_superseded_versions(self) -> None:
+        self.fixture.mutate_transcript(34, "superseded_count", "2")
+        self.assert_rejected("STATE_CAUSAL_VIEW tombstone node-a.superseded_count")
+
+    def test_tombstone_view_requires_exact_current_identity(self) -> None:
+        self.fixture.mutate_transcript(34, "current_id", self.fixture.successor_id)
+        self.assert_rejected("STATE_CAUSAL_VIEW tombstone node-a")
+
+    def test_tombstone_view_binds_all_superseded_ids(self) -> None:
+        self.fixture.mutate_transcript(34, "superseded", self.fixture.successor_id)
+        self.assert_rejected("STATE_CAUSAL_VIEW tombstone node-a.superseded")
+
+    def test_tombstone_view_binds_superseded_publishers(self) -> None:
+        duplicate = ",".join([self.fixture.missions["node-a"]] * 3)
+        self.fixture.mutate_transcript(34, "superseded_publishers", duplicate)
+        self.assert_rejected("STATE_CAUSAL_VIEW tombstone node-a.superseded_publishers")
+
+    def test_tombstone_view_binds_superseded_counters(self) -> None:
+        self.fixture.mutate_transcript(34, "superseded_counters", "2,2,2")
+        self.assert_rejected("STATE_CAUSAL_VIEW tombstone node-a.superseded_counters")
+
+    def test_tombstone_view_binds_superseded_payload_hashes(self) -> None:
+        self.fixture.mutate_transcript(
+            34, "superseded_payload_sha256", ",".join(["0" * 64] * 3)
+        )
+        self.assert_rejected("STATE_CAUSAL_VIEW tombstone node-a.superseded_payload_sha256")
+
+    def test_tombstone_view_requires_superseded_dispositions(self) -> None:
+        self.fixture.mutate_transcript(
+            34, "superseded_dispositions", "concurrent,superseded,superseded"
+        )
+        self.assert_rejected("STATE_CAUSAL_VIEW tombstone node-a.superseded_dispositions")
+
+    def test_tombstone_view_requires_nontombstone_predecessor_flags(self) -> None:
+        self.fixture.mutate_transcript(34, "superseded_tombstones", "false,true,false")
+        self.assert_rejected("STATE_CAUSAL_VIEW tombstone node-a.superseded_tombstones")
+
+    def test_restart_view_preserves_tombstone_identity_and_empty_payload_hash(self) -> None:
+        self.fixture.mutate_transcript(38, "current_payload_sha256", "0" * 64)
+        self.assert_rejected("STATE_CAUSAL_VIEW restart node-a")
+
+    def test_restart_view_preserves_current_tombstone_flag(self) -> None:
+        self.fixture.mutate_transcript(38, "current_tombstone", "false")
+        self.assert_rejected("STATE_CAUSAL_VIEW restart node-a.current_tombstone")
+
+    def test_restart_view_preserves_all_three_superseded_versions(self) -> None:
+        self.fixture.mutate_transcript(38, "superseded_count", "2")
+        self.assert_rejected("STATE_CAUSAL_VIEW restart node-a.superseded_count")
 
     def test_record_siblings_must_be_sorted_and_exact(self) -> None:
         reversed_siblings = ",".join(sorted(self.fixture.record_ids.values(), reverse=True))
@@ -956,11 +1450,11 @@ class SelectedLiveMutableReceiptTests(unittest.TestCase):
         self.assert_rejected("RECORD_RESOLVED connected")
 
     def test_restart_projection_cannot_reintroduce_conflict(self) -> None:
-        self.fixture.mutate_transcript(32, "conflict", "true")
+        self.fixture.mutate_transcript(40, "conflict", "true")
         self.assert_rejected("RECORD_RESOLVED restart")
 
     def test_post_restart_retry_must_preserve_resolution_identity(self) -> None:
-        self.fixture.mutate_transcript(34, "retry_id", identifier("wrong-restart-retry"))
+        self.fixture.mutate_transcript(42, "retry_id", identifier("wrong-restart-retry"))
         self.assert_rejected("post_restart")
 
     def test_peerless_and_restart_contacts_must_be_zero(self) -> None:
@@ -968,16 +1462,16 @@ class SelectedLiveMutableReceiptTests(unittest.TestCase):
         self.assert_rejected("zero-contact")
 
     def test_connected_contacts_must_be_positive_direct_only(self) -> None:
-        self.fixture.mutate_transcript(28, "direct_contacts", "0")
+        self.fixture.mutate_transcript(36, "direct_contacts", "0")
         self.assert_rejected("positive direct-only")
 
     def test_connected_contacts_must_be_equal_paired_sessions(self) -> None:
-        self.fixture.mutate_transcript(29, "contacts", "2")
-        self.fixture.mutate_transcript(29, "direct_contacts", "2")
+        self.fixture.mutate_transcript(37, "contacts", "2")
+        self.fixture.mutate_transcript(37, "direct_contacts", "2")
         self.assert_rejected("equal paired sessions")
 
     def test_contact_errors_fail_closed(self) -> None:
-        self.fixture.mutate_transcript(29, "contact_errors", "1")
+        self.fixture.mutate_transcript(37, "contact_errors", "1")
         self.assert_rejected("contact errors")
 
     def test_runtime_ready_identity_must_cross_bind_transcript(self) -> None:
@@ -1020,6 +1514,37 @@ class SelectedLiveMutableReceiptTests(unittest.TestCase):
         self.fixture.mutate_runtime(6, "blob_bytes_fetched", "1")
         self.assert_rejected("nonzero excluded.*Blob counter")
 
+    def test_new_stop_blob_lifecycle_fields_must_all_be_zero(self) -> None:
+        for field in ORACLE_NEW_STOP_BLOB_FIELDS:
+            with self.subTest(field=field):
+                self.fixture.mutate_runtime(2, field, "1")
+                self.assert_rejected(field)
+                self.fixture.mutate_runtime(2, field, "0")
+
+    def test_stop_blob_lifecycle_field_order_is_exact(self) -> None:
+        parts = self.fixture.runtime_lines[2].split(" ")
+        positions = {
+            token.partition("=")[0]: index
+            for index, token in enumerate(parts[1:], start=1)
+        }
+        first = positions["blob_acceptance_markers"]
+        second = positions["blob_last_acceptance_marker"]
+        parts[first], parts[second] = parts[second], parts[first]
+        self.fixture.runtime_lines[2] = " ".join(parts)
+        self.fixture.refresh_public()
+        self.assert_rejected("reordered fields")
+
+    def test_stop_blob_lifecycle_schema_rejects_a_missing_field(self) -> None:
+        parts = self.fixture.runtime_lines[2].split(" ")
+        parts = [
+            token
+            for token in parts
+            if not token.startswith("blob_network_staging_bytes=")
+        ]
+        self.fixture.runtime_lines[2] = " ".join(parts)
+        self.fixture.refresh_public()
+        self.assert_rejected("field count")
+
     def test_runtime_control_activity_cannot_hide_behind_zero_stop_counters(self) -> None:
         self.fixture.mutate_runtime_fields(
             6,
@@ -1039,12 +1564,11 @@ class SelectedLiveMutableReceiptTests(unittest.TestCase):
         self.assert_rejected("nonzero excluded Event")
 
     def test_runtime_reconciliation_is_bound_to_publication_roles(self) -> None:
-        self.fixture.mutate_runtime_fields(
-            6, {"offered": "3", "fetched": "2", "inserted": "2"}
-        )
-        self.fixture.mutate_runtime_fields(
-            7, {"offered": "2", "fetched": "3", "inserted": "3"}
-        )
+        first_is_node_a = "offered=4" in self.fixture.runtime_lines[6]
+        node_a = {"offered": "4", "fetched": "3", "inserted": "3"}
+        node_b = {"offered": "3", "fetched": "4", "inserted": "4"}
+        self.fixture.mutate_runtime_fields(6, node_b if first_is_node_a else node_a)
+        self.fixture.mutate_runtime_fields(7, node_a if first_is_node_a else node_b)
         self.assert_rejected("publication and resolution arithmetic")
 
     def test_unexpected_stdout_family_fails_closed(self) -> None:
@@ -1053,7 +1577,7 @@ class SelectedLiveMutableReceiptTests(unittest.TestCase):
         self.assert_rejected("unadmitted terminal record family")
 
     def test_six_shutdowns_four_handles_and_two_reacquisitions_are_exact(self) -> None:
-        self.fixture.mutate_transcript(39, "graceful_shutdowns", "5")
+        self.fixture.mutate_transcript(47, "graceful_shutdowns", "5")
         self.assert_rejected("RESULT.graceful_shutdowns")
 
     def test_closed_handle_operation_is_exact(self) -> None:
@@ -1061,7 +1585,7 @@ class SelectedLiveMutableReceiptTests(unittest.TestCase):
         self.assert_rejected("CLOSED_HANDLE")
 
     def test_bind_reacquisition_is_exact(self) -> None:
-        self.fixture.mutate_transcript(38, "status", "failed")
+        self.fixture.mutate_transcript(46, "status", "failed")
         self.assert_rejected("BIND_REACQUIRED")
 
     def test_unexpected_file_and_directory_fail_closed(self) -> None:
