@@ -46,10 +46,31 @@ one immediate peerless reopen, not indefinite tombstone retention, compaction,
 garbage collection, or delete-wins. It does not cover physical hosts, NAT,
 Internet, relay, BTLE, independent implementations, scale beyond two
 participants, resource thresholds, long-duration operation, or evidence for
-the newer live Blob mechanism or live Event/Blob application acceptance. Finite
-State/Record TTL, durable subscriptions, selected-node language bindings,
+the newer live Blob mechanism or, by itself, live Event/Blob application
+acceptance. Finite State/Record TTL, durable subscriptions, selected-node
+language bindings,
 representative physical or mixed-implementation acceptance, and release
 authorization remain open.
+
+A [retained 9,573-byte v1 live-Event receipt](docs/implementation/evidence/selected-live-event-c464129.json)
+(SHA-256
+`4d71d04e4ebcc9f63c0e84e7f11e83bf1f3d1ad2ca8608486cdcc875b6dfeef0`)
+binds signed source `c464129`. On one same-implementation loopback host, a
+peerless publisher durably created three alpha Events plus one authorized beta
+Event. A priority-threshold direct contact delivered alpha sequences 1 and 3,
+exposed the authenticated half-open gap `[2,3)`, and left the beta Event
+withheld. After the receiver child was forcibly terminated following a flushed,
+unacknowledged poll, a fresh process redelivered the same two Event IDs as
+attempt 2 and completed acknowledgement plus idempotent re-acknowledgement. A
+normal contact then delivered alpha sequence 2 and closed the gap.
+
+That receipt also observes `PolicyChangedSinceContact` after a temporary beta
+subscription, followed by exact removal and idempotent removal, but no fresh
+post-change contact or beta delivery. Its awaiting observations have zero—not
+positive—failed contact attempts. It is bounded direct-Iroh software evidence,
+not physical-host, NAT/Internet, relay, BTLE, mixed-implementation, scale,
+resource/soak, State/Record/Blob acceptance, reproducible-build, release, or
+production evidence.
 
 A [retained 10,728-byte v2 live-Blob receipt](docs/implementation/evidence/selected-live-blob-044d90f.json)
 (SHA-256

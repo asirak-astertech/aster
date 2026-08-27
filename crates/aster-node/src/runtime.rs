@@ -20223,6 +20223,247 @@ mod tests {
     }
 
     #[test]
+    fn selected_event_status_tracks_policy_work_contact_failure_and_revocation() {
+        let state = root("selected-event-status-state-machine");
+        fs::create_dir_all(&state).expect("status state root");
+        let services = control_test_services([0xd2; 32]);
+        let peer = services.member.identity();
+        let store = Store::open_for_mission(
+            state.join(STORE_FILE),
+            services.authority.mission_authority_id(),
+        )
+        .expect("status store");
+        let initial = store
+            .event_replication_policy_snapshot()
+            .expect("initial status policy");
+
+        let offline = SelectedEventStatusTracker::new(BTreeSet::new())
+            .snapshot(&store, &initial, 0)
+            .expect("offline status");
+        assert_eq!(offline.sync, EventSyncStatus::Offline);
+        assert_eq!(offline.authenticated_contacts, 0);
+        assert_eq!(offline.failed_contact_attempts, 0);
+        assert!(offline.peers.is_empty());
+
+        let mut tracker = SelectedEventStatusTracker::new(BTreeSet::from([peer]));
+        let awaiting = tracker
+            .snapshot(&store, &initial, 7)
+            .expect("awaiting status");
+        assert_eq!(awaiting.sync, EventSyncStatus::AwaitingAuthenticatedContact);
+        assert_eq!(awaiting.authenticated_contacts, 0);
+        assert_eq!(awaiting.failed_contact_attempts, 7);
+        assert!(awaiting.peers.is_empty());
+
+        tracker
+            .record(&CompletedPeerContact {
+                receipt: PeerReceipt {
+                    mission_peer: Some(peer),
+                    remaining: 1,
+                    ..PeerReceipt::default()
+                },
+                event_policy: ContactEventPolicy::capture(&initial),
+            })
+            .expect("partial authenticated contact");
+        let work_remained = tracker
+            .snapshot(&store, &initial, 7)
+            .expect("partial-contact status");
+        assert_eq!(work_remained.sync, EventSyncStatus::WorkRemained);
+        assert_eq!(work_remained.authenticated_contacts, 1);
+        assert_eq!(work_remained.failed_contact_attempts, 7);
+        assert_eq!(
+            work_remained.peers,
+            vec![AuthenticatedPeerStatus {
+                peer,
+                contacts: 1,
+                authorization: PeerAuthorization::Active,
+                last_contact: ContactSyncStatus::WorkRemained,
+            }]
+        );
+
+        let selector_key =
+            EventSubscriptionKey::new(b"status/policy-change".to_vec()).expect("selector key");
+        store
+            .create_event_subscription_with_policy(
+                initial.control_policy(),
+                &selector_key,
+                EventSubscriptionSpec {
+                    mode: EventSubscriptionMode::Consume,
+                    topic: services.topic.clone(),
+                    scope: services.scope.clone(),
+                    include_descendant_scopes: false,
+                },
+            )
+            .expect("advance selector generation");
+        let changed = store
+            .event_replication_policy_snapshot()
+            .expect("changed status policy");
+        let policy_changed = tracker
+            .snapshot(&store, &changed, 7)
+            .expect("policy-changed status");
+        assert_eq!(
+            policy_changed.sync,
+            EventSyncStatus::PolicyChangedSinceContact
+        );
+        assert_eq!(
+            policy_changed.peers,
+            vec![AuthenticatedPeerStatus {
+                peer,
+                contacts: 1,
+                authorization: PeerAuthorization::Active,
+                last_contact: ContactSyncStatus::PolicyChangedSinceContact,
+            }]
+        );
+
+        tracker
+            .record(&CompletedPeerContact {
+                receipt: PeerReceipt {
+                    mission_peer: Some(peer),
+                    ..PeerReceipt::default()
+                },
+                event_policy: ContactEventPolicy::capture(&changed),
+            })
+            .expect("fresh completed authenticated contact");
+        let complete = tracker
+            .snapshot(&store, &changed, 7)
+            .expect("fresh complete status");
+        assert_eq!(complete.sync, EventSyncStatus::LastContactComplete);
+        assert_eq!(complete.authenticated_contacts, 2);
+        assert_eq!(
+            complete.peers,
+            vec![AuthenticatedPeerStatus {
+                peer,
+                contacts: 2,
+                authorization: PeerAuthorization::Active,
+                last_contact: ContactSyncStatus::CompleteForLastNegotiatedContact,
+            }]
+        );
+
+        publish_revocation_control_in_store(&store, &services.authority, peer, 1)
+            .expect("revoke configured peer");
+        let revoked_policy = store
+            .event_replication_policy_snapshot()
+            .expect("revoked status policy");
+        let revoked = tracker
+            .snapshot(&store, &revoked_policy, 7)
+            .expect("revoked-peer status");
+        assert_eq!(revoked.sync, EventSyncStatus::NoActiveConfiguredPeers);
+        assert_eq!(revoked.authenticated_contacts, 2);
+        assert_eq!(revoked.failed_contact_attempts, 7);
+        assert_eq!(
+            revoked.peers,
+            vec![AuthenticatedPeerStatus {
+                peer,
+                contacts: 2,
+                authorization: PeerAuthorization::Revoked,
+                last_contact: ContactSyncStatus::PolicyChangedSinceContact,
+            }]
+        );
+
+        drop(store);
+        fs::remove_dir_all(state).expect("cleanup status state");
+    }
+
+    #[test]
+    fn selected_event_status_rejects_invalid_contacts_and_count_overflow_without_mutation() {
+        let state = root("selected-event-status-fail-closed");
+        fs::create_dir_all(&state).expect("status failure root");
+        let services = control_test_services([0xd3; 32]);
+        let peer = services.member.identity();
+        let other = services.other.identity();
+        let store = Store::open_for_mission(
+            state.join(STORE_FILE),
+            services.authority.mission_authority_id(),
+        )
+        .expect("status failure store");
+        let current = store
+            .event_replication_policy_snapshot()
+            .expect("status failure policy");
+        let policy = ContactEventPolicy::capture(&current);
+        let mut tracker = SelectedEventStatusTracker::new(BTreeSet::from([peer]));
+
+        let missing = tracker
+            .record(&CompletedPeerContact {
+                receipt: PeerReceipt::default(),
+                event_policy: policy,
+            })
+            .expect_err("missing authenticated mission peer must fail");
+        assert!(matches!(
+            missing,
+            NodeError::Protocol(message)
+                if message == "successful contact omitted its authenticated mission peer"
+        ));
+        assert!(tracker.authenticated.is_empty());
+
+        let unconfigured = tracker
+            .record(&CompletedPeerContact {
+                receipt: PeerReceipt {
+                    mission_peer: Some(other),
+                    ..PeerReceipt::default()
+                },
+                event_policy: policy,
+            })
+            .expect_err("unconfigured authenticated mission peer must fail");
+        assert!(matches!(
+            unconfigured,
+            NodeError::Protocol(message)
+                if message == "successful contact identified an unconfigured mission peer"
+        ));
+        assert!(tracker.authenticated.is_empty());
+
+        tracker.authenticated.insert(
+            peer,
+            AuthenticatedContactObservation {
+                contacts: u64::MAX,
+                complete: false,
+                policy,
+            },
+        );
+        let overflow = tracker
+            .record(&CompletedPeerContact {
+                receipt: PeerReceipt {
+                    mission_peer: Some(peer),
+                    ..PeerReceipt::default()
+                },
+                event_policy: policy,
+            })
+            .expect_err("per-peer authenticated contact overflow must fail");
+        assert!(matches!(
+            overflow,
+            NodeError::Protocol(message) if message == "authenticated contact count overflow"
+        ));
+        let retained = tracker
+            .authenticated
+            .get(&peer)
+            .expect("overflow preserves prior observation");
+        assert_eq!(retained.contacts, u64::MAX);
+        assert!(!retained.complete);
+        assert_eq!(retained.policy, policy);
+
+        tracker.configured_peers.insert(other);
+        tracker.authenticated.insert(
+            other,
+            AuthenticatedContactObservation {
+                contacts: 1,
+                complete: true,
+                policy,
+            },
+        );
+        let aggregate = tracker
+            .snapshot(&store, &current, usize::MAX)
+            .expect_err("aggregate authenticated contact overflow must fail");
+        assert!(matches!(
+            aggregate,
+            NodeError::Protocol(message) if message == "authenticated contact count overflow"
+        ));
+        assert_eq!(tracker.authenticated.len(), 2);
+        assert_eq!(tracker.authenticated[&peer].contacts, u64::MAX);
+        assert_eq!(tracker.authenticated[&other].contacts, 1);
+
+        drop(store);
+        fs::remove_dir_all(state).expect("cleanup status failure state");
+    }
+
+    #[test]
     fn selected_event_cardinality_covers_live_route_and_permanent_fence_bounds() {
         let selected = selected_reconciliation_limits().expect("selected limits");
         assert_eq!(selected.cardinality(), MAX_CARDINALITY_LIMIT);

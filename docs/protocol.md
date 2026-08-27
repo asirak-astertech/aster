@@ -1058,6 +1058,23 @@ three modes but not `PassiveOnly`. Physical emission measurement and the
 distinction between receive-only protocol responses and literal radio silence
 remain stakeholder-validation items.
 
+A [retained 9,573-byte live-Event receipt](implementation/evidence/selected-live-event-c464129.json)
+(SHA-256
+`4d71d04e4ebcc9f63c0e84e7f11e83bf1f3d1ad2ca8608486cdcc875b6dfeef0`,
+signed source `c464129`) provides one bounded observation of these rules. On a
+same-implementation loopback host, `AtLeast(PRIORITY)` transfers alpha
+sequences 1 and 3 while routine sequence 2 remains outside negotiated eligible
+work; the authenticated stream gap is `[2,3)`, while last-contact status is
+complete for that negotiated policy, not `WorkRemained`. After a flushed,
+unacknowledged poll, the parent forcibly terminates the receiver child; a fresh
+process receives the same IDs as attempt 2 and ack/re-acks them. A later Normal
+contact transfers sequence 2 and closes the gap. An authorized beta Event
+remains withheld while unsubscribed; subscribing produces
+`PolicyChangedSinceContact`, then removal, without a fresh post-change contact
+or beta delivery. Awaiting observations have zero failed attempts. This receipt
+does not establish physical/NAT/relay/BTLE, mixed implementation, scale or
+resource behavior, another data class, or release acceptance.
+
 ## 12. Scopes, topics, relay, and bridge policy
 
 Consume interest and carry interest are explicit. A node reconciles only their

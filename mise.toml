@@ -21,6 +21,7 @@ run = [
   "python3 tools/test-selected-iroh-nat-receipt.py",
   "python3 tools/test-selected-live-mutable-receipt.py",
   "python3 tools/test-selected-live-blob-receipt.py",
+  "python3 tools/test-selected-live-event-receipt.py",
   "python3 tools/check-selected-node-dependency-boundary.py",
   "python3 tools/check-netlink-packet-core-patch.py",
   "sh tools/test-netlink-packet-core-patch.sh",
