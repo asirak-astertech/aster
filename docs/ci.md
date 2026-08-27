@@ -510,8 +510,9 @@ garbage collection, or delete-wins. It supplies no physical, NAT/Internet,
 controlled/public-relay, BTLE, independent-implementation, scale beyond two,
 resource-threshold, long-duration, Event/Blob-live, or release acceptance from
 that State/Record receipt.
-Durable State/Record subscriptions, selected-node bindings, finite TTL, and
-automatic registered-policy Record merge remain open. Its zero Blob counters
+Retained State-subscription acceptance, durable Record delivery, selected-node
+bindings, finite TTL, and automatic registered-policy Record merge remain open.
+Its zero Blob counters
 do not evidence the newer live Blob mechanism.
 
 ## Selected live Event retained gate
