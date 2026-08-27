@@ -55,14 +55,16 @@ pub use blob::{
     BlobDepotLimits, BlobId, BlobPublishRequest, BlobPublishResult, BlobReadRequest,
     BlobReadResult, SelectedBlobNode, SelectedBlobOptions,
 };
+pub(crate) use record::SelectedRecordCommand;
 pub use record::{
     RecordConflict, RecordId, RecordItem, RecordProjection, RecordPublishRequest,
     RecordPublishResult, RecordQuery, RecordResolutionGuard, RecordResolveRequest,
-    RecordVersionDisposition, SelectedRecordNode,
+    RecordVersionDisposition, SelectedRecordHandle, SelectedRecordNode,
 };
+pub(crate) use state::SelectedStateCommand;
 pub use state::{
-    SelectedStateNode, StateId, StateItem, StateProjection, StatePublishRequest,
-    StatePublishResult, StateQuery, StateVersionDisposition,
+    SelectedStateHandle, SelectedStateNode, StateId, StateItem, StateProjection,
+    StatePublishRequest, StatePublishResult, StateQuery, StateVersionDisposition,
 };
 
 /// Maximum number of accepted Event rows one query call may scan.
@@ -555,7 +557,7 @@ pub struct SelectedEventStatus {
 /// Cloneable live application handle backed by the running node's sole authority.
 #[derive(Clone)]
 pub struct SelectedEventHandle {
-    commands: mpsc::Sender<SelectedEventCommand>,
+    commands: mpsc::Sender<SelectedApplicationCommand>,
     admission: Arc<AtomicBool>,
     identity: NodeId,
     mission_authority: NodeId,
@@ -563,7 +565,7 @@ pub struct SelectedEventHandle {
 
 impl SelectedEventHandle {
     pub(crate) fn new(
-        commands: mpsc::Sender<SelectedEventCommand>,
+        commands: mpsc::Sender<SelectedApplicationCommand>,
         admission: Arc<AtomicBool>,
         identity: NodeId,
         mission_authority: NodeId,
@@ -713,14 +715,14 @@ impl SelectedEventHandle {
             return Err(actor_unavailable(operation));
         }
         self.commands
-            .send(command)
+            .send(SelectedApplicationCommand::Event(command))
             .await
             .map_err(|_| actor_unavailable(operation))?;
         received.await.map_err(|_| actor_unavailable(operation))?
     }
 }
 
-fn actor_unavailable(operation: &'static str) -> ApplicationError {
+pub(crate) fn actor_unavailable(operation: &'static str) -> ApplicationError {
     ApplicationError::new(ApplicationErrorKind::StateUnavailable, operation)
 }
 
@@ -783,6 +785,32 @@ impl SelectedEventCommand {
             }
             Self::Gaps { response, .. } => _ = response.send(Err(actor_unavailable("gaps"))),
             Self::Status { response } => _ = response.send(Err(actor_unavailable("status"))),
+        }
+    }
+}
+
+/// One bounded high-level application command owned by the running node actor.
+///
+/// The wrapper keeps Event, State, and Record operations on one admission and
+/// fairness lane. Only Event subscription changes require the actor's
+/// selector-write lease; plaintext operations for every class remain behind
+/// the same mission-bound store authority.
+pub(crate) enum SelectedApplicationCommand {
+    Event(SelectedEventCommand),
+    State(SelectedStateCommand),
+    Record(SelectedRecordCommand),
+}
+
+impl SelectedApplicationCommand {
+    pub(crate) const fn mutates_selectors(&self) -> bool {
+        matches!(self, Self::Event(command) if command.mutates_selectors())
+    }
+
+    pub(crate) fn reject(self) {
+        match self {
+            Self::Event(command) => command.reject(),
+            Self::State(command) => command.reject(),
+            Self::Record(command) => command.reject(),
         }
     }
 }

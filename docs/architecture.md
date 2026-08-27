@@ -7,8 +7,8 @@ the complete protocol and semantic reference implementation.
 | Data class | Selected networking | Application surface |
 |---|---|---|
 | Event | Direct Iroh or one operator-pinned controlled Iroh relay | Live Rust handle, stopped Rust handle, and local ConnectRPC agent |
-| State | Class-specific direct-Iroh reconciliation | Exclusive stopped Rust handle |
-| Record | Class-specific direct-Iroh reconciliation | Exclusive stopped Rust handle |
+| State | Class-specific direct-Iroh reconciliation | Cloneable live Rust handle and exclusive stopped Rust facade |
+| Record | Class-specific direct-Iroh reconciliation | Cloneable live Rust handle and exclusive stopped Rust facade |
 | Blob | Semantic-v5 direct source/carrier transfer | Exclusive stopped Rust handle and encrypted local depot |
 
 Read the diagrams from broadest to narrowest: application surfaces, runtime
@@ -27,13 +27,15 @@ flowchart LR
     App --> LiveRust["Live Rust handle"]
     App --> StoppedRust["Stopped Rust handles"]
     Connect --> LiveEvent["Event operations"]
-    LiveRust --> LiveEvent
+    LiveRust --> LiveOps["Event · State · Record operations"]
     LiveEvent --> Actor["Running aster-node actor"]
+    LiveOps --> Actor
     StoppedRust --> Event["Event"]
     StoppedRust --> State["State"]
     StoppedRust --> Record["Record"]
     StoppedRust --> Blob["Blob"]
-    Event --> Exclusive["Exclusive store authority"]
+    Actor --> Exclusive["Exclusive store authority"]
+    Event --> Exclusive
     State --> Exclusive
     Record --> Exclusive
     Blob --> Depot["Encrypted local depot"]
@@ -41,16 +43,18 @@ flowchart LR
 ```
 
 The running actor and stopped handles never own the store at the same time.
-State, Record, and Blob objects published through stopped handles can reconcile
-after those handles close and the actor starts. Blob application access remains
-local and stopped; semantic v5 separately transfers already-durable Blob sources
-and bounded carrier prefixes directly between content-capable peers.
+State and Record applications may publish/query—and for Record, resolve—through
+the running actor, or use their stopped facades after the actor exits. Objects
+published through either mode reconcile under the same authority. Blob
+application access remains local and stopped; semantic v5 separately transfers
+already-durable Blob sources and bounded carrier prefixes directly between
+content-capable peers.
 
 ### Runtime trust path
 
 ```mermaid
 flowchart LR
-    API["Live Event API"] --> Node["aster-node<br/>ordering and lifecycle"]
+    API["Live Event/State/Record API"] --> Node["aster-node<br/>ordering and lifecycle"]
     Authority["Authority CLI"] --> Node
     Operator["Same-UID Unix operator"] -. "local zeroize" .-> Node
     Node --> Core["aster-core<br/>control and source verification"]
@@ -89,14 +93,16 @@ depot. Non-Unix does not prove copied-database replacement/rollback resistance
 at the same canonical path. No supported rebind/restore migration is provided
 in this slice.
 
-The live handle does not open a second store. It sends commands over a bounded
-channel to the actor that already owns the mission-bound writer. Commands that
-insert or remove selectors take the actor's policy write lease; other
-application operations and contacts use a policy read lease. Shutdown or
-zeroization closes admission and rejects queued commands before the authority
-is released. The stopped handle can acquire that authority only after the live
-actor has exited. Conversely, State and Record publication/query handles must
-close before the actor starts reconciling their durable rows.
+Live Event, State, and Record handle clones do not open a second store. They send
+commands over one bounded channel to the actor that already owns the
+mission-bound writer. Event commands that insert or remove selectors take the
+actor's policy write lease; State/Record publish/query/resolve and other
+application operations use the policy read lease. Contacts use that same
+actor-owned policy/store authority. Shutdown or zeroization closes application
+admission and rejects queued commands before the authority is released, so
+retained clones return sanitized `StateUnavailable`. A stopped facade can
+acquire the writer only after the live actor has exited and must close before a
+new actor starts.
 
 Each mission-authenticated contact runs class-separated State and Record
 Negentropy/fetch lanes after its control and Event lanes. A receiver supplies
@@ -109,18 +115,18 @@ one policy generation. Exact transfer identities make repeated receipt
 idempotent. Remote finite-TTL mutable objects fail closed until authenticated
 cumulative forwarding age exists.
 
-## Stopped State publication, projection, and network reconciliation
+## Live or stopped State publication, projection, and network reconciliation
 
-The selected State facade uses the same mission, control policy, source-envelope
-provider, writer lock, and causal ledger as Event. A State publisher counter
-therefore cannot restart at one or reuse an Event dot. State storage is additive
-and uses its own typed transfer identity and reconciliation frames; it cannot be
-confused with either Event or Record traffic.
+The selected State composition uses the same mission, control policy,
+source-envelope provider, writer lock, and causal ledger as Event. A State
+publisher counter therefore cannot restart at one or reuse an Event dot. State
+storage is additive and uses its own typed transfer identity and reconciliation
+frames; it cannot be confused with either Event or Record traffic.
 
 ```mermaid
 sequenceDiagram
     participant A as Application
-    participant N as SelectedStateNode
+    participant N as State composition (live handle or stopped facade)
     participant P as Current control policy
     participant C as Source-envelope provider
     participant S as Mission-bound redb
@@ -165,14 +171,19 @@ freshly verified so they cannot hide structural corruption, but they are not
 returned as application current or recoverable values. A current tombstone is
 returned visibly as authenticated State with an empty payload. There is no
 delete-wins rule, and deletion is not collapsed into an unauthenticated
-`None`. A real-Iroh two-node test transfers one durable State under an explicit
-interest and verifies the independent destination inventory. Expiry, garbage
-collection, durable State subscriptions, live State commands, multi-hop
-acceptance, and independent interoperability remain unimplemented.
+`None`. A
+[retained bounded receipt](implementation/evidence/selected-live-mutable-2ccfba0.json)
+publishes disconnected State through live handles, later reconciles under an
+explicit interest, and verifies the same max-ID-current/other-concurrent
+projection at both actors and after restart. It is one-host,
+same-implementation loopback evidence, not physical-network,
+mixed-implementation, scale, or release acceptance. Expiry, garbage collection,
+durable State subscriptions, selected-node bindings, relay/multi-hop acceptance,
+finite TTL, and independent interoperability remain unimplemented.
 
-## Stopped Record projection, guarded resolution, and network reconciliation
+## Live or stopped Record projection, guarded resolution, and network reconciliation
 
-The selected Record facade uses the same mission, control policy,
+The selected Record composition uses the same mission, control policy,
 source-envelope provider, writer lock, and causal ledger as Event and State.
 Its tables, markers, exact/semantic indexes, and operation ledger remain
 class-disjoint, while a Record publisher cannot reuse a causal dot already used
@@ -188,7 +199,7 @@ projection, not a silent merge or discard.
 ```mermaid
 flowchart LR
     Q["Exact-key query"] --> P["redb bounded structural plan<br/>all retained candidates"]
-    P --> V["SelectedRecordNode<br/>fresh source/content verification<br/>independent causal recomputation"]
+    P --> V["Record composition<br/>fresh source/content verification<br/>independent causal recomputation"]
     V --> H{"Active heads"}
     H -->|one| C["Current<br/>optional superseded history"]
     H -->|two or more| F["Current + Concurrent<br/>explicit sorted siblings<br/>opaque exact guard"]
@@ -218,12 +229,18 @@ empty payload; a concurrent tombstone has no delete-wins priority.
 Registered merge policies are never run automatically by this selected slice.
 Remote ingest stores an immutable, already source-authenticated revision and
 recomputes structural causal heads without invoking application code. A
-real-Iroh two-node test publishes one revision on each independent store while
-disconnected, reconciles both directions under an explicit Record interest,
-and verifies that both stores retain the same two heads. Record still has no
-live application handle, durable application subscription, or selected relay
-cache. Multi-hop/partition sweeps, independent interoperability, finite TTL,
-expiry, garbage collection, and retention-driven deletion remain unimplemented.
+retained direct-Iroh acceptance run publishes one revision through each live
+handle while disconnected, reconciles both directions under an explicit Record
+interest, verifies that both actors retain the same two heads, rejects an
+ordinary conflict-collapsing publish without changing them, then resolves and
+exactly retries the guard through the live authority. Both original heads are
+superseded, and the resolved projection survives restart. The
+[canonical receipt](implementation/evidence/selected-live-mutable-2ccfba0.json)
+does not establish physical-network or mixed-implementation acceptance. Record
+still has no durable application subscription, selected-node binding, or
+selected relay acceptance. Multi-hop/partition sweeps, independent
+interoperability, finite TTL, expiry, garbage collection, and retention-driven
+deletion remain unimplemented.
 
 ## Local Blob streaming and depot authority
 
@@ -457,9 +474,9 @@ independent implementation, resource evidence, or release acceptance. See the
 - [Capability tour](quickstart/capability-tour.md) — fastest visible behavior.
 - [Selected Event API](quickstart/selected-event-api.md) — live publish/query,
   durable delivery, gaps, unsubscribe, and bounded status.
-- [Selected State API](quickstart/selected-state-api.md) — stopped/local
+- [Selected State API](quickstart/selected-state-api.md) — live or stopped
   latest-value projection, recoverable history, and visible tombstones.
-- [Selected Record API](quickstart/selected-record-api.md) — stopped/local
+- [Selected Record API](quickstart/selected-record-api.md) — live or stopped
   explicit conflict projection and exact-sibling guarded resolution.
 - [Selected Blob API](quickstart/selected-blob-api.md) — stopped/local bounded
   encrypted publication and freshly verified streaming read.

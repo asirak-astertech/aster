@@ -6,13 +6,21 @@
 //! adds authenticated custody age, finite-TTL forwarding, bounded global and
 //! per-scope quotas, priority-aware scheduling, and live
 //! [`EventEmissionPolicy`] control (including receive-only operation), while
-//! v1/v2 remain compatible for durable Events. Its stopped-state
-//! application boundary also composes source-authenticated latest-value State,
-//! explicit-conflict Record, and streaming immutable Blob operations. State and
+//! v1/v2 remain compatible for durable Events. Its application boundary also
+//! composes source-authenticated latest-value State, explicit-conflict Record,
+//! and streaming immutable Blob operations. [`RunningNode::selected_state`] and
+//! [`RunningNode::selected_records`] return cloneable handles that share the
+//! running actor's bounded Event/State/Record command lane; the corresponding
+//! stopped facades retain exclusive maintenance/application access. State and
 //! Record additionally use class-specific, explicitly interested reconciliation
-//! lanes; semantic v5 adds an explicitly interested, resumable Blob lane. The
-//! State, Record, and Blob application handles remain stopped/exclusive even
-//! though their durable objects can cross a live contact.
+//! lanes; semantic v5 adds an explicitly interested, resumable Blob lane. Blob
+//! application access remains stopped/exclusive even though durable Blob data
+//! can cross a live contact. Shutdown and zeroization close live application
+//! admission before releasing the actor's store authority, so retained handles
+//! fail closed with [`application::ApplicationErrorKind::StateUnavailable`].
+//! Finite State/Record TTL, durable subscriptions and selected-node bindings,
+//! live Blob access, representative physical/mixed-implementation acceptance,
+//! and retained live State/Record receipts remain open.
 //! The caller-identified opaque API remains isolated for compatibility and is
 //! not advertised by the production Event reconciliation path.
 

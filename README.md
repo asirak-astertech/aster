@@ -14,11 +14,32 @@ constrained, and disconnected operation.
 
 > [!IMPORTANT]
 > Aster is an evaluation-stage reference implementation, not a
-> production-authorized system. Event has a live networked API; State and
-> Record synchronize between selected nodes but use stopped-node
-> application APIs; Blob publication and reading are local to one selected
-> node. Review the [security gates](docs/security.md) and
+> production-authorized system. Event, State, and Record have live Rust APIs;
+> Event alone also has a local ConnectRPC API. State and Record retain
+> stopped-node facades for exclusive use, while Blob publication and reading
+> remain stopped/local. Review the [security gates](docs/security.md) and
 > [conformance status](docs/conformance.md) before planning a deployment.
+
+A [retained live State/Record receipt](docs/implementation/evidence/selected-live-mutable-2ccfba0.json)
+binds a 5,660-byte canonical projection (SHA-256
+`299a3c3b8d1685deb5980ed091797f7d46119562b67c3d853b94d8552c83b67a`)
+to signed source commit `2ccfba0`. On one loopback host, two
+same-implementation participants completed six actor lifetimes, with at most two
+actors concurrent. They published State and conflicting Record revisions while
+peerless; four paired direct `CONTACT` records then accounted for 5/5/5 selected
+items offered/fetched/inserted, concurrent State max-ID tie-break and restart,
+and Record conflict rejection, guarded resolution, superseded originals, exact
+retry, and restart. Six graceful shutdowns closed four retained handles, while
+Event, control, and Blob counters remained zero.
+
+That receipt is bounded evidence, not a broader acceptance claim. Its
+source-to-execution link is operator-attested, not cryptographically proven or
+reproducible; secret artifacts were inspected by metadata only. It does not
+cover physical hosts, NAT, Internet, relay, BTLE, independent implementations,
+scale beyond two participants, resource thresholds, long-duration operation,
+or live Event/Blob application acceptance. Finite State/Record TTL, durable
+subscriptions, selected-node language bindings, representative physical or
+mixed-implementation acceptance, and release authorization remain open.
 
 A [retained two-cell receipt](docs/implementation/requirements-status.md#selected-iroh-nat-retained-receipt)
 observes the selected Event path on one Darwin arm64 host through isolated
@@ -98,7 +119,8 @@ Protobuf schema and does not require a hosted Buf Schema Registry.
 |---|---|---|
 | **Connect, gRPC, or gRPC-Web** | [ConnectRPC agent](docs/quickstart/connect-agent.md) | Live Event and local status; authenticated loopback process |
 | **Rust selected node** | [Selected Event API](docs/quickstart/selected-event-api.md) | Live Event publish, query, durable delivery, gaps, and status |
-| **State, Record, or Blob in Rust** | [State](docs/quickstart/selected-state-api.md), [Record](docs/quickstart/selected-record-api.md), and [Blob](docs/quickstart/selected-blob-api.md) | Exclusive stopped-node handles; Blob application access is local, while already-durable Blob data can transfer directly under semantic v5 |
+| **State or Record in Rust** | [State](docs/quickstart/selected-state-api.md) and [Record](docs/quickstart/selected-record-api.md) | Cloneable live actor handles plus exclusive stopped-node facades; direct-Iroh reconciliation under explicit interests |
+| **Blob in Rust** | [Blob](docs/quickstart/selected-blob-api.md) | Exclusive stopped-node facade; already-durable Blob data can transfer directly under semantic v5 |
 | **Rust semantic API** | [Rust quickstart](docs/quickstart/rust.md) | Broader proven semantic surface used as the migration source |
 | **Python, Go, or C** | [Language quickstarts](docs/quickstart/README.md) | Offline semantic API through the current C ABI, not the selected live node |
 
@@ -113,8 +135,8 @@ provisioning remain open work.
 | Surface | Implemented | Still open |
 |---|---|---|
 | **Event** | Source-authenticated reconciliation over direct Iroh or one operator-pinned controlled Iroh connectivity relay; live Rust and local ConnectRPC APIs; durable consume/carry selectors and at-least-once delivery | Atomic subscription update, hosted discovery/public relay, and broader physical-network acceptance |
-| **State** | Source-authenticated publication, causal projection, and direct-Iroh reconciliation under explicit interests | Live application handle, subscriptions, relay cache, expiry, and garbage collection |
-| **Record** | Conflict-preserving projection, exact-sibling guarded resolution, and direct-Iroh reconciliation | Live application handle, automatic merge execution, expiry, and garbage collection |
+| **State** | Source-authenticated live or stopped publication/query, causal projection, direct-Iroh reconciliation under explicit interests, and bounded retained one-host evidence | Durable subscriptions, selected-node bindings, finite TTL, relay acceptance, expiry/garbage collection, and representative physical/mixed evidence |
+| **Record** | Live or stopped conflict-preserving query/publication, exact-sibling guarded resolution, direct-Iroh reconciliation, and bounded retained one-host evidence | Durable subscriptions, selected-node bindings, automatic merge execution, finite TTL, relay acceptance, expiry/garbage collection, and representative physical/mixed evidence |
 | **Blob** | Authenticated immutable publication, verified encrypted-depot streaming, and direct semantic-v5 source/carrier range transfer with durable resume state | Live application API, route-only relay/custody, representative remote evidence, retention, and garbage collection |
 | **Operations** | Manually admitted direct addresses, an operator-pinned controlled relay, bounded one-host software namespace-NAT acceptance, reference mission provisioning, and bounded same-UID Unix software zeroization | Protected operational provisioning, discovery, representative/physical NAT, public/default relay selection, BTLE platform integration, physical sanitization, and release authorization |
 

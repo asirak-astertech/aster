@@ -8,7 +8,9 @@ but semantic-v4/v5 Normal and `AtLeast` contacts still run their independent
 mutable lanes. Under v5 they also run direct content-capable Blob transfer for
 already-durable objects. `AtLeast` is an Event threshold only. `ReceiveOnly`
 initiates or discloses no State/Record/Blob lane or work. V1-v4 emit zero Blob
-frames, and the Blob application facade remains stopped.
+frames. State and Record have separate cloneable live actor handles, but those
+operations do not enter Event custody; the Blob application facade remains
+stopped.
 
 This is an additive configuration surface. Existing callers of `start_node`
 retain durable Event publication, default store limits, and normal emission.
@@ -250,10 +252,12 @@ inherited by v4 and v5; no
 equivalent deterministic whole-contact partial claim is made for v1/v2.
 
 The selected implementation covers Event and RouteEvent custody only. It does
-not add State/Record custody or a live State/Record handle; their separate
-semantic-v4/v5 mutable reconciliation still runs in Normal and AtLeast, as does
-semantic-v5 direct Blob work. It does not add Blob custody/TTL/GC, route-only
-Blob relay, a live Blob handle, cross-class priority eviction,
-physical-radio silence, protected provisioning, NAT/hosted relay, BTLE,
+not add State/Record custody; their cloneable live handles and separate
+semantic-v4/v5 mutable reconciliation run outside this custody policy in Normal
+and AtLeast, as does semantic-v5 direct Blob work. It does not add finite
+State/Record TTL or subscriptions, Blob custody/TTL/GC, route-only Blob relay, a
+live Blob handle, selected-node bindings, cross-class priority eviction,
+physical-radio silence, protected provisioning, representative/physical NAT or
+public/default relay acceptance, BTLE,
 long-offline or requirement-scale acceptance, mixed implementations, or release
 authorization.

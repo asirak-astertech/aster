@@ -16,6 +16,10 @@
   `15f4e0b8e9f817508c14fcbb4b307d6949add557`; exact immutable source,
   sanitized receipt, replay boundary, and nonclaims in
   [Selected Iroh namespace-NAT retained receipt](#selected-iroh-nat-retained-receipt)
+- Selected live State/Record retained-receipt source freeze: signed commit
+  `2ccfba0d18bf8d8221ab11fb485b32fcf6270272`; exact immutable source,
+  owner-restricted raw custody, sanitized receipt, replay boundary, and
+  nonclaims in [Selected live State and Record retained receipt](#selected-live-state-and-record-retained-receipt)
 - Prior semantic-v4 State/Record source/test freeze: signed commit
   `a0813a2b30b26f69ea7653dd0d3e04eba454c1b3`; exact source manifest and gates in
   [Prior selected State and Record network automated evidence](#prior-selected-state-and-record-network-automated-evidence)
@@ -96,7 +100,7 @@ mission authentication, and neither is source or control authorization:
 | `aster-redb-store` | One mission-bound transaction authority for ordered control/policy, content-verified Event/State/Record/Blob publication, the shared causal frontier, Event delivery/custody, class-specific operations/cursors, guarded Record resolution, route-only Event cache, Blob depot markers, and v5 exact pending Blob source plans plus peer-neutral carrier prefixes. It grants ordinary Blob visibility only after exact depot, fresh full-content, and fresh current-lineage completion agree atomically. | Deriving identity from unverified bytes, route-only Blob relay/custody, executing application merge code, State/Record/Blob TTL or GC, complete physical allocation/sanitization, automatic revoke-plus-rekey, or a second authority |
 | `aster-negentropy` | Sole bounded set-difference mechanism over class-specific exact Event, State, Record, and v5 Blob source transfer identities, with timestamp zero | Object transfer, Blob carrier-prefix ownership, semantic identity, policy, or durable contact progress |
 | `aster-iroh` | Direct endpoint lifecycle, exact carrier identity, allowlist admission, bounded exchange, and an opt-in singleton controlled HTTPS relay with explicit WebPKI or replacement DER-root trust and observation-only path telemetry | Mission identity, item/source authorization, hosted discovery or public/default relay fallback, port mapping, lifetime IP pinning, representative or physical NAT acceptance, or physical-path proof |
-| `aster-node` | Sole composition root for mission-before-inventory/control-before-data; exact control/Event/State/Record transfer; semantic-v3/v4/v5 Event custody; semantic-v4/v5 State/Record lanes; semantic-v5 direct content-capable Blob source-before-carrier transfer with repeated peer proof/current-lineage checks, 16-KiB ranges, resume cursors, and completion promotion; constrained emission with ReceiveOnly zero Blob; caller-provided protected live `NodeConfig`; live Event and privileged control handles; exclusive stopped Event/State/Record/Blob/control facades; local zeroization; receipts and CLI | Production SecretStore or protected stock CLI/bindings, cross-process admin IPC, automatic revoke-plus-rekey, global convergence claims, live State/Record/Blob application handles, route-only Blob relay/custody, Blob TTL/GC, broader State/Record partitions/relays, physical RF silence, automatic merge, generalized policy, coordinated provider destruction, platform-complete zeroization, or release authorization |
+| `aster-node` | Sole composition root for mission-before-inventory/control-before-data; exact control/Event/State/Record transfer; semantic-v3/v4/v5 Event custody; semantic-v4/v5 State/Record lanes; semantic-v5 direct content-capable Blob source-before-carrier transfer with repeated peer proof/current-lineage checks, 16-KiB ranges, resume cursors, and completion promotion; constrained emission with ReceiveOnly zero Blob; caller-provided protected live `NodeConfig`; actor-owned live Event/State/Record and privileged control handles; exclusive stopped Event/State/Record/Blob/control facades; local zeroization; receipts and CLI | Production SecretStore or protected stock CLI/bindings, cross-process admin IPC, automatic revoke-plus-rekey, global convergence claims, a live Blob application handle, durable State/Record delivery subscriptions, route-only Blob relay/custody, Blob TTL/GC, broader State/Record partitions/relays, physical RF silence, automatic merge, generalized policy, coordinated provider destruction, platform-complete zeroization, or release authorization |
 | `aster-core` | Spec-verified mission session, control-envelope, authenticated recipient-filtered rekey planning, typed Event/State/Record/Blob source-envelope security capabilities, and provider-neutral bounded provisioning protection plus operation-bound opaque SecretStore install/load/destroy contracts, of which exact load is used by the selected live config and stopped Event/admin slices | A production SecretStore/protection backend, hardware/platform custody policy, operational recovery or physical-erasure assurance; the core remains authoritative migration source and is not deleted while replacements lack equivalent tests |
 
 Each control transfer ID is the exact envelope digest authenticated against its
@@ -136,28 +140,33 @@ items.
 unique rows, valid selected states, exact selected-status containment, and the
 conservative generated claim boundary.
 
-The current generated totals are 79 `implemented-uncredited`, 40
-`observed-bounded`, and 229 `open` rows. The exact selected-mapping count is
-123 and is validated from the generated trace. The
-selected State slice moved `DM-5.1-01`, `DM-5.1-02`, `DM-5.3-01`, and
-`DM-5.3-02`; the selected Record slice moved `DM-5.1-08`, `DM-5.1-09`, and
-`DM-5.3-06` through `DM-5.3-10` from `open`. Semantic-v4/v5 class- and
-direction-specific State/Record reconciliation now moves already durable source
-objects over a mission-authenticated Iroh contact under explicit receiver
-interests. Exact Apply/Fetch outcomes are acknowledged before the next attempt,
-Finish reports an exact remaining count, valid saturation is typed capacity
-deferral, and durable peer/class/local Offer/Fetch cursors rotate fairly within
-the 256-peer/1,024-row bound. Each mutable object is at most 1 MiB and each class
-is capped at 4,096 rows/16 MiB. Current-code automation observes State delivery,
-disconnected Record publishers preserving the same two retained causal heads,
-capacity deferral, cursor fairness, and current source-lineage replacement. It
-is not a retained execution receipt, so `DM-5.1-09`, `DM-5.3-06`, and
-`DM-5.3-09` remain `implemented-uncredited` rather than moving to
-`observed-bounded`. State/Record application handles remain stopped/exclusive, and the
-runtime has no durable application delivery API for those classes. The result
-does not claim longer partitions, relay custody, divergent State convergence,
-mixed implementations, scale, or release acceptance. Automatic
-registered-policy merge `DM-5.3-05` remains `open`. The stopped/local selected Blob slice additionally
+The current generated totals are 74 `implemented-uncredited`, 48
+`observed-bounded`, and 226 `open` rows. The exact selected-mapping count is
+126 and is validated from the generated trace. The selected live State/Record
+receipt moves `DM-5.1-09`, `DM-5.3-02`, and `DM-5.3-06` through `DM-5.3-10`
+from `implemented-uncredited` to `observed-bounded`, moves `DM-11-06` and
+`DM-11-07` from `open` to `implemented-uncredited`, and moves `DM-12-04` from
+`open` to `observed-bounded`. It also broadens retained evidence without status
+movement for `DM-1-05`, `DM-5.1-01`, `DM-5.1-08`, `DM-5.2-01`, `DM-5.2-09`,
+`DM-7-11`, `DM-7-16`, `DM-7-17`, `DM-8-01`, and `DM-8-02`.
+
+The receipt exercises actor-owned live State and Record publication/query on a
+common bounded command lane, peerless publication, exact noninserting retry,
+explicit receiver interests, mission-authenticated direct-Iroh reconciliation,
+concurrent State tie-break, Record sibling annotation, no-discard ordinary
+publish failure, exact-guard resolution, superseded history, graceful handle
+closure, and peerless restart projection. The existing semantic-v4/v5 lanes
+continue to acknowledge exact Apply/Fetch outcomes before the next attempt,
+report exact Finish remainder, type capacity deferral, and fairly rotate durable
+peer/class/local Offer/Fetch cursors within the 256-peer/1,024-row bound. Each
+mutable object remains capped at 1 MiB and each class at 4,096 rows/16 MiB.
+The new receipt deliberately does not move `DM-5.1-02` or `DM-5.3-01`: it
+proves two concurrent State maxima and their deterministic ID tie-break, not a
+causally later State successor that dominates its predecessor. State and Record
+still have no durable application delivery subscription. Longer partitions,
+relay custody, automatic registered-policy merge (`DM-5.3-05`), mixed
+implementations, physical systems, scale, and release acceptance remain open.
+The stopped/local selected Blob slice additionally
 moves `DM-5.1-10`, `DM-5.1-11`, `DM-5.3-04`, `DM-9-13`, and `DM-9-14` from
 `open` to `implemented-uncredited`. Those movements are limited to local
 fixed-profile authenticated manifest/chunking, immutable publication, bounded
@@ -268,7 +277,7 @@ not completion percentages: `implemented-uncredited` means a partial mechanism
 exists, and `observed-bounded` means only the stated environment and claim
 boundary passed.
 
-All 57 rows with an external gate are included within the 229 `open` rows:
+All 57 rows with an external gate are included within the 226 `open` rows:
 `gate_kind` is an independent ownership dimension, not a fourth selected status.
 The generator validates the trace totals; this family roll-up is the human
 summary of that same CSV.
@@ -278,17 +287,17 @@ summary of that same CSV.
 | DM-1 Project brief | 0 | 3 | 4 | 7 |
 | DM-2 Scope | 1 | 0 | 13 | 14 |
 | DM-3 Operating environment | 0 | 1 | 12 | 13 |
-| DM-5 Functional requirements | 58 | 12 | 52 | 122 |
+| DM-5 Functional requirements | 51 | 19 | 52 | 122 |
 | DM-6 Security requirements | 3 | 18 | 15 | 36 |
 | DM-7 Developer experience | 7 | 2 | 12 | 21 |
 | DM-8 Implementation constraints | 0 | 2 | 17 | 19 |
 | DM-9 Performance and scale | 4 | 1 | 27 | 32 |
 | DM-10 Compatibility | 0 | 0 | 6 | 6 |
-| DM-11 MVP scope | 5 | 0 | 28 | 33 |
-| DM-12 Acceptance criteria | 0 | 1 | 10 | 11 |
+| DM-11 MVP scope | 7 | 0 | 26 | 33 |
+| DM-12 Acceptance criteria | 0 | 2 | 9 | 11 |
 | DM-13 Deliverables | 1 | 0 | 10 | 11 |
 | DM-14 Open design items | 0 | 0 | 23 | 23 |
-| **Total** | **79** | **40** | **229** | **348** |
+| **Total** | **74** | **48** | **226** | **348** |
 
 The selected lane is strongest today in bounded Event synchronization and
 security ordering: real-process direct contacts, one controlled connectivity-
@@ -297,18 +306,19 @@ Event observations, temporal payload-blind Event relay,
 source authentication, mission-before-inventory, control-before-Event,
 durable Consume/Carry receive intent, protected receiver-directed filtering,
 live high-level Event operations and last-contact status, freshly verified gap
-inspection, stopped/exclusive source-authenticated State causal projection,
-stopped/exclusive Record conflict annotation and guarded resolution,
-class-specific State/Record reconciliation with one bounded real-Iroh conflict
-observation, stopped immutable Blob streaming through a bounded encrypted
+inspection, actor-owned live State publication/query and deterministic
+concurrent projection, actor-owned live Record publication/query, explicit
+conflict annotation and exact-guard resolution, class-specific State/Record
+reconciliation with a retained bounded direct-Iroh conflict observation,
+stopped immutable Blob streaming through a bounded encrypted
 depot plus semantic-v5 direct source-before-carrier transfer and peer-neutral
 resume, recipient-filtered rekey, captured-node exclusion, typed bounded live
 and stopped control administration, caller-provided protected/opaque-reference
 live `NodeConfig` plus stopped Event/admin opens, restart/no-op behavior, and
 same-UID Unix terminal software zeroization.
 The largest remaining blocks are
-live State/Record application operations, broader State/Record partition/relay
-acceptance, automatic registered-policy merge, a live Blob application and
+durable State/Record delivery subscriptions and selected-node bindings, broader
+State/Record partition/relay acceptance, automatic registered-policy merge, a live Blob application and
 subscription boundary, route-only Blob relay/custody, Blob TTL/GC and larger
 resource acceptance, selected-node bindings and broader conflict workflows,
 cross-class and non-Linux custody plus physical constrained-operation
@@ -327,14 +337,19 @@ Against the six-item high-leverage closure sequence:
    real-process test publishes offline and delivers later. There is no retained
    PR-C acceptance artifact, and status/gap absence does not prove convergence
    or publisher completeness.
-2. **State and Record reconcile durable objects; their live application surface
-   remains incomplete, while Blob has one bounded direct network slice.**
-   Stopped `SelectedStateNode` source-seals and durably
-   publishes State, shares causal counters/frontier with Event, and returns a
-   freshly verified exact-key current/recoverable projection. Stopped
-   `SelectedRecordNode` preserves and annotates every causal head, rejects an
-   ordinary publish across an unresolved conflict, and commits only an exact-
-   guard application-reviewed successor. Stopped `SelectedBlobNode` prepares a
+2. **State and Record now have retained live application composition; broader
+   acceptance remains open, while Blob has one bounded direct network slice.**
+   Actor-owned `SelectedStateHandle` and `SelectedRecordHandle` share the
+   running node's bounded application command lane, source-seal and durably
+   publish while peerless, query freshly verified projections, and close with
+   the actor. The Record handle preserves and annotates every causal head,
+   rejects ordinary publish across an unresolved conflict, and commits only an
+   exact-guard application-reviewed successor. The retained two-participant run
+   proves concurrent State tie-break, two-head Record preservation, guarded
+   resolution, superseded history, exact retry, direct synchronization, and
+   restart projection. It does not prove causal State dominance, longer
+   partitions, relays, physical or mixed implementations, scale, or release.
+   Stopped `SelectedBlobNode` prepares a
    fixed-profile canonical manifest, resumes bounded encrypted local chunks,
    source-seals a publication only after exact completion, and synchronously
    streams freshly verified plaintext into caller-owned output. Separately, the
@@ -346,9 +361,8 @@ Against the six-item high-leverage closure sequence:
    carriers, persists peer-neutral 16-KiB prefixes, resumes the exact complement
    from another eligible content peer after receiver reopen, and withholds the
    publication until depot, full-content, and current-lineage proofs agree.
-   Current-code real-Iroh automation transfers State, preserves two disconnected
-   Record heads on both stores, and exercises that bounded direct Blob resume,
-   but is not a retained receipt. Live State/Record commands,
+   Current-code Blob automation exercises that bounded direct resume but is not
+   a retained Blob receipt. Durable State/Record delivery subscriptions,
    broader disconnected/relay acceptance, automatic registered-policy Record
    merge, a live Blob handle/subscription, route-only Blob relay/custody,
    metadata-independent byte identity, Blob TTL/GC, and large-Blob acceptance
@@ -395,8 +409,8 @@ Against the six-item high-leverage closure sequence:
    follows from the implementation slices.
 
 The next implementation sequence must extend the bounded item-2 data lanes
-through live State/Record/Blob application operations, broader partition and
-relay acceptance, larger/resource evidence, and retained acceptance without
+through durable State/Record delivery subscriptions, a live Blob application
+surface, broader partition and relay acceptance, larger/resource evidence, and retained acceptance without
 weakening the custody or protected-administration stack. Item 4's admitted
 operational backend, live startup/CLI/bindings, recovery, and coordinated
 lifecycle remain separate work. Items 1 through 5 retain their stated
@@ -747,24 +761,24 @@ column.
 
 | Requirement | Current state | Production-lane implementation | Credit and remaining gap |
 |---|---|---|---|
-| `DM-1-03`, `DM-1-04`, `DM-1-05` peer flow, temporal relay, and resynchronization | `observed-bounded` | `aster-node` + source Event seam + redb + Negentropy + Iroh | Peerless publication committed Ping before isolated per-edge forwarding; peerless destination publication then committed a causally observing Pong before isolated per-edge return. Every directed-edge cohort moved one pre-existing Event and the final no-op moved none. Physical systems, longer custody, all data classes, generalized policy, mixed implementations, and scale remain open. |
+| `DM-1-03`, `DM-1-04`, `DM-1-05` peer flow, temporal relay, and resynchronization | `observed-bounded` | `aster-node` + typed Event/State/Record sources + redb + Negentropy + Iroh | Earlier retained Event flows committed Ping/Pong peerless and exact-forwarded through isolated edges. The live mutable receipt separately published State and Record with zero peerless contacts, later reconciled five exact mutable items, and reproduced converged State plus resolved Record projections after peerless restart. Physical systems, longer custody, Blob, generalized policy, mixed implementations, and scale remain open. |
 | `DM-2-14` adopting-program key policy | `implemented-uncredited` | Existing control formats plus typed bounded live `SelectedControlHandle` and stopped `SelectedControlAdmin`, exact recipient-filtered planning, and atomic redb publication intent | Rust callers can choose one revocation or one scope/epoch and exact recipient/topic policy through sanitized requests; live publication serializes under the actor policy-write authority and refreshes policy before response. This is not generalized policy governance: no production backend, protected stock CLI/bindings, cross-process admin IPC, registry issuance/recovery, automatic/atomic revoke-plus-rekey workflow, or additional key-management mechanism is shipped. |
 | `DM-3-11`, `DM-11-18`, `DM-11-19` pre-mission provisioning/identity/keying | `open` | Protected-artifact and opaque-reference live `NodeConfig` plus stopped Rust opens and provider-neutral SecretStore contracts | Current Rust construction validates bounded options and terminal state before one provider/loader call or state creation and binds credentials to one absolute lexical state pathname. This mechanism is not the operational window or complete MVP: the stock CLI remains unprotected-reference, and identity/key issuance, production backend, recovery/backup/rollback policy, inode/symlink/rename/rollback binding, selected-node bindings, coordinated destruction, admitted-module/FIPS decision, and retained operational evidence remain absent. |
-| `DM-5.1-01`, `DM-5.1-02` State class and convergence | `implemented-uncredited` | Typed source-authenticated State capabilities, bounded redb versions/operations, shared Event-State causal frontier, stopped `SelectedStateNode` projection, and semantic-v4/v5 class/direction runtime reconciliation | Current-code automation covers sequential/concurrent/tombstone/restart projection, exact Offer `MutableApplyResult`, Fetch `MutableFetchResult`/`MutableFetchResultAck`, and Finish remainder, typed capacity deferral, fair durable cursor rotation, current-lineage replacement, and real-Iroh transfer to an interested independent store. There is no retained receipt, live State application handle, or delivery subscription; divergent State convergence, longer partitions, relay custody, independent interoperability, scale, and bindings remain open. |
+| `DM-5.1-01`, `DM-5.1-02` State class and convergence | `implemented-uncredited` | Typed source-authenticated State capabilities, bounded redb versions/operations, shared Event-State causal frontier, stopped `SelectedStateNode`, actor-owned `SelectedStateHandle`, and semantic-v4/v5 class/direction runtime reconciliation | The retained live run covers peerless publication, exact retry, explicit-interest direct reconciliation, deterministic two-maximum projection, handle closure, and restart projection. Current tests separately cover sequential/tombstone projection, exact mutable outcomes, capacity deferral, cursor rotation, and current-lineage replacement. The receipt does not prove a causally later State successor, so `DM-5.1-02` and `DM-5.3-01` gain no status. Durable delivery subscription, longer partitions, relay custody, independent interoperability, scale, physical systems, and bindings remain open. |
 | `DM-5.1-04` Event support | `observed-bounded` | Existing `aster-core` Event envelope ported through selected redb/runtime, with live and stopped high-level projections | The retained sample seals, persists, reconciles, verifies, and reacts to Event. Current-code live-handle tests publish, query, consume, and later synchronize arbitrary authorized Events, but they are not a retained PR-C acceptance receipt. Other data classes and independent wire interoperability remain open. |
 | `DM-5.1-05` through `DM-5.1-07` Event immutability, order, and gaps | `implemented-uncredited` | Authenticated Event sequence/dot, semantic and exact-transfer indexes, publisher/topic/scope positions, and a public bounded verified gap view | Gap pages freshly verify every observed anchor and race-recheck their exact policy-bound store plan. No gap means only that locally observed verified positions are contiguous; it does not prove publisher completeness or convergence. Cross-process missing-position and independent interoperability evidence remain open. |
-| `DM-5.1-08`, `DM-5.1-09` Record class and disconnected concurrency mechanism | `implemented-uncredited` | Typed source-authenticated Record capabilities, bounded redb revisions/operations, shared causal frontier, stopped `SelectedRecordNode` projection/resolution, and semantic-v4/v5 class/direction runtime reconciliation | Local tests cover N-way conflict and guarded resolution. Current-code v4/v5 real-Iroh contacts leave the same two disconnected heads on both stores without merge execution and exercise exact outcome/finish, deferral, cursor, and lineage mechanics, but no retained execution receipt exists. There is no live Record application handle/delivery subscription; longer partitions, relays, mixed implementations, scale, bindings, and retained release acceptance remain open. |
+| `DM-5.1-08`, `DM-5.1-09` Record class and disconnected concurrency mechanism | `implemented-uncredited` / `observed-bounded` | Typed source-authenticated Record capabilities, bounded redb revisions/operations, shared causal frontier, stopped `SelectedRecordNode`, actor-owned `SelectedRecordHandle`, and semantic-v4/v5 class/direction runtime reconciliation | The retained live run created revisions on two peerless stores, reconciled both exact inventories, exposed the same annotated two-head conflict on both actors, rejected ordinary publication without change, guarded resolution across both siblings, and reproduced the resolved projection after restart. There is no durable Record delivery subscription; longer partitions, relays, mixed implementations, scale, bindings, physical systems, and release acceptance remain open. |
 | `DM-5.1-10`, `DM-5.1-11` Blob class, streaming, and immutability | `implemented-uncredited` | Typed source-authenticated Blob capabilities, canonical fixed-64-KiB manifest, bounded encrypted depot, immutable exact publication, stopped `SelectedBlobNode` publish/read streaming, and a semantic-v5 direct source-before-carrier network path | Local multi-chunk tests cover exact retry, restart, rekey variants, dedup within one physical lineage, tamper, revocation, terminal lockout, and bounded buffers. V5 stages exact sources before canonical carrier ranges, persists peer-neutral 16-KiB prefixes, and withholds ordinary publication until depot, full-content, and current-lineage proofs agree. There is no live Blob handle or delivery subscription, route-only relay/custody, TTL/GC, pure-byte metadata-independent identity, physical/resource acceptance, large-Blob bracket, mixed implementation, release artifact, or retained receipt. |
 | `DM-5.1-12`, `DM-5.1-13`, `DM-5.2-19` through `DM-5.2-22` Blob chunk transfer and peer-neutral resume | `implemented-uncredited` | Semantic-v5 exact source-before-carrier transfer among directly authenticated content-capable peers; peer-bound content proof on inventory and every range; peer-neutral durable 16-KiB prefixes; exact missing-complement scheduling; atomic completion-gated visibility | One same-process, one-host, three-node direct-Iroh run covers one 96-KiB Blob: A completes B, A leaves C with source plus one durable prefix, C's runtime/store/provider cache reopens and A is removed, then fresh B→C sends no source and only the exact complement. Cleanup retains a bounded non-public unfinished physical-lineage fence, source/cache transitions share one lifecycle lock, and terminal multi-carrier scheduling advances to the lexicographic maximum; exact repair regressions and independent audit are green. This is current-code same-implementation automation, not a retained receipt, and adds no `observed-bounded` credit. It does not claim an OS-process boundary, route-only relay/custody, a live Blob application handle/subscription, TTL/GC, pure-byte identity/dedup, 100+ MiB/RSS/physical or mixed-implementation acceptance, or release authorization. |
-| `DM-5.1-17` through `DM-5.1-22` common item fields | `implemented-uncredited` / `observed-bounded` | Event, State, Record, and Blob authenticate their applicable class, topic, scope, priority, publisher, causal stamp, logical key, tombstone, epoch, and content commitments; the Event facade additionally publishes and returns exact finite TTL without exposing custody/store internals | The exact row statuses remain Event-derived. Semantic-v3/v4/v5 Event contacts use authenticated priority, source TTL, and cumulative age. State and Record add v4/v5 replication and current-source-lineage automation; Blob adds v5 direct content-capable-peer transfer with separate current route and physical-content lineage proofs. None adds a retained receipt, live application handle, Blob/State/Record finite TTL, or custody evidence. Cross-class eviction and acceptance remain open. |
-| `DM-5.2-01` eventual convergence | `observed-bounded` | Class-specific Negentropy difference over exact Event transfer IDs in v1-v5, State/Record transfer IDs in v4/v5, and Blob source IDs in v5, plus mission-bound redb | Retained Event receipts cover three/eight-node temporal forwarding. Current-code v4/v5 real-Iroh contacts transfer State, preserve two disconnected Record revisions, and exercise one bounded direct Blob resume, but they are not retained or all-reachable-node results. Longer partitions, route-only Blob relay/custody, mixed implementations, physical links, requirement scale, and release acceptance remain open. |
-| `DM-5.2-02` subscribed in-scope convergence | `implemented-uncredited` | Durable canonical Event Consume/Carry selectors, v4/v5 class-separated State/Record interests, and v5 exact Blob selectors carrying a peer-bound current content proof, all projected as protected receiver interests and intersected with route authority | Current-code tests deliver selected Event, State, Record, and one bounded Blob. Normal and AtLeast run mutable lanes and may run v5 Blob transfer, but AtLeast satisfaction is Event-only; ReceiveOnly initiates and discloses neither mutable nor Blob work. Same-implementation bounded observations are not all-reachable-node or global convergence; repeated multi-scope lifecycle, longer partitions, route-only Blob relay, physical peers, scale, mixed implementations, and a retained multi-class receipt remain open. |
+| `DM-5.1-17` through `DM-5.1-22` common item fields | `implemented-uncredited` / `observed-bounded` | Event, State, Record, and Blob authenticate their applicable class, topic, scope, priority, publisher, causal stamp, logical key, tombstone, epoch, and content commitments; Event adds finite TTL and State/Record now have live handles | The exact row statuses remain field-specific. Semantic-v3/v4/v5 Event contacts use authenticated priority, source TTL, and cumulative age. The retained live mutable receipt now exercises State/Record topic, scope, key, publisher, and causal identity through actor-owned handles and v4/v5 replication. Blob has current-code v5 direct content-capable transfer only. State/Record/Blob finite TTL and custody, cross-class eviction, physical/mixed acceptance, and release remain open. |
+| `DM-5.2-01` eventual convergence | `observed-bounded` | Class-specific Negentropy difference over exact Event transfer IDs in v1-v5, State/Record transfer IDs in v4/v5, and Blob source IDs in v5, plus mission-bound redb | Retained Event receipts cover temporal forwarding; the retained live mutable receipt covers two-peer State/Record direct reconciliation and peerless restart projection. The 96-KiB Blob resume remains current-code automation only. These are not all-reachable-node results. Longer partitions, route-only Blob relay/custody, mixed implementations, physical links, requirement scale, and release acceptance remain open. |
+| `DM-5.2-02` subscribed in-scope convergence | `implemented-uncredited` | Durable canonical Event Consume/Carry selectors, v4/v5 class-separated State/Record interests, and v5 exact Blob selectors carrying a peer-bound current content proof, all projected as protected receiver interests and intersected with route authority | The retained mutable run used exact reciprocal State/Record interests and delivered only the selected mutable items; current tests add Event and one bounded Blob. Normal and AtLeast run mutable lanes and may run v5 Blob transfer, while ReceiveOnly discloses neither. The bounded observations are not all-reachable-node or global convergence; repeated multi-scope lifecycle, longer partitions, route-only Blob relay, physical peers, scale, mixed implementations, and a retained four-class receipt remain open. |
 | `DM-5.2-06` through `DM-5.2-08` delivery, duplicate suppression, and idempotent outcome | `implemented-uncredited` / `observed-bounded` | Exact transfer acceptance, durable operation-keyed publication, an at-least-once Event pending ledger, and separate v4 Offer `MutableApplyResult` and Fetch `MutableFetchResult`/required `MutableFetchResultAck` before the next attempt, plus exact Finish remainder | Live and stopped Event poll freshly re-verify source/content authorization. Current-code real processes synchronize, poll, ack, and preserve the Event ack across receiver restart; mutable acknowledgements instead govern durable protocol satisfaction and do not create State/Record application delivery. The retained receipt still covers the built-in Event reaction only; unacknowledged process-crash retry, every external crash point, bindings, and independent implementations remain open. |
-| `DM-5.2-09`, `DM-5.2-10`, `DM-5.2-13`, `DM-5.2-14` causality and clock-independent correctness | `observed-bounded` / `implemented-uncredited` | Authenticated dots/context, atomic Event-State-Record-Blob causal frontier/high-water, Pong observation of Ping, causal projections, class-specific Negentropy timestamp zero, and monotonic semantic-v3-format Event custody age inherited by v4/v5 | Pong publication is isolated after Ping is durable at the destination, and its authenticated context observes Ping before any return-edge process starts. Event causality has retained bounded evidence; current-code v4/v5 real-Iroh automation preserves two disconnected Record heads without wall-clock arbitration; Linux finite Event TTL has automation only. Divergent State transfer, tombstone propagation, Blob causal-convergence acceptance, finite State/Record/Blob TTL, non-Linux Event TTL, long-running operation, and independent interoperability remain open. |
+| `DM-5.2-09`, `DM-5.2-10`, `DM-5.2-13`, `DM-5.2-14` causality and clock-independent correctness | `observed-bounded` / `implemented-uncredited` | Authenticated dots/context, atomic Event-State-Record-Blob causal frontier/high-water, Pong observation of Ping, causal projections, class-specific Negentropy timestamp zero, and monotonic semantic-v3-format Event custody age inherited by v4/v5 | Earlier retained Event evidence binds Pong to observed Ping. The retained mutable run preserves two disconnected Record heads as concurrent, then requires the guarded successor to observe both sibling IDs; State selects between concurrent maxima by authenticated semantic ID, not wall time. It does not prove a causally later State successor. Blob causal convergence, finite State/Record/Blob TTL, non-Linux Event TTL, long-running operation, and independent interoperability remain open. |
 | `DM-5.2-18` difference-proportional synchronization | `implemented-uncredited` | Bounded class-specific Negentropy exact-ID reconciliation for Event in v1-v5, State/Record in v4/v5, and Blob source plans in v5; Blob carrier work requests only the exact missing contiguous complement | Equal Event inventory transferred nothing; current-code mutable and Blob automation bounds each attempt and rotates durable cursors fairly. Total-size-versus-difference cost evidence across all four classes at requirement scale remains open. |
-| `DM-5.3-01`, `DM-5.3-02` State causal resolution and concurrent tie-break | `implemented-uncredited` | Freshly verified exact-key causal maxima; authenticated context dominance; greatest complete semantic State ID current; retained `Concurrent`/`Superseded` history; immutable-fact v4 ingest with current source lineage | Current-code v4 automation transfers State and withholds same-epoch old lineage from ordinary current projection/query and network inventory/transfer without deleting it; an exact idempotent publish retry may recover its committed historical result only through strict cached/projection/historical verification. The facade recomputes dispositions and plan identity, and a current tombstone remains visible. Divergent/concurrent network convergence, mixed implementations, expiry/GC, adversarial scale, and retained acceptance remain open. |
+| `DM-5.3-01`, `DM-5.3-02` State causal resolution and concurrent tie-break | `implemented-uncredited` / `observed-bounded` | Freshly verified exact-key causal maxima; authenticated context dominance; greatest complete semantic State ID current; retained `Concurrent`/`Superseded` history; immutable-fact v4/v5 ingest with current source lineage; actor-owned live query | The retained run created two peerless concurrent State maxima, converged both actors on the greatest complete semantic ID as Current with the other Concurrent, and reproduced both restart views. This moves only the tie-break row. Causal-successor dominance remains current-code local automation, so `DM-5.3-01` and `DM-5.1-02` stay implemented. Mixed implementations, expiry/GC, relays, physical systems, adversarial scale, and release acceptance remain open. |
 | `DM-5.3-04` Blob preservation outside causal merge | `implemented-uncredited` | Immutable Blob bytes/identity metadata remain outside State/Record reducers; multiple signed source publications may reference one exact completed depot variant; semantic-v5 transfer stages bytes outside the ordinary publication indexes until exact completion | The direct network mechanism preserves immutable content and never exposes a partial publication. Route-only relay/custody, adversarial multi-writer interoperability, retention/GC policy, pure-byte identity, large/physical/resource scale, mixed implementations, and acceptance remain open. |
-| `DM-5.3-06` through `DM-5.3-10` Record sibling preservation, annotation, API, no-discard, and recoverable history | `implemented-uncredited` | Freshly verified exact-key causal heads; explicit `RecordConflict`; sorted sibling IDs and opaque exact guard; atomically guarded successor; optional superseded history; merge-free v4 ingest with current source lineage | Ordinary publish cannot collapse heads, stale or changed guards insert nothing, and current-code real-Iroh contacts preserve disconnected revisions on both stores without executing application merge code. Same-epoch old lineage is withheld from ordinary current projection/query and network inventory/transfer while an exact publish/resolution retry may recover its committed result only through strict cached/projection/historical verification. Automatic registered-policy merge (`DM-5.3-05`), live application delivery, explicit-policy GC, bindings, longer partitions/relays, mixed implementations, scale, and retained acceptance remain open. |
+| `DM-5.3-06` through `DM-5.3-10` Record sibling preservation, annotation, API, no-discard, and recoverable history | `observed-bounded` | Freshly verified exact-key causal heads; actor-owned live `RecordConflict`; sorted sibling IDs and opaque exact guard; atomically guarded successor; optional superseded history; merge-free v4/v5 ingest | The retained two-peer run preserves both disconnected revisions on both actors, exposes both annotated sibling IDs, rejects ordinary publication without change, resolves only under the exact complete guard, converges on the successor, and reproduces both superseded originals after restart. Automatic registered-policy merge (`DM-5.3-05`), durable delivery subscriptions, explicit-policy GC, bindings, longer partitions/relays, mixed implementations, scale, physical systems, and release acceptance remain open. |
 | `DM-5.4-01`, `DM-5.4-05`, `DM-5.4-09`, `DM-5.4-10`, `DM-5.4-12` through `DM-5.4-19`, `DM-5.4-21`, `DM-5.4-22` selected priority, TTL, and constrained operation | `implemented-uncredited` | Source-authenticated Event priority/TTL; semantic-v3-format cumulative custody inherited by v4/v5; Linux expiry; bounded scheduler/retry/retirement; Normal/AtLeast/ReceiveOnly startup and live policy | Current automation covers charged Event age/expiry boundaries, priority order, stale-work/final-send races, v3/v4/v5 custody inheritance, and receive-only inbound. Normal and AtLeast run v4/v5 mutable reconciliation and may run v5 Blob work because AtLeast is strictly an Event threshold; ReceiveOnly initiates/discloses no mutable or Blob work. Selected finite State/Record/Blob TTL is rejected/open. Priority count/names, `DM-5.4-11` generic global eviction, optional defaults/caps/overrides, non-Linux Event TTL, physical RF silence, scale, mixed implementations, and retained acceptance remain open. |
 | `DM-5.5-01` through `DM-5.5-03`, `DM-5.5-05` through `DM-5.5-07` topic/scope and payload-blind relay boundary | `implemented-uncredited` / `observed-bounded` | Authenticated topic/scope; durable Consume/Carry selectors; protected receiver interest; current peer scope/epoch route commitments; bounded route-only cache; aggregate and exact-scope Event custody quotas | Canonical selectors bound desired receipt while route authority remains an independent upper bound; empty means receive-none. Unsubscribe removes one selector and its delivery ledger; replacement is a later subscribe, not an atomic update. Limits are logical rather than complete physical accounting. Dynamic multi-scope lifecycle, bridges, other classes, physical/mixed implementations, and scale remain open. |
 | `DM-5.6-01` through `DM-5.6-03`, `DM-5.6-05` direct, infrastructure-free, intermediate, and duplicate-bounded transfer | `implemented-uncredited` / `observed-bounded` | Default direct Iroh line with hosted discovery, public/default relays, and port mapping disabled; additive controlled relay is explicit and singleton | Exact Events moved through payload-blind Aster intermediates and restart no-op. The controlled connectivity relay and retained namespace-NAT receipt are separate and create no custody claim. Physical transport, independent conformance, cycles/broadcast, representative NATs, alternate carriers, and generalized custody remain open. |
@@ -772,7 +786,9 @@ column.
 | `DM-5.8-07` selected IP operation across NAT networks | `observed-bounded` | Selected Iroh endpoints behind two isolated Linux software-NAT namespaces with exact operator-known full-cone mappings and no relay, discovery, public/default relay, or port mapping | Both endpoints observed Direct; one exact Event was delivered and acknowledged, replay was an exact no-op, and 978 cross-NAT UDP observations agreed with complementary nft DNAT/SNAT and directional forwarding counters. This is one same-build, same-implementation, one-host namespace result, not discovery or punching, dynamic or representative NATs, physical hardware/path, public Internet, mixed implementations, resource evidence, or release authorization. |
 | `DM-5.8-09` controlled relay-assisted connectivity | `observed-bounded` | One exact DER-pinned HTTPS relay under a restrictive software-NAT policy, with hosted discovery, public/default fallback, port mapping, and direct cross-NAT traffic absent | Both authenticated endpoints observed Relay; nft recorded three direct-drop packets, WAN capture recorded zero direct packets and 2,052 controlled-relay HTTPS packet observations, two exact allowlisted sessions were accepted, one Event was delivered and acknowledged, and replay was an exact no-op. This proves bounded relay-assisted connectivity, not a temporal direct-first sequence: Iroh may probe paths in parallel and later learn authenticated direct paths. Physical or independently operated relay service, public/default relay operation, mobility/outage recovery, State/Record/Blob-over-relay acceptance, mixed implementations, supported packaging, and release authorization remain open. |
 | `DM-11-03` MVP NAT inclusion | `implemented-uncredited` | The selected composition now contains the retained cone/direct and restrictive/controlled-relay namespace-NAT mechanisms above | The NAT mechanism is implemented and has one retained one-host namespace observation, but the complete MVP is not shipped. Physical and representative NATs, discovery/punching, BTLE, supported-target packaging, bindings, protected operational provisioning, dependency/license admission, mixed implementations, resource evidence, and release authorization remain open. |
-| `DM-6-01` through `DM-6-07`, `DM-6-09` through `DM-6-12` source/route protection | `observed-bounded` / `implemented-uncredited` | Existing `aster-core` source envelope, exact-byte re-verification, separate route/content capabilities, mission-protected mechanics, and typed Event/State/Record/Blob capabilities | Event has retained endpoint/relay evidence; State/Record have current-code semantic-v4/v5 direct-contact source/content and current-lineage automation; Blob v5 additionally requires a peer-bound current content proof at inventory and every source/range send, current source-route and physical-content lineages, exact manifest/carrier proofs, and fresh full-content completion before publication. Same-epoch key replacement withholds old Blob rows and proofs; a bounded non-public unfinished physical-lineage fence preserves `PhysicalLineageConflict` across cleanup until numeric epoch advance. This is not packet-capture acceptance, route-only Blob relay/custody, complete networked class acceptance, key lifecycle completion, or independent cryptographic review. |
+| `DM-11-06`, `DM-11-07` MVP conflict detection and annotation | `implemented-uncredited` | Actor-owned live `SelectedRecordHandle`, explicit sorted-sibling `RecordConflict`, opaque exact projection guard, no-discard ordinary publish failure, and guarded resolution | The mechanism exists and the retained two-participant run exercises it, but the complete MVP is not shipped. Blob remains stopped-only, the agent and selected-node language bindings lack Record operations, automatic registered-policy merge is absent, and physical/mixed/release gates remain open. |
+| `DM-12-04` disconnected Record edits acceptance | `observed-bounded` | Two peerless authenticated publishers, direct-Iroh reconciliation, two annotated siblings, no-discard ordinary publish failure, exact-guard resolution, and restart history | One same-implementation, one-host, two-participant, brief-partition scenario passed without silent loss and retained both superseded originals after restart. It is not physical, mixed-implementation, long-duration, relay/NAT/BTLE, adversarial-scale, product-release, or release-authorization evidence. |
+| `DM-6-01` through `DM-6-07`, `DM-6-09` through `DM-6-12` source/route protection | `observed-bounded` / `implemented-uncredited` | Existing `aster-core` source envelope, exact-byte re-verification, separate route/content capabilities, mission-protected mechanics, and typed Event/State/Record/Blob capabilities | Event has retained endpoint/relay evidence; State/Record now have retained same-host direct-Iroh source/content evidence plus current-lineage automation. Blob v5 requires peer-bound current content proof and fresh full-content completion but remains current-code-only. This is not packet-capture acceptance, route-only Blob relay/custody, complete networked class acceptance, key lifecycle completion, or independent cryptographic review. |
 | `DM-6-13`, `DM-6-14`, `DM-6-18`, `DM-6-19`, `DM-6-25`, `DM-6-26` identity, authorization, and hybrid mission/source mechanics | `observed-bounded` | Carrier identity and mission `NodeId` are independent; mission auth completes before inventory; dynamic topic-content and scope-route grants remain distinct; current live Rust config and stopped Event/admin opens accept protected artifacts or opaque secret references | The retained runtime receipt still uses unprotected-reference provisioning; protected live startup and control refresh are current-code automation only and add no observed credit. Current bootstrap validates options/terminal state before one provider call, binds one absolute lexical state pathname, and reports only a coarse origin. A production backend, protected stock CLI/bindings, operational issuance/recovery, provider-aware destruction, non-Unix/physical zeroization, all data classes, admitted-module/algorithm-policy gates, and independent review remain open. A fresh recipient-package rekey refuses an already-revoked recipient; exact historical retry remains recoverable. There is no automatic remediation workflow. |
 | `DM-3-12`, `DM-6-20` captured-node exclusion and intermittent propagation | `observed-bounded` | Source-authenticated ordered Flash controls, payload-blind forwarding, durable revocation checks before Event, durable rejected-sequence fencing, and exact local historical retry | The retained authority-absent relay scenario denied two captured-node cohorts. Rejection-fence, same-signer historical retry, self-revocation receipt ordering, and cancelled-enqueued stopped recovery have focused current-code automation only. The live additions do not create new intermittent-propagation evidence. Revocation/rekey remain separate; longer impaired partitions, multiple relays/carriers, physical systems, broader topologies, process/power crash injection, and independent implementations remain open. |
 | `DM-6-21`, `DM-12-08` recipient-filtered field rekey and integrated acceptance | `observed-bounded` | Recipient-filtered rekey through typed bounded live/stopped planning, source control, redb, and Iroh runtime; a fresh request fails closed for an already-revoked recipient, while exact same-signer historical receipt remains recoverable; post-revocation legacy recipient-less controls fail closed | The retained receipt advanced one scope once and excluded the captured node. Current-code live automation additionally refreshes epoch-two policy before Event publication and recovers the same receipt after canonical recipient reorder and a higher witness; it adds no observed credit. Both paths use separate revocation and rekey transactions, not automatic affected-scope discovery or atomic remediation. Repeated/multi-scope churn, production provisioning/custody, physical field evidence, independent implementations/review, and release acceptance remain open. |
@@ -780,9 +796,9 @@ column.
 | `DM-6-23` freshness and replay rejection | `observed-bounded` | Protected session replay checks, exact chained controls, rejected-sequence fencing, exact historical local receipts, policy-bound Event transactions, and durable/idempotent application/control operations | Current focused cells purge authenticated predecessor/rollback poison, fence replayed descendants, return nonfatal `PolicyUnsettled` for a pending gap while exact retry remains recoverable, and retain actor ownership after post-enqueue caller cancellation. The retained receipt predates these additions. This covers one caller-cancellation boundary, not process/power interruption; physical capture replay, every data class, other live command/contact boundaries, long retention/eviction, and independent implementations remain open. |
 | `DM-11-20` MVP revocation | `implemented-uncredited` | Durable revocation plus typed bounded live `SelectedControlHandle`, stopped `SelectedControlAdmin`, and exact historical retry | Current live tests return self-revocation receipt before teardown and recover cancelled enqueued work through stopped exact retry. One older real-process captured-leaf scenario passed, but the complete MVP, production provisioning/custody, protected stock CLI/bindings, cross-process admin IPC, automatic/atomic revoke-plus-rekey remediation, platform-complete zeroization assurance, generalized policy management, and release gates remain incomplete. |
 | `DM-7-09`, `DM-7-10` optional local agent and gRPC-like IPC | `implemented-uncredited` | `aster-agent`, repository-owned v1alpha1 Protobuf schema, authenticated loopback listener, and real-node ConnectRPC integration test | Same-implementation Connect unary/streaming calls reject unauthenticated access and preserve durable redelivery. Independent gRPC/gRPC-Web clients, protected provisioning, credential reload/rotation, stronger OS identity, packaging, supported targets, and production deployment acceptance remain open. |
-| `DM-7-11`, `DM-7-14`, `DM-7-15`, `DM-7-18` high-level documented boundary | `implemented-uncredited` | Typed live Event operations, typed stopped Event/State/Record/Blob operations, separate privileged live/stopped control administration, authenticated agent RPCs, sanitized errors/status, no transport or reconciliation types in application handles or agent RPCs, and compiled shipped examples | The agent preserves the live Event application boundary but does not broaden its class support; the privileged control handle likewise adds administration rather than application credit. Live State/Record/Blob handles, automatic merge, selected-node bindings, operational backend/CLI/issuance/recovery, production agent packaging, a shipped live-admin example, and an independent developer-usability study remain open. |
-| `DM-7-16`, `DM-7-17`, `DM-7-20` offline publication/later sync/sample | `implemented-uncredited` / `observed-bounded` | Built-in applications, compiled Event/custody examples, and the local-agent sample | Retained built-in receipts publish peerless and forward later. Current-code real processes publish through the live handle with no peer, restart into later contact, poll/ack, and preserve the ack across receiver restart; the agent exercises that same authority. This does not establish independent usability, the supported offline interval, no-loss acceptance, other live classes, physical systems, or independent interoperability. |
-| `DM-8-01`, `DM-8-02` Rust implementation | `observed-bounded` | Rust 1.91 workspace and current selected-lane checks/tests | The retained locked/offline Darwin arm64 artifact identified below belongs to the parent PR-A/pre-subscription freeze. PR B, PR C, the selected State/Record/Blob, Event-custody, protected/admin, and controlled-relay slices have only their separately stated source/test evidence until a new release receipt is produced. The current relay freeze passed the serialized repository gate and fresh all-feature Rustdoc, but supported-target and release acceptance remain open. |
+| `DM-7-11`, `DM-7-14`, `DM-7-15`, `DM-7-18` high-level documented boundary | `implemented-uncredited` | Typed live Event/State/Record operations, typed stopped Event/State/Record/Blob operations, Record conflict/resolution, separate privileged control administration, authenticated Event-only agent RPCs, sanitized errors/status, no transport or reconciliation types in application handles, and compiled examples | The embedded Rust boundary now includes live State/Record and retained acceptance for its bounded operations. Blob remains stopped-only; State/Record lack durable delivery subscriptions; the agent remains Event-only; automatic merge, selected-node bindings, operational backend/CLI/issuance/recovery, production agent packaging, and an independent developer-usability study remain open. |
+| `DM-7-16`, `DM-7-17`, `DM-7-20` offline publication/later sync/sample | `implemented-uncredited` / `observed-bounded` | Built-in applications, compiled Event/custody/State/Record examples, actor-owned live Event/State/Record handles, and the local-agent sample | Retained Event and live mutable receipts publish peerless and forward later; the mutable receipt also proves State/Record exact retry and restart projection. This does not establish independent usability, the stakeholder-set offline interval, no-loss acceptance, Blob, durable State/Record delivery subscriptions, physical systems, scale, or independent interoperability. |
+| `DM-8-01`, `DM-8-02` Rust implementation | `observed-bounded` | Rust 1.91 workspace, current selected-lane checks/tests, and one retained Cargo release-profile Rust live-mutable executable | The retained live-mutable executable is 12,001,136 bytes with SHA-256 `47ca5e7aededa352604bb8c308def90c46237f594b9eb9be10cc22936afbed60`. Its source-binary-execution link is explicitly operator-attested, not cryptographically proven or reproducible, and it is not a product release artifact. Supported-target acceptance, packaging, and release authorization remain open. |
 | `DM-9-13`, `DM-9-14` Blob streamed reading and bounded working memory | `implemented-uncredited` | Synchronous `read_into`, canonical independently authenticated chunks, final whole-content verification, one manifest-bounded digest vector, independently chunk-bounded adapter buffers, and semantic-v5 16-KiB network ranges | The public metric is the core reader capacity, not whole-operation peak memory. Current local fixtures and one small 96-KiB network case do not establish supported-target resident-memory behavior. Alternate carriers, 100+ MiB brackets, complete physical accounting, mixed implementations, and retained resource evidence remain open. |
 | `DM-9-24`, `DM-9-25` bounded/configurable local storage | `implemented-uncredited` | Validated accounted-namespace aggregate `StoreLimits`, exact-scope Event `CustodyQuota`, authority/tombstone partitions, 1-MiB mutable-object and 4,096-row/16-MiB per-class caps, 256-peer/1,024-row cursor caps, bounded retirement and one-snapshot scheduling | Typed v4 mutable capacity deferral preserves valid differences and fair cursor rotation prevents one saturated peer/class/local Offer-or-Fetch mode from monopolizing attempts. Accepted-dot, causal-frontier, and Event-position/high-water ledgers still lack an aggregate retirement bound. Complete redb/filesystem/Blob-depot/hostile-entry/snapshot/swap/backup accounting, live quota administration, physical pressure, scale, mixed implementations, and retained resource evidence remain open. |
 | `DM-11-15`, `DM-11-17` MVP TTL and receive-only | `implemented-uncredited` | Public finite Event publication plus semantic-v3-format cumulative custody/expiry inherited by v4/v5 and startup/live ReceiveOnly policy with authenticated inbound Event ingestion | The mechanisms exist in the selected Rust Event slice, but the complete MVP does not. Finite Event TTL is Linux-only; selected finite State/Record/Blob TTL is rejected/open. Normal and AtLeast run v4/v5 mutable work and may run v5 Blob work because AtLeast remains Event-only; ReceiveOnly initiates/discloses no mutable objects or Blob frames but is not physical RF silence. Bindings, physical/mixed acceptance, protected provisioning, and release gates remain open. |
@@ -792,10 +808,11 @@ Broader State/Record partition, relay, crash, and mixed-implementation behavior,
 route-only Blob relay/custody, live Blob delivery, TTL/GC, pure-byte
 identity/dedup, large/physical/resource and mixed-implementation Blob behavior,
 automatic registered-policy Record merge, and release acceptance remain open.
-Selected-composition credit is limited to the exact stopped application
-mechanisms, current-code bounded direct-Iroh semantic-v4/v5 State/Record and
-semantic-v5 Blob automation, and the exact controlled carrier evidence named
-above; none of that current-code automation is retained evidence.
+Selected-composition credit is limited to the exact stopped and actor-owned
+application mechanisms, the retained bounded direct-Iroh State/Record receipt,
+current-code semantic-v5 Blob automation, and the exact controlled carrier
+evidence named above. No retained State/Record claim extends beyond the
+two-participant, one-host, direct-only boundary recorded below.
 
 ## Current controlled Iroh relay automated evidence
 
@@ -1028,6 +1045,136 @@ State/Record/Blob-over-relay behavior, mobility/outage recovery, independent
 clock assurance, resource thresholds, a hermetic build, complete MVP, product
 release, or release authorization. `DM-5.8-08` and the physical release gate
 `DM-12-09` remain `open`.
+
+## Selected live State and Record retained receipt
+
+On 2026-08-26, the selected live State/Record composition at signed source
+commit `2ccfba0d18bf8d8221ab11fb485b32fcf6270272` and tree
+`a07c7530ebee60d07c71c20a87febe8b9b360fa8` passed the
+`aster-selected-live-mutable-receipt/v1` contract. The source signature
+verified Good for ED25519 fingerprint
+`SHA256:wDJcS5jorC5+Dm3vvXdMrW/f38sqIl20hJXrt5B8s9E`.
+The checked-in canonical
+[`aster-selected-live-mutable-receipt/v1` receipt](evidence/selected-live-mutable-2ccfba0.json)
+is exactly 5,660 bytes with SHA-256
+`299a3c3b8d1685deb5980ed091797f7d46119562b67c3d853b94d8552c83b67a`.
+The source-bound checker at that freeze is 97,276 bytes with SHA-256
+`0b74826a28695fe44b0536bd5e037c4c33feb8acbc30c0d81a24d309dcaaea9d`;
+its fail-closed test corpus passed 81/81.
+
+The runner verified the signed, clean source before build, after build, and
+after execution. It invoked exactly:
+
+```text
+cargo build --release --locked -p aster-node --example live_mutable_acceptance
+/private/tmp/aster-selected-live-mutable-2ccfba0-final/binary/aster-live-mutable-acceptance /private/tmp/aster-selected-live-mutable-2ccfba0-final
+```
+
+The copied Cargo release-profile executable is 12,001,136 bytes with SHA-256
+`47ca5e7aededa352604bb8c308def90c46237f594b9eb9be10cc22936afbed60`.
+The exact run exited zero. Its stdout is 27,894 bytes/56 lines with SHA-256
+`6282598b162fb06141de1ff1a327e6247999388156ab8a82b4430d681abe5ed7`;
+stderr is exactly empty. The public 40-record transcript is 13,860 bytes with
+SHA-256
+`26eaa243e60fd5cb2add736555a33699000e7602129422c24be2436b33a61821`.
+The canonical receipt excludes exact participant identifiers, paths, ports,
+PIDs, and payload bytes; payloads appear only as SHA-256 commitments.
+
+The retained acceptance facts are exact and bounded:
+
+- Two participants used two distinct carrier identities and two distinct
+  mission identities under one common authority with disjoint mission identity
+  bindings and exact reciprocal expected-peer bindings.
+- Six actor lifetimes ran across three sequential phases, with at most two
+  actors concurrently. All six shut down gracefully; four retained State/Record
+  handle clones closed with the actor; and both UDP binds were reacquired after
+  final shutdown.
+- Both participants published one State value and one Record revision while
+  peerless. Peerless and restart phases recorded zero contacts. Four exact
+  publication retries inserted nothing.
+- Four connected contact receipts were positive, direct-only, paired exactly,
+  and error-free. Selected mutable accounting recorded five offered, five
+  fetched, and five inserted items, zero duplicates, zero deferred or remaining
+  mutable/Event work, and zero Event, control, or Blob transfer counters.
+- Both live State projections selected the greatest complete authenticated
+  semantic State ID as Current and retained the other concurrent maximum; both
+  peerless restart projections reproduced that result. This is concurrent
+  tie-break evidence, not causal-successor dominance evidence.
+- Both live Record projections exposed the same two sibling IDs and exact
+  conflict guard. Ordinary publish returned Conflict without insertion or
+  sibling change. Guarded resolution observed both siblings, exact resolution
+  retry inserted nothing, both connected projections converged, and both
+  peerless restart projections retained the successor plus both superseded
+  originals.
+
+The complete raw root remains outside source control at
+`/private/tmp/aster-selected-live-mutable-2ccfba0-final` on the validating host. Its
+seven directories, including the root, are owner-only `0700`. Its exact
+inventory contains 11 regular files with one link each and no aliases: one
+copied executable, four public terminal/metadata files, and, for each of two
+participant directories, one mission bundle, one identity key, and one redb
+store. The six participant secret artifacts are validated only by regular-file
+identity, owner, mode, link, and path metadata. The checker never opens, reads,
+or hashes their contents. The raw root may contain credentials or
+identity-bearing data and
+must not be copied into documentation, committed, or treated as the public
+receipt.
+
+The original retained run and the two independent canonical projections used
+these exact commands while the source checkout was clean at the signed source
+commit:
+
+```sh
+python3 tools/run-selected-live-mutable.py \
+  --source /Users/megamind/code/aster \
+  --raw-root /private/tmp/aster-selected-live-mutable-2ccfba0-final
+
+python3 tools/check-selected-live-mutable-receipt.py - \
+  --raw-root /private/tmp/aster-selected-live-mutable-2ccfba0-final \
+  --source /Users/megamind/code/aster \
+  --output /private/tmp/aster-live-mutable-projection-2ccfba0/selected-live-mutable-receipt.json
+
+python3 tools/check-selected-live-mutable-receipt.py - \
+  --raw-root /private/tmp/aster-selected-live-mutable-2ccfba0-final \
+  --source /Users/megamind/code/aster \
+  --output /private/tmp/aster-live-mutable-projection-2ccfba0-b/selected-live-mutable-receipt.json
+
+cmp /private/tmp/aster-live-mutable-projection-2ccfba0/selected-live-mutable-receipt.json \
+  /private/tmp/aster-live-mutable-projection-2ccfba0-b/selected-live-mutable-receipt.json
+shasum -a 256 \
+  /private/tmp/aster-live-mutable-projection-2ccfba0/selected-live-mutable-receipt.json
+```
+
+Future review must use a separate clean checkout detached at the exact signed
+source commit because this evidence/documentation commit is a descendant. With
+the retained raw root available, validate the checked-in receipt byte-for-byte
+as follows:
+
+```sh
+python3 tools/check-selected-live-mutable-receipt.py \
+  --raw-root /private/tmp/aster-selected-live-mutable-2ccfba0-final \
+  --source /path/to/aster-source-worktree-detached-at-2ccfba0 \
+  docs/implementation/evidence/selected-live-mutable-2ccfba0.json
+```
+
+The receipt's source-to-binary-to-execution link is explicitly
+`operator-attested-not-cryptographically-proven`, and its admitted source list
+is not a complete reproducible build closure. It claims only one-host loopback,
+same-implementation, two-participant live State/Record behavior. It does not
+claim distinct physical hosts, NAT or Internet traversal, a controlled or
+public relay, BTLE, independent-implementation interoperability, scale beyond
+two participants, resource thresholds or a long-duration soak, Event or Blob
+live-application acceptance, a reproducible build, a product release, or
+release authorization.
+
+The receipt moves exactly `DM-5.1-09`, `DM-5.3-02`, and `DM-5.3-06` through
+`DM-5.3-10` from `implemented-uncredited` to `observed-bounded`; moves
+`DM-11-06` and `DM-11-07` from `open` to `implemented-uncredited`; and moves
+`DM-12-04` from `open` to `observed-bounded`. It strengthens, without moving,
+`DM-1-05`, `DM-5.1-01`, `DM-5.1-08`, `DM-5.2-01`, `DM-5.2-09`, `DM-7-11`,
+`DM-7-16`, `DM-7-17`, `DM-8-01`, and `DM-8-02`. It does not move
+`DM-5.1-02` or `DM-5.3-01`, because no causally later State successor is part
+of the retained scenario.
 
 ## Prior PR-C automated evidence
 
@@ -2624,14 +2771,14 @@ decisions above.
 
 | Requirement class | Current state | What must be delivered before complete credit |
 |---|---|---|
-| Remaining data model | `implemented-uncredited` / `open` | Extend the bounded direct State/Record reconciliation into longer partitions, relays, divergent State convergence, restarts/crash windows, and independent interoperability; add live State/Record application operations; design convergent registered-policy Record merge; extend the bounded direct Blob transfer/resume slice through a live application boundary and route-only custody, then add multi-class retention/GC and broader conflict/deletion behavior |
+| Remaining data model | `implemented-uncredited` / `open` | Extend the retained bounded live State/Record reconciliation into longer partitions, relays, causally divergent State sequences, broader restart/crash windows, physical systems, and independent interoperability; add durable State/Record application delivery subscriptions; design convergent registered-policy Record merge; extend the bounded direct Blob transfer/resume slice through a live application boundary and route-only custody, then add multi-class retention/GC and broader conflict/deletion behavior |
 | Source and mission security | `implemented-uncredited` / `observed-bounded` / `open` / `external-gate` | Extend the caller-provided protected live Rust config and stopped Event/admin seams through an admitted production backend, stock CLI and bindings, issuance/recovery, and a coordinated live-drain/store-terminalization/provider-destroy lifecycle; add generalized multi-family control policy plus automatic/atomic revocation remediation; verify multi-scope, repeated, longer-partition, and physical revocation/rekey propagation; replace the absolute lexical path witness with any required inode/parent-directory/symlink/rename/rollback assurance; add non-Unix and physical/copy-on-write/snapshot/swap/backup zeroization assurance, all data classes, any required admitted FIPS boundary, packet-capture acceptance, and independent cryptographic review |
 | Custody and constrained operation | `implemented-uncredited` / `open` | Selected Event/RouteEvent now has semantic-v3-format cumulative age inherited by v4/v5, Linux finite Event TTL, expiry/GC, priority scheduling/retry, bounded quotas, thresholds, and receive-only inbound. Normal and AtLeast run v4/v5 mutable work and may run the v5 Blob lane because AtLeast is Event-only; ReceiveOnly initiates/discloses neither mutable nor Blob work. Selected finite State/Record/Blob TTL remains rejected/open. Still required are complete cross-class priority eviction/custody, route-only Blob custody, non-Linux Event age, physical RF silence, v1/v2 deterministic partials, bindings, scale, mixed implementations, and retained acceptance. |
 | Scope and application policy | `implemented-uncredited` / `open` | Durable application-facing State/Record subscriptions and delivery behavior beyond explicit contact interests, automatic registered-policy Record merge, atomic subscription update, multi-scope join/leave, bridges, dynamic peer policy, and equivalent live status/gap semantics beyond the selected Event surface |
 | Blob behavior | `implemented-uncredited` / `open` | The local authenticated fixed-profile chunking, encrypted resume, immutable publication, and bounded-memory reader now have one semantic-v5 direct content-capable-peer source/carrier path with peer-neutral range resume and completion-gated visibility. Add a live Blob handle/subscription, route-only relay/custody, TTL and explicit staging GC; decide whether a metadata-independent pure-byte content ID is required; add complete physical accounting and hundreds-of-MB acceptance. |
 | Carrier portfolio | `implemented-uncredited` / `observed-bounded` / `open` / `external-gate` | Selected direct IP and one explicitly trusted singleton relay mechanism now exist, with one retained cone/direct and restrictive/controlled-relay software namespace-NAT observation. Still required are physical IP, representative NAT direct/fallback, discovery/punching policy, BTLE platform driver, smallest-MTU framing, link characteristics, State/Record/Blob-over-relay acceptance, mobility/outage recovery, mixed implementations, and future-carrier proof. |
 | DDIL resilience | `open` / `external-gate` | Loss/bandwidth floors, long custody/offline interval, crash/corruption recovery, broader partial-contact durable progress and alternate-peer/carrier continuation beyond the one bounded direct Blob case, mobility, and power/emission measurements |
-| Developer surface | `implemented-uncredited` / `open` | Add live application handles for the now-networked State/Record classes and a live Blob handle/subscription over the bounded network path; add automatic merge only after a convergent design, atomic subscription update if required, C FFI and at least two selected-node bindings, broader multi-class examples including live privileged administration, carry caller-provided protected Rust startup and typed live/stopped control administration into the stock CLI/bindings with a production backend/recovery/destroy workflow, run an independent usability study, and decide the optional local agent |
+| Developer surface | `implemented-uncredited` / `open` | Extend the live State/Record handles with durable delivery subscriptions where required and add a live Blob handle/subscription over the bounded network path; add automatic merge only after a convergent design, atomic subscription update if required, C FFI and at least two selected-node bindings, broader multi-class examples including live privileged administration, carry caller-provided protected Rust startup and typed live/stopped control administration into the stock CLI/bindings with a production backend/recovery/destroy workflow, run an independent usability study, and decide the optional local agent |
 | Scale and resources | `observed-bounded` / `open` / `external-gate` | Retain the one-host direct-loopback selected Event N=32 receipt as the bounded `DM-9-21A` observation; still obtain stakeholder-confirmed bracketed targets plus repeatable at-least-100-node, inventory-size, memory, CPU, binary, bandwidth, and energy evidence on target tiers |
 | Interoperability and release assurance | `open` / `external-gate` | Independent conformant implementation, mixed-version/downgrade evidence, completed hostile-peer campaigns, admitted dependency/license/SBOM graph, physical acceptance, and signed release disposition |
 

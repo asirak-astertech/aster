@@ -11,7 +11,9 @@ understand Aster's wire format or cryptography before building an application.
    publish offline and synchronize later.
 3. Choose an integration path. Most applications should begin with the
    [local ConnectRPC agent](quickstart/connect-agent.md); Rust applications can
-   use the [selected Event API](quickstart/selected-event-api.md) directly.
+   use the [selected Event](quickstart/selected-event-api.md),
+   [State](quickstart/selected-state-api.md), or
+   [Record](quickstart/selected-record-api.md) API directly.
 4. Read [Selected architecture](architecture.md) and
    [Security](security.md) before designing a deployment.
 
@@ -23,6 +25,7 @@ understand Aster's wire format or cryptography before building an application.
 | See Aster work quickly | [Capability tour](quickstart/capability-tour.md) |
 | Call Aster from Connect, gRPC, or gRPC-Web | [Local ConnectRPC agent](quickstart/connect-agent.md) |
 | Use the live Event API from Rust | [Selected Event API](quickstart/selected-event-api.md) |
+| Use live State or Record from Rust | [Selected State API](quickstart/selected-state-api.md) or [Selected Record API](quickstart/selected-record-api.md) |
 | Explore current State, Record, or Blob behavior | [State](quickstart/selected-state-api.md), [Record](quickstart/selected-record-api.md), or [Blob](quickstart/selected-blob-api.md) |
 | Use the semantic API from Rust, Python, Go, or C | [Language quickstarts](quickstart/README.md) |
 | See examples for every data class | [Application recipes](application-recipes.md) |
@@ -61,8 +64,14 @@ The selected implementation deliberately exposes different maturity levels:
 
 - **Event** has direct-Iroh networking and one operator-pinned controlled Iroh
   connectivity relay, plus live Rust and local ConnectRPC APIs.
-- **State and Record** reconcile between selected nodes, while their application
-  APIs require exclusive stopped-node access.
+- **State and Record** have cloneable live Rust handles backed by the running
+  actor plus exclusive stopped-node facades, and reconcile directly between
+  selected nodes under explicit interests. A
+  [retained bounded receipt](implementation/evidence/selected-live-mutable-2ccfba0.json)
+  covers peerless publication, direct convergence, explicit concurrent State
+  projection, explicit Record conflict/resolution, restart, and handle closure
+  on one loopback host. Their subscriptions, selected-node bindings, finite TTL,
+  and representative physical/mixed acceptance remain open.
 - **Blob** supports authenticated local publication, verified streaming, and
   selected direct range transfer with durable resume state; its live API,
   route-only relay/custody, and representative remote evidence remain open.
@@ -76,6 +85,17 @@ arm64 host. It is not discovery or punching, temporal fallback chronology,
 representative or physical NAT, public Internet or public/default relay,
 independent implementation, State/Record/Blob relay, complete-MVP, or release
 evidence.
+
+The live mutable receipt is a 5,660-byte canonical projection with SHA-256
+`299a3c3b8d1685deb5980ed091797f7d46119562b67c3d853b94d8552c83b67a`,
+bound to signed source `2ccfba0`. Its two participants ran six actor lifetimes
+with at most two concurrent, four paired direct `CONTACT` records and aggregate
+5/5/5 selected-item offer/fetch/insert counts, six graceful shutdowns, four
+closed retained handles, and zero Event/control/Blob counters. This is one-host,
+same-implementation loopback evidence with an operator-attested,
+non-reproducible source-to-execution link and metadata-only secret inspection;
+it is not physical, NAT/relay, BTLE, independent-implementation, scale,
+resource, long-duration, release, or Event/Blob-live acceptance.
 
 Aster remains an evaluation-stage reference implementation. Do not infer
 production authorization from code presence or a passing demo. The

@@ -321,9 +321,12 @@ target/debug/aster node --state ./aster-state --bind 0.0.0.0:49100 \
 repeatable, class-separated receive interests for already durable source
 objects. Empty means receive-none. They do not grant route or content access;
 the mission bundle must independently authorize the exact source, topic,
-scope, and current epoch. The stopped State/Record application handle must be
-closed before the runtime owns the same store. Record network ingest retains
-concurrent revisions and never executes application merge code.
+scope, and current epoch. Any stopped State/Record facade must be closed before
+the runtime owns the same store. Rust applications may instead
+call `RunningNode::selected_state()` and `RunningNode::selected_records()` for
+cloneable live handles backed by that actor's bounded application lane; the CLI
+does not expose those methods as a language binding. Record network ingest
+retains concurrent revisions and never executes application merge code.
 
 The built-in application roles require bundles granting scope `demo/mesh`, key
 epoch 1, and topic `mesh.ping-pong` to the endpoint applications. A relay role
@@ -487,11 +490,12 @@ reconciliation. Do not use `put` as evidence for the source-authenticated mesh.
 | `aster-core` | Existing spec-verified hybrid mission session, control envelope, recipient-filtered rekey, and typed source-envelope Event/State/Record/Blob semantics, used rather than rewritten |
 
 No old path is removed until its replacement passes equivalent tests. Current
-open work includes live State/Record application operations, broader
-State/Record partition/relay acceptance, networked Blob, generalized
-publish/subscribe and topic filtering, finite-TTL authenticated custody age, protected provisioning,
-generalized control administration and repeated multi-scope rekey,
-platform-complete zeroization assurance, physical/multi-carrier acceptance, and
-release gates. The tracked
-[requirements status](../implementation/requirements-status.md) keeps those
-boundaries explicit.
+open work includes State/Record subscriptions and selected-node bindings,
+broader State/Record partition/relay acceptance, a live Blob application path,
+generalized publish/subscribe and topic filtering, finite State/Record/Blob
+custody and non-Linux finite Event custody, protected provisioning, generalized
+control administration and repeated multi-scope rekey,
+platform-complete zeroization assurance, physical/multi-carrier or
+mixed-implementation acceptance, and release gates. The tracked [requirements
+status](../implementation/requirements-status.md) keeps those boundaries
+explicit.

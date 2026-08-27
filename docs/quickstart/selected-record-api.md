@@ -1,25 +1,28 @@
 # Selected Record API quickstart
 
-This is the shortest path to Aster's **selected Record conflict
-projection**. It opens the selected mission-bound redb store while no runtime
-owns it, publishes two source-authenticated revisions for one logical key, and
-reads the deterministic current revision plus recoverable history. Application
-code never constructs an envelope, handles cryptographic keys, reads sealed
-bytes, or runs untrusted merge code during ingest.
+This is the shortest path to Aster's **selected Record conflict projection**. A
+running node exposes cloneable async publish/query/resolve handles, and the same
+composition retains an exclusive stopped facade for maintenance or applications
+that do not need networking. Both return the deterministic current revision,
+explicit conflict siblings, and an opaque exact resolution guard without
+exposing envelopes, cryptographic keys, sealed bytes, or merge execution during
+ingest.
 
-The application handle remains deliberately stopped and exclusive; there is no
-live Record publish/query handle, durable Record subscription, or language
-binding. A separately running node can now reconcile already durable revisions
+`RunningNode::selected_records()` returns `SelectedRecordHandle`. Its clones
+send commands through the actor's one bounded Event/State/Record lane; they do
+not open another store or policy authority. `SelectedRecordNode` remains the
+stopped facade and owns the mission-bound writer exclusively. Record reconciles
 over a semantic-v4/v5 mission-authenticated, class- and direction-specific
-Negentropy lane when the receiver
-configures an exact topic/scope interest. Ingest never executes registered merge
-code, so concurrent heads remain durable and explicit. Finite TTL, expiry,
-garbage collection, automatic registered-policy merge, broader relay
-acceptance, and independent interoperability remain open. The selected store
-rejects every finite-TTL Record object; there is no forwarding-age path to
-enable yet.
+Negentropy lane under exact receiver interests. Ingest never executes registered
+merge code, so concurrent heads remain durable and explicit.
 
-## Run the example
+Durable Record subscriptions, selected-node ConnectRPC/C/Go/Python bindings,
+finite TTL, expiry, garbage collection, automatic registered-policy merge,
+broader relay acceptance, representative physical/mixed-implementation
+evidence, and release authorization remain open. The selected store rejects
+every finite-TTL Record object; there is no forwarding-age path to enable yet.
+
+## Run the stopped example
 
 Install the pinned toolchain, then create a disposable two-node fixture. The
 demo provides a mission bundle and releases its stores before the Record
@@ -68,11 +71,77 @@ cargo test --locked -p aster-node \
 This is an in-process mechanism test over one mission-bound store. The network
 test below separately exercises disconnected publishers and a real carrier.
 
-## Reconcile disconnected Record revisions
+## Use the live actor API
 
-Stop `SelectedRecordNode` before starting the network actor; both deliberately
-own the same mission-bound store exclusively. On every receiving node, add one
-repeatable exact interest for each desired topic and scope:
+Start a `RunningNode` as shown in the
+[selected Event guide](selected-event-api.md), then obtain and clone its Record
+handle. Publication, query, and guarded resolution are async because the actor
+remains the sole store authority:
+
+```rust
+let records = running.selected_records();
+let retained = records.clone();
+
+let request = RecordPublishRequest {
+    operation_key: b"my-app/record/asset-7/live".to_vec(),
+    topic: topic.clone(),
+    scope: scope.clone(),
+    priority: Priority::Priority,
+    logical_key: b"asset-7".to_vec(),
+    payload: b"moving".to_vec(),
+    tombstone: false,
+};
+let published = records.publish(request.clone()).await?;
+assert!(published.inserted);
+assert!(!records.publish(request).await?.inserted); // exact durable retry
+
+let query = RecordQuery {
+    topic,
+    scope,
+    logical_key: b"asset-7".to_vec(),
+    include_superseded_versions: true,
+};
+let projection = records.query(query.clone()).await?;
+assert_eq!(projection.current.expect("current Record").id, published.id);
+
+running.shutdown().await?;
+let closed = retained.query(query).await.expect_err("actor is closed");
+assert_eq!(closed.kind(), ApplicationErrorKind::StateUnavailable);
+assert_eq!(closed.operation(), "record query");
+```
+
+When `query` returns a conflict, pass its guard to
+`records.resolve(resolution_request).await`; the guard and durability semantics
+are the same as the stopped example below. Graceful shutdown closes application
+admission before releasing the writer. The bounded same-UID Unix zeroization
+path does the same before erasing retained secret artifacts. Retained clones
+therefore fail closed with sanitized `StateUnavailable`; they never reopen the
+store or continue on a stale policy. Event, State, and Record clones share one
+bounded command queue and actor-owned policy/store authority.
+
+Focused current-code automation covers peerless durability, idempotency,
+restart, shutdown admission, and protected same-epoch rekey recovery:
+
+```sh
+cargo test --locked -p aster-node \
+  runtime::tests::live_selected_state_and_record_are_durable_idempotent_and_close_admission \
+  -- --exact
+cargo test --locked -p aster-node \
+  runtime::tests::protected_live_mutable_handles_cache_exact_retry_across_same_epoch_rekey \
+  -- --exact
+```
+
+These focused commands are source-level current-code automation and do not by
+themselves create a retained acceptance receipt. The separate retained run
+below binds its claim to signed source and a frozen canonical projection.
+
+## Reconcile disconnected Record revisions while live
+
+Use `SelectedRecordHandle` while the network actor runs. If an application chose
+the stopped `SelectedRecordNode` facade instead, close it before starting the
+actor because both deliberately require the same mission-bound writer. On every
+receiving node, add one repeatable exact interest for each desired topic and
+scope:
 
 ```sh
 aster node ... --record-interest reports@mission/alpha
@@ -85,8 +154,8 @@ have to pass. Remote finite-TTL Record is rejected. Semantic versions 1 through
 3 retain Event compatibility but contain no Record interest, inventory, fetch,
 offer, result, or finish frames.
 
-On semantic v4 or v5, Normal and every `AtLeast` Event threshold still run the Record
-lane; the threshold does not filter Record. `ReceiveOnly` initiates and
+On semantic v4 or v5, Normal and every `AtLeast` Event threshold still run the
+Record lane; the threshold does not filter Record. `ReceiveOnly` initiates and
 discloses no Record lane. An object is limited to 1 MiB, and selected Record
 storage is capped at 4,096 rows and 16 MiB of encoded source bytes. Capacity
 saturation is an authenticated deferred outcome, not a duplicate or integrity
@@ -95,25 +164,42 @@ finish remainders. A durable cursor rotates the authenticated
 peer/class/local-mode starting point so bounded contacts do not permanently
 prefer the same revision.
 
-The current-code real-carrier automation test creates concurrent revisions on
-two independent stores while disconnected, makes one mission-authenticated
-direct Iroh contact, and verifies both exact revision inventories converge and
-both causal heads remain present on both stores:
+The focused real-carrier automation publishes concurrent revisions through live
+handles on two peerless nodes, later makes direct mission-authenticated Iroh
+contacts under exact interests, verifies both live projections retain the same
+sibling set, then resolves and exactly retries the conflict through a live
+handle and verifies the successor converges:
 
 ```sh
 cargo test --locked -p aster-node \
-  runtime::tests::real_iroh_contact_converges_state_and_disconnected_record_siblings \
+  runtime::tests::live_mutable_handles_converge_disconnected_state_and_record_then_resolve \
   -- --exact
 ```
 
-No application merge callback runs during ingest. Current-code regressions also
-cover exact result/acknowledgement, capacity deferral, fair rotation,
-and restart. Same-epoch old lineage is withheld from ordinary current
-projection/query and network inventory/transfer; only an exact idempotent
-publish/resolution retry may recover its committed result through strict
-cached/projection/historical verification. This is bounded same-implementation,
-one-host, two-node evidence, not a retained release receipt,
-multi-hop/partition sweep, or automatic merge implementation.
+No application merge callback runs during ingest. A separate
+[retained live mutable receipt](../implementation/evidence/selected-live-mutable-2ccfba0.json)
+is a 5,660-byte canonical projection (SHA-256
+`299a3c3b8d1685deb5980ed091797f7d46119562b67c3d853b94d8552c83b67a`)
+bound to signed source `2ccfba0`. Its two peerless Record publications become
+two explicit conflict siblings. An ordinary publish is rejected without
+changing them; guarded resolution observes both, supersedes both originals,
+exactly retries without insertion, converges at both actors, and survives
+restart across four resolved/restart views. The enclosing two-participant run
+uses six actor lifetimes with at most two concurrent, four paired direct
+`CONTACT` records, aggregate 5/5/5 selected-item offer/fetch/insert counts, six
+graceful shutdowns, four closed retained handles, and zero Event/control/Blob
+counters.
+
+The source-to-execution link is operator-attested, not cryptographically proven
+or reproducible, and secret artifacts were inspected by metadata only. This is
+one-host same-implementation loopback evidence, not physical, NAT/relay, BTLE,
+mixed-implementation, scale, resource, long-duration, Event/Blob-live, or
+release acceptance. Current-code regressions also cover exact
+result/acknowledgement, capacity deferral, and fair rotation. Same-epoch old
+lineage is withheld from ordinary current projection/query and network
+inventory/transfer; only an exact idempotent publish/resolution retry may recover
+its committed result through strict cached/projection/historical verification.
+The receipt is not a multi-hop/partition sweep or automatic merge implementation.
 
 ## Use the stopped API
 
@@ -238,8 +324,9 @@ The current example remains intentionally conflict-free because one stopped
 writer creates causally ordered successors. Selected-node tests construct
 independently source-authenticated publishers and exercise two-way, N-way,
 stale-guard, restart, rekey-retry, and both semantic-ID-order directions. That
-is automated local mechanism evidence. The separate real-Iroh test establishes
-only the bounded disconnected two-publisher transfer described above.
+is automated local mechanism evidence. The separate live real-Iroh test
+establishes only the bounded two-publisher transfer, guarded resolution, and
+restart behavior described above.
 
 ## Treat tombstones as authenticated Record revisions
 
@@ -262,8 +349,8 @@ If that revision is current, `projection.current` remains `Some(RecordItem)`
 with `tombstone == true`. Concurrent edits and tombstones follow the same
 complete-semantic-ID ordering in both directions; deletion receives no special
 delete-wins priority. Superseded and concurrent revisions remain recoverable in
-this bounded slice. Expiry, explicit-policy garbage collection, and retention-
-driven deletion are not implemented.
+this bounded slice. Expiry, explicit-policy garbage collection, and
+retention-driven deletion are not implemented.
 
 ## Follow the verification boundary
 
@@ -285,7 +372,7 @@ to that transaction.
 ```mermaid
 sequenceDiagram
     participant A as Application
-    participant N as SelectedRecordNode
+    participant N as Record composition (live handle or stopped facade)
     participant C as Source-envelope provider
     participant S as Mission-bound redb
 
@@ -313,9 +400,10 @@ sequenceDiagram
 
 The stopped handle takes the same process-exclusive store authority used by the
 live actor and the stopped State facade. Stop that actor and drop any other
-stopped facade before opening `SelectedRecordNode`, and close this handle before
+stopped facade before opening `SelectedRecordNode`, and close this facade before
 starting the actor; Aster does not permit two writers around one policy
-snapshot. Continue with the
+snapshot. The live `SelectedRecordHandle` instead routes commands to the
+already-running authority. Continue with the
 [selected architecture](../architecture.md) for the full trust split, the
 [selected State API](selected-state-api.md) for causal latest-value semantics,
 the [selected Event API](selected-event-api.md) for the live networked surface,

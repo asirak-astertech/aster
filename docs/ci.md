@@ -18,7 +18,7 @@ single stable check name **`CI / required`**.
 
 | Check | Runner | Purpose |
 | --- | --- | --- |
-| `quality` | `ubuntu-24.04` | Runs `mise run check`: Rust and Go formatting, Apache-2.0-only project-license and package checks, exact 348-row implementation-requirements traceability, the selected-node dependency boundary, vendored netlink source-equivalence and 13-test compatibility gates, the retained-libp2p-oracle boundary, Clippy with warnings denied, the full Rust workspace test suite, C ABI build and C/C++ header checks, Rust/Python conformance, Python/Go binding tests, and the lab-controller tests. |
+| `quality` | `ubuntu-24.04` | Runs `mise run check`: Rust and Go formatting, Apache-2.0-only project-license and package checks, exact 348-row implementation-requirements traceability, the selected-node dependency boundary, vendored netlink source-equivalence and 13-test compatibility gates, the retained-libp2p-oracle boundary, selected live-mutable receipt checker tests, Clippy with warnings denied, the full Rust workspace test suite, C ABI build and C/C++ header checks, Rust/Python conformance, Python/Go binding tests, and the lab-controller tests. |
 | `macOS tests` | `macos-14` | Runs all Rust workspace tests on the supported Apple runner with Rust 1.97.1. |
 | `Rust 1.91 MSRV` | `ubuntu-24.04` | Checks every workspace target and feature with the declared minimum supported Rust version. |
 | `dependency policy` | `ubuntu-24.04` | Enforces the retained-libp2p-oracle boundary, applies `deny.toml` to the root and fuzz dependency graphs, and audits both lockfiles against a freshly downloaded RustSec database. |
@@ -451,11 +451,59 @@ cargo check --locked --manifest-path fuzz/Cargo.toml --bin selected_frame_decode
 The final source manifest, exact two-toolchain matrix results, binding gates,
 and the disclosed pre-existing lab-oracle retry are pinned in the
 [prior State/Record requirements evidence](implementation/requirements-status.md#prior-selected-state-and-record-network-automated-evidence).
-This remains current-code automation only, not a retained execution root. Event
-last-contact status is not State/Record convergence. Physical links,
-State/Record relay, NAT, BTLE, resource brackets, mixed implementations, and
-release gates remain open. This State/Record gate supplies no scale evidence;
-the separate retained N=32 receipt is Event-only.
+That earlier network-mechanics matrix remains current-code automation only; it
+does not itself create a retained execution root. Event last-contact status is
+not State/Record convergence. The later live-application receipt below adds a
+bounded two-participant result, not a scale result. Physical links, State/Record
+relay, NAT, BTLE, resource brackets, mixed implementations, and release gates
+remain open; the separate retained N=32 receipt is Event-only.
+
+The current tree adds a live State/Record application gate after those frozen
+stopped and network-mechanics slices. `RunningNode::selected_state()`
+and `RunningNode::selected_records()` return cloneable handles backed by the
+actor's one bounded Event/State/Record command queue. The cells cover peerless
+live publish/query, exact idempotent retry and changed-intent conflict, shared
+causal high-water, restart, graceful-shutdown admission closure, mixed-command
+queue saturation, direct-Iroh convergence of disconnected State and Record
+heads, ordinary-publish conflict preservation, live guarded Record resolution
+and exact retry, protected same-epoch rekey recovery, and live zeroization
+closing retained State/Record clones with sanitized `StateUnavailable`.
+
+Representative focused commands are:
+
+```sh
+cargo test --locked -p aster-node runtime::tests::live_selected_state_and_record_are_durable_idempotent_and_close_admission -- --exact
+cargo test --locked -p aster-node runtime::tests::live_mutable_handles_converge_disconnected_state_and_record_then_resolve -- --exact
+cargo test --locked -p aster-node runtime::tests::protected_live_mutable_handles_cache_exact_retry_across_same_epoch_rekey -- --exact
+cargo test --locked -p aster-node runtime::tests::run_for_preempts_a_saturated_application_queue_and_closes_every_caller -- --exact
+python3 tools/test-selected-live-mutable-receipt.py
+```
+
+The separate
+[`selected-live-mutable-2ccfba0.json`](implementation/evidence/selected-live-mutable-2ccfba0.json)
+canonical receipt is 5,660 bytes with SHA-256
+`299a3c3b8d1685deb5980ed091797f7d46119562b67c3d853b94d8552c83b67a`
+and binds the run to good-signature source commit `2ccfba0`. Its two distinct
+participants and mission identities execute six actor lifetimes with at most
+two concurrent. They publish State and Record while peerless, then four
+paired direct `CONTACT` records account exactly for 5/5/5 selected items
+offered/fetched/inserted, zero remaining work, and zero Event/control/Blob
+counters. State selects the maximum ID as `Current`, retains the other as
+`Concurrent`, and reproduces the projection after restart. Record retains two
+conflict siblings, rejects an ordinary publish without changing them, resolves
+only under the exact guard, supersedes both originals, retries without another
+insert, converges, and reproduces the result after restart. Six graceful
+shutdowns complete, and four retained State/Record handles fail closed.
+
+The receipt records an operator-attested source/binary/execution link, not a
+cryptographic or reproducible-build proof, and validates participant secret
+artifacts by metadata only without opening, reading, or hashing their contents.
+It is one-host same-implementation loopback evidence. It supplies no physical,
+NAT/Internet, controlled/public-relay, BTLE, independent-implementation, scale
+beyond two, resource-threshold, long-duration, Event/Blob-live, or release
+acceptance. Durable State/Record subscriptions, selected-node bindings, finite
+TTL, expiry/garbage collection, automatic registered-policy merge, and live
+Blob access remain open.
 
 The semantic-v5 direct Blob gate is additive to the earlier stopped/local Blob
 gate. It must cover all Blob interest/source/range/result/ack/finish frame bytes,
@@ -823,8 +871,8 @@ They remain bounded to Event, one control family/scope, and loopback. The
 current code additionally has durable Event Consume/Carry selectors, live and
 stopped-state poll/ack, idempotent unsubscribe, verified gap inspection,
 bounded last-contact status, protected receiver-directed filtering, and
-separate stopped State and Record projections plus stopped Blob streaming and
-semantic-v5 direct Blob transfer/resume automation;
+separate live and stopped State and Record projections plus stopped Blob
+streaming and semantic-v5 direct Blob transfer/resume automation;
 it does not turn the retained parent roots into PR-B, PR-C, State, Record, or
 Blob receipts. Those retained parent tests do not claim networked State/Record
 or Blob, remote Blob chunks, global convergence, generalized control

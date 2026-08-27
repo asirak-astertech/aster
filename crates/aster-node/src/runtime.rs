@@ -83,8 +83,9 @@ use crate::{
     NodeIdentity,
     application::{
         AuthenticatedPeerStatus, ContactSyncStatus, EventSyncStatus, PeerAuthorization,
-        SelectedEventCommand, SelectedEventHandle, SelectedEventNode, SelectedEventStatus,
-        runtime_application_error,
+        SelectedApplicationCommand, SelectedEventCommand, SelectedEventHandle, SelectedEventNode,
+        SelectedEventStatus, SelectedRecordCommand, SelectedRecordHandle, SelectedRecordNode,
+        SelectedStateCommand, SelectedStateHandle, SelectedStateNode, runtime_application_error,
     },
     control_admin::{SelectedControlCommand, SelectedControlHandle, admin_error},
     format_node_id, format_path_field, format_receipt_field,
@@ -1758,6 +1759,8 @@ fn account_blob_receipt(total: &mut NodeReceipt, contact: &PeerReceipt) -> Resul
 /// Owned lifecycle for one running selected-stack node actor.
 pub struct RunningNode {
     selected_events: SelectedEventHandle,
+    selected_state: SelectedStateHandle,
+    selected_records: SelectedRecordHandle,
     selected_controls: SelectedControlHandle,
     application_admission: Arc<AtomicBool>,
     emission_policy: Arc<LiveEmissionPolicy>,
@@ -1769,6 +1772,16 @@ impl RunningNode {
     /// Returns a cloneable, bounded live selected-Event application handle.
     pub fn selected_events(&self) -> SelectedEventHandle {
         self.selected_events.clone()
+    }
+
+    /// Returns a cloneable, bounded live selected-State application handle.
+    pub fn selected_state(&self) -> SelectedStateHandle {
+        self.selected_state.clone()
+    }
+
+    /// Returns a cloneable, bounded live selected-Record application handle.
+    pub fn selected_records(&self) -> SelectedRecordHandle {
+        self.selected_records.clone()
     }
 
     /// Returns the cloneable, one-command live authority-control handle.
@@ -7445,6 +7458,50 @@ fn contact_mutable_route_cache(
     Ok(cache)
 }
 
+pub(crate) fn cache_authenticated_state_route_claim(
+    store: &Store,
+    policy: &ControlPolicySnapshot,
+    cache: &AuthenticatedEventRouteCache,
+    verifier: &ReferenceEnvelopeSealer,
+    route: &RouteVerifiedStateEnvelope,
+) -> Result<(), NodeError> {
+    let transfer_id = StateTransferId::new(route.envelope_id());
+    let (stored, projection) = store
+        .retained_state_source_with_policy(policy, transfer_id)?
+        .ok_or_else(|| {
+            NodeError::Protocol(
+                "authenticated local State publication is missing its exact retained source row"
+                    .into(),
+            )
+        })?;
+    let claim = AuthenticatedMutableRouteClaim::from_verified_state(route, &stored, &projection)?;
+    cache.require_binding(verifier)?;
+    cache.record_mutable_source_verification();
+    cache.insert_mutable(verifier, claim)
+}
+
+pub(crate) fn cache_authenticated_record_route_claim(
+    store: &Store,
+    policy: &ControlPolicySnapshot,
+    cache: &AuthenticatedEventRouteCache,
+    verifier: &ReferenceEnvelopeSealer,
+    route: &RouteVerifiedRecordEnvelope,
+) -> Result<(), NodeError> {
+    let transfer_id = RecordTransferId::new(route.envelope_id());
+    let (stored, projection) = store
+        .retained_record_source_with_policy(policy, transfer_id)?
+        .ok_or_else(|| {
+            NodeError::Protocol(
+                "authenticated local Record publication is missing its exact retained source row"
+                    .into(),
+            )
+        })?;
+    let claim = AuthenticatedMutableRouteClaim::from_verified_record(route, &stored, &projection)?;
+    cache.require_binding(verifier)?;
+    cache.record_mutable_source_verification();
+    cache.insert_mutable(verifier, claim)
+}
+
 fn cache_committed_state_route_claim(
     store: &Store,
     guard: &EventLaneGuard,
@@ -8600,6 +8657,59 @@ fn execute_selected_event_command(
     }
 }
 
+fn execute_selected_state_command(
+    application: &mut SelectedStateNode,
+    command: SelectedStateCommand,
+) {
+    match command {
+        SelectedStateCommand::Publish { request, response } => {
+            let _ = response.send(application.publish(request));
+        }
+        SelectedStateCommand::Query { query, response } => {
+            let _ = response.send(application.query(query));
+        }
+    }
+}
+
+fn execute_selected_record_command(
+    application: &mut SelectedRecordNode,
+    command: SelectedRecordCommand,
+) {
+    match command {
+        SelectedRecordCommand::Publish { request, response } => {
+            let _ = response.send(application.publish(request));
+        }
+        SelectedRecordCommand::Query { query, response } => {
+            let _ = response.send(application.query(query));
+        }
+        SelectedRecordCommand::Resolve { request, response } => {
+            let _ = response.send(application.resolve(request));
+        }
+    }
+}
+
+fn execute_selected_application_command(
+    events: &mut SelectedEventNode,
+    state: &mut SelectedStateNode,
+    records: &mut SelectedRecordNode,
+    store: &Store,
+    status: &SelectedEventStatusTracker,
+    receipt: &NodeReceipt,
+    command: SelectedApplicationCommand,
+) {
+    match command {
+        SelectedApplicationCommand::Event(command) => {
+            execute_selected_event_command(events, store, status, receipt, command);
+        }
+        SelectedApplicationCommand::State(command) => {
+            execute_selected_state_command(state, command);
+        }
+        SelectedApplicationCommand::Record(command) => {
+            execute_selected_record_command(records, command);
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LiveControlRefresh {
     Settled,
@@ -8747,6 +8857,18 @@ pub async fn start_node_with_forwarding(
     let (application_sender, application_receiver) = mpsc::channel(APPLICATION_COMMAND_CAPACITY);
     let application_admission = Arc::new(AtomicBool::new(true));
     let selected_events = SelectedEventHandle::new(
+        application_sender.clone(),
+        application_admission.clone(),
+        identity,
+        mission_authority,
+    );
+    let selected_state = SelectedStateHandle::new(
+        application_sender.clone(),
+        application_admission.clone(),
+        identity,
+        mission_authority,
+    );
+    let selected_records = SelectedRecordHandle::new(
         application_sender,
         application_admission.clone(),
         identity,
@@ -8779,6 +8901,8 @@ pub async fn start_node_with_forwarding(
     }
     Ok(RunningNode {
         selected_events,
+        selected_state,
+        selected_records,
         selected_controls,
         application_admission,
         emission_policy,
@@ -8811,7 +8935,7 @@ struct RunNodeActorTestControl {
 }
 
 struct NodeActorChannels {
-    application_receiver: mpsc::Receiver<SelectedEventCommand>,
+    application_receiver: mpsc::Receiver<SelectedApplicationCommand>,
     application_admission: Arc<AtomicBool>,
     control_receiver: mpsc::Receiver<SelectedControlCommand>,
     shutdown_receiver: mpsc::Receiver<()>,
@@ -8822,7 +8946,7 @@ struct NodeActorChannels {
 
 impl NodeActorChannels {
     fn new(
-        application_receiver: mpsc::Receiver<SelectedEventCommand>,
+        application_receiver: mpsc::Receiver<SelectedApplicationCommand>,
         application_admission: Arc<AtomicBool>,
         control_receiver: mpsc::Receiver<SelectedControlCommand>,
         shutdown_receiver: mpsc::Receiver<()>,
@@ -8843,7 +8967,7 @@ impl NodeActorChannels {
 #[cfg(test)]
 async fn run_node_actor(
     config: NodeConfig,
-    application_receiver: mpsc::Receiver<SelectedEventCommand>,
+    application_receiver: mpsc::Receiver<SelectedApplicationCommand>,
     application_admission: Arc<AtomicBool>,
     shutdown_receiver: mpsc::Receiver<()>,
     ready: oneshot::Sender<Vec<SocketAddr>>,
@@ -8948,7 +9072,13 @@ async fn run_node_actor_inner(
         &mut application_sealer,
         &mut historical_application_sealer,
     )?;
-    drop(historical_application_sealer);
+    // Each live facade owns a stateful sealer. They share one mission-bound
+    // store and startup-authenticated route cache, but never alias provider
+    // state across application operations.
+    let state_application_sealer = open_replayed_verifier(&store, &config.mission)?;
+    let state_historical_sealer = historical_application_sealer;
+    let record_application_sealer = open_replayed_verifier(&store, &config.mission)?;
+    let record_historical_sealer = ReferenceEnvelopeSealer::open(config.mission.fresh_bundle()?)?;
     let global_custody_quota =
         CustodyQuota::for_store_limits(forwarding.store_limits()).map_err(StoreError::from)?;
     store.replace_custody_quotas(global_custody_quota, forwarding.scope_quotas())?;
@@ -8967,6 +9097,22 @@ async fn run_node_actor_inner(
         application_sealer,
         application_control_head,
         custody_clock.clone(),
+        event_route_cache.clone(),
+    );
+    let mut state_application = SelectedStateNode::from_runtime(
+        config.mission.clone(),
+        store.clone(),
+        state_application_sealer,
+        state_historical_sealer,
+        application_control_head,
+        event_route_cache.clone(),
+    );
+    let mut record_application = SelectedRecordNode::from_runtime(
+        config.mission.clone(),
+        store.clone(),
+        record_application_sealer,
+        record_historical_sealer,
+        application_control_head,
         event_route_cache.clone(),
     );
     let identity = NodeIdentity::load_or_create(&config.state)?;
@@ -9096,7 +9242,7 @@ async fn run_node_actor_inner(
     let mut selected_event_status =
         SelectedEventStatusTracker::new(config.peers.iter().map(|peer| peer.mission).collect());
     let mut application_commands_open = true;
-    let mut pending_application_command = None::<SelectedEventCommand>;
+    let mut pending_application_command = None::<SelectedApplicationCommand>;
     let mut control_commands_open = true;
     let mut pending_control_command = None::<SelectedControlCommand>;
     let mut pending_control_lease = None::<ControlPolicyLeaseFuture>;
@@ -9379,7 +9525,7 @@ async fn run_node_actor_inner(
                 policy_lock.clone(),
                 pending_application_command
                     .as_ref()
-                    .is_some_and(SelectedEventCommand::mutates_selectors),
+                    .is_some_and(SelectedApplicationCommand::mutates_selectors),
             ), if pending_application_command.is_some()
                 && network_events_since_application >= NETWORK_EVENT_BUDGET => {
                 control_yield_required = false;
@@ -9387,8 +9533,10 @@ async fn run_node_actor_inner(
                 let command = pending_application_command
                     .take()
                     .expect("application policy lease requires a pending command");
-                execute_selected_event_command(
+                execute_selected_application_command(
                     &mut application,
+                    &mut state_application,
+                    &mut record_application,
                     &store,
                     &selected_event_status,
                     &receipt,
@@ -9642,7 +9790,7 @@ async fn run_node_actor_inner(
                 policy_lock.clone(),
                 pending_application_command
                     .as_ref()
-                    .is_some_and(SelectedEventCommand::mutates_selectors),
+                    .is_some_and(SelectedApplicationCommand::mutates_selectors),
             ), if pending_application_command.is_some()
                 && network_events_since_application < NETWORK_EVENT_BUDGET => {
                 control_yield_required = false;
@@ -9650,8 +9798,10 @@ async fn run_node_actor_inner(
                 let command = pending_application_command
                     .take()
                     .expect("application policy lease requires a pending command");
-                execute_selected_event_command(
+                execute_selected_application_command(
                     &mut application,
+                    &mut state_application,
+                    &mut record_application,
                     &store,
                     &selected_event_status,
                     &receipt,
@@ -9706,6 +9856,8 @@ async fn run_node_actor_inner(
     endpoint.close().await;
     drop(endpoint);
     drop(application);
+    drop(state_application);
+    drop(record_application);
     if let Some(error) = fatal_error {
         return Err(error);
     }
@@ -21546,8 +21698,10 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn live_zeroization_closes_selected_event_admission_before_erasure() {
-        use crate::application::{ApplicationErrorKind, EventPublishRequest};
+    async fn live_zeroization_closes_every_application_admission_before_erasure() {
+        use crate::application::{
+            ApplicationErrorKind, EventPublishRequest, RecordQuery, StateQuery,
+        };
 
         let root = root("zeroize-live-selected-event-actor");
         let state = root.join("state");
@@ -21568,6 +21722,8 @@ mod tests {
         .await
         .expect("start live node");
         let selected = running.selected_events();
+        let selected_state = running.selected_state();
+        let selected_records = running.selected_records();
         selected
             .publish(EventPublishRequest {
                 operation_key: b"zeroization-live-event".to_vec(),
@@ -21596,6 +21752,28 @@ mod tests {
                 .kind(),
             ApplicationErrorKind::StateUnavailable
         );
+        let state_error = selected_state
+            .query(StateQuery {
+                topic: Topic::new("zeroization").expect("topic"),
+                scope: Scope::new("test/zeroization").expect("scope"),
+                logical_key: b"closed-state".to_vec(),
+                include_recoverable_versions: false,
+            })
+            .await
+            .expect_err("zeroized actor rejects retained State handle");
+        assert_eq!(state_error.kind(), ApplicationErrorKind::StateUnavailable);
+        assert_eq!(state_error.operation(), "state query");
+        let record_error = selected_records
+            .query(RecordQuery {
+                topic: Topic::new("zeroization").expect("topic"),
+                scope: Scope::new("test/zeroization").expect("scope"),
+                logical_key: b"closed-record".to_vec(),
+                include_superseded_versions: false,
+            })
+            .await
+            .expect_err("zeroized actor rejects retained Record handle");
+        assert_eq!(record_error.kind(), ApplicationErrorKind::StateUnavailable);
+        assert_eq!(record_error.operation(), "record query");
         assert_eq!(
             Store::inspect_zeroization_state(state.join(STORE_FILE))
                 .expect("terminal state")
@@ -21906,7 +22084,7 @@ mod tests {
     }
 
     fn prefill_status_commands(
-        sender: &mpsc::Sender<SelectedEventCommand>,
+        sender: &mpsc::Sender<SelectedApplicationCommand>,
     ) -> Vec<oneshot::Receiver<Result<SelectedEventStatus, crate::application::ApplicationError>>>
     {
         let mut responses = Vec::with_capacity(APPLICATION_COMMAND_CAPACITY);
@@ -21914,7 +22092,9 @@ mod tests {
             let (response, received) = oneshot::channel();
             assert!(
                 sender
-                    .try_send(SelectedEventCommand::Status { response })
+                    .try_send(SelectedApplicationCommand::Event(
+                        SelectedEventCommand::Status { response },
+                    ))
                     .is_ok(),
                 "pre-fill bounded application queue"
             );
@@ -21922,6 +22102,137 @@ mod tests {
         }
         assert_eq!(sender.capacity(), 0);
         responses
+    }
+
+    enum QueuedApplicationResponse {
+        Event(oneshot::Receiver<Result<SelectedEventStatus, crate::application::ApplicationError>>),
+        State(
+            oneshot::Receiver<
+                Result<crate::application::StateProjection, crate::application::ApplicationError>,
+            >,
+        ),
+        Record(
+            oneshot::Receiver<
+                Result<crate::application::RecordProjection, crate::application::ApplicationError>,
+            >,
+        ),
+    }
+
+    fn prefill_mixed_application_commands(
+        sender: &mpsc::Sender<SelectedApplicationCommand>,
+    ) -> Vec<QueuedApplicationResponse> {
+        use crate::application::{RecordQuery, StateQuery};
+
+        let topic = Topic::new("opaque").expect("topic");
+        let scope = Scope::new("test/runtime").expect("scope");
+        let mut responses = Vec::with_capacity(APPLICATION_COMMAND_CAPACITY);
+        for index in 0..APPLICATION_COMMAND_CAPACITY {
+            let queued = match index % 3 {
+                0 => {
+                    let (response, received) = oneshot::channel();
+                    sender
+                        .try_send(SelectedApplicationCommand::Event(
+                            SelectedEventCommand::Status { response },
+                        ))
+                        .expect("pre-fill Event command");
+                    QueuedApplicationResponse::Event(received)
+                }
+                1 => {
+                    let (response, received) = oneshot::channel();
+                    sender
+                        .try_send(SelectedApplicationCommand::State(
+                            SelectedStateCommand::Query {
+                                query: StateQuery {
+                                    topic: topic.clone(),
+                                    scope: scope.clone(),
+                                    logical_key: format!("queued-state-{index}").into_bytes(),
+                                    include_recoverable_versions: false,
+                                },
+                                response,
+                            },
+                        ))
+                        .expect("pre-fill State command");
+                    QueuedApplicationResponse::State(received)
+                }
+                _ => {
+                    let (response, received) = oneshot::channel();
+                    sender
+                        .try_send(SelectedApplicationCommand::Record(
+                            SelectedRecordCommand::Query {
+                                query: RecordQuery {
+                                    topic: topic.clone(),
+                                    scope: scope.clone(),
+                                    logical_key: format!("queued-record-{index}").into_bytes(),
+                                    include_superseded_versions: false,
+                                },
+                                response,
+                            },
+                        ))
+                        .expect("pre-fill Record command");
+                    QueuedApplicationResponse::Record(received)
+                }
+            };
+            responses.push(queued);
+        }
+        assert_eq!(sender.capacity(), 0);
+        responses
+    }
+
+    async fn assert_explicit_mixed_application_responses(
+        responses: Vec<QueuedApplicationResponse>,
+    ) -> (usize, usize) {
+        use crate::application::ApplicationErrorKind;
+
+        let mut successes = 0usize;
+        let mut unavailable = 0usize;
+        for response in responses {
+            match response {
+                QueuedApplicationResponse::Event(response) => match response
+                    .await
+                    .expect("queued Event caller receives an explicit result")
+                {
+                    Ok(_) => successes += 1,
+                    Err(error) => {
+                        unavailable += 1;
+                        assert_eq!(error.kind(), ApplicationErrorKind::StateUnavailable);
+                        assert_eq!(error.operation(), "status");
+                    }
+                },
+                QueuedApplicationResponse::State(response) => match response
+                    .await
+                    .expect("queued State caller receives an explicit result")
+                {
+                    Ok(projection) => {
+                        successes += 1;
+                        assert!(projection.current.is_none());
+                        assert!(projection.recoverable.is_empty());
+                    }
+                    Err(error) => {
+                        unavailable += 1;
+                        assert_eq!(error.kind(), ApplicationErrorKind::StateUnavailable);
+                        assert_eq!(error.operation(), "state query");
+                    }
+                },
+                QueuedApplicationResponse::Record(response) => match response
+                    .await
+                    .expect("queued Record caller receives an explicit result")
+                {
+                    Ok(projection) => {
+                        successes += 1;
+                        assert!(projection.current.is_none());
+                        assert!(projection.concurrent.is_empty());
+                        assert!(projection.superseded.is_empty());
+                        assert!(projection.conflict.is_none());
+                    }
+                    Err(error) => {
+                        unavailable += 1;
+                        assert_eq!(error.kind(), ApplicationErrorKind::StateUnavailable);
+                        assert_eq!(error.operation(), "record query");
+                    }
+                },
+            }
+        }
+        (successes, unavailable)
     }
 
     async fn assert_explicit_status_responses(
@@ -22053,7 +22364,19 @@ mod tests {
             identity,
             mission_authority,
         );
-        let responses = prefill_status_commands(&application_sender);
+        let selected_state = SelectedStateHandle::new(
+            application_sender.clone(),
+            application_admission.clone(),
+            identity,
+            mission_authority,
+        );
+        let selected_record = SelectedRecordHandle::new(
+            application_sender.clone(),
+            application_admission.clone(),
+            identity,
+            mission_authority,
+        );
+        let responses = prefill_mixed_application_commands(&application_sender);
 
         let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
         let (ready_sender, ready_receiver) = oneshot::channel();
@@ -22075,6 +22398,64 @@ mod tests {
         ));
         let mut callers = JoinSet::new();
         spawn_saturated_status_callers(&mut callers, &selected, Arc::new(AtomicBool::new(false)));
+        let state_pressure = {
+            use crate::application::StateQuery;
+
+            let selected_state = selected_state.clone();
+            tokio::spawn(async move {
+                let query = StateQuery {
+                    topic: Topic::new("opaque").expect("topic"),
+                    scope: Scope::new("test/runtime").expect("scope"),
+                    logical_key: b"saturated-state".to_vec(),
+                    include_recoverable_versions: false,
+                };
+                let mut successes = 0usize;
+                loop {
+                    match selected_state.query(query.clone()).await {
+                        Ok(projection) => {
+                            successes = successes.saturating_add(1);
+                            assert!(projection.current.is_none());
+                            assert!(projection.recoverable.is_empty());
+                        }
+                        Err(error) => {
+                            assert_eq!(error.kind(), ApplicationErrorKind::StateUnavailable);
+                            assert_eq!(error.operation(), "state query");
+                            return successes;
+                        }
+                    }
+                }
+            })
+        };
+        let record_pressure = {
+            use crate::application::RecordQuery;
+
+            let selected_record = selected_record.clone();
+            tokio::spawn(async move {
+                let query = RecordQuery {
+                    topic: Topic::new("opaque").expect("topic"),
+                    scope: Scope::new("test/runtime").expect("scope"),
+                    logical_key: b"saturated-record".to_vec(),
+                    include_superseded_versions: false,
+                };
+                let mut successes = 0usize;
+                loop {
+                    match selected_record.query(query.clone()).await {
+                        Ok(projection) => {
+                            successes = successes.saturating_add(1);
+                            assert!(projection.current.is_none());
+                            assert!(projection.concurrent.is_empty());
+                            assert!(projection.superseded.is_empty());
+                            assert!(projection.conflict.is_none());
+                        }
+                        Err(error) => {
+                            assert_eq!(error.kind(), ApplicationErrorKind::StateUnavailable);
+                            assert_eq!(error.operation(), "record query");
+                            return successes;
+                        }
+                    }
+                }
+            })
+        };
         ready_receiver.await.expect("actor readiness");
         let receipt = timeout(Duration::from_secs(5), actor)
             .await
@@ -22085,7 +22466,7 @@ mod tests {
         assert_eq!(receipt.contact_errors, 0);
         assert!(!application_admission.load(Ordering::Acquire));
 
-        let (successes, unavailable) = assert_explicit_status_responses(responses).await;
+        let (successes, unavailable) = assert_explicit_mixed_application_responses(responses).await;
         assert_eq!(successes + unavailable, APPLICATION_COMMAND_CAPACITY);
         let expected_callers = APPLICATION_COMMAND_CAPACITY * 2;
         let (completed_callers, pressure_successes) = timeout(Duration::from_secs(5), async {
@@ -22100,8 +22481,17 @@ mod tests {
         .await
         .expect("every saturated status caller closes explicitly");
         assert_eq!(completed_callers, expected_callers);
+        let state_pressure_successes = timeout(Duration::from_secs(5), state_pressure)
+            .await
+            .expect("saturated State caller closes explicitly")
+            .expect("State pressure task");
+        let record_pressure_successes = timeout(Duration::from_secs(5), record_pressure)
+            .await
+            .expect("saturated Record caller closes explicitly")
+            .expect("Record pressure task");
         assert!(
-            successes + pressure_successes > 0,
+            successes + pressure_successes + state_pressure_successes + record_pressure_successes
+                > 0,
             "the nonzero run_for interval must admit work before its deadline"
         );
         assert!(
@@ -22114,8 +22504,32 @@ mod tests {
             .expect_err("retained handle closes with the actor");
         assert_eq!(closed.kind(), ApplicationErrorKind::StateUnavailable);
         assert_eq!(closed.operation(), "status");
+        let closed = selected_state
+            .query(crate::application::StateQuery {
+                topic: Topic::new("opaque").expect("topic"),
+                scope: Scope::new("test/runtime").expect("scope"),
+                logical_key: b"closed-state".to_vec(),
+                include_recoverable_versions: false,
+            })
+            .await
+            .expect_err("retained State handle closes with the actor");
+        assert_eq!(closed.kind(), ApplicationErrorKind::StateUnavailable);
+        assert_eq!(closed.operation(), "state query");
+        let closed = selected_record
+            .query(crate::application::RecordQuery {
+                topic: Topic::new("opaque").expect("topic"),
+                scope: Scope::new("test/runtime").expect("scope"),
+                logical_key: b"closed-record".to_vec(),
+                include_superseded_versions: false,
+            })
+            .await
+            .expect_err("retained Record handle closes with the actor");
+        assert_eq!(closed.kind(), ApplicationErrorKind::StateUnavailable);
+        assert_eq!(closed.operation(), "record query");
 
         drop(selected);
+        drop(selected_state);
+        drop(selected_record);
         drop(application_sender);
         drop(shutdown_sender);
         fs::remove_dir_all(state).expect("cleanup saturated application state");
@@ -22519,6 +22933,762 @@ mod tests {
         fs::remove_dir_all(state).expect("cleanup live actor state");
     }
 
+    #[tokio::test]
+    async fn live_selected_state_and_record_are_durable_idempotent_and_close_admission() {
+        use crate::application::{
+            ApplicationErrorKind, RecordPublishRequest, RecordQuery, StatePublishRequest,
+            StateQuery,
+        };
+
+        let state = root("live-selected-mutable-actor");
+        let scope = Scope::new("test/runtime").expect("scope");
+        let topic = Topic::new("opaque").expect("topic");
+        let state_key = b"live-state".to_vec();
+        let record_key = b"live-record".to_vec();
+        let mission = test_mission();
+        let restart_mission = mission.clone();
+        let running = start_node(NodeConfig {
+            state: state.clone(),
+            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            mission,
+            peers: Vec::new(),
+            mutable_interests: Default::default(),
+            sync_interval: Duration::from_millis(10),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("start live selected mutable actor");
+        let selected_state = running.selected_state();
+        let selected_records = running.selected_records();
+        assert_eq!(selected_state.identity(), selected_records.identity());
+        assert_eq!(
+            selected_state.mission_authority(),
+            selected_records.mission_authority()
+        );
+
+        let state_request = StatePublishRequest {
+            operation_key: b"runtime-live-state-publish".to_vec(),
+            topic: topic.clone(),
+            scope: scope.clone(),
+            priority: Priority::Priority,
+            logical_key: state_key.clone(),
+            payload: b"live State payload".to_vec(),
+            tombstone: false,
+        };
+        let published_state = selected_state
+            .publish(state_request.clone())
+            .await
+            .expect("publish State while live");
+        assert!(published_state.inserted);
+        let retried_state = selected_state
+            .publish(state_request.clone())
+            .await
+            .expect("retry exact live State publication");
+        assert!(!retried_state.inserted);
+        assert_eq!(retried_state.id, published_state.id);
+        assert_eq!(
+            retried_state.acceptance_marker,
+            published_state.acceptance_marker
+        );
+        let mut conflicting_state = state_request;
+        conflicting_state.payload = b"changed State payload".to_vec();
+        assert_eq!(
+            selected_state
+                .publish(conflicting_state)
+                .await
+                .expect_err("changed State operation key must fail")
+                .kind(),
+            ApplicationErrorKind::Conflict
+        );
+
+        let record_request = RecordPublishRequest {
+            operation_key: b"runtime-live-record-publish".to_vec(),
+            topic: topic.clone(),
+            scope: scope.clone(),
+            priority: Priority::Priority,
+            logical_key: record_key.clone(),
+            payload: b"live Record payload".to_vec(),
+            tombstone: false,
+        };
+        let published_record = selected_records
+            .publish(record_request.clone())
+            .await
+            .expect("publish Record while live");
+        assert!(published_record.inserted);
+        let retried_record = selected_records
+            .publish(record_request.clone())
+            .await
+            .expect("retry exact live Record publication");
+        assert!(!retried_record.inserted);
+        assert_eq!(retried_record.id, published_record.id);
+        assert_eq!(
+            retried_record.acceptance_marker,
+            published_record.acceptance_marker
+        );
+        assert!(
+            published_record.publisher_counter > published_state.publisher_counter,
+            "State and Record publications share one causal frontier"
+        );
+        let mut conflicting_record = record_request;
+        conflicting_record.payload = b"changed Record payload".to_vec();
+        assert_eq!(
+            selected_records
+                .publish(conflicting_record)
+                .await
+                .expect_err("changed Record operation key must fail")
+                .kind(),
+            ApplicationErrorKind::Conflict
+        );
+
+        let state_query = StateQuery {
+            topic: topic.clone(),
+            scope: scope.clone(),
+            logical_key: state_key,
+            include_recoverable_versions: true,
+        };
+        let state_projection = selected_state
+            .query(state_query.clone())
+            .await
+            .expect("query State while live");
+        let current_state = state_projection.current.expect("current live State");
+        assert_eq!(current_state.id, published_state.id);
+        assert_eq!(current_state.payload, b"live State payload");
+        assert!(state_projection.recoverable.is_empty());
+
+        let record_query = RecordQuery {
+            topic,
+            scope,
+            logical_key: record_key,
+            include_superseded_versions: true,
+        };
+        let record_projection = selected_records
+            .query(record_query.clone())
+            .await
+            .expect("query Record while live");
+        let current_record = record_projection.current.expect("current live Record");
+        assert_eq!(current_record.id, published_record.id);
+        assert_eq!(current_record.payload, b"live Record payload");
+        assert!(record_projection.concurrent.is_empty());
+        assert!(record_projection.superseded.is_empty());
+        assert!(record_projection.conflict.is_none());
+
+        let retained_state = selected_state.clone();
+        let retained_records = selected_records.clone();
+        let receipt = running.shutdown().await.expect("graceful mutable shutdown");
+        assert_eq!(receipt.contacts, 0);
+        assert_eq!(receipt.contact_errors, 0);
+        let state_closed = retained_state
+            .query(state_query.clone())
+            .await
+            .expect_err("closed actor rejects retained State handle");
+        assert_eq!(state_closed.kind(), ApplicationErrorKind::StateUnavailable);
+        assert_eq!(state_closed.operation(), "state query");
+        let record_closed = retained_records
+            .query(record_query.clone())
+            .await
+            .expect_err("closed actor rejects retained Record handle");
+        assert_eq!(record_closed.kind(), ApplicationErrorKind::StateUnavailable);
+        assert_eq!(record_closed.operation(), "record query");
+
+        let reopened = start_node(NodeConfig {
+            state: state.clone(),
+            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            mission: restart_mission,
+            peers: Vec::new(),
+            mutable_interests: Default::default(),
+            sync_interval: Duration::from_millis(10),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("restart live selected mutable actor");
+        assert_eq!(
+            reopened
+                .selected_state()
+                .query(state_query)
+                .await
+                .expect("query State after restart")
+                .current
+                .expect("retained State after restart")
+                .id,
+            published_state.id
+        );
+        assert_eq!(
+            reopened
+                .selected_records()
+                .query(record_query)
+                .await
+                .expect("query Record after restart")
+                .current
+                .expect("retained Record after restart")
+                .id,
+            published_record.id
+        );
+        reopened.shutdown().await.expect("shutdown reopened actor");
+        fs::remove_dir_all(state).expect("cleanup live mutable actor state");
+    }
+
+    #[tokio::test]
+    async fn live_mutable_handles_converge_disconnected_state_and_record_then_resolve() {
+        use crate::application::{
+            ApplicationErrorKind, RecordPublishRequest, RecordQuery, RecordResolveRequest,
+            RecordVersionDisposition, StatePublishRequest, StateQuery, StateVersionDisposition,
+        };
+
+        let root = root("live-mutable-disconnected-convergence");
+        let left_state = root.join("left");
+        let right_state = root.join("right");
+        let mut issued = issue_missions(2);
+        let right_mission = issued.pop().expect("right mission");
+        let left_mission = issued.pop().expect("left mission");
+        let left_carrier = {
+            let identity =
+                NodeIdentity::load_or_create(&left_state).expect("left carrier identity");
+            let id = identity.id();
+            drop(identity);
+            id
+        };
+        let right_carrier = {
+            let identity =
+                NodeIdentity::load_or_create(&right_state).expect("right carrier identity");
+            let id = identity.id();
+            drop(identity);
+            id
+        };
+        let scope = Scope::new("test/runtime-contact").expect("scope");
+        let topic = Topic::new("opaque").expect("topic");
+        let state_key = b"disconnected-state".to_vec();
+        let record_key = b"disconnected-record".to_vec();
+
+        let left_offline = start_node(NodeConfig {
+            state: left_state.clone(),
+            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            mission: left_mission.credentials.clone(),
+            peers: Vec::new(),
+            mutable_interests: Default::default(),
+            sync_interval: Duration::from_millis(10),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("start disconnected left node");
+        let right_offline = start_node(NodeConfig {
+            state: right_state.clone(),
+            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            mission: right_mission.credentials.clone(),
+            peers: Vec::new(),
+            mutable_interests: Default::default(),
+            sync_interval: Duration::from_millis(10),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("start disconnected right node");
+
+        let left_state_publication = left_offline
+            .selected_state()
+            .publish(StatePublishRequest {
+                operation_key: b"left-disconnected-state".to_vec(),
+                topic: topic.clone(),
+                scope: scope.clone(),
+                priority: Priority::Priority,
+                logical_key: state_key.clone(),
+                payload: b"left State".to_vec(),
+                tombstone: false,
+            })
+            .await
+            .expect("publish left disconnected State");
+        let right_state_publication = right_offline
+            .selected_state()
+            .publish(StatePublishRequest {
+                operation_key: b"right-disconnected-state".to_vec(),
+                topic: topic.clone(),
+                scope: scope.clone(),
+                priority: Priority::Priority,
+                logical_key: state_key.clone(),
+                payload: b"right State".to_vec(),
+                tombstone: false,
+            })
+            .await
+            .expect("publish right disconnected State");
+        assert_ne!(left_state_publication.id, right_state_publication.id);
+
+        let left_record_publication = left_offline
+            .selected_records()
+            .publish(RecordPublishRequest {
+                operation_key: b"left-disconnected-record".to_vec(),
+                topic: topic.clone(),
+                scope: scope.clone(),
+                priority: Priority::Priority,
+                logical_key: record_key.clone(),
+                payload: b"left Record".to_vec(),
+                tombstone: false,
+            })
+            .await
+            .expect("publish left disconnected Record");
+        let right_record_publication = right_offline
+            .selected_records()
+            .publish(RecordPublishRequest {
+                operation_key: b"right-disconnected-record".to_vec(),
+                topic: topic.clone(),
+                scope: scope.clone(),
+                priority: Priority::Priority,
+                logical_key: record_key.clone(),
+                payload: b"right Record".to_vec(),
+                tombstone: false,
+            })
+            .await
+            .expect("publish right disconnected Record");
+        assert_ne!(left_record_publication.id, right_record_publication.id);
+        let expected_current_state = left_state_publication.id.max(right_state_publication.id);
+        let expected_concurrent_state = left_state_publication.id.min(right_state_publication.id);
+        let (left_offline_receipt, right_offline_receipt) =
+            tokio::join!(left_offline.shutdown(), right_offline.shutdown());
+        assert_eq!(
+            left_offline_receipt
+                .expect("left offline shutdown")
+                .contacts,
+            0
+        );
+        assert_eq!(
+            right_offline_receipt
+                .expect("right offline shutdown")
+                .contacts,
+            0
+        );
+
+        let left_port = UdpSocket::bind(("127.0.0.1", 0)).expect("reserve left mutable port");
+        let right_port = UdpSocket::bind(("127.0.0.1", 0)).expect("reserve right mutable port");
+        let left_address = left_port.local_addr().expect("left mutable address");
+        let right_address = right_port.local_addr().expect("right mutable address");
+        drop((left_port, right_port));
+        let interests = MutableSourceInterests::new(
+            vec![SourceInterestSelector::new(
+                topic.clone(),
+                scope.clone(),
+                false,
+            )],
+            vec![SourceInterestSelector::new(
+                topic.clone(),
+                scope.clone(),
+                false,
+            )],
+        );
+        let left_config = NodeConfig {
+            state: left_state.clone(),
+            bind: left_address,
+            mission: left_mission.credentials.clone(),
+            peers: vec![MissionExpectedPeer {
+                carrier: ExpectedPeer {
+                    id: right_carrier,
+                    address: right_address,
+                },
+                mission: right_mission.identity,
+            }],
+            mutable_interests: interests.clone(),
+            sync_interval: Duration::from_millis(20),
+            run_for: None,
+            application: NodeApplication::Relay,
+        };
+        let right_config = NodeConfig {
+            state: right_state.clone(),
+            bind: right_address,
+            mission: right_mission.credentials.clone(),
+            peers: vec![MissionExpectedPeer {
+                carrier: ExpectedPeer {
+                    id: left_carrier,
+                    address: left_address,
+                },
+                mission: left_mission.identity,
+            }],
+            mutable_interests: interests,
+            sync_interval: Duration::from_millis(20),
+            run_for: None,
+            application: NodeApplication::Relay,
+        };
+        // The lower carrier identity is the sole initiator. Start the higher
+        // identity first so no expected startup absence becomes a failed
+        // authenticated-contact attempt.
+        let (left_running, right_running) = if left_carrier > right_carrier {
+            let left = start_node(left_config)
+                .await
+                .expect("restart connected left responder");
+            let right = start_node(right_config)
+                .await
+                .expect("restart connected right initiator");
+            (left, right)
+        } else {
+            let right = start_node(right_config)
+                .await
+                .expect("restart connected right responder");
+            let left = start_node(left_config)
+                .await
+                .expect("restart connected left initiator");
+            (left, right)
+        };
+        let left_state_handle = left_running.selected_state();
+        let right_state_handle = right_running.selected_state();
+        let left_records = left_running.selected_records();
+        let right_records = right_running.selected_records();
+        let left_status = left_running.selected_events();
+        let right_status = right_running.selected_events();
+        let state_query = StateQuery {
+            topic: topic.clone(),
+            scope: scope.clone(),
+            logical_key: state_key,
+            include_recoverable_versions: true,
+        };
+        let record_query = RecordQuery {
+            topic,
+            scope,
+            logical_key: record_key,
+            include_superseded_versions: true,
+        };
+
+        let (left_record_projection, right_record_projection) =
+            timeout(Duration::from_secs(20), async {
+                loop {
+                    let left_state_projection = left_state_handle
+                        .query(state_query.clone())
+                        .await
+                        .expect("live left State query");
+                    let right_state_projection = right_state_handle
+                        .query(state_query.clone())
+                        .await
+                        .expect("live right State query");
+                    let left_record_projection = left_records
+                        .query(record_query.clone())
+                        .await
+                        .expect("live left Record query");
+                    let right_record_projection = right_records
+                        .query(record_query.clone())
+                        .await
+                        .expect("live right Record query");
+                    let state_converged =
+                        left_state_projection.current.as_ref().is_some_and(|item| {
+                            item.id == expected_current_state
+                                && item.disposition == StateVersionDisposition::Current
+                        }) && right_state_projection.current.as_ref().is_some_and(|item| {
+                            item.id == expected_current_state
+                                && item.disposition == StateVersionDisposition::Current
+                        }) && left_state_projection.recoverable.len() == 1
+                            && right_state_projection.recoverable.len() == 1
+                            && left_state_projection.recoverable[0].id == expected_concurrent_state
+                            && right_state_projection.recoverable[0].id
+                                == expected_concurrent_state
+                            && left_state_projection.recoverable[0].disposition
+                                == StateVersionDisposition::Concurrent
+                            && right_state_projection.recoverable[0].disposition
+                                == StateVersionDisposition::Concurrent;
+                    let records_converged = left_record_projection
+                        .conflict
+                        .as_ref()
+                        .zip(right_record_projection.conflict.as_ref())
+                        .is_some_and(|(left, right)| {
+                            left.siblings == right.siblings && left.siblings.len() == 2
+                        });
+                    if state_converged && records_converged {
+                        break (left_record_projection, right_record_projection);
+                    }
+                    sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("live State and Record projections converge");
+        timeout(Duration::from_secs(20), async {
+            loop {
+                let left = left_status
+                    .status()
+                    .await
+                    .expect("left initial contact status");
+                let right = right_status
+                    .status()
+                    .await
+                    .expect("right initial contact status");
+                assert_eq!(left.failed_contact_attempts, 0);
+                assert_eq!(right.failed_contact_attempts, 0);
+                if left.authenticated_contacts > 0 && right.authenticated_contacts > 0 {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("initial contact accounting completes");
+        assert_eq!(
+            left_record_projection
+                .conflict
+                .as_ref()
+                .expect("left conflict")
+                .siblings,
+            vec![left_record_publication.id, right_record_publication.id]
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            right_record_projection
+                .conflict
+                .as_ref()
+                .expect("right conflict")
+                .siblings,
+            left_record_projection
+                .conflict
+                .as_ref()
+                .expect("left conflict")
+                .siblings
+        );
+
+        let expected_siblings = left_record_projection
+            .conflict
+            .as_ref()
+            .expect("left conflict before ordinary publication")
+            .siblings
+            .clone();
+        let expected_sibling_set = expected_siblings.iter().copied().collect::<BTreeSet<_>>();
+        let ordinary_conflict = left_records
+            .publish(RecordPublishRequest {
+                operation_key: b"ordinary-publish-cannot-hide-conflict".to_vec(),
+                topic: record_query.topic.clone(),
+                scope: record_query.scope.clone(),
+                priority: Priority::Priority,
+                logical_key: record_query.logical_key.clone(),
+                payload: b"must not replace disconnected siblings".to_vec(),
+                tombstone: false,
+            })
+            .await
+            .expect_err("ordinary Record publication must not hide a conflict");
+        assert_eq!(ordinary_conflict.kind(), ApplicationErrorKind::Conflict);
+        assert_eq!(ordinary_conflict.operation(), "record publish");
+        assert_eq!(
+            left_records
+                .query(record_query.clone())
+                .await
+                .expect("conflict remains after rejected ordinary publication")
+                .conflict
+                .expect("preserved conflict")
+                .siblings,
+            expected_siblings
+        );
+
+        let resolution = RecordResolveRequest {
+            operation_key: b"resolve-disconnected-record".to_vec(),
+            resolution_guard: left_record_projection
+                .conflict
+                .expect("left resolution guard")
+                .resolution_guard,
+            priority: Priority::Immediate,
+            payload: b"resolved Record".to_vec(),
+            tombstone: false,
+        };
+        let restart_resolution = resolution.clone();
+        let resolved = left_records
+            .resolve(resolution.clone())
+            .await
+            .expect("resolve live Record conflict");
+        assert!(resolved.inserted);
+        let retry = left_records
+            .resolve(resolution)
+            .await
+            .expect("retry exact live Record resolution");
+        assert!(!retry.inserted);
+        assert_eq!(retry.id, resolved.id);
+        let left_contact_baseline = left_status
+            .status()
+            .await
+            .expect("left contact baseline")
+            .authenticated_contacts;
+        let right_contact_baseline = right_status
+            .status()
+            .await
+            .expect("right contact baseline")
+            .authenticated_contacts;
+
+        timeout(Duration::from_secs(20), async {
+            loop {
+                let left = left_records
+                    .query(record_query.clone())
+                    .await
+                    .expect("left resolved Record query");
+                let right = right_records
+                    .query(record_query.clone())
+                    .await
+                    .expect("right resolved Record query");
+                if left
+                    .current
+                    .as_ref()
+                    .is_some_and(|item| item.id == resolved.id)
+                    && right
+                        .current
+                        .as_ref()
+                        .is_some_and(|item| item.id == resolved.id)
+                    && left.conflict.is_none()
+                    && right.conflict.is_none()
+                    && left.superseded.len() == 2
+                    && right.superseded.len() == 2
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("live Record resolution converges");
+
+        timeout(Duration::from_secs(20), async {
+            loop {
+                let left = left_status.status().await.expect("left contact status");
+                let right = right_status.status().await.expect("right contact status");
+                assert_eq!(left.failed_contact_attempts, 0);
+                assert_eq!(right.failed_contact_attempts, 0);
+                if left.authenticated_contacts > left_contact_baseline
+                    && right.authenticated_contacts > right_contact_baseline
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("post-resolution contact accounting completes");
+
+        let (left_receipt, right_receipt) =
+            tokio::join!(left_running.shutdown(), right_running.shutdown());
+        let left_receipt = left_receipt.expect("left connected shutdown");
+        let right_receipt = right_receipt.expect("right connected shutdown");
+        assert!(
+            u64::try_from(left_receipt.contacts).expect("left contacts fit u64")
+                > left_contact_baseline
+        );
+        assert!(
+            u64::try_from(right_receipt.contacts).expect("right contacts fit u64")
+                > right_contact_baseline
+        );
+        for receipt in [&left_receipt, &right_receipt] {
+            assert!(receipt.contacts > 0);
+            assert_eq!(receipt.direct_contacts, receipt.contacts);
+            assert_eq!(receipt.relay_contacts, 0);
+            assert_eq!(receipt.unknown_path_contacts, 0);
+            assert_eq!(receipt.contact_errors, 0);
+        }
+
+        let left_reopened = start_node(NodeConfig {
+            state: left_state,
+            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            mission: left_mission.credentials,
+            peers: Vec::new(),
+            mutable_interests: Default::default(),
+            sync_interval: Duration::from_millis(10),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("reopen resolved left node");
+        let right_reopened = start_node(NodeConfig {
+            state: right_state,
+            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            mission: right_mission.credentials,
+            peers: Vec::new(),
+            mutable_interests: Default::default(),
+            sync_interval: Duration::from_millis(10),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("reopen resolved right node");
+        let left_reopened_records = left_reopened.selected_records();
+        for projection in [
+            left_reopened
+                .selected_state()
+                .query(state_query.clone())
+                .await
+                .expect("left converged State after restart"),
+            right_reopened
+                .selected_state()
+                .query(state_query)
+                .await
+                .expect("right converged State after restart"),
+        ] {
+            let current = projection.current.expect("current State after restart");
+            assert_eq!(current.id, expected_current_state);
+            assert_eq!(current.disposition, StateVersionDisposition::Current);
+            assert_eq!(projection.recoverable.len(), 1);
+            assert_eq!(projection.recoverable[0].id, expected_concurrent_state);
+            assert_eq!(
+                projection.recoverable[0].disposition,
+                StateVersionDisposition::Concurrent
+            );
+        }
+        for projection in [
+            left_reopened_records
+                .query(record_query.clone())
+                .await
+                .expect("left resolved projection after restart"),
+            right_reopened
+                .selected_records()
+                .query(record_query)
+                .await
+                .expect("right resolved projection after restart"),
+        ] {
+            assert_eq!(
+                projection
+                    .current
+                    .as_ref()
+                    .expect("resolved current after restart")
+                    .id,
+                resolved.id
+            );
+            assert!(projection.conflict.is_none());
+            assert_eq!(projection.superseded.len(), 2);
+            assert!(
+                projection
+                    .superseded
+                    .iter()
+                    .all(|item| item.disposition == RecordVersionDisposition::Superseded)
+            );
+            assert_eq!(
+                projection
+                    .superseded
+                    .iter()
+                    .map(|item| item.id)
+                    .collect::<BTreeSet<_>>(),
+                expected_sibling_set
+            );
+        }
+        let restarted_retry = left_reopened_records
+            .resolve(restart_resolution.clone())
+            .await
+            .expect("retry exact resolution after restart");
+        assert!(!restarted_retry.inserted);
+        assert_eq!(restarted_retry.id, resolved.id);
+        let (left_reopened_receipt, right_reopened_receipt) =
+            tokio::join!(left_reopened.shutdown(), right_reopened.shutdown());
+        assert_eq!(
+            left_reopened_receipt
+                .expect("left reopened shutdown")
+                .contacts,
+            0
+        );
+        assert_eq!(
+            right_reopened_receipt
+                .expect("right reopened shutdown")
+                .contacts,
+            0
+        );
+        let closed_resolution = left_reopened_records
+            .resolve(restart_resolution)
+            .await
+            .expect_err("retained Record handle closes after restart shutdown");
+        assert_eq!(
+            closed_resolution.kind(),
+            ApplicationErrorKind::StateUnavailable
+        );
+        assert_eq!(closed_resolution.operation(), "record resolve");
+        fs::remove_dir_all(root).expect("cleanup live mutable convergence state");
+    }
+
     fn demo_member_mission() -> UnprotectedReferenceMission {
         let access = ProvisioningAccess::member(
             demo_scope().expect("demo scope"),
@@ -22793,6 +23963,263 @@ mod tests {
             ApplicationErrorKind::StateUnavailable
         );
         fs::remove_dir_all(state).expect("cleanup protected live state");
+    }
+
+    #[tokio::test]
+    async fn protected_live_mutable_handles_cache_exact_retry_across_same_epoch_rekey() {
+        use std::num::NonZeroU64;
+
+        use crate::{
+            application::{RecordPublishRequest, RecordQuery, StatePublishRequest, StateQuery},
+            control_admin::{RegistryGenerationWitness, ScopeRekeyRequest},
+        };
+
+        let state = root("protected-live-mutable-same-epoch-rekey");
+        let services = control_test_services([0xd8; 32]);
+        let protected_config = |plaintext: Vec<u8>| {
+            let mut provider = RuntimeTestUnprotector {
+                calls: 0,
+                plaintext: Some(plaintext),
+            };
+            let config = NodeConfig::from_protected_bytes(
+                &state,
+                b"provider-authenticated-live-mutable-envelope",
+                NodeConfigOptions::new(
+                    SocketAddr::from(([127, 0, 0, 1], 0)),
+                    Duration::from_secs(60),
+                ),
+                &mut provider,
+            )
+            .expect("construct protected mutable runtime config");
+            assert_eq!(provider.calls, 1);
+            config
+        };
+        let authority_bytes = services
+            .authority
+            .fresh_bundle()
+            .expect("authority bundle")
+            .to_bytes()
+            .expect("encode authority bundle");
+        let running = start_node(protected_config(authority_bytes))
+            .await
+            .expect("start protected mutable authority");
+        let state_handle = running.selected_state();
+        let records = running.selected_records();
+        let controls = running.selected_controls();
+        let state_query = StateQuery {
+            topic: services.topic.clone(),
+            scope: services.scope.clone(),
+            logical_key: b"same-epoch-state".to_vec(),
+            include_recoverable_versions: true,
+        };
+        let record_query = RecordQuery {
+            topic: services.topic.clone(),
+            scope: services.scope.clone(),
+            logical_key: b"same-epoch-record".to_vec(),
+            include_superseded_versions: true,
+        };
+        let original_state_request = StatePublishRequest {
+            operation_key: b"same-epoch-original-state".to_vec(),
+            topic: services.topic.clone(),
+            scope: services.scope.clone(),
+            priority: Priority::Priority,
+            logical_key: state_query.logical_key.clone(),
+            payload: b"State before key replacement".to_vec(),
+            tombstone: false,
+        };
+        let original_record_request = RecordPublishRequest {
+            operation_key: b"same-epoch-original-record".to_vec(),
+            topic: services.topic.clone(),
+            scope: services.scope.clone(),
+            priority: Priority::Priority,
+            logical_key: record_query.logical_key.clone(),
+            payload: b"Record before key replacement".to_vec(),
+            tombstone: false,
+        };
+        let original_state = state_handle
+            .publish(original_state_request.clone())
+            .await
+            .expect("publish State before same-epoch rekey");
+        let original_record = records
+            .publish(original_record_request.clone())
+            .await
+            .expect("publish Record before same-epoch rekey");
+        assert_eq!(
+            state_handle
+                .query(state_query.clone())
+                .await
+                .expect("query original State")
+                .current
+                .expect("original State visible")
+                .id,
+            original_state.id
+        );
+        assert_eq!(
+            records
+                .query(record_query.clone())
+                .await
+                .expect("query original Record")
+                .current
+                .expect("original Record visible")
+                .id,
+            original_record.id
+        );
+
+        let rekey = controls
+            .publish_scope_rekey(
+                ScopeRekeyRequest::new(
+                    services.registry.clone(),
+                    RegistryGenerationWitness::new(NonZeroU64::new(1).expect("nonzero")),
+                    services.scope.clone(),
+                    NonZeroU64::new(1).expect("nonzero"),
+                    vec![
+                        ScopeRekeyRecipient::member(
+                            services.authority.identity(),
+                            vec![services.topic.clone()],
+                        )
+                        .expect("authority recipient"),
+                        ScopeRekeyRecipient::member(
+                            services.member.identity(),
+                            vec![services.topic.clone()],
+                        )
+                        .expect("member recipient"),
+                    ],
+                )
+                .expect("same-epoch rekey request"),
+            )
+            .await
+            .expect("publish same-epoch rekey");
+        assert!(rekey.emitted);
+        assert!(
+            state_handle
+                .query(state_query.clone())
+                .await
+                .expect("query State after key replacement")
+                .current
+                .is_none(),
+            "superseded route-key plaintext is withheld"
+        );
+        assert!(
+            records
+                .query(record_query.clone())
+                .await
+                .expect("query Record after key replacement")
+                .current
+                .is_none(),
+            "superseded route-key plaintext is withheld"
+        );
+        let state_retry = state_handle
+            .publish(original_state_request.clone())
+            .await
+            .expect("recover exact historical State publication");
+        assert!(!state_retry.inserted);
+        assert_eq!(state_retry.id, original_state.id);
+        let record_retry = records
+            .publish(original_record_request.clone())
+            .await
+            .expect("recover exact historical Record publication");
+        assert!(!record_retry.inserted);
+        assert_eq!(record_retry.id, original_record.id);
+
+        let replacement_state = state_handle
+            .publish(StatePublishRequest {
+                operation_key: b"same-epoch-replacement-state".to_vec(),
+                topic: services.topic.clone(),
+                scope: services.scope.clone(),
+                priority: Priority::Immediate,
+                logical_key: state_query.logical_key.clone(),
+                payload: b"State after key replacement".to_vec(),
+                tombstone: false,
+            })
+            .await
+            .expect("publish replacement State");
+        let replacement_record = records
+            .publish(RecordPublishRequest {
+                operation_key: b"same-epoch-replacement-record".to_vec(),
+                topic: services.topic.clone(),
+                scope: services.scope.clone(),
+                priority: Priority::Immediate,
+                logical_key: record_query.logical_key.clone(),
+                payload: b"Record after key replacement".to_vec(),
+                tombstone: false,
+            })
+            .await
+            .expect("publish replacement Record");
+        assert_eq!(
+            state_handle
+                .query(state_query.clone())
+                .await
+                .expect("query replacement State")
+                .current
+                .expect("replacement State visible")
+                .id,
+            replacement_state.id
+        );
+        assert_eq!(
+            records
+                .query(record_query.clone())
+                .await
+                .expect("query replacement Record")
+                .current
+                .expect("replacement Record visible")
+                .id,
+            replacement_record.id
+        );
+        let receipt = running
+            .shutdown()
+            .await
+            .expect("protected mutable shutdown");
+        assert_eq!(receipt.controls, 1);
+        assert_eq!(receipt.applied_controls, 1);
+
+        let restart_bytes = services
+            .authority
+            .fresh_bundle()
+            .expect("restart authority bundle")
+            .to_bytes()
+            .expect("encode restart authority bundle");
+        let reopened = start_node(protected_config(restart_bytes))
+            .await
+            .expect("restart protected mutable authority");
+        let reopened_state = reopened.selected_state();
+        let reopened_records = reopened.selected_records();
+        assert_eq!(
+            reopened_state
+                .query(state_query)
+                .await
+                .expect("query replacement State after restart")
+                .current
+                .expect("replacement State retained")
+                .id,
+            replacement_state.id
+        );
+        assert_eq!(
+            reopened_records
+                .query(record_query)
+                .await
+                .expect("query replacement Record after restart")
+                .current
+                .expect("replacement Record retained")
+                .id,
+            replacement_record.id
+        );
+        let restarted_state_retry = reopened_state
+            .publish(original_state_request)
+            .await
+            .expect("recover exact historical State publication after restart");
+        assert!(!restarted_state_retry.inserted);
+        assert_eq!(restarted_state_retry.id, original_state.id);
+        let restarted_record_retry = reopened_records
+            .publish(original_record_request)
+            .await
+            .expect("recover exact historical Record publication after restart");
+        assert!(!restarted_record_retry.inserted);
+        assert_eq!(restarted_record_retry.id, original_record.id);
+        reopened
+            .shutdown()
+            .await
+            .expect("shutdown restarted protected mutable authority");
+        fs::remove_dir_all(state).expect("cleanup protected live mutable state");
     }
 
     #[tokio::test]
