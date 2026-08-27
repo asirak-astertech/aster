@@ -9,7 +9,7 @@ the complete protocol and semantic reference implementation.
 | Event | Direct Iroh or one operator-pinned controlled Iroh relay | Live Rust handle, stopped Rust handle, and local ConnectRPC agent |
 | State | Class-specific direct-Iroh reconciliation | Cloneable live Rust handle and exclusive stopped Rust facade |
 | Record | Class-specific direct-Iroh reconciliation | Cloneable live Rust handle and exclusive stopped Rust facade |
-| Blob | Semantic-v5 direct source/carrier transfer | Exclusive stopped Rust handle and encrypted local depot |
+| Blob | Semantic-v5 direct source/carrier transfer | Cloneable live Rust handle, exclusive stopped Rust handle, and encrypted local depot |
 
 Read the diagrams from broadest to narrowest: application surfaces, runtime
 ownership, then the publication and contact flows for each mechanism. Exact
@@ -27,7 +27,7 @@ flowchart LR
     App --> LiveRust["Live Rust handle"]
     App --> StoppedRust["Stopped Rust handles"]
     Connect --> LiveEvent["Event operations"]
-    LiveRust --> LiveOps["Event · State · Record operations"]
+    LiveRust --> LiveOps["Event · State · Record · Blob operations"]
     LiveEvent --> Actor["Running aster-node actor"]
     LiveOps --> Actor
     StoppedRust --> Event["Event"]
@@ -39,6 +39,7 @@ flowchart LR
     State --> Exclusive
     Record --> Exclusive
     Blob --> Depot["Encrypted local depot"]
+    Actor --> Depot
     Actor --> Network["Event · State · Record · v5 Blob reconciliation"]
 ```
 
@@ -46,15 +47,16 @@ The running actor and stopped handles never own the store at the same time.
 State and Record applications may publish/query—and for Record, resolve—through
 the running actor, or use their stopped facades after the actor exits. Objects
 published through either mode reconcile under the same authority. Blob
-application access remains local and stopped; semantic v5 separately transfers
-already-durable Blob sources and bounded carrier prefixes directly between
-content-capable peers.
+applications likewise publish through the live handle or stopped facade; the
+live handle returns only bounded pages, while the stopped facade supports
+caller-owned streaming. Semantic v5 separately transfers already-durable Blob
+sources and bounded carrier prefixes directly between content-capable peers.
 
 ### Runtime trust path
 
 ```mermaid
 flowchart LR
-    API["Live Event/State/Record API"] --> Node["aster-node<br/>ordering and lifecycle"]
+    API["Live Event/State/Record/Blob API"] --> Node["aster-node<br/>ordering and lifecycle"]
     Authority["Authority CLI"] --> Node
     Operator["Same-UID Unix operator"] -. "local zeroize" .-> Node
     Node --> Core["aster-core<br/>control and source verification"]
@@ -93,16 +95,19 @@ depot. Non-Unix does not prove copied-database replacement/rollback resistance
 at the same canonical path. No supported rebind/restore migration is provided
 in this slice.
 
-Live Event, State, and Record handle clones do not open a second store. They send
-commands over one bounded channel to the actor that already owns the
-mission-bound writer. Event commands that insert or remove selectors take the
-actor's policy write lease; State/Record publish/query/resolve and other
-application operations use the policy read lease. Contacts use that same
-actor-owned policy/store authority. Shutdown or zeroization closes application
-admission and rejects queued commands before the authority is released, so
-retained clones return sanitized `StateUnavailable`. A stopped facade can
-acquire the writer only after the live actor has exited and must close before a
-new actor starts.
+Live Event, State, Record, and Blob handle clones do not open a second store.
+They send commands over one 32-command channel to the actor that already owns
+the mission-bound writer. Blob commands are dispatched without blocking that
+actor to one joined worker with a one-command queue; the worker rechecks current
+policy and lineage rather than retaining an actor lease across file I/O or
+decryption. Event commands that insert or remove selectors take the actor's
+policy write lease; State/Record publish/query/resolve and other application
+operations use the policy read lease. Contacts use that same actor-owned
+policy/store authority. Shutdown or zeroization closes shared and Blob-worker
+admission, rejects queued commands, and joins the worker before the authority
+or key-bearing state is released, so retained clones return sanitized
+`StateUnavailable`. A stopped facade can acquire the writer only after the live
+actor has exited and must close before a new actor starts.
 
 Each mission-authenticated contact runs class-separated State and Record
 Negentropy/fetch lanes after its control and Event lanes. A receiver supplies
@@ -242,26 +247,31 @@ selected relay acceptance. Multi-hop/partition sweeps, independent
 interoperability, finite TTL, expiry, garbage collection, and retention-driven
 deletion remain unimplemented.
 
-## Local Blob streaming and depot authority
+## Live and stopped Blob streaming and depot authority
 
 The selected Blob facade uses the same mission, current control policy,
 source-envelope provider, process-exclusive writer, and shared causal ledger as
-Event, State, and Record. Its application API remains stopped and local. The
+Event, State, and Record. A running node exposes a cloneable
+`SelectedBlobHandle`; the exclusive `SelectedBlobNode` remains available for
+stopped-state streaming after the actor exits. Live publication accepts an
+owned, already-open regular file positioned at byte zero, rejects empty input,
+and is capped at 64 MiB/1,024 canonical 64-KiB chunks. A live read returns one
+freshly authenticated, zeroize-on-drop plaintext page of `1..=64 KiB`; the
+stopped facade retains its synchronous caller-owned streaming interface. The
 runtime separately adds semantic-v5 Blob source and carrier-range frames; v1-v4
-emit none. The selected profile is nonempty and fixes chunking at 64 KiB;
-its `BlobId` commits the exact plaintext bytes, canonical chunk profile, and
-media/schema identity metadata. It is not a metadata-independent whole-byte
+emit none. `BlobId` commits the exact plaintext bytes, canonical chunk profile,
+and media/schema identity metadata. It is not a metadata-independent whole-byte
 content identifier.
 
 ```mermaid
 sequenceDiagram
     participant A as Application
-    participant N as SelectedBlobNode
+    participant N as Blob composition (live handle or stopped facade)
     participant C as Source-envelope and Blob provider
     participant S as Mission-bound redb
     participant D as Encrypted Blob depot
 
-    A->>N: publish(operation key, metadata, seekable source)
+    A->>N: publish(operation key, metadata, bounded source)
     N->>S: current policy + exact operation preflight
     N->>C: bounded preparation pass
     N->>D: encrypt, sync, rename, then mark each chunk
@@ -271,14 +281,21 @@ sequenceDiagram
     N->>C: freshly verify durable publication result
     N-->>A: sanitized BlobPublishResult
 
-    A->>N: read_into(topic, scope, BlobId, caller output)
-    N->>S: bounded structural publication plan
-    S-->>N: every retained source publication
-    N->>C: freshly verify each manifest and source/content capability
-    N->>N: select greatest active semantic publication ID
-    N->>S: require exact policy-bound plan unchanged
-    N->>D: prove selected completion once and stream verified chunks
-    N-->>A: BlobReadResult
+    alt live read_page(≤64 KiB)
+        N->>S: exact-load current selected projection
+        N->>C: authenticate selected source; check inactive projections against cache capabilities
+        N->>S: require current policy, lineage, and plan
+        N->>D: require exact completion and decrypt bounded range
+        N->>S: recheck authority, completion, and lifecycle
+        N-->>A: zeroize-on-drop page
+    else stopped read_into(caller output)
+        N->>S: bounded structural plan with every retained source
+        N->>C: freshly verify every manifest and source/content capability
+        N->>N: select greatest active semantic publication ID
+        N->>S: require exact policy-bound plan unchanged
+        N->>D: prove selected completion once and stream verified chunks
+        N-->>A: BlobReadResult
+    end
 ```
 
 The first publish pass uses one bounded, zeroizing plaintext chunk buffer and,
@@ -294,15 +311,31 @@ A source publication is committed only after the exact authenticated manifest
 equals every expected and committed depot record and the finalized manifest
 digest.
 
-The read plan is structural, not authorization. The facade freshly verifies
-every retained active or inactive source publication, checks the exact topic,
-scope, Blob ID, content group, epoch-specific depot variant, and source, then
-independently recomputes the active deterministic selection. Only after an exact
-plan recheck does it verify the selected depot completion and synchronously
-stream plaintext into caller-owned output. No provider reader or copied epoch
-key escapes the stopped handle. A late integrity failure can leave an already
-verified prefix in caller-owned output, so applications needing all-or-none
-replacement use their own temporary destination.
+The stopped read plan is structural, not authorization. That path freshly
+verifies every retained active or inactive source publication, checks the exact
+topic, scope, Blob ID, content group, epoch-specific depot variant, and source,
+then independently recomputes the active deterministic selection. Only after an
+exact plan recheck does it require one authenticated completion capability for
+that exact selected depot variant and synchronously stream plaintext into
+caller-owned output.
+
+The live path exact-loads and content-authenticates only the selected current
+source. Inactive candidates are projection-checked against
+startup-authenticated cache capabilities; their sealed bytes are not rehashed
+for every page. Current policy, lineage, lifecycle, and the exact completion
+capability are checked around range decryption before a zeroize-on-drop page of
+at most 64 KiB, spanning at most two canonical chunks, is disclosed. No
+provider reader or copied epoch key escapes either surface. A late
+stopped-stream integrity failure can leave an already verified prefix in
+caller-owned output, so applications needing all-or-none replacement use their
+own temporary destination.
+
+Ordinary request, policy, conflict, and capacity failures are sanitized for the
+application. A contradiction among durable Blob rows, the authenticated source
+cache, the exact depot capability, or post-commit verification is actor-fatal
+coherence loss: the joined worker reports `FatalBlobCoherence`, closes shared
+application admission, and makes the exact failure visible through node
+completion rather than continuing with a potentially split authority.
 
 Exact operation retry rehashes the source, passes current policy and revocation
 checks, and freshly verifies the historical publication and variant before
@@ -320,20 +353,22 @@ proofs agree atomically. This is bounded direct, same-implementation automation,
 not a retained Blob receipt, route-only Blob relay/custody, or
 Blob-over-controlled-relay acceptance.
 
-`BlobDepotLimits` bound canonical committed ciphertext-file bytes, durable
-per-chunk metadata rows, and epoch-specific import variants. Chunk rows and
-variants include unfinished resumable imports, which continue to consume
+`BlobDepotLimits` reserve canonical ciphertext-file bytes for every durable
+expected chunk record and bound durable per-chunk metadata rows and
+epoch-specific import variants. Rows and variants include retained unpublished
+imports, whether expected-only or already finalized, and continue to consume
 admission until a future explicit-GC policy exists. The limits do not claim to
 measure redb allocation, directory blocks, snapshots, backups, swap, unrelated
 attacker-created directory entries, or every filesystem overhead. Unix
 depot operations use owner-controlled directory descriptors, no-follow checks,
 and private modes; the non-Unix fallback is not credited with equivalent
 filesystem hardening. Terminal software zeroization destroys the retained
-mission and identity secrets and locks the store, but it does not erase Blob
-ciphertext or establish physical sanitization. Live Blob commands,
-route-only relay/custody, Blob-over-controlled-relay acceptance, subscription,
-finite TTL, retention/GC, large/physical acceptance, mixed implementations, and
-retained network evidence remain open.
+mission/content and identity secrets and locks the store, but deliberately
+preserves the encrypted Blob depot and audited data rows. This is bounded
+cryptographic shredding, not Blob-file deletion or physical sanitization. Blob
+subscription/status, route-only relay/custody, Blob-over-controlled-relay
+acceptance, finite TTL, retention/GC, large/physical acceptance, mixed
+implementations, and retained network evidence remain open.
 
 ## Live application command and status flow
 
@@ -421,7 +456,7 @@ are rechecked at inventory, transfer, and commit boundaries.
 | Event source | Publisher and protected semantic header | Permission for every peer to route or read it |
 | State source | Publisher, causal stamp, exact key, protected semantic header, and payload commitment | Live replication, permission for every peer, or a special delete-wins rule |
 | Record source | Publisher, causal stamp, exact key, protected semantic header, and payload commitment | Live replication, automatic merge execution, permission for every peer, or delete-wins |
-| Blob source/depot | Publisher, causal stamp, immutable object identity, canonical manifest, exact encrypted chunk records, content group, and key epoch | Live or remote transfer, metadata-independent content identity, physical sanitization, or permission for every peer |
+| Blob source/depot | Publisher, causal stamp, immutable object identity, canonical manifest, exact encrypted chunk records, content group, and key epoch | Subscription/status, route-only custody, metadata-independent content identity, physical sanitization, or permission for every peer |
 | Receive selector | Membership-visible topic/scope intent inside the protected mission session; empty means receive-none | Route or content authority, Event-ID disclosure, or scope-private subscription metadata |
 | Route policy | Whether an exact representation may be advertised/carried | Content decryption or semantic admission |
 | Content policy | Whether protected bytes may become a semantic application item | Authority to alter source identity or control state |
@@ -441,9 +476,12 @@ stateDiagram-v2
 ```
 
 Every non-`Live` phase denies normal opens. Terminal-safe inspection and data
-rows remain available. The same-UID Unix operator may enter through owner-only
-live IPC or a stopped exclusive-writer path; there is no carrier or mission-
-control trigger. Pathnames remain as zero-length tombstones. Physical media,
+rows, including encrypted Blob depot state, remain available. Destroying the
+mission/content material makes that retained ciphertext unavailable through the
+terminal store, but is not a claim that its bytes were overwritten. The
+same-UID Unix operator may enter through owner-only live IPC or a stopped
+exclusive-writer path; there is no carrier or mission-control trigger.
+Pathnames remain as zero-length tombstones. Physical media,
 copy-on-write history, snapshots, swap, backups, database rollback/replacement,
 and non-Unix behavior are outside the proof.
 
@@ -478,8 +516,8 @@ independent implementation, resource evidence, or release acceptance. See the
   latest-value projection, recoverable history, and visible tombstones.
 - [Selected Record API](quickstart/selected-record-api.md) — live or stopped
   explicit conflict projection and exact-sibling guarded resolution.
-- [Selected Blob API](quickstart/selected-blob-api.md) — stopped/local bounded
-  encrypted publication and freshly verified streaming read.
+- [Selected Blob API](quickstart/selected-blob-api.md) — bounded live file
+  publication/page reads, stopped streaming, and semantic-v5 direct automation.
 - [Carriers and contacts](transports.md) — selected and migration-source carrier boundaries.
 - [Mesh CLI guide](quickstart/mesh-cli.md) — phase-by-phase and retained receipts.
 - [Requirements status](implementation/requirements-status.md) — exact credited rows and open gaps.

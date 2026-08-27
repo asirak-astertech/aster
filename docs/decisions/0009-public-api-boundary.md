@@ -327,3 +327,59 @@ resource thresholds, long-duration operation, live Event or Blob application
 acceptance, or release authorization. State/Record durable subscriptions,
 selected-node bindings, finite TTL/forwarding age, relay/multi-hop acceptance,
 expiry, garbage collection, and automatic Record merge remain open.
+
+## Live selected Blob application amendment (2026-08-27)
+
+This amendment supersedes the earlier present-tense statements that selected
+Blob has no live application handle. Those statements remain above as the dated
+boundaries of the stopped-Blob and semantic-v5 network slices; they are not a
+description of the current composition. The earlier retained State/Record
+receipt also remains exactly what it was: its zero Blob counters provide no
+evidence for this amendment.
+
+`RunningNode::selected_blobs()` now returns a cloneable `SelectedBlobHandle`.
+It shares the running actor's bounded application admission and dispatches each
+accepted command to one bounded, joined blocking Blob worker; clones do not
+open another Store or depot authority. Async `publish` accepts an owned,
+nonempty regular file at cursor offset zero, bounded to 64 MiB and the selected
+1,024 canonical 64-KiB chunks. It may commit while no peer is configured.
+Success is one durable, source-authenticated, operation-key-idempotent local
+publication, not delivery. An exact authorized retry freshly verifies and
+returns the original publisher counter and acceptance marker. Different bytes
+or identity metadata under the same operation key fail closed as a conflict.
+Cancellation after enqueue may leave an indeterminate committed result, so the
+exact operation key is the recovery path.
+
+Async `read_page` selects the exact current authorized source and returns one
+freshly authenticated, nonempty plaintext page of at most 64 KiB. Plaintext is
+private behind a borrow and its owned allocation is zeroized on drop; no raw
+`Vec` is returned. An application copy becomes caller custody. The live page is
+not a streaming provider handle, subscription delivery, peer observation, or
+convergence-status assertion. The exclusive stopped `SelectedBlobNode` remains
+available for seekable-source publication and caller-owned streaming output
+only while no live actor owns the same store.
+
+The semantic-v5 amendment above remains the networking boundary. A peerless
+live publication can be synchronized later, after restart, by direct
+source-before-carrier transfer to an exactly interested, current
+content-capable peer. Receiver source/prefix progress is durable and ordinary
+visibility remains gated on whole-Blob verification and promotion; a later
+peerless restart can read the completed Blob through the receiver's live
+handle. This composes the live application and existing network mechanisms; it
+does not create Blob route-only forwarding or custody.
+
+Graceful shutdown and live zeroization close application admission, reject
+queued commands, and join the Blob worker before releasing Store authority.
+Retained handles then fail with sanitized `StateUnavailable`, and undisclosed
+page allocations are zeroized. The node cannot erase caller-copied page bytes,
+the caller's backing source file, or externally cloned descriptors. A blocking
+FUSE, NFS, device, or other hostile filesystem syscall may delay the joined
+worker and therefore shutdown or zeroization; no bounded-latency claim is made
+for such providers.
+
+This is mechanism and current-code test coverage, not a retained execution
+receipt or acceptance amendment. Blob subscription/status convergence,
+route-only custody, TTL/expiry/garbage collection, metadata-independent
+whole-byte deduplication, 100+ MiB or RSS/resource thresholds, representative
+physical IP/NAT/relay or BTLE operation, mixed-implementation interoperability,
+selected-node language bindings, and release authorization remain open.

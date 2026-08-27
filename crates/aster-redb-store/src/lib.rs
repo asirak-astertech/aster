@@ -4428,6 +4428,28 @@ struct ControlActivation {
     rejected: Vec<RejectedControl>,
 }
 
+#[cfg(test)]
+#[derive(Default)]
+struct BlobDepotTestCounters {
+    full_open_audits: std::sync::atomic::AtomicU64,
+    begin_write_transactions: std::sync::atomic::AtomicU64,
+    root_creations: std::sync::atomic::AtomicU64,
+    authenticated_read_opens: std::sync::atomic::AtomicU64,
+    full_completion_rechecks: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(test)]
+type BlobCarrierRangePostReadGate = (
+    std::sync::mpsc::SyncSender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
+
+#[cfg(test)]
+type BlobCarrierCommitPostSnapshotGate = (
+    std::sync::mpsc::SyncSender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
+
 /// One exact backing-file handle to the durable accepted-item and acceptance-marker domain.
 ///
 /// Writable construction passes a validated file descriptor directly to redb;
@@ -4446,6 +4468,13 @@ pub struct Store {
     blob_depot_lock: std::sync::Mutex<()>,
     blob_completion_authority: std::sync::Arc<()>,
     blob_depot_owner_token: [u8; 32],
+    #[cfg(test)]
+    blob_depot_test_counters: BlobDepotTestCounters,
+    #[cfg(test)]
+    blob_carrier_range_post_read_gate: std::sync::Mutex<Option<BlobCarrierRangePostReadGate>>,
+    #[cfg(test)]
+    blob_carrier_commit_post_snapshot_gate:
+        std::sync::Mutex<Option<BlobCarrierCommitPostSnapshotGate>>,
 }
 
 /// Exact-writer cleanup handle for a live or terminal mission-bound store.
@@ -5050,6 +5079,12 @@ impl Store {
             blob_depot_lock: std::sync::Mutex::new(()),
             blob_completion_authority: std::sync::Arc::new(()),
             blob_depot_owner_token,
+            #[cfg(test)]
+            blob_depot_test_counters: BlobDepotTestCounters::default(),
+            #[cfg(test)]
+            blob_carrier_range_post_read_gate: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            blob_carrier_commit_post_snapshot_gate: std::sync::Mutex::new(None),
         })
     }
 
@@ -5231,6 +5266,12 @@ impl Store {
             blob_depot_lock: _,
             blob_completion_authority: _,
             blob_depot_owner_token: _,
+            #[cfg(test)]
+                blob_depot_test_counters: _,
+            #[cfg(test)]
+                blob_carrier_range_post_read_gate: _,
+            #[cfg(test)]
+                blob_carrier_commit_post_snapshot_gate: _,
         } = self;
         Ok(ZeroizationStore {
             database,
@@ -12725,7 +12766,10 @@ fn require_mutable_class_capacity(
     Ok(())
 }
 
-fn aggregate_usage(metadata: &redb::Table<'_, &str, u64>) -> Result<CustodyUsage, StoreError> {
+fn aggregate_usage<T>(metadata: &T) -> Result<CustodyUsage, StoreError>
+where
+    T: redb::ReadableTable<&'static str, u64>,
+{
     let items = [
         ITEM_COUNT,
         SEMANTIC_ITEM_COUNT,
@@ -13067,14 +13111,19 @@ fn ensure_frontier_capacity(
     class: SemanticDataClass,
 ) -> Result<(), StoreError> {
     let prefix = event_domain_prefix(topic, scope)?;
+    let upper = lexicographic_prefix_upper_bound(&prefix)?;
     let frontier = write.open_table(CAUSAL_FRONTIER)?;
     let mut direct_publishers = 0usize;
     let mut incoming_present = false;
-    for row in frontier.iter()? {
+    for row in frontier.range::<&[u8]>((
+        std::ops::Bound::<&[u8]>::Included(prefix.as_slice()),
+        std::ops::Bound::<&[u8]>::Excluded(upper.as_slice()),
+    ))? {
         let (key, value) = row?;
         let key = key.value();
-        if !key.starts_with(&prefix) {
-            continue;
+        #[cfg(test)]
+        if class == SemanticDataClass::Blob {
+            blob::record_test_blob_frontier_row();
         }
         if key.len() != prefix.len() + 32 || value.value() == 0 {
             return Err(StoreError::SemanticInvariant(
@@ -17693,6 +17742,22 @@ fn event_domain_prefix(topic: &Topic, scope: &Scope) -> Result<Vec<u8>, StoreErr
     push_short_bytes(&mut key, topic.as_str().as_bytes())?;
     push_short_bytes(&mut key, scope.as_str().as_bytes())?;
     Ok(key)
+}
+
+fn lexicographic_prefix_upper_bound(prefix: &[u8]) -> Result<Vec<u8>, StoreError> {
+    let mut upper = prefix.to_vec();
+    let index =
+        upper
+            .iter()
+            .rposition(|byte| *byte != u8::MAX)
+            .ok_or(StoreError::SemanticInvariant(
+                "durable index prefix has no finite successor",
+            ))?;
+    upper[index] = upper[index]
+        .checked_add(1)
+        .expect("successor byte was checked below u8::MAX");
+    upper.truncate(index + 1);
+    Ok(upper)
 }
 
 fn state_group_prefix(

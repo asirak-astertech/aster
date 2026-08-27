@@ -225,10 +225,11 @@ revocation, exclusive writer ownership, depot tamper, and terminal zeroization.
 
 `BlobId` is exact object identity over plaintext bytes, the canonical chunk
 profile, and media/schema identity metadata; it is not a metadata-independent
-whole-byte identity. `BlobDepotLimits` count redb-marked ciphertext-file bytes,
-all durable per-chunk metadata rows, and all import variants. Unfinished rows
-remain charged pending explicit GC; untracked hostile filesystem entries and
-complete physical allocation are outside the counters. The public peak-buffer
+whole-byte identity. `BlobDepotLimits` reserve canonical ciphertext-file bytes
+for every durable expected chunk record, count all durable per-chunk metadata
+rows, and count every public or unpublished import variant. Retained unpublished
+rows remain charged pending explicit GC; untracked hostile filesystem entries
+and complete physical allocation are outside the counters. The public peak-buffer
 field reports the core Blob engine's capacity; generic store adapters may use
 additional independently chunk-bounded buffers, so it is not a whole-operation
 memory measurement. No test in this gate is a Blob contact, remote/any-peer
@@ -502,8 +503,9 @@ It is one-host same-implementation loopback evidence. It supplies no physical,
 NAT/Internet, controlled/public-relay, BTLE, independent-implementation, scale
 beyond two, resource-threshold, long-duration, Event/Blob-live, or release
 acceptance. Durable State/Record subscriptions, selected-node bindings, finite
-TTL, expiry/garbage collection, automatic registered-policy merge, and live
-Blob access remain open.
+TTL, expiry/garbage collection, and automatic registered-policy Record merge
+remain open. Its zero Blob counters do not evidence the newer live Blob
+mechanism, which still lacks a retained execution receipt.
 
 The semantic-v5 direct Blob gate is additive to the earlier stopped/local Blob
 gate. It must cover all Blob interest/source/range/result/ack/finish frame bytes,
@@ -527,15 +529,16 @@ under the owner-token/binding rules; read-only or partial-group open must not
 migrate or repair it.
 
 Startup cleanup must also begin from an authenticated source plus one durable
-carrier range and reclaim exactly the pending source, cached claim, carrier
-prefix, network-staging accounting, chunks/files, finalized digest, and every
-reserved or committed depot byte after each of same-epoch lineage replacement,
-numeric epoch advance, and publisher revocation. It must retain exactly one
-non-public unfinished physical-lineage fence charged to the existing variant
-cap, reopen with no other progress, permit exact-lineage refill, reject a
-different same-epoch lineage without mutation, permit numeric epoch advance,
-and reject a zero-lineage fence on every open path. Valid later Blob work must
-succeed and a second reopen must remain clean.
+carrier range and remove exactly the pending source, cached claim, carrier
+prefix, and network-staging accounting after each of same-epoch lineage
+replacement, numeric epoch advance, and publisher revocation. It must retain
+the exact non-public depot import and expected/committed chunk staging—including
+rows, files, finalized digest, and reserved/committed accounting—charged to the
+existing byte, chunk, and variant caps. Reopen must expose no ordinary pending
+or published progress, permit exact-lineage resume, reject a different
+same-epoch lineage without mutation, permit numeric epoch advance, and reject a
+zero-lineage fence on every open path. Valid later Blob work must succeed and a
+second reopen must preserve the same bounded quota charge.
 
 Runtime races are part of the gate. One regression must pause exact restage
 between fresh authentication and cache insertion while an abort wins, then
@@ -550,10 +553,13 @@ and first receiver make only partial carrier progress, runtime/store/provider
 cache ownership tears down, then after reopen a different eligible content peer
 continues the same exact source/carrier complement to a fully verified visible
 publication. Normal and AtLeast must run the lane because AtLeast is Event-only;
-ReceiveOnly must perform zero Blob work. This is current-code
-same-implementation loopback automation, not a retained execution root, live
-Blob application handle, route-only Blob relay, 100+ MiB/RSS or resource test,
-physical system, mixed implementation, or release acceptance.
+ReceiveOnly must perform zero Blob work. The separate live Blob gate covers an
+actor-owned handle, peerless publication, later direct synchronization,
+authenticated bounded page reads, restart, and closure, but remains current-code
+same-implementation loopback automation. Neither gate is a retained Blob
+execution root, subscription/status surface, route-only Blob relay, 100+
+MiB/RSS or resource test, physical system, mixed implementation, or release
+acceptance.
 
 Representative focused commands include:
 
@@ -565,7 +571,7 @@ cargo test --locked -p aster-redb-store blob::tests::network_blob_stages_transfe
 cargo test --locked -p aster-redb-store blob::tests::pending_blob_audit_binds_exact_manifest_route_and_carriers_on_all_open_paths -- --exact
 cargo test --locked -p aster-redb-store blob::tests::predecessor_nine_table_blob_schema_migrates_network_additively_with_owner_tokens -- --exact
 cargo test --locked -p aster-node runtime::tests::blob_source_carrier_reopen_resumes_exact_complement_from_different_peer -- --exact
-cargo test --locked -p aster-node runtime::tests::stale_pending_blob_cleanup_reclaims_exact_cache_and_depot_state -- --exact
+cargo test --locked -p aster-node runtime::tests::stale_pending_blob_cleanup_removes_visibility_but_retains_reserved_staging -- --exact
 cargo test --locked -p aster-node runtime::tests::pending_blob_abort_reconciles_concurrent_exact_restage_without_restart -- --exact
 cargo test --locked -p aster-node runtime::tests::blob_lifecycle_lock_serializes_delayed_projection_insert_and_abort -- --exact
 cargo test --locked -p aster-node runtime::tests::terminal_blob_poison_advances_scheduler_past_source_to_later_candidate -- --exact

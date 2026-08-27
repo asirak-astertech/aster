@@ -1,6 +1,5 @@
 # Decision 0028: Start the selected-stack implementation behind an isolated profile
 
-> ****
 
 - Status: accepted — Iroh-first implementation migration; release admission gates open
 - Date: 2026-08-23
@@ -204,11 +203,14 @@ a distinct physical content lineage are rechecked before service and promotion.
 After same-epoch key replacement, old rows and proofs are withheld; a new
 physical lineage for the same `(BlobID, content group, numeric epoch)` is also
 rejected with `PhysicalLineageConflict`, so retry requires an epoch advance.
-Terminal or stale source retirement preserves an exact unfinished, non-public
-`BLOB_IMPORTS` physical-lineage fence while reclaiming its chunks, finalized
-digest, files, and reserved/committed bytes. The fence consumes one existing
-bounded variant slot, remains owner/backing-bound and open-path audited, permits
-only exact-lineage refill at that epoch, and introduces no table or schema.
+Terminal or stale source retirement preserves an exact non-public depot import,
+which may be expected-only or already finalized, and any expected/committed
+chunk staging while removing pending
+source and prefix visibility. The retained rows, files, finalized digest, and
+reserved/committed accounting consume the existing bounded byte, chunk, and
+variant quotas, remain owner/backing-bound and open-path audited, permit only
+exact-lineage resume at that epoch, and introduce no table or schema. A future
+explicit GC protocol is required to reclaim them.
 
 The selected network bounds are 64 MiB plaintext, 1,024 chunks, 10,000 pending
 rows, 64 MiB of pending prefix bytes, and 16 KiB per range. No pending source or

@@ -33,24 +33,31 @@ The recipes below use the broader semantic language bindings. The selected
 Record have cloneable live Rust handles backed by the running actor; all three
 also retain exclusive stopped Rust facades. State and Record live commands
 share Event's bounded actor lane and the same mission-bound store authority,
-while their objects reconcile over protected semantic-v4/v5 contacts. Blob has
-only a stopped Rust facade, while semantic v5 separately transfers its
-already-durable objects directly between current content-capable peers. The
+while their objects reconcile over protected semantic-v4/v5 contacts. Blob now
+has a cloneable live Rust handle plus its exclusive stopped streaming facade;
+semantic v5 separately transfers already-durable Blob objects directly between
+current content-capable peers. The
 selected handshake offers `[5, 4, 3, 2, 1]`. Event keeps v1-v5 compatibility;
 v1-v3 contain no State/Record mechanics and v1-v4 emit zero Blob frames.
 
 `RunningNode::selected_state()` exposes async `publish` and `query`;
 `RunningNode::selected_records()` exposes async `publish`, `query`, and guarded
-`resolve`. Clones use one bounded Event/State/Record command queue rather than
-opening another writer. Graceful shutdown and live zeroization close admission,
-so retained handles fail with sanitized `StateUnavailable`. Durable
-State/Record subscriptions, ConnectRPC/C/Go/Python selected-node bindings,
-finite TTL, live Blob access, and representative physical/mixed-implementation
-acceptance remain open. A
+`resolve`; `RunningNode::selected_blobs()` exposes async durable regular-file
+`publish` and authenticated `read_page`. Blob pages are at most 64 KiB and own a
+zeroize-on-drop plaintext allocation. Clones use the actor's bounded application
+admission rather than opening another writer; Blob work is dispatched to one
+bounded joined worker. Graceful shutdown and live zeroization close admission,
+reject queued work, and join that worker before authority release, so retained
+handles fail with sanitized `StateUnavailable`. Caller-copied Blob bytes and
+caller-owned source files remain outside node zeroization. Durable State/Record
+subscriptions, Blob subscription or convergence status, ConnectRPC/C/Go/Python
+selected-node bindings, finite TTL, and representative physical or
+mixed-implementation acceptance remain open. A
 [retained bounded live-path receipt](implementation/evidence/selected-live-mutable-2ccfba0.json)
 covers peerless State/Record publication, direct convergence, conflict
 resolution, restart, and closed-handle behavior on one same-implementation
-loopback host; it is not representative or release acceptance.
+loopback host; its zero Blob counters make it neither live-Blob evidence nor
+representative/release acceptance.
 
 Selected State/Record lanes are separated by class and receiver direction. They
 use Offer `MutableApplyResult`, Fetch `MutableFetchResult` plus required
@@ -69,10 +76,12 @@ Normal and `AtLeast` run those mutable lanes and the v5 Blob lane because
 mutable or Blob lane. Event last-contact status is not State/Record/Blob
 convergence. The Blob network slice is 16-KiB peer-neutral resume with
 completion-gated visibility. Terminal/stale cleanup retains one bounded,
-non-public unfinished physical-lineage fence after reclaiming chunk and byte
-authority, so a different same-epoch lineage still requires epoch advance. It
-adds no live Blob handle, route-only relay, TTL/GC, pure-byte deduplication, or
-retained release receipt.
+non-public, quota-charged depot import and any expected/committed chunk staging
+after removing source/prefix/cache visibility, so a different same-epoch
+lineage still requires epoch advance. It
+adds no Blob subscription/status convergence, route-only custody, TTL/GC,
+pure-byte deduplication, large/RSS acceptance, representative physical or
+mixed-implementation acceptance, or retained live-Blob receipt.
 
 ## Publish each data class
 
@@ -190,6 +199,19 @@ whole-content digest is checked only when the reader reaches end-of-file. Do not
 act on the output as a complete verified Blob before the final read returns
 end-of-file; the staging-and-rename pattern above prevents a partial result from
 being mistaken for a completed file.
+
+The selected live Rust composition uses a narrower shape than these broader
+language bindings. Obtain `let blobs = running.selected_blobs()`, pass an owned
+regular `std::fs::File` at offset zero to async `publish`, and loop over async
+`read_page` calls using the returned `next_offset()`. A live publication is
+nonempty and at most 64 MiB; each page request is `1..=64 KiB`. The node may have
+no peers when publication commits. An exact operation-key retry recovers the
+durable result, while different bytes or identity metadata under that key fail
+as a conflict. After a later v5 direct contact, an eligible receiver can expose
+the completed Blob through its own live handle and retain it across restart.
+See the [selected Blob quickstart](quickstart/selected-blob-api.md) for the full
+Rust example and its cancellation, closure, and zeroization limits. That path
+has no Blob subscription/status API and no retained acceptance receipt yet.
 
 ## Query current local data
 

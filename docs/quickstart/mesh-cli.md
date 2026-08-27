@@ -21,7 +21,10 @@ non-Unix or physical-media zeroization assurance, physical multi-system
 operation, NAT/hosted relay, BTLE, independent interoperability, or release
 authorization. The selected live Event handle is documented separately; this
 CLI tour uses built-in roles and does not turn last-contact status into a
-global-convergence claim.
+global-convergence claim. State/Record reconciliation, the live Blob
+application surface, and the semantic-v5 direct-Iroh Blob mechanism are current
+selected-code surfaces tested in separate automation; their presence does not
+enlarge this Event-only tour into a retained Blob acceptance receipt.
 
 ## Prerequisites
 
@@ -314,18 +317,31 @@ target/debug/aster node --state ./aster-state --bind 0.0.0.0:49100 \
   --peer "$SYSTEM_A_ID@$SYSTEM_A_IP:49100=$SYSTEM_A_MISSION_ID" \
   --state-interest sensors@mission/alpha \
   --record-interest reports@mission/alpha \
+  --blob-interest blobs@mission/alpha \
   --sync-ms 500 --application pong-responder
 ```
 
-`--state-interest TOPIC@SCOPE` and `--record-interest TOPIC@SCOPE` are
-repeatable, class-separated receive interests for already durable source
-objects. Empty means receive-none. They do not grant route or content access;
+`--state-interest TOPIC@SCOPE`, `--record-interest TOPIC@SCOPE`, and
+`--blob-interest TOPIC@SCOPE` are repeatable, class-separated receive interests
+for already durable source objects. Blob is opt-in only in semantic v5 and its
+selector is an exact topic/scope pair, not a descendant or wildcard match.
+Empty means receive-none. These selectors do not grant route or content access;
 the mission bundle must independently authorize the exact source, topic,
-scope, and current epoch. Any stopped State/Record facade must be closed before
-the runtime owns the same store. Rust applications may instead
-call `RunningNode::selected_state()` and `RunningNode::selected_records()` for
-cloneable live handles backed by that actor's bounded application lane; the CLI
-does not expose those methods as a language binding. Record network ingest
+scope, and current epoch. Eligible semantic-v5 direct-Iroh contacts
+automatically reconcile Blob sources and peer-neutral contiguous carrier ranges
+of at most 16 KiB; this current automation has no retained direct-Iroh Blob
+acceptance receipt.
+
+Any stopped State/Record/Blob facade must be closed before the runtime owns the
+same store. Rust applications may instead call
+`RunningNode::selected_state()`, `RunningNode::selected_records()`, and
+`RunningNode::selected_blobs()` for cloneable live handles backed by that
+actor's bounded application lane. Live Blob publish accepts an already-open
+regular nonempty file at cursor zero, with a 64-MiB/1,024 canonical 64-KiB
+chunk ceiling; a live page read returns at most 64 KiB in zeroize-on-drop
+plaintext after fresh source, policy/lineage, and exact authenticated depot
+completion checks. The CLI does not expose these handles as language bindings,
+and its built-in roles neither publish nor read Blob. Record network ingest
 retains concurrent revisions and never executes application merge code.
 
 The built-in application roles require bundles granting scope `demo/mesh`, key
@@ -378,10 +394,11 @@ target/debug/aster zeroize --state ./aster-state \
 
 If `aster node` owns the state, the command connects to an owner-only local Unix
 socket bound to the state directory and redb file identities. The runtime stops
-starting work, drains its owned contact tasks, closes and drops the Iroh
-endpoint, and drops its application sealer before entering the terminal store
-lifecycle. If no node is live, the same command acquires the exclusive redb
-writer and follows the stopped-state path. A live writer with no matching local
+starting work, closes every application admission surface, joins the bounded
+Blob worker, drains its owned contact tasks, closes and drops the Iroh endpoint,
+and drops derived secret holders before entering the terminal store lifecycle.
+If no node is live, the same command acquires the exclusive redb writer and
+follows the stopped-state path. A live writer with no matching local
 zeroization endpoint is rejected rather than forced.
 
 Before the irreversible transition, both secret artifacts must be owner-only,
@@ -400,10 +417,13 @@ ZEROIZE status=pass mode=live state=complete mission_destroyed=true carrier_iden
 The node emits `STOP lifecycle=zeroized sync_status=terminal-lockout`. `aster
 inspect` remains available and reports `zeroization=complete`; normal `init`,
 `node`, `put`, and authority/store opens fail closed while the retained redb
-marker exists. Application, Event, route-cache, and control rows are
-deliberately preserved for audit. Restoring credential bytes into the retained
-zero-length files does not reopen that same database. Replacing or rolling back
-the database is outside this proof.
+marker exists. Application, Event, State, Record, Blob, route-cache, and control
+rows are deliberately preserved for audit, as is the encrypted Blob depot.
+Erasing the mission/content and carrier-identity secrets makes that ciphertext
+unavailable through normal operation: this is bounded cryptographic shredding,
+not deletion or physical sanitization of depot files. Restoring credential
+bytes into the retained zero-length files does not reopen that same database.
+Replacing or rolling back the database is outside this proof.
 
 Cleanup is idempotent and crash-resumable after the terminal marker: only an
 uncompleted pathname that still identifies the exact recorded inode may be
@@ -485,16 +505,18 @@ reconciliation. Do not use `put` as evidence for the source-authenticated mesh.
 | `aster-profile` | Stable complete reconciliation keys and canonical inventory ordering; class-specific exact Event/State/Record transfer IDs enter by explicit conversion |
 | `aster-redb-store` | Mission-bound audited control chain and atomic policy snapshots plus semantic Event/State/Record/Blob causal/operation state, bounded Event route-only cache, a durable terminal software-zeroization intent/phase receipt, and a disjoint retained opaque compatibility namespace |
 | `aster-negentropy` | Bounded, clock-independent set difference over exact transfer IDs |
-| `aster-iroh` | Direct endpoint lifecycle, carrier identity, and bounded exchange |
-| `aster-node` | Composition, mission-before-inventory and control-before-data ordering, peer route/interest filtering, exact control/Event/State/Record transfer, authority commands, sample applications, bounded same-UID Unix local zeroization lifecycle, receipts, and CLI |
+| `aster-iroh` | Direct and operator-pinned controlled-relay endpoint lifecycle, carrier identity, and bounded exchange |
+| `aster-node` | Composition, mission-before-inventory and control-before-data ordering, peer route/interest filtering, exact control/Event/State/Record transfer, semantic-v5 direct Blob source/range automation, live Event/State/Record/Blob handles, authority commands, sample applications, bounded same-UID Unix local zeroization lifecycle, receipts, and CLI |
 | `aster-core` | Existing spec-verified hybrid mission session, control envelope, recipient-filtered rekey, and typed source-envelope Event/State/Record/Blob semantics, used rather than rewritten |
 
 No old path is removed until its replacement passes equivalent tests. Current
 open work includes State/Record subscriptions and selected-node bindings,
-broader State/Record partition/relay acceptance, a live Blob application path,
-generalized publish/subscribe and topic filtering, finite State/Record/Blob
-custody and non-Linux finite Event custody, protected provisioning, generalized
-control administration and repeated multi-scope rekey,
+broader State/Record partition/relay acceptance, Blob subscription/status and
+selected-node bindings, retained direct-Iroh and controlled-relay Blob
+acceptance, route-only Blob relay/custody, generalized publish/subscribe and
+topic filtering, finite State/Record/Blob custody and non-Linux finite Event
+custody, protected provisioning, generalized control administration and
+repeated multi-scope rekey,
 platform-complete zeroization assurance, physical/multi-carrier or
 mixed-implementation acceptance, and release gates. The tracked [requirements
 status](../implementation/requirements-status.md) keeps those boundaries

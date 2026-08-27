@@ -1,6 +1,6 @@
 # Decision 0010: Source-bound encrypted Blob carriers
 
-- Status: accepted for reference; stopped/local plus semantic-v5 direct-content selected subset implemented
+- Status: accepted for reference; stopped/local, semantic-v5 direct-content, and bounded live-application selected subsets implemented
 - Date: 2026-08-18
 
 ## Decision
@@ -95,10 +95,11 @@ is structural: every retained publication is freshly source/content verified,
 the active deterministic source publication is recomputed, the exact plan is
 rechecked, and only then is the selected depot completion verified and read.
 
-Dedicated limits cover committed ciphertext-file bytes, durable chunk-metadata
-rows, and import variants. Unfinished imports count against row/variant
-admission until an explicit-GC policy is implemented. These limits do not claim
-complete filesystem allocation accounting or physical sanitization. The
+Dedicated limits reserve canonical ciphertext-file bytes for every durable
+expected chunk record and count durable chunk-metadata rows and import variants.
+Retained unpublished imports, whether expected-only or already finalized, count
+against byte/row/variant admission until an explicit-GC policy is implemented.
+These limits do not claim complete filesystem allocation accounting or physical sanitization. The
 selected slice has no Blob frame, remote chunk request, any-peer resume, live
 handle, subscription, carrier-neutral partial staging, or acceptance result;
 the network portion of this decision remains a migration target.
@@ -156,12 +157,13 @@ numeric epoch)` with `PhysicalLineageConflict`; republishing or resuming that
 Blob requires advancing the numeric epoch.
 
 Terminal and stale cleanup preserve that decision after the pending source is
-gone. Unshared chunks, files, finalized digest, and reserved/committed byte
-authority are retired, but the exact unfinished `BLOB_IMPORTS` row remains a
-non-public, owner/backing-bound physical-lineage fence under the existing
-variant cap. Exact-lineage retry may refill the row; a different same-epoch
-lineage still conflicts, and a missing lineage fails audit. This adds no table,
-schema, quota, or visibility surface.
+gone. Pending source and prefix visibility are retired, but the exact depot
+import, any expected/committed chunk rows and files, finalized digest, and
+reserved/committed accounting remain as bounded non-public, owner/backing-bound
+staging under the existing byte, chunk, and variant caps. Exact-lineage retry
+may resume it; a different same-epoch lineage still conflicts, and a missing
+lineage fails audit. This adds no table, schema, quota, or visibility surface;
+an explicit future GC protocol is required to reclaim the abandoned staging.
 
 The node serializes every durable Blob-source transition with its authenticated
 cache transition under one local lifecycle lock. Abort reconciliation removes
@@ -177,3 +179,19 @@ subscription, TTL/expiry/custody/garbage collection, pure whole-byte identity
 or metadata-independent deduplication, selected route-only relay, large-file or
 resource acceptance, physical carrier, mixed-implementation, or release
 acceptance claim.
+
+## Selected live-application amendment (2026-08-27)
+
+This amendment supersedes only the preceding present-tense statement that the
+selected application facade remains stopped. `RunningNode::selected_blobs()`
+now returns a cloneable actor-owned handle for durable publication of a bounded
+regular file and authenticated reads of one zeroize-on-drop plaintext page at a
+time. The exclusive stopped streaming facade and the semantic-v5 network
+boundary above remain unchanged.
+
+The live mechanism composes peerless publication with later direct transfer and
+restart, but does not add a Blob subscription, convergence status, route-only
+custody, TTL/GC, retained execution receipt, physical/resource acceptance,
+mixed-implementation evidence, or release authorization. The authoritative
+application ownership, cancellation, shutdown, and zeroization boundaries are
+recorded in [ADR 0009](0009-public-api-boundary.md#live-selected-blob-application-amendment-2026-08-27).

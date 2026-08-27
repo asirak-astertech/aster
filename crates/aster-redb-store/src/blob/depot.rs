@@ -56,6 +56,13 @@ const MAX_CHUNK_FILE_BYTES: u64 =
     CHUNK_FILE_HEADER_BYTES + MAX_BLOB_CHUNK_SIZE as u64 + BLOB_CHUNK_TAG_BYTES as u64;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(test)]
+thread_local! {
+    static TEST_COMPLETION_CHUNK_ROWS_VISITED: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum DepotFaultPoint {
     TempSynced,
@@ -75,6 +82,145 @@ pub(super) enum DepotFaultPoint {
 #[cfg(test)]
 static TEST_DEPOT_FAULTS: std::sync::Mutex<Vec<(PathBuf, DepotFaultPoint)>> =
     std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct DepotIoCounts {
+    pub full_open_audits: u64,
+    pub begin_write_transactions: u64,
+    pub root_creations: u64,
+    pub authenticated_read_opens: u64,
+    pub full_completion_rechecks: u64,
+    pub completion_chunk_rows_visited: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct BlobSourceShape {
+    pub total_len: u64,
+    pub chunk_size: u32,
+    pub chunk_count: u64,
+}
+
+#[cfg(test)]
+pub(super) fn test_depot_io_counts(store: &Store) -> DepotIoCounts {
+    DepotIoCounts {
+        full_open_audits: store
+            .blob_depot_test_counters
+            .full_open_audits
+            .load(Ordering::Relaxed),
+        begin_write_transactions: store
+            .blob_depot_test_counters
+            .begin_write_transactions
+            .load(Ordering::Relaxed),
+        root_creations: store
+            .blob_depot_test_counters
+            .root_creations
+            .load(Ordering::Relaxed),
+        authenticated_read_opens: store
+            .blob_depot_test_counters
+            .authenticated_read_opens
+            .load(Ordering::Relaxed),
+        full_completion_rechecks: store
+            .blob_depot_test_counters
+            .full_completion_rechecks
+            .load(Ordering::Relaxed),
+        completion_chunk_rows_visited: TEST_COMPLETION_CHUNK_ROWS_VISITED
+            .with(std::cell::Cell::get),
+    }
+}
+
+pub(super) fn committed_pending_plan_chunks_read(
+    read: &redb::ReadTransaction,
+    plan: &VerifiedBlobTransferPlan,
+) -> Result<BTreeSet<u64>, StoreError> {
+    let manifest = plan.manifest();
+    let variant_id = blob_variant_id(
+        manifest.id(),
+        manifest.content_group(),
+        manifest.content_epoch(),
+    );
+    let import = load_import_read(read, variant_id)?
+        .ok_or_else(|| blob_error(BlobStoreError::PendingSourceConflict))?;
+    if !import.matches_manifest(manifest)
+        || import.variant_id != variant_id
+        || import.physical_lineage != Some(*plan.physical_lineage().binding())
+        || import
+            .finalized_manifest_digest
+            .is_some_and(|digest| digest != *plan.manifest_digest())
+    {
+        return Err(blob_error(BlobStoreError::PendingSourceConflict));
+    }
+    let mut committed = BTreeSet::new();
+    for (index, record) in plan.chunk_records().iter().copied().enumerate() {
+        let index = u64::try_from(index).map_err(|_| StoreError::ItemCountAccountingOverflow)?;
+        let state = load_chunk_read(read, variant_id, index)?
+            .ok_or_else(|| blob_error(BlobStoreError::PendingSourceConflict))?;
+        if state.plaintext_digest != Some(*record.plaintext_sha256())
+            || state.expected != Some(record)
+            || state.committed.is_some_and(|committed| committed != record)
+            || (state.committed == Some(record)
+                && state.committed_file_bytes != chunk_file_len(record)?)
+            || (state.committed.is_none() && state.committed_file_bytes != 0)
+        {
+            return Err(blob_error(BlobStoreError::PendingSourceConflict));
+        }
+        if state.committed == Some(record) {
+            committed.insert(index);
+        }
+    }
+    Ok(committed)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn blob_source_shape_read(
+    read: &redb::ReadTransaction,
+    variant_id: BlobVariantId,
+    blob_id: BlobId,
+    epoch: u64,
+    physical_lineage: [u8; 32],
+    manifest_digest: [u8; 32],
+    route_chunk_count: u64,
+    completed: bool,
+) -> Result<BlobSourceShape, StoreError> {
+    let import = load_import_read(read, variant_id)?.ok_or_else(|| {
+        blob_error(BlobStoreError::SchemaInvariant(
+            "retained Blob source is missing its exact depot import",
+        ))
+    })?;
+    let expected_chunks = (import.chunk_size != 0)
+        .then(|| {
+            import
+                .total_len
+                .checked_add(u64::from(import.chunk_size) - 1)
+                .map(|bytes| bytes / u64::from(import.chunk_size))
+        })
+        .flatten();
+    if import.variant_id != variant_id
+        || import.variant_id != blob_variant_id(blob_id, &import.content_group, epoch)
+        || import.blob_id != blob_id
+        || import.epoch != epoch
+        || import.physical_lineage != Some(physical_lineage)
+        || import.total_len == 0
+        || import.chunk_size != SELECTED_BLOB_CHUNK_SIZE
+        || import.chunk_count == 0
+        || import.chunk_count != route_chunk_count
+        || expected_chunks != Some(import.chunk_count)
+        || (completed && import.finalized_manifest_digest != Some(manifest_digest))
+        || (!completed
+            && import
+                .finalized_manifest_digest
+                .is_some_and(|digest| digest != manifest_digest))
+    {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "retained Blob source differs from its exact depot shape",
+        )));
+    }
+    Ok(BlobSourceShape {
+        total_len: import.total_len,
+        chunk_size: import.chunk_size,
+        chunk_count: import.chunk_count,
+    })
+}
 
 #[cfg(test)]
 pub(super) fn inject_test_fault(state_root: &Path, point: DepotFaultPoint) {
@@ -222,7 +368,10 @@ pub struct BlobDepotCompletion {
     pub(super) epoch: u64,
     pub(super) physical_lineage: [u8; 32],
     pub(super) manifest_digest: [u8; 32],
+    pub(super) total_len: u64,
+    pub(super) chunk_size: u32,
     pub(super) chunk_count: u64,
+    pub(super) import_fingerprint: [u8; 32],
 }
 
 impl PartialEq for BlobDepotCompletion {
@@ -235,7 +384,10 @@ impl PartialEq for BlobDepotCompletion {
             && self.epoch == other.epoch
             && self.physical_lineage == other.physical_lineage
             && self.manifest_digest == other.manifest_digest
+            && self.total_len == other.total_len
+            && self.chunk_size == other.chunk_size
             && self.chunk_count == other.chunk_count
+            && self.import_fingerprint == other.import_fingerprint
     }
 }
 
@@ -258,6 +410,18 @@ impl BlobDepotCompletion {
         &self.manifest_digest
     }
 
+    pub const fn total_len(&self) -> u64 {
+        self.total_len
+    }
+
+    pub const fn chunk_size(&self) -> u32 {
+        self.chunk_size
+    }
+
+    pub const fn chunk_count(&self) -> u64 {
+        self.chunk_count
+    }
+
     /// Opaque provider-owned identity of the physical content-key lineage.
     pub const fn physical_lineage(&self) -> &[u8; 32] {
         &self.physical_lineage
@@ -270,6 +434,142 @@ pub struct BlobDepot<'a> {
     _guard: MutexGuard<'a, ()>,
     root: OwnedDirectory,
     active: Option<ActiveImport>,
+    read_authorized_variant: Option<BlobVariantId>,
+}
+
+/// Capability-gated, mutation-incapable adapter for one finalized Blob variant.
+///
+/// This deliberately implements the generic core store seam so authenticated
+/// range reads can reuse the core engine, but every mutating trait operation
+/// fails closed before entering redb or touching the depot filesystem.
+pub struct AuthenticatedBlobReadDepot<'a> {
+    depot: BlobDepot<'a>,
+}
+
+impl AuthenticatedBlobReadDepot<'_> {
+    /// Rechecks the complete exact finalized variant authorized by the
+    /// nonconstructible completion capability.
+    pub fn recheck_completion(
+        &mut self,
+        completion: &BlobDepotCompletion,
+    ) -> Result<(), StoreError> {
+        self.depot.recheck_completion(completion)
+    }
+
+    /// Rechecks only the exact chunk files intersecting one bounded range.
+    pub fn recheck_completion_range(
+        &mut self,
+        completion: &BlobDepotCompletion,
+        first_chunk: u64,
+        chunk_count: u64,
+    ) -> Result<(), StoreError> {
+        self.depot
+            .recheck_completion_range(completion, first_chunk, chunk_count)
+    }
+}
+
+fn authenticated_read_mutation_error() -> StoreError {
+    blob_error(BlobStoreError::CompletionMismatch)
+}
+
+impl CoreBlobStore for AuthenticatedBlobReadDepot<'_> {
+    type StoreError = StoreError;
+
+    fn begin_blob(&mut self, _manifest: &BlobManifest) -> Result<(), Self::StoreError> {
+        Err(authenticated_read_mutation_error())
+    }
+
+    fn begin_blob_with_lineage(
+        &mut self,
+        _manifest: &BlobManifest,
+        _lineage: BlobPhysicalLineage,
+    ) -> Result<(), Self::StoreError> {
+        Err(authenticated_read_mutation_error())
+    }
+
+    fn select_blob_for_read_with_lineage(
+        &mut self,
+        manifest: &BlobManifest,
+        lineage: BlobPhysicalLineage,
+    ) -> Result<(), Self::StoreError> {
+        CoreBlobStore::select_blob_for_read_with_lineage(&mut self.depot, manifest, lineage)
+    }
+
+    fn put_plaintext_digest(
+        &mut self,
+        _id: BlobId,
+        _index: u64,
+        _digest: [u8; 32],
+    ) -> Result<(), Self::StoreError> {
+        Err(authenticated_read_mutation_error())
+    }
+
+    fn plaintext_digest(
+        &mut self,
+        id: BlobId,
+        index: u64,
+    ) -> Result<Option<[u8; 32]>, Self::StoreError> {
+        CoreBlobStore::plaintext_digest(&mut self.depot, id, index)
+    }
+
+    fn chunk_record(
+        &mut self,
+        id: BlobId,
+        index: u64,
+    ) -> Result<Option<BlobChunkRecord>, Self::StoreError> {
+        CoreBlobStore::chunk_record(&mut self.depot, id, index)
+    }
+
+    fn put_expected_chunk_record(
+        &mut self,
+        _id: BlobId,
+        _index: u64,
+        _record: BlobChunkRecord,
+    ) -> Result<(), Self::StoreError> {
+        Err(authenticated_read_mutation_error())
+    }
+
+    fn expected_chunk_record(
+        &mut self,
+        id: BlobId,
+        index: u64,
+    ) -> Result<Option<BlobChunkRecord>, Self::StoreError> {
+        CoreBlobStore::expected_chunk_record(&mut self.depot, id, index)
+    }
+
+    fn commit_verified_chunk(
+        &mut self,
+        _id: BlobId,
+        _index: u64,
+        _record: BlobChunkRecord,
+        _ciphertext: &[u8],
+    ) -> Result<(), Self::StoreError> {
+        Err(authenticated_read_mutation_error())
+    }
+
+    fn read_verified_chunk(
+        &mut self,
+        id: BlobId,
+        index: u64,
+        output: &mut Vec<u8>,
+    ) -> Result<bool, Self::StoreError> {
+        CoreBlobStore::read_verified_chunk(&mut self.depot, id, index, output)
+    }
+
+    fn finalize_blob(
+        &mut self,
+        _id: BlobId,
+        _manifest_digest: [u8; 32],
+    ) -> Result<(), Self::StoreError> {
+        Err(authenticated_read_mutation_error())
+    }
+
+    fn finalized_manifest_digest(
+        &mut self,
+        id: BlobId,
+    ) -> Result<Option<[u8; 32]>, Self::StoreError> {
+        CoreBlobStore::finalized_manifest_digest(&mut self.depot, id)
+    }
 }
 
 impl<'a> BlobDepot<'a> {
@@ -281,6 +581,11 @@ impl<'a> BlobDepot<'a> {
         // Close the precheck/lock race with terminal entry, which flips the
         // live gate before waiting for this same adapter lock.
         store.require_live()?;
+        #[cfg(test)]
+        store
+            .blob_depot_test_counters
+            .full_open_audits
+            .fetch_add(1, Ordering::Relaxed);
         let read = store.database.begin_read()?;
         let stats = inspect_blob_tables_read(&read)?.stats;
         let depot_empty =
@@ -314,10 +619,115 @@ impl<'a> BlobDepot<'a> {
             _guard: guard,
             root,
             active: None,
+            read_authorized_variant: None,
         })
     }
 
+    /// Opens the depot for one authenticated network-plan mutation without a
+    /// global Blob-table audit. Store open already established global schema
+    /// truth; this hot path reacquires the common owner lock, rechecks terminal
+    /// state and exact database/filesystem ownership, and either opens the
+    /// existing root or creates it only from canonical empty depot counters.
+    pub(super) fn open_network_mutation(
+        store: &'a Store,
+        allow_empty_root_creation: bool,
+    ) -> Result<Self, StoreError> {
+        let guard = store
+            .blob_depot_lock
+            .lock()
+            .map_err(|_| blob_error(BlobStoreError::DepotIntegrity("depot lock is poisoned")))?;
+        store.require_live()?;
+        let read = store.database.begin_read()?;
+        require_depot_owner_binding_read(
+            &read,
+            &store.path,
+            store.backing_identity,
+            store.blob_depot_owner_token,
+        )?;
+        let root = match OwnedDirectory::open_root_if_present(&store.path)? {
+            Some(root) => {
+                root.require_store_binding_read_only(
+                    &store.path,
+                    store.backing_identity,
+                    store.blob_depot_owner_token,
+                )?;
+                root
+            }
+            None if allow_empty_root_creation && depot_is_canonical_empty_read(&read)? => {
+                drop(read);
+                Self::create_bound_root(store)?
+            }
+            None => {
+                return Err(blob_error(BlobStoreError::DepotIntegrity(
+                    "populated Blob depot root is missing",
+                )));
+            }
+        };
+        Ok(Self {
+            store,
+            _guard: guard,
+            root,
+            active: None,
+            read_authorized_variant: None,
+        })
+    }
+
+    /// Opens an exact finalized variant for a capability-authorized read
+    /// without a global Blob-table audit, write transaction, or root creation.
+    pub(super) fn open_authenticated_read(
+        store: &'a Store,
+        completion: &BlobDepotCompletion,
+    ) -> Result<AuthenticatedBlobReadDepot<'a>, StoreError> {
+        let guard = store
+            .blob_depot_lock
+            .lock()
+            .map_err(|_| blob_error(BlobStoreError::DepotIntegrity("depot lock is poisoned")))?;
+        store.require_live()?;
+        if !Arc::ptr_eq(&completion.authority, &store.blob_completion_authority)
+            || completion.backing_identity != store.backing_identity
+        {
+            return Err(blob_error(BlobStoreError::CompletionMismatch));
+        }
+        let read = store.database.begin_read()?;
+        require_depot_owner_binding_read(
+            &read,
+            &store.path,
+            store.backing_identity,
+            store.blob_depot_owner_token,
+        )?;
+        let root = OwnedDirectory::open_root_if_present(&store.path)?.ok_or_else(|| {
+            blob_error(BlobStoreError::DepotIntegrity(
+                "completed Blob depot root is missing",
+            ))
+        })?;
+        root.require_store_binding_read_only(
+            &store.path,
+            store.backing_identity,
+            store.blob_depot_owner_token,
+        )?;
+        let mut depot = Self {
+            store,
+            _guard: guard,
+            root,
+            active: None,
+            read_authorized_variant: Some(completion.variant_id),
+        };
+        let import = depot.exact_completion_import(&read, completion)?;
+        depot.active = Some(active_from_import(&import));
+        #[cfg(test)]
+        store
+            .blob_depot_test_counters
+            .authenticated_read_opens
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(AuthenticatedBlobReadDepot { depot })
+    }
+
     fn create_bound_root(store: &Store) -> Result<OwnedDirectory, StoreError> {
+        #[cfg(test)]
+        store
+            .blob_depot_test_counters
+            .root_creations
+            .fetch_add(1, Ordering::Relaxed);
         OwnedDirectory::create_bound_root(
             &store.path,
             store.backing_identity,
@@ -340,7 +750,8 @@ impl<'a> BlobDepot<'a> {
         let read = self.store.database.begin_read()?;
         let import = load_import_read(&read, variant_id)?
             .ok_or_else(|| blob_error(BlobStoreError::CompletionMismatch))?;
-        if import.blob_id != blob_id
+        if !import.matches_manifest(blob.manifest())
+            || import.blob_id != blob_id
             || import.content_group != content_group
             || import.epoch != epoch
             || import.physical_lineage != Some(*blob.physical_lineage().binding())
@@ -353,6 +764,7 @@ impl<'a> BlobDepot<'a> {
             blob.verify_store_completion(manifest_bytes, self)
                 .map_err(|_| blob_error(BlobStoreError::CompletionMismatch))?;
             verify_import_files_read(&read, &self.root, &import)?;
+            let import_fingerprint = Sha256::digest(encode_import(&import)?).into();
             Ok(BlobDepotCompletion {
                 authority: Arc::clone(&self.store.blob_completion_authority),
                 backing_identity: self.store.backing_identity,
@@ -362,11 +774,105 @@ impl<'a> BlobDepot<'a> {
                 epoch,
                 physical_lineage: *blob.physical_lineage().binding(),
                 manifest_digest,
+                total_len: import.total_len,
+                chunk_size: import.chunk_size,
                 chunk_count: import.chunk_count,
+                import_fingerprint,
             })
         })();
         self.active = previous_active;
         result
+    }
+
+    /// Rechecks a previously minted exact completion against the current
+    /// mission-bound depot, including every durable marker and chunk file.
+    ///
+    /// A completion is an in-memory authenticated capability, not a timeless
+    /// assertion about mutable storage. Callers use this method immediately
+    /// before returning plaintext or an idempotent publication receipt so a
+    /// later missing, replaced, or corrupted depot artifact still fails
+    /// closed.
+    pub fn recheck_completion(
+        &mut self,
+        completion: &BlobDepotCompletion,
+    ) -> Result<(), StoreError> {
+        self.store.require_live()?;
+        let read = self.store.database.begin_read()?;
+        let import = self.exact_completion_import(&read, completion)?;
+        verify_import_files_read(&read, &self.root, &import)
+    }
+
+    /// Rechecks the exact finalized import plus only the chunk files needed by
+    /// one bounded plaintext range.
+    ///
+    /// The capability was minted by a complete depot audit. This narrower
+    /// freshness check preserves that exact import/finalization authority while
+    /// avoiding a whole-Blob file scan before every independently authenticated
+    /// page. Missing or corrupt files outside the requested range are detected
+    /// when their own range is read or by [`Self::recheck_completion`].
+    pub fn recheck_completion_range(
+        &mut self,
+        completion: &BlobDepotCompletion,
+        first_chunk: u64,
+        chunk_count: u64,
+    ) -> Result<(), StoreError> {
+        self.store.require_live()?;
+        let last_chunk = first_chunk
+            .checked_add(chunk_count)
+            .filter(|last| chunk_count > 0 && *last <= completion.chunk_count)
+            .ok_or_else(|| blob_error(BlobStoreError::CompletionMismatch))?;
+        let read = self.store.database.begin_read()?;
+        let import = self.exact_completion_import(&read, completion)?;
+        let variant = self
+            .root
+            .open_child_directory(&hex32(import.variant_id.as_bytes()), false)
+            .map_err(|_| blob_error(BlobStoreError::CompletionMismatch))?;
+        let active = active_from_import(&import);
+        for index in first_chunk..last_chunk {
+            let state = load_chunk_read(&read, import.variant_id, index)?
+                .ok_or_else(|| blob_error(BlobStoreError::CompletionMismatch))?;
+            let record = state
+                .committed
+                .ok_or_else(|| blob_error(BlobStoreError::CompletionMismatch))?;
+            verify_chunk_file(
+                &variant,
+                &chunk_file_name(index),
+                active,
+                index,
+                record,
+                state.committed_file_bytes,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn exact_completion_import(
+        &self,
+        read: &redb::ReadTransaction,
+        completion: &BlobDepotCompletion,
+    ) -> Result<ImportRecord, StoreError> {
+        if !Arc::ptr_eq(&completion.authority, &self.store.blob_completion_authority)
+            || completion.backing_identity != self.store.backing_identity
+        {
+            return Err(blob_error(BlobStoreError::CompletionMismatch));
+        }
+        let import = load_import_read(read, completion.variant_id)?
+            .ok_or_else(|| blob_error(BlobStoreError::CompletionMismatch))?;
+        let import_fingerprint = <[u8; 32]>::from(Sha256::digest(encode_import(&import)?));
+        if import.variant_id != completion.variant_id
+            || import.blob_id != completion.blob_id
+            || import.content_group != completion.content_group
+            || import.epoch != completion.epoch
+            || import.total_len != completion.total_len
+            || import.chunk_size != completion.chunk_size
+            || import.chunk_count != completion.chunk_count
+            || import.physical_lineage != Some(completion.physical_lineage)
+            || import.finalized_manifest_digest != Some(completion.manifest_digest)
+            || import_fingerprint != completion.import_fingerprint
+        {
+            return Err(blob_error(BlobStoreError::CompletionMismatch));
+        }
+        Ok(import)
     }
 
     fn require_active(&self, blob_id: BlobId) -> Result<ActiveImport, StoreError> {
@@ -402,15 +908,6 @@ impl<'a> BlobDepot<'a> {
                 ))
             },
         )
-    }
-
-    pub(super) fn reclaim_unmarked(&self) -> Result<(), StoreError> {
-        let write = self.store.database.begin_write()?;
-        enforce_live_write(&write)?;
-        let committed = committed_chunk_map_write(&write)?;
-        reclaim_unmarked_artifacts(&write, &self.root, &committed)?;
-        write.commit()?;
-        Ok(())
     }
 
     fn load_chunk(
@@ -511,6 +1008,11 @@ impl<'a> BlobDepot<'a> {
     ) -> Result<(), StoreError> {
         self.store.require_live()?;
         let incoming = ImportRecord::from_manifest(manifest, physical_lineage)?;
+        #[cfg(test)]
+        self.store
+            .blob_depot_test_counters
+            .begin_write_transactions
+            .fetch_add(1, Ordering::Relaxed);
         let write = self.store.database.begin_write()?;
         enforce_live_write(&write)?;
         let existing = load_import_write(&write, incoming.variant_id)?;
@@ -575,6 +1077,33 @@ impl CoreBlobStore for BlobDepot<'_> {
         lineage: BlobPhysicalLineage,
     ) -> Result<(), Self::StoreError> {
         self.begin_blob_internal(manifest, Some(lineage))
+    }
+
+    fn select_blob_for_read_with_lineage(
+        &mut self,
+        manifest: &BlobManifest,
+        lineage: BlobPhysicalLineage,
+    ) -> Result<(), Self::StoreError> {
+        self.store.require_live()?;
+        let expected = ImportRecord::from_manifest(manifest, Some(lineage))?;
+        if self
+            .read_authorized_variant
+            .is_some_and(|variant| variant != expected.variant_id)
+        {
+            return Err(blob_error(BlobStoreError::CompletionMismatch));
+        }
+        let read = self.store.database.begin_read()?;
+        let existing = load_import_read(&read, expected.variant_id)?
+            .ok_or_else(|| blob_error(BlobStoreError::CompletionMismatch))?;
+        if !existing.matches_manifest(manifest)
+            || existing.variant_id != expected.variant_id
+            || existing.physical_lineage != expected.physical_lineage
+            || existing.finalized_manifest_digest.is_none()
+        {
+            return Err(blob_error(BlobStoreError::CompletionMismatch));
+        }
+        self.active = Some(active_from_import(&existing));
+        Ok(())
     }
 
     fn put_plaintext_digest(
@@ -1431,6 +1960,33 @@ fn require_depot_owner_binding_read(
     )
 }
 
+fn depot_is_canonical_empty_read(read: &redb::ReadTransaction) -> Result<bool, StoreError> {
+    if read.open_table(BLOB_IMPORTS)?.len()? != 0 || read.open_table(BLOB_CHUNKS)?.len()? != 0 {
+        return Ok(false);
+    }
+    let metadata = read.open_table(BLOB_DEPOT_METADATA)?;
+    if metadata
+        .get(DEPOT_SCHEMA_VERSION)?
+        .map(|value| value.value())
+        != Some(BLOB_DEPOT_SCHEMA_VERSION)
+    {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob depot metadata schema is incomplete or unknown",
+        )));
+    }
+    for field in [
+        DEPOT_VARIANT_COUNT,
+        DEPOT_COMMITTED_CHUNK_COUNT,
+        DEPOT_COMMITTED_FILE_BYTES,
+        DEPOT_RESERVED_FILE_BYTES,
+    ] {
+        if metadata.get(field)?.map(|value| value.value()) != Some(0) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn require_depot_owner_binding(
     mut read: impl FnMut(&'static str) -> Result<Option<u64>, StoreError>,
     store_path: &Path,
@@ -1519,6 +2075,11 @@ pub(super) fn verify_completion(
     completion: &BlobDepotCompletion,
 ) -> Result<(), StoreError> {
     store.require_live()?;
+    #[cfg(test)]
+    store
+        .blob_depot_test_counters
+        .full_completion_rechecks
+        .fetch_add(1, Ordering::Relaxed);
     if !Arc::ptr_eq(&completion.authority, &store.blob_completion_authority)
         || completion.backing_identity != store.backing_identity
     {
@@ -1537,12 +2098,17 @@ pub(super) fn verify_completion(
     let read = store.database.begin_read()?;
     let import = load_import_read(&read, completion.variant_id)?
         .ok_or_else(|| blob_error(BlobStoreError::CompletionMismatch))?;
-    if import.blob_id != completion.blob_id
+    let import_fingerprint = <[u8; 32]>::from(Sha256::digest(encode_import(&import)?));
+    if import.variant_id != completion.variant_id
+        || import.blob_id != completion.blob_id
         || import.content_group != completion.content_group
         || import.epoch != completion.epoch
+        || import.total_len != completion.total_len
+        || import.chunk_size != completion.chunk_size
         || import.physical_lineage != Some(completion.physical_lineage)
         || import.chunk_count != completion.chunk_count
         || import.finalized_manifest_digest != Some(completion.manifest_digest)
+        || import_fingerprint != completion.import_fingerprint
     {
         return Err(blob_error(BlobStoreError::CompletionMismatch));
     }
@@ -2101,15 +2667,25 @@ fn committed_chunks_for_variant_read(
     read: &redb::ReadTransaction,
     variant: BlobVariantId,
 ) -> Result<Vec<(u64, ChunkState)>, StoreError> {
-    let prefix = variant.as_bytes();
+    let first = chunk_key(variant, 0);
+    let last = chunk_key(variant, u64::MAX);
     let chunks = read.open_table(BLOB_CHUNKS)?;
     let mut output = Vec::new();
-    for row in chunks.iter()? {
+    for row in chunks.range::<&[u8]>((
+        std::ops::Bound::<&[u8]>::Included(first.as_slice()),
+        std::ops::Bound::<&[u8]>::Included(last.as_slice()),
+    ))? {
         let (key, value) = row?;
-        if !key.value().starts_with(prefix) {
-            continue;
+        #[cfg(test)]
+        TEST_COMPLETION_CHUNK_ROWS_VISITED.with(|counter| {
+            counter.set(counter.get().saturating_add(1));
+        });
+        let (actual_variant, index) = parse_chunk_key(key.value())?;
+        if actual_variant != variant {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob chunk range escaped its exact variant",
+            )));
         }
-        let (_, index) = parse_chunk_key(key.value())?;
         let state = decode_chunk_state(value.value())?;
         if state.committed.is_some() {
             output.push((index, state));
@@ -2354,97 +2930,6 @@ pub(super) fn stage_verified_plan_write(
     Ok(())
 }
 
-/// Retires every chunk of one already-proven-unshared network import while
-/// preserving its exact same-epoch physical-lineage reservation.
-///
-/// The retained import remains charged to the existing bounded variant quota
-/// and is audited through the ordinary owner/backing-bound depot schema. It is
-/// not a semantic publication. Exact-lineage retry may repopulate its chunks;
-/// another physical lineage must advance the numeric content epoch. Physical
-/// files become unmarked authority and are reclaimed after commit.
-pub(super) fn retire_unshared_import_chunks_write(
-    write: &redb::WriteTransaction,
-    variant: BlobVariantId,
-) -> Result<bool, StoreError> {
-    let Some(mut import) = load_import_write(write, variant)? else {
-        return Ok(false);
-    };
-    if import.physical_lineage.is_none() {
-        return Err(blob_error(BlobStoreError::SchemaInvariant(
-            "network Blob lineage reservation is missing its physical lineage",
-        )));
-    }
-    let mut keys = Vec::new();
-    let mut committed_chunks = 0u64;
-    let mut committed_bytes = 0u64;
-    let mut reserved_bytes = 0u64;
-    for row in write.open_table(BLOB_CHUNKS)?.iter()? {
-        let (key, value) = row?;
-        if !key.value().starts_with(variant.as_bytes()) {
-            continue;
-        }
-        let state = decode_chunk_state(value.value())?;
-        if let Some(expected) = state.expected {
-            reserved_bytes = reserved_bytes
-                .checked_add(chunk_file_len(expected)?)
-                .ok_or(StoreError::PayloadByteAccountingOverflow)?;
-        }
-        if state.committed.is_some() {
-            committed_chunks = committed_chunks
-                .checked_add(1)
-                .ok_or(StoreError::ItemCountAccountingOverflow)?;
-            committed_bytes = committed_bytes
-                .checked_add(state.committed_file_bytes)
-                .ok_or(StoreError::PayloadByteAccountingOverflow)?;
-        }
-        keys.push(key.value().to_vec());
-    }
-    {
-        let mut chunks = write.open_table(BLOB_CHUNKS)?;
-        for key in keys {
-            chunks.remove(key.as_slice())?;
-        }
-    }
-    // A finalized digest is a proof that every chunk marker exists. Clearing
-    // it before deleting those markers leaves a canonical unfinished import
-    // that is both retryable and independently auditable on every reopen.
-    import.finalized_manifest_digest = None;
-    let encoded_import = encode_import(&import)?;
-    write
-        .open_table(BLOB_IMPORTS)?
-        .insert(variant.as_bytes().as_slice(), encoded_import.as_slice())?;
-    let mut depot = write.open_table(BLOB_DEPOT_METADATA)?;
-    for (field, decrement, message) in [
-        (
-            DEPOT_COMMITTED_CHUNK_COUNT,
-            committed_chunks,
-            "Blob depot committed-chunk counter underflows",
-        ),
-        (
-            DEPOT_COMMITTED_FILE_BYTES,
-            committed_bytes,
-            "Blob depot committed-byte counter underflows",
-        ),
-        (
-            DEPOT_RESERVED_FILE_BYTES,
-            reserved_bytes,
-            "Blob depot reserved-byte counter underflows",
-        ),
-    ] {
-        let current = depot
-            .get(field)?
-            .map(|value| value.value())
-            .ok_or_else(|| blob_error(BlobStoreError::SchemaInvariant(message)))?;
-        depot.insert(
-            field,
-            current
-                .checked_sub(decrement)
-                .ok_or_else(|| blob_error(BlobStoreError::SchemaInvariant(message)))?,
-        )?;
-    }
-    Ok(true)
-}
-
 fn load_import_read(
     read: &redb::ReadTransaction,
     variant: BlobVariantId,
@@ -2479,6 +2964,25 @@ fn load_chunk_read(
 }
 
 #[cfg(test)]
+pub(super) fn remove_completion_chunk_state_for_test(
+    write: &redb::WriteTransaction,
+    variant: BlobVariantId,
+    index: u64,
+) -> Result<(), StoreError> {
+    let key = chunk_key(variant, index);
+    if write
+        .open_table(BLOB_CHUNKS)?
+        .remove(key.as_slice())?
+        .is_none()
+    {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "test Blob completion chunk state is missing",
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 pub(super) fn corrupt_import_profile_for_test(
     write: &redb::WriteTransaction,
     variant: BlobVariantId,
@@ -2499,6 +3003,61 @@ pub(super) fn corrupt_import_profile_for_test(
     }
     if let Some(count) = chunk_count {
         import.chunk_count = count;
+    }
+    let encoded = encode_import(&import)?;
+    write
+        .open_table(BLOB_IMPORTS)?
+        .insert(variant.as_bytes().as_slice(), encoded.as_slice())?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn corrupt_completion_import_for_test(
+    write: &redb::WriteTransaction,
+    variant: BlobVariantId,
+    field: &str,
+) -> Result<(), StoreError> {
+    let mut import = load_import_write(write, variant)?.ok_or_else(|| {
+        blob_error(BlobStoreError::SchemaInvariant(
+            "test Blob import is missing",
+        ))
+    })?;
+    match field {
+        "whole_plaintext_sha256" => import.whole_plaintext_sha256[0] ^= 0x80,
+        "media_type" => import.media_type = Some("forged/type".into()),
+        "schema_id" => import.schema_id.push(0x5a),
+        "total_len" => {
+            import.total_len = import
+                .total_len
+                .checked_add(1)
+                .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        }
+        "chunk_size" => import.chunk_size ^= 1,
+        "physical_lineage" => {
+            import.physical_lineage.as_mut().ok_or_else(|| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "test Blob completion import has no physical lineage",
+                ))
+            })?[0] ^= 0x80
+        }
+        "finalized_manifest_digest" => {
+            import.finalized_manifest_digest.as_mut().ok_or_else(|| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "test Blob completion import is not finalized",
+                ))
+            })?[0] ^= 0x80
+        }
+        "chunk_count" => {
+            import.chunk_count = import
+                .chunk_count
+                .checked_add(1)
+                .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        }
+        _ => {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "unknown test Blob completion corruption field",
+            )));
+        }
     }
     let encoded = encode_import(&import)?;
     write
@@ -3433,6 +3992,21 @@ impl OwnedDirectory {
         })?;
         self.require_matching_owner_marker(marker, &expected, true)?;
         Ok(())
+    }
+
+    fn require_store_binding_read_only(
+        &self,
+        store_path: &Path,
+        backing_identity: StoreBackingIdentity,
+        owner_token: [u8; 32],
+    ) -> Result<(), StoreError> {
+        let expected = depot_owner_marker(store_path, backing_identity, owner_token)?;
+        let marker = self.read_owner_marker()?.ok_or_else(|| {
+            blob_error(BlobStoreError::DepotIntegrity(
+                "Blob depot owner marker is missing",
+            ))
+        })?;
+        self.require_matching_owner_marker(marker, &expected, true)
     }
 
     fn elect_store_binding(

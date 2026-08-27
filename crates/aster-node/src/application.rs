@@ -1,10 +1,12 @@
 //! High-level selected Event, State, Record, and Blob application surfaces.
 //!
 //! This module deliberately exposes no source-envelope, cryptographic-provider,
-//! carrier, inventory, reconciliation, or sealed-byte operations. Blob access
-//! is synchronous and streaming; other plaintext is bounded. This module
-//! composes the same mission-bound redb authority used by the selected runtime
-//! and freshly verifies every application result before returning plaintext.
+//! carrier, inventory, reconciliation, or sealed-byte operations. Stopped Blob
+//! access is synchronous and streaming; live Blob access uses the bounded
+//! actor and returns one zeroize-on-drop page. Other plaintext is bounded.
+//! This module composes the same mission-bound redb authority used by the
+//! selected runtime and freshly verifies every application result before
+//! returning plaintext.
 
 use std::{
     fmt, fs,
@@ -51,9 +53,12 @@ use crate::{
 mod blob;
 mod record;
 mod state;
+pub(crate) use blob::SelectedBlobCommand;
 pub use blob::{
-    BlobDepotLimits, BlobId, BlobPublishRequest, BlobPublishResult, BlobReadRequest,
-    BlobReadResult, SelectedBlobNode, SelectedBlobOptions,
+    BlobDepotLimits, BlobId, BlobPublishRequest, BlobPublishResult, BlobReadPage,
+    BlobReadPageRequest, BlobReadRequest, BlobReadResult, MAX_SELECTED_BLOB_PAGE_BYTES,
+    MAX_SELECTED_LIVE_BLOB_BYTES, MAX_SELECTED_LIVE_BLOB_CHUNKS, SelectedBlobHandle,
+    SelectedBlobNode, SelectedBlobOptions,
 };
 pub(crate) use record::SelectedRecordCommand;
 pub use record::{
@@ -791,7 +796,7 @@ impl SelectedEventCommand {
 
 /// One bounded high-level application command owned by the running node actor.
 ///
-/// The wrapper keeps Event, State, and Record operations on one admission and
+/// The wrapper keeps Event, State, Record, and Blob operations on one admission and
 /// fairness lane. Only Event subscription changes require the actor's
 /// selector-write lease; plaintext operations for every class remain behind
 /// the same mission-bound store authority.
@@ -799,6 +804,7 @@ pub(crate) enum SelectedApplicationCommand {
     Event(SelectedEventCommand),
     State(SelectedStateCommand),
     Record(SelectedRecordCommand),
+    Blob(SelectedBlobCommand),
 }
 
 impl SelectedApplicationCommand {
@@ -811,6 +817,7 @@ impl SelectedApplicationCommand {
             Self::Event(command) => command.reject(),
             Self::State(command) => command.reject(),
             Self::Record(command) => command.reject(),
+            Self::Blob(command) => command.reject(),
         }
     }
 }
@@ -1761,6 +1768,7 @@ fn application_error(operation: &'static str, error: NodeError) -> ApplicationEr
             ApplicationErrorKind::ExpiredOrRetired
         }
         NodeError::Protocol(_) => ApplicationErrorKind::Integrity,
+        NodeError::FatalBlobCoherence(_) => ApplicationErrorKind::StateUnavailable,
         NodeError::Identity(_)
         | NodeError::SoftwareErasure(_)
         | NodeError::Mission(_)
