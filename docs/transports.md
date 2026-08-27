@@ -42,13 +42,17 @@ set difference, not policy or causality.
 
 `aster-redb-store` is the mission-bound transaction authority for ordered
 control effects, active policy and selector snapshots, accepted objects,
-at-least-once Event delivery, route-only Event representations, and local
-State, Record, and Blob state. The sibling depot stores bounded Blob
-ciphertext; redb owns its committed-file markers and publication authority.
+at-least-once Event delivery, durable positive-current-version State delivery,
+route-only Event representations, and local State, Record, and Blob state. The
+sibling depot stores bounded Blob ciphertext; redb owns its committed-file
+markers and publication authority.
 `aster-node` is the only selected composition root.
 
 The selected runtime networks Event, State, and Record and exposes cloneable
 live Rust handles for all three through one bounded actor command lane. It also
+gives State a durable application subscription/poll/acknowledgement queue for
+freshly verified positive current versions; that application selector does not
+mutate the separately configured network receive interest. The runtime also
 exposes a cloneable live Blob handle: publish accepts an already-open regular
 file at cursor zero, bounded to 64 MiB and 1,024 canonical 64-KiB chunks, and a
 live read returns at most 64 KiB of plaintext per zeroize-on-drop page. Under
@@ -65,12 +69,28 @@ equivalent tests.
 |---|---|---|
 | Selected direct Iroh | Manually admitted exact endpoint ID and socket, authenticated direct UDP/QUIC, and bounded exchange | A retained one-host cone software-namespace cell observed Direct and exact Event delivery across two NAT routers with static operator-known mappings. Carrier authentication is not mission or control/source authorization; discovery/punching, dynamic or representative NAT, physical-network acceptance, and multi-carrier failover remain open. |
 | Selected controlled Iroh relay | One operator-pinned HTTPS relay with explicit trust, either alongside the initial direct locator or with IP disabled | A retained one-host restrictive software-namespace cell blocked direct traffic, observed Relay, and delivered one exact Event through the controlled relay. It is not a temporal direct-first/fallback chronology, representative or physical NAT, public or independently operated relay, an Aster payload-blind relay, State/Record/Blob-over-relay acceptance, or release authorization. |
-| Selected node and CLI | Networked Event and State/Record reconciliation, semantic-v5 direct Blob source/carrier transfer, live Event/State/Record/Blob Rust APIs, durable Event stream and State positive-current-version application delivery in Rust, stopped Event/State/Record/Blob facades, payload-blind Event relay, restart/idempotency, bounded one-host three-participant direct Blob publication/partial/different-peer-resume/read/graceful-reopen evidence, and bounded Unix zeroization | Reference provisioning; no State materialized-view or synthetic-withdrawal delivery, Record/Blob subscription, Blob status API, or selected-node language bindings; State subscriptions do not dynamically change configured network interests; no retained State-subscription acceptance, arbitrary-peer or route-only Blob resume acceptance, Blob-over-controlled-relay acceptance, finite State/Record/Blob TTL and non-Linux finite Event custody, generalized control administration, representative physical or mixed-implementation evidence, resource/soak evidence, or production authorization |
+| Selected node and CLI | Networked Event and State/Record reconciliation, semantic-v5 direct Blob source/carrier transfer, live Event/State/Record/Blob Rust APIs, durable Event stream and State positive-current-version application delivery in Rust, stopped Event/State/Record/Blob facades, payload-blind Event relay, restart/idempotency, bounded retained one-host State forced-process-redelivery and three-participant direct Blob publication/partial/different-peer-resume/read/graceful-reopen evidence, and bounded Unix zeroization | Reference provisioning; no State contact/status, materialized-view, or synthetic-withdrawal delivery, Record/Blob delivery, Blob status API, or selected-node language bindings; State subscriptions do not dynamically change configured network interests; no arbitrary-peer or route-only Blob resume acceptance, Blob-over-controlled-relay acceptance, finite State/Record/Blob TTL and non-Linux finite Event custody, generalized control administration, representative physical or mixed-implementation evidence, resource/soak evidence, or production authorization |
 | Current semantic in-memory link | Full high-level host contact, authentication, reconciliation, resume, and failure tests | It is a test carrier and is not wired to the selected composition |
 | Current semantic UDP/IP | Nonblocking link, manual endpoint mapping, protected local discovery, rendezvous helpers, opaque relay components | Migration onto the selected node; full host acceptance on physical or operational networks |
 | Current semantic NAT/rendezvous and relay | Bounded rendezvous, endpoint-punching, and opaque-relay helpers with local software tests | Selected-node integration and a two-device representative-NAT direct/fallback result |
 | Current semantic BTLE | MTU-aware link, unicast plus an advertisement primitive, disconnect handling, platform `BleRadio` seam | Selected-node integration; a shipped Android, iOS, Linux, or controller-specific radio driver; complete one-to-many profile |
 | LoRa, serial, file | The requirements and semantic design do not preclude them | No selected adapters ship |
+
+The [retained 9,656-byte State-delivery receipt](implementation/evidence/selected-live-state-subscription-8912fc3.json)
+(SHA-256
+`7d0b568dd4d57c3f2967da55953896829261877513c59c51a0b274eeda69485f`,
+signed source `8912fc3`) exercises the application queue and direct carrier together
+on one same-implementation loopback host. Across two participants, three
+processes, 10 actor lifetimes, and 10 positive direct contacts, it forces the
+receiver process down after a flushed unacknowledged poll and observes the same
+State identity as attempt 2 in a fresh process before acknowledgement,
+idempotent re-acknowledgement, and an empty poll. It also distinguishes
+application delivery intent from static network interest, withholds one
+authorized but network-uninterested State, suppresses causal ancestors, and
+retains a current tombstone and subscription through one final peerless reopen.
+It is not a materialized-view/status result, dynamic network-interest mutation,
+physical/NAT/relay/BTLE or mixed-implementation evidence, scale beyond two,
+resource/soak evidence, or release authorization.
 
 Separately from the parent and controlled-relay evidence summarized in the
 table, an operator-attested Cargo release-profile binary run for the signed
@@ -202,8 +222,9 @@ hosts, NAT or Internet paths, controlled or public relay, BTLE, process crash
 or power-loss recovery, long-offline recovery, arbitrary-peer or route-only
 resume, scale beyond three participants, resource thresholds or soak,
 physical sanitization, independent-implementation interoperability, or release
-authorization. Blob subscription/status,
-State/Record subscriptions and selected-node bindings, route-only Blob
+authorization. Blob subscription/status, durable Record/Blob delivery, State
+contact/status and materialized-view/synthetic-withdrawal behavior, dynamic
+State network interests, selected-node bindings, route-only Blob
 relay/custody, Blob-over-controlled-relay acceptance, generalized control
 administration, repeated multi-scope lifecycle, finite State/Record/Blob TTL,
 non-Linux finite Event custody, and protected provisioning remain to be

@@ -23,8 +23,9 @@ authorization. The selected live Event handle is documented separately; this
 CLI tour uses built-in roles and does not turn last-contact status into a
 global-convergence claim. State/Record reconciliation, the live Blob
 application surface, and the semantic-v5 direct-Iroh Blob mechanism are current
-selected-code surfaces tested in separate automation; their presence does not
-enlarge this Event-only tour into a retained Blob acceptance receipt.
+selected-code surfaces tested separately. A retained State-delivery receipt is
+described below, but neither it nor the separate Blob receipt enlarges this
+Event-only CLI tour into broader acceptance.
 
 ## Prerequisites
 
@@ -363,6 +364,22 @@ completion checks. The CLI does not expose these handles as language bindings,
 and its built-in roles neither publish nor read Blob. Record network ingest
 retains concurrent revisions and never executes application merge code.
 
+State's live Rust handle additionally exposes durable positive-current-version
+subscription, poll, acknowledgement, and unsubscribe operations. A
+[retained 9,656-byte receipt](../implementation/evidence/selected-live-state-subscription-8912fc3.json)
+(SHA-256
+`7d0b568dd4d57c3f2967da55953896829261877513c59c51a0b274eeda69485f`,
+signed source `8912fc3`) observes a forced receiver-process termination after a
+flushed unacknowledged poll and fresh-process attempt-2 redelivery,
+acknowledgement, re-acknowledgement, and empty poll. The one-host,
+same-implementation run also proves that the application subscription does not
+mutate static network interest, withholds an authorized network-uninterested
+State, suppresses acknowledged/superseded ancestors, and retains a current
+tombstone and subscription through one final peerless reopen. It does not add
+State contact/status, a materialized view or synthetic withdrawals, dynamic
+network interests, physical/mixed or scale/resource evidence, or release
+authorization. The CLI's built-in roles did not produce this receipt.
+
 The built-in application roles require bundles granting scope `demo/mesh`, key
 epoch 1, and topic `mesh.ping-pong` to the endpoint applications. A relay role
 requires only the scope/epoch route grant. This manual shape is documentation of
@@ -522,16 +539,17 @@ reconciliation. Do not use `put` as evidence for the source-authenticated mesh.
 | Component | Sole responsibility in the selected lane |
 |---|---|
 | `aster-profile` | Stable complete reconciliation keys and canonical inventory ordering; class-specific exact Event/State/Record transfer IDs enter by explicit conversion |
-| `aster-redb-store` | Mission-bound audited control chain and atomic policy snapshots plus semantic Event/State/Record/Blob causal/operation state, bounded Event route-only cache, a durable terminal software-zeroization intent/phase receipt, and a disjoint retained opaque compatibility namespace |
+| `aster-redb-store` | Mission-bound audited control chain and atomic policy snapshots plus semantic Event/State/Record/Blob causal/operation state, durable Event and positive-current-version State delivery state, bounded Event route-only cache, a durable terminal software-zeroization intent/phase receipt, and a disjoint retained opaque compatibility namespace |
 | `aster-negentropy` | Bounded, clock-independent set difference over exact transfer IDs |
 | `aster-iroh` | Direct and operator-pinned controlled-relay endpoint lifecycle, carrier identity, and bounded exchange |
-| `aster-node` | Composition, mission-before-inventory and control-before-data ordering, peer route/interest filtering, exact control/Event/State/Record transfer, semantic-v5 direct Blob source/range automation, live Event/State/Record/Blob handles, authority commands, sample applications, bounded same-UID Unix local zeroization lifecycle, receipts, and CLI |
+| `aster-node` | Composition, mission-before-inventory and control-before-data ordering, peer route/interest filtering, exact control/Event/State/Record transfer, semantic-v5 direct Blob source/range automation, live Event/State/Record/Blob handles, durable Event and State application delivery, authority commands, sample applications, bounded same-UID Unix local zeroization lifecycle, receipts, and CLI |
 | `aster-core` | Existing spec-verified hybrid mission session, control envelope, recipient-filtered rekey, and typed source-envelope Event/State/Record/Blob semantics, used rather than rewritten |
 
 No old path is removed until its replacement passes equivalent tests. Current
-open work includes State/Record subscriptions and selected-node bindings,
-broader State/Record partition/relay acceptance, Blob subscription/status and
-selected-node bindings, Blob resume beyond the bounded retained
+open work includes durable Record/Blob delivery, State contact/status and
+materialized-view/synthetic-withdrawal behavior, dynamic State network
+interests, selected-node bindings, broader State/Record partition/relay
+acceptance, Blob status, and Blob resume beyond the bounded retained
 three-participant/different-eligible-peer direct-Iroh observation,
 controlled-relay Blob acceptance, route-only Blob relay/custody, generalized
 publish/subscribe and topic filtering, finite State/Record/Blob custody and

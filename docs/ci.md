@@ -18,7 +18,7 @@ single stable check name **`CI / required`**.
 
 | Check | Runner | Purpose |
 | --- | --- | --- |
-| `quality` | `ubuntu-24.04` | Runs `mise run check`: Rust and Go formatting, Apache-2.0-only project-license and package checks, exact 348-row implementation-requirements traceability, the selected-node dependency boundary, vendored netlink source-equivalence and 13-test compatibility gates, the retained-libp2p-oracle boundary, selected live-Event, live-mutable, and live-Blob receipt checker tests, Clippy with warnings denied, the full Rust workspace test suite, C ABI build and C/C++ header checks, Rust/Python conformance, Python/Go binding tests, and the lab-controller tests. |
+| `quality` | `ubuntu-24.04` | Runs `mise run check`: Rust and Go formatting, Apache-2.0-only project-license and package checks, exact 348-row implementation-requirements traceability, the selected-node dependency boundary, vendored netlink source-equivalence and 13-test compatibility gates, the retained-libp2p-oracle boundary, selected live-Event, live-mutable, live-State-subscription, and live-Blob receipt checker tests, Clippy with warnings denied, the full Rust workspace test suite, C ABI build and C/C++ header checks, Rust/Python conformance, Python/Go binding tests, and the lab-controller tests. |
 | `macOS tests` | `macos-14` | Runs all Rust workspace tests on the supported Apple runner with Rust 1.97.1. |
 | `Rust 1.91 MSRV` | `ubuntu-24.04` | Checks every workspace target and feature with the declared minimum supported Rust version. |
 | `dependency policy` | `ubuntu-24.04` | Enforces the retained-libp2p-oracle boundary, applies `deny.toml` to the root and fuzz dependency graphs, and audits both lockfiles against a freshly downloaded RustSec database. |
@@ -510,10 +510,93 @@ garbage collection, or delete-wins. It supplies no physical, NAT/Internet,
 controlled/public-relay, BTLE, independent-implementation, scale beyond two,
 resource-threshold, long-duration, Event/Blob-live, or release acceptance from
 that State/Record receipt.
-Retained State-subscription acceptance, durable Record delivery, selected-node
+The separate retained State-subscription gate below adds bounded durable
+positive-current-version delivery. Durable Record delivery, selected-node
 bindings, finite TTL, and automatic registered-policy Record merge remain open.
 Its zero Blob counters
 do not evidence the newer live Blob mechanism.
+
+## Selected live State subscription retained gate
+
+The v1
+[`selected-live-state-subscription-8912fc3.json`](implementation/evidence/selected-live-state-subscription-8912fc3.json)
+canonical receipt is 9,656 bytes with SHA-256
+`7d0b568dd4d57c3f2967da55953896829261877513c59c51a0b274eeda69485f`
+and binds the run to good-signature source commit `8912fc3`. Two participants
+and three processes execute ten actor lifetimes across seven phases with at
+most two concurrent actors. Nine lifetimes stop gracefully; the parent sends
+one receiver child `SIGKILL` after its attempt-one durable poll is flushed and
+before acknowledgement. Both participant binds are reacquired at the end.
+
+Six durable State publications produce five network inserts, deterministic
+concurrent-origin reduction, a causal successor, and an explicit current
+tombstone. One exact-key application subscription is inserted once and replayed
+seven times. Four deliveries include the local current origin, the successor at
+attempt one, the same successor at attempt two in a fresh process, and the
+current tombstone. Two acknowledgements, two idempotent reacknowledgements,
+eight token-binding checks, and four empty polls cover superseded-pending
+retirement, durable redelivery, token rotation, malformed and cross-binding
+rejection, ancestor suppression, and final peerless reopen.
+
+The gate separately proves that application delivery does not mutate network
+receive policy: one configured-network-interest State remains durably retained
+but application-unsubscribed, while one authorized State absent from configured
+network interests remains withheld. These are static `NodeConfig` interests;
+State subscription creation and replay do not change them.
+
+Create a new owner-restricted raw root only from a clean good-signed checkout,
+with the repository-pinned Python 3.13.7 and Rust 1.97.1 runtimes already
+installed through `mise`, then project a canonical receipt. Select those
+runtimes from a neutral directory and execute the source-bound tools by absolute
+path; this avoids trusting checkout configuration merely to run the verifier:
+
+```sh
+ASTER_SOURCE=/path/to/clean-good-signed-aster-source
+cd /private/tmp
+ASTER_PYTHON="$(mise where python@3.13.7)/bin/python3"
+mise exec python@3.13.7 rust@1.97.1 -- python3 "$ASTER_SOURCE/tools/run-selected-live-state-subscription.py" \
+  --source "$ASTER_SOURCE" \
+  --raw-root /private/tmp/aster-selected-live-state-subscription-new
+
+install -d -m 700 /private/tmp/aster-live-state-subscription-projection
+"$ASTER_PYTHON" "$ASTER_SOURCE/tools/check-selected-live-state-subscription-receipt.py" - \
+  --raw-root /private/tmp/aster-selected-live-state-subscription-new \
+  --source "$ASTER_SOURCE" \
+  --output /private/tmp/aster-live-state-subscription-projection/selected-live-state-subscription-receipt.json
+```
+
+The checked-in receipt can be replayed byte-for-byte only with the installed
+pinned Python runtime, the externally retained raw root, and a separate clean
+checkout detached at the exact source. Pass both the source-bound checker and
+the checked-in receipt by absolute path because the receipt postdates the
+signed source freeze:
+
+```sh
+ASTER_SOURCE=/path/to/aster-source-detached-at-8912fc33571449d1beb4a4cb0f204b5dcd44e8c2
+ASTER_RECEIPT=/absolute/path/to/current-aster-checkout/docs/implementation/evidence/selected-live-state-subscription-8912fc3.json
+cd /private/tmp
+ASTER_PYTHON="$(mise where python@3.13.7)/bin/python3"
+"$ASTER_PYTHON" "$ASTER_SOURCE/tools/check-selected-live-state-subscription-receipt.py" \
+  --raw-root /path/to/retained/selected-live-state-subscription-raw-root \
+  --source "$ASTER_SOURCE" \
+  "$ASTER_RECEIPT"
+cd "$ASTER_SOURCE"
+"$ASTER_PYTHON" tools/test-selected-live-state-subscription-receipt.py
+```
+
+The source/binary/execution link is operator-attested, not cryptographic or a
+reproducible build. The six participant mission, identity, and store artifacts
+are validated by metadata only and are never opened, read, or hashed by the
+checker. State causal observation and publication order are producer-attested.
+This is one-host, same-implementation, direct-loopback evidence only. It claims
+no physical host or carrier, NAT/Internet, relay, BTLE, mixed implementation,
+scale/resource/soak, Event/Record/Blob live acceptance, or release result.
+
+The delivery contract is positive-current-only. Its explicit current tombstone
+is a State version, not a synthetic withdrawal; there is no materialized view,
+transition feed, Current-to-None event, or dynamic `NodeConfig` interest
+mutation. The older mutable v2 receipt remains primary for its broader State
+causal convergence observation.
 
 ## Selected live Event retained gate
 

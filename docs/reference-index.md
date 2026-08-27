@@ -40,8 +40,9 @@ For a shorter path based on what you are trying to accomplish, start at the
 - [Conformance and acceptance](conformance.md)
 - [CI and local validation](ci.md)
 - Retained live-application receipts: [Event](implementation/evidence/selected-live-event-c464129.json),
-  [State/Record](implementation/evidence/selected-live-mutable-6cabb4c.json), and
-  [Blob](implementation/evidence/selected-live-blob-044d90f.json)
+  [State/Record convergence](implementation/evidence/selected-live-mutable-6cabb4c.json),
+  [State durable delivery](implementation/evidence/selected-live-state-subscription-8912fc3.json),
+  and [Blob](implementation/evidence/selected-live-blob-044d90f.json)
 - [Fuzzing guide](../fuzz/README.md)
 - [Lab guide](../lab/README.md)
 - [Reconciliation FOSS bake-off](reconciliation-bakeoff.md)

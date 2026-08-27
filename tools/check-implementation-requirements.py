@@ -72,6 +72,9 @@ NAT_RECEIPT = (
 LIVE_EVENT_RECEIPT = (
     "docs/implementation/requirements-status.md#selected-live-event-retained-receipt"
 )
+LIVE_STATE_SUBSCRIPTION_RECEIPT = (
+    "docs/implementation/requirements-status.md#selected-live-state-subscription-retained-receipt"
+)
 LIVE_MUTABLE_RECEIPT = (
     "docs/implementation/requirements-status.md#selected-live-state-and-record-retained-receipt"
 )
@@ -95,6 +98,14 @@ EVENT_SUBSCRIPTION_SLICE = (
     "crates/aster-node/src/runtime.rs; crates/aster-node/src/application.rs; "
     "crates/aster-node/examples/event_application.rs"
 )
+STATE_SUBSCRIPTION_SLICE = (
+    "crates/aster-redb-store/src/state_subscription.rs; "
+    "crates/aster-redb-store/src/lib.rs; "
+    "crates/aster-node/src/application.rs; "
+    "crates/aster-node/src/application/state.rs; "
+    "crates/aster-node/src/runtime.rs; "
+    "docs/quickstart/selected-state-api.md"
+)
 EVENT_LIVE_SLICE = (
     "crates/aster-node/src/application.rs; crates/aster-node/src/runtime.rs; "
     "crates/aster-node/src/lib.rs; "
@@ -109,6 +120,13 @@ LIVE_EVENT_ACCEPTANCE_SLICE = (
     "tools/check-selected-live-event-receipt.py; "
     "tools/test-selected-live-event-receipt.py; "
     "docs/implementation/evidence/selected-live-event-c464129.json"
+)
+LIVE_STATE_SUBSCRIPTION_ACCEPTANCE_SLICE = (
+    "crates/aster-node/examples/live_state_subscription_acceptance.rs; "
+    "tools/run-selected-live-state-subscription.py; "
+    "tools/check-selected-live-state-subscription-receipt.py; "
+    "tools/test-selected-live-state-subscription-receipt.py; "
+    "docs/implementation/evidence/selected-live-state-subscription-8912fc3.json"
 )
 CUSTODY_SLICE = (
     "crates/aster-core/src/custody.rs; crates/aster-core/src/source_event.rs; "
@@ -462,10 +480,10 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
         "The retained receipt covers one captured leaf on one-host direct loopback; the live cancellation/teardown cases are current-code automation only. Revocation and rekey remain separate operator transactions with no automatic or atomic affected-scope workflow; physical capture, larger/non-line topologies, authority recovery, all data classes, and independent implementations remain open.",
     ),
     "DM-5.1-01": selected_claim(
-        "implemented-uncredited",
+        "observed-bounded",
         "aster-core + aster-redb-store + aster-node",
-        f"{STATE_LOCAL_SLICE}; {MUTABLE_NETWORK_SLICE}; {LIVE_MUTABLE_SLICE}; {LIVE_MUTABLE_RECEIPT}; SelectedStateNode and the actor-owned cloneable SelectedStateHandle source-seal and durably publish bounded State versions, query one exact topic/scope/logical-key projection without exposing sealed representations or provider internals, and reconcile explicit interests under semantic-v4/v5 class/direction lanes; the retained two-peer run exercised peerless concurrent publication, exact retry, direct reconciliation, deterministic concurrent projection, a non-tombstone successor that observed both initial heads, an empty authenticated tombstone that observed the successor as its one active head and all three prior versions, handle closure, and exact final projection after one immediate peerless restart",
-        "The retained run is one same-implementation, one-host, two-participant observation; its causal observation/publication order is producer-attested, and restart covers one immediate graceful peerless reopen rather than indefinite tombstone retention, compaction, or garbage collection. A durable State delivery subscription, language bindings, selected relay cache, finite TTL, physical carriers, mixed implementations, scale, and release acceptance remain open. Selected finite State TTL remains structurally rejected.",
+        f"{STATE_LOCAL_SLICE}; {MUTABLE_NETWORK_SLICE}; {LIVE_MUTABLE_SLICE}; {LIVE_MUTABLE_RECEIPT}; {STATE_SUBSCRIPTION_SLICE}; {LIVE_STATE_SUBSCRIPTION_ACCEPTANCE_SLICE}; {LIVE_STATE_SUBSCRIPTION_RECEIPT}; SelectedStateNode and the actor-owned cloneable SelectedStateHandle source-seal and durably publish bounded State versions, query one exact topic/scope/logical-key projection without exposing sealed representations or provider internals, reconcile explicit interests under semantic-v4/v5 class/direction lanes, and durably subscribe, poll, acknowledge, and unsubscribe positive Current projections; the retained State-subscription run exercised peerless concurrent origins, direct reconciliation, a causally observing successor, an authenticated empty tombstone, forced receiver-process termination after a flushed unacknowledged poll, exact attempt-two fresh-process redelivery, idempotent acknowledgement, final empty delivery state, and one immediate peerless reopen",
+        "The retained State runs are same-implementation, one-host, two-participant observations; causal observation/publication order is producer-attested, and restart covers one immediate peerless reopen rather than indefinite tombstone retention, compaction, or garbage collection. Application subscriptions are intentionally separate from configured network interests and deliver positive Current versions rather than Current-to-None withdrawal. Record/Blob delivery subscriptions, language bindings, selected relay cache, finite State TTL, physical carriers, mixed implementations, scale, and release acceptance remain open. Selected finite State TTL remains structurally rejected.",
     ),
     "DM-5.1-02": selected_claim(
         "observed-bounded",
@@ -555,13 +573,13 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     ),
     "DM-5.1-17": selected_claim(
         "implemented-uncredited", "aster-core + aster-node",
-        f"{EVENT_SLICE}; {LIVE_MUTABLE_SLICE}; {LIVE_MUTABLE_RECEIPT}; {BLOB_LIVE_SLICE}; selected live and stopped boundaries publish and query Event, State, Record, and Blob through high-level typed operations; Event additionally exposes subscribe/poll/acknowledge/unsubscribe, Record exposes conflict annotation and exact-guard resolution, and Blob exposes bounded zeroize-on-drop page reads",
-        "State/Record/Blob have no durable delivery subscriptions, Blob has no class-specific status operation, the agent remains Event-only, and selected-node language bindings remain open.",
+        f"{EVENT_SLICE}; {LIVE_MUTABLE_SLICE}; {LIVE_MUTABLE_RECEIPT}; {BLOB_LIVE_SLICE}; {STATE_SUBSCRIPTION_SLICE}; selected live and stopped boundaries publish and query Event, State, Record, and Blob through high-level typed operations; Event and State additionally expose subscribe/poll/acknowledge/unsubscribe, State delivers freshly verified positive Current versions, Record exposes conflict annotation and exact-guard resolution, and Blob exposes bounded zeroize-on-drop page reads",
+        "Record/Blob have no durable delivery subscriptions, State has no contact/status or materialized-view/Current-to-None delivery, Blob has no class-specific status operation, the agent remains Event-only, and selected-node language bindings remain open.",
     ),
     "DM-5.1-18": selected_claim(
         "implemented-uncredited", "aster-core + aster-redb-store + aster-node",
-        f"{EVENT_SLICE}; {EVENT_SUBSCRIPTION_SLICE}; {EVENT_LIVE_SLICE}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; Event, State, Record, and Blob topics are source-authenticated and content-granted; Event has durable Consume/Carry delivery selectors, semantic-v4/v5 State/Record have explicit class-separated interests, and each v5 exact Blob selector carries a current peer-bound content proof",
-        "Repeated dynamic selector lifecycle, durable State/Record/Blob application delivery, route-only Blob custody, and independent interoperability remain open.",
+        f"{EVENT_SLICE}; {EVENT_SUBSCRIPTION_SLICE}; {EVENT_LIVE_SLICE}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; {STATE_SUBSCRIPTION_SLICE}; Event, State, Record, and Blob topics are source-authenticated and content-granted; Event has durable Consume/Carry delivery selectors, State has a durable exact topic/scope positive-current-version application selector separate from configured network interests, semantic-v4/v5 State/Record have explicit class-separated network interests, and each v5 exact Blob selector carries a current peer-bound content proof",
+        "Repeated and multi-scope State application-selector lifecycle, durable Record/Blob application delivery, dynamic network-interest administration, route-only Blob custody, and independent interoperability remain open.",
     ),
     "DM-5.1-19": selected_claim(
         "implemented-uncredited", "aster-core + aster-redb-store + aster-node",
@@ -590,27 +608,27 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
         "The retained observations are same-implementation, one-host, at-most-three-participant, brief cases and are not all-reachable-node or long-partition results. Mutable causal observation/publication order is producer-attested, and its restart is one immediate graceful peerless reopen rather than crash, power-loss, or indefinite retention evidence. Multiple-scope lifecycle, route-only Blob custody, arbitrary-peer continuation, mixed implementations, physical links, requirement scale, and release authorization remain open.",
     ),
     "DM-5.2-02": selected_claim(
-        "implemented-uncredited",
+        "observed-bounded",
         "aster-redb-store + aster-node",
-        f"{EVENT_SUBSCRIPTION_SLICE}; {EVENT_LIVE_SLICE}; {LIVE_MUTABLE_RECEIPT}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; durable Event Consume/Carry selectors, explicit semantic-v4/v5 class-separated State/Record interests, and v5 exact Blob topic/scope/epoch selectors with peer-bound current content proofs become mission-protected receiver interests; the retained two-class mutable run uses exact reciprocal interests, while ReceiveOnly and legacy semantic versions expose no inapplicable lane",
-        "The retained State/Record flow is same-implementation, one-host, and two-participant, not all reachable subscribed nodes or global convergence. No retained four-class receipt exists; repeated multi-scope lifecycle, route-only Blob custody, long partitions, physical peers, scale, and mixed implementations remain open.",
+        f"{EVENT_SUBSCRIPTION_SLICE}; {EVENT_LIVE_SLICE}; {LIVE_MUTABLE_RECEIPT}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; {STATE_SUBSCRIPTION_SLICE}; {LIVE_STATE_SUBSCRIPTION_ACCEPTANCE_SLICE}; {LIVE_STATE_SUBSCRIPTION_RECEIPT}; durable Event Consume/Carry selectors, durable State topic/scope application selectors, explicit semantic-v4/v5 class-separated State/Record network interests, and v5 exact Blob topic/scope/epoch selectors with peer-bound current content proofs become mission-protected receiver interests; the retained State run kept the application subscription durable across forced process replacement and final reopen while proving it neither expanded nor mutated the separately configured network interest",
+        "The retained State/Record flows are same-implementation, one-host, and two-participant, not all reachable subscribed nodes or global convergence. State application selectors cover exact topic/scope plus an optional descendant-scope flag rather than dynamically changing network interest. No retained four-class subscription receipt exists; repeated multi-scope lifecycle, Record/Blob application subscriptions, route-only Blob custody, long partitions, physical peers, scale, and mixed implementations remain open.",
     ),
     "DM-5.2-06": selected_claim(
         "observed-bounded",
         "aster-redb-store + aster-node",
-        f"{RECEIPT}; {EVENT_SUBSCRIPTION_SLICE}; {EVENT_LIVE_SLICE}; {LIVE_EVENT_ACCEPTANCE_SLICE}; {LIVE_EVENT_RECEIPT}; the retained live receiver durably returned two attempt-one deliveries, flushed the poll result, was forcibly terminated as an OS process before acknowledgement, and a fresh receiver process replayed the same two Event identifiers at attempt two before acknowledging both",
-        "This is one deliberately injected receiver-process termination after one flushed poll, not every crash boundary, power-loss recovery, a positive failed-contact observation, or evidence for State/Record/Blob delivery. Bindings, independent interoperability, physical systems, scale, and release acceptance remain open.",
+        f"{RECEIPT}; {EVENT_SUBSCRIPTION_SLICE}; {EVENT_LIVE_SLICE}; {LIVE_EVENT_ACCEPTANCE_SLICE}; {LIVE_EVENT_RECEIPT}; {STATE_SUBSCRIPTION_SLICE}; {LIVE_STATE_SUBSCRIPTION_ACCEPTANCE_SLICE}; {LIVE_STATE_SUBSCRIPTION_RECEIPT}; the retained Event receiver replayed two flushed unacknowledged attempts after forced process termination; independently, the retained State receiver flushed one durable attempt-one Current-version delivery, was killed without graceful shutdown or acknowledgement, and a fresh process replayed the same State identity at attempt two before acknowledgement",
+        "These are deliberately injected receiver-process terminations after flushed polls, not every crash boundary, power-loss recovery, or a positive failed-contact observation. The State case covers one positive Current version under one durable selector; Record/Blob delivery, bindings, independent interoperability, physical systems, scale, and release acceptance remain open.",
     ),
     "DM-5.2-07": selected_claim(
         "observed-bounded", "aster-redb-store + aster-node",
-        f"{RECEIPT}; {EVENT_SUBSCRIPTION_SLICE}; {EVENT_LIVE_SLICE}; {LIVE_EVENT_ACCEPTANCE_SLICE}; {LIVE_EVENT_RECEIPT}; exact network transfer inserted three alpha Events with zero transfer duplicates; only the two unacknowledged attempt-one deliveries reappeared after forced receiver termination, both retained the same Event identifiers at attempt two, acknowledgement and exact reacknowledgement were idempotent, and later polls plus final peerless reopen were empty after acknowledgement",
-        "The retained case covers one direct two-participant topology and one forced receiver termination. Cycles, broadcast, every external crash point, other data classes, bindings, independent implementations, physical systems, scale, and release acceptance remain open.",
+        f"{RECEIPT}; {EVENT_SUBSCRIPTION_SLICE}; {EVENT_LIVE_SLICE}; {LIVE_EVENT_ACCEPTANCE_SLICE}; {LIVE_EVENT_RECEIPT}; {STATE_SUBSCRIPTION_SLICE}; {LIVE_STATE_SUBSCRIPTION_ACCEPTANCE_SLICE}; {LIVE_STATE_SUBSCRIPTION_RECEIPT}; exact Event transfer inserted three alpha Events with zero transfer duplicates and replayed only unacknowledged attempts; the retained State run inserted five network versions with zero transfer duplicates, redelivered the same unacknowledged State identity after forced process termination, made acknowledgement and exact reacknowledgement idempotent, suppressed acknowledged ancestors, retired a superseded pending origin, and retained an empty post-ack poll through final peerless reopen",
+        "The retained cases cover direct two-participant topologies and one forced receiver termination per data class. State delivery is the deterministic positive Current projection, so superseded pending work is retired rather than delivered as history. Cycles, broadcast, every external crash point, Record/Blob delivery, bindings, independent implementations, physical systems, scale, and release acceptance remain open.",
     ),
     "DM-5.2-08": selected_claim(
         "observed-bounded",
         "aster-redb-store + aster-node",
-        f"{RECEIPT}; {EVENT_SUBSCRIPTION_SLICE}; {EVENT_LIVE_SLICE}; {LIVE_EVENT_ACCEPTANCE_SLICE}; {LIVE_EVENT_RECEIPT}; the retained live run binds exact noninserting publication retry, changed-intent rejection, durable subscription replay, attempt-two redelivery of only unacknowledged Events, idempotent acknowledgement and reacknowledgement, empty post-ack polls, exact beta selector insertion/removal, and policy-changed-since-contact status",
-        "The retained process fault is one forced receiver termination after a flushed poll, not crash injection at every external boundary. The post-policy phase has no fresh contact or beta delivery; other data classes, bindings, independent implementations, physical systems, scale, and release acceptance remain open.",
+        f"{RECEIPT}; {EVENT_SUBSCRIPTION_SLICE}; {EVENT_LIVE_SLICE}; {LIVE_EVENT_ACCEPTANCE_SLICE}; {LIVE_EVENT_RECEIPT}; {STATE_SUBSCRIPTION_SLICE}; {LIVE_STATE_SUBSCRIPTION_ACCEPTANCE_SLICE}; {LIVE_STATE_SUBSCRIPTION_RECEIPT}; the retained Event run binds publication retry/conflict, durable replay, redelivery, acknowledgement, selector lifecycle, and policy status; the retained State run binds forced-process redelivery, durable selector replay, attempt-specific token rotation, idempotent exact reacknowledgement, malformed/wrong-State/wrong-subscription/stale-token rejection, superseded-pending retirement, acknowledged-ancestor suppression, and empty post-ack restart state",
+        "Each retained process fault is one forced receiver termination after a flushed poll, not crash injection at every external boundary or power-loss recovery. The Event post-policy phase has no fresh contact or beta delivery; State application subscriptions intentionally do not mutate configured network interest. Record/Blob delivery, bindings, independent implementations, physical systems, scale, and release acceptance remain open.",
     ),
     "DM-5.2-09": selected_claim(
         "observed-bounded", "aster-core + aster-redb-store + aster-node",
@@ -638,8 +656,8 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     "DM-5.2-15": selected_claim(
         "observed-bounded",
         "aster-core + aster-redb-store + aster-node",
-        f"{STATE_LOCAL_SLICE}; {MUTABLE_NETWORK_SLICE}; {LIVE_MUTABLE_SLICE}; {LIVE_MUTABLE_RECEIPT}; after node-b's exact query observed node-a's causal successor, node-b published one authenticated zero-byte State tombstone at publisher counter three whose context bound one active head and all three prior versions; both connected actors returned the exact four-version projection with that tombstone Current and the successor plus both originals Superseded, its exact retry inserted nothing, and two views after one immediate peerless restart reproduced the same projection",
-        "This proves one direct propagation and immediate graceful-restart observation on one same-implementation host with two participants. The query/observation/publication order is producer-attested, and the restart does not establish tombstone retention duration, compaction, garbage collection, crash or power-loss recovery, or a delete-wins rule. Concurrent deletion/update races, multi-hop and long partitions, physical systems, mixed implementations, scale, and release acceptance remain open.",
+        f"{STATE_LOCAL_SLICE}; {MUTABLE_NETWORK_SLICE}; {LIVE_MUTABLE_SLICE}; {LIVE_MUTABLE_RECEIPT}; {STATE_SUBSCRIPTION_SLICE}; {LIVE_STATE_SUBSCRIPTION_ACCEPTANCE_SLICE}; {LIVE_STATE_SUBSCRIPTION_RECEIPT}; the retained mutable run propagated one authenticated zero-byte tombstone whose context observed the causal successor and all earlier versions; the retained subscription run independently reduced the tombstone to explicit Current with three Superseded ancestors, retired pending superseded work, delivered and acknowledged the Current tombstone, and reproduced the exact projection plus empty acknowledged delivery state after one immediate peerless reopen",
+        "This proves bounded direct propagation, positive-Current delivery, and immediate peerless-restart observation on one same-implementation host with two participants. Causal observation/publication order is producer-attested, and restart does not establish tombstone retention duration, compaction, garbage collection, power-loss recovery, Current-to-None withdrawal, or a delete-wins rule. Concurrent deletion/update races, multi-hop and long partitions, physical systems, mixed implementations, scale, and release acceptance remain open.",
     ),
     "DM-5.2-18": selected_claim(
         "implemented-uncredited",
@@ -786,8 +804,8 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     ),
     "DM-5.5-02": selected_claim(
         "observed-bounded", "aster-redb-store + aster-node",
-        f"{EVENT_SUBSCRIPTION_SLICE}; {EVENT_LIVE_SLICE}; {LIVE_EVENT_ACCEPTANCE_SLICE}; {LIVE_EVENT_RECEIPT}; {LIVE_MUTABLE_RECEIPT}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; the retained live Event receiver durably subscribed only to alpha, transferred exactly the three alpha Events while withholding one authorized beta Event, replayed the alpha selector in a fresh process, then inserted and exactly removed the beta selector; explicit State/Record interests and exact v5 Blob selectors remain protected runtime interests",
-        "The retained Event observation covers one alpha selector and proves withholding, but it has no fresh post-change contact or beta delivery. State/Record/Blob interests are not durable live application subscriptions; repeated multi-scope lifecycle, route-only Blob custody, physical peers, scale, mixed implementations, and release acceptance remain open.",
+        f"{EVENT_SUBSCRIPTION_SLICE}; {EVENT_LIVE_SLICE}; {LIVE_EVENT_ACCEPTANCE_SLICE}; {LIVE_EVENT_RECEIPT}; {LIVE_MUTABLE_RECEIPT}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; {STATE_SUBSCRIPTION_SLICE}; {LIVE_STATE_SUBSCRIPTION_ACCEPTANCE_SLICE}; {LIVE_STATE_SUBSCRIPTION_RECEIPT}; the retained live Event receiver durably subscribed only to alpha and withheld authorized beta; the retained State receiver durably subscribed to one exact topic/scope application surface, proved that network-interested but application-unsubscribed State remained retained without delivery, and separately proved an authorized but network-uninterested State was withheld; explicit Record interests and exact v5 Blob selectors remain protected runtime interests",
+        "The Event observation covers one alpha selector and has no fresh post-change beta delivery. The State observation covers one durable exact topic/scope selector and deliberately proves that application subscription does not mutate the separately configured network interest; it is not dynamic network-selector administration. Record/Blob application subscriptions, repeated multi-scope lifecycle, route-only Blob custody, physical peers, scale, mixed implementations, and release acceptance remain open.",
     ),
     "DM-5.5-03": selected_claim(
         "implemented-uncredited", "aster-node",
@@ -877,8 +895,8 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     ),
     "DM-6-02": selected_claim(
         "observed-bounded", "aster-core + aster-node",
-        f"{MISSION_RECEIPT}; {LIVE_MUTABLE_RECEIPT}; {LIVE_BLOB_RECEIPT}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; {BLOB_LIVE_SLICE}; exact source-sealed Event, State, Record, and Blob bytes are freshly verified before inventory serving and remote admission; retained live State/Record projections and retained live Blob pages follow that verification, Blob publication additionally requires every carrier plus fresh full-content/current-lineage completion, live Blob reads repeat current-policy/projection/depot-capability verification, and Event is reverified before reaction",
-        "State/Record/Blob have no durable application delivery subscriptions and Blob has no class-specific sync/peer status. Route-only Blob custody, hostile physical-network acceptance, independent interoperability, and cryptographic review remain open.",
+        f"{MISSION_RECEIPT}; {LIVE_MUTABLE_RECEIPT}; {LIVE_BLOB_RECEIPT}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; {BLOB_LIVE_SLICE}; {STATE_SUBSCRIPTION_SLICE}; exact source-sealed Event, State, Record, and Blob bytes are freshly verified before inventory serving and remote admission; retained live State/Record projections, live positive-current-version State deliveries, and retained live Blob pages follow that verification, Blob publication additionally requires every carrier plus fresh full-content/current-lineage completion, live Blob reads repeat current-policy/projection/depot-capability verification, and Event is reverified before reaction",
+        "Record/Blob have no durable application delivery subscriptions, State has no class-specific contact/status or Current-to-None delivery, and Blob has no class-specific sync/peer status. Route-only Blob custody, hostile physical-network acceptance, independent interoperability, and cryptographic review remain open.",
     ),
     "DM-6-03": selected_claim(
         "observed-bounded", "aster-core + aster-node",
@@ -897,8 +915,8 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     ),
     "DM-6-06": selected_claim(
         "observed-bounded", "aster-core + aster-node",
-        f"{RECEIPT}; {LIVE_EVENT_RECEIPT}; {LIVE_MUTABLE_RECEIPT}; {LIVE_BLOB_RECEIPT}; {EVENT_SUBSCRIPTION_SLICE}; {EVENT_LIVE_SLICE}; {LIVE_EVENT_ACCEPTANCE_SLICE}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; {BLOB_LIVE_SLICE}; Event poll freshly verifies source/content authorization before returning a durable attempt, and the retained live Event run consumed and acknowledged only authenticated exact alpha publications across forced-process redelivery and normal gap closure; retained live State/Record queries expose only verified projections and partial Blob staging remains nonpublic until fresh full-content verification and atomic promotion",
-        "The live Event observation is one same-implementation direct-loopback case and has no independent packet-capture or cryptographic review. State/Record/Blob have no durable application delivery subscription and Blob has no class-specific status; route-only Blob custody, bindings, physical peers, mixed implementations, and independent interoperability remain open.",
+        f"{RECEIPT}; {LIVE_EVENT_RECEIPT}; {LIVE_MUTABLE_RECEIPT}; {LIVE_BLOB_RECEIPT}; {EVENT_SUBSCRIPTION_SLICE}; {EVENT_LIVE_SLICE}; {LIVE_EVENT_ACCEPTANCE_SLICE}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; {BLOB_LIVE_SLICE}; {STATE_SUBSCRIPTION_SLICE}; {LIVE_STATE_SUBSCRIPTION_ACCEPTANCE_SLICE}; {LIVE_STATE_SUBSCRIPTION_RECEIPT}; Event and State polls freshly verify source/content authorization before committing durable delivery attempts; the retained State run delivered only authenticated deterministic positive Current versions under the exact durable selector, rejected tokens bound to another State or subscription, and kept network-interest and application-subscription authority separate, while retained State/Record queries expose only verified projections and partial Blob staging remains nonpublic until fresh full-content verification and atomic promotion",
+        "The live Event and State delivery observations are same-implementation direct-loopback cases without independent packet-capture or cryptographic review. State polling does not signal Current-to-None withdrawal and its application selector cannot expand network or mission authority. Record/Blob delivery subscriptions and Blob class-specific status, route-only Blob custody, bindings, physical peers, mixed implementations, and independent interoperability remain open.",
     ),
     "DM-6-07": selected_claim(
         "observed-bounded", "aster-core + aster-redb-store + aster-node",
@@ -998,38 +1016,38 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     "DM-7-11": selected_claim(
         "implemented-uncredited",
         "aster-node::application + aster-agent",
-        f"{EVENT_LIVE_SLICE}; {LIVE_MUTABLE_SLICE}; {LIVE_MUTABLE_RECEIPT}; {BLOB_LIVE_SLICE}; {LIVE_BLOB_ACCEPTANCE_SLICE}; {LIVE_BLOB_RECEIPT}; {AGENT_SLICE}; the actor-owned Event, State, Record, and Blob handles expose typed high-level publication/query or bounded page-read operations with sanitized errors; retained runs exercise the State/Record and Blob live boundaries, Event adds delivery subscriptions, gaps, acknowledgement, and contact status, and Record adds explicit conflict annotation and exact-guard resolution",
-        "State/Record/Blob have no durable delivery subscriptions, Blob has no class-specific sync/peer status operation, the agent remains Event-only, and selected-node bindings, operational provisioning, independent usability, and the complete adopter-facing API remain open.",
+        f"{EVENT_LIVE_SLICE}; {LIVE_MUTABLE_SLICE}; {LIVE_MUTABLE_RECEIPT}; {BLOB_LIVE_SLICE}; {LIVE_BLOB_ACCEPTANCE_SLICE}; {LIVE_BLOB_RECEIPT}; {STATE_SUBSCRIPTION_SLICE}; {LIVE_STATE_SUBSCRIPTION_ACCEPTANCE_SLICE}; {LIVE_STATE_SUBSCRIPTION_RECEIPT}; {AGENT_SLICE}; the actor-owned Event, State, Record, and Blob handles expose typed high-level publication/query or bounded page-read operations with sanitized errors; Event and State add durable subscribe/poll/acknowledge/unsubscribe operations, State delivers freshly verified positive Current projections, Event adds gaps and contact status, and Record adds explicit conflict annotation and exact-guard resolution",
+        "Record/Blob have no durable delivery subscriptions, Blob has no class-specific sync/peer status operation, State has no Current-to-None withdrawal signal, the agent remains Event-only, and selected-node bindings, operational provisioning, independent usability, and the complete adopter-facing API remain open.",
     ),
     "DM-7-14": selected_claim(
         "implemented-uncredited",
         "aster-node::application",
-        f"{EVENT_LIVE_SLICE}; {LIVE_MUTABLE_SLICE}; {LIVE_MUTABLE_RECEIPT}; {BLOB_LIVE_SLICE}; {LIVE_BLOB_ACCEPTANCE_SLICE}; {LIVE_BLOB_RECEIPT}; {AGENT_SLICE}; SelectedEventHandle, SelectedStateHandle, SelectedRecordHandle, SelectedBlobHandle, and agent operations/results contain no carrier type, endpoint, address, path choice, or transport selection; the retained Blob producer performs publication and reads through that live application boundary while the acceptance harness separately configures connected actors and performs post-shutdown typed Store inspections",
-        "Node startup and acceptance topology still require separate Iroh configuration, and the retained harness directly inspects Store state for evidence rather than through the adopter API. The agent remains Event-only, and selected-node bindings plus future physical/multicarrier composition require the same boundary audit.",
+        f"{EVENT_LIVE_SLICE}; {LIVE_MUTABLE_SLICE}; {LIVE_MUTABLE_RECEIPT}; {BLOB_LIVE_SLICE}; {LIVE_BLOB_ACCEPTANCE_SLICE}; {LIVE_BLOB_RECEIPT}; {STATE_SUBSCRIPTION_SLICE}; {LIVE_STATE_SUBSCRIPTION_ACCEPTANCE_SLICE}; {LIVE_STATE_SUBSCRIPTION_RECEIPT}; {AGENT_SLICE}; SelectedEventHandle, SelectedStateHandle, SelectedRecordHandle, SelectedBlobHandle, and agent operations/results contain no carrier type, endpoint, address, path choice, or transport selection; the retained State-subscription producer performs subscription, polling, acknowledgement, and unsubscribe through that application boundary while its harness separately configures direct-Iroh actors and gathers acceptance-only coordination records",
+        "Node startup and acceptance topology still require separate Iroh configuration, and retained harnesses use topology coordination and typed Store inspection outside the adopter API. The agent remains Event-only, and selected-node bindings plus future physical/multicarrier composition require the same boundary audit.",
     ),
     "DM-7-15": selected_claim(
         "implemented-uncredited",
         "aster-node::application",
-        f"{EVENT_LIVE_SLICE}; {LIVE_MUTABLE_SLICE}; {LIVE_MUTABLE_RECEIPT}; {BLOB_LIVE_SLICE}; {LIVE_BLOB_ACCEPTANCE_SLICE}; {LIVE_BLOB_RECEIPT}; {AGENT_SLICE}; live Event/State/Record/Blob surfaces return application items, verified projections, Record conflicts/guards, bounded authenticated plaintext pages, delivery attempts where applicable, and high-level Event status without exposing inventories, exact transfer IDs, Negentropy state, carrier ranges, depot capabilities, or contact protocol frames; the retained Blob HANDLE, PUBLISH, PAGE, and READ records stay application-level, while its acceptance-only private raw PROGRESS records deliberately carry exact opaque or hash-derived transfer and object identifiers, prefix offsets, range counts, and staging measurements obtained by post-shutdown Store inspection rather than the application API and excluded from the canonical public receipt",
-        "Complete Blob subscription/status, durable State/Record delivery, selected-node bindings, the Event-only agent, and broader control-administration exposure without leaking synchronization internals; keep acceptance-only Store inspection clearly outside the adopter-facing surface.",
+        f"{EVENT_LIVE_SLICE}; {LIVE_MUTABLE_SLICE}; {LIVE_MUTABLE_RECEIPT}; {BLOB_LIVE_SLICE}; {LIVE_BLOB_ACCEPTANCE_SLICE}; {LIVE_BLOB_RECEIPT}; {STATE_SUBSCRIPTION_SLICE}; {LIVE_STATE_SUBSCRIPTION_ACCEPTANCE_SLICE}; {LIVE_STATE_SUBSCRIPTION_RECEIPT}; {AGENT_SLICE}; live Event/State/Record/Blob surfaces return application items, verified projections, conflicts/guards, bounded authenticated plaintext pages, delivery attempts, and high-level Event status without exposing inventories, exact transfer IDs, Negentropy state, carrier ranges, depot capabilities, or contact protocol frames; State delivery exposes only the verified application item, nonzero attempt, and opaque acknowledgement token, while the canonical retained receipt hashes rather than discloses State identities and tokens",
+        "Complete Blob subscription/status, durable Record delivery, State Current-to-None withdrawal semantics, selected-node bindings, the Event-only agent, and broader control-administration exposure without leaking synchronization internals; keep acceptance-only topology coordination and Store inspection clearly outside the adopter-facing surface.",
     ),
     "DM-7-16": selected_claim(
         "observed-bounded",
         "aster-node",
-        f"{CONTROL_RECEIPT}; {EVENT_SLICE}; {EVENT_LIVE_SLICE}; {LIVE_EVENT_ACCEPTANCE_SLICE}; {LIVE_EVENT_RECEIPT}; {LIVE_MUTABLE_RECEIPT}; {BLOB_LIVE_SLICE}; {LIVE_BLOB_ACCEPTANCE_SLICE}; {LIVE_BLOB_RECEIPT}; the retained live Event publisher committed four durable Events with zero peers, queried all four locally, returned one exact noninserting retry, and preserved the original after changed-intent rejection; retained State/Record and Blob cohorts likewise publish durably while peerless",
-        "The retained offline publications are same-implementation, one-host, and brief; the live Event run has no stakeholder-set offline duration and Blob source-removal timing is producer-attested. Verify longer offline intervals, Blob subscription/status, selected-node bindings, physical systems, independent interoperability, scale, and release acceptance.",
+        f"{CONTROL_RECEIPT}; {EVENT_SLICE}; {EVENT_LIVE_SLICE}; {LIVE_EVENT_ACCEPTANCE_SLICE}; {LIVE_EVENT_RECEIPT}; {LIVE_MUTABLE_RECEIPT}; {BLOB_LIVE_SLICE}; {LIVE_BLOB_ACCEPTANCE_SLICE}; {LIVE_BLOB_RECEIPT}; {STATE_SUBSCRIPTION_SLICE}; {LIVE_STATE_SUBSCRIPTION_ACCEPTANCE_SLICE}; {LIVE_STATE_SUBSCRIPTION_RECEIPT}; retained Event, State, Record, and Blob publishers commit durably while peerless; the State-subscription run durably created its application selector and two concurrent origin publications before direct contact, then retained subscription and acknowledged delivery state through process replacement and final peerless reopen",
+        "The retained offline publications are same-implementation, one-host, and brief; the live Event and State runs have no stakeholder-set offline duration, and mutable causal order plus Blob source-removal timing are producer-attested. Verify longer offline intervals, Record/Blob delivery, Blob status, selected-node bindings, physical systems, independent interoperability, scale, and release acceptance.",
     ),
     "DM-7-17": selected_claim(
         "observed-bounded",
         "aster-node",
-        f"{RECEIPT}; {EVENT_LIVE_SLICE}; {LIVE_EVENT_ACCEPTANCE_SLICE}; {LIVE_EVENT_RECEIPT}; {LIVE_MUTABLE_RECEIPT}; {LIVE_BLOB_RECEIPT}; the retained live Event publisher committed four Events peerless, later transferred exactly three subscribed alpha Events over direct Iroh under a priority threshold, durably redelivered two after forced receiver termination, transferred the withheld routine sequence under normal policy, and retained the closed-through-three stream after final peerless reopen; live State/Record and Blob receipts separately publish peerless and synchronize later",
-        "The Event and Blob observations are brief same-implementation one-host schedules, not a stakeholder-set long offline interval or power-loss result. The Event receipt has no post-policy beta delivery; route-only or arbitrary-peer Blob custody, physical systems, scale, independent interoperability, and release acceptance remain open.",
+        f"{RECEIPT}; {EVENT_LIVE_SLICE}; {LIVE_EVENT_ACCEPTANCE_SLICE}; {LIVE_EVENT_RECEIPT}; {LIVE_MUTABLE_RECEIPT}; {LIVE_BLOB_RECEIPT}; {STATE_SUBSCRIPTION_SLICE}; {LIVE_STATE_SUBSCRIPTION_ACCEPTANCE_SLICE}; {LIVE_STATE_SUBSCRIPTION_RECEIPT}; retained Event, State, Record, and Blob publishers commit peerless and synchronize later; the State-subscription run later transferred five exact authenticated State versions with zero duplicates over positive direct contacts, delivered the deterministic Current version, redelivered one unacknowledged identity after forced receiver termination, and retained an empty acknowledged delivery state after final peerless reopen",
+        "The retained observations are brief same-implementation one-host schedules, not stakeholder-set long-offline or power-loss results. State application subscription and network interest remain separate static surfaces; the Event receipt has no post-policy beta delivery, and Record/Blob durable application delivery, route-only or arbitrary-peer Blob custody, physical systems, scale, independent interoperability, and release acceptance remain open.",
     ),
     "DM-7-18": selected_claim(
         "implemented-uncredited",
         "aster-node + aster-agent + shipped documentation",
-        f"{EVENT_LIVE_SLICE}; {LIVE_MUTABLE_SLICE}; {LIVE_MUTABLE_RECEIPT}; {BLOB_LOCAL_SLICE}; {BLOB_LIVE_SLICE}; {LIVE_BLOB_ACCEPTANCE_SLICE}; {LIVE_BLOB_RECEIPT}; {AGENT_SLICE}; docs ship runnable embedded Event/State/Record and stopped Blob examples plus a 35-line local-agent example; the Blob quickstart contains a live-handle publication/page-read guide and snippet, and a compiled retained acceptance producer exercises the live Blob mechanism",
-        "The compiled live Blob acceptance producer is not a minimal documentation-only integration sample or independent developer-usability study, and no Blob subscription/status sample exists. Durable State/Record delivery, selected-node bindings, operational provisioning, production packaging, and the complete integration surface remain open.",
+        f"{EVENT_LIVE_SLICE}; {LIVE_MUTABLE_SLICE}; {LIVE_MUTABLE_RECEIPT}; {BLOB_LOCAL_SLICE}; {BLOB_LIVE_SLICE}; {LIVE_BLOB_ACCEPTANCE_SLICE}; {LIVE_BLOB_RECEIPT}; {STATE_SUBSCRIPTION_SLICE}; {LIVE_STATE_SUBSCRIPTION_ACCEPTANCE_SLICE}; {LIVE_STATE_SUBSCRIPTION_RECEIPT}; {AGENT_SLICE}; docs ship runnable embedded Event/State/Record and stopped Blob examples plus a local-agent example; the State quickstart documents live subscribe/poll/acknowledge/unsubscribe with explicit network-interest separation, and a compiled retained acceptance producer exercises that exact State delivery mechanism",
+        "The compiled State and Blob acceptance producers are not minimal documentation-only integration samples or independent developer-usability studies. No Record/Blob delivery or Blob status sample exists; selected-node bindings, operational provisioning, production packaging, and the complete integration surface remain open.",
     ),
     "DM-7-20": selected_claim(
         "observed-bounded",

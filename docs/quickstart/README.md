@@ -11,18 +11,35 @@ freshly verified gap inspection, and bounded peer/last-contact status through
 the running actor's sole authority. A focused real-process test publishes
 offline and synchronizes later. The separate [selected State
 quickstart](selected-state-api.md) demonstrates cloneable live publish/query
-through the running actor plus stopped/exclusive latest-value access, causal
-projection, recoverable versions, and visible authenticated tombstones. The
+and durable positive-current-version delivery through the running actor plus
+stopped/exclusive latest-value access, causal projection, recoverable versions,
+and visible authenticated tombstones. The
 [selected Record quickstart](selected-record-api.md) demonstrates live and
 stopped durable revisions, explicit conflict siblings, and exact-guard
 application resolution. The [selected Blob quickstart](selected-blob-api.md)
 demonstrates the cloneable live handle's peerless-capable durable regular-file
 publication and bounded zeroize-on-drop page reads, as well as the exclusive
 stopped streaming facade, immutable metadata-bound identity, crash-resumable
-encrypted chunks, and exact durable retry. Durable State/Record subscriptions,
-automatic registered-policy Record merge, atomic Event subscription update,
-Blob subscription or convergence status, selected-node language bindings,
-and representative physical or mixed-implementation acceptance remain open.
+encrypted chunks, and exact durable retry. Durable Record/Blob delivery, State
+contact/status and materialized-view/synthetic-withdrawal behavior, dynamic
+State network interests, automatic registered-policy Record merge, atomic Event
+subscription update, selected-node language bindings, and representative
+physical or mixed-implementation acceptance remain open.
+
+A [retained 9,656-byte State-delivery receipt](../implementation/evidence/selected-live-state-subscription-8912fc3.json)
+(SHA-256
+`7d0b568dd4d57c3f2967da55953896829261877513c59c51a0b274eeda69485f`,
+signed source `8912fc3`) observes one durable State application subscription
+on one same-implementation loopback host. A fresh receiver process redelivers
+the same State identity as attempt 2 after its predecessor was forcibly
+terminated following a flushed unacknowledged poll, then acknowledges,
+idempotently re-acknowledges, and polls empty. The run also observes static
+network/application selector separation, an authorized but network-uninterested
+withheld State, acknowledged/superseded ancestor suppression, a current
+tombstone, and final peerless subscription replay. It does not prove a
+materialized State view or synthetic withdrawals, dynamic network interests,
+physical/NAT/relay/BTLE or mixed implementations, scale beyond two,
+resource/soak thresholds, or release authorization.
 
 A [retained 9,573-byte live-Event receipt](../implementation/evidence/selected-live-event-c464129.json)
 (SHA-256
