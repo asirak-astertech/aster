@@ -6,6 +6,11 @@ contacts, the hybrid mission session, source-sealed Events, and durable
 restart/no-op verification. Tour artifacts are retained under a fresh temporary
 directory so you can inspect every receipt afterward.
 
+In an interactive terminal, each command opens a live dashboard as cohorts
+start and finish. Redirected output falls back to a line-oriented live view, so
+longer relay and control tours still show progress instead of releasing one
+large block only at the end.
+
 The boundary is deliberately small: one-host loopback, Event-only,
 unprotected-reference provisioning, and no physical or mixed-implementation
 evidence. Passing these tours is not production authorization.
@@ -28,6 +33,47 @@ mise run tour
 
 The selected CLI currently requires Unix. The demonstrations bind local UDP
 loopback sockets, so a host firewall or sandbox must permit loopback UDP.
+
+## Choose the terminal view
+
+The default `auto` view uses an updating dashboard on a capable terminal and a
+plain, progressively printed view elsewhere. The presenter is deliberately
+separate from the demo result: every stdout and stderr byte is written to the
+raw receipt before it is interpreted for display. The demo and stopped-node
+inspection exit statuses determine command success. Structured `PHASE`, result,
+and inspection receipts remain the retained basis for the human-readable
+claims; presentation itself does not decide pass or fail.
+
+Use a deterministic non-updating view for logs or screen readers:
+
+```sh
+ASTER_TOUR_VIEW=plain mise run tour-control
+```
+
+Use the original structured records, still streamed as they arrive, when a
+script needs to consume the helper's stdout:
+
+```sh
+ASTER_TOUR_VIEW=raw sh tools/aster-tour.sh control
+```
+
+In raw mode the helper keeps demo and inspection records on stdout and sends
+artifact locations to stderr. The retained `.demo.stdout` file is the strict
+byte-for-byte authority; task runners may print their own command prefix.
+
+`ASTER_TOUR_VIEW=tui` forces the dashboard, while `NO_COLOR=1` keeps its layout
+but removes color. Every mode retains the same raw files:
+
+- `<tour-parent>/<name>.demo.stdout` and `.demo.stderr` contain the demo
+  process receipts;
+- `<tour-parent>/<name>.inspect.stdout` and `.inspect.stderr` contain stopped
+  node inspection; and
+- `<tour-parent>/<name>/logs` contains each child process's exact output.
+
+The dashboard notices creation of a cohort's child logs so it can show which
+nodes are active before that cohort ends. It marks a step verified only after
+the demo emits the corresponding passing `PHASE` receipt. The view is not a
+second evidence format and does not broaden the bounded claim below.
 
 ## What the quick tour proves
 
@@ -142,8 +188,8 @@ sanitization, snapshot/swap/backup removal, or database rollback resistance.
 
 ## Manual equivalent
 
-The tour helper is only a transparent shell wrapper. To run the relay path by
-hand:
+The tour helper adds retention and presentation around the same CLI. To run the
+raw relay path by hand:
 
 ```sh
 ASTER_DEMO_PARENT="$(mktemp -d)"

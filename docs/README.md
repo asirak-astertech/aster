@@ -8,7 +8,9 @@ understand Aster's wire format or cryptography before building an application.
 1. Read [Core concepts](concepts.md) for the mental model: items, topics,
    scopes, data classes, and contacts.
 2. Run the [capability tour](quickstart/capability-tour.md) to watch real nodes
-   publish offline and synchronize later.
+   publish offline and synchronize later. Then use the
+   [message playground](quickstart/message-playground.md) to keep a bounded
+   local line running and publish synthetic Events through different nodes.
 3. Choose an integration path. Most applications should begin with the
    [local ConnectRPC agent](quickstart/connect-agent.md); Rust applications can
    use the [selected Event](quickstart/selected-event-api.md),
@@ -24,6 +26,7 @@ understand Aster's wire format or cryptography before building an application.
 |---|---|
 | Understand what Aster is and when it fits | [Project overview](../README.md) and [Core concepts](concepts.md) |
 | See Aster work quickly | [Capability tour](quickstart/capability-tour.md) |
+| Send messages through several live local node processes | [Message playground](quickstart/message-playground.md) |
 | Call Aster from Connect, gRPC, or gRPC-Web | [Local ConnectRPC agent](quickstart/connect-agent.md) |
 | Use the live Event API from Rust | [Selected Event API](quickstart/selected-event-api.md) |
 | Use live State, Record, or Blob from Rust | [Selected State API](quickstart/selected-state-api.md), [Selected Record API](quickstart/selected-record-api.md), or [Selected Blob API](quickstart/selected-blob-api.md) |

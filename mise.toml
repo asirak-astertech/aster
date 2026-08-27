@@ -17,6 +17,8 @@ run = [
   "python3 tools/check-project-license.py",
   "python3 tools/check-implementation-requirements.py",
   "python3 tools/check-public-provenance.py",
+  "python3 tools/test_aster_tour_ui.py",
+  "python3 tools/test_aster_mesh_playground.py",
   "python3 tools/test-selected-n32-receipt.py",
   "python3 tools/test-selected-iroh-nat-receipt.py",
   "python3 tools/test-selected-live-mutable-receipt.py",
@@ -34,6 +36,7 @@ run = [
   "sh ./tools/test-dependency-exception-scope.sh",
   "cargo clippy --locked --workspace --all-targets --all-features -- -D warnings",
   "cargo test --locked --workspace --all-features",
+  "sh tools/test-aster-mesh-playground-real.sh",
   "cargo build --locked -p aster-ffi",
   "cc -std=c11 -Wall -Wextra -Werror -pedantic -Ibindings/c -fsyntax-only bindings/c/header_smoke.c",
   "c++ -std=c++17 -Wall -Wextra -Werror -pedantic -Ibindings/c -fsyntax-only bindings/c/header_smoke.cpp",
@@ -58,6 +61,14 @@ run = [
 [tasks.fuzz-smoke]
 description = "Run bounded sanitizer-instrumented decoder fuzz campaigns"
 run = "sh ./tools/run-fuzz-smoke.sh"
+
+[tasks.playground]
+description = "Launch a bounded interactive real-process Event message playground"
+run = "sh ./tools/aster-mesh-playground.sh"
+
+[tasks.playground-smoke]
+description = "Exercise delayed Event movement across three real agent processes"
+run = "sh ./tools/test-aster-mesh-playground-real.sh"
 
 [tasks.tour]
 description = "Run the fastest two-node causal Ping/Pong capability tour"

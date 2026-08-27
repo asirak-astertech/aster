@@ -7,6 +7,7 @@ For a shorter path based on what you are trying to accomplish, start at the
 ## Tutorials and integration
 
 - [Capability tour](quickstart/capability-tour.md)
+- [Real-process Event message playground](quickstart/message-playground.md)
 - [Live mesh CLI](quickstart/mesh-cli.md)
 - [Local ConnectRPC agent](quickstart/connect-agent.md)
 - [Selected Event API](quickstart/selected-event-api.md)
@@ -98,3 +99,5 @@ design chose its major boundaries.
 - [0028 — Start the selected-stack implementation behind an isolated profile](decisions/0028-selected-stack-implementation-boundary.md)
 - [0029 — Close Proposal 0004 without selecting rust-libp2p](decisions/0029-close-proposal-0004-libp2p-pilot.md)
 - [0030 — Admit a bounded Event-first local ConnectRPC agent](decisions/0030-event-first-local-connect-agent.md)
+- [0031 — Keep live tour presentation separate from raw receipts](decisions/0031-live-tour-presentation.md)
+- [0032 — Keep interactive Event exploration separate from acceptance tours](decisions/0032-interactive-event-message-playground.md)

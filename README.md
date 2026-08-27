@@ -15,156 +15,11 @@ constrained, and disconnected operation.
 > [!IMPORTANT]
 > Aster is an evaluation-stage reference implementation, not a
 > production-authorized system. Event, State, Record, and Blob have live Rust
-> APIs; Event alone also has a local ConnectRPC API. State, Record, and Blob
-> retain stopped-node facades for exclusive use. State's live Rust API includes
-> durable positive-current-version delivery; it is not a materialized-view,
-> synthetic-withdrawal, dynamic-network-interest, or contact-status surface.
-> Record's live Rust API includes durable whole-key active-head delivery; its
-> conflict annotation is non-authorizing and resolution requires a fresh query.
-> The live Blob API includes peerless-capable durable publication, bounded page
-> reads, and durable metadata-only publication delivery. Its delivery-ledger
-> status is not peer or convergence status, and the delivery mechanism does not
-> change configured network interests. Review the
-> [security gates](docs/security.md) and
-> [conformance status](docs/conformance.md) before planning a deployment.
-
-A [retained 7,752-byte v2 live State/Record receipt](docs/implementation/evidence/selected-live-mutable-6cabb4c.json)
-(SHA-256
-`054945ecf94e8bfba1b130f6a5f47e9b1e0e17ad69f3b1472085a1d10f05eeaa`)
-binds signed source commit `6cabb4c`. On one loopback host, two
-same-implementation participants completed six actor lifetimes, with at most two
-actors concurrent. They published State and conflicting Record revisions while
-peerless; eight direct `CONTACT` records then accounted for 7/7/7 selected items
-offered/fetched/inserted. State first retained two concurrent heads, then a
-causally later successor observed and superseded both. After the other actor
-observed that successor, it published an authenticated empty tombstone that
-observed and superseded all three predecessors; both actors selected the
-tombstone as current, and one immediate peerless restart reproduced that exact
-projection. Record conflict rejection, guarded resolution, superseded
-originals, exact retry, and restart also passed. Six graceful shutdowns closed
-four retained handles, while Event, control, and Blob counters remained zero.
-
-That receipt is bounded evidence, not a broader acceptance claim. Its
-source-to-execution link is operator-attested, not cryptographically proven or
-reproducible; secret artifacts were inspected by metadata only, and the ordered
-State observation/publication chain is producer-attested. The restart proves
-one immediate peerless reopen, not indefinite tombstone retention, compaction,
-garbage collection, or delete-wins. It does not cover physical hosts, NAT,
-Internet, relay, BTLE, independent implementations, scale beyond two
-participants, resource thresholds, long-duration operation, or evidence for
-the newer live Blob mechanism or, by itself, live Event/Blob application
-acceptance. The separate Record-delivery receipt below covers the newer
-whole-key queue; this earlier receipt does not. Finite State/Record TTL, State
-status/materialized-view/synthetic-withdrawal behavior, dynamic State network
-interests, selected-node language bindings,
-representative physical or mixed-implementation acceptance, and release
-authorization remain open.
-
-A separate [retained 9,656-byte v1 State-delivery receipt](docs/implementation/evidence/selected-live-state-subscription-8912fc3.json)
-(SHA-256
-`7d0b568dd4d57c3f2967da55953896829261877513c59c51a0b274eeda69485f`)
-binds signed source commit `8912fc33571449d1beb4a4cb0f204b5dcd44e8c2`.
-On one same-implementation loopback host, two participants ran three processes,
-10 actor lifetimes, and 10 positive direct contacts. After a receiver process
-was forcibly terminated following a flushed unacknowledged poll, a fresh
-process redelivered the same State identity as attempt 2, acknowledged it,
-accepted idempotent re-acknowledgement, and then polled empty. The run also
-retained application/network selector separation, withheld an authorized but
-network-uninterested State, suppressed acknowledged and superseded ancestors,
-delivered an explicit current tombstone, and replayed the subscription on one
-final peerless reopen. This is bounded positive-current-version delivery
-evidence—not a State status or materialized-view/transition feed, dynamic
-network-interest mutation, physical/NAT/relay/BTLE or mixed-implementation
-result, scale beyond two, resource/soak result, or release authorization.
-
-A separate [retained 10,357-byte v1 Record-delivery receipt](docs/implementation/evidence/selected-live-record-subscription-0c11344.json)
-(SHA-256
-`ba0e2bf47291f7e87000b85fa280cc957f3710ac800def82a51fb9b4657a1b48`)
-binds Good-signed source commit `0c1134411953f4bb52133b50aff9989cd4ce3930`.
-On one same-implementation direct-loopback host, two participants ran three
-processes and seven actor lifetimes. A complete two-head edit/tombstone conflict
-remained one delivery at `delivery_limit=1` and `scan_limit=16`; after the
-receiver was sent `SIGKILL` following its flushed unacknowledged attempt-one
-poll, a fresh process replayed the same projection at attempt two with a rotated
-89-byte token. The run then required a fresh exact query guard, resolved both
-heads, delivered the successor under a new projection, preserved both originals
-as query-only superseded history, retained network-interested but
-application-unmatched beta without delivery, and withheld application-matched
-but network-uninterested gamma without mutating network interest. A final
-peerless reopen replayed the subscription with an empty acknowledged queue, the
-resolved current successor, and both query-only superseded originals. This
-receipt moves only `DM-5.1-08`. Its
-source-to-binary execution link is operator-attested, not reproducible proof,
-and it adds no finite-TTL/GC, physical/NAT/relay/BTLE, mixed-implementation,
-scale/resource/soak, selected-node bindings, automatic-merge, or release credit.
-
-A [retained 9,573-byte v1 live-Event receipt](docs/implementation/evidence/selected-live-event-c464129.json)
-(SHA-256
-`4d71d04e4ebcc9f63c0e84e7f11e83bf1f3d1ad2ca8608486cdcc875b6dfeef0`)
-binds signed source `c464129`. On one same-implementation loopback host, a
-peerless publisher durably created three alpha Events plus one authorized beta
-Event. A priority-threshold direct contact delivered alpha sequences 1 and 3,
-exposed the authenticated half-open gap `[2,3)`, and left the beta Event
-withheld. After the receiver child was forcibly terminated following a flushed,
-unacknowledged poll, a fresh process redelivered the same two Event IDs as
-attempt 2 and completed acknowledgement plus idempotent re-acknowledgement. A
-normal contact then delivered alpha sequence 2 and closed the gap.
-
-That receipt also observes `PolicyChangedSinceContact` after a temporary beta
-subscription, followed by exact removal and idempotent removal, but no fresh
-post-change contact or beta delivery. Its awaiting observations have zero—not
-positive—failed contact attempts. It is bounded direct-Iroh software evidence,
-not physical-host, NAT/Internet, relay, BTLE, mixed-implementation, scale,
-resource/soak, State/Record/Blob acceptance, reproducible-build, release, or
-production evidence.
-
-A [retained 10,728-byte v2 live-Blob receipt](docs/implementation/evidence/selected-live-blob-044d90f.json)
-(SHA-256
-`4fea2ffbd16608862a67167fb1b8fcb6d5d8b4b82c576aa9a6b7e25ee9c55909`)
-binds signed source commit `044d90ff07c8e754b3d490cb810d42de3c915e3d`
-with `Good` signature status. Its three participants ran 11 actor lifetimes and
-32 error-free direct `CONTACT` records: a publisher committed while peerless; a replica
-received all 98,638 carrier bytes; a receiver retained an interrupted
-exactly-one-contact 16,384-byte prefix, reopened peerless with that exact
-progress, resumed exactly 16,384 bytes from the different replica without
-refetching the source, fetched the exact remaining 65,870 bytes, reconstructed
-all 98,638 carrier bytes, and reopened peerless for a final authenticated read.
-Its source-to-execution link remains operator-attested, not cryptographically
-proven. This is one-host, same-implementation evidence of graceful same-process
-actor/store/provider reopen only. It does not prove process-crash, power-loss,
-long-offline, arbitrary-peer, or route-only resume; NAT, Internet, relay, or
-BTLE paths; independent-implementation interoperability; scale beyond three
-participants; resource thresholds or soak; physical sanitization; or release
-authorization.
-
-The Blob delivery queue was added after that frozen receipt. It uses exact
-source-publication identity rather than `BlobId`, returns authenticated metadata
-without plaintext, and durably retries token-bound attempts until exact
-acknowledgement. A separate
-[retained 10,269-byte v1 Blob-delivery receipt](docs/implementation/evidence/selected-live-blob-subscription-26e0a09.json)
-(SHA-256
-`3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675`)
-binds Good-signed source `26e0a09`. On one peerless host, one participant runs
-three processes and four actor lifetimes. Two exact publications share one
-`BlobId`; after the attempt-one child flushes its unacknowledged token and is
-sent `SIGKILL`, a fresh process receives attempt 2 and acknowledges it with the
-persisted attempt-one token, then settles the second publication. A final
-parent reopen replays the subscription with an empty ledger. This is local
-delivery-ledger evidence only—not network contact, transfer, synchronization,
-peer/convergence status, selector withholding or network-interest separation,
-power-loss/filesystem-crash recovery, TTL/GC, physical or mixed systems,
-resource/soak, reproducible-build, or release evidence.
-
-A [retained two-cell receipt](docs/implementation/requirements-status.md#selected-iroh-nat-retained-receipt)
-observes the selected Event path on one Darwin arm64 host through isolated
-Docker Linux namespace NATs: one relay-disabled cone cell selected Direct, and
-one restrictive direct-blocked cell selected the exact operator-pinned
-controlled Iroh connectivity relay. Each cell delivered and acknowledged one
-exact 32-byte Event and replayed as an exact no-op. This is one-host software
-namespace-NAT evidence only—not discovery or punching, temporal fallback
-chronology, representative or physical NAT, public Internet or public/default
-relay, independent implementation, BTLE, other-class relay, complete-MVP, or
-release evidence.
+> APIs; Event also has a local ConnectRPC API. Review the
+> [current implementation boundary](#current-implementation-boundary),
+> [security gates](docs/security.md), [conformance status](docs/conformance.md),
+> and [requirements status](docs/implementation/requirements-status.md) before
+> planning a deployment.
 
 ## See it work
 
@@ -184,9 +39,24 @@ mise run tour-relay    # a relay carries protected data it cannot read
 mise run tour-control  # revocation, rekey, and captured-node exclusion
 ```
 
-The tours retain their working directories for inspection. The
+The tours update a terminal dashboard while real processes run, then retain
+their working directories and exact raw receipts for inspection. The
 [capability tour](docs/quickstart/capability-tour.md) explains each result and
 its limits.
+
+For an exploratory view, keep a user-selected 2-through-32-node line running,
+send messages through any node, and isolate or restart nodes while watching
+exact Event observations move:
+
+```sh
+mise run playground -- --nodes 5
+```
+
+The [message playground](docs/quickstart/message-playground.md) uses real local
+agent processes and independent stores. Every playground node can read the
+synthetic messages; this one-host Event demo is separate from the payload-blind
+relay tour and does not establish global convergence, scale, transport, or
+release claims.
 
 ## How Aster moves data
 
