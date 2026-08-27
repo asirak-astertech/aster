@@ -15,8 +15,9 @@ State/Record/Blob convergence signal. State and Record reconcile already
 durable objects on semantic-v4/v5 contacts and expose their own cloneable live
 handles. `RunningNode::selected_blobs()` now adds peerless-capable durable
 regular-file publication and authenticated reads of at most one
-zeroize-on-drop 64-KiB page; it does not add Blob subscription or convergence
-status. Semantic v5 separately transfers already-durable Blobs directly between
+zeroize-on-drop 64-KiB page plus durable metadata-only exact-publication
+delivery. Its local delivery counts are not Blob peer or convergence status.
+Semantic v5 separately transfers already-durable Blobs directly between
 current content-capable peers, including after a peerless publish and later
 restart. V1-v4 emit zero Blob frames. Route-only Blob relay/custody, Blob
 TTL/GC, large/RSS acceptance, representative physical or mixed-implementation

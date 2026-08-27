@@ -883,8 +883,11 @@ served only after the same current policy and lineage checks.
 `Normal` and every `AtLeast(priority)` run Blob source and carrier work because
 `AtLeast` filters Event emission only. `ReceiveOnly` initiates, requests,
 advertises, sends, accepts, reserves, and counts zero selected Blob work. This
-slice adds no Blob subscription/status surface, selected route-only Blob
-relay/custody, Blob TTL/expiry/garbage collection, a
+network slice adds no retained application-delivery evidence or Blob peer/
+convergence status. The separate selected application layer now has a durable
+metadata-only publication queue, but it does not alter this wire path or its
+configured interests. This slice adds no selected route-only Blob relay/
+custody, Blob TTL/expiry/garbage collection, a
 metadata-independent whole-byte identity or deduplication claim, or large-file,
 physical-carrier, mixed-implementation, and release acceptance.
 

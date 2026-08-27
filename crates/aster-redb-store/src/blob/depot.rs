@@ -222,6 +222,57 @@ pub(super) fn blob_source_shape_read(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(super) fn blob_source_shape_write(
+    write: &redb::WriteTransaction,
+    variant_id: BlobVariantId,
+    blob_id: BlobId,
+    epoch: u64,
+    physical_lineage: [u8; 32],
+    manifest_digest: [u8; 32],
+    route_chunk_count: u64,
+    completed: bool,
+) -> Result<BlobSourceShape, StoreError> {
+    let import = load_import_write(write, variant_id)?.ok_or_else(|| {
+        blob_error(BlobStoreError::SchemaInvariant(
+            "retained Blob source is missing its exact depot import",
+        ))
+    })?;
+    let expected_chunks = (import.chunk_size != 0)
+        .then(|| {
+            import
+                .total_len
+                .checked_add(u64::from(import.chunk_size) - 1)
+                .map(|bytes| bytes / u64::from(import.chunk_size))
+        })
+        .flatten();
+    if import.variant_id != variant_id
+        || import.variant_id != blob_variant_id(blob_id, &import.content_group, epoch)
+        || import.blob_id != blob_id
+        || import.epoch != epoch
+        || import.physical_lineage != Some(physical_lineage)
+        || import.total_len == 0
+        || import.chunk_size != SELECTED_BLOB_CHUNK_SIZE
+        || import.chunk_count == 0
+        || import.chunk_count != route_chunk_count
+        || expected_chunks != Some(import.chunk_count)
+        || (completed && import.finalized_manifest_digest != Some(manifest_digest))
+        || (!completed
+            && import
+                .finalized_manifest_digest
+                .is_some_and(|digest| digest != manifest_digest))
+    {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "retained Blob source differs from its exact depot shape",
+        )));
+    }
+    Ok(BlobSourceShape {
+        total_len: import.total_len,
+        chunk_size: import.chunk_size,
+        chunk_count: import.chunk_count,
+    })
+}
+
 #[cfg(test)]
 pub(super) fn inject_test_fault(state_root: &Path, point: DepotFaultPoint) {
     TEST_DEPOT_FAULTS

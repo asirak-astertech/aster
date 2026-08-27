@@ -21,9 +21,10 @@ constrained, and disconnected operation.
 > synthetic-withdrawal, dynamic-network-interest, or contact-status surface.
 > Record's live Rust API includes durable whole-key active-head delivery; its
 > conflict annotation is non-authorizing and resolution requires a fresh query.
-> The live Blob API is limited
-> to peerless-capable durable publication and bounded page reads; it is not a
-> subscription or convergence-status surface. Review the
+> The live Blob API includes peerless-capable durable publication, bounded page
+> reads, and durable metadata-only publication delivery. Its delivery-ledger
+> status is not peer or convergence status, and the delivery mechanism does not
+> change configured network interests. Review the
 > [security gates](docs/security.md) and
 > [conformance status](docs/conformance.md) before planning a deployment.
 
@@ -53,8 +54,8 @@ Internet, relay, BTLE, independent implementations, scale beyond two
 participants, resource thresholds, long-duration operation, or evidence for
 the newer live Blob mechanism or, by itself, live Event/Blob application
 acceptance. The separate Record-delivery receipt below covers the newer
-whole-key queue; this earlier receipt does not. Finite State/Record TTL, durable
-Blob delivery, State
+whole-key queue; this earlier receipt does not. Finite State/Record TTL,
+retained Blob-delivery acceptance, State
 status/materialized-view/synthetic-withdrawal behavior, dynamic State network
 interests, selected-node language bindings,
 representative physical or mixed-implementation acceptance, and release
@@ -137,6 +138,13 @@ BTLE paths; independent-implementation interoperability; scale beyond three
 participants; resource thresholds or soak; physical sanitization; or release
 authorization.
 
+The Blob delivery queue was added after that frozen receipt. It uses exact
+source-publication identity rather than `BlobId`, returns authenticated metadata
+without plaintext, and durably retries token-bound attempts until exact
+acknowledgement. Focused mechanism tests cover its ledger and application
+surface; retained Linux delivery evidence and Blob peer/convergence status are
+still open.
+
 A [retained two-cell receipt](docs/implementation/requirements-status.md#selected-iroh-nat-retained-receipt)
 observes the selected Event path on one Darwin arm64 host through isolated
 Docker Linux namespace NATs: one relay-disabled cone cell selected Direct, and
@@ -216,7 +224,7 @@ Protobuf schema and does not require a hosted Buf Schema Registry.
 | **Connect, gRPC, or gRPC-Web** | [ConnectRPC agent](docs/quickstart/connect-agent.md) | Live Event and local status; authenticated loopback process |
 | **Rust selected node** | [Selected Event API](docs/quickstart/selected-event-api.md) | Live Event publish, query, durable delivery, gaps, and status |
 | **State or Record in Rust** | [State](docs/quickstart/selected-state-api.md) and [Record](docs/quickstart/selected-record-api.md) | Cloneable live actor handles plus exclusive stopped-node facades; direct-Iroh reconciliation under explicit interests; State adds durable positive-current-version delivery and Record adds retained-bounded durable whole-key active-head delivery |
-| **Blob in Rust** | [Blob](docs/quickstart/selected-blob-api.md) | Cloneable `RunningNode::selected_blobs()` handle for durable file publication and bounded pages, plus an exclusive stopped streaming facade; already-durable Blob data can transfer directly under semantic v5 |
+| **Blob in Rust** | [Blob](docs/quickstart/selected-blob-api.md) | Cloneable `RunningNode::selected_blobs()` handle for durable file publication, bounded pages, and metadata-only at-least-once publication delivery, plus an exclusive stopped facade; already-durable Blob data can transfer directly under semantic v5 |
 | **Rust semantic API** | [Rust quickstart](docs/quickstart/rust.md) | Broader proven semantic surface used as the migration source |
 | **Python, Go, or C** | [Language quickstarts](docs/quickstart/README.md) | Offline semantic API through the current C ABI, not the selected live node |
 
@@ -233,7 +241,7 @@ provisioning remain open work.
 | **Event** | Source-authenticated reconciliation over direct Iroh or one operator-pinned controlled Iroh connectivity relay; live Rust and local ConnectRPC APIs; durable consume/carry selectors and at-least-once delivery | Atomic subscription update, hosted discovery/public relay, and broader physical-network acceptance |
 | **State** | Source-authenticated live or stopped publication/query, causal projection, direct-Iroh reconciliation under explicit interests, durable positive-current-version delivery, and bounded retained one-host evidence including forced-process redelivery | Contact/status and materialized-view/synthetic-withdrawal behavior, dynamic network-interest mutation, selected-node bindings, finite TTL, relay acceptance, expiry/garbage collection, and representative physical/mixed evidence |
 | **Record** | Live or stopped conflict-preserving query/publication, exact-sibling guarded resolution, direct-Iroh reconciliation, durable whole-key active-head delivery, and bounded retained one-host conflict, forced-process redelivery, resolution, and reopen evidence | Selected-node bindings, automatic merge execution, finite TTL, relay acceptance, expiry/garbage collection, and representative physical/mixed evidence |
-| **Blob** | Authenticated immutable publication through a cloneable live Rust handle or exclusive stopped facade; live reads return at most one zeroize-on-drop 64-KiB page; direct semantic-v5 source/carrier transfer has durable resume state and bounded retained one-host interrupted/reopened/different-peer resume, completion, read, and reopen evidence | Blob subscription or convergence status, route-only relay/custody, arbitrary-peer resume, crash/power-loss/long-offline recovery, large/RSS acceptance, representative physical or mixed-implementation evidence, retention, garbage collection, and release authorization |
+| **Blob** | Authenticated immutable publication through a cloneable live Rust handle or exclusive stopped facade; bounded zeroize-on-drop pages; durable metadata-only application delivery with exact publication identity and token-bound acknowledgement; direct semantic-v5 source/carrier transfer with durable resume state and bounded retained one-host interrupted/reopened/different-peer evidence | Retained Blob-delivery acceptance, peer/convergence and transfer-progress status, route-only relay/custody, arbitrary-peer resume, crash/power-loss/long-offline recovery, large/RSS acceptance, representative physical or mixed-implementation evidence, retention, garbage collection, and release authorization |
 | **Operations** | Manually admitted direct addresses, an operator-pinned controlled relay, bounded one-host software namespace-NAT acceptance, reference mission provisioning, and bounded same-UID Unix software zeroization | Protected operational provisioning, discovery, representative/physical NAT, public/default relay selection, BTLE platform integration, physical sanitization, and release authorization |
 
 The [capability roadmap](docs/implementation/capability-roadmap.md) is the

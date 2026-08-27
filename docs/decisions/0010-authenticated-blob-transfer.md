@@ -190,8 +190,9 @@ time. The exclusive stopped streaming facade and the semantic-v5 network
 boundary above remain unchanged.
 
 The live mechanism composes peerless publication with later direct transfer and
-restart, but does not add a Blob subscription, convergence status, route-only
-custody, TTL/GC, retained execution receipt, physical/resource acceptance,
+restart. A later current-code amendment adds local metadata-only
+exact-publication delivery, but not Blob peer/convergence status, route-only
+custody, TTL/GC, retained delivery evidence, physical/resource acceptance,
 mixed-implementation evidence, or release authorization. The authoritative
 application ownership, cancellation, shutdown, and zeroization boundaries are
 recorded in [ADR 0009](0009-public-api-boundary.md#live-selected-blob-application-amendment-2026-08-27).

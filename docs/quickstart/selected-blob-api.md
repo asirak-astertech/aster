@@ -1,21 +1,26 @@
 # Selected Blob API quickstart
 
 This is the shortest path to Aster's **selected live Blob application surface**,
-its exclusive stopped streaming facade, and the semantic-v5 direct transfer
-boundary for already-durable Blobs. `RunningNode::selected_blobs()` returns a
-cloneable `SelectedBlobHandle`: an application may durably publish an owned
-regular file while the node has no peers and may read one freshly authenticated
-plaintext page at a time while the actor owns the store. Each live page is at
-most 64 KiB and zeroizes its owned plaintext allocation on drop.
+its durable metadata-delivery queue, its exclusive stopped streaming facade,
+and the semantic-v5 direct transfer boundary for already-durable Blobs.
+`RunningNode::selected_blobs()` returns a cloneable `SelectedBlobHandle`: an
+application may durably publish an owned regular file while the node has no
+peers, read one freshly authenticated plaintext page at a time, and consume
+at-least-once notifications for exact source-authenticated Blob publications.
+Each live page is at most 64 KiB and zeroizes its owned plaintext allocation on
+drop; each delivery is metadata only and carries no Blob plaintext.
 
-The live surface is deliberately small. It has async `publish` and `read_page`,
-but no Blob subscription, peer status, or convergence-status operation. The
-exclusive `SelectedBlobNode` remains available when no runtime owns the same
-store and provides synchronous seekable-source publication plus streaming
-`read_into`. Separately, semantic v5 reconciles already-durable Blob sources and
-direct carrier ranges between current content-capable peers. The default offer
-is `[5, 4, 3, 2, 1]`; v1-v4 emit zero Blob frames, and stable wire/ABI, source,
-manifest, and `ASTRBT01` formats remain version 1.
+The live surface deliberately keeps application delivery separate from network
+replication. A Blob subscription is durable local intent, not a route/content
+grant or a dynamic network interest. The surface has no Blob peer or convergence
+status; `delivery_status` reports only local selector and delivery-ledger counts.
+The exclusive `SelectedBlobNode` remains available when no runtime owns the same
+store and provides the same delivery lifecycle plus synchronous seekable-source
+publication and streaming `read_into`. Separately, semantic v5 reconciles
+already-durable Blob sources and direct carrier ranges between current
+content-capable peers. The default offer is `[5, 4, 3, 2, 1]`; v1-v4 emit zero
+Blob frames, and stable wire/ABI, source, manifest, and `ASTRBT01` formats remain
+version 1.
 
 A [retained 10,728-byte live-Blob receipt](../implementation/evidence/selected-live-blob-044d90f.json)
 (SHA-256
@@ -35,7 +40,8 @@ hosts, NAT or Internet paths, controlled or public relay, BTLE, process crash
 or power-loss recovery, long-offline recovery, arbitrary-peer or route-only
 resume, scale beyond three participants, resource thresholds or soak,
 physical sanitization, independent-implementation interoperability, or release
-authorization.
+authorization. That frozen receipt predates the delivery queue and gives it no
+retained execution credit; the queue currently has focused mechanism tests only.
 
 ## Use the live actor API
 
@@ -109,6 +115,97 @@ and externally cloned file descriptors remain caller custody. A blocking or
 hostile filesystem syscall can delay the joined worker and therefore delay
 shutdown or zeroization; no bounded shutdown-latency claim is made for such a
 file provider.
+
+## Subscribe to immutable publication metadata
+
+A Blob subscription selects one topic and scope, optionally including
+descendant scopes. Each delivery identifies one exact signed publication with
+`BlobPublicationId`, which differs from `BlobId`: several publishers, counters,
+or priorities can sign distinct publications of the same immutable content.
+Acknowledgement and deduplication therefore use the publication identity, while
+the existing read API continues to use the content-and-metadata `BlobId` plus
+the delivered topic and scope.
+
+```rust
+use aster_node::application::{
+    BlobPollRequest, BlobReadRequest, BlobSubscriptionRequest,
+    MAX_SELECTED_BLOB_DELIVERIES, MAX_SELECTED_BLOB_SUBSCRIPTION_SCAN,
+};
+
+let subscription = blobs
+    .subscribe(BlobSubscriptionRequest {
+        operation_key: b"my-app/blob-subscription/imagery".to_vec(),
+        topic: topic.clone(),
+        scope: scope.clone(),
+        include_descendant_scopes: false,
+    })
+    .await?;
+
+let page = blobs
+    .poll(BlobPollRequest {
+        subscription: subscription.id,
+        delivery_limit: MAX_SELECTED_BLOB_DELIVERIES,
+        scan_limit: MAX_SELECTED_BLOB_SUBSCRIPTION_SCAN,
+    })
+    .await?;
+
+for delivery in page.deliveries {
+    let read = BlobReadRequest {
+        id: delivery.id,
+        topic: delivery.topic.clone(),
+        scope: delivery.scope.clone(),
+    };
+    // Read `read` with `read_page` when the application needs plaintext.
+    blobs
+        .acknowledge(subscription.id, delivery.publication, delivery.token)
+        .await?;
+}
+
+let local = blobs.delivery_status().await?;
+assert_eq!(local.subscriptions, 1);
+blobs.unsubscribe(subscription.id).await?;
+```
+
+Subscription creation is operation-key idempotent. A matching retry returns the
+same durable identifier, while changing the selector under that key fails
+closed. `scan_limit` bounds the complete matching retained publication set that
+one poll freshly authenticates; poll fails closed rather than silently advancing
+through a partial snapshot. `delivery_limit` bounds the committed attempts
+returned from that verified set.
+
+Before returning a delivery, the node rechecks current mission policy, exact
+source envelope and identity metadata, route/content authority, revocation and
+epoch, and the completed encrypted-depot content. The notification exposes only
+the publication ID, Blob ID, publisher/counter, topic/scope, priority, byte
+length, media/schema identity metadata, acceptance marker, attempt, and opaque
+acknowledgement token. It never returns a manifest, source envelope, sealed
+bytes, key, nonce, chunk, carrier state, or depot path.
+
+Unacknowledged work is retried with a higher nonzero attempt and a new opaque
+token. Tokens bind the mission-local subscription incarnation, exact publication
+identity, delivery tenure, and issued attempt. Any earlier nonzero token at or
+below the durable attempt high-water remains valid while that exact publication
+tenure remains active, so a response lost to process termination can still be
+acknowledged after a later retry. Exact acknowledgement and reacknowledgement
+are idempotent; tokens above the issued high-water, cross-subscription or
+cross-publication tokens, prior-tenure tokens, stale incarnations, malformed
+tokens, and removed/recreated selectors fail closed.
+`unsubscribe` removes the selector and its delivery ledger without changing
+configured semantic-v5 Blob interests.
+
+Cancellation before enqueue cannot mutate the ledger. After enqueue, the
+worker may have committed: retry `subscribe` with the exact operation key to
+recover its durable selector; a later `poll` safely issues another attempt if
+the prior page was lost; retry `acknowledge` with the exact token to observe its
+idempotent outcome; and retry `unsubscribe` to observe `AlreadyAbsent` after a
+completed removal. `delivery_status` is read-only. These recovery rules do not
+make application side effects transactional with acknowledgement.
+
+`delivery_status` is a structurally audited local ledger snapshot, not sync,
+contact, peer, transfer-progress, or convergence status. The focused mechanism
+tests cover retry, re-acknowledgement, selector replacement/removal, durable
+reopen, policy withholding, bounded scans, and distinct publications sharing
+one Blob ID. Retained Linux delivery acceptance remains pending.
 
 ## Run the example
 
@@ -261,7 +358,8 @@ The live handle does not change those contact rules and reports no Blob peer or
 convergence status. The retained receipt above is only the bounded
 three-participant, one-host, graceful-reopen observation described there. The
 selected slice still has no route-only Blob relay/custody, arbitrary-peer
-resume evidence, Blob subscription, Blob TTL/expiry/GC, metadata-independent
+resume evidence, retained Blob-delivery acceptance, Blob TTL/expiry/GC,
+metadata-independent
 whole-byte identity or deduplication, 100+ MiB/RSS or resource/soak acceptance,
 representative physical carrier, NAT/Internet, relay, BTLE,
 mixed-implementation, crash/power-loss, or long-offline acceptance, or release

@@ -4,7 +4,12 @@
 //! The live facade accepts only an already-open regular [`fs::File`] and
 //! returns at most one zeroize-on-drop 64 KiB page. Encrypted chunks remain in
 //! the mission-bound depot; source-envelope bytes, manifest records, keys,
-//! nonces, and depot mechanics are never returned to applications.
+//! nonces, and depot mechanics are never returned to applications. Both
+//! facades also expose a durable at-least-once metadata-notification queue.
+//! A delivery identifies one exact signed Blob publication, but never carries
+//! plaintext; applications use the existing read surface when bytes are needed.
+//! Subscription intent is local and cannot expand network receive policy or
+//! current route/content authority.
 
 use std::{
     fmt, fs,
@@ -24,11 +29,14 @@ use aster_mesh::{
 };
 pub use aster_redb_store::BlobDepotLimits;
 use aster_redb_store::{
+    BlobDeliveryAck as StoreBlobDeliveryAck, BlobDeliveryToken as StoreBlobDeliveryToken,
     BlobDepotCompletion, BlobOperationKey, BlobOperationRequest, BlobPublicationDisposition,
     BlobPublicationIntent, BlobReadPlan, BlobSemanticId, BlobSourceProjection, BlobSourceRetention,
-    BlobStoreError, BlobVariantId, ControlPolicySnapshot, ControlTransferId,
-    MAX_BLOB_OPERATION_KEY_BYTES, MAX_NETWORK_BLOB_BYTES, MAX_NETWORK_BLOB_CHUNKS, Store,
-    StoreError, StoreLimits, StoredBlob,
+    BlobStoreError, BlobSubscriptionId as StoreBlobSubscriptionId, BlobSubscriptionKey,
+    BlobSubscriptionPollSelection, BlobSubscriptionRemoveOutcome, BlobSubscriptionSpec,
+    BlobVariantId, ControlPolicySnapshot, ControlTransferId, MAX_BLOB_OPERATION_KEY_BYTES,
+    MAX_BLOB_POLL_DELIVERIES, MAX_BLOB_SUBSCRIPTION_SCAN, MAX_NETWORK_BLOB_BYTES,
+    MAX_NETWORK_BLOB_CHUNKS, Store, StoreError, StoreLimits, StoredBlob,
 };
 use tokio::sync::{mpsc, oneshot};
 use zeroize::{Zeroize as _, Zeroizing};
@@ -182,6 +190,17 @@ pub const MAX_SELECTED_LIVE_BLOB_CHUNKS: u64 = MAX_NETWORK_BLOB_CHUNKS;
 /// Maximum plaintext returned by one live Blob page read.
 pub const MAX_SELECTED_BLOB_PAGE_BYTES: usize = SELECTED_BLOB_CHUNK_SIZE as usize;
 
+/// Maximum number of immutable Blob publication notifications returned by one poll.
+pub const MAX_SELECTED_BLOB_DELIVERIES: usize = MAX_BLOB_POLL_DELIVERIES;
+
+/// Maximum retained Blob publications freshly authenticated by one poll.
+pub const MAX_SELECTED_BLOB_SUBSCRIPTION_SCAN: usize = MAX_BLOB_SUBSCRIPTION_SCAN;
+
+/// Canonical byte length of an opaque [`BlobDeliveryToken`].
+pub const BLOB_DELIVERY_TOKEN_BYTES: usize = aster_redb_store::BLOB_DELIVERY_TOKEN_BYTES;
+
+const MAX_SELECTED_BLOB_PLAN_RETRIES: usize = 4;
+
 /// Stable selected-profile identity of immutable Blob bytes and identity metadata.
 ///
 /// The selected profile fixes chunking at 64 KiB. Media type and schema bytes
@@ -216,6 +235,243 @@ impl fmt::Display for BlobId {
         }
         Ok(())
     }
+}
+
+/// Source-authenticated semantic identity of one immutable Blob publication.
+///
+/// This differs from [`BlobId`]: multiple publishers, counters, or priorities
+/// can sign distinct publications of the same immutable content identity.
+/// Delivery acknowledgement and deduplication always use this publication
+/// identity so one source publication cannot consume another's attempt.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct BlobPublicationId([u8; 32]);
+
+impl BlobPublicationId {
+    /// Constructs an identity from its complete source-authenticated bytes.
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the complete semantic publication identity bytes.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    fn from_store(id: BlobSemanticId) -> Self {
+        Self(*id.as_bytes())
+    }
+
+    fn into_store(self) -> BlobSemanticId {
+        BlobSemanticId::new(self.0)
+    }
+}
+
+impl fmt::Display for BlobPublicationId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Stable mission-local identity of one durable Blob metadata subscription.
+///
+/// The identifier grants no route, content, carrier, or network interest
+/// authority. Every candidate is intersected with current policy and freshly
+/// authenticated before it can become a delivery.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct BlobSubscriptionId([u8; 32]);
+
+impl BlobSubscriptionId {
+    /// Constructs an identifier from its complete durable bytes.
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the complete durable identifier bytes.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    fn from_store(id: StoreBlobSubscriptionId) -> Self {
+        Self(*id.as_bytes())
+    }
+
+    fn into_store(self) -> StoreBlobSubscriptionId {
+        StoreBlobSubscriptionId::from_bytes(self.0)
+    }
+}
+
+impl fmt::Display for BlobSubscriptionId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Idempotent creation request for one durable Blob publication subscription.
+///
+/// The selector covers exact signed publications in the selected topic and
+/// scope. When descendants are enabled, each descendant scope remains visible
+/// in its delivery metadata. The request changes only the local application
+/// ledger; configured Blob/network interests remain the receive policy.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlobSubscriptionRequest {
+    pub operation_key: Vec<u8>,
+    pub topic: Topic,
+    pub scope: Scope,
+    pub include_descendant_scopes: bool,
+}
+
+/// Result of creating or replaying one durable Blob subscription request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlobSubscription {
+    pub id: BlobSubscriptionId,
+    pub inserted: bool,
+}
+
+/// One bounded immutable-publication metadata poll.
+///
+/// `scan_limit` bounds the complete matching candidate set freshly verified by
+/// one poll. Poll fails closed instead of advancing through a partial set.
+/// `delivery_limit` bounds attempts committed and returned by the call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlobPollRequest {
+    pub subscription: BlobSubscriptionId,
+    pub delivery_limit: usize,
+    pub scan_limit: usize,
+}
+
+impl BlobPollRequest {
+    fn validate(self) -> Result<Self, ApplicationError> {
+        if self.delivery_limit == 0
+            || self.delivery_limit > MAX_SELECTED_BLOB_DELIVERIES
+            || self.scan_limit == 0
+            || self.scan_limit > MAX_SELECTED_BLOB_SUBSCRIPTION_SCAN
+        {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::InvalidRequest,
+                "blob poll",
+            ));
+        }
+        Ok(self)
+    }
+}
+
+/// Opaque acknowledgement identity for one exact Blob delivery retry.
+///
+/// Tokens bind the subscription incarnation, publication identity, delivery
+/// tenure, and one issued attempt. A token from an earlier retry remains valid
+/// while that same publication tenure is pending, which permits crash-safe
+/// acknowledgement; it cannot cross a later tenure, subscription incarnation,
+/// publication, or subscription. Applications may persist the canonical bytes
+/// without learning or reconstructing the binding fields.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct BlobDeliveryToken(StoreBlobDeliveryToken);
+
+impl BlobDeliveryToken {
+    /// Restores a canonical token previously obtained from [`Self::as_bytes`].
+    pub fn from_bytes(bytes: [u8; BLOB_DELIVERY_TOKEN_BYTES]) -> Result<Self, ApplicationError> {
+        StoreBlobDeliveryToken::from_bytes(bytes)
+            .map(Self::from_store)
+            .map_err(|_| {
+                ApplicationError::new(ApplicationErrorKind::InvalidRequest, "blob delivery token")
+            })
+    }
+
+    /// Returns the canonical opaque bytes for durable application transport.
+    pub fn as_bytes(&self) -> &[u8; BLOB_DELIVERY_TOKEN_BYTES] {
+        self.0.as_bytes()
+    }
+
+    fn from_store(token: StoreBlobDeliveryToken) -> Self {
+        Self(token)
+    }
+
+    fn into_store(self) -> StoreBlobDeliveryToken {
+        self.0
+    }
+
+    #[cfg(test)]
+    fn inert_for_command_rejection() -> Self {
+        let mut bytes = [0_u8; BLOB_DELIVERY_TOKEN_BYTES];
+        bytes[0] = 1;
+        bytes[8] = 1;
+        bytes[16] = 1;
+        bytes[24] = 1;
+        Self::from_bytes(bytes).expect("canonical inert Blob delivery token")
+    }
+}
+
+/// Metadata-only notification for one exact source-authenticated publication.
+///
+/// No plaintext, manifest bytes, source envelope, content key, nonce, carrier,
+/// or depot path crosses this boundary. Use [`BlobReadRequest`] with `id`,
+/// `topic`, and `scope` when the application separately needs the Blob bytes.
+/// That read resolves immutable content under the current read plan; it is not
+/// an exact-publication read and may select a different authorized source
+/// publication of the same [`BlobId`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlobDelivery {
+    pub publication: BlobPublicationId,
+    pub id: BlobId,
+    pub publisher: NodeId,
+    pub publisher_counter: u64,
+    pub topic: Topic,
+    pub scope: Scope,
+    pub priority: Priority,
+    pub total_len: u64,
+    pub media_type: Option<String>,
+    pub schema_id: Vec<u8>,
+    pub acceptance_marker: u64,
+    /// Nonzero durable at-least-once attempt number.
+    pub attempt: u64,
+    /// Opaque token issued for this publication tenure and attempt.
+    ///
+    /// A previously issued token for an earlier attempt in the same still-
+    /// pending tenure remains valid; cross-tenure/incarnation bindings fail.
+    pub token: BlobDeliveryToken,
+}
+
+/// Bounded source-authenticated immutable-publication delivery result.
+///
+/// Pending attempts are returned first and otherwise ordered by this
+/// receiver's durable acceptance markers. That order is local bookkeeping,
+/// not publisher-counter, causal, source-acceptance, or global/network order.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BlobDeliveryPage {
+    pub deliveries: Vec<BlobDelivery>,
+    pub has_more: bool,
+}
+
+/// Idempotent acknowledgement disposition for one exact Blob publication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlobAcknowledgement {
+    Acknowledged,
+    AlreadyAcknowledged,
+}
+
+/// Idempotent disposition from removing one durable Blob selector.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlobUnsubscribe {
+    Removed,
+    AlreadyAbsent,
+}
+
+/// Structurally audited local Blob delivery-ledger status.
+///
+/// This is intentionally not network sync or peer status. It reports only the
+/// durable application selector and at-least-once delivery ledger.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BlobDeliveryStatus {
+    pub subscriptions: u64,
+    pub pending_deliveries: u64,
+    pub acknowledged_deliveries: u64,
+    pub delivery_cursors: u64,
+    pub selector_generation: u64,
 }
 
 /// One durable, operation-key-idempotent Blob publication request.
@@ -488,6 +744,105 @@ impl SelectedBlobHandle {
         .await
     }
 
+    /// Idempotently creates one durable metadata-only Blob subscription.
+    ///
+    /// Dropping the future before enqueue prevents the mutation. After enqueue,
+    /// cancellation leaves the outcome indeterminate; retry the exact operation
+    /// key and selector to recover the stable identity and inserted/replayed
+    /// disposition.
+    pub async fn subscribe(
+        &self,
+        request: BlobSubscriptionRequest,
+    ) -> Result<BlobSubscription, ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedBlobCommand::Subscribe { request, response },
+            received,
+            "blob subscribe",
+        )
+        .await
+    }
+
+    /// Polls freshly authenticated immutable-publication metadata.
+    ///
+    /// Dropping the future before enqueue commits no attempt. After enqueue, a
+    /// cancelled poll may commit an attempt without disclosing its token; that
+    /// unacknowledged publication remains pending and a later poll retries it
+    /// with a higher attempt.
+    pub async fn poll(
+        &self,
+        request: BlobPollRequest,
+    ) -> Result<BlobDeliveryPage, ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedBlobCommand::Poll { request, response },
+            received,
+            "blob poll",
+        )
+        .await
+    }
+
+    /// Idempotently acknowledges one properly bound Blob publication delivery token.
+    ///
+    /// Dropping the future before enqueue cannot acknowledge. After enqueue,
+    /// cancellation leaves the outcome indeterminate; retrying the same valid
+    /// token returns [`BlobAcknowledgement::AlreadyAcknowledged`] if the first
+    /// call committed.
+    pub async fn acknowledge(
+        &self,
+        subscription: BlobSubscriptionId,
+        publication: BlobPublicationId,
+        token: BlobDeliveryToken,
+    ) -> Result<BlobAcknowledgement, ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedBlobCommand::Acknowledge {
+                subscription,
+                publication,
+                token,
+                response,
+            },
+            received,
+            "blob acknowledge",
+        )
+        .await
+    }
+
+    /// Idempotently removes one Blob selector and its delivery ledger.
+    ///
+    /// Dropping the future before enqueue preserves the selector. After enqueue,
+    /// cancellation leaves the outcome indeterminate; retrying the same stable
+    /// identifier returns [`BlobUnsubscribe::AlreadyAbsent`] if removal committed.
+    pub async fn unsubscribe(
+        &self,
+        subscription: BlobSubscriptionId,
+    ) -> Result<BlobUnsubscribe, ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedBlobCommand::Unsubscribe {
+                subscription,
+                response,
+            },
+            received,
+            "blob unsubscribe",
+        )
+        .await
+    }
+
+    /// Returns audited local Blob selector and delivery-ledger counts.
+    ///
+    /// Cancellation has no durable side effect; a completed snapshot that loses
+    /// its receiver is simply discarded.
+    pub async fn delivery_status(&self) -> Result<BlobDeliveryStatus, ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedBlobCommand::DeliveryStatus { response },
+            received,
+            "blob delivery status",
+        )
+        .await
+    }
+
     async fn send<T>(
         &self,
         command: SelectedBlobCommand,
@@ -515,6 +870,27 @@ pub(crate) enum SelectedBlobCommand {
         request: BlobReadPageRequest,
         response: oneshot::Sender<Result<BlobReadPage, ApplicationError>>,
     },
+    Subscribe {
+        request: BlobSubscriptionRequest,
+        response: oneshot::Sender<Result<BlobSubscription, ApplicationError>>,
+    },
+    Poll {
+        request: BlobPollRequest,
+        response: oneshot::Sender<Result<BlobDeliveryPage, ApplicationError>>,
+    },
+    Acknowledge {
+        subscription: BlobSubscriptionId,
+        publication: BlobPublicationId,
+        token: BlobDeliveryToken,
+        response: oneshot::Sender<Result<BlobAcknowledgement, ApplicationError>>,
+    },
+    Unsubscribe {
+        subscription: BlobSubscriptionId,
+        response: oneshot::Sender<Result<BlobUnsubscribe, ApplicationError>>,
+    },
+    DeliveryStatus {
+        response: oneshot::Sender<Result<BlobDeliveryStatus, ApplicationError>>,
+    },
 }
 
 impl SelectedBlobCommand {
@@ -525,6 +901,21 @@ impl SelectedBlobCommand {
             }
             Self::ReadPage { response, .. } => {
                 _ = response.send(Err(actor_unavailable("blob read page")));
+            }
+            Self::Subscribe { response, .. } => {
+                _ = response.send(Err(actor_unavailable("blob subscribe")));
+            }
+            Self::Poll { response, .. } => {
+                _ = response.send(Err(actor_unavailable("blob poll")));
+            }
+            Self::Acknowledge { response, .. } => {
+                _ = response.send(Err(actor_unavailable("blob acknowledge")));
+            }
+            Self::Unsubscribe { response, .. } => {
+                _ = response.send(Err(actor_unavailable("blob unsubscribe")));
+            }
+            Self::DeliveryStatus { response } => {
+                _ = response.send(Err(actor_unavailable("blob delivery status")));
             }
         }
     }
@@ -541,6 +932,36 @@ impl SelectedBlobCommand {
                 _ = response.send(Err(ApplicationError::new(
                     ApplicationErrorKind::ResourceLimit,
                     "blob read page",
+                )));
+            }
+            Self::Subscribe { response, .. } => {
+                _ = response.send(Err(ApplicationError::new(
+                    ApplicationErrorKind::ResourceLimit,
+                    "blob subscribe",
+                )));
+            }
+            Self::Poll { response, .. } => {
+                _ = response.send(Err(ApplicationError::new(
+                    ApplicationErrorKind::ResourceLimit,
+                    "blob poll",
+                )));
+            }
+            Self::Acknowledge { response, .. } => {
+                _ = response.send(Err(ApplicationError::new(
+                    ApplicationErrorKind::ResourceLimit,
+                    "blob acknowledge",
+                )));
+            }
+            Self::Unsubscribe { response, .. } => {
+                _ = response.send(Err(ApplicationError::new(
+                    ApplicationErrorKind::ResourceLimit,
+                    "blob unsubscribe",
+                )));
+            }
+            Self::DeliveryStatus { response } => {
+                _ = response.send(Err(ApplicationError::new(
+                    ApplicationErrorKind::ResourceLimit,
+                    "blob delivery status",
                 )));
             }
         }
@@ -573,6 +994,41 @@ struct VerifiedLiveCandidate {
     current_lineage: bool,
 }
 
+struct VerifiedBlobDeliveryMetadata {
+    publication: BlobPublicationId,
+    id: BlobId,
+    publisher: NodeId,
+    publisher_counter: u64,
+    topic: Topic,
+    scope: Scope,
+    priority: Priority,
+    total_len: u64,
+    media_type: Option<String>,
+    schema_id: Vec<u8>,
+    acceptance_marker: u64,
+    completion: BlobDepotCompletion,
+}
+
+impl VerifiedBlobDeliveryMetadata {
+    fn into_delivery(self, attempt: u64, token: StoreBlobDeliveryToken) -> BlobDelivery {
+        BlobDelivery {
+            publication: self.publication,
+            id: self.id,
+            publisher: self.publisher,
+            publisher_counter: self.publisher_counter,
+            topic: self.topic,
+            scope: self.scope,
+            priority: self.priority,
+            total_len: self.total_len,
+            media_type: self.media_type,
+            schema_id: self.schema_id,
+            acceptance_marker: self.acceptance_marker,
+            attempt,
+            token: BlobDeliveryToken::from_store(token),
+        }
+    }
+}
+
 /// Exclusive stopped-state handle over selected immutable Blob content.
 ///
 /// This owns the same process-exclusive mission-bound redb writer as Event,
@@ -594,6 +1050,10 @@ pub struct SelectedBlobNode {
     live_read_projection_coherence_fault: bool,
     #[cfg(test)]
     live_selected_load_policy_race_fault: bool,
+    #[cfg(test)]
+    live_poll_coherence_fault: bool,
+    #[cfg(test)]
+    live_poll_postcommit_completion_fault: bool,
 }
 
 impl SelectedBlobNode {
@@ -665,6 +1125,10 @@ impl SelectedBlobNode {
             live_read_projection_coherence_fault: false,
             #[cfg(test)]
             live_selected_load_policy_race_fault: false,
+            #[cfg(test)]
+            live_poll_coherence_fault: false,
+            #[cfg(test)]
+            live_poll_postcommit_completion_fault: false,
         };
         selected.current_policy("blob open")?;
         Ok(selected)
@@ -693,6 +1157,10 @@ impl SelectedBlobNode {
             live_read_projection_coherence_fault: false,
             #[cfg(test)]
             live_selected_load_policy_race_fault: false,
+            #[cfg(test)]
+            live_poll_coherence_fault: false,
+            #[cfg(test)]
+            live_poll_postcommit_completion_fault: false,
         }
     }
 
@@ -712,6 +1180,16 @@ impl SelectedBlobNode {
         release: Arc<std::sync::Barrier>,
     ) {
         self.live_publish_pass_two_gate = Some((reached, release));
+    }
+
+    #[cfg(test)]
+    fn inject_live_poll_coherence_fault(&mut self) {
+        self.live_poll_coherence_fault = true;
+    }
+
+    #[cfg(test)]
+    fn inject_live_poll_postcommit_completion_fault(&mut self) {
+        self.live_poll_postcommit_completion_fault = true;
     }
 
     /// Executes one worker-owned live command.
@@ -767,6 +1245,64 @@ impl SelectedBlobNode {
                     }
                     Ok(())
                 }
+            }
+            SelectedBlobCommand::Subscribe { request, response } => {
+                let result = self.subscribe(request);
+                finish_live_blob_ledger_command(
+                    result,
+                    response,
+                    admission,
+                    "blob subscribe",
+                    "live Blob subscription mutation failed a durable invariant",
+                )
+            }
+            SelectedBlobCommand::Poll { request, response } => {
+                let result = self.poll(request);
+                finish_live_blob_ledger_command(
+                    result,
+                    response,
+                    admission,
+                    "blob poll",
+                    "live Blob delivery poll lost an exact authenticated source/depot claim",
+                )
+            }
+            SelectedBlobCommand::Acknowledge {
+                subscription,
+                publication,
+                token,
+                response,
+            } => {
+                let result = self.acknowledge(subscription, publication, token);
+                finish_live_blob_ledger_command(
+                    result,
+                    response,
+                    admission,
+                    "blob acknowledge",
+                    "live Blob acknowledgement failed a durable ledger invariant",
+                )
+            }
+            SelectedBlobCommand::Unsubscribe {
+                subscription,
+                response,
+            } => {
+                let result = self.unsubscribe(subscription);
+                finish_live_blob_ledger_command(
+                    result,
+                    response,
+                    admission,
+                    "blob unsubscribe",
+                    "live Blob subscription removal failed a durable ledger invariant",
+                )
+            }
+            SelectedBlobCommand::DeliveryStatus { response } => {
+                let result = self.delivery_status();
+                finish_live_blob_ledger_command(
+                    result,
+                    response,
+                    admission,
+                    "blob delivery status",
+                    "live Blob delivery status failed a durable ledger invariant",
+                )
             }
         }
     }
@@ -1198,6 +1734,350 @@ impl SelectedBlobNode {
             return Err(application_error("blob publish", error));
         }
         Ok(blob_publish_result(&stored, outcome.inserted()))
+    }
+
+    /// Idempotently creates one durable metadata-only Blob subscription.
+    ///
+    /// The selector is local delivery intent only. It neither mutates the
+    /// runtime's network interests nor grants route/content authority.
+    pub fn subscribe(
+        &mut self,
+        request: BlobSubscriptionRequest,
+    ) -> Result<BlobSubscription, ApplicationError> {
+        let BlobSubscriptionRequest {
+            operation_key,
+            topic,
+            scope,
+            include_descendant_scopes,
+        } = request;
+        let key = BlobSubscriptionKey::new(operation_key)
+            .map_err(|error| application_error("blob subscribe", error.into()))?;
+        let policy = self.current_policy("blob subscribe")?;
+        let epoch = self.active_epoch(&scope, "blob subscribe")?;
+        self.require_blob_grants(&topic, &scope, epoch, "blob subscribe")?;
+        let outcome = self
+            .store
+            .create_blob_subscription_with_policy(
+                &policy,
+                &key,
+                BlobSubscriptionSpec {
+                    topic,
+                    scope,
+                    include_descendant_scopes,
+                },
+            )
+            .map_err(|error| application_error("blob subscribe", error.into()))?;
+        Ok(BlobSubscription {
+            id: BlobSubscriptionId::from_store(outcome.id),
+            inserted: outcome.inserted,
+        })
+    }
+
+    /// Polls freshly authenticated immutable-publication metadata.
+    ///
+    /// Every complete matching candidate is rebound to its startup-authenticated
+    /// source claim and current policy. A deliverable candidate is then exact-
+    /// loaded, source/content authenticated, and checked against its completed
+    /// depot capability before the Store atomically advances its retry. No Blob
+    /// plaintext is opened or returned by this operation.
+    pub fn poll(&mut self, request: BlobPollRequest) -> Result<BlobDeliveryPage, ApplicationError> {
+        let request = request.validate()?;
+        for _ in 0..MAX_SELECTED_BLOB_PLAN_RETRIES {
+            let policy = self.current_policy("blob poll")?;
+            let plan = self
+                .store
+                .prepare_blob_subscription_poll_with_policy(
+                    &policy,
+                    request.subscription.into_store(),
+                    request.delivery_limit,
+                    request.scan_limit,
+                )
+                .map_err(|error| application_error("blob poll", error.into()))?;
+            if plan.subscription() != request.subscription.into_store() {
+                return Err(ApplicationError::new(
+                    ApplicationErrorKind::Integrity,
+                    "blob poll",
+                ));
+            }
+
+            let spec = plan.spec();
+            let mut seen = std::collections::BTreeSet::new();
+            let mut verified = std::collections::BTreeMap::new();
+            let mut selection = BlobSubscriptionPollSelection::default();
+            for candidate in plan.candidates() {
+                if candidate.acceptance_marker() == 0
+                    || candidate
+                        .pending_attempt()
+                        .is_some_and(|attempt| attempt == 0)
+                    || candidate
+                        .acknowledged_attempt()
+                        .is_some_and(|attempt| attempt == 0)
+                    || (candidate.pending_attempt().is_some()
+                        && candidate.acknowledged_attempt().is_some())
+                {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::Integrity,
+                        "blob poll",
+                    ));
+                }
+                let projection = candidate.projection();
+                let publication = BlobPublicationId::from_store(projection.semantic_id);
+                if !seen.insert(publication) {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::Integrity,
+                        "blob poll",
+                    ));
+                }
+                let scope_matches = if spec.include_descendant_scopes {
+                    spec.scope.contains(&projection.scope)
+                } else {
+                    spec.scope == projection.scope
+                };
+                if spec.topic != projection.topic || !scope_matches {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::Integrity,
+                        "blob poll",
+                    ));
+                }
+                let retention = BlobSourceRetention::Completed {
+                    acceptance_marker: candidate.acceptance_marker(),
+                };
+                let current_lineage = {
+                    #[cfg(test)]
+                    if std::mem::replace(&mut self.live_poll_coherence_fault, false) {
+                        Err(NodeError::Protocol(
+                            "injected live Blob poll source-claim mismatch".into(),
+                        ))
+                    } else {
+                        self.source_route_cache.is_current_blob_source_projection(
+                            &self.verifier,
+                            projection,
+                            retention,
+                        )
+                    }
+                    #[cfg(not(test))]
+                    self.source_route_cache.is_current_blob_source_projection(
+                        &self.verifier,
+                        projection,
+                        retention,
+                    )
+                }
+                .map_err(|error| application_error("blob poll", error))?;
+                let current_epoch = self.active_epoch(&projection.scope, "blob poll")?;
+                let revoked = self
+                    .store
+                    .is_control_principal_revoked(projection.publisher)
+                    .map_err(|error| application_error("blob poll", error.into()))?;
+                let granted = self
+                    .verifier
+                    .can_route_blob(&projection.scope, current_epoch)
+                    && self.verifier.can_open_blob_content(
+                        &projection.scope,
+                        &projection.topic,
+                        current_epoch,
+                    );
+                if revoked || projection.epoch != current_epoch || !current_lineage || !granted {
+                    selection.inactive.push(projection.semantic_id);
+                    continue;
+                }
+
+                let stored = self
+                    .store
+                    .blob_by_semantic_id(projection.semantic_id)
+                    .map_err(|error| application_error("blob poll", error.into()))?
+                    .ok_or_else(|| {
+                        ApplicationError::new(ApplicationErrorKind::Integrity, "blob poll")
+                    })?;
+                let (durable_projection, durable_retention) =
+                    self.completed_projection(&stored, "blob poll")?;
+                if durable_projection != *projection || durable_retention != retention {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::Integrity,
+                        "blob poll",
+                    ));
+                }
+                let opened =
+                    self.verify_stored_blob(&stored, None, current_epoch, "blob poll", false)?;
+                if opened.semantic_id != projection.semantic_id
+                    || opened.acceptance_marker != candidate.acceptance_marker()
+                    || opened.blob.topic() != &projection.topic
+                    || opened.blob.scope() != &projection.scope
+                    || opened.blob.publisher() != projection.publisher
+                    || opened.blob.key_epoch() != current_epoch
+                {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::Integrity,
+                        "blob poll",
+                    ));
+                }
+                let (cache_current, completion) = self
+                    .source_route_cache
+                    .verify_completed_blob_source_claim(
+                        &self.verifier,
+                        projection,
+                        retention,
+                        &stored.sealed,
+                        opened.blob.blob_id(),
+                        opened.blob.manifest().total_len(),
+                        opened.blob.manifest().chunk_size(),
+                        opened.blob.manifest().chunk_count(),
+                        stored.variant_id,
+                    )
+                    .map_err(|error| application_error("blob poll", error))?;
+                if !cache_current
+                    || !self.verifier.is_current_source_route_lineage(
+                        opened.blob.scope(),
+                        opened.blob.key_epoch(),
+                        opened.blob.route_lineage(),
+                    )
+                    || !self.verifier.is_current_blob_physical_lineage(
+                        opened.blob.scope(),
+                        opened.blob.topic(),
+                        opened.blob.key_epoch(),
+                        opened.blob.physical_lineage(),
+                    )
+                {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::Integrity,
+                        "blob poll",
+                    ));
+                }
+                self.store
+                    .blob_depot_for_authenticated_read(&completion)
+                    .and_then(|mut depot| depot.recheck_completion(&completion))
+                    .map_err(|error| application_error("blob poll", error.into()))?;
+
+                let metadata = opened.blob.manifest().metadata();
+                let delivery = VerifiedBlobDeliveryMetadata {
+                    publication,
+                    id: BlobId::from_core(opened.blob.blob_id()),
+                    publisher: opened.blob.publisher(),
+                    publisher_counter: opened.blob.dot().counter,
+                    topic: opened.blob.topic().clone(),
+                    scope: opened.blob.scope().clone(),
+                    priority: opened.blob.priority(),
+                    total_len: opened.blob.manifest().total_len(),
+                    media_type: metadata.media_type().map(str::to_owned),
+                    schema_id: metadata.schema_id().to_vec(),
+                    acceptance_marker: opened.acceptance_marker,
+                    completion,
+                };
+                if verified.insert(publication, delivery).is_some() {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::Integrity,
+                        "blob poll",
+                    ));
+                }
+                selection.deliverable.push(projection.semantic_id);
+            }
+
+            let committed = match self
+                .store
+                .commit_blob_subscription_poll_with_policy(&policy, &plan, &selection)
+            {
+                Ok(committed) => committed,
+                Err(
+                    StoreError::BlobSubscriptionPlanChanged
+                    | StoreError::BlobSelectorGenerationChanged
+                    | StoreError::ControlPolicyChanged,
+                ) => continue,
+                Err(error) => return Err(application_error("blob poll", error.into())),
+            };
+            let mut deliveries = Vec::with_capacity(committed.deliveries.len());
+            for delivery in committed.deliveries {
+                let publication = BlobPublicationId::from_store(delivery.semantic_id);
+                let metadata = verified.remove(&publication).ok_or_else(|| {
+                    ApplicationError::new(ApplicationErrorKind::Integrity, "blob poll")
+                })?;
+                if metadata.publication != publication
+                    || metadata.acceptance_marker != delivery.acceptance_marker
+                    || delivery.attempt == 0
+                {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::Integrity,
+                        "blob poll",
+                    ));
+                }
+                #[cfg(test)]
+                if std::mem::replace(&mut self.live_poll_postcommit_completion_fault, false) {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::Integrity,
+                        "blob poll",
+                    ));
+                }
+                self.store
+                    .blob_depot_for_authenticated_read(&metadata.completion)
+                    .and_then(|mut depot| depot.recheck_completion(&metadata.completion))
+                    .map_err(|error| application_error("blob poll", error.into()))?;
+                deliveries.push(metadata.into_delivery(delivery.attempt, delivery.token));
+            }
+            return Ok(BlobDeliveryPage {
+                deliveries,
+                has_more: committed.has_more,
+            });
+        }
+        Err(ApplicationError::new(
+            ApplicationErrorKind::PolicyUnsettled,
+            "blob poll",
+        ))
+    }
+
+    /// Idempotently acknowledges one exact token-bound Blob delivery.
+    pub fn acknowledge(
+        &mut self,
+        subscription: BlobSubscriptionId,
+        publication: BlobPublicationId,
+        token: BlobDeliveryToken,
+    ) -> Result<BlobAcknowledgement, ApplicationError> {
+        let policy = self.current_policy("blob acknowledge")?;
+        match self
+            .store
+            .acknowledge_blob_delivery_with_policy(
+                &policy,
+                subscription.into_store(),
+                publication.into_store(),
+                token.into_store(),
+            )
+            .map_err(|error| application_error("blob acknowledge", error.into()))?
+        {
+            StoreBlobDeliveryAck::Acknowledged => Ok(BlobAcknowledgement::Acknowledged),
+            StoreBlobDeliveryAck::AlreadyAcknowledged => {
+                Ok(BlobAcknowledgement::AlreadyAcknowledged)
+            }
+        }
+    }
+
+    /// Idempotently removes one Blob selector and its delivery ledger.
+    pub fn unsubscribe(
+        &mut self,
+        subscription: BlobSubscriptionId,
+    ) -> Result<BlobUnsubscribe, ApplicationError> {
+        let policy = self.current_policy("blob unsubscribe")?;
+        let BlobSubscriptionRemoveOutcome { removed, .. } = self
+            .store
+            .remove_blob_subscription_with_policy(&policy, subscription.into_store())
+            .map_err(|error| application_error("blob unsubscribe", error.into()))?;
+        Ok(if removed {
+            BlobUnsubscribe::Removed
+        } else {
+            BlobUnsubscribe::AlreadyAbsent
+        })
+    }
+
+    /// Returns audited local Blob selector and delivery-ledger counts.
+    pub fn delivery_status(&mut self) -> Result<BlobDeliveryStatus, ApplicationError> {
+        let _policy = self.current_policy("blob delivery status")?;
+        let stats = self
+            .store
+            .blob_subscription_stats()
+            .map_err(|error| application_error("blob delivery status", error.into()))?;
+        Ok(BlobDeliveryStatus {
+            subscriptions: stats.subscriptions,
+            pending_deliveries: stats.pending_deliveries,
+            acknowledged_deliveries: stats.acknowledged_deliveries,
+            delivery_cursors: stats.delivery_cursors,
+            selector_generation: stats.selector_generation,
+        })
     }
 
     /// Streams one freshly source/content/depot-verified Blob into `output`.
@@ -2313,6 +3193,29 @@ fn live_blob_coherence_fatal(context: &'static str, error: NodeError) -> NodeErr
     }
 }
 
+fn finish_live_blob_ledger_command<T>(
+    result: Result<T, ApplicationError>,
+    response: oneshot::Sender<Result<T, ApplicationError>>,
+    admission: &AtomicBool,
+    operation: &'static str,
+    fatal_context: &'static str,
+) -> Result<(), NodeError> {
+    if result
+        .as_ref()
+        .is_err_and(|error| error.kind() == ApplicationErrorKind::Integrity)
+    {
+        drop(response);
+        return Err(NodeError::FatalBlobCoherence(fatal_context.into()));
+    }
+    if admission.load(Ordering::Acquire) {
+        _ = response.send(result);
+    } else {
+        drop(result);
+        _ = response.send(Err(actor_unavailable(operation)));
+    }
+    Ok(())
+}
+
 fn validate_live_publish_request(request: &BlobPublishRequest) -> Result<(), ApplicationError> {
     if request.operation_key.is_empty()
         || request.operation_key.len() > MAX_BLOB_OPERATION_KEY_BYTES
@@ -2624,8 +3527,383 @@ mod tests {
         }
     }
 
+    fn subscription_request(operation: &[u8]) -> BlobSubscriptionRequest {
+        BlobSubscriptionRequest {
+            operation_key: operation.to_vec(),
+            topic: blob_topic(),
+            scope: blob_scope(),
+            include_descendant_scopes: false,
+        }
+    }
+
     fn payload(length: usize) -> Vec<u8> {
         (0..length).map(|index| (index % 251) as u8).collect()
+    }
+
+    #[test]
+    fn blob_subscription_delivers_exact_publications_with_durable_token_bound_retries() {
+        let root = TestRoot::new("subscription-lifecycle");
+        let bytes = payload(SELECTED_BLOB_CHUNK_SIZE as usize + 19);
+        let operation = b"blob/subscriptions/exact";
+        let (subscription, second_publication, acknowledged_token) = {
+            let mut node = selected_node(&root);
+            let subscription = node
+                .subscribe(subscription_request(operation))
+                .expect("create Blob subscription");
+            assert!(subscription.inserted);
+            assert_eq!(
+                node.subscribe(subscription_request(operation))
+                    .expect("replay Blob subscription"),
+                BlobSubscription {
+                    inserted: false,
+                    ..subscription
+                }
+            );
+
+            let mut conflicting = subscription_request(operation);
+            conflicting.include_descendant_scopes = true;
+            let conflict = node
+                .subscribe(conflicting)
+                .expect_err("changed selector under one operation key");
+            assert_eq!(conflict.kind(), ApplicationErrorKind::Conflict);
+            assert_eq!(conflict.operation(), "blob subscribe");
+
+            for invalid in [
+                BlobPollRequest {
+                    subscription: subscription.id,
+                    delivery_limit: 0,
+                    scan_limit: 1,
+                },
+                BlobPollRequest {
+                    subscription: subscription.id,
+                    delivery_limit: 1,
+                    scan_limit: 0,
+                },
+                BlobPollRequest {
+                    subscription: subscription.id,
+                    delivery_limit: MAX_SELECTED_BLOB_DELIVERIES + 1,
+                    scan_limit: 1,
+                },
+                BlobPollRequest {
+                    subscription: subscription.id,
+                    delivery_limit: 1,
+                    scan_limit: MAX_SELECTED_BLOB_SUBSCRIPTION_SCAN + 1,
+                },
+            ] {
+                let error = node.poll(invalid).expect_err("invalid Blob poll bounds");
+                assert_eq!(error.kind(), ApplicationErrorKind::InvalidRequest);
+                assert_eq!(error.operation(), "blob poll");
+            }
+
+            let first = node
+                .publish(
+                    request(b"blob/subscriptions/publication-one"),
+                    &mut Cursor::new(bytes.clone()),
+                )
+                .expect("publish first source publication");
+            let mut second_request = request(b"blob/subscriptions/publication-two");
+            second_request.priority = Priority::Flash;
+            let second = node
+                .publish(second_request, &mut Cursor::new(bytes.clone()))
+                .expect("publish second source publication");
+            assert_eq!(first.id, second.id, "content identity is shared");
+            assert_ne!(first.publisher_counter, second.publisher_counter);
+            assert_ne!(first.priority, second.priority);
+
+            let first_page = node
+                .poll(BlobPollRequest {
+                    subscription: subscription.id,
+                    delivery_limit: 1,
+                    scan_limit: 8,
+                })
+                .expect("poll first Blob publication");
+            assert_eq!(first_page.deliveries.len(), 1);
+            assert!(first_page.has_more);
+            let first_delivery = &first_page.deliveries[0];
+            assert_eq!(first_delivery.id, first.id);
+            assert_eq!(first_delivery.acceptance_marker, first.acceptance_marker);
+            assert_eq!(first_delivery.publisher, first.publisher);
+            assert_eq!(first_delivery.publisher_counter, first.publisher_counter);
+            assert_eq!(first_delivery.topic, blob_topic());
+            assert_eq!(first_delivery.scope, blob_scope());
+            assert_eq!(first_delivery.priority, first.priority);
+            assert_eq!(first_delivery.total_len, bytes.len() as u64);
+            assert_eq!(first_delivery.media_type, first.media_type);
+            assert_eq!(first_delivery.schema_id, first.schema_id);
+            assert_eq!(first_delivery.attempt, 1);
+            let first_publication = first_delivery.publication;
+            let prior_attempt = first_delivery.token;
+
+            let retried = node
+                .poll(BlobPollRequest {
+                    subscription: subscription.id,
+                    delivery_limit: 1,
+                    scan_limit: 8,
+                })
+                .expect("retry unacknowledged Blob publication");
+            assert_eq!(retried.deliveries.len(), 1);
+            assert!(retried.has_more);
+            assert_eq!(retried.deliveries[0].publication, first_publication);
+            assert_eq!(retried.deliveries[0].attempt, 2);
+            assert_ne!(retried.deliveries[0].token, prior_attempt);
+            assert_eq!(
+                node.acknowledge(subscription.id, first_publication, prior_attempt)
+                    .expect("an earlier same-tenure token remains crash-safe"),
+                BlobAcknowledgement::Acknowledged
+            );
+            assert_eq!(
+                node.acknowledge(
+                    subscription.id,
+                    first_publication,
+                    retried.deliveries[0].token,
+                )
+                .expect("the latest same-tenure token is idempotent"),
+                BlobAcknowledgement::AlreadyAcknowledged
+            );
+
+            let second_page = node
+                .poll(BlobPollRequest {
+                    subscription: subscription.id,
+                    delivery_limit: 1,
+                    scan_limit: 8,
+                })
+                .expect("poll second Blob publication");
+            assert_eq!(second_page.deliveries.len(), 1);
+            assert!(!second_page.has_more);
+            let second_delivery = &second_page.deliveries[0];
+            assert_eq!(second_delivery.id, second.id);
+            assert_eq!(second_delivery.acceptance_marker, second.acceptance_marker);
+            assert_eq!(second_delivery.publisher_counter, second.publisher_counter);
+            assert_eq!(second_delivery.priority, second.priority);
+            assert_ne!(second_delivery.publication, first_publication);
+            assert_eq!(second_delivery.attempt, 1);
+            let second_publication = second_delivery.publication;
+            let acknowledged_token = second_delivery.token;
+            assert_eq!(
+                node.acknowledge(subscription.id, second_publication, acknowledged_token,)
+                    .expect("acknowledge second publication"),
+                BlobAcknowledgement::Acknowledged
+            );
+            assert_eq!(
+                node.acknowledge(subscription.id, second_publication, acknowledged_token,)
+                    .expect("idempotent second acknowledgement"),
+                BlobAcknowledgement::AlreadyAcknowledged
+            );
+            assert!(
+                node.poll(BlobPollRequest {
+                    subscription: subscription.id,
+                    delivery_limit: 8,
+                    scan_limit: 8,
+                })
+                .expect("poll after acknowledgements")
+                .deliveries
+                .is_empty()
+            );
+            assert_eq!(
+                node.delivery_status().expect("Blob delivery status"),
+                BlobDeliveryStatus {
+                    subscriptions: 1,
+                    pending_deliveries: 0,
+                    acknowledged_deliveries: 2,
+                    delivery_cursors: 2,
+                    selector_generation: 1,
+                }
+            );
+            (subscription, second_publication, acknowledged_token)
+        };
+
+        let mut reopened = selected_node(&root);
+        assert!(
+            reopened
+                .poll(BlobPollRequest {
+                    subscription: subscription.id,
+                    delivery_limit: 8,
+                    scan_limit: 8,
+                })
+                .expect("restart preserves acknowledgements")
+                .deliveries
+                .is_empty()
+        );
+        assert_eq!(
+            reopened
+                .unsubscribe(subscription.id)
+                .expect("remove Blob subscription"),
+            BlobUnsubscribe::Removed
+        );
+        assert_eq!(
+            reopened
+                .unsubscribe(subscription.id)
+                .expect("repeat Blob subscription removal"),
+            BlobUnsubscribe::AlreadyAbsent
+        );
+        let recreated = reopened
+            .subscribe(subscription_request(operation))
+            .expect("recreate stable Blob subscription identity");
+        assert_eq!(recreated.id, subscription.id);
+        assert!(recreated.inserted);
+        let stale = reopened
+            .acknowledge(recreated.id, second_publication, acknowledged_token)
+            .expect_err("removed-incarnation token cannot cross recreation");
+        assert_eq!(stale.kind(), ApplicationErrorKind::InvalidRequest);
+        assert_eq!(stale.operation(), "blob acknowledge");
+        assert_eq!(
+            reopened
+                .delivery_status()
+                .expect("recreated Blob delivery status"),
+            BlobDeliveryStatus {
+                subscriptions: 1,
+                pending_deliveries: 0,
+                acknowledged_deliveries: 0,
+                delivery_cursors: 0,
+                selector_generation: 3,
+            }
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_blob_handle_routes_subscription_lifecycle_through_joined_worker() {
+        let root = TestRoot::new("live-subscription-lifecycle");
+        let mut node = selected_node(&root);
+        let published = node
+            .publish(
+                request(b"blob/live-subscriptions/publication"),
+                &mut Cursor::new(payload(73)),
+            )
+            .expect("publish live subscription fixture");
+        let identity = node.identity();
+        let mission_authority = node.mission_authority();
+        let admission = Arc::new(AtomicBool::new(true));
+        let worker_admission = Arc::clone(&admission);
+        let (commands, mut received) = mpsc::channel(2);
+        let handle = SelectedBlobHandle::new(commands, admission, identity, mission_authority);
+        let worker = tokio::task::spawn_blocking(move || {
+            while let Some(command) = received.blocking_recv() {
+                let SelectedApplicationCommand::Blob(command) = command else {
+                    panic!("live Blob test received another application class");
+                };
+                node.execute_live(command, &worker_admission)
+                    .expect("execute live Blob subscription command");
+            }
+        });
+
+        let subscription = handle
+            .subscribe(subscription_request(b"blob/live-subscriptions/selector"))
+            .await
+            .expect("live Blob subscribe");
+        assert!(subscription.inserted);
+        let page = handle
+            .poll(BlobPollRequest {
+                subscription: subscription.id,
+                delivery_limit: 1,
+                scan_limit: 4,
+            })
+            .await
+            .expect("live Blob poll");
+        assert_eq!(page.deliveries.len(), 1);
+        assert_eq!(page.deliveries[0].id, published.id);
+        assert_eq!(
+            handle
+                .acknowledge(
+                    subscription.id,
+                    page.deliveries[0].publication,
+                    page.deliveries[0].token,
+                )
+                .await
+                .expect("live Blob acknowledgement"),
+            BlobAcknowledgement::Acknowledged
+        );
+        assert_eq!(
+            handle
+                .delivery_status()
+                .await
+                .expect("live Blob delivery status"),
+            BlobDeliveryStatus {
+                subscriptions: 1,
+                pending_deliveries: 0,
+                acknowledged_deliveries: 1,
+                delivery_cursors: 1,
+                selector_generation: 1,
+            }
+        );
+        assert_eq!(
+            handle
+                .unsubscribe(subscription.id)
+                .await
+                .expect("live Blob unsubscribe"),
+            BlobUnsubscribe::Removed
+        );
+        drop(handle);
+        worker.await.expect("join live Blob subscription worker");
+    }
+
+    #[test]
+    fn blob_subscription_withholds_stale_epoch_and_delivers_only_current_publication() {
+        let root = TestRoot::new("subscription-policy-withholding");
+        let mut services = persist_rekey_mission(&root);
+        let bytes = payload(91);
+        let (subscription, old_publication) = {
+            let mut node = selected_node(&root);
+            let old = node
+                .publish(
+                    request(b"blob/subscriptions/pre-rekey"),
+                    &mut Cursor::new(bytes.clone()),
+                )
+                .expect("publish pre-rekey Blob");
+            let subscription = node
+                .subscribe(subscription_request(
+                    b"blob/subscriptions/policy-withholding",
+                ))
+                .expect("subscribe before Blob rekey");
+            (subscription, old)
+        };
+
+        apply_epoch_two_rekey(&root, &mut services);
+        let mut reopened = selected_node(&root);
+        let withheld = reopened
+            .poll(BlobPollRequest {
+                subscription: subscription.id,
+                delivery_limit: 4,
+                scan_limit: 8,
+            })
+            .expect("poll stale-epoch Blob publication");
+        assert!(withheld.deliveries.is_empty());
+        assert!(!withheld.has_more);
+        assert_eq!(
+            reopened
+                .delivery_status()
+                .expect("withheld Blob ledger status")
+                .pending_deliveries,
+            0
+        );
+
+        let current = reopened
+            .publish(
+                request(b"blob/subscriptions/post-rekey"),
+                &mut Cursor::new(bytes),
+            )
+            .expect("publish post-rekey Blob");
+        assert_eq!(current.id, old_publication.id);
+        let delivered = reopened
+            .poll(BlobPollRequest {
+                subscription: subscription.id,
+                delivery_limit: 4,
+                scan_limit: 8,
+            })
+            .expect("poll current-epoch Blob publication");
+        assert_eq!(delivered.deliveries.len(), 1);
+        assert_eq!(delivered.deliveries[0].id, current.id);
+        assert_eq!(
+            delivered.deliveries[0].publisher_counter,
+            current.publisher_counter
+        );
+        assert_eq!(
+            delivered.deliveries[0].acceptance_marker,
+            current.acceptance_marker
+        );
+        assert_ne!(
+            delivered.deliveries[0].acceptance_marker,
+            old_publication.acceptance_marker
+        );
     }
 
     #[test]
@@ -2749,6 +4027,77 @@ mod tests {
             .expect_err("saturated worker rejects");
         assert_eq!(error.kind(), ApplicationErrorKind::ResourceLimit);
         assert_eq!(error.operation(), "blob read page");
+
+        let subscription = BlobSubscriptionId::from_bytes([8; 32]);
+        let publication = BlobPublicationId::from_bytes([9; 32]);
+        let token = BlobDeliveryToken::inert_for_command_rejection();
+
+        let (response, received) = oneshot::channel();
+        SelectedBlobCommand::Subscribe {
+            request: subscription_request(b"blob/command-rejection"),
+            response,
+        }
+        .reject();
+        let error = received
+            .blocking_recv()
+            .expect("closed subscribe response")
+            .expect_err("closed subscribe rejects");
+        assert_eq!(error.kind(), ApplicationErrorKind::StateUnavailable);
+        assert_eq!(error.operation(), "blob subscribe");
+
+        let (response, received) = oneshot::channel();
+        SelectedBlobCommand::Poll {
+            request: BlobPollRequest {
+                subscription,
+                delivery_limit: 1,
+                scan_limit: 1,
+            },
+            response,
+        }
+        .reject_resource_limit();
+        let error = received
+            .blocking_recv()
+            .expect("saturated poll response")
+            .expect_err("saturated poll rejects");
+        assert_eq!(error.kind(), ApplicationErrorKind::ResourceLimit);
+        assert_eq!(error.operation(), "blob poll");
+
+        let (response, received) = oneshot::channel();
+        SelectedBlobCommand::Acknowledge {
+            subscription,
+            publication,
+            token,
+            response,
+        }
+        .reject();
+        let error = received
+            .blocking_recv()
+            .expect("closed acknowledgement response")
+            .expect_err("closed acknowledgement rejects");
+        assert_eq!(error.kind(), ApplicationErrorKind::StateUnavailable);
+        assert_eq!(error.operation(), "blob acknowledge");
+
+        let (response, received) = oneshot::channel();
+        SelectedBlobCommand::Unsubscribe {
+            subscription,
+            response,
+        }
+        .reject_resource_limit();
+        let error = received
+            .blocking_recv()
+            .expect("saturated unsubscribe response")
+            .expect_err("saturated unsubscribe rejects");
+        assert_eq!(error.kind(), ApplicationErrorKind::ResourceLimit);
+        assert_eq!(error.operation(), "blob unsubscribe");
+
+        let (response, received) = oneshot::channel();
+        SelectedBlobCommand::DeliveryStatus { response }.reject();
+        let error = received
+            .blocking_recv()
+            .expect("closed delivery-status response")
+            .expect_err("closed delivery-status rejects");
+        assert_eq!(error.kind(), ApplicationErrorKind::StateUnavailable);
+        assert_eq!(error.operation(), "blob delivery status");
     }
 
     #[tokio::test]
@@ -2825,6 +4174,104 @@ mod tests {
                 .publications,
             0
         );
+    }
+
+    #[test]
+    fn live_blob_poll_coherence_failure_is_actor_fatal_and_does_not_advance_attempt() {
+        let root = TestRoot::new("live-poll-coherence-fatal");
+        let mut node = selected_node(&root);
+        node.publish(
+            request(b"blob/live-poll-coherence/publication"),
+            &mut Cursor::new(vec![1, 2, 3]),
+        )
+        .expect("publish live poll coherence fixture");
+        let subscription = node
+            .subscribe(subscription_request(
+                b"blob/live-poll-coherence/subscription",
+            ))
+            .expect("subscribe live poll coherence fixture");
+        node.inject_live_poll_coherence_fault();
+
+        let (response, received) = oneshot::channel();
+        let command = SelectedBlobCommand::Poll {
+            request: BlobPollRequest {
+                subscription: subscription.id,
+                delivery_limit: 1,
+                scan_limit: 4,
+            },
+            response,
+        };
+        let admission = AtomicBool::new(true);
+        let error = node
+            .execute_live(command, &admission)
+            .expect_err("live poll coherence contradiction must escape as actor-fatal");
+        assert!(matches!(&error, NodeError::FatalBlobCoherence(_)));
+        assert!(error.to_string().contains("delivery poll"));
+        assert!(received.blocking_recv().is_err());
+        assert_eq!(
+            node.delivery_status()
+                .expect("unadvanced delivery ledger after fatal poll"),
+            BlobDeliveryStatus {
+                subscriptions: 1,
+                pending_deliveries: 0,
+                acknowledged_deliveries: 0,
+                delivery_cursors: 0,
+                selector_generation: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn live_blob_poll_postcommit_completion_failure_is_fatal_and_attempt_retries() {
+        let root = TestRoot::new("live-poll-postcommit-completion-fatal");
+        let mut node = selected_node(&root);
+        node.publish(
+            request(b"blob/live-poll-postcommit/publication"),
+            &mut Cursor::new(vec![4, 5, 6]),
+        )
+        .expect("publish live postcommit poll fixture");
+        let subscription = node
+            .subscribe(subscription_request(
+                b"blob/live-poll-postcommit/subscription",
+            ))
+            .expect("subscribe live postcommit poll fixture");
+        node.inject_live_poll_postcommit_completion_fault();
+
+        let (response, received) = oneshot::channel();
+        let command = SelectedBlobCommand::Poll {
+            request: BlobPollRequest {
+                subscription: subscription.id,
+                delivery_limit: 1,
+                scan_limit: 4,
+            },
+            response,
+        };
+        let admission = AtomicBool::new(true);
+        let error = node
+            .execute_live(command, &admission)
+            .expect_err("postcommit completion contradiction must escape as actor-fatal");
+        assert!(matches!(&error, NodeError::FatalBlobCoherence(_)));
+        assert!(received.blocking_recv().is_err());
+        assert_eq!(
+            node.delivery_status()
+                .expect("pending ledger after hidden postcommit attempt"),
+            BlobDeliveryStatus {
+                subscriptions: 1,
+                pending_deliveries: 1,
+                acknowledged_deliveries: 0,
+                delivery_cursors: 1,
+                selector_generation: 1,
+            }
+        );
+        let retried = node
+            .poll(BlobPollRequest {
+                subscription: subscription.id,
+                delivery_limit: 1,
+                scan_limit: 4,
+            })
+            .expect("hidden postcommit attempt remains retryable");
+        assert_eq!(retried.deliveries.len(), 1);
+        assert_eq!(retried.deliveries[0].attempt, 2);
     }
 
     #[test]

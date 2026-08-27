@@ -384,8 +384,9 @@ FUSE, NFS, device, or other hostile filesystem syscall may delay the joined
 worker and therefore shutdown or zeroization; no bounded-latency claim is made
 for such providers.
 
-This is mechanism and current-code test coverage, not a retained execution
-receipt or acceptance amendment. Blob subscription/status convergence,
+This was mechanism and current-code test coverage, not a retained execution
+receipt or acceptance amendment. At this amendment freeze, Blob
+subscription/status convergence,
 route-only custody, TTL/expiry/garbage collection, metadata-independent
 whole-byte deduplication, 100+ MiB or RSS/resource thresholds, representative
 physical IP/NAT/relay or BTLE operation, mixed-implementation interoperability,
@@ -442,7 +443,8 @@ This amendment supersedes the earlier present-tense statements that selected
 State has no live application subscription or durable delivery subscription.
 Those statements remain above only as dated boundaries of the stopped and
 semantic-v4 network slices. Record's separate delivery and receipt amendment
-follows below; Blob delivery subscriptions remain open.
+follows below. Blob delivery now has a later current-code amendment, but its
+retained acceptance remains open.
 
 `SelectedStateHandle` now exposes durable `subscribe`, `poll`, `acknowledge`,
 and `unsubscribe` operations backed by the actor-owned Store. The queue is
@@ -534,4 +536,50 @@ sample, an integration-usability result, or a release gate. The receipt adds no
 finite Record TTL/GC, physical/NAT/relay/BTLE operation, mixed implementations,
 scale/resource/soak evidence, selected-node bindings, automatic registered-policy
 merge, reproducible source-to-binary proof, release credit, or production
-authorization. Blob delivery/status also remains open.
+authorization. At that receipt freeze, Blob delivery/status also remained open.
+
+## Live selected Blob delivery mechanism amendment (2026-08-27)
+
+This amendment supersedes present-tense statements above that selected Blob has
+no application subscription or delivery surface. It does not amend the frozen
+live-Blob receipt: that retained run predates this queue and provides no Blob
+delivery evidence.
+
+`SelectedBlobHandle` and the exclusive stopped `SelectedBlobNode` now expose
+durable `subscribe`, `poll`, `acknowledge`, `unsubscribe`, and
+`delivery_status` operations. A selector covers one topic and exact scope or its
+descendants. It is local application intent only and cannot add or mutate the
+semantic-v5 configured network interests, route/content authority, carrier
+eligibility, or depot capabilities.
+
+One delivery identifies one exact source-authenticated immutable publication.
+Its `BlobPublicationId` is the semantic source-publication identity, not
+`BlobId`: distinct publishers, counters, or priorities can sign separate
+publications of the same immutable content identity, and acknowledgement of one
+cannot consume another. The notification returns only authenticated identity
+metadata, total length, local acceptance marker, attempt, and opaque token. It
+contains no plaintext, source envelope, manifest, sealed bytes, content key,
+nonce, chunk, carrier progress, provider state, or depot path. Applications use
+the existing `BlobReadRequest` separately when they need bytes.
+
+Poll snapshots the complete bounded matching publication set, rebinds every
+candidate to its startup-authenticated projection and current policy, then
+exact-loads and rechecks each still-deliverable source envelope and completed
+depot before atomically committing attempts. It fails closed when the caller's
+scan bound cannot cover the matching set. The Store durably retains selector
+incarnation, pending attempt,
+acknowledgement receipt, and monotonic per-publication cursor. Tokens bind the
+subscription, incarnation, publication, tenure, and issued attempt. Exact ack
+and re-ack are idempotent. An earlier nonzero issued attempt remains valid at or
+below the durable high-water while the same publication tenure is pending;
+wrong-tenure, wrong-incarnation, malformed, cross-subscription, cross-
+publication, future/unissued, removed, and recreated-selector tokens fail
+closed.
+
+`delivery_status` reports only structurally audited local selector/pending/ack/
+cursor counts. It is not peer, contact, transfer-progress, synchronization, or
+convergence status. This amendment has focused mechanism and migration tests,
+not a retained Linux delivery receipt. It changes no atomic requirement status
+by itself and makes no finite Blob TTL/expiry/GC, route-only custody,
+crash/power-loss, physical/NAT/relay/BTLE, mixed-implementation, large/RSS,
+binding, reproducible-build, release, or production-authority claim.

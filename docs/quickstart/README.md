@@ -19,13 +19,14 @@ stopped durable revisions, explicit conflict siblings, exact-guard application
 resolution, and retained-bounded durable whole-key active-head delivery. The
 [selected Blob quickstart](selected-blob-api.md)
 demonstrates the cloneable live handle's peerless-capable durable regular-file
-publication and bounded zeroize-on-drop page reads, as well as the exclusive
-stopped streaming facade, immutable metadata-bound identity, crash-resumable
-encrypted chunks, and exact durable retry. Durable Blob delivery, State contact/status and
-materialized-view/synthetic-withdrawal behavior, dynamic State network
-interests, automatic registered-policy Record merge, atomic Event
-subscription update, selected-node language bindings, and representative
-physical or mixed-implementation acceptance remain open.
+publication, bounded zeroize-on-drop page reads, and durable metadata-only
+publication delivery, as well as the exclusive stopped streaming facade,
+immutable metadata-bound identity, crash-resumable encrypted chunks, and exact
+durable retry. Retained Blob-delivery acceptance, Blob peer/convergence status,
+State contact/status and materialized-view/synthetic-withdrawal behavior,
+dynamic State network interests, automatic registered-policy Record merge,
+atomic Event subscription update, selected-node language bindings, and
+representative physical or mixed-implementation acceptance remain open.
 
 A [retained 9,656-byte State-delivery receipt](../implementation/evidence/selected-live-state-subscription-8912fc3.json)
 (SHA-256

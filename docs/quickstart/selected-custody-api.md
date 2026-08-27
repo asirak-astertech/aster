@@ -279,8 +279,9 @@ documented in the [selected State API](selected-state-api.md). This slice adds
 no Record subscription itself; Record's separate retained-bounded durable
 whole-key queue is documented in the [selected Record API](selected-record-api.md)
 and its [Record-delivery receipt](../implementation/evidence/selected-live-record-subscription-0c11344.json).
-That receipt adds no custody or TTL/GC claim here. Blob subscription/status,
-Blob custody/TTL/GC,
+That receipt adds no custody or TTL/GC claim here. Blob application delivery is
+now a separate metadata-only current-code queue, but retained delivery
+acceptance, Blob peer/convergence status, Blob custody/TTL/GC,
 arbitrary-peer or route-only Blob resume, selected-node bindings, cross-class
 priority eviction, physical-radio silence or media-sanitization proof, protected
 provisioning, representative/physical NAT or Internet, public/default or
