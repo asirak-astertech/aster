@@ -471,7 +471,7 @@ mise run tour-relay
             <div class="q">Immutable content</div>
             <h3>Blob</h3>
             <div class="for">Imagery, maps, attachments, model files</div>
-            <p>Immutable chunks are bound to an authenticated manifest and stored through crash-resumable encrypted local staging. Network transfer is the remaining data-class integration.</p>
+            <p>Immutable chunks are bound to an authenticated manifest and stored through crash-resumable encrypted local staging. Semantic v5 can transfer already-durable Blob sources and bounded missing carrier prefixes directly between content-capable peers; live Blob application access, route-only relay/custody, controlled-relay acceptance, and retained physical evidence remain open.</p>
           </article>
         </div>
       </div>
@@ -488,7 +488,7 @@ mise run tour-relay
           <article class="card">
             <div class="icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20v-8"></path><circle cx="12" cy="12" r="2"></circle><path d="M7.8 7.8a6 6 0 0 0 0 8.4M16.2 7.8a6 6 0 0 1 0 8.4"></path><path d="M4.9 4.9a10 10 0 0 0 0 14.2M19.1 4.9a10 10 0 0 1 0 14.2"></path></svg></div>
             <h3>Separate carrier from protocol</h3>
-            <p>The IP runtime uses direct Iroh, while mission identity, source authenticity, and data semantics remain independent. The boundary is designed for additional carriers without changing the application model.</p>
+            <p>The IP runtime uses direct Iroh or one exact operator-pinned controlled Iroh connectivity relay, while mission identity, source authenticity, and data semantics remain independent. The controlled relay is connectivity infrastructure, not an Aster node, store, route grant, or payload-blind Event relay. A retained one-host receipt observes exact Event delivery and no-op replay through one cone/direct and one restrictive/controlled-relay Docker Linux namespace-NAT cell. It is not discovery or punching, temporal fallback chronology, representative or physical NAT, public Internet or public/default relay, independent implementation, or release evidence. Hosted lookup, public/default relay substitution, and port mapping remain disabled; the carrier boundary is designed for additional carriers without changing the application model.</p>
           </article>
           <article class="card">
             <div class="icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 5 6v5c0 4.4 3 8.3 7 9.5 4-1.2 7-5.1 7-9.5V6l-7-3z"></path><path d="m9.5 12 1.8 1.8 3.4-3.6"></path></svg></div>
@@ -560,7 +560,7 @@ mise install</pre>
           <div class="icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 9v4"></path><path d="M12 17h.01"></path><path d="M10.3 3.9 2.6 17a2 2 0 0 0 1.7 3h15.4a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"></path></svg></div>
           <div style="display: flex; flex-direction: column; gap: 10px;">
             <h3>Built for evaluation. Explicit about what is left.</h3>
-            <p>Aster is an early reference implementation for protocol evaluation, application integration, and controlled capability testing—not production deployment. Applications can publish and consume Events through live Rust and ConnectRPC APIs. State and Record synchronize over direct Iroh contacts, but their application APIs require the node to be stopped. Blob supports local authenticated streaming; mesh transfer remains open. Production authorization depends on the tracked security, interoperability, platform, operations, and acceptance gates.</p>
+            <p>Aster is an early reference implementation for protocol evaluation, application integration, and controlled capability testing—not production deployment. Applications can publish and consume Events through live Rust and ConnectRPC APIs. State and Record synchronize over direct Iroh contacts, but their application APIs require the node to be stopped. Blob has local authenticated streaming plus bounded semantic-v5 direct source/carrier transfer between content-capable peers; its application API remains stopped/local, and route-only or controlled-relay Blob acceptance remains open. A separate retained receipt observes one cone/direct and one restrictive/controlled-relay software namespace-NAT cell on one Darwin arm64 host, moving only <code>DM-5.8-07</code>, <code>DM-5.8-09</code>, and <code>DM-11-03</code> within their bounded statuses. It is not discovery or punching, temporal fallback chronology, representative or physical NAT, public Internet or public/default relay, BTLE or cross-transport, mixed implementation, resource-threshold, complete-MVP, or release evidence. Production authorization depends on the tracked security, interoperability, platform, operations, and acceptance gates.</p>
             <div style="display: flex; gap: 24px; flex-wrap: wrap; font-weight: 600;">
               <a href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/implementation/requirements-status.md">Project status →</a>
               <a href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/quickstart/connect-agent.md">ConnectRPC guide →</a>

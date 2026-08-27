@@ -330,6 +330,21 @@ epoch 1, and topic `mesh.ping-pong` to the endpoint applications. A relay role
 requires only the scope/epoch route grant. This manual shape is documentation of
 the process interface, not an operational provisioning workflow.
 
+### Retained selected-Iroh NAT evidence
+
+A separately frozen one-host receipt observes one exact Event and an exact
+replay no-op through cone/direct and restrictive/controlled-relay Docker Linux
+namespace NATs. The cone cell uses static operator-known mappings; the
+restrictive cell records blocked direct traffic and carries only through the
+exact DER-pinned relay. Source and test automation alone do not create this
+retained receipt.
+
+This evidence does not establish selected endpoint discovery or punching, a
+temporal direct-first/fallback sequence, representative or physical NAT,
+public-network or public-relay operation, State/Record/Blob-over-relay, BTLE,
+mixed implementations, resource brackets, or release authorization. See the
+exact [evidence and replay boundary](../implementation/requirements-status.md#selected-iroh-nat-retained-receipt).
+
 The Iroh handshake binds the expected endpoint and rejects an unlisted carrier
 before an application frame. The node then runs the hybrid reference session,
 checks the configured mission `NodeId`, reconciles and activates the contiguous
@@ -340,11 +355,11 @@ the current scope/epoch route grant learns no matching Event, State, or Record
 ID and cannot Fetch or Offer it; a durably revoked mission principal is
 rejected.
 
-Hosted discovery, Iroh relays, and port mapping are disabled. Direct IP
-reachability and firewalls are operator responsibilities. Manual mission bundle
-files must be regular, bounded, non-symlink files with owner-only Unix
-permissions; receipts deliberately label them
-`provisioning=unprotected-reference`.
+Without controlled-relay flags, hosted discovery, Iroh relays, and port mapping
+are disabled. Direct IP reachability and firewalls are operator
+responsibilities. Manual mission bundle files must be regular, bounded,
+non-symlink files with owner-only Unix permissions; receipts deliberately label
+them `provisioning=unprotected-reference`.
 
 ### Trigger bounded local software zeroization
 

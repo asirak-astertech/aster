@@ -87,12 +87,13 @@ words, signature messages, KDF salts, labels, and contexts are normative in
 Security digests and semantic identifiers are 32-byte SHA-256 results. The
 replication namespace uses a fixed 33-byte `ObjectID = kind u8 || digest[32]`.
 Semantic version 1 permits kind `1` source envelopes and kind `2` Blob chunk
-carriers. Semantic versions 2, 3, and 4 additionally permit kind `3` source-batch
-proofs, kind `4` bridge authorizations, and kind `5` bridge-route wrappers.
-Semantic versions 3 and 4 additionally enable session-bound custody records for
-the selected Event/RouteEvent path without allocating a new stable transfer-
-object kind. Semantic version 4 adds selected protected State/Record mechanics
-frames, not a new stable transfer-object kind. Full typed
+carriers. Semantic versions 2 through 5 additionally permit kind `3`
+source-batch proofs, kind `4` bridge authorizations, and kind `5` bridge-route
+wrappers. Semantic versions 3 through 5 additionally enable session-bound
+custody records for the selected Event/RouteEvent path without allocating a new
+stable transfer-object kind. Semantic version 4 adds selected protected
+State/Record mechanics frames, inherited by version 5, not a new stable
+transfer-object kind. Full typed
 identifiers decide ordering and dispatch; a session MAY use dictionary indexes
 only after collision-safe binding to the full value.
 
@@ -215,9 +216,10 @@ authentication.
 
 This profile amortizes the authority credential and ML-DSA source signature
 without removing post-quantum authentication. It is available only after the
-authenticated session selects semantic version 2, 3, or 4. A batch has `2..64` items
-from one publisher with one data class, topic, scope, content-key epoch, and
-credential. Causal counters are nonzero and contiguous in item-index order.
+authenticated session selects semantic version 2, 3, 4, or 5. A batch has
+`2..64` items from one publisher with one data class, topic, scope, content-key
+epoch, and credential. Causal counters are nonzero and contiguous in item-index
+order.
 Event sequences are also nonzero and contiguous for class `1` Event; every
 other class encodes `first_event_sequence = 0` and has no Event sequence.
 Overflow, a gap, a mixed field, or reordered/duplicate item index rejects the
@@ -1243,6 +1245,15 @@ its NAT negotiation. The profile therefore makes no direct-first ordering,
 temporal fallback, or representative NAT claim. Relay-only binding supplies no
 IP transport and waits for the pinned relay to become ready; direct-plus-relay
 binding retains IP and does not block startup on relay readiness.
+
+A retained implementation receipt separately observes this selected carrier
+through one cone/direct and one restrictive/controlled-relay Docker Linux
+namespace-NAT cell on one physical host. That evidence does not change the
+normative route semantics above: the cone cell uses exact operator-known static
+mappings; the receipt makes no discovery or punching claim, records final
+Direct/Relay observations rather than a temporal fallback sequence, and grants
+no representative, physical, public-network, independent-implementation, or
+release credit.
 
 For one authenticated connection, a `PathWitness` reports the last observed
 Direct or Relay selection and at most 1,024 coalesced observed path-kind

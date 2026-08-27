@@ -294,10 +294,20 @@ and authenticated Iroh NAT negotiation may derive later direct paths, so this
 does not prove direct-first fallback or representative NAT behavior. Path and
 transition fields are bounded, coalesced diagnostics only.
 
-This subgate creates no retained receipt and no physical, multi-host,
-mixed-implementation, N=32, resource-bracket, BTLE, State/Record-over-relay,
+This source/test subgate creates no retained receipt by itself and no physical,
+multi-host, mixed-implementation, N=32, resource-bracket, BTLE, State/Record-over-relay,
 Blob-over-relay, payload-blind application-relay, or release credit. It does not
 satisfy `A-04` or `A-08`.
+
+A separately frozen selected-Iroh receipt observes one cone/direct and one
+restrictive/controlled-relay Docker Linux namespace-NAT Event cell on one
+Darwin arm64 host. Each delivered and acknowledged one exact Event and repeated
+as an exact no-op, with nft and WAN tuple/count metadata bound to the receipt.
+That advances only the bounded requirements-ledger rows; it still does not
+satisfy `A-08`, which requires representative controlled NAT/firewall
+topologies and a separately deployed opaque relay. The receipt claims no
+discovery/punching, temporal fallback chronology, physical/public network,
+independent implementation, resource threshold, or release acceptance.
 
 Current-code semantic-v4/v5 selected-node regressions separately exercise State
 and Record in both receiver directions. They require exact

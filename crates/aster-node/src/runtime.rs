@@ -23808,58 +23808,30 @@ mod tests {
         client_store: Arc<Store>,
         client_mission: UnprotectedReferenceMission,
     ) -> (PeerReceipt, PeerReceipt) {
-        let server = Endpoint::bind(
-            aster_iroh::SecretKey::generate(),
-            EndpointConfig::direct("127.0.0.1:0".parse().expect("server address")),
-        )
-        .await
-        .expect("server endpoint");
-        let client = Endpoint::bind(
-            aster_iroh::SecretKey::generate(),
-            EndpointConfig::direct("127.0.0.1:0".parse().expect("client address")),
-        )
-        .await
-        .expect("client endpoint");
-        let server_task = tokio::spawn({
-            let server = server.clone();
-            let store = server_store;
-            let credentials = server_mission.clone();
-            let allowed = BTreeSet::from([client.id()]);
-            let peer = MissionPeerBinding::new(client.id(), client_mission.identity());
-            async move {
-                let connection = server.accept(&allowed).await.expect("accept carrier");
-                serve_connection(
-                    store,
-                    connection,
-                    credentials,
-                    peer,
-                    Arc::new(RwLock::new(())),
-                    MutableSourceInterests::default(),
-                )
-                .await
-            }
-        });
-        let client_receipt = sync_once(
-            client_store,
-            &client,
-            client_mission,
-            MissionExpectedPeer {
-                carrier: ExpectedPeer {
-                    id: server.id(),
-                    address: loopback(&server),
-                },
-                mission: server_mission.identity(),
+        // These generic policy/inventory fixtures do not test elapsed time.
+        // Keep their finalization samples deterministic so scheduler or disk
+        // contention cannot cross the deliberately fail-closed production
+        // charge. Custody-age tests use the forwarding harness directly with
+        // explicit advancing clocks.
+        contact_test_pair_with_forwarding(
+            TestForwardingNode {
+                store: server_store,
+                mission: server_mission,
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                clock: NodeCustodyClock::injected([0xa1; 16], 0, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            },
+            TestForwardingNode {
+                store: client_store,
+                mission: client_mission,
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                clock: NodeCustodyClock::injected([0xa2; 16], 0, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
             },
         )
         .await
-        .expect("client contact");
-        let server_receipt = server_task
-            .await
-            .expect("server task")
-            .expect("server contact");
-        client.close().await;
-        server.close().await;
-        (client_receipt, server_receipt.receipt)
     }
 
     fn publish_test_blob(
@@ -25006,9 +24978,21 @@ mod tests {
         store: &Store,
         mission: &UnprotectedReferenceMission,
     ) -> Arc<AuthenticatedEventRouteCache> {
-        open_startup_event_verifier_and_cache(store, mission)
-            .expect("prewarm Event route cache")
-            .cache
+        let StartupEventVerification {
+            verifier: mut cache_verifier,
+            mut historical_verifier,
+            cache,
+            policy,
+        } = open_startup_event_verifier_and_cache(store, mission)
+            .expect("prewarm Event route cache");
+        migrate_legacy_event_operation_witnesses(
+            store,
+            &policy,
+            &mut cache_verifier,
+            &mut historical_verifier,
+        )
+        .expect("migrate legacy Event operation witnesses");
+        cache
     }
 
     async fn with_test_contact_hooks<F>(

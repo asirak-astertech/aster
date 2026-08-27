@@ -18,6 +18,7 @@ run = [
   "python3 tools/check-implementation-requirements.py",
   "python3 tools/check-public-provenance.py",
   "python3 tools/test-selected-n32-receipt.py",
+  "python3 tools/test-selected-iroh-nat-receipt.py",
   "python3 tools/check-selected-node-dependency-boundary.py",
   "python3 tools/check-netlink-packet-core-patch.py",
   "sh tools/test-netlink-packet-core-patch.sh",

@@ -20,6 +20,17 @@ constrained, and disconnected operation.
 > node. Review the [security gates](docs/security.md) and
 > [conformance status](docs/conformance.md) before planning a deployment.
 
+A [retained two-cell receipt](docs/implementation/requirements-status.md#selected-iroh-nat-retained-receipt)
+observes the selected Event path on one Darwin arm64 host through isolated
+Docker Linux namespace NATs: one relay-disabled cone cell selected Direct, and
+one restrictive direct-blocked cell selected the exact operator-pinned
+controlled Iroh connectivity relay. Each cell delivered and acknowledged one
+exact 32-byte Event and replayed as an exact no-op. This is one-host software
+namespace-NAT evidence only—not discovery or punching, temporal fallback
+chronology, representative or physical NAT, public Internet or public/default
+relay, independent implementation, BTLE, other-class relay, complete-MVP, or
+release evidence.
+
 ## See it work
 
 The capability tour starts real processes with independent stores and
@@ -87,7 +98,7 @@ Protobuf schema and does not require a hosted Buf Schema Registry.
 |---|---|---|
 | **Connect, gRPC, or gRPC-Web** | [ConnectRPC agent](docs/quickstart/connect-agent.md) | Live Event and local status; authenticated loopback process |
 | **Rust selected node** | [Selected Event API](docs/quickstart/selected-event-api.md) | Live Event publish, query, durable delivery, gaps, and status |
-| **State, Record, or Blob in Rust** | [State](docs/quickstart/selected-state-api.md), [Record](docs/quickstart/selected-record-api.md), and [Blob](docs/quickstart/selected-blob-api.md) | Exclusive stopped-node handles; Blob remains local |
+| **State, Record, or Blob in Rust** | [State](docs/quickstart/selected-state-api.md), [Record](docs/quickstart/selected-record-api.md), and [Blob](docs/quickstart/selected-blob-api.md) | Exclusive stopped-node handles; Blob application access is local, while already-durable Blob data can transfer directly under semantic v5 |
 | **Rust semantic API** | [Rust quickstart](docs/quickstart/rust.md) | Broader proven semantic surface used as the migration source |
 | **Python, Go, or C** | [Language quickstarts](docs/quickstart/README.md) | Offline semantic API through the current C ABI, not the selected live node |
 
@@ -101,11 +112,11 @@ provisioning remain open work.
 
 | Surface | Implemented | Still open |
 |---|---|---|
-| **Event** | Source-authenticated direct-Iroh reconciliation; live Rust and local ConnectRPC APIs; durable consume/carry selectors and at-least-once delivery | Atomic subscription update, hosted discovery/relay, and broader physical-network acceptance |
+| **Event** | Source-authenticated reconciliation over direct Iroh or one operator-pinned controlled Iroh connectivity relay; live Rust and local ConnectRPC APIs; durable consume/carry selectors and at-least-once delivery | Atomic subscription update, hosted discovery/public relay, and broader physical-network acceptance |
 | **State** | Source-authenticated publication, causal projection, and direct-Iroh reconciliation under explicit interests | Live application handle, subscriptions, relay cache, expiry, and garbage collection |
 | **Record** | Conflict-preserving projection, exact-sibling guarded resolution, and direct-Iroh reconciliation | Live application handle, automatic merge execution, expiry, and garbage collection |
 | **Blob** | Authenticated immutable publication, verified encrypted-depot streaming, and direct semantic-v5 source/carrier range transfer with durable resume state | Live application API, route-only relay/custody, representative remote evidence, retention, and garbage collection |
-| **Operations** | Manually admitted direct addresses, reference mission provisioning, and bounded same-UID Unix software zeroization | Protected operational provisioning, NAT/hosted relay, BTLE platform integration, physical sanitization, and release authorization |
+| **Operations** | Manually admitted direct addresses, an operator-pinned controlled relay, bounded one-host software namespace-NAT acceptance, reference mission provisioning, and bounded same-UID Unix software zeroization | Protected operational provisioning, discovery, representative/physical NAT, public/default relay selection, BTLE platform integration, physical sanitization, and release authorization |
 
 The [capability roadmap](docs/implementation/capability-roadmap.md) is the
 planning and merge-review view. The

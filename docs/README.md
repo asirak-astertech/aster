@@ -59,7 +59,8 @@ into outcomes for planning and PR review.
 
 The selected implementation deliberately exposes different maturity levels:
 
-- **Event** has direct-Iroh networking plus live Rust and local ConnectRPC APIs.
+- **Event** has direct-Iroh networking and one operator-pinned controlled Iroh
+  connectivity relay, plus live Rust and local ConnectRPC APIs.
 - **State and Record** reconcile between selected nodes, while their application
   APIs require exclusive stopped-node access.
 - **Blob** supports authenticated local publication, verified streaming, and
@@ -67,6 +68,14 @@ The selected implementation deliberately exposes different maturity levels:
   route-only relay/custody, and representative remote evidence remain open.
 - The broader semantic Rust implementation and language bindings remain the
   proven migration source for behavior not yet composed into the selected node.
+
+A [retained two-cell receipt](implementation/requirements-status.md#selected-iroh-nat-retained-receipt)
+observes exact Event delivery and no-op replay through one cone/direct and one
+restrictive/controlled-relay Docker Linux namespace-NAT cell on one Darwin
+arm64 host. It is not discovery or punching, temporal fallback chronology,
+representative or physical NAT, public Internet or public/default relay,
+independent implementation, State/Record/Blob relay, complete-MVP, or release
+evidence.
 
 Aster remains an evaluation-stage reference implementation. Do not infer
 production authorization from code presence or a passing demo. The

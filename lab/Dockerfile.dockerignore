@@ -5,7 +5,10 @@
 !THIRD_PARTY_NOTICES.md
 !crates/
 !crates/**
+!third-party/
+!third-party/**
 !lab/
 !lab/Dockerfile
+!lab/Dockerfile.selected-nat
 !lab/Dockerfile.dockerignore
 !lab/debian.sources

@@ -6,15 +6,17 @@ WORKDIR /work
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY third-party ./third-party
-ARG LAB_ASTER_FEATURES=aster-lab/default
-ARG LAB_ASTER_BINARY=aster-lab
-RUN cargo build --locked --release -p aster-lab \
-    --bin "${LAB_ASTER_BINARY}" \
+RUN timeout --signal=TERM --kill-after=30s 600s \
+    cargo test --locked -p aster-lab \
     --no-default-features \
-    --features "${LAB_ASTER_FEATURES}"
-RUN cargo build --locked --release -p aster-ip --bins
-RUN cp "/work/target/release/${LAB_ASTER_BINARY}" \
-    /work/target/release/candidate-aster-lab
+    --features selected-nat \
+    --bins
+RUN cargo build --locked --release -p aster-lab \
+    --bin aster-selected-nat \
+    --bin aster-selected-relay \
+    --no-default-features \
+    --features selected-nat
+RUN cargo build --locked --release -p aster-node --bin aster
 
 FROM ${LAB_BASE_IMAGE} AS runtime
 ENV PATH="/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -32,8 +34,8 @@ RUN apt-get update \
         ca-certificates iproute2 iputils-ping nftables procps tcpdump \
         > /usr/share/aster-lab/runtime-package-inventory.tsv \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=build /work/target/release/candidate-aster-lab /usr/local/bin/aster-lab
-COPY --from=build /work/target/release/aster-relay /usr/local/bin/aster-relay
+COPY --from=build /work/target/release/aster /usr/local/bin/aster
+COPY --from=build /work/target/release/aster-selected-nat /usr/local/bin/aster-selected-nat
+COPY --from=build /work/target/release/aster-selected-relay /usr/local/bin/aster-selected-relay
 COPY LICENSE /usr/share/licenses/aster/LICENSE
-COPY THIRD_PARTY_NOTICES.md /usr/share/licenses/aster/THIRD_PARTY_NOTICES.md
-ENTRYPOINT ["/usr/local/bin/aster-lab"]
+ENTRYPOINT ["/usr/local/bin/aster-selected-nat"]

@@ -66,6 +66,9 @@ ZEROIZATION_RECEIPT = (
 N32_RECEIPT = (
     "docs/implementation/requirements-status.md#selected-n32-retained-receipt"
 )
+NAT_RECEIPT = (
+    "docs/implementation/requirements-status.md#selected-iroh-nat-retained-receipt"
+)
 DEPENDENCY_GATE = (
     "docs/implementation/requirements-status.md#dependency-admission-gate"
 )
@@ -240,6 +243,12 @@ CONTROLLED_RELAY_SLICE = (
     "manual_node_rejects_malformed_relay_root_before_state_or_mission_access; "
     "crates/aster-node/tests/mesh_cli.rs::"
     "manual_node_redacts_duplicate_token_bearing_relay_url_before_state_access"
+)
+SELECTED_NAT_SLICE = (
+    "crates/aster-iroh/src/lib.rs; crates/aster-node/src/runtime.rs; "
+    "crates/aster-node/src/main.rs; crates/aster-lab/src/selected_nat_main.rs; "
+    "crates/aster-lab/src/selected_relay_main.rs; lab/Dockerfile.selected-nat; "
+    "lab/orchestrate.py; tools/check-selected-iroh-nat-receipt.py"
 )
 CONTROL_SLICE = (
     "crates/aster-core/src/source_control.rs; crates/aster-redb-store/src/lib.rs; "
@@ -762,13 +771,19 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
         "implemented-uncredited",
         "aster-iroh + aster-node",
         f"{CONTROLLED_RELAY_SLICE}; the selected Iroh carrier binds direct UDP/QUIC, authenticates the exact endpoint identity, accepts bounded operator-supplied initial IP locators, and current-code real processes complete exact direct contacts while the sole configured controlled relay is unavailable",
-        "This is source plus same-implementation one-host loopback automation, not a supported or released IP-adapter acceptance result. Representative physical IP networks, NAT operation, supported-target packaging, mixed implementations, dependency/license admission, retained acceptance, and release authorization remain open.",
+        "This is source plus same-implementation one-host loopback automation, not a supported or released IP-adapter acceptance result. Representative physical IP networks, dynamic or representative NATs, physical NAT hardware or paths, supported-target packaging, mixed implementations, dependency/license admission, retained supported-target acceptance, and release authorization remain open.",
+    ),
+    "DM-5.8-07": selected_claim(
+        "observed-bounded",
+        "aster-iroh + aster-node + aster-lab",
+        f"{NAT_RECEIPT}; {SELECTED_NAT_SLICE}; the retained cone cell ran two selected endpoints behind distinct Linux software-NAT namespaces with operator-known static full-cone mappings, observed Direct at both endpoints, transferred and acknowledged one exact Event, repeated as an exact no-op, and bound 978 cross-NAT UDP packet observations to complementary nft DNAT/SNAT and exact directional forwarding counters without a relay, hosted discovery, public/default relay, or port mapping",
+        "This is one same-build, same-implementation, one-host Docker namespace observation with static operator-known mappings. It does not prove endpoint discovery or punching, dynamic or representative NATs, physical NAT hardware or paths, public Internet operation, mixed implementations, supported-target packaging, resource thresholds, or release authorization.",
     ),
     "DM-5.8-09": selected_claim(
-        "implemented-uncredited",
-        "aster-iroh + aster-node",
-        f"{CONTROLLED_RELAY_SLICE}; one current-code real-process test uses exactly one operator-pinned HTTPS relay with explicit DER trust, gives the initiator an unusable initial direct candidate, disables responder IP, observes Relay at both authenticated endpoints, synchronizes one Event, and repeats as an exact no-op; a separate focused runtime test rejects the wrong expected mission before inventory construction",
-        "This is one same-implementation localhost fixture, not representative NAT failure, physical relay service, or a temporal direct-first fallback: Iroh may probe initial paths in parallel and may derive authenticated direct paths later. NAT direct/traversal acceptance, public/default relay operation, mobility/outage recovery, State/Record/Blob-over-relay acceptance, mixed implementations, a retained receipt, and release authorization remain open.",
+        "observed-bounded",
+        "aster-iroh + aster-node + aster-lab",
+        f"{NAT_RECEIPT}; {CONTROLLED_RELAY_SLICE}; {SELECTED_NAT_SLICE}; the retained restrictive cell blocked direct cross-NAT traffic, recorded three direct-drop packets and zero direct WAN observations, observed Relay at both authenticated endpoints through one explicitly DER-pinned HTTPS origin, accepted two exact allowlisted sessions, bound 2,052 controlled-relay HTTPS packet observations, transferred and acknowledged one exact Event, and repeated as an exact no-op",
+        "The bounded result proves relay-assisted connectivity under one same-host restrictive software-NAT policy, not a temporal direct-first fallback sequence: Iroh may probe paths in parallel and learn later authenticated direct paths. Physical or independently operated relay service, public/default relay operation, mobility/outage recovery, State/Record/Blob-over-relay acceptance, mixed implementations, supported-target packaging, and release authorization remain open.",
     ),
     "DM-5.8-10": selected_claim(
         "observed-bounded",
@@ -995,7 +1010,13 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
         "implemented-uncredited",
         "aster-iroh + aster-node",
         f"{CONTROLLED_RELAY_SLICE}; the selected Rust composition and CLI integrate exact authenticated direct IP contacts plus an explicit singleton controlled-relay option, with current-code real-process direct and relay path evidence",
-        "The IP mechanism exists, but the complete MVP does not. NAT operation, BTLE, physical and supported-target acceptance, bindings, protected operational provisioning, dependency/license admission, mixed implementations, resource evidence, retained acceptance, and release authorization remain open.",
+        "The IP mechanism exists, but the complete MVP does not. Dynamic, representative, or physical NAT operation, BTLE, physical and supported-target acceptance, bindings, protected operational provisioning, dependency/license admission, mixed implementations, resource evidence, complete-MVP acceptance, and release authorization remain open.",
+    ),
+    "DM-11-03": selected_claim(
+        "implemented-uncredited",
+        "aster-iroh + aster-node + aster-lab",
+        f"{NAT_RECEIPT}; {SELECTED_NAT_SLICE}; the selected composition now includes direct Event operation across two isolated software-NAT namespaces and controlled-relay operation under a separate restrictive namespace policy",
+        "The NAT mechanism is implemented and has one retained one-host namespace observation, but the complete MVP is not shipped. Physical and representative NATs, endpoint discovery/punching, BTLE, supported-target packaging, bindings, protected operational provisioning, dependency/license admission, mixed implementations, resource evidence, and release authorization remain open.",
     ),
     "DM-11-15": selected_claim(
         "implemented-uncredited",
