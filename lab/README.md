@@ -1,5 +1,12 @@
 # Aster OrbStack laboratory controller
 
+This directory contains the maintained Docker acceptance controller and its
+regression tests. Historical component experiments are summarized in
+[`docs/evaluations/0005`](../docs/evaluations/0005/README.md); the maintained
+candidate-neutral corpus lives in
+[`conformance/evaluation-v0`](../conformance/evaluation-v0/README.md).
+
+
 `orchestrate.py` is the reproducible host-side controller for the task-created
 `aster-lab` executable. It uses only the Python standard library and invokes
 Docker with argument arrays; it never invokes a command shell.
@@ -40,10 +47,18 @@ an image. Every `docker run` includes `--pull=never`, and `build` always uses
   own. Provisioning and live-node commands are different: their `/output` root
   is intentionally durable and may already exist.
 - The controller receipt area is never mounted into a container. Each role sees
-  only its own mode-0700 writable `outputs/<role>/` directory at `/output`.
-  Each live node additionally sees only its own bundle as the exact read-only
-  file `/run/secrets/node.bundle`; it cannot see the peer bundle, provisioning
-  directory, another role's output, or controller receipts.
+  only its assigned mode-0700 writable directory beneath `outputs/`. Most roles
+  mount `outputs/<role>/` at `/output`; each selected live node instead mounts
+  only `outputs/provision/node-a` or `outputs/provision/node-b` at exactly
+  `/output/node-a` or `/output/node-b`, matching the canonical path used by
+  stopped provisioning and preserving the Store's Blob owner binding. Each
+  selected live node additionally sees only its own owner-only bundle as the
+  exact writable file `/run/secrets/node.bundle`.
+  This narrow exception is required because the production loader retains one
+  read/write, exclusively locked descriptor for optional exact-inode software
+  erasure. The node cannot see the peer state, peer bundle, parent provisioning
+  directory, another role's output, or controller receipts; relay certificate
+  mounts remain read-only.
 - Preflight validates image provenance labels against the current admitted
   source hashes, resolves the tag to one `sha256:` image ID, and every container
   runs that immutable ID. Post-start inspection verifies the image, limits,
@@ -308,6 +323,57 @@ Fixed networks and addresses:
 | LAN A | `aster-lab-lan-a`, `10.250.1.0/24` | node A `.10`, NAT A `.1` |
 | WAN | `aster-lab-wan`, `10.250.0.0/24` | NAT A `.11`, NAT B `.12`, infra `.20` |
 | LAN B | `aster-lab-lan-b`, `10.250.2.0/24` | node B `.10`, NAT B `.1` |
+
+### Selected Iroh NAT acceptance
+
+`selected-iroh-nat-run` is the fail-closed selected-runtime acceptance path for
+this topology. A preview is mutation-free; execution builds the dedicated
+locked selected image, runs its Linux helper tests, then executes the direct
+and controlled-relay cells into a fresh external evidence root:
+
+```sh
+python3 lab/orchestrate.py selected-iroh-nat-run --profile all
+
+python3 lab/orchestrate.py selected-iroh-nat-run --profile all --execute \
+  --allow-build-network \
+  --evidence-root /private/tmp/aster-selected-iroh-nat
+```
+
+Each live node has a fixed 30-second run budget established before endpoint
+setup and READY. The selected acceptance command requests an immediate contact
+and, when startup leaves enough budget, one nominal repeat at 15.001 seconds;
+the next nominal interval falls after the terminal deadline.
+Acceptance remains semantic rather than count-based: each endpoint must record
+one exact role-bound Event transfer followed by an exact zero-difference
+contact, empty stderr, zero contact errors, the expected Direct or Relay path,
+and a complete terminal inventory. The remaining quiet portion of the run
+budget also lets both WAN capture streams retire their final packet batches
+before bounded capture shutdown. A slow or failed contact still fails the
+existing deadline, stderr, transfer, no-op, counter, or capture checks; it is
+never reclassified as planned-shutdown success.
+
+Both WAN captures request tcpdump `--immediate-mode` delivery and
+packet-buffered pcap writes. Finalization requires exactly one terminal
+captured, received-by-filter, and dropped counter per capture, captured equal to
+received, zero drops, and the parsed pcap packet count equal to captured. Exact
+nft-to-pcap equality remains mandatory; no capture-tail discount is permitted.
+
+The direct cell's lower-carrier-ID node is the runtime-selected contact
+initiator. Stateful nftables therefore has complementary first-flow evidence:
+the initiator router must record positive SNAT and exact-zero DNAT, while the
+responder router must record positive DNAT and exact-zero SNAT. Both routers
+must independently record positive forward-in and forward-out counters exactly
+equal to their parsed WAN packet directions. The controller derives the active
+NAT hook from the exact homogeneous `CONTACT direction` receipts instead of
+requiring both conntrack creation hooks to fire on reply traffic.
+
+This is bounded one-host Linux-network-namespace evidence with operator-known
+static external mappings. It does not prove endpoint discovery or hole
+punching, physical or public-internet NAT behavior, a temporal direct-first
+fallback, an independently operated relay, mixed implementations, BTLE, or
+target-device resource limits. The restrictive cell separately proves use of
+the explicitly pinned local HTTPS relay while direct UDP is blocked; it is not
+relabeled as physical relay deployment.
 
 Create a deterministic full-cone mapping scaffold:
 

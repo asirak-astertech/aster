@@ -70,7 +70,8 @@ synchronization success. Direct-plus-relay startup does not wait for relay
 readiness; relay-only requires readiness and disables IP. Iroh may probe an
 initial direct locator and the relay in parallel and may learn a later
 authenticated direct path through NAT negotiation. Initial locators are not
-lifetime pins, and no direct-first or NAT-acceptance property follows.
+lifetime pins, and no direct-first or NAT-acceptance property follows from the
+configured route or path witness alone.
 
 Direct/Relay path telemetry retains only the last observed path and a coalesced
 transition count capped at 1,024. Ordinary closure preserves the last
@@ -84,9 +85,23 @@ below is instead a mission node with route-only Event custody, and route-only
 Blob relay/custody remains unimplemented. Current real-process controlled-relay
 evidence is one-host and Event-only. A separate focused direct-Iroh runtime test
 proves that a wrong expected mission fails before inventory; it is not part of
-the relay-path process proof. Neither result creates retained, physical,
-representative-NAT, BTLE, mixed-implementation, N=32,
+the relay-path process proof. Neither source/test result creates retained,
+physical, representative-NAT, BTLE, mixed-implementation, N=32,
 State/Record/Blob-over-relay, or release credit.
+
+A separately frozen retained receipt observes the selected Event carrier in two
+Docker Linux namespace cells on one Darwin arm64 host. One cell disables every
+relay and selects Direct across two software NAT routers with static
+operator-known mappings. The restrictive cell records direct drops and selects
+the exact DER-pinned controlled relay. Each cell delivers and acknowledges one
+exact 32-byte Event and repeats as an exact no-op. The public receipt contains
+only bounded sanitized data and packet tuple/count metadata; the raw pcaps,
+mission bundles, credentials, and encrypted stores remain external-restricted.
+Its canary scan covers exactly 26 enumerated finalized targets, not every file
+or the whole host. This is not discovery/punching, a temporal fallback sequence,
+representative or physical NAT, public Internet/relay operation, independent
+implementation, packet-capture confidentiality acceptance, complete-MVP, or
+release evidence. See the [receipt and replay boundary](implementation/requirements-status.md#selected-iroh-nat-retained-receipt).
 
 Aster application relays are not content readers by default. The implemented
 semantic-version-2/3/v4/v5 bridge similarly limits a bridge to rule-specific endpoint routing grants and

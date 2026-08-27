@@ -6,10 +6,10 @@ the complete protocol and semantic reference implementation.
 
 | Data class | Selected networking | Application surface |
 |---|---|---|
-| Event | Direct-Iroh reconciliation | Live Rust handle, stopped Rust handle, and local ConnectRPC agent |
+| Event | Direct Iroh or one operator-pinned controlled Iroh relay | Live Rust handle, stopped Rust handle, and local ConnectRPC agent |
 | State | Class-specific direct-Iroh reconciliation | Exclusive stopped Rust handle |
 | Record | Class-specific direct-Iroh reconciliation | Exclusive stopped Rust handle |
-| Blob | Not composed | Exclusive stopped Rust handle and encrypted local depot |
+| Blob | Semantic-v5 direct source/carrier transfer | Exclusive stopped Rust handle and encrypted local depot |
 
 Read the diagrams from broadest to narrowest: application surfaces, runtime
 ownership, then the publication and contact flows for each mechanism. Exact
@@ -37,12 +37,14 @@ flowchart LR
     State --> Exclusive
     Record --> Exclusive
     Blob --> Depot["Encrypted local depot"]
-    Actor --> Network["Event, State, and Record reconciliation"]
+    Actor --> Network["Event · State · Record · v5 Blob reconciliation"]
 ```
 
 The running actor and stopped handles never own the store at the same time.
-State and Record objects published through stopped handles can reconcile after
-those handles close and the actor starts. Blob remains local.
+State, Record, and Blob objects published through stopped handles can reconcile
+after those handles close and the actor starts. Blob application access remains
+local and stopped; semantic v5 separately transfers already-durable Blob sources
+and bounded carrier prefixes directly between content-capable peers.
 
 ### Runtime trust path
 
@@ -57,12 +59,14 @@ flowchart LR
     Node --> Profile["Canonical transfer IDs"]
     Profile --> Diff["Bounded set difference"]
     Node --> Session["Hybrid mission session"]
-    Session --> Carrier["Direct Iroh carrier"]
+    Session --> Carrier["Iroh carrier<br/>direct or operator-pinned relay"]
     Carrier <--> Peer["Peer aster-node"]
 ```
 
 `aster-node` is the sole composition root. `aster-iroh` authenticates only the
-carrier endpoint and provides bounded direct exchange. The mission `NodeId` is
+carrier endpoint and provides bounded direct exchange or exchange through one
+operator-pinned controlled relay. That relay is connectivity infrastructure,
+not an Aster mission node, store, or route grant. The mission `NodeId` is
 independent from the Iroh `EndpointId`. `aster-negentropy` computes exact-ID set
 difference; it does not transfer objects, establish causality, or make policy.
 `aster-redb-store` is the selected durable authority for accepted Events,
@@ -225,8 +229,9 @@ expiry, garbage collection, and retention-driven deletion remain unimplemented.
 
 The selected Blob facade uses the same mission, current control policy,
 source-envelope provider, process-exclusive writer, and shared causal ledger as
-Event, State, and Record. It adds no Blob frame or inventory identifier to the
-selected wire. The selected profile is nonempty and fixes chunking at 64 KiB;
+Event, State, and Record. Its application API remains stopped and local. The
+runtime separately adds semantic-v5 Blob source and carrier-range frames; v1-v4
+emit none. The selected profile is nonempty and fixes chunking at 64 KiB;
 its `BlobId` commits the exact plaintext bytes, canonical chunk profile, and
 media/schema identity metadata. It is not a metadata-independent whole-byte
 content identifier.
@@ -289,6 +294,15 @@ new signed publication while reusing the same immutable completed variant in
 one content group and epoch. Rekey creates a distinct encrypted variant even
 when object identity is unchanged.
 
+Under semantic v5, a content-capable receiver reconciles exact Blob source IDs
+before requesting only missing, peer-neutral 16-KiB carrier prefixes. Every
+source and range send requires the authenticated peer's current exact content
+proof plus route and nonrevocation authority. Pending bytes remain outside
+ordinary publication until the exact depot, full-content, and current-lineage
+proofs agree atomically. This is bounded direct, same-implementation automation,
+not a retained Blob receipt, route-only Blob relay/custody, or
+Blob-over-controlled-relay acceptance.
+
 `BlobDepotLimits` bound canonical committed ciphertext-file bytes, durable
 per-chunk metadata rows, and epoch-specific import variants. Chunk rows and
 variants include unfinished resumable imports, which continue to consume
@@ -299,9 +313,10 @@ depot operations use owner-controlled directory descriptors, no-follow checks,
 and private modes; the non-Unix fallback is not credited with equivalent
 filesystem hardening. Terminal software zeroization destroys the retained
 mission and identity secrets and locks the store, but it does not erase Blob
-ciphertext or establish physical sanitization. Live Blob commands, remote
-chunk transfer/resume, carrier-neutral partials, subscription, finite TTL,
-retention/GC, physical acceptance, and network reconciliation remain open.
+ciphertext or establish physical sanitization. Live Blob commands,
+route-only relay/custody, Blob-over-controlled-relay acceptance, subscription,
+finite TTL, retention/GC, large/physical acceptance, mixed implementations, and
+retained network evidence remain open.
 
 ## Live application command and status flow
 
@@ -350,11 +365,11 @@ completeness or mesh convergence.
 ```mermaid
 sequenceDiagram
     participant L as Local node
-    participant C as Direct Iroh carrier
+    participant C as Iroh carrier (direct or controlled relay)
     participant P as Peer node
     participant S as redb store
 
-    L->>C: connect to exact endpoint and address
+    L->>C: connect to exact endpoint over configured route
     C->>P: authenticate carrier endpoint
     L->>P: complete hybrid mission authentication
     P-->>L: prove expected mission NodeId
@@ -383,7 +398,7 @@ are rechecked at inventory, transfer, and commit boundaries.
 
 | Layer | Proves or decides | Does not imply |
 |---|---|---|
-| Carrier | Exact direct Iroh endpoint | Mission membership or data access |
+| Carrier | Exact Iroh endpoint over a direct or controlled-relay path | Mission membership, data access, or representative/physical NAT acceptance |
 | Mission | Hybrid-session possession of the expected mission `NodeId` | Control authority, source authorship, route, or content grant |
 | Control | Ordered authority/delegation chain and policy effect | Event source identity or plaintext access |
 | Event source | Publisher and protected semantic header | Permission for every peer to route or read it |
@@ -426,6 +441,16 @@ That same-build, same-implementation, one-scope/authority/topic line does not
 establish distributed or physical architecture, the separate at-least-100-node
 target, NAT/relay/BTLE/cross-transport behavior, independent interoperability,
 resource thresholds, or release readiness.
+
+A separate retained two-cell selected-Iroh receipt observes one exact Event and
+an exact replay no-op through cone/direct and restrictive/controlled-relay
+Docker Linux namespace NATs on one physical host. The cone cell uses static
+operator-known mappings; the restrictive cell records direct drops and carries
+only through the exact DER-pinned relay. This does not establish endpoint
+discovery or punching, a temporal direct-first sequence, representative or
+physical NAT, public Internet or relay operation, another data class,
+independent implementation, resource evidence, or release acceptance. See the
+[retained receipt and replay boundary](implementation/requirements-status.md#selected-iroh-nat-retained-receipt).
 
 ## Follow the evidence
 

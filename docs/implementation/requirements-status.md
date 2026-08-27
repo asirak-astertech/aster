@@ -12,6 +12,10 @@
 - Current controlled Iroh relay source/test freeze: signed commit
   `b0a1203f4f24c05edd31e5ce1ea0f3b7f9bd2f52`; exact source manifest and gates in
   [Current controlled Iroh relay automated evidence](#current-controlled-iroh-relay-automated-evidence)
+- Selected Iroh namespace-NAT retained-receipt source freeze: signed commit
+  `15f4e0b8e9f817508c14fcbb4b307d6949add557`; exact immutable source,
+  sanitized receipt, replay boundary, and nonclaims in
+  [Selected Iroh namespace-NAT retained receipt](#selected-iroh-nat-retained-receipt)
 - Prior semantic-v4 State/Record source/test freeze: signed commit
   `a0813a2b30b26f69ea7653dd0d3e04eba454c1b3`; exact source manifest and gates in
   [Prior selected State and Record network automated evidence](#prior-selected-state-and-record-network-automated-evidence)
@@ -91,7 +95,7 @@ mission authentication, and neither is source or control authorization:
 | `aster-profile` | Requirements-owned complete reconciliation key and canonical inventory ordering | Semantic identity, source security, policy, or a competing product object model |
 | `aster-redb-store` | One mission-bound transaction authority for ordered control/policy, content-verified Event/State/Record/Blob publication, the shared causal frontier, Event delivery/custody, class-specific operations/cursors, guarded Record resolution, route-only Event cache, Blob depot markers, and v5 exact pending Blob source plans plus peer-neutral carrier prefixes. It grants ordinary Blob visibility only after exact depot, fresh full-content, and fresh current-lineage completion agree atomically. | Deriving identity from unverified bytes, route-only Blob relay/custody, executing application merge code, State/Record/Blob TTL or GC, complete physical allocation/sanitization, automatic revoke-plus-rekey, or a second authority |
 | `aster-negentropy` | Sole bounded set-difference mechanism over class-specific exact Event, State, Record, and v5 Blob source transfer identities, with timestamp zero | Object transfer, Blob carrier-prefix ownership, semantic identity, policy, or durable contact progress |
-| `aster-iroh` | Direct endpoint lifecycle, exact carrier identity, allowlist admission, bounded exchange, and an opt-in singleton controlled HTTPS relay with explicit WebPKI or replacement DER-root trust and observation-only path telemetry | Mission identity, item/source authorization, hosted discovery or public/default relay fallback, port mapping, lifetime IP pinning, NAT acceptance, or physical-path proof |
+| `aster-iroh` | Direct endpoint lifecycle, exact carrier identity, allowlist admission, bounded exchange, and an opt-in singleton controlled HTTPS relay with explicit WebPKI or replacement DER-root trust and observation-only path telemetry | Mission identity, item/source authorization, hosted discovery or public/default relay fallback, port mapping, lifetime IP pinning, representative or physical NAT acceptance, or physical-path proof |
 | `aster-node` | Sole composition root for mission-before-inventory/control-before-data; exact control/Event/State/Record transfer; semantic-v3/v4/v5 Event custody; semantic-v4/v5 State/Record lanes; semantic-v5 direct content-capable Blob source-before-carrier transfer with repeated peer proof/current-lineage checks, 16-KiB ranges, resume cursors, and completion promotion; constrained emission with ReceiveOnly zero Blob; caller-provided protected live `NodeConfig`; live Event and privileged control handles; exclusive stopped Event/State/Record/Blob/control facades; local zeroization; receipts and CLI | Production SecretStore or protected stock CLI/bindings, cross-process admin IPC, automatic revoke-plus-rekey, global convergence claims, live State/Record/Blob application handles, route-only Blob relay/custody, Blob TTL/GC, broader State/Record partitions/relays, physical RF silence, automatic merge, generalized policy, coordinated provider destruction, platform-complete zeroization, or release authorization |
 | `aster-core` | Spec-verified mission session, control-envelope, authenticated recipient-filtered rekey planning, typed Event/State/Record/Blob source-envelope security capabilities, and provider-neutral bounded provisioning protection plus operation-bound opaque SecretStore install/load/destroy contracts, of which exact load is used by the selected live config and stopped Event/admin slices | A production SecretStore/protection backend, hardware/platform custody policy, operational recovery or physical-erasure assurance; the core remains authoritative migration source and is not deleted while replacements lack equivalent tests |
 
@@ -132,9 +136,9 @@ items.
 unique rows, valid selected states, exact selected-status containment, and the
 conservative generated claim boundary.
 
-The current generated totals are 79 `implemented-uncredited`, 38
-`observed-bounded`, and 231 `open` rows. The exact selected-mapping count is
-121 and is validated from the generated trace. The
+The current generated totals are 79 `implemented-uncredited`, 40
+`observed-bounded`, and 229 `open` rows. The exact selected-mapping count is
+123 and is validated from the generated trace. The
 selected State slice moved `DM-5.1-01`, `DM-5.1-02`, `DM-5.3-01`, and
 `DM-5.3-02`; the selected Record slice moved `DM-5.1-08`, `DM-5.1-09`, and
 `DM-5.3-06` through `DM-5.3-10` from `open`. Semantic-v4/v5 class- and
@@ -194,6 +198,24 @@ relay slice. Physical IP, representative NAT direct/fallback, BTLE, mixed
 implementation, resource thresholds, State/Record/Blob-over-relay acceptance,
 and every release gate remain open.
 
+The separate selected Iroh namespace-NAT retained receipt moves exactly
+`DM-5.8-07` from `open` to `observed-bounded`, `DM-5.8-09` from
+`implemented-uncredited` to `observed-bounded`, and `DM-11-03` from `open` to
+`implemented-uncredited`. On one Darwin arm64 host, the two cells ran four
+fresh selected-Iroh endpoints total (two per cell) inside separate Docker Linux
+LAN and NAT-router namespaces.
+The cone cell disabled every relay and observed Direct at both endpoints, 978
+cross-NAT UDP packet observations, one exact Event delivery and acknowledgement,
+and an exact replay no-op. The restrictive cell admitted one exact controlled
+HTTPS relay, recorded three direct-drop packets and no direct cross-NAT packet,
+observed Relay at both endpoints, accepted two relay sessions with 2,052 HTTPS
+packet observations, delivered and acknowledged one exact Event, and repeated
+as an exact no-op. This is bounded software namespace-NAT evidence, not a
+direct-first or timed fallback chronology, physical NAT hardware or path,
+public Internet, hosted discovery, public/default relay, port-mapping,
+independent-implementation, BTLE, resource-threshold, complete-MVP, or release
+result. `DM-5.8-08` and `DM-12-09` therefore remain `open`.
+
 The selected N=32 retained receipt moves exactly `DM-9-21A` from
 `implemented-uncredited` to `observed-bounded`. One operator-attested Cargo
 release-profile binary run for the signed current-tree source completed the
@@ -222,12 +244,13 @@ No row moves to `observed-bounded`.
 
 PR C previously moved `DM-7-11`, `DM-7-14`, `DM-7-15`, and `DM-7-18` to
 `implemented-uncredited` for the live Event boundary. The preceding PR-B
-movement was `DM-5.5-02`; the most recent retained-receipt movement is now
-`DM-9-21A` to `observed-bounded`. The already-merged local ConnectRPC agent
-moves `DM-7-09` and `DM-7-10` from `open` to `implemented-uncredited` and
-extends the mapped evidence for the existing Event application boundary. That
-agent remains an alpha same-host, same-implementation surface; it adds no live
-State/Record/Blob or production deployment claim.
+movement was `DM-5.5-02`; the most recent retained-receipt movements are now
+the selected namespace-NAT changes above. The already-merged local ConnectRPC
+agent moves `DM-7-09` and `DM-7-10` from `open` to
+`implemented-uncredited` and extends the mapped evidence for the existing
+Event application boundary. That agent remains an alpha same-host,
+same-implementation surface; it adds no live State/Record/Blob or production
+deployment claim.
 
 The protected stopped provisioning/control-administration slice changes no
 selected status. It strengthens existing evidence for `DM-2-14`, `DM-3-12`,
@@ -245,7 +268,7 @@ not completion percentages: `implemented-uncredited` means a partial mechanism
 exists, and `observed-bounded` means only the stated environment and claim
 boundary passed.
 
-All 57 rows with an external gate are included within the 231 `open` rows:
+All 57 rows with an external gate are included within the 229 `open` rows:
 `gate_kind` is an independent ownership dimension, not a fourth selected status.
 The generator validates the trace totals; this family roll-up is the human
 summary of that same CSV.
@@ -255,21 +278,22 @@ summary of that same CSV.
 | DM-1 Project brief | 0 | 3 | 4 | 7 |
 | DM-2 Scope | 1 | 0 | 13 | 14 |
 | DM-3 Operating environment | 0 | 1 | 12 | 13 |
-| DM-5 Functional requirements | 59 | 10 | 53 | 122 |
+| DM-5 Functional requirements | 58 | 12 | 52 | 122 |
 | DM-6 Security requirements | 3 | 18 | 15 | 36 |
 | DM-7 Developer experience | 7 | 2 | 12 | 21 |
 | DM-8 Implementation constraints | 0 | 2 | 17 | 19 |
 | DM-9 Performance and scale | 4 | 1 | 27 | 32 |
 | DM-10 Compatibility | 0 | 0 | 6 | 6 |
-| DM-11 MVP scope | 4 | 0 | 29 | 33 |
+| DM-11 MVP scope | 5 | 0 | 28 | 33 |
 | DM-12 Acceptance criteria | 0 | 1 | 10 | 11 |
 | DM-13 Deliverables | 1 | 0 | 10 | 11 |
 | DM-14 Open design items | 0 | 0 | 23 | 23 |
-| **Total** | **79** | **38** | **231** | **348** |
+| **Total** | **79** | **40** | **229** | **348** |
 
 The selected lane is strongest today in bounded Event synchronization and
 security ordering: real-process direct contacts, one controlled connectivity-
-relay Event path, temporal payload-blind Event relay,
+relay Event path, retained one-host namespace-NAT direct and controlled-relay
+Event observations, temporal payload-blind Event relay,
 source authentication, mission-before-inventory, control-before-Event,
 durable Consume/Carry receive intent, protected receiver-directed filtering,
 live high-level Event operations and last-contact status, freshly verified gap
@@ -355,14 +379,17 @@ Against the six-item high-leverage closure sequence:
    cross-process admin IPC, registry/credential issuance and recovery,
    automatic/atomic revoke-plus-rekey workflow, coordinated provider destroy,
    or physical-erasure assurance is delivered.
-5. **Selected IP and one controlled-relay mechanism — implemented, not accepted
-   complete; physical IP/relay deployment, representative NAT, BTLE, mixed
-   implementation, at-least-100-node scale, and resources remain open.** The bounded carrier and
-   selected CLI support direct IP plus exactly one opt-in relay with explicit
-   TLS trust and no public fallback. Same-implementation localhost direct/relay
-   automation does not satisfy the named physical gates. The separate one-host
-   direct-loopback N=32 Event receipt below moves only `DM-9-21A`; it does not
-   satisfy the at-least-100-node or resource brackets.
+5. **Selected IP, namespace-NAT operation, and one controlled-relay mechanism —
+   boundedly observed, not accepted complete; physical IP/relay deployment,
+   representative NAT, BTLE, mixed implementation, at-least-100-node scale,
+   and resources remain open.** The bounded carrier and selected CLI support
+   direct IP plus exactly one opt-in relay with explicit TLS trust and no public
+   fallback. The retained two-cell receipt observes selected Event operation
+   through cone/direct and restrictive/controlled-relay Linux namespace NATs on
+   one physical host. It is not physical or representative NAT acceptance and
+   makes no direct-first chronology claim. The separate one-host direct-loopback
+   N=32 Event receipt moves only `DM-9-21A`; it does not satisfy the
+   at-least-100-node or resource brackets.
 6. **Targets, licenses, cryptographic module, independent review, SBOM, and
    signed release — open external/release gates.** No production authorization
    follows from the implementation slices.
@@ -740,9 +767,11 @@ column.
 | `DM-5.3-06` through `DM-5.3-10` Record sibling preservation, annotation, API, no-discard, and recoverable history | `implemented-uncredited` | Freshly verified exact-key causal heads; explicit `RecordConflict`; sorted sibling IDs and opaque exact guard; atomically guarded successor; optional superseded history; merge-free v4 ingest with current source lineage | Ordinary publish cannot collapse heads, stale or changed guards insert nothing, and current-code real-Iroh contacts preserve disconnected revisions on both stores without executing application merge code. Same-epoch old lineage is withheld from ordinary current projection/query and network inventory/transfer while an exact publish/resolution retry may recover its committed result only through strict cached/projection/historical verification. Automatic registered-policy merge (`DM-5.3-05`), live application delivery, explicit-policy GC, bindings, longer partitions/relays, mixed implementations, scale, and retained acceptance remain open. |
 | `DM-5.4-01`, `DM-5.4-05`, `DM-5.4-09`, `DM-5.4-10`, `DM-5.4-12` through `DM-5.4-19`, `DM-5.4-21`, `DM-5.4-22` selected priority, TTL, and constrained operation | `implemented-uncredited` | Source-authenticated Event priority/TTL; semantic-v3-format cumulative custody inherited by v4/v5; Linux expiry; bounded scheduler/retry/retirement; Normal/AtLeast/ReceiveOnly startup and live policy | Current automation covers charged Event age/expiry boundaries, priority order, stale-work/final-send races, v3/v4/v5 custody inheritance, and receive-only inbound. Normal and AtLeast run v4/v5 mutable reconciliation and may run v5 Blob work because AtLeast is strictly an Event threshold; ReceiveOnly initiates/discloses no mutable or Blob work. Selected finite State/Record/Blob TTL is rejected/open. Priority count/names, `DM-5.4-11` generic global eviction, optional defaults/caps/overrides, non-Linux Event TTL, physical RF silence, scale, mixed implementations, and retained acceptance remain open. |
 | `DM-5.5-01` through `DM-5.5-03`, `DM-5.5-05` through `DM-5.5-07` topic/scope and payload-blind relay boundary | `implemented-uncredited` / `observed-bounded` | Authenticated topic/scope; durable Consume/Carry selectors; protected receiver interest; current peer scope/epoch route commitments; bounded route-only cache; aggregate and exact-scope Event custody quotas | Canonical selectors bound desired receipt while route authority remains an independent upper bound; empty means receive-none. Unsubscribe removes one selector and its delivery ledger; replacement is a later subscribe, not an atomic update. Limits are logical rather than complete physical accounting. Dynamic multi-scope lifecycle, bridges, other classes, physical/mixed implementations, and scale remain open. |
-| `DM-5.6-01` through `DM-5.6-03`, `DM-5.6-05` direct, infrastructure-free, intermediate, and duplicate-bounded transfer | `implemented-uncredited` / `observed-bounded` | Default direct Iroh line with hosted discovery, public/default relays, and port mapping disabled; additive controlled relay is explicit and singleton | Exact Events moved through payload-blind Aster intermediates and restart no-op. The controlled connectivity-relay fixture is separate and creates no custody claim. Physical transport, independent conformance, cycles/broadcast, NAT, alternate carriers, and generalized custody remain open. |
-| `DM-5.8-06`, `DM-11-02`, `DM-13-04` selected IP transport, MVP inclusion, and adapter deliverable | `implemented-uncredited` | Bounded `aster-iroh` direct UDP/QUIC endpoints composed by `aster-node`, plus exact endpoint/mission peer binding and selected CLI configuration | Source and current same-implementation loopback automation prove the selected IP mechanism, including direct contact while a configured relay is unavailable. This is not a supported/released adapter acceptance result. Physical IP and NAT networks, target packaging/stability, bindings, mixed implementations, dependency/license/SBOM admission, retained acceptance, and release authorization remain open. |
-| `DM-5.8-09` controlled relay-assisted connectivity | `implemented-uncredited` | One exact HTTPS relay origin with explicit WebPKI or replacement DER-root trust; no hosted lookup, public/default fallback, or port mapping; optional relay-only mode disables IP | A same-implementation localhost process fixture gives the initiator an unusable initial direct candidate, disables responder IP, observes Relay at both authenticated endpoints, transfers one Event, and repeats as a no-op. A separate focused direct-Iroh runtime test proves wrong expected mission failure before inventory; it is not part of that relay process proof. Iroh may probe initial paths in parallel and learn authenticated direct paths later, so this is not a direct-first chronology, representative NAT failure/fallback, physical relay service, lifetime IP pin, State/Record/Blob-over-relay acceptance, retained receipt, or release evidence. |
+| `DM-5.6-01` through `DM-5.6-03`, `DM-5.6-05` direct, infrastructure-free, intermediate, and duplicate-bounded transfer | `implemented-uncredited` / `observed-bounded` | Default direct Iroh line with hosted discovery, public/default relays, and port mapping disabled; additive controlled relay is explicit and singleton | Exact Events moved through payload-blind Aster intermediates and restart no-op. The controlled connectivity relay and retained namespace-NAT receipt are separate and create no custody claim. Physical transport, independent conformance, cycles/broadcast, representative NATs, alternate carriers, and generalized custody remain open. |
+| `DM-5.8-06`, `DM-11-02`, `DM-13-04` selected IP transport, MVP inclusion, and adapter deliverable | `implemented-uncredited` | Bounded `aster-iroh` direct UDP/QUIC endpoints composed by `aster-node`, plus exact endpoint/mission peer binding and selected CLI configuration | Source and current same-implementation loopback automation prove the selected IP mechanism, including direct contact while a configured relay is unavailable. The separate retained namespace-NAT receipt does not turn these product-scope rows into a supported or released adapter result. Physical/representative networks, target packaging/stability, bindings, mixed implementations, dependency/license/SBOM admission, complete-MVP acceptance, and release authorization remain open. |
+| `DM-5.8-07` selected IP operation across NAT networks | `observed-bounded` | Selected Iroh endpoints behind two isolated Linux software-NAT namespaces with exact operator-known full-cone mappings and no relay, discovery, public/default relay, or port mapping | Both endpoints observed Direct; one exact Event was delivered and acknowledged, replay was an exact no-op, and 978 cross-NAT UDP observations agreed with complementary nft DNAT/SNAT and directional forwarding counters. This is one same-build, same-implementation, one-host namespace result, not discovery or punching, dynamic or representative NATs, physical hardware/path, public Internet, mixed implementations, resource evidence, or release authorization. |
+| `DM-5.8-09` controlled relay-assisted connectivity | `observed-bounded` | One exact DER-pinned HTTPS relay under a restrictive software-NAT policy, with hosted discovery, public/default fallback, port mapping, and direct cross-NAT traffic absent | Both authenticated endpoints observed Relay; nft recorded three direct-drop packets, WAN capture recorded zero direct packets and 2,052 controlled-relay HTTPS packet observations, two exact allowlisted sessions were accepted, one Event was delivered and acknowledged, and replay was an exact no-op. This proves bounded relay-assisted connectivity, not a temporal direct-first sequence: Iroh may probe paths in parallel and later learn authenticated direct paths. Physical or independently operated relay service, public/default relay operation, mobility/outage recovery, State/Record/Blob-over-relay acceptance, mixed implementations, supported packaging, and release authorization remain open. |
+| `DM-11-03` MVP NAT inclusion | `implemented-uncredited` | The selected composition now contains the retained cone/direct and restrictive/controlled-relay namespace-NAT mechanisms above | The NAT mechanism is implemented and has one retained one-host namespace observation, but the complete MVP is not shipped. Physical and representative NATs, discovery/punching, BTLE, supported-target packaging, bindings, protected operational provisioning, dependency/license admission, mixed implementations, resource evidence, and release authorization remain open. |
 | `DM-6-01` through `DM-6-07`, `DM-6-09` through `DM-6-12` source/route protection | `observed-bounded` / `implemented-uncredited` | Existing `aster-core` source envelope, exact-byte re-verification, separate route/content capabilities, mission-protected mechanics, and typed Event/State/Record/Blob capabilities | Event has retained endpoint/relay evidence; State/Record have current-code semantic-v4/v5 direct-contact source/content and current-lineage automation; Blob v5 additionally requires a peer-bound current content proof at inventory and every source/range send, current source-route and physical-content lineages, exact manifest/carrier proofs, and fresh full-content completion before publication. Same-epoch key replacement withholds old Blob rows and proofs; a bounded non-public unfinished physical-lineage fence preserves `PhysicalLineageConflict` across cleanup until numeric epoch advance. This is not packet-capture acceptance, route-only Blob relay/custody, complete networked class acceptance, key lifecycle completion, or independent cryptographic review. |
 | `DM-6-13`, `DM-6-14`, `DM-6-18`, `DM-6-19`, `DM-6-25`, `DM-6-26` identity, authorization, and hybrid mission/source mechanics | `observed-bounded` | Carrier identity and mission `NodeId` are independent; mission auth completes before inventory; dynamic topic-content and scope-route grants remain distinct; current live Rust config and stopped Event/admin opens accept protected artifacts or opaque secret references | The retained runtime receipt still uses unprotected-reference provisioning; protected live startup and control refresh are current-code automation only and add no observed credit. Current bootstrap validates options/terminal state before one provider call, binds one absolute lexical state pathname, and reports only a coarse origin. A production backend, protected stock CLI/bindings, operational issuance/recovery, provider-aware destruction, non-Unix/physical zeroization, all data classes, admitted-module/algorithm-policy gates, and independent review remain open. A fresh recipient-package rekey refuses an already-revoked recipient; exact historical retry remains recoverable. There is no automatic remediation workflow. |
 | `DM-3-12`, `DM-6-20` captured-node exclusion and intermittent propagation | `observed-bounded` | Source-authenticated ordered Flash controls, payload-blind forwarding, durable revocation checks before Event, durable rejected-sequence fencing, and exact local historical retry | The retained authority-absent relay scenario denied two captured-node cohorts. Rejection-fence, same-signer historical retry, self-revocation receipt ordering, and cancelled-enqueued stopped recovery have focused current-code automation only. The live additions do not create new intermittent-propagation evidence. Revocation/rekey remain separate; longer impaired partitions, multiple relays/carriers, physical systems, broader topologies, process/power crash injection, and independent implementations remain open. |
@@ -804,8 +833,8 @@ configured relay to become ready and disables all IP transports. Iroh may probe
 the supplied initial paths in parallel; this API promises no temporal
 direct-first ordering. After exact endpoint authentication, Iroh may negotiate
 additional direct paths, so initial locators are not a lifetime IP allowlist and
-the mechanism is not NAT acceptance evidence. Endpoint identity and the sole
-configured relay origin remain exact.
+those route semantics and this source/test slice alone are not NAT acceptance
+evidence. Endpoint identity and the sole configured relay origin remain exact.
 
 Every connection retains a bounded diagnostic `Direct`, `Relay`, or `Unknown`
 path witness. It subscribes before the initial snapshot, coalesces observed
@@ -864,10 +893,13 @@ env RUSTDOCFLAGS=-Dwarnings \
   cargo doc --locked --workspace --all-features --no-deps
 ```
 
-This is current-code, same-implementation, one-host automated evidence, not a
-retained execution root. It moves only `DM-5.8-06`, `DM-5.8-09`, `DM-11-02`,
-and `DM-13-04` from `open` to `implemented-uncredited`; it creates no
-`observed-bounded` credit and relabels no historical receipt. It does not prove
+This source/test slice is current-code, same-implementation, one-host automated
+evidence, not a retained execution root. It originally moved only `DM-5.8-06`,
+`DM-5.8-09`, `DM-11-02`, and `DM-13-04` from `open` to
+`implemented-uncredited`; by itself it creates no `observed-bounded` credit and
+relabels no historical receipt. The later, separately frozen namespace-NAT
+receipt below upgrades only the exact rows and claim boundaries stated there.
+This source/test slice does not prove
 a physical relay deployment, direct operation across NAT, direct-first
 fallback, multi-host operation, BTLE, mixed implementations, N=32/resource
 brackets, packet-capture confidentiality, State/Record/Blob-over-relay behavior,
@@ -875,6 +907,127 @@ route-only Blob custody, supported-target packaging, dependency/license/SBOM
 admission, or release authorization. The connectivity relay is below the
 peer-to-peer QUIC and mission/source protections; it is not the payload-blind
 Aster Event node from retained temporal-relay receipts.
+
+## Selected Iroh NAT retained receipt
+
+On 2026-08-26, the exact selected composition at signed commit
+`15f4e0b8e9f817508c14fcbb4b307d6949add557` and tree
+`09d2f5bb037d694367e24ec50747aba8cac83b96` passed the two-cell
+`aster-selected-iroh-nat-receipt/v1` suite. The commit signature verified as
+Good for `code@jeffm.us` with ED25519 key
+`SHA256:wDJcS5jorC5+Dm3vvXdMrW/f38sqIl20hJXrt5B8s9E`. The source-bound
+`Cargo.lock` SHA-256 is
+`61a774190d9cb3b54a7fca62353bd0241f62bf676d1bf956ac7f1fef0c6d5521`,
+and the requirements SHA-256 remains
+`e88bcc6c717a5175a460205fdc084aaa2e1f020a142a84087f9881677da02987`.
+
+The checked-in canonical
+[`aster-selected-iroh-nat-receipt/v1` receipt](evidence/selected-iroh-nat-15f4e0b.json)
+is exactly 48,302 bytes with SHA-256
+`55dc67ac606e92c44c2e36d959b23bc52880b483bdab21a7c2ec47487eee0393`.
+It is the only raw-run file copied into source control. The complete raw root is
+`/private/tmp/aster-selected-iroh-nat.zFpaqB/20260826T143559Z-selected-iroh-nat-50726015670670e9`
+on the validating host. It retains encrypted state, mission bundles,
+credentials, and packet captures under an external-restricted boundary and
+must not be copied into documentation or treated as the public receipt.
+
+The build used the exact selected-NAT Dockerfile SHA-256
+`2b7ce7b548aaec3fb3a0b412bde3547753e4e7f45ddeb44d98bd7f5ed973e56c`
+and build-input manifest SHA-256
+`ce908e0c1b8ed743f3cdf03bd3525df72f9fc5a89d8e59ce7759211f833c3183`.
+The local image/config ID was
+`sha256:05d80d1ddf9624f70c7c4bcfcf9a78a02ce5d957967d6f5221c676a56f36740f`.
+The three runtime artifacts were:
+
+```text
+1715eb1ee572d619abb8641482cb9b7418a82bb14ac2ab7c40a39238476f9da2  aster; 11,957,512 bytes
+dc59753490170e6b018b3bdcf2da257c27f70747386d4f1053407adf5b7fe6ab  aster-selected-nat; 3,216,136 bytes
+df7b8127881a82b0677083c17d4f6f85d187bfbb93a9d5d23abdcfbb624584ed  aster-selected-relay; 4,928,672 bytes
+```
+
+The run used one Darwin arm64 physical host, Docker 29.4.0, OrbStack 2.2.3,
+and kernel `7.0.14-orbstack-00380-ga7e0a2dc9535` to host isolated Docker Linux
+network namespaces. Across both cells, four selected endpoints (two per cell)
+used fresh, disjoint carrier identities, mission identities, mission
+authorities, subscriptions, state directories, and stores. Each cell published
+one exact 32-byte source-authenticated Event, observed one destination delivery
+on attempt one, acknowledged it, observed an empty
+post-ack poll, and repeated both the acknowledgement and subscription contact
+as exact no-ops. Each cell retained four successful contact receipts, with all
+control, mutable, and Blob work zero.
+
+| Cell | Exact retained observation |
+|---|---|
+| Cone/direct | Two selected endpoints were placed behind separate LAN and software-NAT-router namespaces with exact operator-known static full-cone mappings. Relay, hosted discovery, public/default relay, and port mapping were disabled. Both endpoints selected Direct with zero observed transitions. The two WAN captures retained 489 packets each with zero drops and 978 aggregate cross-NAT UDP/44000 observations; complementary nft DNAT/SNAT and directional forwarding counters agreed. |
+| Restrictive/controlled relay | The restrictive nft policy recorded three direct-drop packets. The WAN captures retained 1,025 and 1,027 packets with zero drops, zero direct cross-NAT observations, and 2,052 controlled-relay HTTPS observations, with zero HTTP, hosted-discovery, or public-relay observations. Both endpoints selected Relay with zero observed transitions. The exact DER-pinned, two-identity-allowlisted relay accepted two sessions, rejected zero, and reached an active-session peak of two. |
+
+The receipt's canonical raw manifest contains 99 records, 10,928 manifest
+bytes, and 1,094,629 enumerated artifact bytes, with SHA-256
+`6253de629d1ba2791bf86e4a72c316761a7f80b3420c0b03577dc1f5e026bbe4`.
+The canary scan covered exactly 26 enumerated finalized targets: 11 in the
+cone/direct cell and 15 in the restrictive/relay cell, including the named WAN
+captures. It searched raw bytes, lowercase hexadecimal, and standard Base64,
+found zero matches, and first proved all three encodings against one positive
+control per cell. This is not an all-file, all-storage, or whole-host secret
+scan. The external-restricted state and credential files were metadata-
+inspected only.
+
+Both standalone 32-byte canary control files were overwritten, synchronized,
+unlinked, and absent after cleanup. The restrictive relay's temporary private-
+key file received the same bounded-software treatment. Each cell ended with
+zero runtime containers, networks, and namespaces. Those assertions do not
+claim deletion of the selected local build image, physical erasure, global
+host sanitization, or sanitization of retained encrypted state and credentials.
+The image/config ID is a local identity only, not a registry image digest.
+
+The canonical projection was reproduced byte-for-byte from the raw root at the
+same 48,302-byte size and SHA-256. The current receipt checker has SHA-256
+`357b2ac98300dfb88e8ce2dc97672f4c685d401de82c80756db51b0dacb73823`;
+it passed against the immutable signed source, and its synthetic fail-closed
+suite passed 38/38.
+Review requires both the public receipt and access-controlled raw root; the
+checked-in JSON alone cannot replay packet, nft, chronology, or raw-artifact
+bindings. Validate the retained receipt with a source repository containing the
+signed commit object and the reviewer's configured trusted signer:
+
+```sh
+python3 tools/check-selected-iroh-nat-receipt.py \
+  --raw-root /private/tmp/aster-selected-iroh-nat.zFpaqB/20260826T143559Z-selected-iroh-nat-50726015670670e9 \
+  --source . \
+  docs/implementation/evidence/selected-iroh-nat-15f4e0b.json
+```
+
+To independently reproject the sanitized JSON, choose a fresh nonexistent
+owner-controlled output path; the projector refuses to overwrite an existing
+path. The result must compare byte-for-byte with the checked-in receipt:
+
+```sh
+nat_review_dir="$(mktemp -d /private/tmp/aster-selected-nat-review.XXXXXX)"
+chmod 700 "$nat_review_dir"
+python3 lab/orchestrate.py selected-iroh-nat-project \
+  --raw-root /private/tmp/aster-selected-iroh-nat.zFpaqB/20260826T143559Z-selected-iroh-nat-50726015670670e9 \
+  --output "$nat_review_dir/selected-iroh-nat-receipt.json"
+cmp "$nat_review_dir/selected-iroh-nat-receipt.json" \
+  docs/implementation/evidence/selected-iroh-nat-15f4e0b.json
+shasum -a 256 "$nat_review_dir/selected-iroh-nat-receipt.json"
+```
+
+This receipt moves exactly `DM-5.8-07` from `open` to
+`observed-bounded`, `DM-5.8-09` from `implemented-uncredited` to
+`observed-bounded`, and `DM-11-03` from `open` to
+`implemented-uncredited`. Relay-assisted connectivity was observed while the
+restrictive policy blocked direct traffic; no temporal direct-first or fallback
+sequence is claimed because Iroh may probe paths in parallel and learn later
+authenticated direct paths. The receipt is one same-build,
+same-implementation, one-host software-namespace result. It does not claim
+dynamic endpoint discovery or hole punching, representative or physical NAT
+hardware/path, public Internet, hosted discovery, public/default relay, port
+mapping, an independently operated relay, lab-network exclusivity, a complete
+listener-wide pre-authentication cap, independent implementation, BTLE,
+State/Record/Blob-over-relay behavior, mobility/outage recovery, independent
+clock assurance, resource thresholds, a hermetic build, complete MVP, product
+release, or release authorization. `DM-5.8-08` and the physical release gate
+`DM-12-09` remain `open`.
 
 ## Prior PR-C automated evidence
 
@@ -2476,7 +2629,7 @@ decisions above.
 | Custody and constrained operation | `implemented-uncredited` / `open` | Selected Event/RouteEvent now has semantic-v3-format cumulative age inherited by v4/v5, Linux finite Event TTL, expiry/GC, priority scheduling/retry, bounded quotas, thresholds, and receive-only inbound. Normal and AtLeast run v4/v5 mutable work and may run the v5 Blob lane because AtLeast is Event-only; ReceiveOnly initiates/discloses neither mutable nor Blob work. Selected finite State/Record/Blob TTL remains rejected/open. Still required are complete cross-class priority eviction/custody, route-only Blob custody, non-Linux Event age, physical RF silence, v1/v2 deterministic partials, bindings, scale, mixed implementations, and retained acceptance. |
 | Scope and application policy | `implemented-uncredited` / `open` | Durable application-facing State/Record subscriptions and delivery behavior beyond explicit contact interests, automatic registered-policy Record merge, atomic subscription update, multi-scope join/leave, bridges, dynamic peer policy, and equivalent live status/gap semantics beyond the selected Event surface |
 | Blob behavior | `implemented-uncredited` / `open` | The local authenticated fixed-profile chunking, encrypted resume, immutable publication, and bounded-memory reader now have one semantic-v5 direct content-capable-peer source/carrier path with peer-neutral range resume and completion-gated visibility. Add a live Blob handle/subscription, route-only relay/custody, TTL and explicit staging GC; decide whether a metadata-independent pure-byte content ID is required; add complete physical accounting and hundreds-of-MB acceptance. |
-| Carrier portfolio | `implemented-uncredited` / `open` / `external-gate` | Selected direct IP and one explicitly trusted singleton relay mechanism now exist. Still required are physical IP, representative NAT direct/fallback, discovery policy, BTLE platform driver, smallest-MTU framing, link characteristics, State/Record/Blob-over-relay acceptance, mobility/outage recovery, mixed implementations, and future-carrier proof. |
+| Carrier portfolio | `implemented-uncredited` / `observed-bounded` / `open` / `external-gate` | Selected direct IP and one explicitly trusted singleton relay mechanism now exist, with one retained cone/direct and restrictive/controlled-relay software namespace-NAT observation. Still required are physical IP, representative NAT direct/fallback, discovery/punching policy, BTLE platform driver, smallest-MTU framing, link characteristics, State/Record/Blob-over-relay acceptance, mobility/outage recovery, mixed implementations, and future-carrier proof. |
 | DDIL resilience | `open` / `external-gate` | Loss/bandwidth floors, long custody/offline interval, crash/corruption recovery, broader partial-contact durable progress and alternate-peer/carrier continuation beyond the one bounded direct Blob case, mobility, and power/emission measurements |
 | Developer surface | `implemented-uncredited` / `open` | Add live application handles for the now-networked State/Record classes and a live Blob handle/subscription over the bounded network path; add automatic merge only after a convergent design, atomic subscription update if required, C FFI and at least two selected-node bindings, broader multi-class examples including live privileged administration, carry caller-provided protected Rust startup and typed live/stopped control administration into the stock CLI/bindings with a production backend/recovery/destroy workflow, run an independent usability study, and decide the optional local agent |
 | Scale and resources | `observed-bounded` / `open` / `external-gate` | Retain the one-host direct-loopback selected Event N=32 receipt as the bounded `DM-9-21A` observation; still obtain stakeholder-confirmed bracketed targets plus repeatable at-least-100-node, inventory-size, memory, CPU, binary, bandwidth, and energy evidence on target tiers |

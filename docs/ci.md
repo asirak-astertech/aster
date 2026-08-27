@@ -617,10 +617,65 @@ may be probed in parallel, so it is not a temporal direct-first/fallback result;
 authenticated Iroh NAT negotiation may also derive later direct paths, so it is
 not representative-NAT acceptance. Path kind and a coalesced transition count
 capped at 1,024 are observation-only diagnostics and never authorization or
-success inputs. The gate creates no retained receipt and grants no physical,
-NAT, BTLE/cross-transport, mixed-implementation, N=32, resource-bracket,
+success inputs. That source/test gate creates no retained receipt by itself and
+grants no physical or representative-NAT, BTLE/cross-transport,
+mixed-implementation, N=32, resource-bracket,
 State/Record/Blob-over-controlled-relay, route-only Blob custody, release, or
 `observed-bounded` credit.
+
+## Selected Iroh namespace-NAT retained gate
+
+The separate retained gate is bound to signed commit
+`15f4e0b8e9f817508c14fcbb4b307d6949add557` and exact tree
+`09d2f5bb037d694367e24ec50747aba8cac83b96`. On one Darwin arm64 host,
+Docker 29.4.0 and OrbStack 2.2.3 ran two cells, each with two selected endpoints
+behind distinct Docker Linux LAN/NAT-router namespaces. The cone cell disabled
+relays and observed Direct plus 978 cross-NAT UDP packet observations. The
+restrictive cell recorded three direct-drop packets, zero direct WAN
+observations, Relay at both endpoints, two accepted allowlisted sessions, and
+2,052 controlled-relay
+HTTPS packet observations. Each cell delivered and acknowledged one exact
+32-byte Event and repeated as an exact no-op.
+
+The canonical checked-in receipt is
+[`selected-iroh-nat-15f4e0b.json`](implementation/evidence/selected-iroh-nat-15f4e0b.json):
+48,302 bytes, SHA-256
+`55dc67ac606e92c44c2e36d959b23bc52880b483bdab21a7c2ec47487eee0393`.
+The raw root contains external-restricted packet captures, mission bundles,
+credentials, and encrypted state and must remain outside source control. Its
+canary result covers exactly 26 enumerated finalized targets, not the complete
+raw root or host. Runtime cleanup removed the cell containers, networks, and
+namespaces; it does not claim deletion of the selected local image, global or
+physical sanitization, or sanitization of retained encrypted state.
+
+A future fresh run requires explicit mutation and build-network authorization:
+
+```sh
+python3 lab/orchestrate.py selected-iroh-nat-run \
+  --execute --allow-build-network --profile all
+```
+
+Review of the frozen run requires access to its external-restricted raw root.
+The validator binds the public receipt to the immutable signed Git objects and
+all curated raw artifacts:
+
+```sh
+python3 tools/check-selected-iroh-nat-receipt.py \
+  --raw-root /private/tmp/aster-selected-iroh-nat.zFpaqB/20260826T143559Z-selected-iroh-nat-50726015670670e9 \
+  --source . \
+  docs/implementation/evidence/selected-iroh-nat-15f4e0b.json
+python3 tools/test-selected-iroh-nat-receipt.py
+```
+
+The raw-root projector independently reproduced the public receipt
+byte-for-byte, and the synthetic fail-closed suite passed 38/38. The receipt
+does not claim discovery or punching, temporal direct-first fallback,
+representative or physical NAT, public Internet/relay operation, lab-network
+exclusivity, a complete listener-wide pre-authentication cap, BTLE,
+independent implementation or clock, resource thresholds, a hermetic build,
+complete MVP, or release authorization. Exact identities, replay commands, and
+status movements are in the
+[requirements ledger](implementation/requirements-status.md#selected-iroh-nat-retained-receipt).
 
 The 57th test in that parent redb-store receipt is a Unix writable-open
 durability adversary. Every new or existing writer, including a terminal

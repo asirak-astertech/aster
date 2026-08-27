@@ -1,6 +1,6 @@
 # Carriers and contacts
 
-This guide distinguishes the selected direct-Iroh carrier/storage composition
+This guide distinguishes the selected Iroh carrier/storage composition
 from the proven semantic implementation whose protocol and carrier behavior is
 being migrated onto it. Read [Core concepts](concepts.md) first if terms such as
 node, topic, or scope are new.
@@ -30,7 +30,7 @@ flowchart LR
     Node --> Store["Durable policy and data authority"]
     Store --> Depot["Encrypted local Blob depot"]
     Node --> Reconcile["Canonical IDs and bounded set difference"]
-    Node --> Carrier["Direct Iroh carrier"]
+    Node --> Carrier["Iroh carrier<br/>direct or operator-pinned relay"]
     Carrier <--> Peer["Peer aster-node"]
 ```
 
@@ -47,17 +47,20 @@ State, Record, and Blob state. The sibling depot stores bounded Blob
 ciphertext; redb owns its committed-file markers and publication authority.
 `aster-node` is the only selected composition root.
 
-The selected runtime networks Event, State, and Record. Blob remains local. The
-broader semantic implementation remains the migration source for behavior that
-has not yet moved into this composition, and it is retained until replacements
-pass equivalent tests.
+The selected runtime networks Event, State, and Record. Under semantic v5 it
+also transfers already-durable Blob sources and bounded carrier prefixes
+directly between content-capable peers; Blob application access remains local
+and stopped. The broader semantic implementation remains the migration source
+for behavior that has not yet moved into this composition, and it is retained
+until replacements pass equivalent tests.
 
 ## Capability boundary
 
 | Path | Implemented | Boundary |
 |---|---|---|
-| Selected direct Iroh | Manually admitted endpoint ID and socket, authenticated direct QUIC, bounded exchange | No hosted discovery, relay, port mapping, NAT acceptance, physical-network acceptance, or multi-carrier failover |
-| Selected node and CLI | Networked Event plus State/Record reconciliation, live Event API, stopped State/Record/Blob APIs, payload-blind Event relay, restart/idempotency, and bounded Unix zeroization | Reference provisioning, local-only Blob, no live State/Record/Blob APIs, finite-TTL custody, generalized control administration, or production authorization |
+| Selected direct Iroh | Manually admitted exact endpoint ID and socket, authenticated direct UDP/QUIC, and bounded exchange | A retained one-host cone software-namespace cell observed Direct and exact Event delivery across two NAT routers with static operator-known mappings. Carrier authentication is not mission or control/source authorization; discovery/punching, dynamic or representative NAT, physical-network acceptance, and multi-carrier failover remain open. |
+| Selected controlled Iroh relay | One operator-pinned HTTPS relay with explicit trust, either alongside the initial direct locator or with IP disabled | A retained one-host restrictive software-namespace cell blocked direct traffic, observed Relay, and delivered one exact Event through the controlled relay. It is not a temporal direct-first/fallback chronology, representative or physical NAT, public or independently operated relay, an Aster payload-blind relay, State/Record/Blob-over-relay acceptance, or release authorization. |
+| Selected node and CLI | Networked Event and State/Record reconciliation, semantic-v5 direct Blob source/carrier transfer, live Event API, stopped State/Record/Blob APIs, payload-blind Event relay, restart/idempotency, and bounded Unix zeroization | Reference provisioning, no live State/Record/Blob APIs, no route-only Blob relay/custody, no Blob-over-controlled-relay acceptance, finite State/Record/Blob TTL and non-Linux finite Event custody, generalized control administration, or production authorization |
 | Current semantic in-memory link | Full high-level host contact, authentication, reconciliation, resume, and failure tests | It is a test carrier and is not wired to the selected composition |
 | Current semantic UDP/IP | Nonblocking link, manual endpoint mapping, protected local discovery, rendezvous helpers, opaque relay components | Migration onto the selected node; full host acceptance on physical or operational networks |
 | Current semantic NAT/rendezvous and relay | Bounded rendezvous, endpoint-punching, and opaque-relay helpers with local software tests | Selected-node integration and a two-device representative-NAT direct/fallback result |
@@ -76,6 +79,17 @@ same-build, same-implementation, one-scope/authority/topic, line-topology
 receipt is not the full 2–32 range, the separate at-least-100-node target,
 distributed/physical scale, NAT, controlled-relay, BTLE/cross-transport,
 mixed-implementation, resource-threshold, or release acceptance.
+
+A separate retained two-cell selected-Iroh receipt observes one exact Event and
+an exact replay no-op through cone/direct and restrictive/controlled-relay
+Docker Linux namespace NATs on one Darwin arm64 host. The cone cell uses exact
+operator-known static mappings with every relay disabled; the restrictive cell
+records direct drops and carries only through the exact DER-pinned relay. Its
+nft and WAN tuple metadata are bound to the sanitized receipt. This is not
+endpoint discovery or punching, a temporal direct-first sequence,
+representative or physical NAT, public Internet or relay operation, independent
+implementation, another data class, resource evidence, or release acceptance.
+See the [retained receipt and replay boundary](implementation/requirements-status.md#selected-iroh-nat-retained-receipt).
 
 Code presence is not deployment credit. See the tracked
 [production requirements status](implementation/requirements-status.md) and
@@ -124,8 +138,9 @@ Configure both sides with exact
 `CARRIER_ID@IP:PORT=MISSION_NODE_ID_HEX64` bindings and pass each local bundle
 through `--mission-bundle-unprotected-reference`. The carrier fails closed when
 its handshake identity is not in the configured allowlist; the node then fails
-closed unless the mission identity also matches. Its direct path does not
-perform hosted address lookup, relay discovery, or port mapping.
+closed unless the mission identity also matches. With no controlled relay
+flags, the direct path performs no hosted address lookup, relay discovery, or
+port mapping.
 
 Iroh carrier authentication is not Aster mission authentication and does not
 satisfy zero trust by itself. `aster-node` carries the existing `aster-core`
@@ -140,10 +155,11 @@ acceptance and reaction; revoked mission principals fail closed.
 The live selected Event handle composes high-level operations and bounded
 authenticated last-contact status with this path. `LastContactComplete` reports
 only the most recent bounded negotiation with each active configured peer; it
-does not assert global convergence. Live State/Record application handles,
-networked Blob and remote Blob chunk transfer, generalized control
-administration, repeated multi-scope lifecycle, finite-TTL custody, and
-protected provisioning remain to be composed.
+does not assert global convergence. Live State/Record/Blob application handles,
+route-only Blob relay/custody, Blob-over-controlled-relay acceptance,
+generalized control administration, repeated multi-scope lifecycle, finite
+State/Record/Blob TTL, non-Linux finite Event custody, and protected provisioning
+remain to be composed.
 The mission bundle is owner-only on Unix but explicitly unprotected-reference
 at rest; other platforms fail closed because that owner-only contract cannot be
 verified.
@@ -161,12 +177,14 @@ flowchart LR
 
 The phases above describe the Event lane of the manual direct-Iroh selected slice
 with unprotected-reference provisioning. The same mission contact also runs
-class-specific State and Record difference/fetch lanes under explicit
-receiver topic/scope interests; Blob remains absent. Carrier authentication does not grant
-mission membership, route authority does not grant content access, and a
-subscription cannot expand either authority. Consume selectors also drive
-local poll delivery; Carry selectors drive receipt/forwarding without local
-poll delivery. Both modes project to the same protected wire interest.
+class-specific State and Record difference/fetch lanes under explicit receiver
+topic/scope interests in semantic v4/v5. Under v5, content-capable peers
+additionally reconcile exact Blob sources before transferring bounded missing
+carrier prefixes; v1-v4 emit zero Blob frames. Carrier authentication does not
+grant mission membership, route authority does not grant content access, and a
+subscription cannot expand either authority. Consume selectors also drive local
+poll delivery; Carry selectors drive receipt/forwarding without local poll
+delivery. Both modes project to the same protected wire interest.
 
 On Unix, a same-UID operator can invoke `aster zeroize` against the exact state
 and mission-bundle paths. A live node accepts the request only through an
@@ -342,6 +360,12 @@ The IP crate provides separate tools for three deployment situations:
   direct reachability fails. A relay is useful infrastructure, not part of data
   correctness and not automatically a content reader.
 
+These retained semantic/reference helpers are migration sources, not the
+selected controlled-Iroh relay path above. They do not supply the
+selected retained NAT evidence: that receipt uses exact operator-known static
+cone mappings and the selected controlled relay, and makes no selected
+discovery or punching claim.
+
 Start with manually known addresses. Add discovery or rendezvous only after the
 authenticated two-node path is understood and measured in the target network.
 
@@ -440,13 +464,25 @@ reconciliation, authentication, or scheduling authority. Use the
 
 ## Semantic protocol versions you may see
 
-Aster separates stable bytes from negotiated behavior:
+Aster separates stable bytes from negotiated behavior. The current selected
+implementation offers semantic versions `[5, 4, 3, 2, 1]` in that descending
+order:
 
 - **Replication wire/profile version 1** identifies the current encoding and
   fixed security-object family.
-- **Semantic version 2** is offered first by the current implementation and adds
-  compact authenticated batches and authorized cross-scope routes.
-- **Semantic version 1** remains a compatibility option for singleton transfer.
+- **Semantic version 5** is offered first. It inherits Event, compact-batch,
+  bridge, custody, and semantic-v4 State/Record behavior and adds selected
+  direct content-capable Blob source-before-carrier transfer with
+  completion-gated visibility. Semantic versions 1 through 4 emit zero Blob
+  frames.
+- **Semantic version 4** remains a compatibility option with Event behavior and
+  protected, class- and direction-specific State/Record reconciliation.
+- **Semantic version 3** remains an Event-compatible option with bounded
+  session-authenticated Event/RouteEvent custody and no State/Record frames.
+- **Semantic version 2** remains a compatibility option for compact batches and
+  authorized cross-scope routes without semantic-v3 custody.
+- **Semantic version 1** remains a compatibility option for singleton Event
+  transfer and has no State/Record or Blob frames.
 
 The process-wide version constants report implementation support, not what a
 particular session negotiated. Application code normally does not branch on
