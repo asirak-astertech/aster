@@ -1,12 +1,15 @@
 # Selected Record API quickstart
 
 This is the shortest path to Aster's **selected Record conflict projection**. A
-running node exposes cloneable async publish/query/resolve handles, and the same
-composition retains an exclusive stopped facade for maintenance or applications
-that do not need networking. Both return the deterministic current revision,
-explicit conflict siblings, and an opaque exact resolution guard without
-exposing envelopes, cryptographic keys, sealed bytes, or merge execution during
-ingest.
+running node exposes cloneable async publish/query/resolve and durable
+subscribe/poll/acknowledge/unsubscribe operations, while the same composition
+retains an exclusive stopped facade for maintenance or applications that do not
+need networking. Exact query returns the deterministic current revision,
+explicit conflict siblings, and an opaque exact resolution guard. Durable
+delivery instead returns one non-authorizing whole-key active-head projection;
+an application must issue a fresh exact query before resolving a delivered
+conflict. Neither surface exposes envelopes, cryptographic keys, sealed bytes,
+or merge execution during ingest.
 
 `RunningNode::selected_records()` returns `SelectedRecordHandle`. Its clones
 send commands through the actor's one bounded Event/State/Record lane; they do
@@ -16,11 +19,13 @@ over a semantic-v4/v5 mission-authenticated, class- and direction-specific
 Negentropy lane under exact receiver interests. Ingest never executes registered
 merge code, so concurrent heads remain durable and explicit.
 
-Durable Record subscriptions, selected-node ConnectRPC/C/Go/Python bindings,
-finite TTL, expiry, garbage collection, automatic registered-policy merge,
-broader relay acceptance, representative physical/mixed-implementation
-evidence, and release authorization remain open. The selected store rejects
-every finite-TTL Record object; there is no forwarding-age path to enable yet.
+Durable whole-key Record delivery now exists as a current-code Rust mechanism.
+It has no retained Record-delivery acceptance receipt, selected-node
+ConnectRPC/C/Go/Python bindings, class-specific status, finite TTL, expiry,
+garbage collection, automatic registered-policy merge, broader relay
+acceptance, representative physical/mixed-implementation evidence, or release
+authorization. The selected store rejects every finite-TTL Record object;
+there is no forwarding-age path to enable yet.
 
 ## Run the stopped example
 
@@ -118,6 +123,112 @@ path does the same before erasing retained secret artifacts. Retained clones
 therefore fail closed with sanitized `StateUnavailable`; they never reopen the
 store or continue on a stale policy. Event, State, and Record clones share one
 bounded command queue and actor-owned policy/store authority.
+
+## Subscribe to whole-key active-head projections
+
+A Record subscription selects a topic and scope, optionally including
+descendant scopes. Each delivery is one complete exact-key active-head
+projection, not one Record version. `delivery_limit` therefore counts logical
+key projections, while `scan_limit` bounds the complete set of matching retained
+versions that one poll revalidates under current policy and reduces. Current-
+lineage source/content is freshly authenticated; lineage-withheld claims are
+rebound to startup-authenticated sender projections without exposing plaintext:
+
+```rust
+let subscription = records
+    .subscribe(RecordSubscriptionRequest {
+        operation_key: b"my-app/record-subscription/reports".to_vec(),
+        topic: topic.clone(),
+        scope: scope.clone(),
+        include_descendant_scopes: false,
+    })
+    .await?;
+
+let page = records
+    .poll(RecordPollRequest {
+        subscription: subscription.id,
+        delivery_limit: MAX_SELECTED_RECORD_DELIVERIES,
+        scan_limit: MAX_SELECTED_RECORD_SUBSCRIPTION_SCAN,
+    })
+    .await?;
+
+for delivery in page.deliveries {
+    // One delivery contains the deterministic visible Current head, every
+    // visible Concurrent head, and any complete non-authorizing sibling list.
+    if delivery.projection.conflict.is_some() {
+        let exact = records
+            .query(RecordQuery {
+                topic: delivery.key.topic.clone(),
+                scope: delivery.key.scope.clone(),
+                logical_key: delivery.key.logical_key.clone(),
+                include_superseded_versions: false,
+            })
+            .await?;
+        if let Some(exact_conflict) = exact.conflict {
+            // Inspect the fresh query, then pass
+            // `exact_conflict.resolution_guard` to a reviewed resolve call.
+        }
+    }
+    records
+        .acknowledge(subscription.id, delivery.projection_id, delivery.token)
+        .await?;
+}
+
+assert_eq!(
+    records.unsubscribe(subscription.id).await?,
+    RecordUnsubscribe::Removed,
+);
+```
+
+Subscription creation is exactly retryable by operation key. The selector is
+durable application delivery intent only: it does not add or alter configured
+Record network interests and does not grant route, content, source, or epoch
+authority. A receiver still needs a matching `NodeConfig` Record interest and
+current mission grants before a remote revision can be retained or delivered.
+
+The delivery identity binds the exact topic, scope, logical key, and complete
+sorted policy-active causal head set. One head is deterministically visible as
+`current`; every other visible head is in `concurrent`. A conflict annotation
+contains the complete sorted sibling IDs, including opaque IDs for
+startup-authenticated heads whose same-epoch route lineage now withholds
+plaintext. Every delivery separately carries its verified `RecordProjectionKey`
+(`topic`, `scope`, and `logical_key`), so even an opaque-only conflict can be
+queried exactly. The delivery annotation deliberately contains no
+`RecordResolutionGuard`: retained dominated history can change the query's
+guarded Store plan without changing the active-head identity. Query the
+delivered key immediately before calling `resolve`.
+
+Delivery has no superseded-history lane. Poll still verifies every retained
+candidate before reducing the active heads, but a late dominated ancestor does
+not create a new delivery. Use `RecordQuery` with
+`include_superseded_versions: true` when history is required. A current
+authenticated tombstone is an ordinary explicit head; an edit concurrent with
+a tombstone remains a conflict and receives no delete-wins treatment.
+
+Unacknowledged work is retried with a higher nonzero attempt and a new opaque
+token. Tokens bind subscription incarnation, projection identity, active-head
+tenure, and issued attempt. Exact acknowledgement and reacknowledgement are
+idempotent; stale unacknowledged tenures, old subscription incarnations, and
+tokens bound to another projection fail closed. If the policy-active head set
+changes away and later returns to the same set, it starts a fresh tenure. A
+route-lineage visibility change that leaves that head set unchanged does not
+rearm an acknowledged projection. Poll emits no synthetic withdrawal, and an
+empty page means only that no unacknowledged positive active/conflicted
+projection is currently available; it does not prove that a key is absent.
+
+This is a durable projection queue, not a revision stream, transition log,
+materialized view, automatic merge engine, or withdrawal feed. The focused
+tests are current-code mechanism evidence only. A signed retained
+Record-delivery run with forced receiver-process replacement and exact
+redelivery remains open.
+
+Run the focused whole-projection mechanism regression with:
+
+```sh
+cargo test --locked -p aster-node \
+  application::record::tests::record_subscription_delivers_whole_conflict_retries_resolves_and_reopens \
+  -- --exact
+```
 
 Focused current-code automation covers peerless durability, idempotency,
 restart, shutdown admission, and protected same-epoch rekey recovery:
@@ -366,12 +477,13 @@ policy, revocation, and authority checks before the original result is
 returned.
 
 On query, redb supplies a bounded structural plan, not an authorization
-capability. The facade freshly authenticates every retained candidate, verifies
-its plaintext and exact key, excludes revoked or stale-epoch revisions from the
-application projection, independently recomputes every causal disposition and
-head identity, and asks the store to recheck the exact policy-bound plan before
-returning application data. Resolution adds the exact verified conflict guard
-to that transaction.
+capability. The facade freshly authenticates current-lineage source/content and
+exact keys; lineage-withheld rows are rebound to startup-authenticated sender
+projections and current policy without exposing plaintext. It excludes revoked
+or stale-epoch revisions from the application projection, independently
+recomputes every causal disposition and head identity, and asks the store to
+recheck the exact policy-bound plan before returning application data.
+Resolution adds the exact verified conflict guard to that transaction.
 
 ```mermaid
 sequenceDiagram

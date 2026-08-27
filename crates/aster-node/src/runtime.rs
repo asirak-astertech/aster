@@ -10114,6 +10114,26 @@ fn execute_selected_record_command(
         SelectedRecordCommand::Resolve { request, response } => {
             let _ = response.send(application.resolve(request));
         }
+        SelectedRecordCommand::Subscribe { request, response } => {
+            let _ = response.send(application.subscribe(request));
+        }
+        SelectedRecordCommand::Poll { request, response } => {
+            let _ = response.send(application.poll(request));
+        }
+        SelectedRecordCommand::Acknowledge {
+            subscription,
+            projection,
+            token,
+            response,
+        } => {
+            let _ = response.send(application.acknowledge(subscription, projection, token));
+        }
+        SelectedRecordCommand::Unsubscribe {
+            subscription,
+            response,
+        } => {
+            let _ = response.send(application.unsubscribe(subscription));
+        }
     }
 }
 
@@ -27255,8 +27275,10 @@ mod tests {
     #[tokio::test]
     async fn live_selected_state_and_record_are_durable_idempotent_and_close_admission() {
         use crate::application::{
-            ApplicationErrorKind, MAX_SELECTED_STATE_DELIVERIES,
-            MAX_SELECTED_STATE_SUBSCRIPTION_SCAN, RecordPublishRequest, RecordQuery,
+            ApplicationErrorKind, MAX_SELECTED_RECORD_DELIVERIES,
+            MAX_SELECTED_RECORD_SUBSCRIPTION_SCAN, MAX_SELECTED_STATE_DELIVERIES,
+            MAX_SELECTED_STATE_SUBSCRIPTION_SCAN, RecordAcknowledgement, RecordPollRequest,
+            RecordPublishRequest, RecordQuery, RecordSubscriptionRequest, RecordUnsubscribe,
             StateAcknowledgement, StatePollRequest, StatePublishRequest, StateQuery,
             StateSubscriptionRequest, StateUnsubscribe,
         };
@@ -27439,6 +27461,66 @@ mod tests {
         assert!(record_projection.superseded.is_empty());
         assert!(record_projection.conflict.is_none());
 
+        let record_subscription = selected_records
+            .subscribe(RecordSubscriptionRequest {
+                operation_key: b"runtime-live-record-subscription".to_vec(),
+                topic: record_query.topic.clone(),
+                scope: record_query.scope.clone(),
+                include_descendant_scopes: false,
+            })
+            .await
+            .expect("subscribe to retained Record while live");
+        assert!(record_subscription.inserted);
+        let record_delivery = selected_records
+            .poll(RecordPollRequest {
+                subscription: record_subscription.id,
+                delivery_limit: MAX_SELECTED_RECORD_DELIVERIES,
+                scan_limit: MAX_SELECTED_RECORD_SUBSCRIPTION_SCAN,
+            })
+            .await
+            .expect("poll Record through live actor");
+        assert_eq!(record_delivery.deliveries.len(), 1);
+        assert_eq!(
+            record_delivery.deliveries[0]
+                .projection
+                .current
+                .as_ref()
+                .map(|item| item.id),
+            Some(published_record.id)
+        );
+        assert!(
+            record_delivery.deliveries[0]
+                .projection
+                .concurrent
+                .is_empty()
+        );
+        assert!(record_delivery.deliveries[0].projection.conflict.is_none());
+        assert_eq!(record_delivery.deliveries[0].attempt, 1);
+        let record_projection_id = record_delivery.deliveries[0].projection_id;
+        let record_delivery_token = record_delivery.deliveries[0].token;
+        assert_eq!(
+            selected_records
+                .acknowledge(
+                    record_subscription.id,
+                    record_projection_id,
+                    record_delivery_token,
+                )
+                .await
+                .expect("acknowledge Record through live actor"),
+            RecordAcknowledgement::Acknowledged
+        );
+        assert_eq!(
+            selected_records
+                .acknowledge(
+                    record_subscription.id,
+                    record_projection_id,
+                    record_delivery_token,
+                )
+                .await
+                .expect("repeat Record acknowledgement through live actor"),
+            RecordAcknowledgement::AlreadyAcknowledged
+        );
+
         let retained_state = selected_state.clone();
         let retained_records = selected_records.clone();
         let receipt = running.shutdown().await.expect("graceful mutable shutdown");
@@ -27469,6 +27551,19 @@ mod tests {
             .expect_err("closed actor rejects retained Record handle");
         assert_eq!(record_closed.kind(), ApplicationErrorKind::StateUnavailable);
         assert_eq!(record_closed.operation(), "record query");
+        let record_poll_closed = retained_records
+            .poll(RecordPollRequest {
+                subscription: record_subscription.id,
+                delivery_limit: MAX_SELECTED_RECORD_DELIVERIES,
+                scan_limit: MAX_SELECTED_RECORD_SUBSCRIPTION_SCAN,
+            })
+            .await
+            .expect_err("closed actor rejects retained Record subscription handle");
+        assert_eq!(
+            record_poll_closed.kind(),
+            ApplicationErrorKind::StateUnavailable
+        );
+        assert_eq!(record_poll_closed.operation(), "record poll");
 
         let reopened = start_node(NodeConfig {
             state: state.clone(),
@@ -27520,9 +27615,9 @@ mod tests {
                 .expect("repeat State unsubscribe through live actor"),
             StateUnsubscribe::AlreadyAbsent
         );
+        let reopened_record_handle = reopened.selected_records();
         assert_eq!(
-            reopened
-                .selected_records()
+            reopened_record_handle
                 .query(record_query)
                 .await
                 .expect("query Record after restart")
@@ -27530,6 +27625,32 @@ mod tests {
                 .expect("retained Record after restart")
                 .id,
             published_record.id
+        );
+        assert!(
+            reopened_record_handle
+                .poll(RecordPollRequest {
+                    subscription: record_subscription.id,
+                    delivery_limit: MAX_SELECTED_RECORD_DELIVERIES,
+                    scan_limit: MAX_SELECTED_RECORD_SUBSCRIPTION_SCAN,
+                })
+                .await
+                .expect("acknowledged Record subscription survives restart")
+                .deliveries
+                .is_empty()
+        );
+        assert_eq!(
+            reopened_record_handle
+                .unsubscribe(record_subscription.id)
+                .await
+                .expect("unsubscribe Record through live actor"),
+            RecordUnsubscribe::Removed
+        );
+        assert_eq!(
+            reopened_record_handle
+                .unsubscribe(record_subscription.id)
+                .await
+                .expect("repeat Record unsubscribe through live actor"),
+            RecordUnsubscribe::AlreadyAbsent
         );
         reopened.shutdown().await.expect("shutdown reopened actor");
         fs::remove_dir_all(state).expect("cleanup live mutable actor state");

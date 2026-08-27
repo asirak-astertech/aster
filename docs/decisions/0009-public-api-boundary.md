@@ -440,7 +440,9 @@ acceptance, a release artifact, or production authorization.
 This amendment supersedes the earlier present-tense statements that selected
 State has no live application subscription or durable delivery subscription.
 Those statements remain above only as dated boundaries of the stopped and
-semantic-v4 network slices. Record and Blob delivery subscriptions remain open.
+semantic-v4 network slices. At this State-amendment boundary, Record and Blob
+delivery subscriptions remained open; the Record mechanism amendment below is
+newer.
 
 `SelectedStateHandle` now exposes durable `subscribe`, `poll`, `acknowledge`,
 and `unsubscribe` operations backed by the actor-owned Store. The queue is
@@ -466,5 +468,46 @@ tombstone, and final peerless replay. The source/binary/execution link is
 operator-attested and the causal schedule is producer-attested. This amendment
 does not claim physical/NAT/relay/BTLE operation, mixed implementations, scale,
 resource or soak thresholds, indefinite tombstone retention, dynamic network
-interest, Record/Blob delivery, selected-node bindings, a release artifact, or
-production authorization.
+interest, retained Record-delivery acceptance, Blob delivery, selected-node
+bindings, a release artifact, or production authorization.
+
+## Live selected Record delivery mechanism amendment (2026-08-27)
+
+This amendment supersedes present-tense statements above that selected Record
+has no durable application delivery mechanism. It changes no retained receipt
+claim and no requirement status.
+
+`SelectedRecordHandle` now exposes durable `subscribe`, `poll`, `acknowledge`,
+and `unsubscribe` operations backed by the actor-owned Store. One delivery is a
+complete active-head projection for one exact topic, scope, and logical key;
+`delivery_limit` counts projections rather than Record versions, so a conflict
+cannot be split across pages. Poll freshly verifies the complete bounded
+matching candidate snapshot before atomically advancing an at-least-once
+attempt. Superseded history is excluded from delivery and remains available by
+explicit query.
+
+The projection identity binds the exact key and complete sorted policy-active
+causal head set. Visible Current and Concurrent heads are returned together. A
+conflict carries the complete sorted sibling IDs, including opaque IDs for
+startup-authenticated heads whose same-epoch lineage now withholds plaintext,
+but it is deliberately non-authorizing: it contains no resolution guard. Every
+delivery carries a verified `RecordProjectionKey`, and an application must
+issue a fresh exact query for a current guard before resolution. A late
+dominated ancestor therefore cannot change or rearm an acknowledged active-head
+delivery merely by changing the query's historical plan.
+
+Application selectors remain separate from configured Record network
+interests. Creating or replaying one does not mutate `NodeConfig`, authorize
+transfer, or expand route/content authority. Tokens bind subscription
+incarnation, projection identity, active-head tenure, and issued attempt;
+exact acknowledgement is idempotent and cannot consume later work. A current
+tombstone is an explicit head, concurrent edit/tombstone remains a conflict,
+and no synthetic withdrawal is emitted when no positive projection exists.
+
+This is a durable active-head projection queue, not a revision stream,
+transition log, materialized view, automatic merge engine, or withdrawal feed.
+It has current-code automation only. Retained forced-process Record redelivery,
+Blob delivery/status, selected-node bindings, finite Record TTL/GC, automatic
+registered-policy merge, physical/NAT/relay/BTLE operation, mixed
+implementations, scale/resource/soak evidence, a release artifact, and
+production authorization remain open.

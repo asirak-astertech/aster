@@ -291,15 +291,20 @@ for delivery in subscription.poll(limit=64):
 ```
 
 Stopping before acknowledgment can cause redelivery. That is the intended
-at-least-once contract. Acknowledging a projected current State or Record head
-does not promote a causally superseded ancestor into new work; concurrent Record
-siblings are acknowledged independently.
+at-least-once contract. Mutable delivery identity is API-specific: the selected
+Rust State queue follows one positive current version, while the selected Rust
+Record queue acknowledges one complete active-head set rather than independent
+siblings. Neither promotes a causally superseded ancestor into new work.
 
-For the selected production-lane Rust node, State alone currently exposes this
-delivery pattern as a freshly authenticated positive-current-version queue;
-see [Deliver positive current State versions durably](quickstart/selected-state-api.md#deliver-positive-current-state-versions-durably).
-Record and Blob selected-node delivery remain open, and the State queue is not
-a materialized view, transition feed, or dynamic network-interest controller.
+For the selected production-lane Rust node, State exposes this pattern as a
+freshly authenticated positive-current-version queue; see
+[Deliver positive current State versions durably](quickstart/selected-state-api.md#deliver-positive-current-state-versions-durably).
+Record separately exposes a current-code durable whole-key active-head queue;
+see [Subscribe to whole-key active-head projections](quickstart/selected-record-api.md#subscribe-to-whole-key-active-head-projections).
+It acknowledges a complete head set rather than independent siblings and
+requires a fresh exact query for a resolution guard. Blob selected-node
+delivery remains open. Neither mutable queue is a materialized view, transition
+feed, or dynamic network-interest controller.
 
 ## Publish an atomic batch
 

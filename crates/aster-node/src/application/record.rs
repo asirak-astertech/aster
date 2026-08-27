@@ -1,14 +1,17 @@
 //! High-level live and stopped-state surfaces for source-authenticated Record projections.
 //!
 //! The cloneable live handle reaches the running node's sole application
-//! authority through its bounded actor. The stopped/exclusive facade shares
-//! the exact mission-bound store, control policy, provider, and causal ledger
-//! with the selected Event and State surfaces. A running node reconciles its
-//! durable Record objects through the class-specific Record lane when the
-//! receiver declares an exact source interest. Network ingest never executes
-//! application merge code: conflicts remain explicit until an application
-//! submits a guarded successor that observes the complete sibling set it
-//! inspected.
+//! authority through its bounded actor. Both surfaces publish, query, and
+//! explicitly resolve Record projections, and expose a durable at-least-once
+//! queue of whole exact-key projections. A delivery never splits a conflict,
+//! runs merge code, or synthesizes a withdrawal. The stopped/exclusive facade
+//! shares the exact mission-bound store, control policy, provider, and causal
+//! ledger with the selected Event and State surfaces. A running node reconciles
+//! its durable Record objects through the class-specific Record lane when the
+//! receiver declares an exact source interest; application subscriptions do
+//! not replace that static network policy. Conflicts remain explicit until an
+//! application submits a guarded successor that observes the complete sibling
+//! set it inspected.
 
 use std::{
     fmt, fs,
@@ -24,10 +27,14 @@ use aster_mesh::{
     RouteVerifiedRecordEnvelope, Scope, Topic,
 };
 use aster_redb_store::{
-    ControlPolicySnapshot, ControlTransferId, RecordOperationKey, RecordOperationRequest,
-    RecordProjectionPlan, RecordPublicationIntent, RecordResolutionRequest as StoreResolution,
-    RecordSemanticId, RecordSenderProjection, RecordVersionDisposition as StoreRecordDisposition,
-    Store, StoredRecord,
+    ControlPolicySnapshot, ControlTransferId, MAX_RECORD_POLL_DELIVERIES,
+    MAX_RECORD_SUBSCRIPTION_SCAN, RecordDeliveryAck as StoreRecordDeliveryAck,
+    RecordDeliveryToken as StoreRecordDeliveryToken, RecordOperationKey, RecordOperationRequest,
+    RecordProjectionId as StoreRecordProjectionId, RecordProjectionPlan, RecordPublicationIntent,
+    RecordResolutionRequest as StoreResolution, RecordSemanticId, RecordSenderProjection,
+    RecordSubscriptionId as StoreRecordSubscriptionId, RecordSubscriptionKey,
+    RecordSubscriptionPollSelection, RecordSubscriptionRemoveOutcome, RecordSubscriptionSpec,
+    RecordVersionDisposition as StoreRecordDisposition, Store, StoreError, StoredRecord,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -45,6 +52,17 @@ use crate::{
         refresh_application_policy,
     },
 };
+
+/// Maximum number of whole Record projections returned by one poll.
+pub const MAX_SELECTED_RECORD_DELIVERIES: usize = MAX_RECORD_POLL_DELIVERIES;
+
+/// Maximum retained Record candidates revalidated under current policy by one poll.
+pub const MAX_SELECTED_RECORD_SUBSCRIPTION_SCAN: usize = MAX_RECORD_SUBSCRIPTION_SCAN;
+
+/// Canonical byte length of an opaque [`RecordDeliveryToken`].
+pub const RECORD_DELIVERY_TOKEN_BYTES: usize = aster_redb_store::RECORD_DELIVERY_TOKEN_BYTES;
+
+const MAX_SELECTED_RECORD_PLAN_RETRIES: usize = 4;
 
 /// Source-authenticated semantic identity of one Record version.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -240,6 +258,275 @@ pub struct RecordResolveRequest {
     pub tombstone: bool,
 }
 
+/// Exact application-visible group key for one delivered Record projection.
+///
+/// The key is derived from the same freshly verified Store plan as the
+/// delivery. It lets an application issue the required fresh [`RecordQuery`]
+/// even when current route lineage withholds every sibling's plaintext.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordProjectionKey {
+    pub topic: Topic,
+    pub scope: Scope,
+    pub logical_key: Vec<u8>,
+}
+
+/// Semantic delivery identity of one complete exact-key Record projection.
+///
+/// The identity binds the selected topic, exact scope, logical key, and complete
+/// sorted policy-active head set. It therefore changes when that head set
+/// changes and is the durable deduplication/acknowledgement identity for that
+/// semantic projection, not a stable key identity, conflict guard, route grant,
+/// or content capability.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RecordProjectionId([u8; 32]);
+
+impl RecordProjectionId {
+    /// Constructs an identifier from its complete durable bytes.
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the complete durable identifier bytes.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    fn from_store(id: StoreRecordProjectionId) -> Self {
+        Self(*id.as_bytes())
+    }
+
+    fn into_store(self) -> StoreRecordProjectionId {
+        StoreRecordProjectionId::from_bytes(self.0)
+    }
+}
+
+impl fmt::Display for RecordProjectionId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Stable mission-local identity of one durable Record subscription.
+///
+/// This local ledger identity grants no route or content authority. The
+/// selected node intersects its receive intent with current mission policy,
+/// freshly authenticates current-lineage source/content, and revalidates
+/// startup-authenticated lineage-withheld claims before delivery.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RecordSubscriptionId([u8; 32]);
+
+impl RecordSubscriptionId {
+    /// Constructs an identifier from its complete durable bytes.
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the complete durable identifier bytes.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    fn from_store(id: StoreRecordSubscriptionId) -> Self {
+        Self(*id.as_bytes())
+    }
+
+    fn into_store(self) -> StoreRecordSubscriptionId {
+        StoreRecordSubscriptionId::from_bytes(self.0)
+    }
+}
+
+impl fmt::Display for RecordSubscriptionId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Idempotent creation request for one durable whole-projection subscription.
+///
+/// The selector covers every logical key in the selected topic and scope.
+/// Descendant scopes remain distinct projection groups. Subscription intent
+/// cannot expand current route or content authority or network receive policy.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordSubscriptionRequest {
+    pub operation_key: Vec<u8>,
+    pub topic: Topic,
+    pub scope: Scope,
+    pub include_descendant_scopes: bool,
+}
+
+/// Result of creating or replaying one durable Record subscription request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecordSubscription {
+    pub id: RecordSubscriptionId,
+    pub inserted: bool,
+}
+
+/// One bounded at-least-once whole-projection delivery poll.
+///
+/// `scan_limit` bounds the complete matching retained candidate set freshly
+/// authenticated by one poll. Poll fails closed when that full snapshot exceeds
+/// the bound; it never advances through a partial candidate set.
+/// `delivery_limit` counts exact logical-key projections, not Record versions,
+/// so a conflict is never split across pages. An empty result is not a
+/// projection withdrawal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecordPollRequest {
+    pub subscription: RecordSubscriptionId,
+    pub delivery_limit: usize,
+    pub scan_limit: usize,
+}
+
+impl RecordPollRequest {
+    fn validate(self) -> Result<Self, ApplicationError> {
+        if self.delivery_limit == 0
+            || self.delivery_limit > MAX_SELECTED_RECORD_DELIVERIES
+            || self.scan_limit == 0
+            || self.scan_limit > MAX_SELECTED_RECORD_SUBSCRIPTION_SCAN
+        {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::InvalidRequest,
+                "record poll",
+            ));
+        }
+        Ok(self)
+    }
+}
+
+/// Opaque acknowledgement identity for one exact Record-projection tenure and retry.
+///
+/// Tokens originate in [`RecordDelivery`] and bind the subscription
+/// incarnation, semantic projection identity, tenure, and issued retry. The
+/// projection identity binds the complete policy-active head set but not
+/// dominated retained history. A delayed acknowledgement cannot consume later
+/// work.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RecordDeliveryToken(StoreRecordDeliveryToken);
+
+impl RecordDeliveryToken {
+    /// Restores a canonical opaque token previously obtained from [`Self::as_bytes`].
+    ///
+    /// A structurally valid token is still accepted only when acknowledgement
+    /// verifies its exact subscription and projection binding.
+    pub fn from_bytes(bytes: [u8; RECORD_DELIVERY_TOKEN_BYTES]) -> Result<Self, ApplicationError> {
+        StoreRecordDeliveryToken::from_bytes(bytes)
+            .map(Self::from_store)
+            .map_err(|_| {
+                ApplicationError::new(
+                    ApplicationErrorKind::InvalidRequest,
+                    "record delivery token",
+                )
+            })
+    }
+
+    /// Returns the canonical opaque bytes for durable application transport.
+    pub fn as_bytes(&self) -> &[u8; RECORD_DELIVERY_TOKEN_BYTES] {
+        self.0.as_bytes()
+    }
+
+    fn from_store(token: StoreRecordDeliveryToken) -> Self {
+        Self(token)
+    }
+
+    fn into_store(self) -> StoreRecordDeliveryToken {
+        self.0
+    }
+
+    #[cfg(test)]
+    fn inert_for_command_rejection() -> Self {
+        let mut bytes = [0_u8; RECORD_DELIVERY_TOKEN_BYTES];
+        bytes[0] = 1;
+        bytes[1] = 1;
+        bytes[40] = 1;
+        bytes[48] = 1;
+        bytes[56] = 1;
+        Self::from_bytes(bytes).expect("canonical inert Record delivery token")
+    }
+}
+
+/// Non-authorizing conflict annotation for one delivered Record projection.
+///
+/// `siblings` is the complete sorted policy-active head set. It may contain IDs
+/// whose same-epoch route lineage is no longer current; those exact sources were
+/// authenticated at startup, but their plaintext remains withheld. This
+/// annotation deliberately carries no [`RecordResolutionGuard`]. Applications
+/// must issue an exact [`RecordQuery`] before resolving because retained
+/// dominated history can change the guarded Store plan without changing this
+/// semantic head set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordDeliveryConflict {
+    pub siblings: Vec<RecordId>,
+}
+
+/// Complete application-visible active-head projection for one exact Record key.
+///
+/// Every currently visible causal head appears in `current` or `concurrent`.
+/// Superseded history is excluded so a late dominated ancestor cannot alter an
+/// already acknowledged semantic delivery. `conflict` preserves the complete
+/// policy-active sibling annotation, including opaque lineage-withheld IDs, but
+/// is not authority to resolve.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordDeliveryProjection {
+    pub current: Option<RecordItem>,
+    pub concurrent: Vec<RecordItem>,
+    pub conflict: Option<RecordDeliveryConflict>,
+}
+
+/// One complete, freshly verified exact-key Record projection whose retry was
+/// committed before return.
+///
+/// A delivery never splits a conflict, discloses superseded plaintext, or
+/// executes a merge or resolution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordDelivery {
+    pub projection_id: RecordProjectionId,
+    pub key: RecordProjectionKey,
+    pub projection: RecordDeliveryProjection,
+    /// Nonzero durable at-least-once attempt number.
+    pub attempt: u64,
+    /// Exact opaque token required to acknowledge this projection delivery.
+    pub token: RecordDeliveryToken,
+}
+
+/// Bounded whole-projection delivery result.
+///
+/// An empty page means there is no unacknowledged positive active/conflicted
+/// projection. It is not a complete materialized view and never signals that a
+/// previously authorized projection was withdrawn.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RecordDeliveryPage {
+    pub deliveries: Vec<RecordDelivery>,
+    pub has_more: bool,
+}
+
+/// Idempotent acknowledgement disposition for one exact Record projection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecordAcknowledgement {
+    Acknowledged,
+    AlreadyAcknowledged,
+}
+
+/// Idempotent disposition from withdrawing one durable Record selector.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecordUnsubscribe {
+    /// This call removed the selector and its delivery ledger.
+    Removed,
+    /// The exact selector was already absent.
+    AlreadyAbsent,
+}
+
+struct VerifiedRecordSubscriptionProjection {
+    projection_id: RecordProjectionId,
+    key: RecordProjectionKey,
+    plan: RecordProjectionPlan,
+    projection: RecordDeliveryProjection,
+}
+
 struct VerifiedRecordCandidate {
     id: RecordId,
     item: Option<RecordItem>,
@@ -329,6 +616,72 @@ impl SelectedRecordHandle {
         .await
     }
 
+    /// Idempotently creates one durable whole-Record-projection subscription.
+    pub async fn subscribe(
+        &self,
+        request: RecordSubscriptionRequest,
+    ) -> Result<RecordSubscription, ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedRecordCommand::Subscribe { request, response },
+            received,
+            "record subscribe",
+        )
+        .await
+    }
+
+    /// Polls policy-revalidated whole Record projections with at-least-once delivery.
+    pub async fn poll(
+        &self,
+        request: RecordPollRequest,
+    ) -> Result<RecordDeliveryPage, ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedRecordCommand::Poll { request, response },
+            received,
+            "record poll",
+        )
+        .await
+    }
+
+    /// Idempotently acknowledges one exact token-bound Record projection delivery.
+    pub async fn acknowledge(
+        &self,
+        subscription: RecordSubscriptionId,
+        projection: RecordProjectionId,
+        token: RecordDeliveryToken,
+    ) -> Result<RecordAcknowledgement, ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedRecordCommand::Acknowledge {
+                subscription,
+                projection,
+                token,
+                response,
+            },
+            received,
+            "record acknowledge",
+        )
+        .await
+    }
+
+    /// Idempotently removes one Record selector and its delivery ledger.
+    pub async fn unsubscribe(
+        &self,
+        subscription: RecordSubscriptionId,
+    ) -> Result<RecordUnsubscribe, ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedRecordCommand::Unsubscribe {
+                subscription,
+                response,
+            },
+            received,
+            "record unsubscribe",
+        )
+        .await
+    }
+
     async fn send<T>(
         &self,
         command: SelectedRecordCommand,
@@ -359,9 +712,31 @@ pub(crate) enum SelectedRecordCommand {
         request: RecordResolveRequest,
         response: oneshot::Sender<Result<RecordPublishResult, ApplicationError>>,
     },
+    Subscribe {
+        request: RecordSubscriptionRequest,
+        response: oneshot::Sender<Result<RecordSubscription, ApplicationError>>,
+    },
+    Poll {
+        request: RecordPollRequest,
+        response: oneshot::Sender<Result<RecordDeliveryPage, ApplicationError>>,
+    },
+    Acknowledge {
+        subscription: RecordSubscriptionId,
+        projection: RecordProjectionId,
+        token: RecordDeliveryToken,
+        response: oneshot::Sender<Result<RecordAcknowledgement, ApplicationError>>,
+    },
+    Unsubscribe {
+        subscription: RecordSubscriptionId,
+        response: oneshot::Sender<Result<RecordUnsubscribe, ApplicationError>>,
+    },
 }
 
 impl SelectedRecordCommand {
+    pub(crate) const fn mutates_selectors(&self) -> bool {
+        matches!(self, Self::Subscribe { .. } | Self::Unsubscribe { .. })
+    }
+
     pub(crate) fn reject(self) {
         match self {
             Self::Publish { response, .. } => {
@@ -372,6 +747,18 @@ impl SelectedRecordCommand {
             }
             Self::Resolve { response, .. } => {
                 _ = response.send(Err(actor_unavailable("record resolve")));
+            }
+            Self::Subscribe { response, .. } => {
+                _ = response.send(Err(actor_unavailable("record subscribe")));
+            }
+            Self::Poll { response, .. } => {
+                _ = response.send(Err(actor_unavailable("record poll")));
+            }
+            Self::Acknowledge { response, .. } => {
+                _ = response.send(Err(actor_unavailable("record acknowledge")));
+            }
+            Self::Unsubscribe { response, .. } => {
+                _ = response.send(Err(actor_unavailable("record unsubscribe")));
             }
         }
     }
@@ -547,7 +934,7 @@ impl SelectedRecordNode {
         Ok(record_result(record, outcome.inserted()))
     }
 
-    /// Returns one exact-key projection after freshly verifying every retained candidate.
+    /// Returns one exact-key projection after revalidating its complete retained plan.
     pub fn query(&mut self, query: RecordQuery) -> Result<RecordProjection, ApplicationError> {
         let policy = self.current_policy("record query")?;
         let epoch = self.active_epoch(&query.scope, "record query")?;
@@ -718,6 +1105,278 @@ impl SelectedRecordNode {
             ));
         }
         Ok(record_result(record, outcome.inserted()))
+    }
+
+    /// Idempotently creates one durable whole-Record-projection subscription.
+    ///
+    /// The selector covers all logical keys in the selected topic/scope. It is
+    /// local application-delivery intent only; configured mutable interests
+    /// remain the network receive policy in this slice.
+    pub fn subscribe(
+        &mut self,
+        request: RecordSubscriptionRequest,
+    ) -> Result<RecordSubscription, ApplicationError> {
+        let RecordSubscriptionRequest {
+            operation_key,
+            topic,
+            scope,
+            include_descendant_scopes,
+        } = request;
+        let key = RecordSubscriptionKey::new(operation_key)
+            .map_err(|error| application_error("record subscribe", error.into()))?;
+        let policy = self.current_policy("record subscribe")?;
+        let epoch = self.active_epoch(&scope, "record subscribe")?;
+        self.require_record_grants(&topic, &scope, epoch, "record subscribe")?;
+        let outcome = self
+            .store
+            .create_record_subscription_with_policy(
+                &policy,
+                &key,
+                RecordSubscriptionSpec {
+                    topic,
+                    scope,
+                    include_descendant_scopes,
+                },
+            )
+            .map_err(|error| application_error("record subscribe", error.into()))?;
+        Ok(RecordSubscription {
+            id: RecordSubscriptionId::from_store(outcome.id),
+            inserted: outcome.inserted,
+        })
+    }
+
+    /// Polls complete exact-key projections with durable at-least-once attempts.
+    ///
+    /// Preparation returns the complete matching retained snapshot, including
+    /// acknowledged candidates. Current-lineage source/content is freshly
+    /// authenticated; lineage-withheld rows are rebound to their
+    /// startup-authenticated sender projections and current policy. Each
+    /// complete projection plan is independently verified before the privileged
+    /// store commit atomically rechecks the full subscription plan.
+    /// `delivery_limit` counts projections, never sibling versions, so a
+    /// [`RecordDeliveryConflict`] cannot be split. Its annotation carries no
+    /// resolution guard; an application must query the exact key before resolve.
+    /// A multi-head projection whose policy heads are all lineage-withheld is
+    /// still delivered as an opaque conflict. One hidden policy head alone is
+    /// inactive; absence never synthesizes a withdrawal.
+    pub fn poll(
+        &mut self,
+        request: RecordPollRequest,
+    ) -> Result<RecordDeliveryPage, ApplicationError> {
+        let request = request.validate()?;
+        for _ in 0..MAX_SELECTED_RECORD_PLAN_RETRIES {
+            let policy = self.current_policy("record poll")?;
+            let plan = self
+                .store
+                .prepare_record_subscription_poll_with_policy(
+                    &policy,
+                    request.subscription.into_store(),
+                    request.delivery_limit,
+                    request.scan_limit,
+                )
+                .map_err(|error| application_error("record poll", error.into()))?;
+            if plan.subscription() != request.subscription.into_store() {
+                return Err(ApplicationError::new(
+                    ApplicationErrorKind::Integrity,
+                    "record poll",
+                ));
+            }
+            let spec = plan.spec();
+            let mut verified = std::collections::BTreeMap::new();
+            let mut verified_ids = std::collections::BTreeSet::new();
+            let mut selection = RecordSubscriptionPollSelection::default();
+            for candidate in plan.candidates() {
+                if candidate
+                    .pending_attempt()
+                    .is_some_and(|attempt| attempt == 0)
+                    || candidate
+                        .acknowledged_attempt()
+                        .is_some_and(|attempt| attempt == 0)
+                    || (candidate.pending_attempt().is_some()
+                        && candidate.acknowledged_attempt().is_some())
+                {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::Integrity,
+                        "record poll",
+                    ));
+                }
+                let projection_id = RecordProjectionId::from_store(candidate.projection_id());
+                if !verified_ids.insert(projection_id) {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::Integrity,
+                        "record poll",
+                    ));
+                }
+                let projection_plan = candidate.plan();
+                let scope_matches = if spec.include_descendant_scopes {
+                    spec.scope.contains(projection_plan.scope())
+                } else {
+                    &spec.scope == projection_plan.scope()
+                };
+                if &spec.topic != projection_plan.topic() || !scope_matches {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::Integrity,
+                        "record poll",
+                    ));
+                }
+                let projection = self
+                    .verify_projection(
+                        &RecordQuery {
+                            topic: projection_plan.topic().clone(),
+                            scope: projection_plan.scope().clone(),
+                            logical_key: projection_plan.logical_key().to_vec(),
+                            include_superseded_versions: false,
+                        },
+                        projection_plan,
+                        "record poll",
+                    )
+                    .map_err(|error| ApplicationError::new(error.kind(), "record poll"))?;
+                if !projection.superseded.is_empty() {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::Integrity,
+                        "record poll",
+                    ));
+                }
+                let deliverable = projection.current.is_some()
+                    || !projection.concurrent.is_empty()
+                    || projection.conflict.is_some();
+                let projection = RecordDeliveryProjection {
+                    current: projection.current,
+                    concurrent: projection.concurrent,
+                    conflict: projection.conflict.map(|conflict| RecordDeliveryConflict {
+                        siblings: conflict.siblings,
+                    }),
+                };
+                let key = RecordProjectionKey {
+                    topic: projection_plan.topic().clone(),
+                    scope: projection_plan.scope().clone(),
+                    logical_key: projection_plan.logical_key().to_vec(),
+                };
+                if projection
+                    .current
+                    .iter()
+                    .chain(&projection.concurrent)
+                    .any(|item| {
+                        item.topic != key.topic
+                            || item.scope != key.scope
+                            || item.logical_key != key.logical_key
+                    })
+                {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::Integrity,
+                        "record poll",
+                    ));
+                }
+                if deliverable {
+                    selection.deliverable.push(projection_id.into_store());
+                    if verified
+                        .insert(
+                            projection_id,
+                            VerifiedRecordSubscriptionProjection {
+                                projection_id,
+                                key,
+                                plan: projection_plan.clone(),
+                                projection,
+                            },
+                        )
+                        .is_some()
+                    {
+                        return Err(ApplicationError::new(
+                            ApplicationErrorKind::Integrity,
+                            "record poll",
+                        ));
+                    }
+                } else {
+                    selection.inactive.push(projection_id.into_store());
+                }
+            }
+
+            let committed = match self
+                .store
+                .commit_record_subscription_poll_with_policy(&policy, &plan, &selection)
+            {
+                Ok(committed) => committed,
+                Err(
+                    StoreError::RecordSubscriptionPlanChanged
+                    | StoreError::RecordSelectorGenerationChanged
+                    | StoreError::ControlPolicyChanged,
+                ) => continue,
+                Err(error) => return Err(application_error("record poll", error.into())),
+            };
+            let mut deliveries = Vec::with_capacity(committed.deliveries.len());
+            for delivery in committed.deliveries {
+                let projection_id = RecordProjectionId::from_store(delivery.projection_id);
+                let verified_projection = verified.remove(&projection_id).ok_or_else(|| {
+                    ApplicationError::new(ApplicationErrorKind::Integrity, "record poll")
+                })?;
+                if verified_projection.projection_id != projection_id
+                    || verified_projection.plan != delivery.plan
+                    || delivery.attempt == 0
+                {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::Integrity,
+                        "record poll",
+                    ));
+                }
+                deliveries.push(RecordDelivery {
+                    projection_id,
+                    key: verified_projection.key,
+                    projection: verified_projection.projection,
+                    attempt: delivery.attempt,
+                    token: RecordDeliveryToken::from_store(delivery.token),
+                });
+            }
+            return Ok(RecordDeliveryPage {
+                deliveries,
+                has_more: committed.has_more,
+            });
+        }
+        Err(ApplicationError::new(
+            ApplicationErrorKind::PolicyUnsettled,
+            "record poll",
+        ))
+    }
+
+    /// Idempotently acknowledges one exact token-bound Record projection delivery.
+    pub fn acknowledge(
+        &mut self,
+        subscription: RecordSubscriptionId,
+        projection: RecordProjectionId,
+        token: RecordDeliveryToken,
+    ) -> Result<RecordAcknowledgement, ApplicationError> {
+        let policy = self.current_policy("record acknowledge")?;
+        match self
+            .store
+            .acknowledge_record_delivery_with_policy(
+                &policy,
+                subscription.into_store(),
+                projection.into_store(),
+                token.into_store(),
+            )
+            .map_err(|error| application_error("record acknowledge", error.into()))?
+        {
+            StoreRecordDeliveryAck::Acknowledged => Ok(RecordAcknowledgement::Acknowledged),
+            StoreRecordDeliveryAck::AlreadyAcknowledged => {
+                Ok(RecordAcknowledgement::AlreadyAcknowledged)
+            }
+        }
+    }
+
+    /// Idempotently removes one durable Record selector and its delivery ledger.
+    pub fn unsubscribe(
+        &mut self,
+        subscription: RecordSubscriptionId,
+    ) -> Result<RecordUnsubscribe, ApplicationError> {
+        let policy = self.current_policy("record unsubscribe")?;
+        let RecordSubscriptionRemoveOutcome { removed, .. } = self
+            .store
+            .remove_record_subscription_with_policy(&policy, subscription.into_store())
+            .map_err(|error| application_error("record unsubscribe", error.into()))?;
+        Ok(if removed {
+            RecordUnsubscribe::Removed
+        } else {
+            RecordUnsubscribe::AlreadyAbsent
+        })
     }
 
     fn open_published_record(
@@ -1480,6 +2139,47 @@ mod tests {
         assert_eq!(closed.kind(), ApplicationErrorKind::StateUnavailable);
         assert_eq!(closed.operation(), "record publish");
 
+        let subscription_request = RecordSubscriptionRequest {
+            operation_key: b"closed-subscription".to_vec(),
+            topic: query.topic.clone(),
+            scope: query.scope.clone(),
+            include_descendant_scopes: false,
+        };
+        let closed = handle
+            .subscribe(subscription_request.clone())
+            .await
+            .expect_err("closed actor subscription");
+        assert_eq!(closed.kind(), ApplicationErrorKind::StateUnavailable);
+        assert_eq!(closed.operation(), "record subscribe");
+        let subscription = RecordSubscriptionId::from_bytes([0x43; 32]);
+        let projection = RecordProjectionId::from_bytes([0x44; 32]);
+        let closed = handle
+            .poll(RecordPollRequest {
+                subscription,
+                delivery_limit: 1,
+                scan_limit: 1,
+            })
+            .await
+            .expect_err("closed actor poll");
+        assert_eq!(closed.kind(), ApplicationErrorKind::StateUnavailable);
+        assert_eq!(closed.operation(), "record poll");
+        let closed = handle
+            .acknowledge(
+                subscription,
+                projection,
+                RecordDeliveryToken::inert_for_command_rejection(),
+            )
+            .await
+            .expect_err("closed actor acknowledgement");
+        assert_eq!(closed.kind(), ApplicationErrorKind::StateUnavailable);
+        assert_eq!(closed.operation(), "record acknowledge");
+        let closed = handle
+            .unsubscribe(subscription)
+            .await
+            .expect_err("closed actor unsubscribe");
+        assert_eq!(closed.kind(), ApplicationErrorKind::StateUnavailable);
+        assert_eq!(closed.operation(), "record unsubscribe");
+
         let (response, received) = oneshot::channel();
         SelectedRecordCommand::Publish {
             request: publish,
@@ -1494,13 +2194,78 @@ mod tests {
         assert_eq!(rejected.operation(), "record publish");
 
         let (response, received) = oneshot::channel();
-        SelectedRecordCommand::Query { query, response }.reject();
+        SelectedRecordCommand::Query {
+            query: query.clone(),
+            response,
+        }
+        .reject();
         let rejected = received
             .await
             .expect("actor rejection response")
             .expect_err("rejected command");
         assert_eq!(rejected.kind(), ApplicationErrorKind::StateUnavailable);
         assert_eq!(rejected.operation(), "record query");
+
+        let (response, received) = oneshot::channel();
+        let command = SelectedRecordCommand::Subscribe {
+            request: subscription_request,
+            response,
+        };
+        assert!(command.mutates_selectors());
+        command.reject();
+        let rejected = received
+            .await
+            .expect("actor subscription rejection response")
+            .expect_err("rejected subscription command");
+        assert_eq!(rejected.kind(), ApplicationErrorKind::StateUnavailable);
+        assert_eq!(rejected.operation(), "record subscribe");
+
+        let (response, received) = oneshot::channel();
+        let command = SelectedRecordCommand::Poll {
+            request: RecordPollRequest {
+                subscription,
+                delivery_limit: 1,
+                scan_limit: 1,
+            },
+            response,
+        };
+        assert!(!command.mutates_selectors());
+        command.reject();
+        let rejected = received
+            .await
+            .expect("actor poll rejection response")
+            .expect_err("rejected poll command");
+        assert_eq!(rejected.kind(), ApplicationErrorKind::StateUnavailable);
+        assert_eq!(rejected.operation(), "record poll");
+
+        let (response, received) = oneshot::channel();
+        SelectedRecordCommand::Acknowledge {
+            subscription,
+            projection,
+            token: RecordDeliveryToken::inert_for_command_rejection(),
+            response,
+        }
+        .reject();
+        let rejected = received
+            .await
+            .expect("actor acknowledgement rejection response")
+            .expect_err("rejected acknowledgement command");
+        assert_eq!(rejected.kind(), ApplicationErrorKind::StateUnavailable);
+        assert_eq!(rejected.operation(), "record acknowledge");
+
+        let (response, received) = oneshot::channel();
+        let command = SelectedRecordCommand::Unsubscribe {
+            subscription,
+            response,
+        };
+        assert!(command.mutates_selectors());
+        command.reject();
+        let rejected = received
+            .await
+            .expect("actor unsubscribe rejection response")
+            .expect_err("rejected unsubscribe command");
+        assert_eq!(rejected.kind(), ApplicationErrorKind::StateUnavailable);
+        assert_eq!(rejected.operation(), "record unsubscribe");
     }
 
     struct TestRoot(PathBuf);
@@ -2708,6 +3473,267 @@ mod tests {
         assert!(projection.concurrent.is_empty());
         assert!(projection.conflict.is_none());
         assert_eq!(projection.superseded.len(), 2);
+    }
+
+    #[test]
+    fn record_subscription_delivers_whole_conflict_retries_resolves_and_reopens() {
+        let root = TestRoot::new("subscription-conflict");
+        let _services = persist_concurrent_records(&root, 3);
+        let subscription_request = RecordSubscriptionRequest {
+            operation_key: b"subscriptions/record/asset-7".to_vec(),
+            topic: record_topic(),
+            scope: record_scope(),
+            include_descendant_scopes: false,
+        };
+
+        let (subscription, first_projection, first_token, siblings) = {
+            let mut node = selected_node(&root);
+            let subscription = node
+                .subscribe(subscription_request.clone())
+                .expect("create Record subscription");
+            assert!(subscription.inserted);
+            let replay = node
+                .subscribe(subscription_request.clone())
+                .expect("replay Record subscription");
+            assert_eq!(replay.id, subscription.id);
+            assert!(!replay.inserted);
+
+            let page = node
+                .poll(RecordPollRequest {
+                    subscription: subscription.id,
+                    delivery_limit: MAX_SELECTED_RECORD_DELIVERIES,
+                    scan_limit: MAX_SELECTED_RECORD_SUBSCRIPTION_SCAN,
+                })
+                .expect("poll whole Record conflict");
+            assert_eq!(page.deliveries.len(), 1);
+            assert!(!page.has_more);
+            let delivery = &page.deliveries[0];
+            assert_eq!(delivery.attempt, 1);
+            assert_eq!(delivery.key.topic, record_topic());
+            assert_eq!(delivery.key.scope, record_scope());
+            assert_eq!(delivery.key.logical_key, b"asset-7");
+            assert_eq!(delivery.projection.concurrent.len(), 2);
+            let conflict = delivery
+                .projection
+                .conflict
+                .as_ref()
+                .expect("whole conflict annotation");
+            assert_eq!(conflict.siblings.len(), 3);
+            assert!(conflict.siblings.windows(2).all(|pair| pair[0] < pair[1]));
+            let visible = delivery
+                .projection
+                .current
+                .iter()
+                .chain(&delivery.projection.concurrent)
+                .map(|item| item.id)
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(visible.len(), 3);
+            assert_eq!(visible, conflict.siblings.iter().copied().collect());
+            (
+                subscription,
+                delivery.projection_id,
+                delivery.token,
+                conflict.siblings.clone(),
+            )
+        };
+
+        let mut reopened = selected_node(&root);
+        let repeated = reopened
+            .poll(RecordPollRequest {
+                subscription: subscription.id,
+                delivery_limit: MAX_SELECTED_RECORD_DELIVERIES,
+                scan_limit: MAX_SELECTED_RECORD_SUBSCRIPTION_SCAN,
+            })
+            .expect("repeat unacknowledged whole Record conflict");
+        assert_eq!(repeated.deliveries.len(), 1);
+        let repeated = repeated.deliveries.into_iter().next().expect("delivery");
+        assert_eq!(repeated.projection_id, first_projection);
+        assert_eq!(repeated.attempt, 2);
+        assert_ne!(repeated.token, first_token);
+        assert_eq!(
+            repeated
+                .projection
+                .conflict
+                .as_ref()
+                .expect("repeated whole conflict")
+                .siblings,
+            siblings
+        );
+        assert_eq!(
+            RecordDeliveryToken::from_bytes(*repeated.token.as_bytes())
+                .expect("restore opaque Record delivery token"),
+            repeated.token
+        );
+        let malformed = RecordDeliveryToken::from_bytes([0_u8; RECORD_DELIVERY_TOKEN_BYTES])
+            .expect_err("reject malformed Record delivery token");
+        assert_eq!(malformed.kind(), ApplicationErrorKind::InvalidRequest);
+        assert_eq!(malformed.operation(), "record delivery token");
+        assert_eq!(
+            reopened
+                .acknowledge(subscription.id, repeated.projection_id, repeated.token)
+                .expect("acknowledge whole Record conflict"),
+            RecordAcknowledgement::Acknowledged
+        );
+        assert_eq!(
+            reopened
+                .acknowledge(subscription.id, repeated.projection_id, repeated.token)
+                .expect("idempotent Record acknowledgement"),
+            RecordAcknowledgement::AlreadyAcknowledged
+        );
+        assert!(
+            reopened
+                .poll(RecordPollRequest {
+                    subscription: subscription.id,
+                    delivery_limit: MAX_SELECTED_RECORD_DELIVERIES,
+                    scan_limit: MAX_SELECTED_RECORD_SUBSCRIPTION_SCAN,
+                })
+                .expect("empty after Record acknowledgement")
+                .deliveries
+                .is_empty()
+        );
+
+        let queried = reopened
+            .query(RecordQuery {
+                topic: repeated.key.topic.clone(),
+                scope: repeated.key.scope.clone(),
+                logical_key: repeated.key.logical_key.clone(),
+                include_superseded_versions: false,
+            })
+            .expect("query a fresh exact resolution guard");
+        assert_eq!(
+            queried
+                .conflict
+                .as_ref()
+                .expect("queried conflict")
+                .siblings,
+            siblings
+        );
+        let guard = queried
+            .conflict
+            .expect("query carries normal exact guard")
+            .resolution_guard;
+        let resolved = reopened
+            .resolve(RecordResolveRequest {
+                operation_key: b"record/subscription/resolve".to_vec(),
+                resolution_guard: guard,
+                priority: Priority::Immediate,
+                payload: b"subscription-resolved".to_vec(),
+                tombstone: false,
+            })
+            .expect("resolve delivered whole conflict");
+        let successor = reopened
+            .poll(RecordPollRequest {
+                subscription: subscription.id,
+                delivery_limit: MAX_SELECTED_RECORD_DELIVERIES,
+                scan_limit: MAX_SELECTED_RECORD_SUBSCRIPTION_SCAN,
+            })
+            .expect("deliver resolved successor");
+        assert_eq!(successor.deliveries.len(), 1);
+        let successor = &successor.deliveries[0];
+        assert_ne!(successor.projection_id, first_projection);
+        assert_eq!(successor.key, repeated.key);
+        assert_eq!(successor.attempt, 1);
+        assert_eq!(
+            successor.projection.current.as_ref().map(|item| item.id),
+            Some(resolved.id)
+        );
+        assert!(successor.projection.concurrent.is_empty());
+        assert!(successor.projection.conflict.is_none());
+
+        assert_eq!(
+            reopened
+                .unsubscribe(subscription.id)
+                .expect("remove Record subscription"),
+            RecordUnsubscribe::Removed
+        );
+        assert_eq!(
+            reopened
+                .unsubscribe(subscription.id)
+                .expect("idempotent remove Record subscription"),
+            RecordUnsubscribe::AlreadyAbsent
+        );
+        let recreated = reopened
+            .subscribe(subscription_request)
+            .expect("recreate removed Record subscription");
+        assert!(recreated.inserted);
+        assert_eq!(recreated.id, subscription.id);
+        let redelivered = reopened
+            .poll(RecordPollRequest {
+                subscription: recreated.id,
+                delivery_limit: MAX_SELECTED_RECORD_DELIVERIES,
+                scan_limit: MAX_SELECTED_RECORD_SUBSCRIPTION_SCAN,
+            })
+            .expect("recreated Record subscription starts a fresh ledger");
+        assert_eq!(redelivered.deliveries.len(), 1);
+        assert_eq!(
+            redelivered.deliveries[0].projection_id,
+            successor.projection_id
+        );
+        assert_eq!(redelivered.deliveries[0].attempt, 1);
+        let stale = reopened
+            .acknowledge(recreated.id, first_projection, first_token)
+            .expect_err("removed Record subscription incarnation token is stale");
+        assert_eq!(stale.kind(), ApplicationErrorKind::InvalidRequest);
+        assert_eq!(stale.operation(), "record acknowledge");
+    }
+
+    #[test]
+    fn record_subscription_rejects_conflicts_bounds_and_unauthorized_intent() {
+        let root = TestRoot::new("subscription-errors");
+        let mut node = selected_node(&root);
+        let request = RecordSubscriptionRequest {
+            operation_key: b"subscriptions/record/errors".to_vec(),
+            topic: record_topic(),
+            scope: record_scope(),
+            include_descendant_scopes: false,
+        };
+        let subscription = node.subscribe(request.clone()).expect("subscription");
+
+        let mut conflict = request;
+        conflict.include_descendant_scopes = true;
+        let error = node
+            .subscribe(conflict)
+            .expect_err("changed Record selector operation");
+        assert_eq!(error.kind(), ApplicationErrorKind::Conflict);
+        assert_eq!(error.operation(), "record subscribe");
+
+        for invalid in [
+            RecordPollRequest {
+                subscription: subscription.id,
+                delivery_limit: 0,
+                scan_limit: 1,
+            },
+            RecordPollRequest {
+                subscription: subscription.id,
+                delivery_limit: MAX_SELECTED_RECORD_DELIVERIES + 1,
+                scan_limit: 1,
+            },
+            RecordPollRequest {
+                subscription: subscription.id,
+                delivery_limit: 1,
+                scan_limit: 0,
+            },
+            RecordPollRequest {
+                subscription: subscription.id,
+                delivery_limit: 1,
+                scan_limit: MAX_SELECTED_RECORD_SUBSCRIPTION_SCAN + 1,
+            },
+        ] {
+            let error = node.poll(invalid).expect_err("invalid Record poll bound");
+            assert_eq!(error.kind(), ApplicationErrorKind::InvalidRequest);
+            assert_eq!(error.operation(), "record poll");
+        }
+
+        let unauthorized = node
+            .subscribe(RecordSubscriptionRequest {
+                operation_key: b"subscriptions/record/unauthorized".to_vec(),
+                topic: Topic::new("private.record").expect("topic"),
+                scope: record_scope(),
+                include_descendant_scopes: false,
+            })
+            .expect_err("unauthorized Record subscription");
+        assert_eq!(unauthorized.kind(), ApplicationErrorKind::RequestRejected);
+        assert_eq!(unauthorized.operation(), "record subscribe");
     }
 
     #[test]

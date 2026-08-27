@@ -23,10 +23,12 @@
 
 mod blob;
 mod custody;
+mod record_subscription;
 mod state_subscription;
 
 pub use blob::*;
 pub use custody::*;
+pub use record_subscription::*;
 pub use state_subscription::*;
 
 use std::error::Error;
@@ -112,6 +114,10 @@ const RECORD_BYTES: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.semantic-record-bytes.v1");
 const RECORD_ACCEPTANCE_MARKERS: TableDefinition<&[u8], u64> =
     TableDefinition::new("aster.semantic-record-markers.v1");
+// Marker order is the audited inverse used to construct complete bounded Record
+// subscription snapshots. Neither direction is cryptographic authority.
+pub(crate) const RECORD_ACCEPTANCE_ORDER: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("aster.semantic-record-acceptance-order.v1");
 const RECORD_SEMANTIC_ITEMS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.semantic-record-items.v1");
 const RECORD_GROUP_VERSIONS: TableDefinition<&[u8], &[u8]> =
@@ -3176,6 +3182,8 @@ pub struct StoreInspection {
     pub event_subscription_stats: EventSubscriptionStats,
     /// State application-delivery selector and ledger counts from the same transaction.
     pub state_subscription_stats: StateSubscriptionStats,
+    /// Record whole-projection selector and ledger counts from the same transaction.
+    pub record_subscription_stats: RecordSubscriptionStats,
     /// Mission-wide Flash control counts from the same audited read transaction.
     pub control_stats: ControlStoreStats,
     /// Mission-bound custody, quota, lease, retry, and retirement counts.
@@ -3424,6 +3432,42 @@ pub enum StoreError {
     RecordProjectionLimitExceeded { current: usize, limit: usize },
     /// A prepared Record projection no longer matches durable structure or policy.
     RecordProjectionPlanChanged,
+    /// A durable Record subscription operation key was empty or over its bound.
+    InvalidRecordSubscriptionKey { length: usize },
+    /// The dedicated durable Record subscription cap was reached.
+    RecordSubscriptionLimitExceeded { current: u64, limit: u64 },
+    /// The dedicated unacknowledged Record projection-delivery cap was reached.
+    RecordPendingDeliveryLimitExceeded { current: u64, limit: u64 },
+    /// The durable Record acknowledgement-receipt cap was reached.
+    RecordAcknowledgementReceiptLimitExceeded { current: u64, limit: u64 },
+    /// Pending and acknowledged Record projection rows exhausted their shared bound.
+    RecordDeliveryLedgerLimitExceeded { current: u64, limit: u64 },
+    /// A Record subscription operation key was replayed with another specification.
+    RecordSubscriptionConflict,
+    /// The requested durable Record subscription does not exist.
+    RecordSubscriptionNotFound,
+    /// One bounded Record subscription poll limit was invalid.
+    RecordSubscriptionPollLimitExceeded { requested: usize, maximum: usize },
+    /// A prepared Record poll no longer matches its exact snapshot or ledger.
+    RecordSubscriptionPlanChanged,
+    /// A selected Record projection was never durably delivered by this subscription.
+    RecordDeliveryNotFound,
+    /// Opaque Record delivery-token bytes have an unknown version or zero counter.
+    InvalidRecordDeliveryToken,
+    /// A Record delivery token is not bound to the supplied subscription and projection.
+    RecordDeliveryTokenBindingMismatch,
+    /// The durable Record delivery-attempt counter is exhausted.
+    RecordDeliveryAttemptExhausted,
+    /// The durable Record projection-tenure counter is exhausted.
+    RecordDeliveryTenureExhausted,
+    /// An acknowledgement token belongs to another incarnation of the stable subscription ID.
+    RecordSubscriptionIncarnationChanged { current: u64, received: u64 },
+    /// An acknowledgement token belongs to another head-set tenure.
+    RecordDeliveryTenureChanged { current: u64, received: u64 },
+    /// An acknowledgement token names an attempt not issued in its tenure.
+    RecordDeliveryAttemptChanged { current: u64, received: u64 },
+    /// The durable Record selector generation changed after poll preparation.
+    RecordSelectorGenerationChanged,
     /// An ordinary publication would implicitly collapse multiple conflict heads.
     RecordConflictRequiresResolution,
     /// A durable Record table or index disagreed with its paired authority row.
@@ -3856,6 +3900,67 @@ impl fmt::Display for StoreError {
             ),
             Self::RecordProjectionPlanChanged => {
                 formatter.write_str("durable Record projection changed; prepare and verify again")
+            }
+            Self::InvalidRecordSubscriptionKey { length } => write!(
+                formatter,
+                "Record subscription key length {length} is outside 1..={MAX_RECORD_SUBSCRIPTION_KEY_BYTES}"
+            ),
+            Self::RecordSubscriptionLimitExceeded { current, limit } => write!(
+                formatter,
+                "Record subscription count {current} is at dedicated limit {limit}"
+            ),
+            Self::RecordPendingDeliveryLimitExceeded { current, limit } => write!(
+                formatter,
+                "pending Record projection delivery count {current} is at dedicated limit {limit}"
+            ),
+            Self::RecordAcknowledgementReceiptLimitExceeded { current, limit } => write!(
+                formatter,
+                "Record acknowledgement receipt count {current} is at dedicated limit {limit}"
+            ),
+            Self::RecordDeliveryLedgerLimitExceeded { current, limit } => write!(
+                formatter,
+                "combined pending and acknowledged Record projection count {current} exceeds shared limit {limit}"
+            ),
+            Self::RecordSubscriptionConflict => formatter
+                .write_str("Record subscription retry differs from its durable specification"),
+            Self::RecordSubscriptionNotFound => {
+                formatter.write_str("durable Record subscription was not found")
+            }
+            Self::RecordSubscriptionPollLimitExceeded { requested, maximum } => write!(
+                formatter,
+                "Record subscription poll request {requested} exceeds maximum {maximum}"
+            ),
+            Self::RecordSubscriptionPlanChanged => {
+                formatter.write_str("durable Record subscription poll state changed; prepare again")
+            }
+            Self::RecordDeliveryNotFound => {
+                formatter.write_str("Record projection was not delivered by this subscription")
+            }
+            Self::InvalidRecordDeliveryToken => {
+                formatter.write_str("Record delivery token bytes are invalid")
+            }
+            Self::RecordDeliveryTokenBindingMismatch => formatter
+                .write_str("Record delivery token is bound to another subscription or projection"),
+            Self::RecordDeliveryAttemptExhausted => {
+                formatter.write_str("Record delivery attempt counter is exhausted")
+            }
+            Self::RecordDeliveryTenureExhausted => {
+                formatter.write_str("Record delivery tenure counter is exhausted")
+            }
+            Self::RecordSubscriptionIncarnationChanged { current, received } => write!(
+                formatter,
+                "Record subscription incarnation changed from token {received} to {current}"
+            ),
+            Self::RecordDeliveryTenureChanged { current, received } => write!(
+                formatter,
+                "Record delivery tenure changed from token {received} to {current}"
+            ),
+            Self::RecordDeliveryAttemptChanged { current, received } => write!(
+                formatter,
+                "Record delivery token attempt {received} was not issued through {current}"
+            ),
+            Self::RecordSelectorGenerationChanged => {
+                formatter.write_str("durable Record receive-selector state changed")
             }
             Self::RecordConflictRequiresResolution => {
                 formatter.write_str("Record conflict requires an explicit stale-guarded resolution")
@@ -11434,6 +11539,15 @@ impl Store {
         write
             .open_table(RECORD_ACCEPTANCE_MARKERS)?
             .insert(prepared.transfer_id.as_bytes().as_slice(), marker)?;
+        if write
+            .open_table(RECORD_ACCEPTANCE_ORDER)?
+            .insert(marker, prepared.transfer_id.as_bytes().as_slice())?
+            .is_some()
+        {
+            return Err(StoreError::RecordInvariant(
+                "Record acceptance marker is already indexed to another transfer",
+            ));
+        }
         write.open_table(RECORDS)?.insert(
             prepared.transfer_id.as_bytes().as_slice(),
             prepared.encoded_metadata.as_slice(),
@@ -15844,7 +15958,7 @@ fn preflight_state_schema_group(write: &redb::WriteTransaction) -> Result<bool, 
     }
 }
 
-fn preflight_record_schema_group(write: &redb::WriteTransaction) -> Result<(), StoreError> {
+fn preflight_record_schema_group(write: &redb::WriteTransaction) -> Result<bool, StoreError> {
     let record_tables = [
         RECORDS.name(),
         RECORD_BYTES.name(),
@@ -15853,10 +15967,9 @@ fn preflight_record_schema_group(write: &redb::WriteTransaction) -> Result<(), S
         RECORD_GROUP_VERSIONS.name(),
         RECORD_OPERATIONS.name(),
     ];
-    if write
-        .list_multimap_tables()?
-        .any(|table| record_tables.contains(&table.name()))
-    {
+    if write.list_multimap_tables()?.any(|table| {
+        record_tables.contains(&table.name()) || table.name() == RECORD_ACCEPTANCE_ORDER.name()
+    }) {
         return Err(StoreError::RecordInvariant(
             "mission-scoped Record schema has the wrong table kind",
         ));
@@ -15880,7 +15993,15 @@ fn preflight_record_schema_group(write: &redb::WriteTransaction) -> Result<(), S
         ]
     };
     let present_metadata = metadata_presence.iter().filter(|present| **present).count();
+    let acceptance_order_present = table_names.contains(RECORD_ACCEPTANCE_ORDER.name());
+    let subscription_schema_absent =
+        record_subscription::record_subscription_schema_wholly_absent_write(write)?;
     if present_tables == 0 && present_metadata == 0 {
+        if acceptance_order_present || !subscription_schema_absent {
+            return Err(StoreError::RecordInvariant(
+                "mission-scoped Record schema group is incomplete",
+            ));
+        }
         write.open_table(RECORDS)?;
         write.open_table(RECORD_BYTES)?;
         write.open_table(RECORD_ACCEPTANCE_MARKERS)?;
@@ -15893,24 +16014,34 @@ fn preflight_record_schema_group(write: &redb::WriteTransaction) -> Result<(), S
         metadata.insert(LAST_RECORD_ACCEPTANCE_MARKER, 0)?;
         metadata.insert(RECORD_OPERATION_COUNT, 0)?;
         metadata.insert(RECORD_OPERATION_TOTAL_BYTES, 0)?;
-        return Ok(());
+        return Ok(true);
     }
     if present_tables != record_tables.len() || present_metadata != metadata_presence.len() {
         return Err(StoreError::RecordInvariant(
             "mission-scoped Record schema group is incomplete",
         ));
     }
-    Ok(())
+    match (acceptance_order_present, subscription_schema_absent) {
+        (false, true) => Ok(true),
+        (true, false) => Ok(false),
+        (true, true) => Err(StoreError::RecordInvariant(
+            "Record subscription schema group is incomplete",
+        )),
+        (false, false) => Err(StoreError::RecordInvariant(
+            "Record acceptance-order index is missing from current schema",
+        )),
+    }
 }
 
 fn audit_record_tables(
     write: &redb::WriteTransaction,
     shared: &mut StateAuditSnapshot,
-) -> Result<(), StoreError> {
-    preflight_record_schema_group(write)?;
+) -> Result<bool, StoreError> {
+    let exact_legacy_record_extensions = preflight_record_schema_group(write)?;
     let records = write.open_table(RECORDS)?;
     let record_bytes = write.open_table(RECORD_BYTES)?;
     let markers = write.open_table(RECORD_ACCEPTANCE_MARKERS)?;
+    let mut acceptance_order = write.open_table(RECORD_ACCEPTANCE_ORDER)?;
     let semantic_items = write.open_table(RECORD_SEMANTIC_ITEMS)?;
     let groups = write.open_table(RECORD_GROUP_VERSIONS)?;
     let operations = write.open_table(RECORD_OPERATIONS)?;
@@ -15969,6 +16100,35 @@ fn audit_record_tables(
             return Err(StoreError::RecordInvariant(
                 "Record acceptance markers must be nonzero and unique",
             ));
+        }
+        let ordered = acceptance_order
+            .get(marker)?
+            .map(|value| value.value().to_vec());
+        match ordered {
+            Some(ordered) => {
+                if parse_record_transfer_id("Record acceptance-order table", &ordered)?
+                    != transfer_id
+                {
+                    return Err(StoreError::RecordInvariant(
+                        "Record acceptance-order index differs from its forward marker",
+                    ));
+                }
+            }
+            None if !exact_legacy_record_extensions => {
+                return Err(StoreError::RecordInvariant(
+                    "Record acceptance-order index is missing an accepted Record",
+                ));
+            }
+            None => {
+                if acceptance_order
+                    .insert(marker, transfer_id.as_bytes().as_slice())?
+                    .is_some()
+                {
+                    return Err(StoreError::RecordInvariant(
+                        "Record acceptance marker is indexed to another transfer",
+                    ));
+                }
+            }
         }
         let indexed = semantic_items
             .get(metadata.semantic_id.as_bytes().as_slice())?
@@ -16100,6 +16260,7 @@ fn audit_record_tables(
     }
     if record_bytes.len()? != count
         || markers.len()? != count
+        || acceptance_order.len()? != count
         || semantic_items.len()? != count
         || groups.len()? != count
     {
@@ -16117,6 +16278,25 @@ fn audit_record_tables(
         let (key, _) = row?;
         if records.get(key.value())?.is_none() {
             return Err(StoreError::RecordInvariant("Record marker is orphaned"));
+        }
+    }
+    for row in acceptance_order.iter()? {
+        let (marker, transfer) = row?;
+        if marker.value() == 0 {
+            return Err(StoreError::RecordInvariant(
+                "Record acceptance-order index contains a zero marker",
+            ));
+        }
+        let transfer = parse_record_transfer_id("Record acceptance-order table", transfer.value())?;
+        if records.get(transfer.as_bytes().as_slice())?.is_none()
+            || markers
+                .get(transfer.as_bytes().as_slice())?
+                .map(|value| value.value())
+                != Some(marker.value())
+        {
+            return Err(StoreError::RecordInvariant(
+                "Record acceptance-order index contains an orphan or mismatched row",
+            ));
         }
     }
     for row in semantic_items.iter()? {
@@ -16182,7 +16362,7 @@ fn audit_record_tables(
     audit_or_initialize_counter(&mut metadata, LAST_RECORD_ACCEPTANCE_MARKER, last_marker)?;
     audit_or_initialize_counter(&mut metadata, RECORD_OPERATION_COUNT, operation_count)?;
     audit_or_initialize_counter(&mut metadata, RECORD_OPERATION_TOTAL_BYTES, operation_bytes)?;
-    Ok(())
+    Ok(exact_legacy_record_extensions)
 }
 
 fn audit_semantic_tables(
@@ -16193,7 +16373,7 @@ fn audit_semantic_tables(
     // stores. Existing v1 opaque item/effect bytes remain untouched and use a
     // disjoint caller-controlled key namespace.
     let (mut state_audit, exact_legacy_state_extensions) = audit_state_tables(write)?;
-    audit_record_tables(write, &mut state_audit)?;
+    let exact_legacy_record_extensions = audit_record_tables(write, &mut state_audit)?;
     let blob_audit = blob::audit_blob_tables_write(write, &mut state_audit)?;
     let wrong_multimap_tables = write
         .list_multimap_tables()?
@@ -16905,6 +17085,7 @@ fn audit_semantic_tables(
     drop(_domain);
     audit_event_subscription_tables(write)?;
     state_subscription::audit_state_subscription_tables(write, exact_legacy_state_extensions)?;
+    record_subscription::audit_record_subscription_tables(write, exact_legacy_record_extensions)?;
     Ok(blob_audit.stats)
 }
 
@@ -20820,10 +21001,9 @@ fn inspect_record_readable(
         RECORD_GROUP_VERSIONS.name(),
         RECORD_OPERATIONS.name(),
     ];
-    if read
-        .list_multimap_tables()?
-        .any(|table| record_tables.contains(&table.name()))
-    {
+    if read.list_multimap_tables()?.any(|table| {
+        record_tables.contains(&table.name()) || table.name() == RECORD_ACCEPTANCE_ORDER.name()
+    }) {
         return Err(StoreError::RecordInvariant(
             "mission-scoped Record schema has the wrong table kind",
         ));
@@ -20844,7 +21024,15 @@ fn inspect_record_readable(
         metadata.get(RECORD_OPERATION_COUNT)?.is_some(),
         metadata.get(RECORD_OPERATION_TOTAL_BYTES)?.is_some(),
     ];
+    let acceptance_order_present = table_names.contains(RECORD_ACCEPTANCE_ORDER.name());
+    let subscription_schema_absent =
+        record_subscription::record_subscription_schema_wholly_absent_read(read)?;
     if present == 0 && metadata_presence.iter().all(|present| !present) {
+        if acceptance_order_present || !subscription_schema_absent {
+            return Err(StoreError::RecordInvariant(
+                "mission-scoped Record schema group is incomplete",
+            ));
+        }
         return Ok(RecordStoreStats::default());
     }
     if present != record_tables.len() || metadata_presence.iter().any(|present| !present) {
@@ -20852,9 +21040,25 @@ fn inspect_record_readable(
             "mission-scoped Record schema group is incomplete",
         ));
     }
+    match (acceptance_order_present, subscription_schema_absent) {
+        (false, true) | (true, false) => {}
+        (true, true) => {
+            return Err(StoreError::RecordInvariant(
+                "Record subscription schema group is incomplete",
+            ));
+        }
+        (false, false) => {
+            return Err(StoreError::RecordInvariant(
+                "Record acceptance-order index is missing from current schema",
+            ));
+        }
+    }
     let records = read.open_table(RECORDS)?;
     let bytes = read.open_table(RECORD_BYTES)?;
     let markers = read.open_table(RECORD_ACCEPTANCE_MARKERS)?;
+    let acceptance_order = acceptance_order_present
+        .then(|| read.open_table(RECORD_ACCEPTANCE_ORDER))
+        .transpose()?;
     let semantic_items = read.open_table(RECORD_SEMANTIC_ITEMS)?;
     let groups = read.open_table(RECORD_GROUP_VERSIONS)?;
     let operations = read.open_table(RECORD_OPERATIONS)?;
@@ -20952,6 +21156,19 @@ fn inspect_record_readable(
             return Err(StoreError::RecordInvariant(
                 "Record acceptance markers must be nonzero and unique",
             ));
+        }
+        if let Some(acceptance_order) = &acceptance_order {
+            let ordered = acceptance_order
+                .get(marker)?
+                .map(|value| value.value().to_vec())
+                .ok_or(StoreError::RecordInvariant(
+                    "Record acceptance-order index is missing an accepted Record",
+                ))?;
+            if parse_record_transfer_id("Record acceptance-order table", &ordered)? != transfer_id {
+                return Err(StoreError::RecordInvariant(
+                    "Record acceptance-order index differs from its forward marker",
+                ));
+            }
         }
         let indexed = semantic_items
             .get(record.semantic_id.as_bytes().as_slice())?
@@ -21068,12 +21285,39 @@ fn inspect_record_readable(
     }
     if bytes.len()? != count
         || markers.len()? != count
+        || acceptance_order
+            .as_ref()
+            .map(ReadableTableMetadata::len)
+            .transpose()?
+            .is_some_and(|ordered| ordered != count)
         || semantic_items.len()? != count
         || groups.len()? != count
     {
         return Err(StoreError::RecordInvariant(
             "Record schema has missing or orphan rows",
         ));
+    }
+    if let Some(acceptance_order) = &acceptance_order {
+        for row in acceptance_order.iter()? {
+            let (marker, transfer) = row?;
+            if marker.value() == 0 {
+                return Err(StoreError::RecordInvariant(
+                    "Record acceptance-order index contains a zero marker",
+                ));
+            }
+            let transfer =
+                parse_record_transfer_id("Record acceptance-order table", transfer.value())?;
+            if records.get(transfer.as_bytes().as_slice())?.is_none()
+                || markers
+                    .get(transfer.as_bytes().as_slice())?
+                    .map(|value| value.value())
+                    != Some(marker.value())
+            {
+                return Err(StoreError::RecordInvariant(
+                    "Record acceptance-order index contains an orphan or mismatched row",
+                ));
+            }
+        }
     }
     for row in groups.iter()? {
         let (key, value) = row?;
@@ -22243,6 +22487,7 @@ fn inspect_readable(
     }
     let event_subscription_stats = event_subscription_stats_read(&read)?;
     let state_subscription_stats = state_subscription::inspect_state_subscription_tables(&read)?;
+    let record_subscription_stats = record_subscription::inspect_record_subscription_tables(&read)?;
     let control_stats = inspect_control_tables(&read, mission_authority)?.unwrap_or_default();
     let aggregate_items = [
         ITEM_COUNT,
@@ -22283,6 +22528,7 @@ fn inspect_readable(
         blob_stats,
         event_subscription_stats,
         state_subscription_stats,
+        record_subscription_stats,
         control_stats,
         custody_stats,
         mission_authority,
@@ -22666,6 +22912,26 @@ mod tests {
         }
     }
 
+    fn record_subscription_selection(
+        plan: &RecordSubscriptionPollPlan,
+    ) -> RecordSubscriptionPollSelection {
+        let (deliverable, inactive) = plan
+            .candidates()
+            .iter()
+            .map(|candidate| (candidate.projection_id(), candidate.plan().heads().count()))
+            .partition::<Vec<_>, _>(|(_, heads)| *heads != 0);
+        RecordSubscriptionPollSelection {
+            deliverable: deliverable
+                .into_iter()
+                .map(|(projection, _)| projection)
+                .collect(),
+            inactive: inactive
+                .into_iter()
+                .map(|(projection, _)| projection)
+                .collect(),
+        }
+    }
+
     fn reserved_record(
         publisher: &mut ReferenceEnvelopeSealer,
         reader: &mut ReferenceEnvelopeSealer,
@@ -22961,6 +23227,9 @@ mod tests {
         let mut markers = write
             .open_table(RECORD_ACCEPTANCE_MARKERS)
             .expect("Record markers");
+        let mut acceptance_order = write
+            .open_table(RECORD_ACCEPTANCE_ORDER)
+            .expect("Record acceptance order");
         let mut semantics = write
             .open_table(RECORD_SEMANTIC_ITEMS)
             .expect("Record semantic items");
@@ -23002,6 +23271,9 @@ mod tests {
             markers
                 .insert(transfer_id.as_bytes().as_slice(), index + 1)
                 .expect("insert Record fixture marker");
+            acceptance_order
+                .insert(index + 1, transfer_id.as_bytes().as_slice())
+                .expect("insert Record fixture acceptance order");
             semantics
                 .insert(
                     semantic_id.as_bytes().as_slice(),
@@ -23014,7 +23286,15 @@ mod tests {
             dots.insert(dot_key.as_slice(), semantic_id.as_bytes().as_slice())
                 .expect("insert Record fixture dot");
         }
-        drop((records, bytes, markers, semantics, groups, dots));
+        drop((
+            records,
+            bytes,
+            markers,
+            acceptance_order,
+            semantics,
+            groups,
+            dots,
+        ));
         write
             .open_table(PUBLISHER_HIGH_WATER)
             .expect("publisher high-water")
@@ -35228,6 +35508,576 @@ mod tests {
     }
 
     #[test]
+    fn record_subscription_retries_whole_projections_and_accepts_earlier_attempt_tokens() {
+        assert!(matches!(
+            RecordSubscriptionKey::new(Vec::new()),
+            Err(StoreError::InvalidRecordSubscriptionKey { length: 0 })
+        ));
+        assert!(matches!(
+            RecordSubscriptionKey::new(vec![0; MAX_RECORD_SUBSCRIPTION_KEY_BYTES + 1]),
+            Err(StoreError::InvalidRecordSubscriptionKey { .. })
+        ));
+
+        let file = TestFile::new("Record projection subscription retry");
+        let mut services = state_services(0xce);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("Record store");
+        let policy = store.control_policy_snapshot().expect("settled policy");
+        let spec = RecordSubscriptionSpec {
+            topic: state_topic(),
+            scope: state_scope(),
+            include_descendant_scopes: false,
+        };
+        let key = RecordSubscriptionKey::new(b"application/records".to_vec()).expect("key");
+        let subscription = store
+            .create_record_subscription_with_policy(&policy, &key, spec.clone())
+            .expect("create Record subscription")
+            .id;
+        assert_eq!(
+            store
+                .create_record_subscription_with_policy(&policy, &key, spec.clone())
+                .expect("idempotent create"),
+            RecordSubscriptionCreateOutcome {
+                id: subscription,
+                inserted: false,
+            }
+        );
+        let mut conflicting_spec = spec.clone();
+        conflicting_spec.include_descendant_scopes = true;
+        assert!(matches!(
+            store.create_record_subscription_with_policy(&policy, &key, conflicting_spec),
+            Err(StoreError::RecordSubscriptionConflict)
+        ));
+
+        let (first, first_sealed) = verified_record_for_remote_apply(
+            &mut services.first,
+            &mut services.reader,
+            1,
+            VersionVector::default(),
+            b"record/subscription/one",
+            b"one",
+        );
+        let (second, second_sealed) = verified_record_for_remote_apply(
+            &mut services.second,
+            &mut services.reader,
+            1,
+            VersionVector::default(),
+            b"record/subscription/two",
+            b"two",
+        );
+        store
+            .apply_verified_record_with_policy(&policy, &first, &first_sealed)
+            .expect("apply first Record");
+        store
+            .apply_verified_record_with_policy(&policy, &second, &second_sealed)
+            .expect("apply second Record");
+        assert!(matches!(
+            store.prepare_record_subscription_poll_with_policy(&policy, subscription, 0, 8),
+            Err(StoreError::RecordSubscriptionPollLimitExceeded {
+                requested: 0,
+                maximum: MAX_RECORD_POLL_DELIVERIES,
+            })
+        ));
+        assert!(matches!(
+            store.prepare_record_subscription_poll_with_policy(
+                &policy,
+                subscription,
+                MAX_RECORD_POLL_DELIVERIES + 1,
+                8,
+            ),
+            Err(StoreError::RecordSubscriptionPollLimitExceeded {
+                requested,
+                maximum: MAX_RECORD_POLL_DELIVERIES,
+            }) if requested == MAX_RECORD_POLL_DELIVERIES + 1
+        ));
+        assert!(matches!(
+            store.prepare_record_subscription_poll_with_policy(&policy, subscription, 1, 0),
+            Err(StoreError::RecordSubscriptionPollLimitExceeded {
+                requested: 0,
+                maximum: MAX_RECORD_SUBSCRIPTION_SCAN,
+            })
+        ));
+        assert!(matches!(
+            store.prepare_record_subscription_poll_with_policy(
+                &policy,
+                subscription,
+                1,
+                MAX_RECORD_SUBSCRIPTION_SCAN + 1,
+            ),
+            Err(StoreError::RecordSubscriptionPollLimitExceeded {
+                requested,
+                maximum: MAX_RECORD_SUBSCRIPTION_SCAN,
+            }) if requested == MAX_RECORD_SUBSCRIPTION_SCAN + 1
+        ));
+        assert!(matches!(
+            store.prepare_record_subscription_poll_with_policy(&policy, subscription, 1, 1),
+            Err(StoreError::RecordSubscriptionPollLimitExceeded {
+                requested: 2,
+                maximum: 1,
+            })
+        ));
+
+        let first_plan = store
+            .prepare_record_subscription_poll_with_policy(&policy, subscription, 1, 8)
+            .expect("prepare whole projections");
+        assert_eq!(first_plan.candidates().len(), 2);
+        assert!(
+            first_plan
+                .candidates()
+                .iter()
+                .all(|candidate| candidate.plan().heads().count() == 1)
+        );
+        let first_selection = record_subscription_selection(&first_plan);
+        let stale_plan = first_plan.clone();
+        let first_page = store
+            .commit_record_subscription_poll_with_policy(&policy, &first_plan, &first_selection)
+            .expect("commit first bounded projection");
+        assert_eq!(first_page.deliveries.len(), 1);
+        assert!(first_page.has_more);
+        assert_eq!(first_page.deliveries[0].attempt, 1);
+        assert_eq!(first_page.deliveries[0].plan.heads().count(), 1);
+        let first_projection = first_page.deliveries[0].projection_id;
+        let attempt_one = first_page.deliveries[0].token;
+        assert!(matches!(
+            store.commit_record_subscription_poll_with_policy(
+                &policy,
+                &stale_plan,
+                &first_selection,
+            ),
+            Err(StoreError::RecordSubscriptionPlanChanged)
+        ));
+
+        let retry_plan = store
+            .prepare_record_subscription_poll_with_policy(&policy, subscription, 2, 8)
+            .expect("prepare pending-first retry");
+        assert_eq!(
+            retry_plan
+                .candidates()
+                .iter()
+                .find(|candidate| candidate.projection_id() == first_projection)
+                .expect("pending projection")
+                .pending_attempt(),
+            Some(1)
+        );
+        let retry_selection = record_subscription_selection(&retry_plan);
+        let retry_page = store
+            .commit_record_subscription_poll_with_policy(&policy, &retry_plan, &retry_selection)
+            .expect("commit pending-first retry");
+        assert_eq!(retry_page.deliveries.len(), 2);
+        assert_eq!(retry_page.deliveries[0].projection_id, first_projection);
+        assert_eq!(retry_page.deliveries[0].attempt, 2);
+        let second_projection = retry_page.deliveries[1].projection_id;
+        let second_attempt_one = retry_page.deliveries[1].token;
+        assert_ne!(second_projection, first_projection);
+        assert_eq!(retry_page.deliveries[1].attempt, 1);
+        assert!(!retry_page.has_more);
+
+        let fair_retry_plan = store
+            .prepare_record_subscription_poll_with_policy(&policy, subscription, 1, 8)
+            .expect("prepare lowered-limit fair retry");
+        let fair_retry_page = store
+            .commit_record_subscription_poll_with_policy(
+                &policy,
+                &fair_retry_plan,
+                &record_subscription_selection(&fair_retry_plan),
+            )
+            .expect("least-attempt pending projection wins lowered limit");
+        assert_eq!(fair_retry_page.deliveries.len(), 1);
+        assert_eq!(
+            fair_retry_page.deliveries[0].projection_id,
+            second_projection
+        );
+        assert_eq!(fair_retry_page.deliveries[0].attempt, 2);
+        assert!(fair_retry_page.has_more);
+        assert_eq!(
+            store
+                .acknowledge_record_delivery_with_policy(
+                    &policy,
+                    subscription,
+                    first_projection,
+                    attempt_one,
+                )
+                .expect("earlier issued attempt remains valid"),
+            RecordDeliveryAck::Acknowledged
+        );
+        assert_eq!(
+            store
+                .acknowledge_record_delivery_with_policy(
+                    &policy,
+                    subscription,
+                    first_projection,
+                    attempt_one,
+                )
+                .expect("idempotent reack"),
+            RecordDeliveryAck::AlreadyAcknowledged
+        );
+        assert_eq!(
+            store
+                .acknowledge_record_delivery_with_policy(
+                    &policy,
+                    subscription,
+                    second_projection,
+                    second_attempt_one,
+                )
+                .expect("earlier attempt acknowledges the fair retry"),
+            RecordDeliveryAck::Acknowledged
+        );
+
+        let wrong_projection = RecordProjectionId::from_bytes([0x55; 32]);
+        assert!(matches!(
+            store.acknowledge_record_delivery_with_policy(
+                &policy,
+                subscription,
+                wrong_projection,
+                attempt_one,
+            ),
+            Err(StoreError::RecordDeliveryTokenBindingMismatch)
+        ));
+        let other_subscription = store
+            .create_record_subscription_with_policy(
+                &policy,
+                &RecordSubscriptionKey::new(b"application/records/other".to_vec())
+                    .expect("other key"),
+                spec,
+            )
+            .expect("other subscription")
+            .id;
+        assert!(matches!(
+            store.acknowledge_record_delivery_with_policy(
+                &policy,
+                other_subscription,
+                first_projection,
+                attempt_one,
+            ),
+            Err(StoreError::RecordDeliveryTokenBindingMismatch)
+        ));
+        let mut malformed = *attempt_one.as_bytes();
+        malformed[0] = 0xff;
+        assert!(matches!(
+            RecordDeliveryToken::from_bytes(malformed),
+            Err(StoreError::InvalidRecordDeliveryToken)
+        ));
+        let mut forged = *attempt_one.as_bytes();
+        *forged.last_mut().expect("digest byte") ^= 1;
+        let forged = RecordDeliveryToken::from_bytes(forged).expect("structural token");
+        assert!(matches!(
+            store.acknowledge_record_delivery_with_policy(
+                &policy,
+                subscription,
+                first_projection,
+                forged,
+            ),
+            Err(StoreError::RecordDeliveryTokenBindingMismatch)
+        ));
+        assert_eq!(
+            store.record_subscription_stats().expect("durable stats"),
+            RecordSubscriptionStats {
+                subscriptions: 2,
+                pending_deliveries: 0,
+                acknowledged_deliveries: 2,
+                delivery_cursors: 2,
+                selector_generation: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn record_subscription_head_set_and_selector_aba_open_fresh_tenures() {
+        let file = TestFile::new("Record projection and selector ABA");
+        let mut services = state_services(0xcf);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("Record store");
+        let initial_policy = store.control_policy_snapshot().expect("settled policy");
+        let spec = RecordSubscriptionSpec {
+            topic: state_topic(),
+            scope: state_scope(),
+            include_descendant_scopes: false,
+        };
+        let operation_key =
+            RecordSubscriptionKey::new(b"application/record-aba".to_vec()).expect("key");
+        let subscription = store
+            .create_record_subscription_with_policy(&initial_policy, &operation_key, spec.clone())
+            .expect("create subscription")
+            .id;
+
+        let (left, left_sealed) = verified_record_for_remote_apply(
+            &mut services.first,
+            &mut services.reader,
+            1,
+            VersionVector::default(),
+            b"record/subscription/aba",
+            b"left",
+        );
+        store
+            .apply_verified_record_with_policy(&initial_policy, &left, &left_sealed)
+            .expect("apply left head");
+        let left_plan = store
+            .prepare_record_subscription_poll_with_policy(&initial_policy, subscription, 1, 8)
+            .expect("prepare left head");
+        assert_eq!(left_plan.candidates().len(), 1);
+        assert_eq!(left_plan.candidates()[0].plan().heads().count(), 1);
+        let left_projection = left_plan.candidates()[0].projection_id();
+        let left_page = store
+            .commit_record_subscription_poll_with_policy(
+                &initial_policy,
+                &left_plan,
+                &record_subscription_selection(&left_plan),
+            )
+            .expect("deliver left head");
+        let old_left_token = left_page.deliveries[0].token;
+        store
+            .acknowledge_record_delivery_with_policy(
+                &initial_policy,
+                subscription,
+                left_projection,
+                old_left_token,
+            )
+            .expect("ack left head");
+        let hidden_plan = store
+            .prepare_record_subscription_poll_with_policy(&initial_policy, subscription, 1, 8)
+            .expect("prepare unchanged route-hidden projection");
+        let hidden = store
+            .commit_record_subscription_poll_with_policy(
+                &initial_policy,
+                &hidden_plan,
+                &RecordSubscriptionPollSelection {
+                    deliverable: Vec::new(),
+                    inactive: vec![left_projection],
+                },
+            )
+            .expect("hide unchanged projection");
+        assert!(hidden.deliveries.is_empty());
+        let visible_again_plan = store
+            .prepare_record_subscription_poll_with_policy(&initial_policy, subscription, 1, 8)
+            .expect("prepare unchanged route-visible projection");
+        let visible_again = store
+            .commit_record_subscription_poll_with_policy(
+                &initial_policy,
+                &visible_again_plan,
+                &record_subscription_selection(&visible_again_plan),
+            )
+            .expect("unchanged projection remains acknowledged");
+        assert!(visible_again.deliveries.is_empty());
+
+        let (right, right_sealed) = verified_record_for_remote_apply(
+            &mut services.second,
+            &mut services.reader,
+            1,
+            VersionVector::default(),
+            b"record/subscription/aba",
+            b"right",
+        );
+        store
+            .apply_verified_record_with_policy(&initial_policy, &right, &right_sealed)
+            .expect("apply concurrent right head");
+        assert_eq!(
+            store
+                .acknowledge_record_delivery_with_policy(
+                    &initial_policy,
+                    subscription,
+                    left_projection,
+                    old_left_token,
+                )
+                .expect("exact reack survives uncommitted head-set change"),
+            RecordDeliveryAck::AlreadyAcknowledged
+        );
+        let conflict_plan = store
+            .prepare_record_subscription_poll_with_policy(&initial_policy, subscription, 1, 8)
+            .expect("prepare complete conflict");
+        assert_eq!(conflict_plan.candidates().len(), 1);
+        assert_eq!(conflict_plan.candidates()[0].plan().heads().count(), 2);
+        let conflict_projection = conflict_plan.candidates()[0].projection_id();
+        assert_ne!(conflict_projection, left_projection);
+        let conflict_page = store
+            .commit_record_subscription_poll_with_policy(
+                &initial_policy,
+                &conflict_plan,
+                &record_subscription_selection(&conflict_plan),
+            )
+            .expect("deliver conflict as one projection");
+        assert_eq!(conflict_page.deliveries.len(), 1);
+        assert_eq!(conflict_page.deliveries[0].plan.heads().count(), 2);
+        let conflict_token = conflict_page.deliveries[0].token;
+        let conflict_retry = store
+            .prepare_record_subscription_poll_with_policy(&initial_policy, subscription, 1, 8)
+            .expect("inspect conflict tenure");
+        assert_eq!(conflict_retry.candidates()[0].delivery_tenure(), Some(2));
+
+        let revoke_right = services
+            .authority_signer
+            .seal_chained_revocation_control(services.second.identity(), 1, 1, None)
+            .expect("seal right-publisher revocation");
+        let verified_revoke_right = services
+            .reader
+            .verify_control(&revoke_right)
+            .expect("verify right-publisher revocation");
+        store
+            .ingest_verified_control(&verified_revoke_right, &revoke_right)
+            .expect("apply right-publisher revocation");
+        let left_again_policy = store
+            .control_policy_snapshot()
+            .expect("post-revocation policy");
+        assert!(matches!(
+            store.acknowledge_record_delivery_with_policy(
+                &left_again_policy,
+                subscription,
+                conflict_projection,
+                conflict_token,
+            ),
+            Err(StoreError::RecordSubscriptionPlanChanged)
+        ));
+        let left_again_plan = store
+            .prepare_record_subscription_poll_with_policy(&left_again_policy, subscription, 1, 8)
+            .expect("prepare ABA left head");
+        assert_eq!(left_again_plan.candidates()[0].plan().heads().count(), 1);
+        assert_eq!(
+            left_again_plan.candidates()[0].projection_id(),
+            left_projection
+        );
+        let left_again_page = store
+            .commit_record_subscription_poll_with_policy(
+                &left_again_policy,
+                &left_again_plan,
+                &record_subscription_selection(&left_again_plan),
+            )
+            .expect("deliver ABA left head in fresh tenure");
+        assert_eq!(left_again_page.deliveries[0].attempt, 1);
+        let fresh_left_token = left_again_page.deliveries[0].token;
+        let fresh_left_plan = store
+            .prepare_record_subscription_poll_with_policy(&left_again_policy, subscription, 1, 8)
+            .expect("inspect fresh left tenure");
+        assert_eq!(fresh_left_plan.candidates()[0].delivery_tenure(), Some(3));
+        assert!(matches!(
+            store.acknowledge_record_delivery_with_policy(
+                &left_again_policy,
+                subscription,
+                left_projection,
+                old_left_token,
+            ),
+            Err(StoreError::RecordDeliveryTenureChanged {
+                current: 3,
+                received: 1,
+            })
+        ));
+        assert!(matches!(
+            store.acknowledge_record_delivery_with_policy(
+                &left_again_policy,
+                subscription,
+                conflict_projection,
+                conflict_token,
+            ),
+            Err(StoreError::RecordDeliveryTenureChanged {
+                current: 3,
+                received: 2,
+            })
+        ));
+        assert_eq!(
+            store
+                .acknowledge_record_delivery_with_policy(
+                    &left_again_policy,
+                    subscription,
+                    left_projection,
+                    fresh_left_token,
+                )
+                .expect("ack fresh left tenure"),
+            RecordDeliveryAck::Acknowledged
+        );
+
+        assert!(
+            store
+                .remove_record_subscription_with_policy(&left_again_policy, subscription)
+                .expect("remove subscription")
+                .removed
+        );
+        let recreated = store
+            .create_record_subscription_with_policy(&left_again_policy, &operation_key, spec)
+            .expect("recreate same stable subscription");
+        assert_eq!(recreated.id, subscription);
+        let recreated_plan = store
+            .prepare_record_subscription_poll_with_policy(&left_again_policy, subscription, 1, 8)
+            .expect("prepare recreated subscription");
+        let recreated_page = store
+            .commit_record_subscription_poll_with_policy(
+                &left_again_policy,
+                &recreated_plan,
+                &record_subscription_selection(&recreated_plan),
+            )
+            .expect("deliver recreated subscription");
+        assert_eq!(recreated_page.deliveries[0].attempt, 1);
+        assert!(matches!(
+            store.acknowledge_record_delivery_with_policy(
+                &left_again_policy,
+                subscription,
+                left_projection,
+                fresh_left_token,
+            ),
+            Err(StoreError::RecordSubscriptionIncarnationChanged { .. })
+        ));
+        store
+            .acknowledge_record_delivery_with_policy(
+                &left_again_policy,
+                subscription,
+                left_projection,
+                recreated_page.deliveries[0].token,
+            )
+            .expect("ack recreated subscription");
+
+        let revoke_left = services
+            .authority_signer
+            .seal_chained_revocation_control(
+                services.first.identity(),
+                1,
+                2,
+                Some(verified_revoke_right.envelope_id()),
+            )
+            .expect("seal left-publisher revocation");
+        let verified_revoke_left = services
+            .reader
+            .verify_control(&revoke_left)
+            .expect("verify left-publisher revocation");
+        store
+            .ingest_verified_control(&verified_revoke_left, &revoke_left)
+            .expect("apply left-publisher revocation");
+        let empty_policy = store.control_policy_snapshot().expect("empty-head policy");
+        let empty_plan = store
+            .prepare_record_subscription_poll_with_policy(&empty_policy, subscription, 1, 8)
+            .expect("prepare empty head set");
+        assert_eq!(empty_plan.candidates().len(), 1);
+        assert_eq!(empty_plan.candidates()[0].plan().heads().count(), 0);
+        let empty_projection = empty_plan.candidates()[0].projection_id();
+        assert!(matches!(
+            store.commit_record_subscription_poll_with_policy(
+                &empty_policy,
+                &empty_plan,
+                &RecordSubscriptionPollSelection {
+                    deliverable: vec![empty_projection],
+                    inactive: Vec::new(),
+                },
+            ),
+            Err(StoreError::RecordSubscriptionPlanChanged)
+        ));
+        let empty_plan = store
+            .prepare_record_subscription_poll_with_policy(&empty_policy, subscription, 1, 8)
+            .expect("reprepare empty head set");
+        let empty_page = store
+            .commit_record_subscription_poll_with_policy(
+                &empty_policy,
+                &empty_plan,
+                &record_subscription_selection(&empty_plan),
+            )
+            .expect("retire delivery evidence for empty head set");
+        assert!(empty_page.deliveries.is_empty());
+        assert_eq!(
+            store.record_subscription_stats().expect("empty-head stats"),
+            RecordSubscriptionStats {
+                subscriptions: 1,
+                pending_deliveries: 0,
+                acknowledged_deliveries: 0,
+                delivery_cursors: 1,
+                selector_generation: 3,
+            }
+        );
+    }
+
+    #[test]
     fn record_aggregate_and_dedicated_operation_caps_roll_back_atomically() {
         let file = TestFile::new("Record quota rollback");
         let mut services = state_services(0xc4);
@@ -35535,6 +36385,21 @@ mod tests {
         write
             .delete_table(RECORD_OPERATIONS)
             .expect("delete Record operations");
+        write
+            .delete_table(RECORD_ACCEPTANCE_ORDER)
+            .expect("delete Record acceptance order");
+        write
+            .delete_table(record_subscription::RECORD_SUBSCRIPTIONS)
+            .expect("delete Record subscriptions");
+        write
+            .delete_table(record_subscription::RECORD_SUBSCRIPTION_PENDING)
+            .expect("delete Record pending deliveries");
+        write
+            .delete_table(record_subscription::RECORD_DELIVERY_ACKNOWLEDGEMENTS)
+            .expect("delete Record acknowledgements");
+        write
+            .delete_table(record_subscription::RECORD_DELIVERY_CURSORS)
+            .expect("delete Record delivery cursors");
         {
             let mut metadata = write.open_table(METADATA).expect("metadata");
             for field in [
@@ -35543,6 +36408,11 @@ mod tests {
                 LAST_RECORD_ACCEPTANCE_MARKER,
                 RECORD_OPERATION_COUNT,
                 RECORD_OPERATION_TOTAL_BYTES,
+                record_subscription::RECORD_SUBSCRIPTION_COUNT,
+                record_subscription::RECORD_PENDING_DELIVERY_COUNT,
+                record_subscription::RECORD_ACKNOWLEDGEMENT_COUNT,
+                record_subscription::RECORD_DELIVERY_CURSOR_COUNT,
+                record_subscription::RECORD_SELECTOR_GENERATION,
             ] {
                 metadata.remove(field).expect("remove Record counter");
             }
@@ -35622,6 +36492,356 @@ mod tests {
                 ))
             ));
         }
+    }
+
+    #[test]
+    fn record_acceptance_order_and_subscription_schema_migrate_exactly_and_reject_corruption() {
+        let migrated = TestFile::new("Record acceptance-order migration");
+        let mut services = state_services(0xd0);
+        let (first_stored, second_stored) = {
+            let store =
+                Store::open_for_mission(&migrated.0, services.authority).expect("Record store");
+            let policy = store.control_policy_snapshot().expect("settled policy");
+            let (first, first_sealed) = verified_record_for_remote_apply(
+                &mut services.first,
+                &mut services.reader,
+                1,
+                VersionVector::default(),
+                b"record/order/one",
+                b"one",
+            );
+            let (second, second_sealed) = verified_record_for_remote_apply(
+                &mut services.second,
+                &mut services.reader,
+                1,
+                VersionVector::default(),
+                b"record/order/two",
+                b"two",
+            );
+            store
+                .apply_verified_record_with_policy(&policy, &first, &first_sealed)
+                .expect("apply first Record");
+            store
+                .apply_verified_record_with_policy(&policy, &second, &second_sealed)
+                .expect("apply second Record");
+            (
+                store
+                    .record_by_semantic_id(RecordSemanticId::new(first.item_id()))
+                    .expect("read first Record")
+                    .expect("first Record row"),
+                store
+                    .record_by_semantic_id(RecordSemanticId::new(second.item_id()))
+                    .expect("read second Record")
+                    .expect("second Record row"),
+            )
+        };
+        {
+            let database = Database::open(&migrated.0).expect("open legacy simulation");
+            let write = database.begin_write().expect("legacy simulation write");
+            write
+                .delete_table(RECORD_ACCEPTANCE_ORDER)
+                .expect("remove post-legacy Record acceptance order");
+            for table in [
+                record_subscription::RECORD_SUBSCRIPTIONS,
+                record_subscription::RECORD_SUBSCRIPTION_PENDING,
+                record_subscription::RECORD_DELIVERY_ACKNOWLEDGEMENTS,
+                record_subscription::RECORD_DELIVERY_CURSORS,
+            ] {
+                write
+                    .delete_table(table)
+                    .expect("remove post-legacy Record table");
+            }
+            {
+                let mut metadata = write.open_table(METADATA).expect("legacy metadata");
+                for field in [
+                    record_subscription::RECORD_SUBSCRIPTION_COUNT,
+                    record_subscription::RECORD_PENDING_DELIVERY_COUNT,
+                    record_subscription::RECORD_ACKNOWLEDGEMENT_COUNT,
+                    record_subscription::RECORD_DELIVERY_CURSOR_COUNT,
+                    record_subscription::RECORD_SELECTOR_GENERATION,
+                ] {
+                    metadata
+                        .remove(field)
+                        .expect("remove post-legacy Record metadata");
+                }
+            }
+            write.commit().expect("commit legacy simulation");
+        }
+        let legacy = Store::inspect_existing(&migrated.0)
+            .expect("exact legacy Record schema remains inspectable");
+        assert_eq!(legacy.record_stats.records, 2);
+        assert_eq!(
+            legacy.record_subscription_stats,
+            RecordSubscriptionStats::default()
+        );
+        drop(
+            Store::open_for_mission(&migrated.0, services.authority)
+                .expect("writable open atomically migrates Record extensions"),
+        );
+        {
+            let database = redb::Builder::new()
+                .open_read_only(&migrated.0)
+                .expect("read migrated Record store");
+            let read = database.begin_read().expect("read transaction");
+            let order = read
+                .open_table(RECORD_ACCEPTANCE_ORDER)
+                .expect("migrated Record order");
+            assert_eq!(
+                order
+                    .get(1)
+                    .expect("first order row")
+                    .expect("first row")
+                    .value(),
+                first_stored.transfer_id.as_bytes().as_slice()
+            );
+            assert_eq!(
+                order
+                    .get(2)
+                    .expect("second order row")
+                    .expect("second row")
+                    .value(),
+                second_stored.transfer_id.as_bytes().as_slice()
+            );
+        }
+        {
+            let database = Database::open(&migrated.0).expect("open corrupt Record index");
+            let write = database.begin_write().expect("corrupt Record index write");
+            write
+                .open_table(RECORD_ACCEPTANCE_ORDER)
+                .expect("Record acceptance order")
+                .insert(1, second_stored.transfer_id.as_bytes().as_slice())
+                .expect("misindex first marker");
+            write.commit().expect("commit corrupt Record order");
+        }
+        for result in [
+            Store::inspect_existing(&migrated.0).map(|_| ()),
+            Store::open_for_mission(&migrated.0, services.authority).map(|_| ()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(StoreError::RecordInvariant(
+                    "Record acceptance-order index differs from its forward marker"
+                ))
+            ));
+        }
+
+        let missing_order = TestFile::new("current Record missing acceptance order");
+        let store = Store::open_for_mission(&missing_order.0, services.authority)
+            .expect("current Record store");
+        let policy = store.control_policy_snapshot().expect("policy");
+        store
+            .create_record_subscription_with_policy(
+                &policy,
+                &RecordSubscriptionKey::new(b"application/current-record".to_vec())
+                    .expect("subscription key"),
+                RecordSubscriptionSpec {
+                    topic: state_topic(),
+                    scope: state_scope(),
+                    include_descendant_scopes: false,
+                },
+            )
+            .expect("create current Record subscription");
+        drop(store);
+        {
+            let database = Database::open(&missing_order.0).expect("open current schema");
+            let write = database.begin_write().expect("delete current Record order");
+            write
+                .delete_table(RECORD_ACCEPTANCE_ORDER)
+                .expect("delete current Record acceptance order");
+            write.commit().expect("commit missing-order corruption");
+        }
+        for result in [
+            Store::inspect_existing(&missing_order.0).map(|_| ()),
+            Store::open_for_mission(&missing_order.0, services.authority).map(|_| ()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(StoreError::RecordInvariant(
+                    "Record acceptance-order index is missing from current schema"
+                ))
+            ));
+        }
+
+        let wrong_kind = TestFile::new("Record acceptance-order wrong kind");
+        drop(Store::open_for_mission(&wrong_kind.0, services.authority).expect("wrong-kind base"));
+        {
+            let database = Database::open(&wrong_kind.0).expect("open wrong-kind database");
+            let write = database.begin_write().expect("wrong-kind write");
+            write
+                .delete_table(RECORD_ACCEPTANCE_ORDER)
+                .expect("delete normal Record order");
+            let definition = redb::MultimapTableDefinition::<u64, &[u8]>::new(
+                "aster.semantic-record-acceptance-order.v1",
+            );
+            write
+                .open_multimap_table(definition)
+                .expect("wrong-kind Record order")
+                .insert(1, b"not-a-transfer".as_slice())
+                .expect("wrong-kind row");
+            write.commit().expect("commit wrong-kind Record order");
+        }
+        for result in [
+            Store::inspect_existing(&wrong_kind.0).map(|_| ()),
+            Store::open_for_mission(&wrong_kind.0, services.authority).map(|_| ()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(StoreError::RecordInvariant(
+                    "mission-scoped Record schema has the wrong table kind"
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn record_subscription_schema_corruption_fails_inspection_and_reopen_without_repair() {
+        let authority = state_services(0xd1).authority;
+
+        let missing_table = TestFile::new("Record subscription missing table");
+        drop(
+            Store::open_for_mission(&missing_table.0, authority)
+                .expect("missing-table fixture base"),
+        );
+        {
+            let database = Database::open(&missing_table.0).expect("open missing-table fixture");
+            let write = database.begin_write().expect("missing-table write");
+            write
+                .delete_table(record_subscription::RECORD_DELIVERY_CURSORS)
+                .expect("delete one Record subscription table");
+            write.commit().expect("commit missing table");
+        }
+        for result in [
+            Store::inspect_existing(&missing_table.0).map(|_| ()),
+            Store::open_for_mission(&missing_table.0, authority).map(|_| ()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(StoreError::RecordInvariant(
+                    "Record subscription schema group is incomplete"
+                ))
+            ));
+        }
+        let database = Database::open(&missing_table.0).expect("verify missing table unchanged");
+        assert!(
+            !database
+                .begin_read()
+                .expect("read missing table")
+                .list_tables()
+                .expect("list missing-table schema")
+                .any(|table| table.name() == record_subscription::RECORD_DELIVERY_CURSORS.name())
+        );
+        drop(database);
+
+        let wrong_kind = TestFile::new("Record subscription wrong kind");
+        drop(Store::open_for_mission(&wrong_kind.0, authority).expect("wrong-kind fixture base"));
+        {
+            let database = Database::open(&wrong_kind.0).expect("open wrong-kind fixture");
+            let write = database.begin_write().expect("wrong-kind write");
+            write
+                .delete_table(record_subscription::RECORD_SUBSCRIPTION_PENDING)
+                .expect("delete normal pending table");
+            let definition = redb::MultimapTableDefinition::<&[u8], &[u8]>::new(
+                "aster.semantic-record-delivery-pending.v1",
+            );
+            write
+                .open_multimap_table(definition)
+                .expect("wrong-kind pending table")
+                .insert(b"key".as_slice(), b"value".as_slice())
+                .expect("wrong-kind pending row");
+            write.commit().expect("commit wrong-kind pending table");
+        }
+        for result in [
+            Store::inspect_existing(&wrong_kind.0).map(|_| ()),
+            Store::open_for_mission(&wrong_kind.0, authority).map(|_| ()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(StoreError::RecordInvariant(
+                    "Record subscription schema has the wrong table kind"
+                ))
+            ));
+        }
+
+        let missing_counter = TestFile::new("Record subscription missing counter");
+        drop(
+            Store::open_for_mission(&missing_counter.0, authority)
+                .expect("missing-counter fixture base"),
+        );
+        {
+            let database = Database::open(&missing_counter.0).expect("open missing counter");
+            let write = database.begin_write().expect("missing-counter write");
+            write
+                .open_table(METADATA)
+                .expect("metadata")
+                .remove(record_subscription::RECORD_PENDING_DELIVERY_COUNT)
+                .expect("remove pending counter");
+            write.commit().expect("commit missing counter");
+        }
+        for result in [
+            Store::inspect_existing(&missing_counter.0).map(|_| ()),
+            Store::open_for_mission(&missing_counter.0, authority).map(|_| ()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(StoreError::RecordInvariant(
+                    "Record subscription schema group is incomplete"
+                ))
+            ));
+        }
+        let database = Database::open(&missing_counter.0).expect("verify counter unchanged");
+        assert!(
+            database
+                .begin_read()
+                .expect("read missing counter")
+                .open_table(METADATA)
+                .expect("metadata")
+                .get(record_subscription::RECORD_PENDING_DELIVERY_COUNT)
+                .expect("read pending counter")
+                .is_none()
+        );
+        drop(database);
+
+        let mismatched_counter = TestFile::new("Record subscription mismatched counter");
+        drop(
+            Store::open_for_mission(&mismatched_counter.0, authority)
+                .expect("mismatched-counter fixture base"),
+        );
+        {
+            let database = Database::open(&mismatched_counter.0).expect("open mismatched counter");
+            let write = database.begin_write().expect("mismatched-counter write");
+            write
+                .open_table(METADATA)
+                .expect("metadata")
+                .insert(record_subscription::RECORD_SUBSCRIPTION_COUNT, 1)
+                .expect("inflate subscription counter");
+            write.commit().expect("commit mismatched counter");
+        }
+        for result in [
+            Store::inspect_existing(&mismatched_counter.0).map(|_| ()),
+            Store::open_for_mission(&mismatched_counter.0, authority).map(|_| ()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(StoreError::AccountingMismatch {
+                    field: record_subscription::RECORD_SUBSCRIPTION_COUNT,
+                    durable: 1,
+                    reconstructed: 0,
+                })
+            ));
+        }
+        let database = Database::open(&mismatched_counter.0).expect("verify mismatch unchanged");
+        assert_eq!(
+            database
+                .begin_read()
+                .expect("read mismatched counter")
+                .open_table(METADATA)
+                .expect("metadata")
+                .get(record_subscription::RECORD_SUBSCRIPTION_COUNT)
+                .expect("read subscription counter")
+                .expect("counter remains present")
+                .value(),
+            1
+        );
     }
 
     #[test]
