@@ -54,10 +54,20 @@ dispatched to one bounded joined worker. Graceful shutdown and live zeroization
 close admission, reject queued work, and join that worker before authority
 release, so retained handles fail with sanitized `StateUnavailable`.
 Caller-copied Blob bytes and caller-owned source files remain outside node
-zeroization. Retained Blob-delivery acceptance, Blob peer/convergence status,
-State contact/status and materialized-view/synthetic-withdrawal behavior,
+zeroization. A
+[retained 10,269-byte Blob-delivery receipt](implementation/evidence/selected-live-blob-subscription-26e0a09.json)
+(SHA-256
+`3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675`,
+Good-signed source `26e0a09`) observes two exact publications sharing one
+`BlobId`, forced attempt-one child termination after a flushed unacknowledged
+poll, fresh-process attempt-2 redelivery acknowledged with the persisted older
+token, and an empty final peerless reopen on one host. It is local-ledger
+evidence only. Blob peer/convergence status, network contact/transfer,
+selector/network-interest separation, State contact/status and
+materialized-view/synthetic-withdrawal behavior,
 dynamic State network interests, ConnectRPC/C/Go/Python selected-node bindings,
-finite TTL, and representative physical or mixed-implementation acceptance
+finite TTL/GC, power-loss/filesystem-crash, representative physical or
+mixed-implementation acceptance, resource/soak, and release authorization
 remain open. A
 [retained 7,752-byte v2 live-path receipt](implementation/evidence/selected-live-mutable-6cabb4c.json)
 (SHA-256
@@ -280,8 +290,9 @@ See the [selected Blob quickstart](quickstart/selected-blob-api.md) for the full
 Rust example and its cancellation, closure, and zeroization limits. That path
 also has a durable metadata-only publication queue with exact token-bound
 acknowledgement and local ledger counts. Its frozen retained live-path receipt
-predates that queue, so delivery currently has focused mechanism tests rather
-than retained acceptance; Blob peer/convergence status remains absent.
+predates that queue; the separate Blob-delivery receipt above covers the
+bounded peerless forced-process retry. Blob peer/convergence status remains
+absent.
 
 ## Query current local data
 

@@ -97,8 +97,8 @@ The selected implementation deliberately exposes different maturity levels:
   [retained 10,357-byte receipt](implementation/evidence/selected-live-record-subscription-0c11344.json)
   covering a whole conflict, forced-process attempt-2 redelivery, guarded
   resolution, a successor projection, selector separation, and final peerless
-  reopen. That receipt moves only `DM-5.1-08`; Blob delivery now has a separate
-  current-code mechanism but no retained acceptance. State contact/status and
+  reopen. That receipt moves only `DM-5.1-08`; Blob delivery has separate
+  retained acceptance described below. State contact/status and
   materialized-view/synthetic-withdrawal behavior, dynamic State network
   interests, selected-node bindings, finite TTL,
   tombstone retention duration/garbage collection, and representative
@@ -114,10 +114,20 @@ The selected implementation deliberately exposes different maturity levels:
   between current content-capable peers, with durable restart/resume state and
   bounded retained one-host interrupted/reopened/different-peer resume,
   completion, read, and reopen evidence; that receipt predates the delivery
-  ledger. Retained Blob-delivery acceptance, peer/convergence status, route-only
-  custody, arbitrary-peer resume, crash/power-loss/long-offline recovery,
-  large/RSS acceptance, and representative physical or mixed-implementation
-  evidence remain open.
+  ledger. A separate
+  [retained 10,269-byte Blob-delivery receipt](implementation/evidence/selected-live-blob-subscription-26e0a09.json)
+  (SHA-256
+  `3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675`,
+  Good-signed source `26e0a09`) observes one participant on one peerless host
+  across three processes and four actor lifetimes. The attempt-one child is
+  sent `SIGKILL` after flushing an unacknowledged delivery; a fresh process
+  receives attempt 2, acknowledges with the persisted attempt-one token,
+  settles a second exact publication sharing the same `BlobId`, and leaves the
+  final reopened ledger empty. Peer/convergence status, network transfer,
+  selector/network-interest separation, route-only custody, arbitrary-peer
+  resume, power-loss/filesystem-crash/long-offline recovery,
+  large/RSS acceptance, TTL/expiry/garbage collection, representative physical
+  or mixed-implementation evidence, and release authorization remain open.
 - The broader semantic Rust implementation and language bindings remain the
   proven migration source for behavior not yet composed into the selected node.
 

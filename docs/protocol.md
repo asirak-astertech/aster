@@ -891,6 +891,21 @@ custody, Blob TTL/expiry/garbage collection, a
 metadata-independent whole-byte identity or deduplication claim, or large-file,
 physical-carrier, mixed-implementation, and release acceptance.
 
+The separate application ledger now has a
+[retained 10,269-byte peerless Blob-delivery receipt](implementation/evidence/selected-live-blob-subscription-26e0a09.json)
+(SHA-256
+`3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675`,
+Good-signed source `26e0a09`). One participant executes three processes and
+four actor lifetimes on one host. Two exact source publications share one
+`BlobId`; an attempt-one child flushes an unacknowledged token and receives
+`SIGKILL`, then a fresh process receives attempt 2 and acknowledges it with the
+persisted attempt-one token before settling both publications. The final
+peerless reopen has one replayed subscription, zero pending, two acknowledged,
+and an empty poll. This receipt does not amend the wire grammar or configured
+interests and claims no contact, transfer, peer/convergence status,
+selector/network-interest separation, TTL/GC, physical or mixed carrier,
+resource/soak, reproducible-build, or release result.
+
 The reference driver can initiate an exchange and can answer one through its
 responder-with-start path, so its in-memory authenticated flow is bidirectional.
 If backend storage rejects a received range, the intent remains queued for a

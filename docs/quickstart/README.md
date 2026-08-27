@@ -22,11 +22,21 @@ demonstrates the cloneable live handle's peerless-capable durable regular-file
 publication, bounded zeroize-on-drop page reads, and durable metadata-only
 publication delivery, as well as the exclusive stopped streaming facade,
 immutable metadata-bound identity, crash-resumable encrypted chunks, and exact
-durable retry. Retained Blob-delivery acceptance, Blob peer/convergence status,
-State contact/status and materialized-view/synthetic-withdrawal behavior,
+durable retry. Its
+[retained 10,269-byte Blob-delivery receipt](../implementation/evidence/selected-live-blob-subscription-26e0a09.json)
+(SHA-256
+`3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675`,
+Good-signed source `26e0a09`) observes one peerless participant across three
+processes/four actor lifetimes: forced termination after a flushed attempt-one
+poll, fresh-process attempt-2 redelivery acknowledged with the older token, two
+exact publications sharing one `BlobId`, and a final empty reopened ledger.
+Blob peer/convergence status, network contact/transfer,
+selector/network-interest separation, State contact/status and
+materialized-view/synthetic-withdrawal behavior,
 dynamic State network interests, automatic registered-policy Record merge,
 atomic Event subscription update, selected-node language bindings, and
-representative physical or mixed-implementation acceptance remain open.
+TTL/GC, power-loss/filesystem-crash, resource/soak, representative physical or
+mixed-implementation acceptance, and release authorization remain open.
 
 A [retained 9,656-byte State-delivery receipt](../implementation/evidence/selected-live-state-subscription-8912fc3.json)
 (SHA-256

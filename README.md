@@ -54,8 +54,7 @@ Internet, relay, BTLE, independent implementations, scale beyond two
 participants, resource thresholds, long-duration operation, or evidence for
 the newer live Blob mechanism or, by itself, live Event/Blob application
 acceptance. The separate Record-delivery receipt below covers the newer
-whole-key queue; this earlier receipt does not. Finite State/Record TTL,
-retained Blob-delivery acceptance, State
+whole-key queue; this earlier receipt does not. Finite State/Record TTL, State
 status/materialized-view/synthetic-withdrawal behavior, dynamic State network
 interests, selected-node language bindings,
 representative physical or mixed-implementation acceptance, and release
@@ -141,9 +140,20 @@ authorization.
 The Blob delivery queue was added after that frozen receipt. It uses exact
 source-publication identity rather than `BlobId`, returns authenticated metadata
 without plaintext, and durably retries token-bound attempts until exact
-acknowledgement. Focused mechanism tests cover its ledger and application
-surface; retained Linux delivery evidence and Blob peer/convergence status are
-still open.
+acknowledgement. A separate
+[retained 10,269-byte v1 Blob-delivery receipt](docs/implementation/evidence/selected-live-blob-subscription-26e0a09.json)
+(SHA-256
+`3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675`)
+binds Good-signed source `26e0a09`. On one peerless host, one participant runs
+three processes and four actor lifetimes. Two exact publications share one
+`BlobId`; after the attempt-one child flushes its unacknowledged token and is
+sent `SIGKILL`, a fresh process receives attempt 2 and acknowledges it with the
+persisted attempt-one token, then settles the second publication. A final
+parent reopen replays the subscription with an empty ledger. This is local
+delivery-ledger evidence only—not network contact, transfer, synchronization,
+peer/convergence status, selector withholding or network-interest separation,
+power-loss/filesystem-crash recovery, TTL/GC, physical or mixed systems,
+resource/soak, reproducible-build, or release evidence.
 
 A [retained two-cell receipt](docs/implementation/requirements-status.md#selected-iroh-nat-retained-receipt)
 observes the selected Event path on one Darwin arm64 host through isolated
@@ -241,7 +251,7 @@ provisioning remain open work.
 | **Event** | Source-authenticated reconciliation over direct Iroh or one operator-pinned controlled Iroh connectivity relay; live Rust and local ConnectRPC APIs; durable consume/carry selectors and at-least-once delivery | Atomic subscription update, hosted discovery/public relay, and broader physical-network acceptance |
 | **State** | Source-authenticated live or stopped publication/query, causal projection, direct-Iroh reconciliation under explicit interests, durable positive-current-version delivery, and bounded retained one-host evidence including forced-process redelivery | Contact/status and materialized-view/synthetic-withdrawal behavior, dynamic network-interest mutation, selected-node bindings, finite TTL, relay acceptance, expiry/garbage collection, and representative physical/mixed evidence |
 | **Record** | Live or stopped conflict-preserving query/publication, exact-sibling guarded resolution, direct-Iroh reconciliation, durable whole-key active-head delivery, and bounded retained one-host conflict, forced-process redelivery, resolution, and reopen evidence | Selected-node bindings, automatic merge execution, finite TTL, relay acceptance, expiry/garbage collection, and representative physical/mixed evidence |
-| **Blob** | Authenticated immutable publication through a cloneable live Rust handle or exclusive stopped facade; bounded zeroize-on-drop pages; durable metadata-only application delivery with exact publication identity and token-bound acknowledgement; direct semantic-v5 source/carrier transfer with durable resume state and bounded retained one-host interrupted/reopened/different-peer evidence | Retained Blob-delivery acceptance, peer/convergence and transfer-progress status, route-only relay/custody, arbitrary-peer resume, crash/power-loss/long-offline recovery, large/RSS acceptance, representative physical or mixed-implementation evidence, retention, garbage collection, and release authorization |
+| **Blob** | Authenticated immutable publication through a cloneable live Rust handle or exclusive stopped facade; bounded zeroize-on-drop pages; durable metadata-only application delivery with exact publication identity and token-bound acknowledgement and bounded retained one-host forced-process-redelivery evidence; direct semantic-v5 source/carrier transfer with durable resume state and bounded retained one-host interrupted/reopened/different-peer evidence | Peer/convergence and transfer-progress status, network/application selector-separation acceptance, route-only relay/custody, arbitrary-peer resume, power-loss/filesystem-crash/long-offline recovery, large/RSS acceptance, representative physical or mixed-implementation evidence, retention, garbage collection, and release authorization |
 | **Operations** | Manually admitted direct addresses, an operator-pinned controlled relay, bounded one-host software namespace-NAT acceptance, reference mission provisioning, and bounded same-UID Unix software zeroization | Protected operational provisioning, discovery, representative/physical NAT, public/default relay selection, BTLE platform integration, physical sanitization, and release authorization |
 
 The [capability roadmap](docs/implementation/capability-roadmap.md) is the

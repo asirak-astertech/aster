@@ -178,6 +178,7 @@ implementation version and conformance-vector digest under test.
 | V-MUTABLE-V4 | selected State/Record mechanics inherited by v5 | `[5,4,3,2,1]` negotiation with v1-v3 mutable absence and v4/v5 State/Record parity; every class/direction frame and all malformed/truncated/trailing/unknown variants; exact offer apply result and fetch-result/ack sequencing; exact finish remainder; current-lineage and same-epoch replacement behavior; Normal/AtLeast/ReceiveOnly boundaries; fatal over-1-MiB rejection; 4,096-row/16-MiB class caps; typed effective ordinary-aggregate/per-class item/byte, 1,024-version per-key projection, and causal-frontier deferral; durable 256-peer/1,024-row fair-cursor rotation, CAS race, prune, reopen, audit, and terminal preservation |
 | V-BLOB-V5 | selected direct Blob source and carrier mechanics | v1-v4 zero Blob frames; exact canonical interest/source/range/result/ack/finish bytes and class/direction/tuple sequencing, including the 76,807-byte maximum protected interest, 153,718-byte two-frame interest exchange, and 17,127-byte six-frame carrier settlement reserve; source-before-carrier; peer/mission/topic/scope/epoch/current-grant proof with route and revocation checks at inventory/source/every range; wrong/tampered/stale/same-epoch proof rejection; old-lineage withholding plus `PhysicalLineageConflict` until numeric epoch advance; 16-KiB contiguous peer-neutral durable prefixes resumed from a different eligible peer after runtime/store/cache teardown and reopen; exact startup removal of pending source/cache/prefix visibility after same-epoch replacement, epoch advance, or publisher revocation while retaining bounded quota-charged depot expected/committed staging; 64-MiB/1,024-chunk admission and 10,000-row/64-MiB staging bounds; typed deferral without eviction; pending invisibility; exact depot plus fresh full-content and current-lineage completion before atomic publication; all-open-path cross-table audit binding pending source/manifest route/carriers to the depot plan and excluding simultaneous pending/completed state without repair; all-or-none writable nine-to-13-table migration with owner-token rules and read-only/partial-group nonmigration; requester Finish echo distinguished from per-range durable Result/Ack; Normal/AtLeast work and ReceiveOnly zero Blob |
 | V-BLOB-LIVE | selected live Blob application boundary | cloneable handle publication from an already-open regular nonempty file at cursor zero, with two-pass mutation detection, cancellation, durable idempotency, a 64-MiB/1,024 canonical 64-KiB-chunk ceiling, and no caller-path reopen; live absolute-offset reads returning at most 64 KiB in zeroize-on-drop plaintext and withholding plaintext across rekey; fresh selected source plus current policy/lineage and exact authenticated `BlobDepotCompletion` capability around depot access; shared application-lane capacity 32 and joined Blob-worker capacity one with bounded saturation; `FatalBlobCoherence` closure of all application admission and actor termination; shutdown and live/stopped terminal zeroization join/closure behavior while audit rows and encrypted depot ciphertext remain preserved |
+| V-BLOB-DELIVERY | selected durable Blob application delivery | exact source-publication identity distinct from `BlobId`; metadata-only bounded poll; durable selector replay, pending attempts, acknowledgement receipts, and monotonic cursors; attempt-token rotation with earlier same-tenure token validity; malformed and cross-publication rejection; exact re-acknowledgement; forced receiver-process replacement; final peerless empty-ledger reopen; local status explicitly separated from peer/convergence status |
 | V-FRAG | carrier segments | every supported MTU, order, duplicate, truncation, overlap, bounds |
 | V-IP | IP control bytes | discovery proof vectors and nonce freshness; rendezvous token echo/address forms, TTL, source, and capacity rejection; local endpoint-handle collision and non-authorization tests |
 | V-EXT | evolution | optional skip/preserve and critical rejection; transactional core SQLite schema-14→15 provenance migration preserving existing v1-v4 rows and v5 restart provenance |
@@ -374,6 +375,22 @@ and therefore claim no retained delivery evidence. The queue's local ledger
 counts are not peer/convergence status. Neither evidence tier claims route-only
 Blob relay/custody, the 100+ MiB or RSS target, physical-media behavior, mixed
 implementation, or release acceptance.
+
+The delivery queue separately has a dated
+[`V-BLOB-DELIVERY` retained receipt](implementation/evidence/selected-live-blob-subscription-26e0a09.json).
+Its 10,269 canonical bytes have SHA-256
+`3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675`
+and bind Good-signed source `26e0a09`. One participant executes three
+processes and four actor lifetimes on one peerless host. Two exact publications
+share one `BlobId`; after the attempt-one child flushes an unacknowledged token
+and receives `SIGKILL`, a fresh process receives attempt 2 and acknowledges it
+with the persisted attempt-one token, rejects a cross-publication token, and
+settles both publications. The final parent reopen replays one selector and
+polls an empty ledger. This is not a network conformance result and claims no
+contact, synchronization, transfer, peer/convergence status,
+selector/network-interest separation, power-loss/filesystem-crash recovery,
+TTL/GC, physical or mixed implementation, resource/soak, reproducible build,
+or release acceptance.
 
 A separate dated
 [`V-BLOB-LIVE` retained receipt](implementation/evidence/selected-live-blob-044d90f.json)

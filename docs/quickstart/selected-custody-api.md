@@ -280,8 +280,15 @@ no Record subscription itself; Record's separate retained-bounded durable
 whole-key queue is documented in the [selected Record API](selected-record-api.md)
 and its [Record-delivery receipt](../implementation/evidence/selected-live-record-subscription-0c11344.json).
 That receipt adds no custody or TTL/GC claim here. Blob application delivery is
-now a separate metadata-only current-code queue, but retained delivery
-acceptance, Blob peer/convergence status, Blob custody/TTL/GC,
+now a separate metadata-only queue with a
+[retained 10,269-byte peerless receipt](../implementation/evidence/selected-live-blob-subscription-26e0a09.json)
+(SHA-256
+`3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675`,
+Good-signed source `26e0a09`) covering forced attempt-one process termination,
+fresh-process attempt-2 redelivery acknowledged with the older token, two exact
+publications sharing one `BlobId`, and an empty final ledger. That receipt adds
+no custody evidence. Blob peer/convergence status, network/selector separation,
+Blob custody/TTL/GC,
 arbitrary-peer or route-only Blob resume, selected-node bindings, cross-class
 priority eviction, physical-radio silence or media-sanitization proof, protected
 provisioning, representative/physical NAT or Internet, public/default or

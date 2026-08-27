@@ -71,7 +71,7 @@ equivalent tests.
 |---|---|---|
 | Selected direct Iroh | Manually admitted exact endpoint ID and socket, authenticated direct UDP/QUIC, and bounded exchange | A retained one-host cone software-namespace cell observed Direct and exact Event delivery across two NAT routers with static operator-known mappings. Carrier authentication is not mission or control/source authorization; discovery/punching, dynamic or representative NAT, physical-network acceptance, and multi-carrier failover remain open. |
 | Selected controlled Iroh relay | One operator-pinned HTTPS relay with explicit trust, either alongside the initial direct locator or with IP disabled | A retained one-host restrictive software-namespace cell blocked direct traffic, observed Relay, and delivered one exact Event through the controlled relay. It is not a temporal direct-first/fallback chronology, representative or physical NAT, public or independently operated relay, an Aster payload-blind relay, State/Record/Blob-over-relay acceptance, or release authorization. |
-| Selected node and CLI | Networked Event and State/Record reconciliation, semantic-v5 direct Blob source/carrier transfer, live Event/State/Record/Blob Rust APIs, durable Event stream, State positive-current-version delivery, Record whole-key active-head delivery, and Blob metadata-only publication delivery in Rust, stopped Event/State/Record/Blob facades, payload-blind Event relay, restart/idempotency, bounded retained one-host State and Record forced-process-redelivery evidence, three-participant direct Blob publication/partial/different-peer-resume/read/graceful-reopen evidence, and bounded Unix zeroization | Reference provisioning; no State contact/status, materialized-view, or synthetic-withdrawal delivery, retained Blob-delivery acceptance, Blob peer/convergence status, or selected-node language bindings; State/Record/Blob application subscriptions do not dynamically change configured network interests; no automatic Record merge, arbitrary-peer or route-only Blob resume acceptance, Blob-over-controlled-relay acceptance, finite State/Record/Blob TTL and non-Linux finite Event custody, generalized control administration, representative physical or mixed-implementation evidence, resource/soak evidence, or production authorization |
+| Selected node and CLI | Networked Event and State/Record reconciliation, semantic-v5 direct Blob source/carrier transfer, live Event/State/Record/Blob Rust APIs, durable Event stream, State positive-current-version delivery, Record whole-key active-head delivery, and Blob metadata-only publication delivery in Rust, stopped Event/State/Record/Blob facades, payload-blind Event relay, restart/idempotency, bounded retained one-host State, Record, and peerless Blob forced-process-redelivery evidence, three-participant direct Blob publication/partial/different-peer-resume/read/graceful-reopen evidence, and bounded Unix zeroization | Reference provisioning; no State contact/status, materialized-view, or synthetic-withdrawal delivery, Blob peer/convergence status, network/application selector-separation acceptance, or selected-node language bindings; State/Record/Blob application subscriptions do not dynamically change configured network interests; no automatic Record merge, arbitrary-peer or route-only Blob resume acceptance, Blob-over-controlled-relay acceptance, finite State/Record/Blob TTL and non-Linux finite Event custody, generalized control administration, representative physical or mixed-implementation evidence, resource/soak evidence, or production authorization |
 | Current semantic in-memory link | Full high-level host contact, authentication, reconciliation, resume, and failure tests | It is a test carrier and is not wired to the selected composition |
 | Current semantic UDP/IP | Nonblocking link, manual endpoint mapping, protected local discovery, rendezvous helpers, opaque relay components | Migration onto the selected node; full host acceptance on physical or operational networks |
 | Current semantic NAT/rendezvous and relay | Bounded rendezvous, endpoint-punching, and opaque-relay helpers with local software tests | Selected-node integration and a two-device representative-NAT direct/fallback result |
@@ -245,8 +245,17 @@ hosts, NAT or Internet paths, controlled or public relay, BTLE, process crash
 or power-loss recovery, long-offline recovery, arbitrary-peer or route-only
 resume, scale beyond three participants, resource thresholds or soak,
 physical sanitization, independent-implementation interoperability, or release
-authorization. Blob delivery now has a metadata-only current-code mechanism,
-but retained delivery acceptance and Blob peer/convergence status, State contact/status and
+authorization. Blob delivery now has a metadata-only mechanism and a separate
+[retained 10,269-byte peerless delivery receipt](implementation/evidence/selected-live-blob-subscription-26e0a09.json)
+(SHA-256
+`3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675`,
+Good-signed source `26e0a09`). It observes one participant across three
+processes/four actor lifetimes, `SIGKILL` after a flushed attempt-one poll,
+fresh-process attempt-2 redelivery acknowledged with the older token, two exact
+publications sharing one `BlobId`, and an empty final reopen. It adds no network
+transport, selector-separation, peer-status, power-loss/filesystem-crash,
+TTL/GC, physical/mixed-implementation, resource/soak, or release evidence. Blob
+peer/convergence status, State contact/status and
 materialized-view/synthetic-withdrawal behavior,
 dynamic State/Record network interests, selected-node bindings, route-only Blob
 relay/custody, Blob-over-controlled-relay acceptance, generalized control

@@ -43,6 +43,24 @@ physical sanitization, independent-implementation interoperability, or release
 authorization. That frozen receipt predates the delivery queue and gives it no
 retained execution credit; the queue currently has focused mechanism tests only.
 
+A separate
+[retained 10,269-byte v1 Blob-delivery receipt](../implementation/evidence/selected-live-blob-subscription-26e0a09.json)
+(SHA-256
+`3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675`)
+binds Good-signed source `26e0a09`. It is a peerless one-host,
+one-participant run with three processes and four actor lifetimes. Two exact
+publications share one `BlobId`. The attempt-one child flushes a durable
+unacknowledged token and is sent `SIGKILL`; a fresh process receives the same
+publication as attempt 2 and acknowledges it using the persisted attempt-one
+token, rejects that publication's token against the second publication, then
+settles both exact publications. A final parent reopen replays one subscription
+and polls an empty ledger with zero pending and two acknowledged publications.
+This receipt observes no contacts or network Blob activity and does not claim
+peer/convergence status, selector withholding or network-interest separation,
+plaintext delivery or exact-publication reads, power-loss/filesystem-crash
+recovery, physical or mixed systems, TTL/GC, resource/soak, reproducible build,
+or release authorization.
+
 ## Use the live actor API
 
 Start the node as described in the [selected Event quickstart](selected-event-api.md),
@@ -205,7 +223,8 @@ make application side effects transactional with acknowledgement.
 contact, peer, transfer-progress, or convergence status. The focused mechanism
 tests cover retry, re-acknowledgement, selector replacement/removal, durable
 reopen, policy withholding, bounded scans, and distinct publications sharing
-one Blob ID. Retained Linux delivery acceptance remains pending.
+one Blob ID. The retained receipt above covers only its narrower peerless
+forced-process retry and final empty ledger.
 
 ## Run the example
 
@@ -355,10 +374,11 @@ ID, not the last manifest record.
 Normal and `AtLeast` run the v5 lane because `AtLeast` filters Event only.
 `ReceiveOnly` advertises, requests, stages, promotes, and counts zero Blob work.
 The live handle does not change those contact rules and reports no Blob peer or
-convergence status. The retained receipt above is only the bounded
+convergence status. The retained direct-transfer receipt above is only the bounded
 three-participant, one-host, graceful-reopen observation described there. The
 selected slice still has no route-only Blob relay/custody, arbitrary-peer
-resume evidence, retained Blob-delivery acceptance, Blob TTL/expiry/GC,
+resume evidence, network/application selector-separation acceptance, Blob
+TTL/expiry/GC,
 metadata-independent
 whole-byte identity or deduplication, 100+ MiB/RSS or resource/soak acceptance,
 representative physical carrier, NAT/Internet, relay, BTLE,
