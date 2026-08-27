@@ -62,6 +62,8 @@ PRODUCER_PATH = "crates/aster-node/examples/live_event_acceptance.rs"
 RUNNER_PATH = "tools/run-selected-live-event.py"
 CHECKER_PATH = "tools/check-selected-live-event-receipt.py"
 TEST_PATH = "tools/test-selected-live-event-receipt.py"
+BINARY_NAME = "aster-live-event-acceptance"
+PARTICIPANTS = ("publisher", "receiver")
 ADMITTED_SOURCE_PATHS = tuple(
     sorted(
         {
@@ -121,7 +123,7 @@ EXPECTED_FILES = {
     "stdout.log": 0o600,
     "stderr.log": 0o600,
     "transcript.tsv": 0o600,
-    "binary/aster-live-event-acceptance": 0o700,
+    f"binary/{BINARY_NAME}": 0o700,
     "participants/publisher/mission.bundle": 0o600,
     "participants/publisher/state/identity.key": 0o600,
     "participants/publisher/state/mesh.redb": 0o600,
@@ -780,7 +782,7 @@ def validate_inventory(root_descriptor: int) -> dict[str, dict[str, os.stat_resu
     if len(set(identities)) != len(identities):
         fail("raw inventory contains aliased directory or file identities")
 
-    for participant in ("publisher", "receiver"):
+    for participant in PARTICIPANTS:
         mission = observed_files[f"participants/{participant}/mission.bundle"]
         identity = observed_files[f"participants/{participant}/state/identity.key"]
         store = observed_files[f"participants/{participant}/state/mesh.redb"]
@@ -2130,7 +2132,7 @@ def validate_run_document(
     if build_argv != EXPECTED_BUILD_ARGV:
         fail("run.commands.build_argv differs from the exact release build invocation")
     run_argv = exact_array(commands["run_argv"], "run.commands.run_argv", length=2)
-    expected_binary = os.fspath(root / "binary" / "aster-live-event-acceptance")
+    expected_binary = os.fspath(root / "binary" / BINARY_NAME)
     if run_argv != [expected_binary, os.fspath(root)]:
         fail("run.commands.run_argv does not bind the copied executable and exact raw root")
 
@@ -2162,7 +2164,7 @@ def validate_run_document(
         "binary": validate_artifact_record(
             artifacts["binary"],
             "run.artifacts.binary",
-            path="binary/aster-live-event-acceptance",
+            path=f"binary/{BINARY_NAME}",
             data=binary,
         ),
         "stdout": validate_artifact_record(artifacts["stdout"], "run.artifacts.stdout", path="stdout.log", data=stdout),
@@ -2206,7 +2208,7 @@ def validate_raw_root(root: Path, source_authority: dict[str, Any]) -> dict[str,
         )
         binary, binary_metadata = read_public_file(
             root_descriptor,
-            "binary/aster-live-event-acceptance",
+            f"binary/{BINARY_NAME}",
             "copied release executable",
             BINARY_MAX_BYTES,
         )
@@ -2215,7 +2217,7 @@ def validate_raw_root(root: Path, source_authority: dict[str, Any]) -> dict[str,
             "stdout.log": stdout_metadata,
             "stderr.log": stderr_metadata,
             "transcript.tsv": transcript_metadata,
-            "binary/aster-live-event-acceptance": binary_metadata,
+            f"binary/{BINARY_NAME}": binary_metadata,
         }
         for relative, metadata in public_metadata.items():
             observed = inventory["files"][relative]
@@ -2260,9 +2262,9 @@ def validate_raw_root(root: Path, source_authority: dict[str, Any]) -> dict[str,
                 "terminal selected transcript",
                 TRANSCRIPT_MAX_BYTES,
             )[0],
-            "binary/aster-live-event-acceptance": read_public_file(
+            f"binary/{BINARY_NAME}": read_public_file(
                 root_descriptor,
-                "binary/aster-live-event-acceptance",
+                f"binary/{BINARY_NAME}",
                 "terminal copied release executable",
                 BINARY_MAX_BYTES,
             )[0],
@@ -2272,7 +2274,7 @@ def validate_raw_root(root: Path, source_authority: dict[str, Any]) -> dict[str,
             "stdout.log": stdout,
             "stderr.log": stderr,
             "transcript.tsv": transcript,
-            "binary/aster-live-event-acceptance": binary,
+            f"binary/{BINARY_NAME}": binary,
         }
         for relative, initial_data in initial_public.items():
             if final_public[relative] != initial_data:
@@ -2297,10 +2299,10 @@ def validate_raw_root(root: Path, source_authority: dict[str, Any]) -> dict[str,
                 "root_mode": "0700",
                 "directories": len(EXPECTED_DIRECTORIES),
                 "files": len(EXPECTED_FILES),
-                "participant_directories": 2,
-                "mission_artifacts": 2,
-                "identity_artifacts": 2,
-                "store_artifacts": 2,
+                "participant_directories": len(PARTICIPANTS),
+                "mission_artifacts": len(PARTICIPANTS),
+                "identity_artifacts": len(PARTICIPANTS),
+                "store_artifacts": len(PARTICIPANTS),
                 "secret_artifact_contents": "metadata-only-not-opened-read-or-hashed",
                 "file_links": "all-one",
                 "inventory_aliases": "none",

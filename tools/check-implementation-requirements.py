@@ -78,6 +78,9 @@ LIVE_MUTABLE_RECEIPT = (
 LIVE_BLOB_RECEIPT = (
     "docs/implementation/requirements-status.md#selected-live-blob-retained-receipt"
 )
+LINUX_CUSTODY_RECEIPT = (
+    "docs/implementation/requirements-status.md#selected-linux-event-custody-retained-receipt"
+)
 DEPENDENCY_GATE = (
     "docs/implementation/requirements-status.md#dependency-admission-gate"
 )
@@ -115,6 +118,13 @@ CUSTODY_SLICE = (
     "crates/aster-node/src/runtime.rs; crates/aster-node/src/application.rs; "
     "crates/aster-node/examples/custody_application.rs; "
     "docs/quickstart/selected-custody-api.md"
+)
+LINUX_CUSTODY_ACCEPTANCE_SLICE = (
+    "crates/aster-node/examples/linux_event_custody_acceptance.rs; "
+    "tools/run-selected-linux-event-custody.py; "
+    "tools/check-selected-linux-event-custody-receipt.py; "
+    "tools/test-selected-linux-event-custody-receipt.py; "
+    "docs/implementation/evidence/selected-linux-event-custody-ade6ee1.json"
 )
 AGENT_SLICE = (
     "proto/aster/application/v1alpha1/aster.proto; crates/aster-agent/src/lib.rs; "
@@ -692,16 +702,16 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
         "The exact count and names remain provisional pending stakeholder and service-doctrine approval; State, Record, Blob, and generic cross-class pressure remain outside selected custody.",
     ),
     "DM-5.4-05": selected_claim(
-        "implemented-uncredited",
+        "observed-bounded",
         "aster-core + aster-redb-store + aster-node",
-        f"{CUSTODY_SLICE}; EventPublishRequest requires the publisher to choose one priority and the source envelope authenticates it through storage and forwarding",
-        "Selected evidence is Event/RouteEvent-only and same-implementation; stakeholder priority-name governance, other classes, bindings, and acceptance remain open.",
+        f"{CUSTODY_SLICE}; {LINUX_CUSTODY_ACCEPTANCE_SLICE}; {LINUX_CUSTODY_RECEIPT}; the retained origin assigned and authenticated one priority on each of six Events, four exact Events with preserved priorities reached route custody, and the two surviving receiver deliveries preserved Flash and Immediate",
+        "The receipt is one same-implementation Linux-container loopback observation for Event/RouteEvent only. Stakeholder priority-name governance, other classes, bindings, physical systems, mixed implementations, scale, and release authorization remain open.",
     ),
     "DM-5.4-09": selected_claim(
-        "implemented-uncredited",
+        "observed-bounded",
         "aster-redb-store + aster-node",
-        f"{CUSTODY_SLICE}; one bounded bulk scheduler orders eligible semantic-v3/v4/v5 Event/RouteEvent custody by source priority, remaining TTL, acceptance order, and exact identity before leasing and final send rechecks",
-        "Evidence is selected Event-only and loopback automated testing; v1/v2 deterministic partial behavior, physical links, many-node scale, mixed implementations, and other classes remain open.",
+        f"{CUSTODY_SLICE}; {LINUX_CUSTODY_ACCEPTANCE_SLICE}; {LINUX_CUSTODY_RECEIPT}; after finite expiry and one explicit pressure retirement, the retained relay offered exactly the surviving Flash and Immediate Events and the receiver returned those two deliveries in that priority order",
+        "This observes one two-item current selected Event/RouteEvent order after a deliberately staged quota transition. It does not observe retry cadence, older-version deterministic partial behavior, cross-class ordering, physical or impaired links, many-node scale, mixed implementations, or release authorization.",
     ),
     "DM-5.4-10": selected_claim(
         "implemented-uncredited",
@@ -710,34 +720,34 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
         "This is selected Event/RouteEvent mechanism evidence, not physical-loss, long-disconnection, many-peer, cross-class, or retained acceptance evidence.",
     ),
     "DM-5.4-12": selected_claim(
-        "implemented-uncredited",
+        "observed-bounded",
         "aster-core + aster-redb-store + aster-node",
-        f"{CUSTODY_SLICE}; priority and optional TTL are independent source-authenticated Event fields and neither the scheduler nor custody merge derives or rewrites one from the other",
-        "The mechanism is Event-only; State, Record, Blob, bindings, physical systems, mixed implementations, and release acceptance remain open.",
+        f"{CUSTODY_SLICE}; {LINUX_CUSTODY_ACCEPTANCE_SLICE}; {LINUX_CUSTODY_RECEIPT}; the retained origin authenticated two finite Flash Events with distinct expiry horizons plus durable Flash, Immediate, Priority, and Routine Events, preserving TTL as independent from priority through custody",
+        "The observation is Event/RouteEvent-only in one same-implementation Linux container. State, Record, Blob, non-Linux finite TTL, bindings, physical systems, mixed implementations, scale, and release authorization remain open.",
     ),
     "DM-5.4-13": selected_claim(
-        "implemented-uncredited",
+        "observed-bounded",
         "aster-core + aster-redb-store + aster-node",
-        f"{CUSTODY_SLICE}; for non-tombstone finite-TTL Event/RouteEvent data, age greater than or equal to source TTL is withheld in inventory, load, lease, carrier-adjacent final checks, and final application query/poll/gap exposure",
-        "Finite Event custody is Linux-only and requires semantic v3, v4, or v5; selected clock-domain loss is sticky and requires an application-specific replacement or new source revision. Selected State/Record/Blob finite TTL is rejected; physical links, other classes, and retained acceptance remain open.",
+        f"{CUSTODY_SLICE}; {LINUX_CUSTODY_ACCEPTANCE_SLICE}; {LINUX_CUSTODY_RECEIPT}; Linux CLOCK_BOOTTIME withheld one Event already expired before the first contact and expired a second retained route Event on relay reopen before the receiver contact, with neither Event delivered",
+        "Finite Event custody is Linux-only and semantic-v3-format behavior inherited by v4/v5. The receipt is one short one-kernel loopback run without suspend injection; selected clock-domain replacement, non-Linux behavior, State/Record/Blob TTL, physical links, mixed implementations, scale, and release authorization remain open.",
     ),
     "DM-5.4-14": selected_claim(
-        "implemented-uncredited",
+        "observed-bounded",
         "aster-redb-store + aster-node",
-        f"{CUSTODY_SLICE}; bounded maintenance marks known-expired Event/RouteEvent custody unavailable, drains protected leases safely, removes exact payload bytes, and retains permanent receiver fences with audited restart state",
-        "Collection is selected Event/RouteEvent-only. State, Record, Blob, physical allocation, long-duration evidence, and release acceptance remain open.",
+        f"{CUSTODY_SLICE}; {LINUX_CUSTODY_ACCEPTANCE_SLICE}; {LINUX_CUSTODY_RECEIPT}; bounded Linux maintenance collected the already-expired origin Event and the relay-expired route Event, and the retained inspection verified the retirement fence persisted through reopen and forwarding",
+        "Collection is observed only for two selected Event/RouteEvent items in one short same-implementation Linux-container run. State, Record, Blob, physical allocation reclamation, long-duration pressure, crash/power-loss points, mixed implementations, scale, and release authorization remain open.",
     ),
     "DM-5.4-15": selected_claim(
-        "implemented-uncredited",
+        "observed-bounded",
         "aster-node",
-        f"{CUSTODY_SLICE}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; SelectedForwardingConfig and the live RunningNode policy expose Normal, AtLeast, and ReceiveOnly with revision checks at object send and receive-commit boundaries; Normal/AtLeast run v4/v5 State/Record and may run v5 Blob because AtLeast is Event-only, while ReceiveOnly exposes neither mutable nor Blob work",
-        "AtLeast does not create State/Record/Blob custody priority. Physical RF silence, carrier-wide policy, route-only Blob custody, bindings, and operational acceptance remain open.",
+        f"{CUSTODY_SLICE}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; {LINUX_CUSTODY_ACCEPTANCE_SLICE}; {LINUX_CUSTODY_RECEIPT}; the retained origin used AtLeast(Priority), both downstream actors used ReceiveOnly while accepting inbound Event custody, and the relay later used Normal to forward only the two surviving route Events",
+        "This is a same-implementation loopback exercise of the selected Event policy hooks, not physical RF silence or carrier-wide policy. AtLeast does not create State/Record/Blob custody priority; route-only Blob custody, bindings, broader platform/transport evidence, scale, and release authorization remain open.",
     ),
     "DM-5.4-16": selected_claim(
-        "implemented-uncredited",
+        "observed-bounded",
         "aster-node",
-        f"{CUSTODY_SLICE}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; EventEmissionPolicy::AtLeast applies one explicit source-priority floor to every selected Event offer with carrier-adjacent live revision closure; configured contacts, required protocol/control work, semantic-v4/v5 State/Record lanes, and eligible v5 Blob work continue",
-        "No topic default, integrator priority rewrite/cap, State/Record/Blob custody priority, policy-driven discovery control, physical proof, language binding, or retained acceptance is claimed.",
+        f"{CUSTODY_SLICE}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; {LINUX_CUSTODY_ACCEPTANCE_SLICE}; {LINUX_CUSTODY_RECEIPT}; the retained AtLeast(Priority) contact transferred exactly four unexpired Events at or above Priority while withholding the authenticated Routine Event below the configured floor",
+        "The receipt covers one explicit Event floor and one direct loopback contact. It does not establish topic defaults, integrator rewrites/caps, State/Record/Blob custody priority, policy-driven discovery control, physical or impaired-link behavior, language bindings, mixed implementations, scale, or release authorization.",
     ),
     "DM-5.4-17": selected_claim(
         "implemented-uncredited",
@@ -746,10 +756,10 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
         "ReceiveOnly may emit mandatory connection authentication and Event acknowledgements/apply results; it is not physical radio silence and has no packet-capture, BTLE, platform, or independent acceptance evidence.",
     ),
     "DM-5.4-18": selected_claim(
-        "implemented-uncredited",
+        "observed-bounded",
         "aster-node",
-        f"{CUSTODY_SLICE}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; a real semantic-v3/v4/v5 loopback test gives the ReceiveOnly responder an empty disclosed Event inventory while it accepts authenticated finite priority Event offers within interest, route, TTL, and quota policy; semantic-v4/v5 mutable classes and semantic-v5 Blob work are skipped",
-        "Evidence is one-host same-implementation automation, not physical, impaired-link, mixed-implementation, long-running, or release acceptance.",
+        f"{CUSTODY_SLICE}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; {LINUX_CUSTODY_ACCEPTANCE_SLICE}; {LINUX_CUSTODY_RECEIPT}; while operating in ReceiveOnly, the retained relay initiated zero contacts and disclosed zero local Event, State, Record, Blob, or control objects while ingesting four authenticated route Events; the ReceiveOnly receiver likewise ingested the two surviving Events",
+        "Evidence is one-host same-implementation direct-loopback execution, not physical RF silence, an impaired link, a long-running partition, mixed implementations, broader class custody, scale, or release authorization.",
     ),
     "DM-5.4-19": selected_claim(
         "implemented-uncredited",
@@ -764,10 +774,10 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
         "The qualitative simplicity claim lacks adopter usability evidence, stakeholder approval, language bindings, physical operation, and release acceptance.",
     ),
     "DM-5.4-22": selected_claim(
-        "implemented-uncredited",
+        "observed-bounded",
         "aster-core + aster-redb-store + aster-node",
-        f"{CUSTODY_SLICE}; {LIVE_MUTABLE_SLICE}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; the selected Event matrix is fixed priority, optional positive TTL, and Normal/AtLeast/ReceiveOnly emission, with aggregate and exact-scope bounds rather than an open-ended policy language; live State/Record publication remains outside Event custody/priority, their v4/v5 lanes and the v5 Blob lane continue under AtLeast, and all three classes are absent under ReceiveOnly",
-        "Priority count/names remain provisional; optional defaults/caps/overrides, richer post-MVP policy, State/Record/Blob custody/TTL, bindings, physical evidence, and release acceptance remain open.",
+        f"{CUSTODY_SLICE}; {LIVE_MUTABLE_SLICE}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; {LINUX_CUSTODY_ACCEPTANCE_SLICE}; {LINUX_CUSTODY_RECEIPT}; one retained run exercised the fixed four Event priorities, finite-or-durable TTL, AtLeast/Normal/ReceiveOnly emission, and exact-scope quota bounds without an open-ended policy language",
+        "The receipt covers one deliberately small same-implementation Event/RouteEvent matrix. Priority count/names remain provisional; defaults/caps/overrides, richer post-MVP policy, State/Record/Blob custody/TTL, bindings, physical systems, mixed implementations, scale, and release authorization remain open.",
     ),
     "DM-5.5-01": selected_claim(
         "implemented-uncredited", "aster-core + aster-redb-store + aster-node",
@@ -795,10 +805,10 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
         "Verify repeated dynamic membership changes, multiple scopes, physical peers, route-only Blob relay/custody policy, and independent implementations.",
     ),
     "DM-5.5-07": selected_claim(
-        "implemented-uncredited",
+        "observed-bounded",
         "aster-redb-store + aster-node",
-        f"{EVENT_SLICE}; {CUSTODY_SLICE}; SelectedForwardingConfig installs aggregate StoreLimits and exact-scope CustodyQuota values before readiness; route-only and accepted Event custody share audited ordinary usage and bounded pressure",
-        "Logical row/source-byte limits do not measure redb/filesystem allocation. State/Record have fixed 4,096-row/16-MiB per-class fail-closed admission and durable cursor metadata but no custody eviction; Blob network staging is bounded at 10,000 rows/64 MiB but has no TTL/custody pressure or complete physical accounting. Physical sustained-pressure, scale, mixed-implementation, and retained acceptance evidence remain open.",
+        f"{EVENT_SLICE}; {CUSTODY_SLICE}; {LINUX_CUSTODY_ACCEPTANCE_SLICE}; {LINUX_CUSTODY_RECEIPT}; the retained route-only relay admitted exactly four Events under an exact-scope four-item quota, expired one, retired exactly one lower-priority RouteEvent under explicit stopped-store pressure, persisted a two-item quota, and reopened with exactly two route items",
+        "The quota transition was deliberately staged by stopped-store pressure followed by quota lowering; it is not automatic startup down-sizing or sustained physical-capacity pressure. Logical row/source-byte limits do not measure redb/filesystem allocation; other classes lack equivalent custody eviction and complete physical accounting. Scale, mixed implementations, long pressure, and release authorization remain open.",
     ),
     "DM-5.6-01": selected_claim(
         "implemented-uncredited",
@@ -1064,16 +1074,16 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
         "This is one same-build, same-implementation, one-scope/authority/topic, line-topology observation on one macOS arm64 host. It is not the bracketed at-least-100-node target, a full 2-through-32 range sweep, distributed or physical scale, NAT/relay/BTLE/cross-transport evidence, independent interoperability, or resource-threshold/release acceptance.",
     ),
     "DM-9-24": selected_claim(
-        "implemented-uncredited",
+        "observed-bounded",
         "aster-redb-store + aster-node",
-        f"{CUSTODY_SLICE}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; StoreLimits bound accounted aggregate namespaces while custody quotas, table caps, schedulers, retry/receipt/lease caps, authority reserve, and permanent-fence reserve fail closed at selected Event boundaries; State/Record cap objects at 1 MiB and each class at 4,096 rows/16 MiB, while v5 Blob network admission is 64 MiB/1,024 chunks and pending staging is 10,000 rows/64 MiB with 16-KiB range service",
-        "Accepted-dot, aggregate causal-frontier domains, and Event-position/high-water ledgers lack a complete retirement bound. State/Record/Blob have no complete GC/custody pressure or physical allocation accounting. Hostile unrelated files, snapshots/backups/swap, long pressure, scale, mixed implementations, and release acceptance remain open.",
+        f"{CUSTODY_SLICE}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; {LINUX_CUSTODY_ACCEPTANCE_SLICE}; {LINUX_CUSTODY_RECEIPT}; one retained route-only scope stayed within a four-item bound, then bounded maintenance plus explicit pressure reduced it to exactly two retained items with zero legacy, State, Record, Blob, or control namespace content",
+        "This observes one logical Event/RouteEvent item bound, not complete local-storage or physical-allocation accounting. Accepted-dot, causal-frontier, Event-position/high-water, State/Record/Blob GC/custody, hostile unrelated files, snapshots/backups/swap, sustained pressure, scale, mixed implementations, and release authorization remain open.",
     ),
     "DM-9-25": selected_claim(
-        "implemented-uncredited",
+        "observed-bounded",
         "aster-redb-store + aster-node",
-        f"{CUSTODY_SLICE}; SelectedForwardingConfig accepts validated aggregate StoreLimits and deterministic exact-scope CustodyQuota replacements before readiness",
-        "Not every hard safety cap is operator-tunable, and there is no selected binding, live administrative quota mutation, physical-capacity accounting, or release evidence.",
+        f"{CUSTODY_SLICE}; {LINUX_CUSTODY_ACCEPTANCE_SLICE}; {LINUX_CUSTODY_RECEIPT}; the retained relay ran under explicit exact-scope four-item and one-MiB bounds, then persisted an explicit two-item replacement before reopen and forwarded within that configured bound",
+        "The run exercises one stopped exact-scope Event quota transition. Not every hard safety cap is operator-tunable, and there is no selected binding, live administrative mutation, physical-capacity accounting, mixed-implementation evidence, scale result, or release authorization.",
     ),
     "DM-11-02": selected_claim(
         "implemented-uncredited",
@@ -1099,11 +1109,23 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
         f"{LIVE_MUTABLE_SLICE}; {LIVE_MUTABLE_RECEIPT}; SelectedRecordHandle surfaces an application-level RecordConflict containing every sorted sibling semantic ID and an opaque exact projection guard, then returns current and superseded annotations after resolution",
         "The annotation exists only in the embedded Rust application surface; the complete MVP, selected-node language bindings, agent RPC support, independent usability, physical/mixed acceptance, and release authorization remain open.",
     ),
+    "DM-11-13": selected_claim(
+        "implemented-uncredited",
+        "aster-core + aster-redb-store + aster-node",
+        f"{CUSTODY_SLICE}; {LINUX_CUSTODY_ACCEPTANCE_SLICE}; {LINUX_CUSTODY_RECEIPT}; the selected Event composition includes the fixed Routine, Priority, Immediate, and Flash set; the retained run published Events at all four levels, withheld Routine below the threshold, retired Priority under pressure, and delivered Flash plus Immediate",
+        "The fixed set exists and has one bounded retained observation, but the exact count and names remain provisional and the complete MVP is not shipped. Stakeholder approval, bindings, supported-target packaging, physical/mixed acceptance, and release authorization remain open.",
+    ),
     "DM-11-15": selected_claim(
         "implemented-uncredited",
         "aster-core + aster-redb-store + aster-node",
         f"{CUSTODY_SLICE}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; the selected Event MVP surface includes positive source-authenticated TTL publication, cumulative semantic-v3/v4/v5 custody, exact expiry withholding, collection, and permanent replay fences; selected State/Record/Blob finite TTL is rejected",
         "Finite TTL is Linux-only and Event/RouteEvent-only; State/Record/Blob forwarding age, expiry, custody, and GC, the complete MVP, other platforms/classes, physical acceptance, bindings, protected provisioning, and release gates remain open.",
+    ),
+    "DM-11-16": selected_claim(
+        "implemented-uncredited",
+        "aster-node",
+        f"{CUSTODY_SLICE}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; {LINUX_CUSTODY_ACCEPTANCE_SLICE}; {LINUX_CUSTODY_RECEIPT}; the selected Rust composition includes Normal, AtLeast(priority), and ReceiveOnly startup/live emission-policy hooks, and the retained run exercised all three forms across two contacts",
+        "The hooks exist and have one bounded retained Event observation, but the complete MVP is not shipped. Selected-node bindings, protected operational provisioning, supported-target packaging, physical/mixed acceptance, broader class custody, and release authorization remain open.",
     ),
     "DM-11-17": selected_claim(
         "implemented-uncredited",
@@ -1134,6 +1156,18 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
         "aster-core + aster-redb-store + aster-node",
         f"{LIVE_MUTABLE_RECEIPT}; two independently authenticated live publishers edited the same Record key while peerless, four positive direct-only contacts reconciled both revisions, both actors exposed the same two annotated sibling IDs without silent loss, ordinary publication inserted nothing, exact-guard resolution observed both siblings, and both peerless restart views retained the successor plus both superseded originals",
         "This passes one equivalent scenario on one host with one Rust implementation, two participants, a brief partition, direct Iroh, and no injected process crash. It is not physical, mixed-implementation, long-duration, relay/NAT/BTLE, adversarial-scale, product-release, or release-authorization evidence.",
+    ),
+    "DM-12-06": selected_claim(
+        "observed-bounded",
+        "aster-core + aster-redb-store + aster-node",
+        f"{LINUX_CUSTODY_ACCEPTANCE_SLICE}; {LINUX_CUSTODY_RECEIPT}; one equivalent bounded scenario withheld an already-expired Flash Event before the first contact, expired a second Flash route Event before the next contact, then delivered exactly the surviving Flash Event before the surviving Immediate Event",
+        "This is one same-implementation Linux-container direct-loopback equivalent scenario with staged quota pressure, not a physical constrained link. Impairment/loss, long disconnection, suspend injection, other classes, mixed implementations, target hardware, scale, product-release, and release-authorization evidence remain open.",
+    ),
+    "DM-12-07": selected_claim(
+        "observed-bounded",
+        "aster-node",
+        f"{LINUX_CUSTODY_ACCEPTANCE_SLICE}; {LINUX_CUSTODY_RECEIPT}; one equivalent bounded scenario used AtLeast(Priority) to withhold exactly one Routine Event while transferring four eligible Events into a ReceiveOnly route relay, then transferred the two surviving route Events into a ReceiveOnly receiver; while operating in ReceiveOnly, both actors initiated zero contacts and disclosed zero local data/control objects",
+        "This is one same-implementation Linux-container direct-loopback equivalent scenario, not physical RF silence, a constrained carrier, long-running operation, mixed implementations, broader-class custody, target hardware, scale, product-release, or release authorization.",
     ),
     "DM-12-08": selected_claim(
         "observed-bounded",

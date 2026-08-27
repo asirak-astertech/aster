@@ -1135,18 +1135,19 @@ impl Default for SelectedForwardingConfig {
 
 /// Process-local reader for one OS monotonic-clock continuity domain.
 ///
-/// Linux and macOS derive the domain from the current boot plus mission
+/// Linux derives the domain from a validated kernel boot UUID plus mission
 /// identity, so a stopped handle and a later runtime in the same boot share a
-/// checkpoint domain. Linux uses the suspend-inclusive boot clock. This crate
-/// cannot safely call macOS `mach_continuous_time` under its no-unsafe policy,
-/// so finite custody is explicitly disabled there; `CLOCK_MONOTONIC` remains
-/// usable only for durable v3 scheduling. Other Unix monotonic sources and the
-/// process-local non-Unix fallback likewise have no proven suspend-inclusive
-/// contract, so finite custody is Linux-only until such a source is integrated;
-/// durable v3 scheduling remains portable.
+/// checkpoint domain. Linux uses the suspend-inclusive boot clock. A missing or
+/// malformed boot UUID falls back to process-local continuity and disables
+/// finite custody. This crate cannot safely call macOS `mach_continuous_time`
+/// under its no-unsafe policy, so finite custody is explicitly disabled there;
+/// `CLOCK_MONOTONIC` remains usable only for durable v3 scheduling. Other Unix
+/// monotonic sources and the process-local non-Unix fallback likewise have no
+/// proven suspend-inclusive contract; durable v3 scheduling remains portable.
 #[derive(Clone, Debug)]
 pub(crate) struct NodeCustodyClock {
     clock_id: [u8; 16],
+    finite_ttl_supported: bool,
     #[cfg(not(unix))]
     origin: Arc<Instant>,
     #[cfg(test)]
@@ -1161,17 +1162,13 @@ struct InjectedCustodyClock {
 }
 
 impl NodeCustodyClock {
-    /// Whether this target supplies a suspend-inclusive custody clock.
-    pub(crate) const fn platform_supports_finite_ttl() -> bool {
-        cfg!(target_os = "linux")
-    }
-
     /// Whether this reader may exercise finite custody semantics.
     ///
     /// Deterministic injected readers are test-only continuity authorities;
-    /// production readers remain limited to the proven Linux clock source.
+    /// production readers require both the proven Linux clock source and a
+    /// validated kernel boot identity.
     pub(crate) fn supports_finite_ttl(&self) -> bool {
-        Self::platform_supports_finite_ttl()
+        self.finite_ttl_supported
             || cfg!(test) && {
                 #[cfg(test)]
                 {
@@ -1185,26 +1182,53 @@ impl NodeCustodyClock {
     }
 
     pub(crate) fn open(identity: NodeId) -> Result<Self, NodeError> {
-        let mut domain = Vec::new();
         #[cfg(target_os = "linux")]
         {
-            if let Ok(boot_id) = fs::read("/proc/sys/kernel/random/boot_id") {
-                domain.extend_from_slice(b"linux-boot-id\0");
-                domain.extend_from_slice(&boot_id);
-            }
+            let boot_id = fs::read("/proc/sys/kernel/random/boot_id").ok();
+            Self::open_from_linux_boot_id(identity, boot_id.as_deref())
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(not(target_os = "linux"))]
         {
-            if let Ok(output) = Command::new("/usr/sbin/sysctl")
-                .args(["-n", "kern.boottime"])
-                .output()
-                && output.status.success()
-                && !output.stdout.is_empty()
+            let mut domain = Vec::new();
+            #[cfg(target_os = "macos")]
             {
-                domain.extend_from_slice(b"macos-kern-boottime\0");
-                domain.extend_from_slice(&output.stdout);
+                if let Ok(output) = Command::new("/usr/sbin/sysctl")
+                    .args(["-n", "kern.boottime"])
+                    .output()
+                    && output.status.success()
+                    && !output.stdout.is_empty()
+                {
+                    domain.extend_from_slice(b"macos-kern-boottime\0");
+                    domain.extend_from_slice(&output.stdout);
+                }
             }
+            Self::from_domain(identity, domain, false)
         }
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    fn open_from_linux_boot_id(
+        identity: NodeId,
+        boot_id: Option<&[u8]>,
+    ) -> Result<Self, NodeError> {
+        let mut domain = Vec::new();
+        let boot_identity = boot_id.and_then(parse_linux_boot_id);
+        if boot_identity.is_some()
+            && let Some(boot_id) = boot_id
+        {
+            domain.extend_from_slice(b"linux-boot-id\0");
+            // Preserve the established same-boot checkpoint domain while
+            // requiring the input to decode to one canonical fixed identity.
+            domain.extend_from_slice(boot_id);
+        }
+        Self::from_domain(identity, domain, boot_identity.is_some())
+    }
+
+    fn from_domain(
+        identity: NodeId,
+        mut domain: Vec<u8>,
+        finite_ttl_supported: bool,
+    ) -> Result<Self, NodeError> {
         if domain.is_empty() {
             domain.extend_from_slice(b"process-fallback\0");
             let mut nonce = [0u8; 32];
@@ -1224,6 +1248,7 @@ impl NodeCustodyClock {
         clock_id.copy_from_slice(&digest[..16]);
         Ok(Self {
             clock_id,
+            finite_ttl_supported,
             #[cfg(not(unix))]
             origin: Arc::new(Instant::now()),
             #[cfg(test)]
@@ -1235,6 +1260,7 @@ impl NodeCustodyClock {
     pub(crate) fn injected(clock_id: [u8; 16], first_tick_ms: u64, step_ms: u64) -> Self {
         Self {
             clock_id,
+            finite_ttl_supported: false,
             #[cfg(not(unix))]
             origin: Arc::new(Instant::now()),
             injected: Some(Arc::new(InjectedCustodyClock {
@@ -1286,6 +1312,43 @@ impl NodeCustodyClock {
             tick_ms,
         })
     }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_linux_boot_id(input: &[u8]) -> Option<[u8; 16]> {
+    let canonical = match input {
+        value if value.len() == 36 => value,
+        value if value.len() == 37 && value.last() == Some(&b'\n') => &value[..36],
+        _ => return None,
+    };
+    if canonical[8] != b'-'
+        || canonical[13] != b'-'
+        || canonical[18] != b'-'
+        || canonical[23] != b'-'
+    {
+        return None;
+    }
+
+    let mut identity = [0u8; 16];
+    let mut nibble_index = 0usize;
+    for (index, byte) in canonical.iter().copied().enumerate() {
+        if matches!(index, 8 | 13 | 18 | 23) {
+            continue;
+        }
+        let nibble = match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            _ => return None,
+        };
+        let target = &mut identity[nibble_index / 2];
+        if nibble_index & 1 == 0 {
+            *target = nibble << 4;
+        } else {
+            *target |= nibble;
+        }
+        nibble_index += 1;
+    }
+    (!identity.iter().all(|byte| *byte == 0)).then_some(identity)
 }
 
 /// Runs one bounded expiry and quota-pressure maintenance pass.
@@ -1445,7 +1508,7 @@ fn contact_custody_sample() -> Result<Option<CustodySample>, NodeError> {
 fn contact_supports_finite_ttl() -> bool {
     CONTACT_EMISSION_GUARD
         .try_with(|guard| guard.custody_clock.supports_finite_ttl())
-        .unwrap_or_else(|_| NodeCustodyClock::platform_supports_finite_ttl())
+        .unwrap_or(false)
 }
 
 fn contact_policy_or_normal() -> Result<EmissionPolicySnapshot, NodeError> {
@@ -20149,16 +20212,74 @@ mod tests {
     fn injected_custody_clock_clones_share_one_identity_and_tick_source() {
         let clock = NodeCustodyClock::injected([0x81; 16], 41, 1);
         let clone = clock.clone();
+        assert!(clock.supports_finite_ttl());
         assert_eq!(clock.sample().expect("first sample").clock_id, [0x81; 16]);
         assert_eq!(clone.sample().expect("second sample").clock_id, [0x81; 16]);
         assert_eq!(clock.sample().expect("third sample").tick_ms, 43);
     }
 
     #[test]
-    fn finite_ttl_platform_contract_is_linux_suspend_inclusive_only() {
+    fn canonical_linux_boot_id_decodes_to_one_nonzero_identity() {
+        let canonical = b"00112233-4455-6677-8899-aabbccddeeff";
+        let expected = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ];
+        assert_eq!(parse_linux_boot_id(canonical), Some(expected));
         assert_eq!(
-            NodeCustodyClock::platform_supports_finite_ttl(),
-            cfg!(target_os = "linux")
+            parse_linux_boot_id(b"00112233-4455-6677-8899-aabbccddeeff\n"),
+            Some(expected)
+        );
+
+        let identity = [0x42; 32];
+        let clock = NodeCustodyClock::open_from_linux_boot_id(
+            identity,
+            Some(b"00112233-4455-6677-8899-aabbccddeeff\n"),
+        )
+        .expect("validated Linux custody clock");
+        assert!(clock.supports_finite_ttl());
+
+        let mut established_domain = b"linux-boot-id\0".to_vec();
+        established_domain.extend_from_slice(b"00112233-4455-6677-8899-aabbccddeeff\n");
+        let established = NodeCustodyClock::from_domain(identity, established_domain, true)
+            .expect("established Linux custody clock domain");
+        assert_eq!(clock.clock_id, established.clock_id);
+    }
+
+    #[test]
+    fn empty_and_malformed_linux_boot_ids_are_rejected() {
+        for malformed in [
+            b"".as_slice(),
+            b"\n".as_slice(),
+            b"00000000-0000-0000-0000-000000000000".as_slice(),
+            b"00000000-0000-0000-0000-000000000000\n".as_slice(),
+            b"00112233445566778899aabbccddeeff\n".as_slice(),
+            b"-0112233-4455-6677-8899-aabbccddeeff\n".as_slice(),
+            b"00112233-4455-6677-8899-AABBCCDDEEFF\n".as_slice(),
+            b"00112233-4455-6677-8899-aabbccddeefg\n".as_slice(),
+            b" 00112233-4455-6677-8899-aabbccddeeff".as_slice(),
+            b"00112233-4455-6677-8899-aabbccddeeff ".as_slice(),
+            b"00112233-4455-6677-8899-aabbccddeeff\r\n".as_slice(),
+            b"00112233-4455-6677-8899-aabbccddeeff\n\n".as_slice(),
+        ] {
+            assert_eq!(parse_linux_boot_id(malformed), None, "{malformed:?}");
+        }
+    }
+
+    #[test]
+    fn unavailable_or_invalid_linux_boot_id_falls_back_without_finite_ttl_support() {
+        let identity = [0x43; 32];
+        let unavailable = NodeCustodyClock::open_from_linux_boot_id(identity, None)
+            .expect("unavailable boot ID fallback");
+        let malformed = NodeCustodyClock::open_from_linux_boot_id(identity, Some(b"malformed"))
+            .expect("malformed boot ID fallback");
+        assert!(!unavailable.supports_finite_ttl());
+        assert!(!malformed.supports_finite_ttl());
+        unavailable.sample().expect("durable-only fallback sample");
+        malformed.sample().expect("malformed-ID fallback sample");
+        assert!(
+            !contact_supports_finite_ttl(),
+            "a contact without a verified task-local clock must fail closed"
         );
     }
 
