@@ -16,13 +16,12 @@ stopped/exclusive latest-value access, causal projection, recoverable versions,
 and visible authenticated tombstones. The
 [selected Record quickstart](selected-record-api.md) demonstrates live and
 stopped durable revisions, explicit conflict siblings, exact-guard application
-resolution, and current-code durable whole-key active-head delivery. The
+resolution, and retained-bounded durable whole-key active-head delivery. The
 [selected Blob quickstart](selected-blob-api.md)
 demonstrates the cloneable live handle's peerless-capable durable regular-file
 publication and bounded zeroize-on-drop page reads, as well as the exclusive
 stopped streaming facade, immutable metadata-bound identity, crash-resumable
-encrypted chunks, and exact durable retry. Retained Record-delivery acceptance,
-durable Blob delivery, State contact/status and
+encrypted chunks, and exact durable retry. Durable Blob delivery, State contact/status and
 materialized-view/synthetic-withdrawal behavior, dynamic State network
 interests, automatic registered-policy Record merge, atomic Event
 subscription update, selected-node language bindings, and representative
@@ -42,6 +41,18 @@ tombstone, and final peerless subscription replay. It does not prove a
 materialized State view or synthetic withdrawals, dynamic network interests,
 physical/NAT/relay/BTLE or mixed implementations, scale beyond two,
 resource/soak thresholds, or release authorization.
+
+A [retained 10,357-byte Record-delivery receipt](../implementation/evidence/selected-live-record-subscription-0c11344.json)
+(SHA-256
+`ba0e2bf47291f7e87000b85fa280cc957f3710ac800def82a51fb9b4657a1b48`,
+Good-signed source `0c11344`) observes one complete edit/tombstone projection
+across attempt-one flush, forced receiver `SIGKILL`, and fresh-process
+attempt-two replay with a rotated 89-byte token. It then requires a fresh query
+guard, resolves the conflict, delivers a new successor projection, retains both
+siblings as query-only Superseded history, preserves beta/gamma selector
+separation, and reopens peerless with an empty queue. It moves only
+`DM-5.1-08`; it is not TTL/GC, physical/NAT/relay/BTLE, mixed, scale/resource,
+binding, automatic-merge, reproducible-build, or release evidence.
 
 A [retained 9,573-byte live-Event receipt](../implementation/evidence/selected-live-event-c464129.json)
 (SHA-256

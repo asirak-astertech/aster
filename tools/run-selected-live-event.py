@@ -241,7 +241,12 @@ def safe_git_environment(global_config: str = os.devnull) -> dict[str, str]:
             "GIT_CONFIG_PARAMETERS",
             "GIT_CONFIG_SYSTEM",
             "GIT_CONFIG_GLOBAL",
-        } or name.startswith("GIT_CONFIG_KEY_") or name.startswith("GIT_CONFIG_VALUE_"):
+            "PYTHONHOME",
+            "PYTHONPATH",
+        } or any(
+            name.startswith(prefix)
+            for prefix in ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_", "DYLD_", "LD_")
+        ):
             environment.pop(name, None)
     environment.pop("GIT_CONFIG_COUNT", None)
     environment.pop("GNUPGHOME", None)
@@ -255,6 +260,7 @@ def safe_git_environment(global_config: str = os.devnull) -> dict[str, str]:
             "HOME": reviewer_home_directory(),
             "LC_ALL": "C",
             "LANG": "C",
+            "PATH": os.confstr("CS_PATH") or "/bin:/usr/bin",
         }
     )
     return environment
@@ -466,15 +472,18 @@ def source_snapshot(
 
 def build_release(source: Path) -> Path:
     environment = os.environ.copy()
-    for name in (
-        "CARGO_TARGET_DIR",
-        "RUSTFLAGS",
-        "CARGO_ENCODED_RUSTFLAGS",
-        "RUSTC_WRAPPER",
-        "RUSTC_WORKSPACE_WRAPPER",
-        "RUSTDOCFLAGS",
-    ):
-        environment.pop(name, None)
+    for name in list(environment):
+        if name in {
+            "CARGO_TARGET_DIR",
+            "RUSTFLAGS",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "RUSTDOCFLAGS",
+            "PYTHONHOME",
+            "PYTHONPATH",
+        } or name.startswith(("DYLD_", "LD_")):
+            environment.pop(name, None)
     environment.update(
         {
             "CARGO_TARGET_DIR": os.fspath(source / "target"),

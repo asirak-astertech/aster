@@ -20,8 +20,10 @@ selected Rust surface and has a
 It is not a synthetic-withdrawal or materialized-view feed. Configured
 `NodeConfig` State interests remain the network receive
 policy in this slice; subscriptions do not dynamically replace them. Record
-now has a separate current-code durable whole-key delivery mechanism, without a
-retained Record-delivery receipt. Dynamic network selectors, State/node contact
+has a separate durable whole-key delivery mechanism with a
+[retained bounded receipt](../implementation/evidence/selected-live-record-subscription-0c11344.json).
+That Record receipt moves only `DM-5.1-08` and does not broaden this State
+contract. Dynamic network selectors, State/node contact
 status, Blob delivery, selected-node ConnectRPC/C/Go/Python bindings, finite
 TTL, tombstone retention duration,
 expiry, compaction, garbage collection, broader relay acceptance,

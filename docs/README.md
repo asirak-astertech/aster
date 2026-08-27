@@ -92,9 +92,13 @@ The selected implementation deliberately exposes different maturity levels:
   loopback host, a flushed unacknowledged poll, forced receiver-process
   termination, fresh-process attempt-2 redelivery and acknowledgement,
   selector withholding, causal ancestor suppression, an explicit current
-  tombstone, and one final peerless subscription replay. Record now has a
-  current-code durable whole-key active-head queue, but retained Record-delivery
-  acceptance and Blob delivery remain open. State contact/status and
+  tombstone, and one final peerless subscription replay. Record separately has
+  durable whole-key active-head delivery and a
+  [retained 10,357-byte receipt](implementation/evidence/selected-live-record-subscription-0c11344.json)
+  covering a whole conflict, forced-process attempt-2 redelivery, guarded
+  resolution, a successor projection, selector separation, and final peerless
+  reopen. That receipt moves only `DM-5.1-08`; Blob delivery remains open. State
+  contact/status and
   materialized-view/synthetic-withdrawal behavior, dynamic State network
   interests, selected-node bindings, finite TTL,
   tombstone retention duration/garbage collection, and representative
@@ -140,6 +144,27 @@ long-duration operation, release, or Event/Blob-live acceptance. Those are
 limits of the State/Record receipt, not of the separate receipts
 linked above and below; its zero Blob counters do not evidence the newer live
 Blob handle.
+
+A separate [retained 10,357-byte v1 Record-delivery receipt](implementation/evidence/selected-live-record-subscription-0c11344.json)
+(SHA-256
+`ba0e2bf47291f7e87000b85fa280cc957f3710ac800def82a51fb9b4657a1b48`)
+binds Good-signed source commit `0c1134411953f4bb52133b50aff9989cd4ce3930`.
+On one same-implementation direct-loopback host, two participants ran three
+processes and seven actor lifetimes. A complete two-head edit/tombstone conflict
+remained one delivery at `delivery_limit=1` and `scan_limit=16`. After the
+receiver was sent `SIGKILL` following its flushed durable unacknowledged
+attempt-one poll, a fresh process received the same projection at attempt two
+with a rotated 89-byte token. A fresh exact query guard was then required to
+resolve both heads; the new successor arrived under a new projection and both
+originals remained query-only superseded history. The beta object was
+network-interested but application-unmatched and retained without delivery; the
+gamma object was application-matched but network-uninterested and withheld, so
+the subscription did not mutate network interest. A final peerless reopen
+replayed the subscription with an empty acknowledged queue, the resolved current
+successor, and two query-only superseded originals. This receipt moves only
+`DM-5.1-08`. It adds no finite-TTL/GC, physical/NAT/relay/BTLE,
+mixed-implementation, scale/resource/soak, selected-node bindings, automatic
+merge, reproducible source-to-binary proof, or release credit.
 
 A separate [retained 10,728-byte v2 live-Blob receipt](implementation/evidence/selected-live-blob-044d90f.json)
 (SHA-256

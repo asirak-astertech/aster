@@ -2347,7 +2347,12 @@ def _clean_git_environment() -> dict[str, str]:
             "GIT_CONFIG_PARAMETERS",
             "GIT_CONFIG_SYSTEM",
             "GIT_CONFIG_GLOBAL",
-        } or key.startswith("GIT_CONFIG_KEY_") or key.startswith("GIT_CONFIG_VALUE_"):
+            "PYTHONHOME",
+            "PYTHONPATH",
+        } or any(
+            key.startswith(prefix)
+            for prefix in ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_", "DYLD_", "LD_")
+        ):
             environment.pop(key, None)
     environment.pop("GIT_CONFIG_COUNT", None)
     environment.pop("GNUPGHOME", None)
@@ -2360,6 +2365,9 @@ def _clean_git_environment() -> dict[str, str]:
             "GIT_CONFIG_GLOBAL": os.devnull,
             "GIT_OPTIONAL_LOCKS": "0",
             "HOME": reviewer_home,
+            "LC_ALL": "C",
+            "LANG": "C",
+            "PATH": os.confstr("CS_PATH") or "/bin:/usr/bin",
         }
     )
     return environment
