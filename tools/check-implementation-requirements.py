@@ -72,6 +72,9 @@ NAT_RECEIPT = (
 LIVE_MUTABLE_RECEIPT = (
     "docs/implementation/requirements-status.md#selected-live-state-and-record-retained-receipt"
 )
+LIVE_BLOB_RECEIPT = (
+    "docs/implementation/requirements-status.md#selected-live-blob-retained-receipt"
+)
 DEPENDENCY_GATE = (
     "docs/implementation/requirements-status.md#dependency-admission-gate"
 )
@@ -246,6 +249,13 @@ BLOB_LIVE_SLICE = (
     "crates/aster-node/src/runtime.rs::tests::"
     "live_zeroization_closes_every_application_admission_before_erasure"
 )
+LIVE_BLOB_ACCEPTANCE_SLICE = (
+    "crates/aster-node/examples/live_blob_acceptance.rs; "
+    "tools/run-selected-live-blob.py; "
+    "tools/check-selected-live-blob-receipt.py; "
+    "tools/test-selected-live-blob-receipt.py; "
+    "docs/quickstart/selected-blob-api.md"
+)
 CONTROLLED_RELAY_SLICE = (
     "crates/aster-iroh/src/lib.rs; crates/aster-node/src/runtime.rs; "
     "crates/aster-node/src/main.rs; crates/aster-node/tests/mesh_cli.rs; "
@@ -396,8 +406,8 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     "DM-1-03": selected_claim(
         "observed-bounded",
         "aster-node",
-        f"{RECEIPT}; direct Iroh contacts moved exact source-sealed Events between mission-authenticated peers",
-        "The receipt covers one Event application and one scope on one-host loopback; State, Record, Blob, physical, mixed-implementation, generalized policy, and scale evidence remain open.",
+        f"{RECEIPT}; {LIVE_BLOB_RECEIPT}; direct Iroh contacts moved exact source-sealed Events between mission-authenticated peers, and a separate retained live Blob run moved one completed two-chunk authenticated Blob between two current content-capable peers",
+        "The retained observations are small same-implementation one-host loopback cases. State and Record retain separate bounded evidence; route-only Blob custody, physical systems, mixed implementations, generalized policy, and scale remain open.",
     ),
     "DM-1-04": selected_claim(
         "observed-bounded",
@@ -408,8 +418,8 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     "DM-1-05": selected_claim(
         "observed-bounded",
         "aster-node",
-        f"{RECEIPT}; {LIVE_MUTABLE_RECEIPT}; stopped and restarted processes reconciled exact source-sealed Event inventories and reused durable reaction operations; two live peers separately published State and Record while peerless, later reconciled five exact mutable items over direct Iroh, and retained the converged State and resolved Record projections after peerless restart",
-        "Verify the stakeholder-set extended or day-scale disconnection interval, Blob, physical systems, generalized policy, mixed implementations, and requirement scale.",
+        f"{RECEIPT}; {LIVE_MUTABLE_RECEIPT}; {LIVE_BLOB_RECEIPT}; stopped and restarted processes reconciled exact source-sealed Event inventories and reused durable reaction operations; two live peers separately published State and Record while peerless, later reconciled five exact mutable items over direct Iroh, and retained the converged State and resolved Record projections after peerless restart; a separate live Blob publisher committed while peerless and a later direct contact delivered one completed authenticated Blob that remained readable after graceful receiver reopen",
+        "Verify the stakeholder-set extended or day-scale disconnection interval, interrupted partial-Blob resume, route-only custody, physical systems, generalized policy, mixed implementations, and requirement scale.",
     ),
     "DM-2-14": selected_claim(
         "implemented-uncredited",
@@ -459,52 +469,52 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
         "The retained partition is brief and the run remains same-implementation, one-host, and two-participant, with no comprehensive crash sweep, relay, automatic registered-policy merge, mixed implementation, scale, physical system, long-duration soak, or release acceptance.",
     ),
     "DM-5.1-10": selected_claim(
-        "implemented-uncredited",
+        "observed-bounded",
         "aster-core + aster-redb-store + aster-node",
-        f"{BLOB_LOCAL_SLICE}; {BLOB_NETWORK_SLICE}; {BLOB_LIVE_SLICE}; SelectedBlobNode and the cloneable actor-owned SelectedBlobHandle prepare a manifest-bounded digest set, commit encrypted chunks under the fixed 64-KiB profile outside redb, source-seal one canonical manifest, and expose synchronous stopped streaming or bounded live zeroize-on-drop plaintext pages; semantic v5 stages the exact authenticated source before canonical carrier ranges and grants ordinary publication visibility only after exact depot, full-content, and current-lineage completion",
-        "The live mechanism exposes publish and bounded page read, not Blob subscription or Blob-specific status. The network slice is direct content-capable-peer only. Route-only relay/custody, Blob TTL/GC, language bindings, physical/resource acceptance, mixed-implementation evidence, large-Blob/RSS evidence, and a retained Blob receipt remain open.",
+        f"{BLOB_LOCAL_SLICE}; {BLOB_NETWORK_SLICE}; {BLOB_LIVE_SLICE}; {LIVE_BLOB_ACCEPTANCE_SLICE}; {LIVE_BLOB_RECEIPT}; SelectedBlobNode and the cloneable actor-owned SelectedBlobHandle prepare a manifest-bounded digest set, commit encrypted chunks under the fixed 64-KiB profile outside redb, source-seal one canonical manifest, and expose synchronous stopped streaming or bounded live zeroize-on-drop plaintext pages; the retained live run published and read one 65,747-byte two-chunk Blob while peerless, delivered it later over direct Iroh, read it at the receiver, and read it again after graceful receiver reopen",
+        "The retained run is one same-implementation, one-host, two-participant, small two-chunk observation with an operator-attested source/binary/execution link. Blob subscription or class-specific status, route-only relay/custody, Blob TTL/GC, language bindings, physical/resource acceptance, mixed implementations, large-Blob/RSS evidence, and release authorization remain open.",
     ),
     "DM-5.1-11": selected_claim(
-        "implemented-uncredited",
+        "observed-bounded",
         "aster-core + aster-redb-store + aster-node",
-        f"{BLOB_LOCAL_SLICE}; {BLOB_NETWORK_SLICE}; {BLOB_LIVE_SLICE}; BlobId commits exact plaintext bytes, the canonical chunk profile, and media/schema identity metadata; stopped and live exact-operation retry reauthenticate the immutable publication, source-authenticated manifest records and the epoch-specific encrypted depot variant are immutable once committed, and semantic-v5 remote staging remains invisible until exact immutable content verification and atomic publication",
-        "The ID is metadata-bound object identity, not a separate pure whole-byte content ID. Blob subscription/status, metadata-independent deduplication, route-only relay/custody, independent interoperability, scale, large-RSS, physical/resource evidence, and retained acceptance remain open.",
+        f"{BLOB_LOCAL_SLICE}; {BLOB_NETWORK_SLICE}; {BLOB_LIVE_SLICE}; {LIVE_BLOB_ACCEPTANCE_SLICE}; {LIVE_BLOB_RECEIPT}; BlobId commits exact plaintext bytes, the canonical chunk profile, and media/schema identity metadata; the retained live run returned the original publication on one exact noninserting retry, rejected one changed-payload reuse as a conflict, preserved the original publication, and reproduced all exact page and whole-payload commitments at the source, receiver, and graceful receiver reopen",
+        "The ID is metadata-bound object identity, not a separate pure whole-byte content ID. The retained case is one publisher and does not establish adversarial multi-writer behavior. Blob subscription/status, metadata-independent deduplication, route-only relay/custody, independent interoperability, scale, large-RSS, physical/resource evidence, and release authorization remain open.",
     ),
     "DM-5.1-12": selected_claim(
-        "implemented-uncredited",
+        "observed-bounded",
         "aster-core + aster-redb-store + aster-node",
-        f"{BLOB_NETWORK_SLICE}; {BLOB_LIVE_SLICE}; semantic v5 authenticates and atomically stages the exact source envelope and manifest before strict kind-2 carrier work, transfers canonical carriers through contiguous ranges no larger than 16 KiB, and verifies carrier identity, every AEAD/chunk digest, and the whole BlobId before publication; the live handle admits only the selected 64-MiB/1,024-chunk network profile and returns plaintext in pages no larger than 64 KiB spanning at most two canonical chunks",
-        "Current network evidence remains a small same-implementation, one-host direct-Iroh case. There is no Blob subscription/status, 100+ MiB/RSS or physical/resource acceptance, route-only relay/custody, mixed implementation, retained Blob receipt, or release authorization.",
+        f"{BLOB_NETWORK_SLICE}; {BLOB_LIVE_SLICE}; {LIVE_BLOB_ACCEPTANCE_SLICE}; {LIVE_BLOB_RECEIPT}; semantic v5 authenticates and atomically stages the exact source envelope and manifest before strict kind-2 carrier work, transfers canonical carriers through contiguous ranges no larger than 16 KiB, and verifies carrier identity, every AEAD/chunk digest, and the whole BlobId before publication; the retained direct run accounted six positive receiver ranges and 66,081 fetched bytes, retained exactly two committed ciphertext chunks per participant, and returned the 65,747-byte plaintext as exact 65,536-byte and 211-byte pages",
+        "The retained network observation is one small same-implementation, one-host direct-Iroh case and does not interrupt a partial transfer. Blob subscription/status, 100+ MiB/RSS or physical/resource acceptance, route-only relay/custody, mixed implementation, retained partial-resume evidence, and release authorization remain open.",
     ),
     "DM-5.1-13": selected_claim(
         "implemented-uncredited",
         "aster-core + aster-redb-store + aster-node",
-        f"{BLOB_NETWORK_SLICE}; {BLOB_LIVE_SLICE}; exact source plans and contiguous carrier prefixes are durable under source/carrier identity rather than peer or session, survive runtime/store/provider-cache teardown and reopen, resume only the exact missing complement from another eligible content peer, and remain nonpublic until full verified promotion; current live automation separately publishes peerless, synchronizes later over direct Iroh, reads through the receiver handle, and reads again after a peerless receiver restart",
-        "The bounded cases use small Blobs on one host and immediate modeled later contacts. Blob subscription/status, route-only relay/custody, long-delay and crash/power-loss acceptance, 100+ MiB/RSS or physical evidence, mixed implementations, retained Blob evidence, and release acceptance remain open.",
+        f"{BLOB_NETWORK_SLICE}; {BLOB_LIVE_SLICE}; {LIVE_BLOB_RECEIPT}; exact source plans and contiguous carrier prefixes are durable under source/carrier identity rather than peer or session, survive runtime/store/provider-cache teardown and reopen, resume only the exact missing complement from another eligible content peer, and remain nonpublic until full verified promotion; the retained live run separately publishes peerless, synchronizes a complete transfer later over direct Iroh, reads through the receiver handle, and reads again after graceful same-process receiver reopen",
+        "The retained receipt does not interrupt a partial transfer or resume its complement. The bounded cases use small Blobs on one host and immediate modeled later contacts. Blob subscription/status, route-only relay/custody, long-delay and crash/power-loss acceptance, 100+ MiB/RSS or physical evidence, mixed implementations, retained partial-resume evidence, and release authorization remain open.",
     ),
     "DM-5.2-19": selected_claim(
         "implemented-uncredited",
         "aster-core + aster-redb-store + aster-node",
         f"{BLOB_NETWORK_SLICE}; {BLOB_LIVE_SLICE}; an authenticated pending source plus peer-neutral contiguous carrier prefix survives interruption and reopen, and the scheduler requests the exact source/carrier complement without discarding already accepted bytes; the live receiver exposes only the completed authenticated publication through bounded pages",
-        "This is small same-implementation, one-host direct-Iroh automation, not long-partition, 100+ MiB/RSS, physical/resource, mixed-implementation, retained-receipt, or release evidence. Blob subscription/status and route-only relay/custody remain open.",
+        "This is small same-implementation, one-host direct-Iroh current-code partial-resume automation; the retained live receipt covers only a completed transfer and graceful post-completion reopen. Long partitions, 100+ MiB/RSS, physical/resource, mixed-implementation, retained interrupted partial-resume, Blob subscription/status, route-only relay/custody, and release evidence remain open.",
     ),
     "DM-5.2-20": selected_claim(
         "implemented-uncredited",
         "aster-core + aster-redb-store + aster-node",
         f"{BLOB_NETWORK_SLICE}; {BLOB_LIVE_SLICE}; A sends C the authenticated source plus one bounded durable range, then C's runtime, store, and provider cache tear down and reopen with that exact partial progress retained and nonpublic; live publication and read automation preserve committed work across actor shutdown/restart without exposing partial plaintext",
-        "The brief-contact checkpoints are controlled small same-process, one-host cases. Blob subscription/status, OS-process/power-loss, long-duration, 100+ MiB/RSS, physical/resource, route-only, mixed-implementation, retained-receipt, and release acceptance remain open.",
+        "The brief-contact checkpoints are controlled small same-process, one-host current-code cases; the retained live receipt covers only a completed transfer and graceful post-completion reopen. Blob subscription/status, OS-process/power-loss, long-duration, 100+ MiB/RSS, physical/resource, route-only, mixed-implementation, retained interrupted partial-resume, and release acceptance remain open.",
     ),
     "DM-5.2-21": selected_claim(
         "implemented-uncredited",
         "aster-core + aster-redb-store + aster-node",
         f"{BLOB_NETWORK_SLICE}; {BLOB_LIVE_SLICE}; after reopen the receiver continues at the first missing carrier byte and creates exactly one ordinary publication only after canonical carrier, depot completion, freshly streamed full-content verification, and current-lineage proof all agree; the current receiver handle then serves authenticated pages and a peerless restart serves the same current content",
-        "Later contact is immediate within small same-implementation, one-host tests. Blob subscription/status, long offline intervals, OS-process/power-loss, route-only custody, 100+ MiB/RSS or physical evidence, mixed implementations, retained Blob evidence, and release authorization remain open.",
+        "Later contact is immediate within small same-implementation, one-host tests; the retained live receipt does not interrupt partial transfer. Blob subscription/status, long offline intervals, OS-process/power-loss, route-only custody, 100+ MiB/RSS or physical evidence, mixed implementations, retained partial-continuation evidence, and release authorization remain open.",
     ),
     "DM-5.2-22": selected_claim(
         "implemented-uncredited",
         "aster-core + aster-redb-store + aster-node",
         f"{BLOB_NETWORK_SLICE}; {BLOB_LIVE_SLICE}; A completes B, partially stages C, and is removed; fresh eligible content peer B then sends C no source retransmission and only the exact missing carrier complement while every inventory/source/range service rechecks peer content proof, route, revocation, and current route/physical lineage; completed content is available through the live receiver handle only after promotion",
-        "Eligibility deliberately excludes route-only peers. This is small same-implementation, one-host direct-Iroh automation without a retained Blob receipt, Blob subscription/status, TTL/GC, pure-byte deduplication, 100+ MiB/RSS or physical/resource acceptance, mixed implementation, or release authorization.",
+        "Eligibility deliberately excludes route-only peers. This is small same-implementation, one-host direct-Iroh current-code any-peer automation; the retained live receipt uses only the original publisher and does not retain a partial or different-peer continuation. Blob subscription/status, TTL/GC, pure-byte deduplication, 100+ MiB/RSS or physical/resource acceptance, mixed implementation, and release authorization remain open.",
     ),
     "DM-5.1-05": selected_claim(
         "implemented-uncredited", "aster-redb-store",
@@ -548,14 +558,14 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     ),
     "DM-5.1-22": selected_claim(
         "observed-bounded", "aster-core + aster-node",
-        f"{RECEIPT}; {LIVE_MUTABLE_RECEIPT}; {EVENT_SLICE}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; retained Ping/Pong and live State/Record contacts authenticate authority-provisioned source identities independently at each endpoint; current-code v5 Blob range service additionally binds the authenticated claimant peer to the current content grant",
-        "The State/Record receipt is same-implementation, one-host, direct-only, and two-participant; Blob remains current-code-only and 96 KiB. Route-only Blob custody, independent interoperability, physical systems, scale, and release authorization remain open.",
+        f"{RECEIPT}; {LIVE_MUTABLE_RECEIPT}; {LIVE_BLOB_RECEIPT}; {EVENT_SLICE}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; retained Ping/Pong, live State/Record, and live Blob runs authenticate authority-provisioned source identities independently at each endpoint; the Blob receipt binds one exact publisher through peerless publication, direct transfer, receiver read, and graceful receiver reopen while v5 range service separately binds the authenticated claimant peer to the current content grant",
+        "The live receipts are same-implementation, one-host, direct-only, and two-participant observations. Route-only Blob custody, independent interoperability, physical systems, scale, and release authorization remain open.",
     ),
     "DM-5.2-01": selected_claim(
         "observed-bounded",
         "aster-node",
-        f"{RECEIPT}; {LIVE_MUTABLE_RECEIPT}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; retained Event lines converged exact transfers, and the retained live mutable run reconciled two concurrent State versions plus two disconnected Record revisions over positive direct-only contacts and preserved the resulting projections after peerless restart; current-code Blob automation resumes one bounded v5 object from a different eligible content peer",
-        "The State/Record observation is same-implementation, one-host, two-participant, and not an all-reachable-node or long-partition result; Blob still has no retained receipt and is 96 KiB on one host. Multiple-scope lifecycle, route-only Blob custody, mixed implementations, physical links, requirement scale, and release authorization remain open.",
+        f"{RECEIPT}; {LIVE_MUTABLE_RECEIPT}; {LIVE_BLOB_RECEIPT}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; retained Event lines converged exact transfers, the retained live mutable run reconciled two concurrent State versions plus two disconnected Record revisions, and the retained live Blob run transferred one peerless-published two-chunk object over positive direct-only contacts and reproduced its authenticated pages after graceful receiver reopen; current-code automation separately resumes one bounded v5 object from a different eligible content peer",
+        "The retained observations are same-implementation, one-host, two-participant, brief cases and are not all-reachable-node, long-partition, or retained partial-resume results. Multiple-scope lifecycle, route-only Blob custody, mixed implementations, physical links, requirement scale, and release authorization remain open.",
     ),
     "DM-5.2-02": selected_claim(
         "implemented-uncredited",
@@ -654,8 +664,8 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     "DM-5.3-04": selected_claim(
         "implemented-uncredited",
         "aster-core + aster-redb-store + aster-node",
-        f"{BLOB_LOCAL_SLICE}; {BLOB_NETWORK_SLICE}; {BLOB_LIVE_SLICE}; immutable Blob bytes and identity metadata never enter the State/Record causal merge reducers, multiple stopped or live signed source publications can reference one exact completed content variant without changing it, live reads select only a freshly authenticated current immutable publication, and semantic-v5 remote source/carrier staging remains outside ordinary publication indexes until exact atomic completion",
-        "The network and live mechanisms are small same-implementation direct cases. Blob subscription/status, route-only relay/custody, adversarial multi-writer interoperability, retention/GC policy, pure-byte identity, scale/large-RSS/resource/physical evidence, mixed implementations, and retained acceptance remain open.",
+        f"{BLOB_LOCAL_SLICE}; {BLOB_NETWORK_SLICE}; {BLOB_LIVE_SLICE}; {LIVE_BLOB_RECEIPT}; immutable Blob bytes and identity metadata never enter the State/Record causal merge reducers, multiple stopped or live signed source publications can reference one exact completed content variant without changing it, live reads select only a freshly authenticated current immutable publication, and semantic-v5 remote source/carrier staging remains outside ordinary publication indexes until exact atomic completion; the retained one-publisher run rejected changed-payload operation reuse and preserved the original publication",
+        "The retained conflict is operation-key immutability for one publisher, not adversarial multi-writer merge behavior. Blob subscription/status, route-only relay/custody, adversarial multi-writer interoperability, retention/GC policy, pure-byte identity, scale/large-RSS/resource/physical evidence, mixed implementations, and release authorization remain open.",
     ),
     "DM-5.4-01": selected_claim(
         "implemented-uncredited",
@@ -775,8 +785,8 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     "DM-5.6-01": selected_claim(
         "implemented-uncredited",
         "aster-node",
-        f"{RECEIPT}; {LIVE_MUTABLE_RECEIPT}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; same-implementation nodes synchronized source-sealed Event, State, and Record in retained direct one-host runs; current-code automation separately transfers one bounded v5 Blob and resumes it from a different eligible content peer after receiver reopen",
-        "Add independent conformance, broader partitions, route-only Blob relay/custody, physical transport, large/resource evidence, and broader network acceptance. Blob still has no retained receipt.",
+        f"{RECEIPT}; {LIVE_MUTABLE_RECEIPT}; {LIVE_BLOB_RECEIPT}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; same-implementation nodes synchronized source-sealed Event, State, Record, and one completed two-chunk Blob in retained direct one-host runs; current-code automation separately resumes a bounded partial v5 Blob from a different eligible content peer after receiver reopen",
+        "The requirement applies to conformant nodes generally, while all retained data-class observations are same-implementation. Add independent conformance, broader partitions, retained interrupted partial resume, route-only Blob relay/custody, physical transport, large/resource evidence, and broader network acceptance.",
     ),
     "DM-5.6-02": selected_claim(
         "observed-bounded",
@@ -834,32 +844,32 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     ),
     "DM-6-01": selected_claim(
         "observed-bounded", "aster-core + aster-node",
-        f"{RECEIPT}; {LIVE_MUTABLE_RECEIPT}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; Event, State, Record, and Blob content remain source-sealed independently of the Iroh carrier session; retained State/Record contacts bind source and carrier identities separately, Blob range service requires current claimant-bound content proof, and retained Event evidence separately shows a route-only relay cannot open content",
-        "State/Record evidence is one same-host direct-Iroh implementation; Blob remains current-code-only with no route-only relay/custody or packet capture. Complete carrier variants, provisioning, physical/mixed acceptance, and independent review.",
+        f"{RECEIPT}; {LIVE_MUTABLE_RECEIPT}; {LIVE_BLOB_RECEIPT}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; Event, State, Record, and Blob content remain source-sealed independently of the Iroh carrier session; retained State/Record and Blob contacts bind source and carrier identities separately, Blob range service requires current claimant-bound content proof, and retained Event evidence separately shows a route-only relay cannot open content",
+        "State/Record/Blob evidence is one same-host direct-Iroh implementation; the Blob receipt has no route-only relay/custody or packet capture. Complete carrier variants, provisioning, physical/mixed acceptance, and independent review remain open.",
     ),
     "DM-6-02": selected_claim(
         "observed-bounded", "aster-core + aster-node",
-        f"{MISSION_RECEIPT}; {LIVE_MUTABLE_RECEIPT}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; {BLOB_LIVE_SLICE}; exact source-sealed Event, State, Record, and Blob bytes are freshly verified before inventory serving and remote admission; retained live State/Record projections follow that verification, Blob publication additionally requires every carrier plus fresh full-content/current-lineage completion, live Blob reads repeat current-policy/projection/depot-capability verification, and Event is reverified before reaction",
+        f"{MISSION_RECEIPT}; {LIVE_MUTABLE_RECEIPT}; {LIVE_BLOB_RECEIPT}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; {BLOB_LIVE_SLICE}; exact source-sealed Event, State, Record, and Blob bytes are freshly verified before inventory serving and remote admission; retained live State/Record projections and retained live Blob pages follow that verification, Blob publication additionally requires every carrier plus fresh full-content/current-lineage completion, live Blob reads repeat current-policy/projection/depot-capability verification, and Event is reverified before reaction",
         "State/Record/Blob have no durable application delivery subscriptions and Blob has no class-specific sync/peer status. Route-only Blob custody, hostile physical-network acceptance, independent interoperability, and cryptographic review remain open.",
     ),
     "DM-6-03": selected_claim(
         "observed-bounded", "aster-core + aster-node",
-        f"{RECEIPT}; {LIVE_MUTABLE_RECEIPT}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; {BLOB_LIVE_SLICE}; destinations authenticate authority-provisioned Event, State, Record, and Blob publishers independently of carrier/session identities; retained live State/Record publication exercises that separation, current live Blob automation publishes while peerless and later serves only freshly authorized pages, and Blob network service separately binds the claimant peer to the current content grant",
+        f"{RECEIPT}; {LIVE_MUTABLE_RECEIPT}; {LIVE_BLOB_RECEIPT}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; {BLOB_LIVE_SLICE}; destinations authenticate authority-provisioned Event, State, Record, and Blob publishers independently of carrier/session identities; retained live State/Record and Blob publication exercise that separation, the Blob publisher commits while peerless and a later receiver serves only freshly authorized pages, and Blob network service separately binds the claimant peer to the current content grant",
         "Blob subscription/status, route-only Blob custody, protected operational provisioning, platform-complete zeroization assurance, broader control lifecycle, physical/mixed acceptance, and independent review remain open.",
     ),
     "DM-6-04": selected_claim(
         "observed-bounded", "aster-core + aster-node",
-        f"{RECEIPT}; {LIVE_MUTABLE_RECEIPT}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; {BLOB_LIVE_SLICE}; isolated Event cohorts and retained disconnected live State/Record publishers source-seal objects before contact; current live Blob automation likewise publishes durably with no peers, then a later v5 contact completes source verification before any carrier range",
-        "State/Record retention is same-implementation, one-host, and direct-only; Blob remains current-code-only with no retained receipt or subscription/status. Route-only Blob custody, key lifecycle beyond one bounded rekey, physical/mixed acceptance, and independent review remain open.",
+        f"{RECEIPT}; {LIVE_MUTABLE_RECEIPT}; {LIVE_BLOB_RECEIPT}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; {BLOB_LIVE_SLICE}; isolated Event cohorts and retained disconnected live State/Record/Blob publishers source-seal objects before contact; the Blob receipt records peerless durable publication before a later v5 direct contact completes source verification and carrier transfer",
+        "State/Record/Blob retention is same-implementation, one-host, and direct-only. Blob subscription/status, route-only Blob custody, key lifecycle beyond one bounded rekey, physical/mixed acceptance, and independent review remain open.",
     ),
     "DM-6-05": selected_claim(
         "observed-bounded", "aster-core + aster-node",
-        f"{RECEIPT}; {LIVE_MUTABLE_RECEIPT}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; {BLOB_LIVE_SLICE}; Event, State, Record, and Blob objects carry authenticated source identities and signed semantic headers; retained live State/Record projections preserve those identities, the live Blob handle publishes and reads only the authenticated current publication, and Blob transfer additionally binds the exact manifest, carrier IDs, and current route/physical lineages",
-        "State/Record retention is bounded same-implementation direct-Iroh evidence; Blob remains current-code-only with no retained receipt or subscription/status. Route-only Blob custody, physical/mixed evidence, and independent interoperability remain open.",
+        f"{RECEIPT}; {LIVE_MUTABLE_RECEIPT}; {LIVE_BLOB_RECEIPT}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; {BLOB_LIVE_SLICE}; Event, State, Record, and Blob objects carry authenticated source identities and signed semantic headers; retained live State/Record/Blob projections preserve those identities, the live Blob handle publishes and reads only the authenticated current publication, and Blob transfer additionally binds the exact manifest, carrier IDs, and current route/physical lineages",
+        "State/Record/Blob retention is bounded same-implementation direct-Iroh evidence. Blob subscription/status, route-only Blob custody, physical/mixed evidence, and independent interoperability remain open.",
     ),
     "DM-6-06": selected_claim(
         "observed-bounded", "aster-core + aster-node",
-        f"{RECEIPT}; {LIVE_MUTABLE_RECEIPT}; {EVENT_SUBSCRIPTION_SLICE}; {EVENT_LIVE_SLICE}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; {BLOB_LIVE_SLICE}; Event applications react only to content-verified payloads, retained live State/Record queries expose only verified projections and remote admission never executes merge code, partial Blob staging remains nonpublic until fresh full-content verification and atomic promotion, and the live Blob handle returns only bounded freshly authenticated pages",
+        f"{RECEIPT}; {LIVE_MUTABLE_RECEIPT}; {LIVE_BLOB_RECEIPT}; {EVENT_SUBSCRIPTION_SLICE}; {EVENT_LIVE_SLICE}; {MUTABLE_NETWORK_SLICE}; {BLOB_NETWORK_SLICE}; {BLOB_LIVE_SLICE}; Event applications react only to content-verified payloads, retained live State/Record queries expose only verified projections and remote admission never executes merge code, partial Blob staging remains nonpublic until fresh full-content verification and atomic promotion, and the retained live Blob run returns only bounded freshly authenticated pages at the source, receiver, and graceful receiver reopen",
         "State/Record/Blob have no durable application delivery subscription and Blob has no class-specific sync/peer status. Route-only Blob custody, bindings, physical peers, mixed implementations, and independent interoperability remain open.",
     ),
     "DM-6-07": selected_claim(
@@ -960,56 +970,56 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     "DM-7-11": selected_claim(
         "implemented-uncredited",
         "aster-node::application + aster-agent",
-        f"{EVENT_LIVE_SLICE}; {LIVE_MUTABLE_SLICE}; {LIVE_MUTABLE_RECEIPT}; {BLOB_LIVE_SLICE}; {AGENT_SLICE}; the actor-owned Event, State, Record, and Blob handles expose typed high-level publication/query or bounded page-read operations with sanitized errors; Event adds delivery subscriptions, gaps, acknowledgement, and contact status, while Record adds explicit conflict annotation and exact-guard resolution",
+        f"{EVENT_LIVE_SLICE}; {LIVE_MUTABLE_SLICE}; {LIVE_MUTABLE_RECEIPT}; {BLOB_LIVE_SLICE}; {LIVE_BLOB_ACCEPTANCE_SLICE}; {LIVE_BLOB_RECEIPT}; {AGENT_SLICE}; the actor-owned Event, State, Record, and Blob handles expose typed high-level publication/query or bounded page-read operations with sanitized errors; retained runs exercise the State/Record and Blob live boundaries, Event adds delivery subscriptions, gaps, acknowledgement, and contact status, and Record adds explicit conflict annotation and exact-guard resolution",
         "State/Record/Blob have no durable delivery subscriptions, Blob has no class-specific sync/peer status operation, the agent remains Event-only, and selected-node bindings, operational provisioning, independent usability, and the complete adopter-facing API remain open.",
     ),
     "DM-7-14": selected_claim(
         "implemented-uncredited",
         "aster-node::application",
-        f"{EVENT_LIVE_SLICE}; {LIVE_MUTABLE_SLICE}; {LIVE_MUTABLE_RECEIPT}; {BLOB_LIVE_SLICE}; {AGENT_SLICE}; SelectedEventHandle, SelectedStateHandle, SelectedRecordHandle, SelectedBlobHandle, and agent operations/results contain no carrier type, endpoint, address, path choice, or transport selection",
+        f"{EVENT_LIVE_SLICE}; {LIVE_MUTABLE_SLICE}; {LIVE_MUTABLE_RECEIPT}; {BLOB_LIVE_SLICE}; {LIVE_BLOB_ACCEPTANCE_SLICE}; {LIVE_BLOB_RECEIPT}; {AGENT_SLICE}; SelectedEventHandle, SelectedStateHandle, SelectedRecordHandle, SelectedBlobHandle, and agent operations/results contain no carrier type, endpoint, address, path choice, or transport selection; the retained Blob producer uses only that live application boundary",
         "Node startup still requires separate Iroh configuration; the agent remains Event-only, and selected-node bindings plus future physical/multicarrier composition require the same boundary audit.",
     ),
     "DM-7-15": selected_claim(
         "implemented-uncredited",
         "aster-node::application",
-        f"{EVENT_LIVE_SLICE}; {LIVE_MUTABLE_SLICE}; {LIVE_MUTABLE_RECEIPT}; {BLOB_LIVE_SLICE}; {AGENT_SLICE}; live Event/State/Record/Blob surfaces return application items, verified projections, Record conflicts/guards, bounded authenticated plaintext pages, delivery attempts where applicable, and high-level Event status without exposing inventories, exact transfer IDs, Negentropy state, carrier ranges, depot capabilities, or contact protocol frames",
+        f"{EVENT_LIVE_SLICE}; {LIVE_MUTABLE_SLICE}; {LIVE_MUTABLE_RECEIPT}; {BLOB_LIVE_SLICE}; {LIVE_BLOB_ACCEPTANCE_SLICE}; {LIVE_BLOB_RECEIPT}; {AGENT_SLICE}; live Event/State/Record/Blob surfaces return application items, verified projections, Record conflicts/guards, bounded authenticated plaintext pages, delivery attempts where applicable, and high-level Event status without exposing inventories, exact transfer IDs, Negentropy state, carrier ranges, depot capabilities, or contact protocol frames; the retained Blob run exposes only publication metadata and authenticated pages through its application transcript",
         "Complete Blob subscription/status, durable State/Record delivery, selected-node bindings, the Event-only agent, and broader control-administration exposure without leaking synchronization internals.",
     ),
     "DM-7-16": selected_claim(
-        "implemented-uncredited",
+        "observed-bounded",
         "aster-node",
-        f"{CONTROL_RECEIPT}; {EVENT_SLICE}; {EVENT_LIVE_SLICE}; {LIVE_MUTABLE_RECEIPT}; {BLOB_LIVE_SLICE}; after epoch-two control convergence one retained cohort published Ping with peers=0 and contacts=0; the live mutable receipt separately records peerless State/Record publication and exact retry; current live Blob automation publishes a regular file durably with no configured peers before a later direct-Iroh run",
-        "The retained live mutable run and unretained live Blob automation are same-implementation, one-host, and brief. Verify the stakeholder-set offline interval, Blob subscription/status, selected-node bindings, physical systems, and independent interoperability.",
+        f"{CONTROL_RECEIPT}; {EVENT_SLICE}; {EVENT_LIVE_SLICE}; {LIVE_MUTABLE_RECEIPT}; {BLOB_LIVE_SLICE}; {LIVE_BLOB_ACCEPTANCE_SLICE}; {LIVE_BLOB_RECEIPT}; retained Event and live State/Record cohorts publish durably with zero peers, and the retained live Blob publisher likewise commits one 65,747-byte publication with peers=0, returns its exact noninserting retry, reads it locally, and closes gracefully before the later direct-Iroh phase",
+        "The retained offline publications are same-implementation, one-host, and brief; Blob source-removal timing is producer-attested. Verify the stakeholder-set offline interval, Blob subscription/status, selected-node bindings, physical systems, independent interoperability, and release acceptance.",
     ),
     "DM-7-17": selected_claim(
         "observed-bounded",
         "aster-node",
-        f"{RECEIPT}; {EVENT_LIVE_SLICE}; {LIVE_MUTABLE_RECEIPT}; {BLOB_LIVE_SLICE}; retained Event flows published while peerless and synchronized later; the retained live mutable run separately published State/Record while peerless and reconciled later; current-code-only live Blob automation publishes peerless, later transfers over direct Iroh, exposes authenticated receiver pages, and preserves the read after peerless restart",
-        "Observed-bounded credit remains limited to the retained Event/State/Record receipts. Blob has no retained receipt, subscription/status, long offline interval, no-loss acceptance, physical system, scale, or independent-interoperability evidence.",
+        f"{RECEIPT}; {EVENT_LIVE_SLICE}; {LIVE_MUTABLE_RECEIPT}; {LIVE_BLOB_RECEIPT}; retained Event flows published while peerless and synchronized later; the retained live mutable run separately published State/Record while peerless and reconciled later; the retained live Blob run publishes peerless, later transfers one completed object over direct Iroh, exposes exact authenticated receiver pages, and preserves those pages after graceful same-process receiver reopen",
+        "The Blob receipt does not establish a stakeholder-set long offline interval, interrupted partial resume, process-crash or power-loss recovery, subscription/status, route-only custody, physical systems, scale, independent interoperability, or release acceptance.",
     ),
     "DM-7-18": selected_claim(
         "implemented-uncredited",
         "aster-node + aster-agent + shipped documentation",
-        f"{EVENT_LIVE_SLICE}; {LIVE_MUTABLE_SLICE}; {LIVE_MUTABLE_RECEIPT}; {BLOB_LOCAL_SLICE}; {BLOB_LIVE_SLICE}; {AGENT_SLICE}; docs ship runnable embedded Event/State/Record and stopped Blob examples plus a 35-line local-agent example; the Blob quickstart now contains a live-handle publication/page-read guide and snippet while the compiled Blob example remains stopped; focused real-node tests exercise the live mechanism",
-        "No compiled live Blob example or Blob subscription/status sample exists. Compilation and automation are not an independent developer-usability study; durable State/Record delivery, selected-node bindings, operational provisioning, production packaging, and the complete integration surface remain open.",
+        f"{EVENT_LIVE_SLICE}; {LIVE_MUTABLE_SLICE}; {LIVE_MUTABLE_RECEIPT}; {BLOB_LOCAL_SLICE}; {BLOB_LIVE_SLICE}; {LIVE_BLOB_ACCEPTANCE_SLICE}; {LIVE_BLOB_RECEIPT}; {AGENT_SLICE}; docs ship runnable embedded Event/State/Record and stopped Blob examples plus a 35-line local-agent example; the Blob quickstart contains a live-handle publication/page-read guide and snippet, and a compiled retained acceptance producer exercises the live Blob mechanism",
+        "The compiled live Blob acceptance producer is not a minimal documentation-only integration sample or independent developer-usability study, and no Blob subscription/status sample exists. Durable State/Record delivery, selected-node bindings, operational provisioning, production packaging, and the complete integration surface remain open.",
     ),
     "DM-7-20": selected_claim(
         "observed-bounded",
         "aster-node + aster-agent",
-        f"docs/quickstart/mesh-cli.md; {EVENT_LIVE_SLICE}; {LIVE_MUTABLE_SLICE}; {LIVE_MUTABLE_RECEIPT}; {BLOB_LOCAL_SLICE}; {BLOB_LIVE_SLICE}; {CUSTODY_SLICE}; {AGENT_SLICE}; shipped and compiled examples exercise high-level Event/State/Record publication and query, Record conflict resolution, stopped Blob streaming, Event delivery/custody/quota/policy, and the Event-only agent sample; the Blob quickstart separately supplies a live publish/page-read/later-sync guide and current tests exercise that handle",
-        "Observed-bounded credit remains tied to the existing retained samples, not live Blob. Add a compiled live Blob sample, make subscription/status boundaries explicit, add durable State/Record delivery samples and selected-node bindings, and retain independent usability, operational provisioning, Linux/physical custody, and physical multi-system evidence.",
+        f"docs/quickstart/mesh-cli.md; {EVENT_LIVE_SLICE}; {LIVE_MUTABLE_SLICE}; {LIVE_MUTABLE_RECEIPT}; {BLOB_LOCAL_SLICE}; {BLOB_LIVE_SLICE}; {LIVE_BLOB_ACCEPTANCE_SLICE}; {LIVE_BLOB_RECEIPT}; {CUSTODY_SLICE}; {AGENT_SLICE}; shipped and compiled examples exercise high-level Event/State/Record publication and query, Record conflict resolution, stopped Blob streaming, Event delivery/custody/quota/policy, and the Event-only agent sample; the Blob quickstart supplies a live publish/page-read/later-sync guide and a retained acceptance producer exercises that handle",
+        "The retained live Blob producer is an acceptance harness, not a minimal developer sample. Add a compiled minimal live Blob sample, make subscription/status boundaries explicit, add durable State/Record delivery samples and selected-node bindings, and retain independent usability, operational provisioning, Linux/physical custody, and physical multi-system evidence.",
     ),
     "DM-8-01": selected_claim(
         "observed-bounded",
         "selected Rust workspace",
-        f"{LIVE_MUTABLE_RECEIPT}; cargo +1.91.0 check --locked --offline --workspace --all-targets --all-features and selected control/Event/runtime tests passed; the retained live-mutable run used a Cargo release-profile Rust executable of 12001136 bytes with SHA-256 47ca5e7aededa352604bb8c308def90c46237f594b9eb9be10cc22936afbed60",
-        "The retained executable is operator-attested rather than a reproducible or cryptographically source-bound build, and it is not a product release. Repeat static-build and target acceptance for every supported release target after the full semantic migration.",
+        f"{LIVE_MUTABLE_RECEIPT}; {LIVE_BLOB_RECEIPT}; cargo +1.91.0 check --locked --offline --workspace --all-targets --all-features and selected control/Event/runtime tests passed; retained live-mutable and live-Blob runs used Cargo release-profile Rust executables, with the live-Blob executable exactly 12196704 bytes and SHA-256 1d1f1ea704e03087a9800b81465ed15bcea0fcb045b8fc59800894ccfa3e873b",
+        "The retained executables are operator-attested rather than reproducible or cryptographically source-bound builds, and neither is a product release. Repeat static-build and target acceptance for every supported release target after the full semantic migration.",
     ),
     "DM-8-02": selected_claim(
         "observed-bounded",
         "selected Rust workspace",
-        f"{LIVE_MUTABLE_RECEIPT}; Cargo.toml designates the selected crates as Rust; the retained live-mutable executable was built with cargo build --release --locked -p aster-node --example live_mutable_acceptance and passed its bounded run",
-        "Retain Rust as the core-framework language through full semantic migration, supported-target acceptance, and release packaging; the retained binary is not release authorization.",
+        f"{LIVE_MUTABLE_RECEIPT}; {LIVE_BLOB_RECEIPT}; Cargo.toml designates the selected crates as Rust; retained live-mutable and live-Blob executables were built with exact cargo build --release --locked aster-node example commands and passed their bounded runs",
+        "Retain Rust as the core-framework language through full semantic migration, supported-target acceptance, and release packaging; neither retained binary is release authorization.",
     ),
     "DM-8-05": selected_claim(
         "open",
@@ -1020,14 +1030,14 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     "DM-9-13": selected_claim(
         "implemented-uncredited",
         "aster-core + aster-redb-store + aster-node",
-        f"{BLOB_LOCAL_SLICE}; {BLOB_NETWORK_SLICE}; {BLOB_LIVE_SLICE}; stopped read_into freshly verifies the selected publication and completed depot variant before streaming independently authenticated plaintext chunks into a caller-owned writer; live read_page repeats current-policy, projection, depot-capability, chunk, and final-lifecycle checks and returns at most one 64-KiB zeroize-on-drop plaintext page; semantic-v5 transport accepts ranges no larger than 16 KiB and verifies the complete Blob before publication",
-        "The network and live cases use modest files and do not establish Blob subscription/status, route-only custody, 100+ MiB or process-RSS behavior, carrier switching, physical-disk acceptance, platform breadth, mixed implementations, or retained resource evidence.",
+        f"{BLOB_LOCAL_SLICE}; {BLOB_NETWORK_SLICE}; {BLOB_LIVE_SLICE}; {LIVE_BLOB_RECEIPT}; stopped read_into freshly verifies the selected publication and completed depot variant before streaming independently authenticated plaintext chunks into a caller-owned writer; live read_page repeats current-policy, projection, depot-capability, chunk, and final-lifecycle checks and returns at most one 64-KiB zeroize-on-drop plaintext page; the retained live run returned six exact pages across source, receiver, and graceful receiver reopen for one 65,747-byte payload",
+        "The retained fixture is only 65,747 bytes and does not establish large-Blob storage streaming, Blob subscription/status, route-only custody, 100+ MiB or process-RSS behavior, carrier switching, physical-disk acceptance, platform breadth, mixed implementations, or retained resource evidence.",
     ),
     "DM-9-14": selected_claim(
         "implemented-uncredited",
         "aster-core + aster-redb-store + aster-node",
-        f"{BLOB_LOCAL_SLICE}; {BLOB_NETWORK_SLICE}; {BLOB_LIVE_SLICE}; preparation uses one bounded zeroizing plaintext chunk buffer and a one-MiB-manifest-bounded digest vector; the core streaming engine reports its peak chunk-buffer capacity, store adapters are independently chunk-bounded, the live worker is joined and capacity-one, live plaintext pages are capped at 64 KiB spanning at most two canonical chunks and are zeroized on drop, and semantic-v5 transfer bounds each accepted range at 16 KiB without granting visibility until freshly streamed whole-content verification",
-        "These component bounds are not a whole-process peak-memory measurement; adapters, the actor, filesystem, and caller custody may hold other bounded buffers. Current evidence uses modest local fixtures. Add bracketed process RSS on supported targets, 100+ MiB network transfer, physical storage/resource accounting, mixed implementations, and retained acceptance before crediting the full resource target.",
+        f"{BLOB_LOCAL_SLICE}; {BLOB_NETWORK_SLICE}; {BLOB_LIVE_SLICE}; {LIVE_BLOB_RECEIPT}; preparation uses one bounded zeroizing plaintext chunk buffer and a one-MiB-manifest-bounded digest vector; the core streaming engine reports its peak chunk-buffer capacity, store adapters are independently chunk-bounded, the live worker is joined and capacity-one, live plaintext pages are capped at 64 KiB spanning at most two canonical chunks and are zeroized on drop, and the retained run exercises only one 65,747-byte two-page fixture",
+        "These component bounds and the retained small fixture are not a whole-process peak-memory measurement; adapters, the actor, filesystem, and caller custody may hold other bounded buffers. Add bracketed process RSS on supported targets, 100+ MiB network transfer, physical storage/resource accounting, mixed implementations, and retained resource acceptance before crediting the full target.",
     ),
     "DM-9-21A": selected_claim(
         "observed-bounded",
@@ -1063,7 +1073,7 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
         "implemented-uncredited",
         "aster-redb-store + aster-node",
         f"{LIVE_MUTABLE_SLICE}; {LIVE_MUTABLE_RECEIPT}; the selected MVP composition detects multiple active Record heads through an explicit live RecordConflict, rejects ordinary publication without insertion, and accepts only an exact-sibling guarded application resolution",
-        "The conflict mechanism is present and bounded evidence exists, but the complete MVP is not shipped: live Blob has no subscription/status or retained acceptance, bindings and the local agent lack Record operations, automatic registered-policy merge is absent, and physical/mixed/release gates remain open.",
+        "The conflict mechanism is present and bounded evidence exists, but the complete MVP is not shipped: live Blob has no subscription/status, bindings and the local agent lack Record operations, automatic registered-policy merge is absent, and physical/mixed/release gates remain open. The retained Blob receipt is unrelated to Record conflict detection and does not complete the MVP.",
     ),
     "DM-11-07": selected_claim(
         "implemented-uncredited",

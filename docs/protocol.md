@@ -799,9 +799,19 @@ here.
 
 The current selected `aster-node` schedules this grammar automatically on its
 direct-Iroh contacts after semantic-v5 negotiation, control activation, and an
-exact configured Blob receive selector. That current-code automation is not a
-retained direct-Iroh Blob acceptance receipt and does not establish operation
-over the controlled Iroh relay.
+exact configured Blob receive selector. A
+[retained 8,220-byte live-Blob receipt](implementation/evidence/selected-live-blob-036d068.json)
+(SHA-256
+`484eafe504d958881dc7b871fbf788f733d9c8814e02fc27253ece38e6169735`)
+binds source commit `036d068a8d055154beeffe265ceea8cf97079fa6` with
+`Good` signature status; 49 verifier tests pass. Its source-to-execution link
+remains operator-attested, not cryptographically proven. It is one-host,
+same-implementation direct-loopback evidence of peerless publication, later
+complete transfer, bounded live page reads, and a graceful same-process
+actor/store/provider reopen only. It does not prove partial or different-peer
+resume, process-crash, power-loss, or long-offline recovery, physical
+sanitization, independent-implementation interoperability, operation over the
+controlled Iroh relay, or release authorization.
 
 For each receiver direction, the Blob source phase completes first through the
 class-separated mutable inventory/difference/Offer/Fetch/result/ack/finish

@@ -44,6 +44,19 @@ acceptance. Finite State/Record TTL, durable
 subscriptions, selected-node language bindings, representative physical or
 mixed-implementation acceptance, and release authorization remain open.
 
+A [retained 8,220-byte live-Blob receipt](docs/implementation/evidence/selected-live-blob-036d068.json)
+(SHA-256
+`484eafe504d958881dc7b871fbf788f733d9c8814e02fc27253ece38e6169735`)
+binds source commit `036d068a8d055154beeffe265ceea8cf97079fa6` with
+`Good` signature status; 49 verifier tests pass. Its source-to-execution link
+remains operator-attested, not cryptographically proven. It is one-host,
+same-implementation direct-loopback evidence of peerless publication, later
+complete transfer, bounded live page reads, and a graceful same-process
+actor/store/provider reopen only. It does not prove partial or different-peer
+resume, process-crash, power-loss, or long-offline recovery, physical
+sanitization, independent-implementation interoperability, or release
+authorization.
+
 A [retained two-cell receipt](docs/implementation/requirements-status.md#selected-iroh-nat-retained-receipt)
 observes the selected Event path on one Darwin arm64 host through isolated
 Docker Linux namespace NATs: one relay-disabled cone cell selected Direct, and
@@ -140,7 +153,7 @@ provisioning remain open work.
 | **Event** | Source-authenticated reconciliation over direct Iroh or one operator-pinned controlled Iroh connectivity relay; live Rust and local ConnectRPC APIs; durable consume/carry selectors and at-least-once delivery | Atomic subscription update, hosted discovery/public relay, and broader physical-network acceptance |
 | **State** | Source-authenticated live or stopped publication/query, causal projection, direct-Iroh reconciliation under explicit interests, and bounded retained one-host evidence | Durable subscriptions, selected-node bindings, finite TTL, relay acceptance, expiry/garbage collection, and representative physical/mixed evidence |
 | **Record** | Live or stopped conflict-preserving query/publication, exact-sibling guarded resolution, direct-Iroh reconciliation, and bounded retained one-host evidence | Durable subscriptions, selected-node bindings, automatic merge execution, finite TTL, relay acceptance, expiry/garbage collection, and representative physical/mixed evidence |
-| **Blob** | Authenticated immutable publication through a cloneable live Rust handle or exclusive stopped facade; live reads return at most one zeroize-on-drop 64-KiB page; direct semantic-v5 source/carrier transfer has durable resume state | Blob subscription or convergence status, route-only relay/custody, retained live-Blob receipt, large/RSS acceptance, representative physical or mixed-implementation evidence, retention, and garbage collection |
+| **Blob** | Authenticated immutable publication through a cloneable live Rust handle or exclusive stopped facade; live reads return at most one zeroize-on-drop 64-KiB page; direct semantic-v5 source/carrier transfer has durable resume state and bounded retained one-host complete-transfer/read/reopen evidence | Blob subscription or convergence status, route-only relay/custody, partial or different-peer resume acceptance, crash/power-loss/long-offline recovery, large/RSS acceptance, representative physical or mixed-implementation evidence, retention, garbage collection, and release authorization |
 | **Operations** | Manually admitted direct addresses, an operator-pinned controlled relay, bounded one-host software namespace-NAT acceptance, reference mission provisioning, and bounded same-UID Unix software zeroization | Protected operational provisioning, discovery, representative/physical NAT, public/default relay selection, BTLE platform integration, physical sanitization, and release authorization |
 
 The [capability roadmap](docs/implementation/capability-roadmap.md) is the

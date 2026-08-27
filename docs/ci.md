@@ -18,7 +18,7 @@ single stable check name **`CI / required`**.
 
 | Check | Runner | Purpose |
 | --- | --- | --- |
-| `quality` | `ubuntu-24.04` | Runs `mise run check`: Rust and Go formatting, Apache-2.0-only project-license and package checks, exact 348-row implementation-requirements traceability, the selected-node dependency boundary, vendored netlink source-equivalence and 13-test compatibility gates, the retained-libp2p-oracle boundary, selected live-mutable receipt checker tests, Clippy with warnings denied, the full Rust workspace test suite, C ABI build and C/C++ header checks, Rust/Python conformance, Python/Go binding tests, and the lab-controller tests. |
+| `quality` | `ubuntu-24.04` | Runs `mise run check`: Rust and Go formatting, Apache-2.0-only project-license and package checks, exact 348-row implementation-requirements traceability, the selected-node dependency boundary, vendored netlink source-equivalence and 13-test compatibility gates, the retained-libp2p-oracle boundary, selected live-mutable and live-Blob receipt checker tests, Clippy with warnings denied, the full Rust workspace test suite, C ABI build and C/C++ header checks, Rust/Python conformance, Python/Go binding tests, and the lab-controller tests. |
 | `macOS tests` | `macos-14` | Runs all Rust workspace tests on the supported Apple runner with Rust 1.97.1. |
 | `Rust 1.91 MSRV` | `ubuntu-24.04` | Checks every workspace target and feature with the declared minimum supported Rust version. |
 | `dependency policy` | `ubuntu-24.04` | Enforces the retained-libp2p-oracle boundary, applies `deny.toml` to the root and fuzz dependency graphs, and audits both lockfiles against a freshly downloaded RustSec database. |
@@ -591,6 +591,71 @@ relabel historical Event/control evidence.
 Strict workspace Rustdoc and a fresh isolated `aster-node` plus `aster-iroh`
 documentation build are also part of the frozen gate; stale Cargo rmeta is not a
 source change or an accepted substitute for the clean isolated build.
+
+## Selected live Blob retained gate
+
+The dated 2026-08-27 retained gate supersedes only the earlier statements above
+that no live Blob execution receipt existed. The canonical
+[`selected-live-blob-036d068.json`](implementation/evidence/selected-live-blob-036d068.json)
+receipt is 8,220 bytes with SHA-256
+`484eafe504d958881dc7b871fbf788f733d9c8814e02fc27253ece38e6169735`
+and binds the run to good-signature source commit
+`036d068a8d055154beeffe265ceea8cf97079fa6`.
+
+Two distinct participants execute four actor lifetimes with at most two
+concurrent actors. The publisher creates one 65,747-byte Blob while peerless,
+reads its two bounded pages, proves exact noninserting retry and changed-payload
+conflict behavior, removes and parent-syncs both plaintext source files, and
+then transfers directly over Iroh. Twelve positive direct `CONTACT` records
+cross-bind the terminal counters: the publisher fetches zero ranges and bytes,
+while the receiver fetches six ranges and 66,081 bytes with zero deferred work.
+The receiver reads the same two-page Blob after transfer and again after a
+peerless graceful reopen. Four graceful shutdowns, four closed retained
+handles, and two bind reacquisitions pass. Each participant retains one
+two-chunk finalized variant with 66,085 committed ciphertext-file bytes.
+`blob_remaining` is reconciled exactly but is not retained as completion proof;
+authenticated page reads, durable rows, and the completed depot shape provide
+the bounded visibility evidence.
+
+The raw root is owner-only evidence and contains mission and identity material,
+databases, depot metadata, and ciphertext. It must remain outside source
+control. The checker inventories those private artifacts by metadata only and
+does not open, read, or hash their contents. A fresh capture requires a clean,
+good-signed source checkout and a new exclusive raw-root path:
+
+```sh
+python3 tools/run-selected-live-blob.py \
+  --source /path/to/clean-good-signed-aster-source \
+  --raw-root /private/tmp/aster-selected-live-blob-new
+
+python3 tools/check-selected-live-blob-receipt.py - \
+  --raw-root /private/tmp/aster-selected-live-blob-new \
+  --source /path/to/clean-good-signed-aster-source \
+  --output /private/tmp/aster-live-blob-projection/selected-live-blob-receipt.json
+```
+
+Replaying the checked-in receipt requires the externally retained raw root and
+a separate clean checkout detached at the exact signed source commit:
+
+```sh
+python3 tools/check-selected-live-blob-receipt.py \
+  --raw-root /path/to/retained/selected-live-blob-raw-root \
+  --source /path/to/aster-source-detached-at-036d068a8d055154beeffe265ceea8cf97079fa6 \
+  docs/implementation/evidence/selected-live-blob-036d068.json
+python3 tools/test-selected-live-blob-receipt.py
+```
+
+The raw-root projection reproduced the checked-in receipt byte-for-byte, and
+the independent-oracle fail-closed suite passed 49/49. The source-to-binary-to-
+execution link remains operator-attested rather than cryptographically proven,
+and the admitted source list is not a complete reproducible build closure. The
+restart is a graceful same-process actor/store/provider reopen, not a process-
+crash or power-loss recovery. Transcript timing and source-removal order are
+producer-attested; unlink plus parent sync is not physical-media sanitization.
+The receipt proves neither long-offline nor partial-transfer resume, independent
+black-box conformance, physical or representative NAT/relay/BTLE operation,
+mixed implementations, resource or scale targets, route-only custody, a
+complete MVP, a release artifact, or production authorization.
 
 ## Controlled Iroh relay software gate
 

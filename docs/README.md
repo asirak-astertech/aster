@@ -78,10 +78,11 @@ The selected implementation deliberately exposes different maturity levels:
   at most one 64-KiB, zeroize-on-drop plaintext page. Its exclusive stopped
   streaming facade remains available when no actor owns the store. Semantic v5
   can later synchronize the already-durable source and carrier ranges directly
-  between current content-capable peers, with durable restart/resume state.
-  Blob subscription/status convergence, route-only custody, retained live-path
-  receipt, large/RSS acceptance, and representative physical or
-  mixed-implementation evidence remain open.
+  between current content-capable peers, with durable restart/resume state and
+  bounded retained one-host complete-transfer/read/reopen evidence. Blob
+  subscription/status convergence, route-only custody, partial or
+  different-peer resume acceptance, large/RSS acceptance, and representative
+  physical or mixed-implementation evidence remain open.
 - The broader semantic Rust implementation and language bindings remain the
   proven migration source for behavior not yet composed into the selected node.
 
@@ -104,6 +105,19 @@ non-reproducible source-to-execution link and metadata-only secret inspection;
 it is not physical, NAT/relay, BTLE, independent-implementation, scale,
 resource, long-duration, release, or Event/Blob-live acceptance. In particular,
 its zero Blob counters do not evidence the newer live Blob handle.
+
+A separate [retained 8,220-byte live-Blob receipt](implementation/evidence/selected-live-blob-036d068.json)
+(SHA-256
+`484eafe504d958881dc7b871fbf788f733d9c8814e02fc27253ece38e6169735`)
+binds source commit `036d068a8d055154beeffe265ceea8cf97079fa6` with
+`Good` signature status; 49 verifier tests pass. Its source-to-execution link
+remains operator-attested, not cryptographically proven. It is one-host,
+same-implementation direct-loopback evidence of peerless publication, later
+complete transfer, bounded live page reads, and a graceful same-process
+actor/store/provider reopen only. It does not prove partial or different-peer
+resume, process-crash, power-loss, or long-offline recovery, physical
+sanitization, independent-implementation interoperability, or release
+authorization.
 
 Aster remains an evaluation-stage reference implementation. Do not infer
 production authorization from code presence or a passing demo. The

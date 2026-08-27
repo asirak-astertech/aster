@@ -17,10 +17,20 @@ direct carrier ranges between current content-capable peers. The default offer
 is `[5, 4, 3, 2, 1]`; v1-v4 emit zero Blob frames, and stable wire/ABI, source,
 manifest, and `ASTRBT01` formats remain version 1.
 
-This branch has mechanism tests but no retained live-Blob execution receipt.
-Nothing in this guide claims route-only Blob custody, large-Blob/RSS acceptance,
-representative physical networking, mixed-implementation interoperability,
-physical sanitization, or release acceptance.
+A [retained 8,220-byte live-Blob receipt](../implementation/evidence/selected-live-blob-036d068.json)
+(SHA-256
+`484eafe504d958881dc7b871fbf788f733d9c8814e02fc27253ece38e6169735`)
+binds source commit `036d068a8d055154beeffe265ceea8cf97079fa6` with
+`Good` signature status; 49 verifier tests pass. Its source-to-execution link
+remains operator-attested, not cryptographically proven. It is one-host,
+same-implementation direct-loopback evidence of peerless publication, later
+complete transfer, bounded live page reads, and a graceful same-process
+actor/store/provider reopen only. It does not prove partial or different-peer
+resume, process-crash, power-loss, or long-offline recovery, physical
+sanitization, independent-implementation interoperability, or release
+authorization. Nothing in this guide claims route-only Blob custody,
+large-Blob/RSS acceptance, representative physical networking, or broader
+acceptance.
 
 ## Use the live actor API
 

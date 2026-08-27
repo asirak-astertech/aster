@@ -329,8 +329,20 @@ Empty means receive-none. These selectors do not grant route or content access;
 the mission bundle must independently authorize the exact source, topic,
 scope, and current epoch. Eligible semantic-v5 direct-Iroh contacts
 automatically reconcile Blob sources and peer-neutral contiguous carrier ranges
-of at most 16 KiB; this current automation has no retained direct-Iroh Blob
-acceptance receipt.
+of at most 16 KiB. A
+[retained 8,220-byte live-Blob receipt](../implementation/evidence/selected-live-blob-036d068.json)
+(SHA-256
+`484eafe504d958881dc7b871fbf788f733d9c8814e02fc27253ece38e6169735`)
+binds source commit `036d068a8d055154beeffe265ceea8cf97079fa6` with
+`Good` signature status; 49 verifier tests pass. Its source-to-execution link
+remains operator-attested, not cryptographically proven. It is one-host,
+same-implementation direct-loopback evidence of peerless publication, later
+complete transfer, bounded live page reads, and a graceful same-process
+actor/store/provider reopen only. It does not prove partial or different-peer
+resume, process-crash, power-loss, or long-offline recovery, physical
+sanitization, independent-implementation interoperability, or release
+authorization. The CLI's built-in roles did not produce that receipt and gain
+no Blob acceptance credit from it.
 
 Any stopped State/Record/Blob facade must be closed before the runtime owns the
 same store. Rust applications may instead call
@@ -512,11 +524,11 @@ reconciliation. Do not use `put` as evidence for the source-authenticated mesh.
 No old path is removed until its replacement passes equivalent tests. Current
 open work includes State/Record subscriptions and selected-node bindings,
 broader State/Record partition/relay acceptance, Blob subscription/status and
-selected-node bindings, retained direct-Iroh and controlled-relay Blob
-acceptance, route-only Blob relay/custody, generalized publish/subscribe and
-topic filtering, finite State/Record/Blob custody and non-Linux finite Event
-custody, protected provisioning, generalized control administration and
-repeated multi-scope rekey,
+selected-node bindings, partial or different-peer direct-Iroh Blob resume and
+controlled-relay Blob acceptance, route-only Blob relay/custody, generalized
+publish/subscribe and topic filtering, finite State/Record/Blob custody and
+non-Linux finite Event custody, protected provisioning, generalized control
+administration and repeated multi-scope rekey,
 platform-complete zeroization assurance, physical/multi-carrier or
 mixed-implementation acceptance, and release gates. The tracked [requirements
 status](../implementation/requirements-status.md) keeps those boundaries

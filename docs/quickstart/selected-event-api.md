@@ -20,8 +20,7 @@ status. Semantic v5 separately transfers already-durable Blobs directly between
 current content-capable peers, including after a peerless publish and later
 restart. V1-v4 emit zero Blob frames. Route-only Blob relay/custody, Blob
 TTL/GC, large/RSS acceptance, representative physical or mixed-implementation
-acceptance, and a retained live-Blob receipt remain open. Non-Linux finite Event
-TTL, atomic subscription update,
+acceptance remain open. Non-Linux finite Event TTL, atomic subscription update,
 selected-node language bindings, a production provisioning/SecretStore backend,
 protected stock CLI startup, generalized multi-family control policy, and
 automatic/atomic revoke-plus-rekey remediation remain open. The stopped
@@ -31,6 +30,19 @@ construction now accepts the same sources, and a running authority exposes the
 typed `SelectedControlHandle`; those bounded Rust-only seams are documented
 below. Linux semantic-v3/v4/v5 finite Event TTL is documented in the
 [selected custody quickstart](selected-custody-api.md).
+
+A [retained 8,220-byte live-Blob receipt](../implementation/evidence/selected-live-blob-036d068.json)
+(SHA-256
+`484eafe504d958881dc7b871fbf788f733d9c8814e02fc27253ece38e6169735`)
+binds source commit `036d068a8d055154beeffe265ceea8cf97079fa6` with
+`Good` signature status; 49 verifier tests pass. Its source-to-execution link
+remains operator-attested, not cryptographically proven. It is one-host,
+same-implementation direct-loopback evidence of peerless publication, later
+complete transfer, bounded live page reads, and a graceful same-process
+actor/store/provider reopen only. It does not prove partial or different-peer
+resume, process-crash, power-loss, or long-offline recovery, physical
+sanitization, independent-implementation interoperability, or release
+authorization.
 
 ## Run the live example
 

@@ -358,6 +358,32 @@ application handle is tested separately by `V-BLOB-LIVE`; neither gate claims a
 Blob subscription/status API, route-only Blob relay/custody, the 100+ MiB or RSS
 target, physical-media behavior, mixed implementation, or release acceptance.
 
+A separate dated
+[`V-BLOB-LIVE` retained receipt](implementation/evidence/selected-live-blob-036d068.json)
+now records the bounded live-application composition at good-signature source
+commit `036d068a8d055154beeffe265ceea8cf97079fa6`. Its 8,220 canonical bytes have
+SHA-256
+`484eafe504d958881dc7b871fbf788f733d9c8814e02fc27253ece38e6169735`.
+One peerless live publisher proves publication, exact retry, changed-payload
+conflict, bounded two-page read, and source unlink plus parent sync; a later
+two-participant direct-Iroh phase proves positive receiver transfer and
+completed visibility; a final peerless receiver actor reproduces the read after
+graceful reopen. Four retained handles fail closed and both direct bind
+addresses are reacquired. The 49-test independent-oracle checker suite covers
+the canonical projection, exact transcript/runtime relations, private-artifact
+metadata-only inventory, privacy exclusion, and fail-closed replay.
+
+This advances only the bounded same-implementation, one-host live Blob
+observation. It is not an independent black-box conformance result and does not
+satisfy a separately deployed SUT requirement. The reopen is graceful and
+same-process, not process-crash or power-loss recovery; the run does not
+interrupt a partial transfer and therefore proves neither partial resume nor
+long-offline continuation. Source unlink and parent sync do not establish
+physical-media sanitization, and transcript timing remains producer-attested.
+Physical or representative networking, route-only custody, mixed
+implementations, scale/resource targets, complete MVP acceptance, release
+evidence, and production authorization remain open.
+
 Focused inventory-selection regressions exercise the same bound at small test
 sizes: the SQLite helper returns exactly the configured cap, requests only cap
 plus one rows in its single metadata-only query, and rejects the extra row; the

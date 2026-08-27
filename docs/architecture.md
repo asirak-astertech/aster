@@ -350,8 +350,19 @@ source and range send requires the authenticated peer's current exact content
 proof plus route and nonrevocation authority. Pending bytes remain outside
 ordinary publication until the exact depot, full-content, and current-lineage
 proofs agree atomically. This is bounded direct, same-implementation automation,
-not a retained Blob receipt, route-only Blob relay/custody, or
-Blob-over-controlled-relay acceptance.
+not route-only Blob relay/custody or Blob-over-controlled-relay acceptance. A
+[retained 8,220-byte live-Blob receipt](implementation/evidence/selected-live-blob-036d068.json)
+(SHA-256
+`484eafe504d958881dc7b871fbf788f733d9c8814e02fc27253ece38e6169735`)
+binds source commit `036d068a8d055154beeffe265ceea8cf97079fa6` with
+`Good` signature status; 49 verifier tests pass. Its source-to-execution link
+remains operator-attested, not cryptographically proven. It is one-host,
+same-implementation direct-loopback evidence of peerless publication, later
+complete transfer, bounded live page reads, and a graceful same-process
+actor/store/provider reopen only. It does not prove partial or different-peer
+resume, process-crash, power-loss, or long-offline recovery, physical
+sanitization, independent-implementation interoperability, or release
+authorization.
 
 `BlobDepotLimits` reserve canonical ciphertext-file bytes for every durable
 expected chunk record and bound durable per-chunk metadata rows and
@@ -368,7 +379,7 @@ preserves the encrypted Blob depot and audited data rows. This is bounded
 cryptographic shredding, not Blob-file deletion or physical sanitization. Blob
 subscription/status, route-only relay/custody, Blob-over-controlled-relay
 acceptance, finite TTL, retention/GC, large/physical acceptance, mixed
-implementations, and retained network evidence remain open.
+implementations, and representative network evidence remain open.
 
 ## Live application command and status flow
 

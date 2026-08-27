@@ -383,3 +383,39 @@ route-only custody, TTL/expiry/garbage collection, metadata-independent
 whole-byte deduplication, 100+ MiB or RSS/resource thresholds, representative
 physical IP/NAT/relay or BTLE operation, mixed-implementation interoperability,
 selected-node language bindings, and release authorization remain open.
+
+## Retained live Blob acceptance amendment (2026-08-27)
+
+This amendment supersedes only the preceding statement that the live selected
+Blob composition has no retained execution receipt. It does not change the
+application ownership, page custody, cancellation, shutdown, or zeroization
+decision above. The canonical
+[`selected-live-blob-036d068.json`](../implementation/evidence/selected-live-blob-036d068.json)
+receipt is 8,220 bytes with SHA-256
+`484eafe504d958881dc7b871fbf788f733d9c8814e02fc27253ece38e6169735`
+and binds the bounded execution to good-signature source commit
+`036d068a8d055154beeffe265ceea8cf97079fa6`.
+
+Two distinct participant identities under one common mission authority execute
+four actor lifetimes with at most two concurrent. The publisher's live handle
+publishes one fixed nonempty file
+while peerless, proves exact retry and changed-payload conflict behavior, and
+reads the exact two-page result. After the plaintext source files are unlinked
+and their parent is synchronized, a direct-Iroh phase transfers the Blob to the
+receiver, whose live handle reads the completed result. A later graceful
+peerless receiver reopen reproduces that read. Four retained handles fail
+closed after shutdown, and both direct bind addresses are reacquired. The
+private mission, identity, database, depot-marker, and ciphertext contents are
+inventoried by metadata only and are not opened, read, or hashed by the
+projector. The independent-oracle checker suite passed 49/49.
+
+The source/binary/execution link remains operator-attested, the selected source
+list is not a complete reproducible-build closure, and transcript timing is
+producer-attested. The reopen is a graceful same-process actor/store/provider
+reopen rather than crash or power-loss recovery. Source unlink plus parent sync
+is not physical-media sanitization. The run contains no interrupted partial
+transfer and proves no long-offline continuation. It also establishes no Blob
+subscription/status convergence, route-only custody, independent black-box
+conformance, physical or representative network, mixed implementation,
+scale/resource target, complete MVP, release artifact, or production
+authorization.
