@@ -19,9 +19,11 @@ selected Rust surface and has a
 [retained bounded receipt](../implementation/evidence/selected-live-state-subscription-8912fc3.json).
 It is not a synthetic-withdrawal or materialized-view feed. Configured
 `NodeConfig` State interests remain the network receive
-policy in this slice; subscriptions do not dynamically replace them. Dynamic
-network selectors, State/node contact status, Record/Blob delivery, selected-
-node ConnectRPC/C/Go/Python bindings, finite TTL, tombstone retention duration,
+policy in this slice; subscriptions do not dynamically replace them. Record
+now has a separate current-code durable whole-key delivery mechanism, without a
+retained Record-delivery receipt. Dynamic network selectors, State/node contact
+status, Blob delivery, selected-node ConnectRPC/C/Go/Python bindings, finite
+TTL, tombstone retention duration,
 expiry, compaction, garbage collection, broader relay acceptance,
 representative physical/mixed-implementation evidence, and release
 authorization remain open. The selected store rejects every finite-TTL State

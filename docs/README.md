@@ -92,9 +92,11 @@ The selected implementation deliberately exposes different maturity levels:
   loopback host, a flushed unacknowledged poll, forced receiver-process
   termination, fresh-process attempt-2 redelivery and acknowledgement,
   selector withholding, causal ancestor suppression, an explicit current
-  tombstone, and one final peerless subscription replay. Record/Blob delivery,
-  State contact/status and materialized-view/synthetic-withdrawal behavior,
-  dynamic State network interests, selected-node bindings, finite TTL,
+  tombstone, and one final peerless subscription replay. Record now has a
+  current-code durable whole-key active-head queue, but retained Record-delivery
+  acceptance and Blob delivery remain open. State contact/status and
+  materialized-view/synthetic-withdrawal behavior, dynamic State network
+  interests, selected-node bindings, finite TTL,
   tombstone retention duration/garbage collection, and representative
   physical/mixed acceptance, scale/resource evidence, and release authorization
   remain open.

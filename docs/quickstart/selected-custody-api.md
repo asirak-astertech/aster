@@ -276,7 +276,9 @@ same-process reopens on one host; it adds no custody acceptance to this guide.
 This slice does not add finite State/Record TTL. State's separate durable
 positive-current-version application subscription runs outside custody and is
 documented in the [selected State API](selected-state-api.md). This slice adds
-no Record subscription, Blob subscription/status, Blob custody/TTL/GC,
+no Record subscription itself; Record's separate current-code durable whole-key
+queue is documented in the [selected Record API](selected-record-api.md) and has
+no retained delivery receipt. Blob subscription/status, Blob custody/TTL/GC,
 arbitrary-peer or route-only Blob resume, selected-node bindings, cross-class
 priority eviction, physical-radio silence or media-sanitization proof, protected
 provisioning, representative/physical NAT or Internet, public/default or

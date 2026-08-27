@@ -62,9 +62,14 @@ pub use blob::{
 };
 pub(crate) use record::SelectedRecordCommand;
 pub use record::{
-    RecordConflict, RecordId, RecordItem, RecordProjection, RecordPublishRequest,
-    RecordPublishResult, RecordQuery, RecordResolutionGuard, RecordResolveRequest,
-    RecordVersionDisposition, SelectedRecordHandle, SelectedRecordNode,
+    MAX_SELECTED_RECORD_DELIVERIES, MAX_SELECTED_RECORD_SUBSCRIPTION_SCAN,
+    RECORD_DELIVERY_TOKEN_BYTES, RecordAcknowledgement, RecordConflict, RecordDelivery,
+    RecordDeliveryConflict, RecordDeliveryPage, RecordDeliveryProjection, RecordDeliveryToken,
+    RecordId, RecordItem, RecordPollRequest, RecordProjection, RecordProjectionId,
+    RecordProjectionKey, RecordPublishRequest, RecordPublishResult, RecordQuery,
+    RecordResolutionGuard, RecordResolveRequest, RecordSubscription, RecordSubscriptionId,
+    RecordSubscriptionRequest, RecordUnsubscribe, RecordVersionDisposition, SelectedRecordHandle,
+    SelectedRecordNode,
 };
 pub(crate) use state::SelectedStateCommand;
 pub use state::{
@@ -801,7 +806,7 @@ impl SelectedEventCommand {
 /// One bounded high-level application command owned by the running node actor.
 ///
 /// The wrapper keeps Event, State, Record, and Blob operations on one admission and
-/// fairness lane. Event and State subscription changes require the actor's
+/// fairness lane. Event, State, and Record subscription changes require the actor's
 /// selector-write lease; plaintext operations for every class remain behind
 /// the same mission-bound store authority.
 pub(crate) enum SelectedApplicationCommand {
@@ -816,7 +821,8 @@ impl SelectedApplicationCommand {
         match self {
             Self::Event(command) => command.mutates_selectors(),
             Self::State(command) => command.mutates_selectors(),
-            Self::Record(_) | Self::Blob(_) => false,
+            Self::Record(command) => command.mutates_selectors(),
+            Self::Blob(_) => false,
         }
     }
 
@@ -1804,6 +1810,7 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         | StoreError::InvalidRecordOperationKey { .. }
         | StoreError::InvalidEventSubscriptionKey { .. }
         | StoreError::InvalidStateSubscriptionKey { .. }
+        | StoreError::InvalidRecordSubscriptionKey { .. }
         | StoreError::EventPageLimitExceeded { .. }
         | StoreError::EventSubscriptionNotFound
         | StoreError::EventSubscriptionNotConsumable
@@ -1817,6 +1824,14 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         | StoreError::StateSubscriptionIncarnationChanged { .. }
         | StoreError::StateDeliveryTenureChanged { .. }
         | StoreError::StateDeliveryAttemptChanged { .. }
+        | StoreError::RecordSubscriptionNotFound
+        | StoreError::RecordSubscriptionPollLimitExceeded { .. }
+        | StoreError::RecordDeliveryNotFound
+        | StoreError::InvalidRecordDeliveryToken
+        | StoreError::RecordDeliveryTokenBindingMismatch
+        | StoreError::RecordSubscriptionIncarnationChanged { .. }
+        | StoreError::RecordDeliveryTenureChanged { .. }
+        | StoreError::RecordDeliveryAttemptChanged { .. }
         | StoreError::EventReplicationNotSelected
         | StoreError::EventReplicationNotConsumable
         | StoreError::InvalidSemanticEvent(_)
@@ -1846,6 +1861,8 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         | StoreError::StateProjectionPlanChanged
         | StoreError::StateSubscriptionPlanChanged
         | StoreError::StateSelectorGenerationChanged
+        | StoreError::RecordSubscriptionPlanChanged
+        | StoreError::RecordSelectorGenerationChanged
         | StoreError::EventSubscriptionPlanChanged
         | StoreError::EventGapScanPlanChanged
         | StoreError::EventSelectorRevisionChanged => ApplicationErrorKind::PolicyUnsettled,
@@ -1864,7 +1881,8 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         | StoreError::RecordConflictRequiresResolution
         | StoreError::RecordProjectionPlanChanged
         | StoreError::EventSubscriptionConflict
-        | StoreError::StateSubscriptionConflict => ApplicationErrorKind::Conflict,
+        | StoreError::StateSubscriptionConflict
+        | StoreError::RecordSubscriptionConflict => ApplicationErrorKind::Conflict,
         StoreError::ItemLimitExceeded { .. }
         | StoreError::EventOperationLimitExceeded { .. }
         | StoreError::EventOperationByteLimitExceeded { .. }
@@ -1887,6 +1905,12 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         | StoreError::StateDeliveryLedgerLimitExceeded { .. }
         | StoreError::StateDeliveryAttemptExhausted
         | StoreError::StateDeliveryTenureExhausted
+        | StoreError::RecordSubscriptionLimitExceeded { .. }
+        | StoreError::RecordPendingDeliveryLimitExceeded { .. }
+        | StoreError::RecordAcknowledgementReceiptLimitExceeded { .. }
+        | StoreError::RecordDeliveryLedgerLimitExceeded { .. }
+        | StoreError::RecordDeliveryAttemptExhausted
+        | StoreError::RecordDeliveryTenureExhausted
         | StoreError::PayloadByteLimitExceeded { .. }
         | StoreError::AcceptanceMarkerExhausted
         | StoreError::ItemCountAccountingOverflow

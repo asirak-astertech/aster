@@ -539,14 +539,15 @@ reconciliation. Do not use `put` as evidence for the source-authenticated mesh.
 | Component | Sole responsibility in the selected lane |
 |---|---|
 | `aster-profile` | Stable complete reconciliation keys and canonical inventory ordering; class-specific exact Event/State/Record transfer IDs enter by explicit conversion |
-| `aster-redb-store` | Mission-bound audited control chain and atomic policy snapshots plus semantic Event/State/Record/Blob causal/operation state, durable Event and positive-current-version State delivery state, bounded Event route-only cache, a durable terminal software-zeroization intent/phase receipt, and a disjoint retained opaque compatibility namespace |
+| `aster-redb-store` | Mission-bound audited control chain and atomic policy snapshots plus semantic Event/State/Record/Blob causal/operation state, durable Event, positive-current-version State, and whole-key active-head Record delivery state, bounded Event route-only cache, a durable terminal software-zeroization intent/phase receipt, and a disjoint retained opaque compatibility namespace |
 | `aster-negentropy` | Bounded, clock-independent set difference over exact transfer IDs |
 | `aster-iroh` | Direct and operator-pinned controlled-relay endpoint lifecycle, carrier identity, and bounded exchange |
-| `aster-node` | Composition, mission-before-inventory and control-before-data ordering, peer route/interest filtering, exact control/Event/State/Record transfer, semantic-v5 direct Blob source/range automation, live Event/State/Record/Blob handles, durable Event and State application delivery, authority commands, sample applications, bounded same-UID Unix local zeroization lifecycle, receipts, and CLI |
+| `aster-node` | Composition, mission-before-inventory and control-before-data ordering, peer route/interest filtering, exact control/Event/State/Record transfer, semantic-v5 direct Blob source/range automation, live Event/State/Record/Blob handles, durable Event, State, and current-code Record application delivery, authority commands, sample applications, bounded same-UID Unix local zeroization lifecycle, receipts, and CLI |
 | `aster-core` | Existing spec-verified hybrid mission session, control envelope, recipient-filtered rekey, and typed source-envelope Event/State/Record/Blob semantics, used rather than rewritten |
 
 No old path is removed until its replacement passes equivalent tests. Current
-open work includes durable Record/Blob delivery, State contact/status and
+open work includes retained Record-delivery acceptance, durable Blob delivery,
+State contact/status and
 materialized-view/synthetic-withdrawal behavior, dynamic State network
 interests, selected-node bindings, broader State/Record partition/relay
 acceptance, Blob status, and Blob resume beyond the bounded retained

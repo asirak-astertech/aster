@@ -15,14 +15,16 @@ and durable positive-current-version delivery through the running actor plus
 stopped/exclusive latest-value access, causal projection, recoverable versions,
 and visible authenticated tombstones. The
 [selected Record quickstart](selected-record-api.md) demonstrates live and
-stopped durable revisions, explicit conflict siblings, and exact-guard
-application resolution. The [selected Blob quickstart](selected-blob-api.md)
+stopped durable revisions, explicit conflict siblings, exact-guard application
+resolution, and current-code durable whole-key active-head delivery. The
+[selected Blob quickstart](selected-blob-api.md)
 demonstrates the cloneable live handle's peerless-capable durable regular-file
 publication and bounded zeroize-on-drop page reads, as well as the exclusive
 stopped streaming facade, immutable metadata-bound identity, crash-resumable
-encrypted chunks, and exact durable retry. Durable Record/Blob delivery, State
-contact/status and materialized-view/synthetic-withdrawal behavior, dynamic
-State network interests, automatic registered-policy Record merge, atomic Event
+encrypted chunks, and exact durable retry. Retained Record-delivery acceptance,
+durable Blob delivery, State contact/status and
+materialized-view/synthetic-withdrawal behavior, dynamic State network
+interests, automatic registered-policy Record merge, atomic Event
 subscription update, selected-node language bindings, and representative
 physical or mixed-implementation acceptance remain open.
 

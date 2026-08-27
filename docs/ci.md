@@ -511,7 +511,8 @@ controlled/public-relay, BTLE, independent-implementation, scale beyond two,
 resource-threshold, long-duration, Event/Blob-live, or release acceptance from
 that State/Record receipt.
 The separate retained State-subscription gate below adds bounded durable
-positive-current-version delivery. Durable Record delivery, selected-node
+positive-current-version delivery. Current code now adds durable whole-key
+Record projection delivery, but its retained acceptance receipt, selected-node
 bindings, finite TTL, and automatic registered-policy Record merge remain open.
 Its zero Blob counters
 do not evidence the newer live Blob mechanism.
