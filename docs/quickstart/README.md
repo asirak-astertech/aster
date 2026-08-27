@@ -22,8 +22,20 @@ stopped streaming facade, immutable metadata-bound identity, crash-resumable
 encrypted chunks, and exact durable retry. Durable State/Record subscriptions,
 automatic registered-policy Record merge, atomic Event subscription update,
 Blob subscription or convergence status, selected-node language bindings,
-retained live-Blob evidence, and representative physical or
-mixed-implementation acceptance remain open.
+and representative physical or mixed-implementation acceptance remain open.
+
+A [retained 8,220-byte live-Blob receipt](../implementation/evidence/selected-live-blob-036d068.json)
+(SHA-256
+`484eafe504d958881dc7b871fbf788f733d9c8814e02fc27253ece38e6169735`)
+binds source commit `036d068a8d055154beeffe265ceea8cf97079fa6` with
+`Good` signature status; 49 verifier tests pass. Its source-to-execution link
+remains operator-attested, not cryptographically proven. It is one-host,
+same-implementation direct-loopback evidence of peerless publication, later
+complete transfer, bounded live page reads, and a graceful same-process
+actor/store/provider reopen only. It does not prove partial or different-peer
+resume, process-crash, power-loss, or long-offline recovery, physical
+sanitization, independent-implementation interoperability, or release
+authorization.
 
 The alpha [local ConnectRPC agent](connect-agent.md) exposes that live Event
 handle to standard Connect, gRPC, and gRPC-Web clients over an authenticated

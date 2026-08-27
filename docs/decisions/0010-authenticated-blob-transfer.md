@@ -195,3 +195,29 @@ custody, TTL/GC, retained execution receipt, physical/resource acceptance,
 mixed-implementation evidence, or release authorization. The authoritative
 application ownership, cancellation, shutdown, and zeroization boundaries are
 recorded in [ADR 0009](0009-public-api-boundary.md#live-selected-blob-application-amendment-2026-08-27).
+
+## Retained live direct-transfer amendment (2026-08-27)
+
+This amendment supersedes only the preceding statement that the bounded live
+composition has no retained execution receipt. The canonical
+[`selected-live-blob-036d068.json`](../implementation/evidence/selected-live-blob-036d068.json)
+receipt is 8,220 bytes with SHA-256
+`484eafe504d958881dc7b871fbf788f733d9c8814e02fc27253ece38e6169735`
+and binds good-signature source commit
+`036d068a8d055154beeffe265ceea8cf97079fa6` to one peerless live publication,
+later positive direct-Iroh transfer to an exactly interested receiver,
+whole-Blob visibility and bounded reads, and a final peerless graceful reopen.
+The publisher reports zero fetched ranges and bytes; the receiver reports
+positive range and byte transfer with zero deferred work. Exact durable rows,
+two committed chunks, freshly authenticated reads, and depot completion—not
+`blob_remaining` alone—establish the bounded receiver result.
+
+This receipt does not broaden the semantic-v5 carrier decision to route-only
+custody and does not retain the separate three-node different-peer partial-
+resume mechanism. No session is interrupted, so neither partial-transfer resume
+nor long-offline continuation is proved. Reopen is graceful and same-process,
+not crash or power-loss recovery. Source unlink and parent sync do not prove
+physical-media sanitization, and transcript timing remains producer-attested.
+The evidence is not independent black-box conformance, a physical or mixed-
+implementation network result, a resource/scale result, complete MVP
+acceptance, a release artifact, or production authorization.
