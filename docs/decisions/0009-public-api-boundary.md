@@ -3,7 +3,7 @@
 - Status: accepted as an application ergonomics boundary; prior adapter
   security-boundary claim withdrawn
 - Date: 2026-08-18
-- Amended: 2026-08-24
+- Amended: 2026-08-27
 
 The default Rust library and every first-class language binding expose only
 application operations: node lifecycle, offline publish, streamed Blob I/O,
@@ -330,9 +330,10 @@ claim indefinite tombstone retention, compaction, garbage collection, or
 delete-wins. The amendment does not claim physical hosts, NAT or Internet
 operation, controlled/public relay, BTLE, independent interoperability, scale
 beyond two, resource thresholds, long-duration operation, live Event or Blob
-application acceptance, or release authorization. State/Record durable
-subscriptions, selected-node bindings, finite TTL/forwarding age,
-relay/multi-hop acceptance, expiry, and automatic Record merge remain open.
+application acceptance, or release authorization. At that dated boundary,
+State/Record durable subscriptions had not yet been added; the later delivery
+amendments below supersede it. Selected-node bindings, finite TTL/forwarding
+age, relay/multi-hop acceptance, expiry, and automatic Record merge remain open.
 
 ## Live selected Blob application amendment (2026-08-27)
 
@@ -440,9 +441,8 @@ acceptance, a release artifact, or production authorization.
 This amendment supersedes the earlier present-tense statements that selected
 State has no live application subscription or durable delivery subscription.
 Those statements remain above only as dated boundaries of the stopped and
-semantic-v4 network slices. At this State-amendment boundary, Record and Blob
-delivery subscriptions remained open; the Record mechanism amendment below is
-newer.
+semantic-v4 network slices. Record's separate delivery and receipt amendment
+follows below; Blob delivery subscriptions remain open.
 
 `SelectedStateHandle` now exposes durable `subscribe`, `poll`, `acknowledge`,
 and `unsubscribe` operations backed by the actor-owned Store. The queue is
@@ -468,14 +468,16 @@ tombstone, and final peerless replay. The source/binary/execution link is
 operator-attested and the causal schedule is producer-attested. This amendment
 does not claim physical/NAT/relay/BTLE operation, mixed implementations, scale,
 resource or soak thresholds, indefinite tombstone retention, dynamic network
-interest, retained Record-delivery acceptance, Blob delivery, selected-node
-bindings, a release artifact, or production authorization.
+interest, Blob delivery, selected-node bindings, a release artifact, or
+production authorization.
 
-## Live selected Record delivery mechanism amendment (2026-08-27)
+## Live selected Record delivery amendment (2026-08-27)
 
 This amendment supersedes present-tense statements above that selected Record
-has no durable application delivery mechanism. It changes no retained receipt
-claim and no requirement status.
+has no durable application delivery mechanism. The retained receipt below
+updates its bounded acceptance status: only `DM-5.1-08` moves.
+`DM-7-11`, `DM-7-14`, `DM-7-15`, and `DM-7-18` remain
+implemented-uncredited; `DM-7-20` is unchanged.
 
 `SelectedRecordHandle` now exposes durable `subscribe`, `poll`, `acknowledge`,
 and `unsubscribe` operations backed by the actor-owned Store. One delivery is a
@@ -506,8 +508,30 @@ and no synthetic withdrawal is emitted when no positive projection exists.
 
 This is a durable active-head projection queue, not a revision stream,
 transition log, materialized view, automatic merge engine, or withdrawal feed.
-It has current-code automation only. Retained forced-process Record redelivery,
-Blob delivery/status, selected-node bindings, finite Record TTL/GC, automatic
-registered-policy merge, physical/NAT/relay/BTLE operation, mixed
-implementations, scale/resource/soak evidence, a release artifact, and
-production authorization remain open.
+
+The canonical 10,357-byte
+[`selected-live-record-subscription-0c11344.json`](../implementation/evidence/selected-live-record-subscription-0c11344.json)
+receipt (SHA-256
+`ba0e2bf47291f7e87000b85fa280cc957f3710ac800def82a51fb9b4657a1b48`)
+binds Good-signed source commit `0c1134411953f4bb52133b50aff9989cd4ce3930`.
+On one same-implementation direct-loopback host, two participants run three
+processes and seven actor lifetimes. A complete two-head edit/tombstone conflict
+remains one delivery at `delivery_limit=1` and `scan_limit=16`; after the
+receiver is sent `SIGKILL` following its flushed durable unacknowledged
+attempt-one poll, a fresh process receives the same projection at attempt two
+with a rotated 89-byte token. A fresh exact query guard resolves both heads, a
+new successor projection is delivered, and the two originals remain query-only
+superseded history. Network-interested/application-unmatched beta is retained
+without delivery; application-matched/network-uninterested gamma is withheld,
+and the subscription does not mutate network interest. A final peerless reopen
+replays the subscription with an empty acknowledged queue, the resolved current
+successor, and two query-only superseded originals. The source-to-binary
+execution link is operator-attested, not reproducible proof.
+
+The compiled `live_record_subscription_acceptance` producer is a receipt-making
+acceptance harness outside the adopter API. It is not a minimal developer
+sample, an integration-usability result, or a release gate. The receipt adds no
+finite Record TTL/GC, physical/NAT/relay/BTLE operation, mixed implementations,
+scale/resource/soak evidence, selected-node bindings, automatic registered-policy
+merge, reproducible source-to-binary proof, release credit, or production
+authorization. Blob delivery/status also remains open.

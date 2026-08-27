@@ -19,6 +19,8 @@ constrained, and disconnected operation.
 > retain stopped-node facades for exclusive use. State's live Rust API includes
 > durable positive-current-version delivery; it is not a materialized-view,
 > synthetic-withdrawal, dynamic-network-interest, or contact-status surface.
+> Record's live Rust API includes durable whole-key active-head delivery; its
+> conflict annotation is non-authorizing and resolution requires a fresh query.
 > The live Blob API is limited
 > to peerless-capable durable publication and bounded page reads; it is not a
 > subscription or convergence-status surface. Review the
@@ -50,9 +52,9 @@ garbage collection, or delete-wins. It does not cover physical hosts, NAT,
 Internet, relay, BTLE, independent implementations, scale beyond two
 participants, resource thresholds, long-duration operation, or evidence for
 the newer live Blob mechanism or, by itself, live Event/Blob application
-acceptance. Current code separately adds durable whole-key Record projection
-delivery without a retained Record-delivery receipt. Finite State/Record TTL,
-retained Record-delivery acceptance, durable Blob delivery, State
+acceptance. The separate Record-delivery receipt below covers the newer
+whole-key queue; this earlier receipt does not. Finite State/Record TTL, durable
+Blob delivery, State
 status/materialized-view/synthetic-withdrawal behavior, dynamic State network
 interests, selected-node language bindings,
 representative physical or mixed-implementation acceptance, and release
@@ -74,6 +76,27 @@ final peerless reopen. This is bounded positive-current-version delivery
 evidence—not a State status or materialized-view/transition feed, dynamic
 network-interest mutation, physical/NAT/relay/BTLE or mixed-implementation
 result, scale beyond two, resource/soak result, or release authorization.
+
+A separate [retained 10,357-byte v1 Record-delivery receipt](docs/implementation/evidence/selected-live-record-subscription-0c11344.json)
+(SHA-256
+`ba0e2bf47291f7e87000b85fa280cc957f3710ac800def82a51fb9b4657a1b48`)
+binds Good-signed source commit `0c1134411953f4bb52133b50aff9989cd4ce3930`.
+On one same-implementation direct-loopback host, two participants ran three
+processes and seven actor lifetimes. A complete two-head edit/tombstone conflict
+remained one delivery at `delivery_limit=1` and `scan_limit=16`; after the
+receiver was sent `SIGKILL` following its flushed unacknowledged attempt-one
+poll, a fresh process replayed the same projection at attempt two with a rotated
+89-byte token. The run then required a fresh exact query guard, resolved both
+heads, delivered the successor under a new projection, preserved both originals
+as query-only superseded history, retained network-interested but
+application-unmatched beta without delivery, and withheld application-matched
+but network-uninterested gamma without mutating network interest. A final
+peerless reopen replayed the subscription with an empty acknowledged queue, the
+resolved current successor, and both query-only superseded originals. This
+receipt moves only `DM-5.1-08`. Its
+source-to-binary execution link is operator-attested, not reproducible proof,
+and it adds no finite-TTL/GC, physical/NAT/relay/BTLE, mixed-implementation,
+scale/resource/soak, selected-node bindings, automatic-merge, or release credit.
 
 A [retained 9,573-byte v1 live-Event receipt](docs/implementation/evidence/selected-live-event-c464129.json)
 (SHA-256
@@ -192,7 +215,7 @@ Protobuf schema and does not require a hosted Buf Schema Registry.
 |---|---|---|
 | **Connect, gRPC, or gRPC-Web** | [ConnectRPC agent](docs/quickstart/connect-agent.md) | Live Event and local status; authenticated loopback process |
 | **Rust selected node** | [Selected Event API](docs/quickstart/selected-event-api.md) | Live Event publish, query, durable delivery, gaps, and status |
-| **State or Record in Rust** | [State](docs/quickstart/selected-state-api.md) and [Record](docs/quickstart/selected-record-api.md) | Cloneable live actor handles plus exclusive stopped-node facades; direct-Iroh reconciliation under explicit interests; State adds durable positive-current-version delivery and Record adds current-code durable whole-key active-head delivery |
+| **State or Record in Rust** | [State](docs/quickstart/selected-state-api.md) and [Record](docs/quickstart/selected-record-api.md) | Cloneable live actor handles plus exclusive stopped-node facades; direct-Iroh reconciliation under explicit interests; State adds durable positive-current-version delivery and Record adds retained-bounded durable whole-key active-head delivery |
 | **Blob in Rust** | [Blob](docs/quickstart/selected-blob-api.md) | Cloneable `RunningNode::selected_blobs()` handle for durable file publication and bounded pages, plus an exclusive stopped streaming facade; already-durable Blob data can transfer directly under semantic v5 |
 | **Rust semantic API** | [Rust quickstart](docs/quickstart/rust.md) | Broader proven semantic surface used as the migration source |
 | **Python, Go, or C** | [Language quickstarts](docs/quickstart/README.md) | Offline semantic API through the current C ABI, not the selected live node |
@@ -209,7 +232,7 @@ provisioning remain open work.
 |---|---|---|
 | **Event** | Source-authenticated reconciliation over direct Iroh or one operator-pinned controlled Iroh connectivity relay; live Rust and local ConnectRPC APIs; durable consume/carry selectors and at-least-once delivery | Atomic subscription update, hosted discovery/public relay, and broader physical-network acceptance |
 | **State** | Source-authenticated live or stopped publication/query, causal projection, direct-Iroh reconciliation under explicit interests, durable positive-current-version delivery, and bounded retained one-host evidence including forced-process redelivery | Contact/status and materialized-view/synthetic-withdrawal behavior, dynamic network-interest mutation, selected-node bindings, finite TTL, relay acceptance, expiry/garbage collection, and representative physical/mixed evidence |
-| **Record** | Live or stopped conflict-preserving query/publication, exact-sibling guarded resolution, direct-Iroh reconciliation, current-code durable whole-key active-head delivery, and bounded retained one-host evidence | Retained delivery acceptance, selected-node bindings, automatic merge execution, finite TTL, relay acceptance, expiry/garbage collection, and representative physical/mixed evidence |
+| **Record** | Live or stopped conflict-preserving query/publication, exact-sibling guarded resolution, direct-Iroh reconciliation, durable whole-key active-head delivery, and bounded retained one-host conflict, forced-process redelivery, resolution, and reopen evidence | Selected-node bindings, automatic merge execution, finite TTL, relay acceptance, expiry/garbage collection, and representative physical/mixed evidence |
 | **Blob** | Authenticated immutable publication through a cloneable live Rust handle or exclusive stopped facade; live reads return at most one zeroize-on-drop 64-KiB page; direct semantic-v5 source/carrier transfer has durable resume state and bounded retained one-host interrupted/reopened/different-peer resume, completion, read, and reopen evidence | Blob subscription or convergence status, route-only relay/custody, arbitrary-peer resume, crash/power-loss/long-offline recovery, large/RSS acceptance, representative physical or mixed-implementation evidence, retention, garbage collection, and release authorization |
 | **Operations** | Manually admitted direct addresses, an operator-pinned controlled relay, bounded one-host software namespace-NAT acceptance, reference mission provisioning, and bounded same-UID Unix software zeroization | Protected operational provisioning, discovery, representative/physical NAT, public/default relay selection, BTLE platform integration, physical sanitization, and release authorization |
 

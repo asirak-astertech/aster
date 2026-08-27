@@ -19,13 +19,14 @@ over a semantic-v4/v5 mission-authenticated, class- and direction-specific
 Negentropy lane under exact receiver interests. Ingest never executes registered
 merge code, so concurrent heads remain durable and explicit.
 
-Durable whole-key Record delivery now exists as a current-code Rust mechanism.
-It has no retained Record-delivery acceptance receipt, selected-node
-ConnectRPC/C/Go/Python bindings, class-specific status, finite TTL, expiry,
-garbage collection, automatic registered-policy merge, broader relay
-acceptance, representative physical/mixed-implementation evidence, or release
-authorization. The selected store rejects every finite-TTL Record object;
-there is no forwarding-age path to enable yet.
+Durable whole-key Record delivery has a
+[retained bounded receipt](../implementation/evidence/selected-live-record-subscription-0c11344.json).
+It covers one same-implementation, one-host direct-loopback run, not
+selected-node ConnectRPC/C/Go/Python bindings, class-specific status, finite
+TTL, expiry, garbage collection, automatic registered-policy merge, broader
+relay acceptance, representative physical/mixed-implementation evidence, or
+release authorization. The selected store rejects every finite-TTL Record
+object; there is no forwarding-age path to enable yet.
 
 ## Run the stopped example
 
@@ -218,9 +219,9 @@ projection is currently available; it does not prove that a key is absent.
 
 This is a durable projection queue, not a revision stream, transition log,
 materialized view, automatic merge engine, or withdrawal feed. The focused
-tests are current-code mechanism evidence only. A signed retained
-Record-delivery run with forced receiver-process replacement and exact
-redelivery remains open.
+tests remain source-level mechanism evidence. The separate signed retained
+receipt binds one forced receiver-process replacement and exact whole-projection
+redelivery to its frozen source and raw run.
 
 Run the focused whole-projection mechanism regression with:
 
@@ -243,8 +244,8 @@ cargo test --locked -p aster-node \
 ```
 
 These focused commands are source-level current-code automation and do not by
-themselves create a retained acceptance receipt. The separate retained run
-below binds its claim to signed source and a frozen canonical projection.
+themselves create retained acceptance. The separate retained run below binds
+its narrow claim to signed source and a frozen canonical projection.
 
 ## Reconcile disconnected Record revisions while live
 
@@ -288,6 +289,29 @@ cargo test --locked -p aster-node \
 ```
 
 No application merge callback runs during ingest. A separate
+[retained v1 Record-delivery receipt](../implementation/evidence/selected-live-record-subscription-0c11344.json)
+is a 10,357-byte canonical projection with SHA-256
+`ba0e2bf47291f7e87000b85fa280cc957f3710ac800def82a51fb9b4657a1b48`,
+bound to Good-signed source
+`0c1134411953f4bb52133b50aff9989cd4ce3930`. Across two participants, three OS
+processes, and seven actor lifetimes, it flushes one complete two-head
+edit/tombstone delivery at attempt one, forcibly terminates that receiver with
+`SIGKILL`, and has a fresh process redeliver the same projection at attempt two
+with a distinct 89-byte token. It then acknowledges exact work, rejects
+malformed and cross-bound tokens, obtains a fresh query-only guard, resolves the
+conflict, delivers the successor under a new projection, keeps both originals
+query-only as Superseded, and reopens peerless with an empty delivery queue.
+
+The same run proves static selector separation: network-interested but
+application-unmatched beta remains retained without delivery, while
+application-matched but network-uninterested gamma remains withheld. This is
+not dynamic network-interest administration. The receipt moves only
+`DM-5.1-08`; it adds no TTL/GC, physical/NAT/relay/BTLE, mixed-implementation,
+scale/resource/soak, binding, automatic-merge, reproducible-build, or release
+credit. A forced `SIGKILL` is not power-loss or filesystem-crash recovery, and
+the final immediate reopen is not long-retention or garbage-collection proof.
+
+A different
 [retained v2 live mutable receipt](../implementation/evidence/selected-live-mutable-6cabb4c.json)
 is a 7,752-byte canonical projection (SHA-256
 `054945ecf94e8bfba1b130f6a5f47e9b1e0e17ad69f3b1472085a1d10f05eeaa`)

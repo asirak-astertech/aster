@@ -42,6 +42,7 @@ For a shorter path based on what you are trying to accomplish, start at the
 - Retained live-application receipts: [Event](implementation/evidence/selected-live-event-c464129.json),
   [State/Record convergence](implementation/evidence/selected-live-mutable-6cabb4c.json),
   [State durable delivery](implementation/evidence/selected-live-state-subscription-8912fc3.json),
+  [Record durable delivery](implementation/evidence/selected-live-record-subscription-0c11344.json),
   and [Blob](implementation/evidence/selected-live-blob-044d90f.json)
 - [Fuzzing guide](../fuzz/README.md)
 - [Lab guide](../lab/README.md)

@@ -42,15 +42,16 @@ v1-v3 contain no State/Record mechanics and v1-v4 emit zero Blob frames.
 
 `RunningNode::selected_state()` exposes async `publish`, `query`, `subscribe`,
 `poll`, `acknowledge`, and `unsubscribe`;
-`RunningNode::selected_records()` exposes async `publish`, `query`, and guarded
-`resolve`; `RunningNode::selected_blobs()` exposes async durable regular-file
+`RunningNode::selected_records()` exposes async `publish`, `query`, guarded
+`resolve`, `subscribe`, `poll`, `acknowledge`, and `unsubscribe`;
+`RunningNode::selected_blobs()` exposes async durable regular-file
 `publish` and authenticated `read_page`. Blob pages are at most 64 KiB and own a
 zeroize-on-drop plaintext allocation. Clones use the actor's bounded application
 admission rather than opening another writer; Blob work is dispatched to one
 bounded joined worker. Graceful shutdown and live zeroization close admission,
 reject queued work, and join that worker before authority release, so retained
 handles fail with sanitized `StateUnavailable`. Caller-copied Blob bytes and
-caller-owned source files remain outside node zeroization. Durable Record/Blob
+caller-owned source files remain outside node zeroization. Durable Blob
 delivery, State contact/status and materialized-view/synthetic-withdrawal
 behavior, dynamic State network interests, ConnectRPC/C/Go/Python selected-node
 bindings, finite TTL, and representative physical or mixed-implementation
@@ -79,6 +80,29 @@ separation, causal ancestor suppression, a current tombstone, and final
 peerless subscription replay. It is not State status, a materialized-view or
 synthetic-withdrawal feed, dynamic network-interest mutation, physical/mixed
 or scale/resource evidence, or release authorization.
+
+A separate
+[retained 10,357-byte Record-delivery receipt](implementation/evidence/selected-live-record-subscription-0c11344.json)
+(SHA-256
+`ba0e2bf47291f7e87000b85fa280cc957f3710ac800def82a51fb9b4657a1b48`,
+Good-signed source commit `0c1134411953f4bb52133b50aff9989cd4ce3930`)
+observes one same-implementation direct-loopback host with two participants,
+three processes, and seven actor lifetimes. A complete two-head edit/tombstone
+conflict remains one delivery at `delivery_limit=1` and `scan_limit=16`. After
+the receiver is sent `SIGKILL` following its flushed durable unacknowledged
+attempt-one poll, a fresh process receives the same projection at attempt two
+with a rotated 89-byte token. Resolution requires a fresh exact query guard for
+both heads, produces a new successor projection, and leaves both originals as
+query-only superseded history. Network-interested/application-unmatched beta is
+retained without delivery; application-matched/network-uninterested gamma is
+withheld, and the subscription does not mutate network interest. A final
+peerless reopen replays the subscription with an empty acknowledged queue, the
+resolved current successor, and both superseded originals available only by
+query. Only `DM-5.1-08` moves. `DM-7-11`, `DM-7-14`, `DM-7-15`, and
+`DM-7-18` remain implemented-uncredited; `DM-7-20` is unchanged. This receipt
+adds no finite-TTL/GC, physical/NAT/relay/BTLE, mixed-implementation,
+scale/resource/soak, selected-node bindings, automatic merge, reproducible
+source-to-binary proof, or release credit.
 
 Selected State/Record lanes are separated by class and receiver direction. They
 use Offer `MutableApplyResult`, Fetch `MutableFetchResult` plus required
@@ -299,7 +323,7 @@ siblings. Neither promotes a causally superseded ancestor into new work.
 For the selected production-lane Rust node, State exposes this pattern as a
 freshly authenticated positive-current-version queue; see
 [Deliver positive current State versions durably](quickstart/selected-state-api.md#deliver-positive-current-state-versions-durably).
-Record separately exposes a current-code durable whole-key active-head queue;
+Record separately exposes a retained-bounded durable whole-key active-head queue;
 see [Subscribe to whole-key active-head projections](quickstart/selected-record-api.md#subscribe-to-whole-key-active-head-projections).
 It acknowledges a complete head set rather than independent siblings and
 requires a fresh exact query for a resolution guard. Blob selected-node
