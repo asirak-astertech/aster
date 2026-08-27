@@ -177,14 +177,20 @@ returned as application current or recoverable values. A current tombstone is
 returned visibly as authenticated State with an empty payload. There is no
 delete-wins rule, and deletion is not collapsed into an unauthenticated
 `None`. A
-[retained bounded receipt](implementation/evidence/selected-live-mutable-2ccfba0.json)
-publishes disconnected State through live handles, later reconciles under an
-explicit interest, and verifies the same max-ID-current/other-concurrent
-projection at both actors and after restart. It is one-host,
-same-implementation loopback evidence, not physical-network,
-mixed-implementation, scale, or release acceptance. Expiry, garbage collection,
-durable State subscriptions, selected-node bindings, relay/multi-hop acceptance,
-finite TTL, and independent interoperability remain unimplemented.
+[retained 7,752-byte v2 receipt](implementation/evidence/selected-live-mutable-6cabb4c.json)
+(SHA-256
+`054945ecf94e8bfba1b130f6a5f47e9b1e0e17ad69f3b1472085a1d10f05eeaa`,
+signed source `6cabb4c`) first verifies two disconnected State heads as the exact
+max-ID-current/other-concurrent projection. In the producer-attested ordered
+loopback chain, a later successor observes and supersedes both heads; after the
+other actor observes that successor, its authenticated empty tombstone observes
+and supersedes all three predecessors. Both actors select the tombstone as
+current, and one immediate peerless restart reproduces that exact four-version
+projection. This is one-host, same-implementation evidence, not indefinite
+tombstone retention, garbage collection, delete-wins, physical or mixed
+implementations, scale, or release acceptance. Expiry, durable State
+subscriptions, selected-node bindings, relay/multi-hop acceptance, finite TTL,
+and independent interoperability remain unimplemented.
 
 ## Live or stopped Record projection, guarded resolution, and network reconciliation
 
@@ -240,7 +246,7 @@ interest, verifies that both actors retain the same two heads, rejects an
 ordinary conflict-collapsing publish without changing them, then resolves and
 exactly retries the guard through the live authority. Both original heads are
 superseded, and the resolved projection survives restart. The
-[canonical receipt](implementation/evidence/selected-live-mutable-2ccfba0.json)
+[canonical v2 receipt](implementation/evidence/selected-live-mutable-6cabb4c.json)
 does not establish physical-network or mixed-implementation acceptance. Record
 still has no durable application subscription, selected-node binding, or
 selected relay acceptance. Multi-hop/partition sweeps, independent

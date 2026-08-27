@@ -304,29 +304,35 @@ shutdown and live zeroization close admission before authority release, and
 retained handles fail with sanitized `StateUnavailable`. The exclusive stopped
 facades remain available only while no live actor owns the store.
 
-The [retained canonical receipt](../implementation/evidence/selected-live-mutable-2ccfba0.json)
-is 5,660 bytes with SHA-256
-`299a3c3b8d1685deb5980ed091797f7d46119562b67c3d853b94d8552c83b67a`
-and binds the execution to good-signature source commit `2ccfba0`. Two distinct
-participants publish State and Record while peerless, then run four paired
-direct `CONTACT` records with exact aggregate 5/5/5 selected-item
+The [retained v2 canonical receipt](../implementation/evidence/selected-live-mutable-6cabb4c.json)
+is 7,752 bytes with SHA-256
+`054945ecf94e8bfba1b130f6a5f47e9b1e0e17ad69f3b1472085a1d10f05eeaa`
+and binds the execution to good-signature source commit `6cabb4c`. Two distinct
+participants publish State and Record while peerless, then run eight direct
+`CONTACT` records with exact aggregate 7/7/7 selected-item
 offer/fetch/insert accounting. The six actor lifetimes never exceed two
-concurrent actors. State preserves the max-ID-current/other-concurrent projection
-across restart. Record preserves two siblings, rejects an ordinary
+concurrent actors. State first preserves the exact
+max-ID-current/other-concurrent projection. A causally later successor observes
+and supersedes both heads; after the other actor observes that successor, an
+authenticated empty tombstone observes and supersedes all three predecessors.
+Both actors select it as current, and one immediate peerless restart reproduces
+the exact projection. Record preserves two siblings, rejects an ordinary
 conflict-collapsing publish, resolves under the exact guard, supersedes both
 originals, retries without insertion, and preserves the result across restart.
 Six graceful shutdowns and four closed retained handles pass; Event, control,
 and Blob counters remain zero.
 
-This is bounded one-host, same-implementation loopback evidence. The
-source-to-execution link is operator-attested, not cryptographically proven or
-reproducible, and the participant secret artifacts are inspected by metadata
-only. The amendment does not claim physical hosts, NAT or Internet operation,
-controlled/public relay, BTLE, independent interoperability, scale beyond two,
-resource thresholds, long-duration operation, live Event or Blob application
-acceptance, or release authorization. State/Record durable subscriptions,
-selected-node bindings, finite TTL/forwarding age, relay/multi-hop acceptance,
-expiry, garbage collection, and automatic Record merge remain open.
+This is a producer-attested ordered, bounded one-host, same-implementation
+loopback chain. The source-to-execution link is operator-attested, not
+cryptographically proven or reproducible, and the participant secret artifacts
+are inspected by metadata only. The single immediate peerless restart does not
+claim indefinite tombstone retention, compaction, garbage collection, or
+delete-wins. The amendment does not claim physical hosts, NAT or Internet
+operation, controlled/public relay, BTLE, independent interoperability, scale
+beyond two, resource thresholds, long-duration operation, live Event or Blob
+application acceptance, or release authorization. State/Record durable
+subscriptions, selected-node bindings, finite TTL/forwarding age,
+relay/multi-hop acceptance, expiry, and automatic Record merge remain open.
 
 ## Live selected Blob application amendment (2026-08-27)
 

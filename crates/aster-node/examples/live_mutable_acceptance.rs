@@ -34,14 +34,16 @@ use sha2::{Digest as _, Sha256};
 use tokio::time::{sleep, timeout};
 use zeroize::Zeroize as _;
 
-const TRANSCRIPT_SCHEMA: &str = "aster-selected-live-mutable-transcript/v1";
-const CLAIM: &str = "selected-live-state-record-one-host-direct-iroh-two-actor-acceptance";
+const TRANSCRIPT_SCHEMA: &str = "aster-selected-live-mutable-transcript/v2";
+const CLAIM: &str = "selected-live-state-causal-successor-tombstone-record-one-host-direct-iroh-two-actor-acceptance";
 const TOPIC: &str = "opaque";
 const SCOPE: &str = "test/runtime-contact";
 const STATE_KEY: &[u8] = b"disconnected-state";
 const RECORD_KEY: &[u8] = b"disconnected-record";
 const LEFT_STATE_PAYLOAD: &[u8] = b"left State";
 const RIGHT_STATE_PAYLOAD: &[u8] = b"right State";
+const SUCCESSOR_STATE_PAYLOAD: &[u8] = b"joined State";
+const TOMBSTONE_STATE_PAYLOAD: &[u8] = b"";
 const LEFT_RECORD_PAYLOAD: &[u8] = b"left Record";
 const RIGHT_RECORD_PAYLOAD: &[u8] = b"right Record";
 const RESOLVED_RECORD_PAYLOAD: &[u8] = b"resolved Record";
@@ -78,7 +80,7 @@ struct Participant {
     carrier_id: EndpointId,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 struct PublicationEvidence {
     id: String,
     publisher: String,
@@ -87,22 +89,36 @@ struct PublicationEvidence {
     inserted: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 struct ItemEvidence {
     id: String,
     publisher: String,
     counter: u64,
     payload_sha256: String,
     disposition: &'static str,
+    tombstone: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 struct StateViewEvidence {
     current: ItemEvidence,
     concurrent: ItemEvidence,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
+struct StateCausalViewEvidence {
+    current: ItemEvidence,
+    superseded: Vec<ItemEvidence>,
+}
+
+#[derive(Clone, Copy)]
+struct StateVersionExpectation<'a> {
+    publication: &'a StatePublishResult,
+    payload: &'a [u8],
+    tombstone: bool,
+}
+
+#[derive(Clone, Eq, PartialEq)]
 struct RecordConflictEvidence {
     current: ItemEvidence,
     concurrent: ItemEvidence,
@@ -110,7 +126,7 @@ struct RecordConflictEvidence {
     guard_siblings: Vec<String>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 struct RecordResolvedEvidence {
     current: ItemEvidence,
     superseded: Vec<String>,
@@ -159,13 +175,23 @@ struct AcceptanceTranscript {
     peerless_shutdowns: [ShutdownEvidence; 2],
     connected_state: [StateViewEvidence; 2],
     connected_conflicts: [RecordConflictEvidence; 2],
+    state_successor_observed_heads: Vec<String>,
+    state_successor_observed_versions: Vec<String>,
+    state_successor: PublicationEvidence,
+    state_successor_retry_id: String,
+    state_successor_views: [StateCausalViewEvidence; 2],
+    state_tombstone_observed_heads: Vec<String>,
+    state_tombstone_observed_versions: Vec<String>,
+    state_tombstone: PublicationEvidence,
+    state_tombstone_retry_id: String,
+    state_tombstone_views: [StateCausalViewEvidence; 2],
     rejection_siblings: Vec<String>,
     resolution: PublicationEvidence,
     resolution_observed: Vec<String>,
     immediate_retry_id: String,
     connected_resolved: [RecordResolvedEvidence; 2],
     connected_shutdowns: [ShutdownEvidence; 2],
-    restarted_state: [StateViewEvidence; 2],
+    restarted_state: [StateCausalViewEvidence; 2],
     restarted_resolved: [RecordResolvedEvidence; 2],
     post_restart_retry_id: String,
     restart_shutdowns: [ShutdownEvidence; 2],
@@ -495,6 +521,214 @@ async fn run() -> Result<(), DynError> {
     )
     .await?;
 
+    // This future is intentionally not polled until after the existing Record
+    // resolution has converged. Keeping construction here binds the initial
+    // State observations while preserving the Record publication frontier.
+    let state_transition = async {
+        let state_transition_contact_baseline =
+            snapshot_contact_counters(&left_live_status, &right_live_status).await?;
+        let state_successor_observed_heads = state_ids_as_strings(&expected_state_ids);
+        let state_successor_observed_versions = state_successor_observed_heads.clone();
+        let state_successor_request = StatePublishRequest {
+            operation_key: b"join-disconnected-state-heads".to_vec(),
+            topic: topic.clone(),
+            scope: scope.clone(),
+            priority: Priority::Priority,
+            logical_key: STATE_KEY.to_vec(),
+            payload: SUCCESSOR_STATE_PAYLOAD.to_vec(),
+            tombstone: false,
+        };
+        let state_successor = publish_state_eventually(
+            &left_live_state,
+            state_successor_request.clone(),
+            "State successor publication deadline",
+        )
+        .await?;
+        let state_successor_retry = publish_state_eventually(
+            &left_live_state,
+            state_successor_request,
+            "State successor retry deadline",
+        )
+        .await?;
+        validate_publication_retry(&state_successor, &state_successor_retry, node_a.mission_id)?;
+        require(
+            state_successor.publisher_counter > left_record_publication.publisher_counter,
+            "State successor publisher frontier",
+        )?;
+        require(
+            [
+                left_state_publication.id,
+                right_state_publication.id,
+                state_successor.id,
+            ]
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .len()
+                == 3,
+            "distinct State successor identity",
+        )?;
+
+        let successor_state_projections = wait_for_state_causal_projections(
+            &left_live_state,
+            &right_live_state,
+            &state_query,
+            state_successor.id,
+            &expected_state_ids,
+            "State successor convergence deadline",
+        )
+        .await?;
+        let initial_state_expectations = [
+            StateVersionExpectation {
+                publication: &left_state_publication,
+                payload: LEFT_STATE_PAYLOAD,
+                tombstone: false,
+            },
+            StateVersionExpectation {
+                publication: &right_state_publication,
+                payload: RIGHT_STATE_PAYLOAD,
+                tombstone: false,
+            },
+        ];
+        let successor_expectation = StateVersionExpectation {
+            publication: &state_successor,
+            payload: SUCCESSOR_STATE_PAYLOAD,
+            tombstone: false,
+        };
+        let state_successor_views = [
+            validate_state_causal_view(
+                &successor_state_projections[0],
+                &topic,
+                &scope,
+                successor_expectation,
+                &initial_state_expectations,
+            )?,
+            validate_state_causal_view(
+                &successor_state_projections[1],
+                &topic,
+                &scope,
+                successor_expectation,
+                &initial_state_expectations,
+            )?,
+        ];
+        require(
+            state_successor_views[0] == state_successor_views[1],
+            "identical State successor projections",
+        )?;
+        let successor_contact = wait_for_contact_advance(
+            &left_live_status,
+            &right_live_status,
+            state_transition_contact_baseline,
+            "State successor contact accounting deadline",
+        )
+        .await?;
+
+        let state_tombstone_observed_heads = vec![state_successor.id.to_string()];
+        let state_tombstone_ids = [
+            left_state_publication.id,
+            right_state_publication.id,
+            state_successor.id,
+        ];
+        let state_tombstone_observed_versions = state_ids_as_strings(&state_tombstone_ids);
+        let state_tombstone_request = StatePublishRequest {
+            operation_key: b"delete-joined-state".to_vec(),
+            topic: topic.clone(),
+            scope: scope.clone(),
+            priority: Priority::Priority,
+            logical_key: STATE_KEY.to_vec(),
+            payload: TOMBSTONE_STATE_PAYLOAD.to_vec(),
+            tombstone: true,
+        };
+        let state_tombstone = publish_state_eventually(
+            &right_live_state,
+            state_tombstone_request.clone(),
+            "State tombstone publication deadline",
+        )
+        .await?;
+        let state_tombstone_retry = publish_state_eventually(
+            &right_live_state,
+            state_tombstone_request,
+            "State tombstone retry deadline",
+        )
+        .await?;
+        validate_publication_retry(&state_tombstone, &state_tombstone_retry, node_b.mission_id)?;
+        require(
+            state_tombstone.publisher_counter > right_record_publication.publisher_counter,
+            "State tombstone publisher frontier",
+        )?;
+        require(
+            [
+                left_state_publication.id,
+                right_state_publication.id,
+                state_successor.id,
+                state_tombstone.id,
+            ]
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .len()
+                == 4,
+            "distinct State tombstone identity",
+        )?;
+
+        let tombstone_state_projections = wait_for_state_causal_projections(
+            &left_live_state,
+            &right_live_state,
+            &state_query,
+            state_tombstone.id,
+            &state_tombstone_ids,
+            "State tombstone convergence deadline",
+        )
+        .await?;
+        let pre_tombstone_expectations = [
+            initial_state_expectations[0],
+            initial_state_expectations[1],
+            successor_expectation,
+        ];
+        let tombstone_expectation = StateVersionExpectation {
+            publication: &state_tombstone,
+            payload: TOMBSTONE_STATE_PAYLOAD,
+            tombstone: true,
+        };
+        let state_tombstone_views = [
+            validate_state_causal_view(
+                &tombstone_state_projections[0],
+                &topic,
+                &scope,
+                tombstone_expectation,
+                &pre_tombstone_expectations,
+            )?,
+            validate_state_causal_view(
+                &tombstone_state_projections[1],
+                &topic,
+                &scope,
+                tombstone_expectation,
+                &pre_tombstone_expectations,
+            )?,
+        ];
+        require(
+            state_tombstone_views[0] == state_tombstone_views[1],
+            "identical State tombstone projections",
+        )?;
+        let _tombstone_contact = wait_for_contact_advance(
+            &left_live_status,
+            &right_live_status,
+            successor_contact,
+            "State tombstone contact accounting deadline",
+        )
+        .await?;
+        Ok::<_, DynError>((
+            state_successor_observed_heads,
+            state_successor_observed_versions,
+            state_successor,
+            state_successor_retry.id.to_string(),
+            state_successor_views,
+            state_tombstone_observed_heads,
+            state_tombstone_observed_versions,
+            state_tombstone,
+            state_tombstone_retry.id.to_string(),
+            state_tombstone_views,
+        ))
+    };
+
     let before_siblings = connected_conflict_evidence[0].siblings.clone();
     let ordinary_request = RecordPublishRequest {
         operation_key: b"ordinary-publish-cannot-hide-conflict".to_vec(),
@@ -625,6 +859,25 @@ async fn run() -> Result<(), DynError> {
     )
     .await?;
 
+    let (
+        state_successor_observed_heads,
+        state_successor_observed_versions,
+        state_successor,
+        state_successor_retry_id,
+        state_successor_views,
+        state_tombstone_observed_heads,
+        state_tombstone_observed_versions,
+        state_tombstone,
+        state_tombstone_retry_id,
+        state_tombstone_views,
+    ) = state_transition.await?;
+    require(
+        resolved.publisher_counter == left_record_publication.publisher_counter + 1
+            && state_successor.publisher_counter == resolved.publisher_counter + 1
+            && state_tombstone.publisher_counter == right_record_publication.publisher_counter + 1,
+        "Record and State transition publisher counters",
+    )?;
+
     let (left_connected_receipt, right_connected_receipt) =
         tokio::join!(left_running.shutdown(), right_running.shutdown());
     let left_connected_receipt = left_connected_receipt?;
@@ -650,22 +903,48 @@ async fn run() -> Result<(), DynError> {
         left_restarted_records.query(record_query.clone()).await?,
         right_restarted_records.query(record_query).await?,
     ];
+    let restarted_superseded_expectations = [
+        StateVersionExpectation {
+            publication: &left_state_publication,
+            payload: LEFT_STATE_PAYLOAD,
+            tombstone: false,
+        },
+        StateVersionExpectation {
+            publication: &right_state_publication,
+            payload: RIGHT_STATE_PAYLOAD,
+            tombstone: false,
+        },
+        StateVersionExpectation {
+            publication: &state_successor,
+            payload: SUCCESSOR_STATE_PAYLOAD,
+            tombstone: false,
+        },
+    ];
+    let restarted_tombstone_expectation = StateVersionExpectation {
+        publication: &state_tombstone,
+        payload: TOMBSTONE_STATE_PAYLOAD,
+        tombstone: true,
+    };
     let restarted_state_evidence = [
-        validate_state_view(
+        validate_state_causal_view(
             &restarted_state_projections[0],
             &topic,
             &scope,
-            &left_state_publication,
-            &right_state_publication,
+            restarted_tombstone_expectation,
+            &restarted_superseded_expectations,
         )?,
-        validate_state_view(
+        validate_state_causal_view(
             &restarted_state_projections[1],
             &topic,
             &scope,
-            &left_state_publication,
-            &right_state_publication,
+            restarted_tombstone_expectation,
+            &restarted_superseded_expectations,
         )?,
     ];
+    require(
+        restarted_state_evidence == state_tombstone_views,
+        "identical peerless restart State projections",
+    )?;
     let restarted_resolved_evidence = [
         validate_record_resolved(
             &restarted_record_projections[0],
@@ -746,6 +1025,16 @@ async fn run() -> Result<(), DynError> {
         ],
         connected_state: connected_state_evidence,
         connected_conflicts: connected_conflict_evidence,
+        state_successor_observed_heads,
+        state_successor_observed_versions,
+        state_successor: state_publication_evidence(&state_successor, SUCCESSOR_STATE_PAYLOAD),
+        state_successor_retry_id,
+        state_successor_views,
+        state_tombstone_observed_heads,
+        state_tombstone_observed_versions,
+        state_tombstone: state_publication_evidence(&state_tombstone, TOMBSTONE_STATE_PAYLOAD),
+        state_tombstone_retry_id,
+        state_tombstone_views,
         rejection_siblings: before_siblings.clone(),
         resolution: record_publication_evidence(&resolved, RESOLVED_RECORD_PAYLOAD),
         resolution_observed: before_siblings,
@@ -1011,6 +1300,70 @@ async fn query_record_eventually(
     .map_err(|_| AcceptanceFailure(deadline_label))?
 }
 
+async fn publish_state_eventually(
+    handle: &aster_node::application::SelectedStateHandle,
+    request: StatePublishRequest,
+    deadline_label: &'static str,
+) -> Result<StatePublishResult, DynError> {
+    timeout(POLL_DEADLINE, async {
+        loop {
+            match handle.publish(request.clone()).await {
+                Ok(result) => break Ok::<_, DynError>(result),
+                Err(error) if error.kind() == ApplicationErrorKind::PolicyUnsettled => {
+                    sleep(Duration::from_millis(20)).await;
+                }
+                Err(error) => break Err(error.into()),
+            }
+        }
+    })
+    .await
+    .map_err(|_| AcceptanceFailure(deadline_label))?
+}
+
+async fn wait_for_state_causal_projections(
+    left: &aster_node::application::SelectedStateHandle,
+    right: &aster_node::application::SelectedStateHandle,
+    query: &StateQuery,
+    expected_current: StateId,
+    expected_superseded: &[StateId],
+    deadline_label: &'static str,
+) -> Result<[StateProjection; 2], DynError> {
+    timeout(POLL_DEADLINE, async {
+        loop {
+            let left_projection = match left.query(query.clone()).await {
+                Ok(projection) => projection,
+                Err(error) if error.kind() == ApplicationErrorKind::PolicyUnsettled => {
+                    sleep(Duration::from_millis(20)).await;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let right_projection = match right.query(query.clone()).await {
+                Ok(projection) => projection,
+                Err(error) if error.kind() == ApplicationErrorKind::PolicyUnsettled => {
+                    sleep(Duration::from_millis(20)).await;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if state_causal_projection_ready(
+                &left_projection,
+                expected_current,
+                expected_superseded,
+            ) && state_causal_projection_ready(
+                &right_projection,
+                expected_current,
+                expected_superseded,
+            ) {
+                break Ok::<_, DynError>([left_projection, right_projection]);
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| AcceptanceFailure(deadline_label))?
+}
+
 async fn resolve_eventually(
     handle: &aster_node::application::SelectedRecordHandle,
     request: RecordResolveRequest,
@@ -1071,7 +1424,7 @@ async fn snapshot_contact_counters(
             && right_status.authenticated_contacts > 0
             && left_status.failed_contact_attempts == 0
             && right_status.failed_contact_attempts == 0,
-        "resolution baseline contact status",
+        "connected contact status",
     )?;
     Ok([
         left_status.authenticated_contacts,
@@ -1121,6 +1474,26 @@ fn projections_converged(
         && state_ready(right_state)
         && record_ready(left_record)
         && record_ready(right_record)
+}
+
+fn state_causal_projection_ready(
+    projection: &StateProjection,
+    expected_current: StateId,
+    expected_superseded: &[StateId],
+) -> bool {
+    projection.current.as_ref().is_some_and(|item| {
+        item.id == expected_current && item.disposition == StateVersionDisposition::Current
+    }) && projection.recoverable.len() == expected_superseded.len()
+        && projection.recoverable.iter().all(|item| {
+            item.disposition == StateVersionDisposition::Superseded
+                && expected_superseded.contains(&item.id)
+        })
+        && projection
+            .recoverable
+            .iter()
+            .map(|item| item.id)
+            .collect::<BTreeSet<_>>()
+            == expected_superseded.iter().copied().collect::<BTreeSet<_>>()
 }
 
 fn validate_state_view(
@@ -1175,13 +1548,97 @@ fn validate_state_item(
     right: &StatePublishResult,
     disposition: StateVersionDisposition,
 ) -> Result<ItemEvidence, DynError> {
-    let (expected, payload) = if item.id == left.id {
-        (left, LEFT_STATE_PAYLOAD)
+    let expectation = if item.id == left.id {
+        StateVersionExpectation {
+            publication: left,
+            payload: LEFT_STATE_PAYLOAD,
+            tombstone: false,
+        }
     } else if item.id == right.id {
-        (right, RIGHT_STATE_PAYLOAD)
+        StateVersionExpectation {
+            publication: right,
+            payload: RIGHT_STATE_PAYLOAD,
+            tombstone: false,
+        }
     } else {
         return Err(Box::new(AcceptanceFailure("unknown State item")));
     };
+    validate_expected_state_item(item, topic, scope, expectation, disposition)
+}
+
+fn validate_state_causal_view(
+    projection: &StateProjection,
+    topic: &Topic,
+    scope: &Scope,
+    expected_current: StateVersionExpectation<'_>,
+    expected_superseded: &[StateVersionExpectation<'_>],
+) -> Result<StateCausalViewEvidence, DynError> {
+    require(
+        projection.recoverable.len() == expected_superseded.len(),
+        "State superseded cardinality",
+    )?;
+    let current = projection
+        .current
+        .as_ref()
+        .ok_or(AcceptanceFailure("State causal current missing"))?;
+    require(
+        current.id == expected_current.publication.id,
+        "State causal current identity",
+    )?;
+    let expected_superseded_ids = expected_superseded
+        .iter()
+        .map(|expected| expected.publication.id)
+        .collect::<BTreeSet<_>>();
+    require(
+        expected_superseded_ids.len() == expected_superseded.len()
+            && !expected_superseded_ids.contains(&expected_current.publication.id)
+            && projection
+                .recoverable
+                .iter()
+                .map(|item| item.id)
+                .collect::<BTreeSet<_>>()
+                == expected_superseded_ids,
+        "State superseded identities",
+    )?;
+    let mut superseded = projection
+        .recoverable
+        .iter()
+        .map(|item| {
+            let expectation = expected_superseded
+                .iter()
+                .find(|expected| expected.publication.id == item.id)
+                .copied()
+                .ok_or(AcceptanceFailure("unknown State superseded item"))?;
+            validate_expected_state_item(
+                item,
+                topic,
+                scope,
+                expectation,
+                StateVersionDisposition::Superseded,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    superseded.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(StateCausalViewEvidence {
+        current: validate_expected_state_item(
+            current,
+            topic,
+            scope,
+            expected_current,
+            StateVersionDisposition::Current,
+        )?,
+        superseded,
+    })
+}
+
+fn validate_expected_state_item(
+    item: &StateItem,
+    topic: &Topic,
+    scope: &Scope,
+    expectation: StateVersionExpectation<'_>,
+    disposition: StateVersionDisposition,
+) -> Result<ItemEvidence, DynError> {
+    let expected = expectation.publication;
     require(
         item.publisher == expected.publisher
             && item.publisher_counter == expected.publisher_counter
@@ -1189,8 +1646,8 @@ fn validate_state_item(
             && item.scope == *scope
             && item.priority == Priority::Priority
             && item.logical_key == STATE_KEY
-            && item.payload == payload
-            && !item.tombstone
+            && item.payload == expectation.payload
+            && item.tombstone == expectation.tombstone
             && item.disposition == disposition,
         "verified State item",
     )?;
@@ -1200,6 +1657,7 @@ fn validate_state_item(
         counter: item.publisher_counter,
         payload_sha256: sha256_hex(&item.payload),
         disposition: state_disposition(item.disposition),
+        tombstone: item.tombstone,
     })
 }
 
@@ -1291,6 +1749,7 @@ fn validate_record_item(
         counter: item.publisher_counter,
         payload_sha256: sha256_hex(&item.payload),
         disposition: record_disposition(item.disposition),
+        tombstone: item.tombstone,
     })
 }
 
@@ -1366,6 +1825,7 @@ fn validate_record_resolved(
             counter: current.publisher_counter,
             payload_sha256: sha256_hex(&current.payload),
             disposition: record_disposition(current.disposition),
+            tombstone: current.tombstone,
         },
         superseded: superseded.into_iter().map(|id| id.to_string()).collect(),
     })
@@ -1418,6 +1878,15 @@ fn participant_transcript(
 
 fn record_ids_as_strings(ids: &[RecordId]) -> Vec<String> {
     ids.iter().map(ToString::to_string).collect()
+}
+
+fn state_ids_as_strings(ids: &[StateId]) -> Vec<String> {
+    ids.iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|id| id.to_string())
+        .collect()
 }
 
 fn state_disposition(disposition: StateVersionDisposition) -> &'static str {
@@ -1627,12 +2096,50 @@ fn emit_transcript(transcript: &AcceptanceTranscript) {
         &transcript.participants,
         &transcript.connected_resolved,
     );
+    emit_state_transition_publication(
+        "STATE_SUCCESSOR_PUBLICATION",
+        "node-a",
+        &transcript.state_successor_observed_heads,
+        &transcript.state_successor_observed_versions,
+        &transcript.state_successor,
+        false,
+    );
+    emit_state_transition_retry(
+        "STATE_SUCCESSOR_RETRY",
+        "node-a",
+        &transcript.state_successor,
+        &transcript.state_successor_retry_id,
+    );
+    emit_state_causal_views(
+        "successor",
+        &transcript.participants,
+        &transcript.state_successor_views,
+    );
+    emit_state_transition_publication(
+        "STATE_TOMBSTONE_PUBLICATION",
+        "node-b",
+        &transcript.state_tombstone_observed_heads,
+        &transcript.state_tombstone_observed_versions,
+        &transcript.state_tombstone,
+        true,
+    );
+    emit_state_transition_retry(
+        "STATE_TOMBSTONE_RETRY",
+        "node-b",
+        &transcript.state_tombstone,
+        &transcript.state_tombstone_retry_id,
+    );
+    emit_state_causal_views(
+        "tombstone",
+        &transcript.participants,
+        &transcript.state_tombstone_views,
+    );
     emit_shutdowns(
         "connected",
         &transcript.participants,
         &transcript.connected_shutdowns,
     );
-    emit_state_views(
+    emit_state_causal_views(
         "restart",
         &transcript.participants,
         &transcript.restarted_state,
@@ -1672,7 +2179,7 @@ fn emit_transcript(transcript: &AcceptanceTranscript) {
             ("status", "pass".to_owned()),
             ("secret_values_emitted", "false".to_owned()),
             ("payload_representation", "sha256_only".to_owned()),
-            ("records", "40".to_owned()),
+            ("records", "48".to_owned()),
             ("actor_lifetimes", "6".to_owned()),
             ("maximum_concurrent_actors", "2".to_owned()),
             ("graceful_shutdowns", "6".to_owned()),
@@ -1724,6 +2231,47 @@ fn emit_retries(
     }
 }
 
+fn emit_state_transition_publication(
+    record: &str,
+    participant: &str,
+    observed_heads: &[String],
+    observed_versions: &[String],
+    publication: &PublicationEvidence,
+    tombstone: bool,
+) {
+    emit(
+        record,
+        &[
+            ("participant", participant.to_owned()),
+            ("observed_heads", join_ids(observed_heads)),
+            ("observed_versions", join_ids(observed_versions)),
+            ("id", publication.id.clone()),
+            ("publisher", publication.publisher.clone()),
+            ("counter", publication.counter.to_string()),
+            ("payload_sha256", publication.payload_sha256.clone()),
+            ("tombstone", tombstone.to_string()),
+            ("inserted", publication.inserted.to_string()),
+        ],
+    );
+}
+
+fn emit_state_transition_retry(
+    record: &str,
+    participant: &str,
+    publication: &PublicationEvidence,
+    retry_id: &str,
+) {
+    emit(
+        record,
+        &[
+            ("participant", participant.to_owned()),
+            ("original_id", publication.id.clone()),
+            ("retry_id", retry_id.to_owned()),
+            ("inserted", "false".to_owned()),
+        ],
+    );
+}
+
 fn emit_shutdowns(
     phase: &str,
     participants: &[ParticipantTranscript; 2],
@@ -1743,6 +2291,80 @@ fn emit_shutdowns(
                     shutdown.unknown_path_contacts.to_string(),
                 ),
                 ("contact_errors", shutdown.contact_errors.to_string()),
+            ],
+        );
+    }
+}
+
+fn emit_state_causal_views(
+    phase: &str,
+    participants: &[ParticipantTranscript; 2],
+    views: &[StateCausalViewEvidence; 2],
+) {
+    for (participant, view) in participants.iter().zip(views) {
+        emit(
+            "STATE_CAUSAL_VIEW",
+            &[
+                ("phase", phase.to_owned()),
+                ("participant", participant.name.to_owned()),
+                ("current_id", view.current.id.clone()),
+                ("current_publisher", view.current.publisher.clone()),
+                ("current_counter", view.current.counter.to_string()),
+                (
+                    "current_payload_sha256",
+                    view.current.payload_sha256.clone(),
+                ),
+                ("current_disposition", view.current.disposition.to_owned()),
+                ("current_tombstone", view.current.tombstone.to_string()),
+                ("superseded_count", view.superseded.len().to_string()),
+                (
+                    "superseded",
+                    view.superseded
+                        .iter()
+                        .map(|item| item.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ),
+                (
+                    "superseded_publishers",
+                    view.superseded
+                        .iter()
+                        .map(|item| item.publisher.as_str())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ),
+                (
+                    "superseded_counters",
+                    view.superseded
+                        .iter()
+                        .map(|item| item.counter.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ),
+                (
+                    "superseded_payload_sha256",
+                    view.superseded
+                        .iter()
+                        .map(|item| item.payload_sha256.as_str())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ),
+                (
+                    "superseded_dispositions",
+                    view.superseded
+                        .iter()
+                        .map(|item| item.disposition)
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ),
+                (
+                    "superseded_tombstones",
+                    view.superseded
+                        .iter()
+                        .map(|item| item.tombstone.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ),
             ],
         );
     }

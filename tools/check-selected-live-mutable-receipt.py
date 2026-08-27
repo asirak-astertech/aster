@@ -30,10 +30,12 @@ import sys
 from typing import Any, Iterable, Sequence
 
 
-SCHEMA = "aster-selected-live-mutable-receipt/v1"
-RAW_SCHEMA = "aster-selected-live-mutable-raw/v1"
-TRANSCRIPT_SCHEMA = "aster-selected-live-mutable-transcript/v1"
-CLAIM = "selected-live-state-record-one-host-direct-iroh-two-actor-acceptance"
+SCHEMA = "aster-selected-live-mutable-receipt/v2"
+RAW_SCHEMA = "aster-selected-live-mutable-raw/v2"
+TRANSCRIPT_SCHEMA = "aster-selected-live-mutable-transcript/v2"
+CLAIM = "selected-live-state-causal-successor-tombstone-record-one-host-direct-iroh-two-actor-acceptance"
+OLD_RECEIPT_SOURCE_COMMIT = "2ccfba0d18bf8d8221ab11fb485b32fcf6270272"
+OLD_RECEIPT_SHA256 = "299a3c3b8d1685deb5980ed091797f7d46119562b67c3d853b94d8552c83b67a"
 RECEIPT_NAME = "selected-live-mutable-receipt.json"
 RECEIPT_MAX_BYTES = 16 * 1024
 RUN_JSON_MAX_BYTES = 64 * 1024
@@ -44,7 +46,7 @@ BINARY_MAX_BYTES = 128 * 1024 * 1024
 MISSION_MAX_BYTES = 1024 * 1024
 STORE_MAX_BYTES = 1024 * 1024 * 1024
 IDENTITY_BYTES = 32
-TRANSCRIPT_RECORDS = 40
+TRANSCRIPT_RECORDS = 48
 
 HEX_32 = re.compile(r"[0-9a-f]{64}\Z")
 GIT_OBJECT = re.compile(r"[0-9a-f]{40}\Z")
@@ -64,12 +66,19 @@ ADMITTED_SOURCE_PATHS = tuple(
             "Cargo.lock",
             "Cargo.toml",
             "mise.toml",
+            "crates/aster-core/Cargo.toml",
+            "crates/aster-core/src/causal.rs",
+            "crates/aster-core/src/crypto/reference.rs",
+            "crates/aster-core/src/lib.rs",
+            "crates/aster-core/src/source_state.rs",
             "crates/aster-node/Cargo.toml",
             "crates/aster-node/src/application.rs",
             "crates/aster-node/src/application/record.rs",
             "crates/aster-node/src/application/state.rs",
             "crates/aster-node/src/lib.rs",
             "crates/aster-node/src/runtime.rs",
+            "crates/aster-redb-store/Cargo.toml",
+            "crates/aster-redb-store/src/lib.rs",
             PRODUCER_PATH,
             RUNNER_PATH,
             CHECKER_PATH,
@@ -157,6 +166,17 @@ PUBLICATION_KEYS = (
     "payload_sha256",
     "inserted",
 )
+CAUSAL_PUBLICATION_KEYS = (
+    "participant",
+    "observed_heads",
+    "observed_versions",
+    "id",
+    "publisher",
+    "counter",
+    "payload_sha256",
+    "tombstone",
+    "inserted",
+)
 RETRY_KEYS = ("participant", "original_id", "retry_id", "inserted")
 SHUTDOWN_KEYS = (
     "phase",
@@ -182,6 +202,23 @@ STATE_VIEW_KEYS = (
     "concurrent_counter",
     "concurrent_payload_sha256",
     "concurrent_disposition",
+)
+STATE_CAUSAL_VIEW_KEYS = (
+    "phase",
+    "participant",
+    "current_id",
+    "current_publisher",
+    "current_counter",
+    "current_payload_sha256",
+    "current_disposition",
+    "current_tombstone",
+    "superseded_count",
+    "superseded",
+    "superseded_publishers",
+    "superseded_counters",
+    "superseded_payload_sha256",
+    "superseded_dispositions",
+    "superseded_tombstones",
 )
 RECORD_CONFLICT_KEYS = (
     "phase",
@@ -356,7 +393,20 @@ STOP_KEYS = (
     "pending_controls",
     "control_highwater",
     "blobs",
+    "blob_acceptance_markers",
+    "blob_last_acceptance_marker",
+    "blob_sealed_bytes",
+    "blob_operations",
+    "blob_operation_bytes",
+    "blob_variants",
+    "blob_finalized_variants",
+    "blob_committed_chunks",
+    "blob_committed_file_bytes",
+    "blob_reserved_file_bytes",
     "pending_blobs",
+    "blob_carrier_prefixes",
+    "blob_carrier_fetch_cursors",
+    "blob_network_staging_bytes",
     "blob_ranges_fetched",
     "blob_bytes_fetched",
     "blob_remaining",
@@ -366,6 +416,37 @@ STOP_KEYS = (
     "semantics",
     "reconciliation_classes",
     "controls_semantics",
+)
+STOP_NUMERIC_FIELDS = STOP_KEYS[4:11] + STOP_KEYS[12:-5]
+STOP_EXCLUDED_ZERO_FIELDS = (
+    "opaque_items",
+    "opaque_acceptance_markers",
+    "events",
+    "event_acceptance_markers",
+    "route_cached_events",
+    "controls",
+    "applied_controls",
+    "pending_controls",
+    "control_highwater",
+    "blobs",
+    "blob_acceptance_markers",
+    "blob_last_acceptance_marker",
+    "blob_sealed_bytes",
+    "blob_operations",
+    "blob_operation_bytes",
+    "blob_variants",
+    "blob_finalized_variants",
+    "blob_committed_chunks",
+    "blob_committed_file_bytes",
+    "blob_reserved_file_bytes",
+    "pending_blobs",
+    "blob_carrier_prefixes",
+    "blob_carrier_fetch_cursors",
+    "blob_network_staging_bytes",
+    "blob_ranges_fetched",
+    "blob_bytes_fetched",
+    "blob_remaining",
+    "blob_deferred",
 )
 LOOPBACK_SOCKET = re.compile(r"127\.0\.0\.1:([1-9][0-9]{0,4})\Z")
 
@@ -398,10 +479,18 @@ EXPECTED_SEQUENCE: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("RECORD_RESOLUTION_RETRY", RESOLUTION_RETRY_KEYS),
     ("RECORD_RESOLVED", RECORD_RESOLVED_KEYS),
     ("RECORD_RESOLVED", RECORD_RESOLVED_KEYS),
+    ("STATE_SUCCESSOR_PUBLICATION", CAUSAL_PUBLICATION_KEYS),
+    ("STATE_SUCCESSOR_RETRY", RETRY_KEYS),
+    ("STATE_CAUSAL_VIEW", STATE_CAUSAL_VIEW_KEYS),
+    ("STATE_CAUSAL_VIEW", STATE_CAUSAL_VIEW_KEYS),
+    ("STATE_TOMBSTONE_PUBLICATION", CAUSAL_PUBLICATION_KEYS),
+    ("STATE_TOMBSTONE_RETRY", RETRY_KEYS),
+    ("STATE_CAUSAL_VIEW", STATE_CAUSAL_VIEW_KEYS),
+    ("STATE_CAUSAL_VIEW", STATE_CAUSAL_VIEW_KEYS),
     ("SHUTDOWN", SHUTDOWN_KEYS),
     ("SHUTDOWN", SHUTDOWN_KEYS),
-    ("STATE_VIEW", STATE_VIEW_KEYS),
-    ("STATE_VIEW", STATE_VIEW_KEYS),
+    ("STATE_CAUSAL_VIEW", STATE_CAUSAL_VIEW_KEYS),
+    ("STATE_CAUSAL_VIEW", STATE_CAUSAL_VIEW_KEYS),
     ("RECORD_RESOLVED", RECORD_RESOLVED_KEYS),
     ("RECORD_RESOLVED", RECORD_RESOLVED_KEYS),
     ("RECORD_RESOLUTION_RETRY", RESOLUTION_RETRY_KEYS),
@@ -418,6 +507,8 @@ PAYLOAD_HASHES = {
     ("record", "node-a"): "ea7e65181655ebe13372e8b1d740c2114675ce2d85ba511074158ef1b971e34d",
     ("record", "node-b"): "0572316ec50701364d0e721db4197d4c15667411949b9821ae72c52dd6003ba3",
     ("resolution", "node-a"): "4b631dc38a7dc95cf0d35bc24ff0cdf94bfa9e84aad297bcc1af81fa8970afb3",
+    ("successor", "node-a"): "d1604822c53bec359621ef55529767e3e3a586634f8e0218d4a2eea3730e581c",
+    ("tombstone", "node-b"): "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
 }
 
 LIMITATIONS = [
@@ -425,6 +516,8 @@ LIMITATIONS = [
     "selected-admitted-source-list-is-not-a-complete-reproducible-build-closure",
     "one-host-loopback-same-implementation-observation",
     "participant-secret-artifacts-validated-by-metadata-only",
+    "state-causal-observation-and-publication-order-are-producer-attested",
+    "restart-observes-one-immediate-peerless-reopen-not-indefinite-tombstone-retention",
 ]
 NONCLAIMS = [
     "distinct-physical-hosts",
@@ -436,6 +529,7 @@ NONCLAIMS = [
     "resource-thresholds-or-long-duration-soak",
     "event-or-blob-live-application-acceptance",
     "reproducible-build-or-cryptographic-source-to-execution-provenance",
+    "tombstone-retention-duration-compaction-or-garbage-collection",
 ]
 
 
@@ -871,6 +965,22 @@ def sorted_pair(first: str, second: str) -> str:
     return ",".join(sorted((first, second)))
 
 
+def require_csv(
+    value: str,
+    expected: Sequence[str],
+    label: str,
+    *,
+    identifiers: bool = False,
+) -> list[str]:
+    observed = value.split(",")
+    if observed != list(expected) or any(not item for item in observed):
+        fail(f"{label} differs from its exact ordered values")
+    if identifiers:
+        for index, item in enumerate(observed):
+            require_id(item, f"{label}[{index}]")
+    return observed
+
+
 def validate_item(
     record: dict[str, str],
     prefix: str,
@@ -897,7 +1007,7 @@ def validate_transcript(data: bytes) -> dict[str, Any]:
         fail("transcript is not canonical ASCII")
     lines = text.splitlines()
     if len(lines) != TRANSCRIPT_RECORDS:
-        fail("transcript does not contain exactly 40 records")
+        fail(f"transcript does not contain exactly {TRANSCRIPT_RECORDS} records")
     if any(not line or len(line.encode("ascii")) > 16 * 1024 for line in lines):
         fail("transcript contains an empty or overlong record")
     records = [
@@ -1204,8 +1314,199 @@ def validate_transcript(data: bytes) -> dict[str, Any]:
 
     for index, participant in zip((26, 27), ("node-a", "node-b"), strict=True):
         validate_resolved(records[index], "connected", participant)
+
+    initial_state_versions = [
+        {**state_by_id[state_id], "tombstone": "false"} for state_id in state_ids
+    ]
+    successor = records[28]
+    require_fixed(
+        successor,
+        {
+            "participant": "node-a",
+            "observed_heads": ",".join(state_ids),
+            "observed_versions": ",".join(state_ids),
+            "publisher": a["mission_id"],
+            "counter": "4",
+            "payload_sha256": PAYLOAD_HASHES[("successor", "node-a")],
+            "tombstone": "false",
+            "inserted": "true",
+        },
+        "STATE_SUCCESSOR_PUBLICATION",
+    )
+    require_csv(
+        successor["observed_heads"],
+        state_ids,
+        "STATE_SUCCESSOR_PUBLICATION.observed_heads",
+        identifiers=True,
+    )
+    require_csv(
+        successor["observed_versions"],
+        state_ids,
+        "STATE_SUCCESSOR_PUBLICATION.observed_versions",
+        identifiers=True,
+    )
+    successor_id = require_id(successor["id"], "STATE_SUCCESSOR_PUBLICATION.id")
+    if successor_id in all_publication_ids | {resolution_id}:
+        fail("State successor identity overlaps an original publication or Record resolution")
+    require_fixed(
+        records[29],
+        {
+            "participant": "node-a",
+            "original_id": successor_id,
+            "retry_id": successor_id,
+            "inserted": "false",
+        },
+        "STATE_SUCCESSOR_RETRY",
+    )
+    expected_successor = {
+        "id": successor_id,
+        "publisher": successor["publisher"],
+        "counter": successor["counter"],
+        "payload_sha256": successor["payload_sha256"],
+        "tombstone": successor["tombstone"],
+    }
+
+    def validate_causal_state_view(
+        record: dict[str, str],
+        phase: str,
+        participant: str,
+        current: dict[str, str],
+        superseded_versions: Sequence[dict[str, str]],
+    ) -> None:
+        ordered = sorted(superseded_versions, key=lambda item: item["id"])
+        label = f"STATE_CAUSAL_VIEW {phase} {participant}"
+        require_fixed(
+            record,
+            {
+                "phase": phase,
+                "participant": participant,
+                "current_disposition": "current",
+                "current_tombstone": current["tombstone"],
+                "superseded_count": str(len(ordered)),
+                "superseded": ",".join(item["id"] for item in ordered),
+                "superseded_publishers": ",".join(
+                    item["publisher"] for item in ordered
+                ),
+                "superseded_counters": ",".join(
+                    item["counter"] for item in ordered
+                ),
+                "superseded_payload_sha256": ",".join(
+                    item["payload_sha256"] for item in ordered
+                ),
+                "superseded_dispositions": ",".join(
+                    "superseded" for _item in ordered
+                ),
+                "superseded_tombstones": ",".join(
+                    item["tombstone"] for item in ordered
+                ),
+            },
+            label,
+        )
+        validate_item(record, "current", current, label)
+        require_csv(
+            record["superseded"],
+            [item["id"] for item in ordered],
+            f"{label}.superseded",
+            identifiers=True,
+        )
+        require_csv(
+            record["superseded_publishers"],
+            [item["publisher"] for item in ordered],
+            f"{label}.superseded_publishers",
+            identifiers=True,
+        )
+        require_csv(
+            record["superseded_counters"],
+            [item["counter"] for item in ordered],
+            f"{label}.superseded_counters",
+        )
+        require_csv(
+            record["superseded_payload_sha256"],
+            [item["payload_sha256"] for item in ordered],
+            f"{label}.superseded_payload_sha256",
+            identifiers=True,
+        )
+        require_csv(
+            record["superseded_dispositions"],
+            ["superseded"] * len(ordered),
+            f"{label}.superseded_dispositions",
+        )
+        require_csv(
+            record["superseded_tombstones"],
+            [item["tombstone"] for item in ordered],
+            f"{label}.superseded_tombstones",
+        )
+
+    for index, participant in zip((30, 31), ("node-a", "node-b"), strict=True):
+        validate_causal_state_view(
+            records[index],
+            "successor",
+            participant,
+            expected_successor,
+            initial_state_versions,
+        )
+
+    pre_tombstone_versions = [*initial_state_versions, expected_successor]
+    pre_tombstone_ids = sorted(item["id"] for item in pre_tombstone_versions)
+    tombstone = records[32]
+    require_fixed(
+        tombstone,
+        {
+            "participant": "node-b",
+            "observed_heads": successor_id,
+            "observed_versions": ",".join(pre_tombstone_ids),
+            "publisher": b["mission_id"],
+            "counter": "3",
+            "payload_sha256": PAYLOAD_HASHES[("tombstone", "node-b")],
+            "tombstone": "true",
+            "inserted": "true",
+        },
+        "STATE_TOMBSTONE_PUBLICATION",
+    )
+    require_csv(
+        tombstone["observed_heads"],
+        [successor_id],
+        "STATE_TOMBSTONE_PUBLICATION.observed_heads",
+        identifiers=True,
+    )
+    require_csv(
+        tombstone["observed_versions"],
+        pre_tombstone_ids,
+        "STATE_TOMBSTONE_PUBLICATION.observed_versions",
+        identifiers=True,
+    )
+    tombstone_id = require_id(tombstone["id"], "STATE_TOMBSTONE_PUBLICATION.id")
+    application_ids = all_publication_ids | {resolution_id, successor_id, tombstone_id}
+    if len(application_ids) != 7:
+        fail("State, Record, successor, tombstone, and resolution identity domains overlap")
+    require_fixed(
+        records[33],
+        {
+            "participant": "node-b",
+            "original_id": tombstone_id,
+            "retry_id": tombstone_id,
+            "inserted": "false",
+        },
+        "STATE_TOMBSTONE_RETRY",
+    )
+    expected_tombstone = {
+        "id": tombstone_id,
+        "publisher": tombstone["publisher"],
+        "counter": tombstone["counter"],
+        "payload_sha256": tombstone["payload_sha256"],
+        "tombstone": tombstone["tombstone"],
+    }
+    for index, participant in zip((34, 35), ("node-a", "node-b"), strict=True):
+        validate_causal_state_view(
+            records[index],
+            "tombstone",
+            participant,
+            expected_tombstone,
+            pre_tombstone_versions,
+        )
+
     connected_contacts = 0
-    for index, participant in zip((28, 29), ("node-a", "node-b"), strict=True):
+    for index, participant in zip((36, 37), ("node-a", "node-b"), strict=True):
         observed = validate_shutdown(records[index], "connected", participant)
         shutdown_contacts["connected"][participant] = observed
         connected_contacts += observed
@@ -1214,12 +1515,18 @@ def validate_transcript(data: bytes) -> dict[str, Any]:
         != shutdown_contacts["connected"]["node-b"]
     ):
         fail("connected participant contact counts are not equal paired sessions")
-    for index, participant in zip((30, 31), ("node-a", "node-b"), strict=True):
-        validate_state_view(records[index], "restart", participant)
-    for index, participant in zip((32, 33), ("node-a", "node-b"), strict=True):
+    for index, participant in zip((38, 39), ("node-a", "node-b"), strict=True):
+        validate_causal_state_view(
+            records[index],
+            "restart",
+            participant,
+            expected_tombstone,
+            pre_tombstone_versions,
+        )
+    for index, participant in zip((40, 41), ("node-a", "node-b"), strict=True):
         validate_resolved(records[index], "restart", participant)
     require_fixed(
-        records[34],
+        records[42],
         {
             "phase": "post_restart",
             "participant": "node-a",
@@ -1229,23 +1536,23 @@ def validate_transcript(data: bytes) -> dict[str, Any]:
         },
         "RECORD_RESOLUTION_RETRY post_restart",
     )
-    for index, participant in zip((35, 36), ("node-a", "node-b"), strict=True):
+    for index, participant in zip((43, 44), ("node-a", "node-b"), strict=True):
         shutdown_contacts["restart"][participant] = validate_shutdown(
             records[index], "restart", participant
         )
-    for index, participant in zip((37, 38), ("node-a", "node-b"), strict=True):
+    for index, participant in zip((45, 46), ("node-a", "node-b"), strict=True):
         require_fixed(
             records[index],
             {"participant": participant, "status": "reacquired"},
             f"BIND_REACQUIRED {participant}",
         )
     require_fixed(
-        records[39],
+        records[47],
         {
             "status": "pass",
             "secret_values_emitted": "false",
             "payload_representation": "sha256_only",
-            "records": "40",
+            "records": "48",
             "actor_lifetimes": "6",
             "maximum_concurrent_actors": "2",
             "graceful_shutdowns": "6",
@@ -1263,16 +1570,20 @@ def validate_transcript(data: bytes) -> dict[str, Any]:
         "actor_lifetimes": 6,
         "maximum_concurrent_actors": 2,
         "connected_contacts": connected_contacts,
-        "state_publications": 2,
+        "state_publications": 4,
+        "initial_state_publications": 2,
+        "state_successors": 1,
+        "state_tombstones": 1,
+        "state_causal_views": 6,
         "record_publications": 2,
-        "publication_retries": 4,
+        "publication_retries": 6,
         "resolution_retries": 2,
         "shutdowns": 6,
         "closed_handles": 4,
         "bind_reacquisitions": 2,
         "_participants": participants,
         "_shutdown_contacts": shutdown_contacts,
-        "_application_ids": sorted(all_publication_ids | {resolution_id}),
+        "_application_ids": sorted(application_ids),
     }
 
 
@@ -1487,26 +1798,9 @@ def validate_terminal_stdout(
                 },
                 label,
             )
-            numeric_fields = STOP_KEYS[4:11] + STOP_KEYS[12:27]
-            for field in numeric_fields:
+            for field in STOP_NUMERIC_FIELDS:
                 parse_uint(record[field], f"{label}.{field}")
-            for field in (
-                "opaque_items",
-                "opaque_acceptance_markers",
-                "events",
-                "event_acceptance_markers",
-                "route_cached_events",
-                "controls",
-                "applied_controls",
-                "pending_controls",
-                "control_highwater",
-                "blobs",
-                "pending_blobs",
-                "blob_ranges_fetched",
-                "blob_bytes_fetched",
-                "blob_remaining",
-                "blob_deferred",
-            ):
+            for field in STOP_EXCLUDED_ZERO_FIELDS:
                 if record[field] != "0":
                     fail(f"{label}.{field} is nonzero outside the selected State/Record receipt")
             if phase == "connected" and contact_count[participant] != expected_contacts:
@@ -1543,14 +1837,14 @@ def validate_terminal_stdout(
         or connected_stop_direct_contacts != contact_records
     ):
         fail("captured stdout CONTACT records do not aggregate exactly to connected STOP accounting")
-    expected_contact_totals = {"offered": 5, "fetched": 5, "inserted": 5}
+    expected_contact_totals = {"offered": 7, "fetched": 7, "inserted": 7}
     if contact_totals != expected_contact_totals:
         fail(
-            "captured stdout CONTACT reconciliation aggregate does not prove exactly five offers, fetches, and insertions"
+            "captured stdout CONTACT reconciliation aggregate does not prove exactly seven offers, fetches, and insertions"
         )
     expected_participant_totals = {
-        "node-a": {"offered": 3, "fetched": 2, "inserted": 2},
-        "node-b": {"offered": 2, "fetched": 3, "inserted": 3},
+        "node-a": {"offered": 4, "fetched": 3, "inserted": 3},
+        "node-b": {"offered": 3, "fetched": 4, "inserted": 4},
     }
     for participant, expected in expected_participant_totals.items():
         if contact_totals_by_participant[participant] != expected:
@@ -2185,6 +2479,11 @@ def build_receipt(source: dict[str, Any], evidence: dict[str, Any]) -> dict[str,
         "schema": SCHEMA,
         "status": "pass",
         "claim": CLAIM,
+        "supersedes": {
+            "schema": "aster-selected-live-mutable-receipt/v1",
+            "source_commit": OLD_RECEIPT_SOURCE_COMMIT,
+            "receipt_sha256": OLD_RECEIPT_SHA256,
+        },
         "source": {
             "commit": source["commit"],
             "tree": source["tree"],
@@ -2241,15 +2540,42 @@ def build_receipt(source: dict[str, Any], evidence: dict[str, Any]) -> dict[str,
             "connected_path": "positive-direct-only-zero-errors",
             "connected_reconciliation": terminal["reconciliation"],
             "state": {
-                "publications": 2,
-                "reducer": "max-id-current-other-concurrent",
-                "connected_and_restart_views": 4,
+                "publications": transcript["state_publications"],
+                "initial_publications": transcript["initial_state_publications"],
+                "initial_reducer": "max-id-current-other-concurrent",
+                "initial_connected_views": 2,
+                "causal_observed_head_and_version_sets": "exact",
+                "successor": {
+                    "publications": transcript["state_successors"],
+                    "publisher_role": "node-a",
+                    "publisher_counter": 4,
+                    "observed_heads": 2,
+                    "observed_versions": 2,
+                    "current_tombstone": False,
+                    "superseded_predecessors": 2,
+                    "network_views": 2,
+                },
+                "tombstone": {
+                    "publications": transcript["state_tombstones"],
+                    "publisher_role": "node-b",
+                    "publisher_counter": 3,
+                    "empty_payload_sha256": PAYLOAD_HASHES[("tombstone", "node-b")],
+                    "observed_heads": 1,
+                    "observed_versions": 3,
+                    "current_tombstone": True,
+                    "superseded_predecessors": 3,
+                    "network_views": 2,
+                    "peerless_restart_views": 2,
+                    "retention_scope": "one-immediate-peerless-restart-observation",
+                },
+                "causal_views": transcript["state_causal_views"],
             },
             "record": {
                 "publications": 2,
                 "conflict_siblings": 2,
                 "ordinary_publish_rejected_unchanged": True,
                 "resolution_observes_all_siblings": True,
+                "resolution_publisher_counter": 3,
                 "resolved_and_restart_views": 4,
                 "superseded_originals": 2,
             },

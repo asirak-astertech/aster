@@ -22,27 +22,34 @@ constrained, and disconnected operation.
 > [security gates](docs/security.md) and
 > [conformance status](docs/conformance.md) before planning a deployment.
 
-A [retained live State/Record receipt](docs/implementation/evidence/selected-live-mutable-2ccfba0.json)
-binds a 5,660-byte canonical projection (SHA-256
-`299a3c3b8d1685deb5980ed091797f7d46119562b67c3d853b94d8552c83b67a`)
-to signed source commit `2ccfba0`. On one loopback host, two
+A [retained 7,752-byte v2 live State/Record receipt](docs/implementation/evidence/selected-live-mutable-6cabb4c.json)
+(SHA-256
+`054945ecf94e8bfba1b130f6a5f47e9b1e0e17ad69f3b1472085a1d10f05eeaa`)
+binds signed source commit `6cabb4c`. On one loopback host, two
 same-implementation participants completed six actor lifetimes, with at most two
 actors concurrent. They published State and conflicting Record revisions while
-peerless; four paired direct `CONTACT` records then accounted for 5/5/5 selected
-items offered/fetched/inserted, concurrent State max-ID tie-break and restart,
-and Record conflict rejection, guarded resolution, superseded originals, exact
-retry, and restart. Six graceful shutdowns closed four retained handles, while
-Event, control, and Blob counters remained zero.
+peerless; eight direct `CONTACT` records then accounted for 7/7/7 selected items
+offered/fetched/inserted. State first retained two concurrent heads, then a
+causally later successor observed and superseded both. After the other actor
+observed that successor, it published an authenticated empty tombstone that
+observed and superseded all three predecessors; both actors selected the
+tombstone as current, and one immediate peerless restart reproduced that exact
+projection. Record conflict rejection, guarded resolution, superseded
+originals, exact retry, and restart also passed. Six graceful shutdowns closed
+four retained handles, while Event, control, and Blob counters remained zero.
 
 That receipt is bounded evidence, not a broader acceptance claim. Its
 source-to-execution link is operator-attested, not cryptographically proven or
-reproducible; secret artifacts were inspected by metadata only. It does not
-cover physical hosts, NAT, Internet, relay, BTLE, independent implementations,
-scale beyond two participants, resource thresholds, long-duration operation,
-or evidence for the newer live Blob mechanism or live Event/Blob application
-acceptance. Finite State/Record TTL, durable
-subscriptions, selected-node language bindings, representative physical or
-mixed-implementation acceptance, and release authorization remain open.
+reproducible; secret artifacts were inspected by metadata only, and the ordered
+State observation/publication chain is producer-attested. The restart proves
+one immediate peerless reopen, not indefinite tombstone retention, compaction,
+garbage collection, or delete-wins. It does not cover physical hosts, NAT,
+Internet, relay, BTLE, independent implementations, scale beyond two
+participants, resource thresholds, long-duration operation, or evidence for
+the newer live Blob mechanism or live Event/Blob application acceptance. Finite
+State/Record TTL, durable subscriptions, selected-node language bindings,
+representative physical or mixed-implementation acceptance, and release
+authorization remain open.
 
 A [retained 10,728-byte v2 live-Blob receipt](docs/implementation/evidence/selected-live-blob-044d90f.json)
 (SHA-256

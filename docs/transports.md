@@ -168,14 +168,21 @@ authenticated cache state, depot capability, or post-commit verification is a
 the actor rather than becoming an ordinary request error. Event's
 `LastContactComplete` reports only the most recent bounded negotiation with each
 active configured peer; it does not assert State/Record or global convergence.
-A [retained bounded receipt](implementation/evidence/selected-live-mutable-2ccfba0.json)
-publishes State and conflicting Record revisions while peerless, later
-reconciles them over direct loopback Iroh, queries both peers through live
-handles, and resolves/retries the guarded Record conflict across restart. Its
-four direct `CONTACT` records are paired and account for 5/5/5 selected-item
-offer/fetch/insert totals with zero Event/control/Blob counters. This is
-same-implementation one-host evidence, not physical, NAT/relay, BTLE, scale,
-resource, mixed-implementation, or release acceptance. The live Blob handle and
+A [retained 7,752-byte v2 receipt](implementation/evidence/selected-live-mutable-6cabb4c.json)
+(SHA-256
+`054945ecf94e8bfba1b130f6a5f47e9b1e0e17ad69f3b1472085a1d10f05eeaa`,
+signed source `6cabb4c`) publishes State and conflicting Record revisions while
+peerless, later reconciles them over direct loopback Iroh, queries both peers
+through live handles, and resolves/retries the guarded Record conflict across
+restart. Its eight direct `CONTACT` records account for 7/7/7 selected-item
+offer/fetch/insert totals with zero Event/control/Blob counters. The
+producer-attested ordered State chain proves exact concurrent heads, a causal
+successor that supersedes both, and an authenticated empty tombstone that
+supersedes all three predecessors and remains current at both actors and one
+immediate peerless restart. This is same-implementation one-host evidence—not
+indefinite tombstone retention, garbage collection, delete-wins, physical or
+mixed implementations, NAT/relay, BTLE, scale, resource, or release acceptance.
+The live Blob handle and
 the semantic-v5 direct-Iroh Blob automation now have a separate
 [retained 10,728-byte receipt](implementation/evidence/selected-live-blob-044d90f.json)
 (SHA-256
