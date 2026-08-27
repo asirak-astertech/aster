@@ -1609,9 +1609,9 @@ pub struct PeerReceipt {
     pub remaining: usize,
     /// Event reconciliation lanes cleanly deferred by the authenticated v3 budget boundary.
     pub deferred_event_lanes: usize,
-    /// State/Record objects deterministically deferred to a later semantic-v4 contact.
+    /// Mutable-class objects and Blob carrier work deferred to a later v4/v5 contact.
     pub mutable_remaining: usize,
-    /// State/Record reconciliation lanes cleanly deferred at an authenticated v4 boundary.
+    /// Mutable-class reconciliation lanes cleanly deferred at an authenticated v4/v5 boundary.
     pub deferred_mutable_lanes: usize,
     /// Exact Blob carrier ranges durably settled during this contact.
     pub blob_ranges_fetched: usize,
@@ -1710,6 +1710,20 @@ pub struct NodeReceipt {
     pub pending_controls: u64,
     /// Durable mission-control chain highwater.
     pub control_highwater: u64,
+    /// Data items offered across successful contacts in either direction.
+    pub data_offered: u64,
+    /// Data items fetched across successful contacts in either direction.
+    pub data_fetched: u64,
+    /// Newly inserted data items across successful contacts in either direction.
+    pub data_inserted: u64,
+    /// Harmless duplicate data transfers across successful contacts in either direction.
+    pub data_duplicates: u64,
+    /// Event-lane data work reported outstanding across successful contacts.
+    pub data_remaining: u64,
+    /// Mutable-class object and Blob carrier work reported outstanding across successful contacts.
+    pub mutable_remaining: u64,
+    /// Mutable-class lanes cleanly deferred across successful contacts.
+    pub deferred_mutable_lanes: u64,
     /// Blob carrier ranges settled across successful contacts.
     pub blob_ranges_fetched: u64,
     /// Blob carrier payload bytes accepted across successful contacts.
@@ -1771,6 +1785,67 @@ fn account_path_receipt(total: &mut NodeReceipt, contact: &PeerReceipt) -> Resul
                 NodeError::Protocol("aggregate carrier path saturation count overflow".into())
             })?;
     }
+    Ok(())
+}
+
+fn account_data_receipt(total: &mut NodeReceipt, contact: &PeerReceipt) -> Result<(), NodeError> {
+    let data_offered =
+        total
+            .data_offered
+            .checked_add(u64::try_from(contact.offered).map_err(|_| {
+                NodeError::Protocol("contact data offered count exceeds u64".into())
+            })?)
+            .ok_or_else(|| NodeError::Protocol("aggregate data offered count overflow".into()))?;
+    let data_fetched =
+        total
+            .data_fetched
+            .checked_add(u64::try_from(contact.fetched).map_err(|_| {
+                NodeError::Protocol("contact data fetched count exceeds u64".into())
+            })?)
+            .ok_or_else(|| NodeError::Protocol("aggregate data fetched count overflow".into()))?;
+    let data_inserted =
+        total
+            .data_inserted
+            .checked_add(u64::try_from(contact.inserted).map_err(|_| {
+                NodeError::Protocol("contact data inserted count exceeds u64".into())
+            })?)
+            .ok_or_else(|| NodeError::Protocol("aggregate data inserted count overflow".into()))?;
+    let data_duplicates =
+        total
+            .data_duplicates
+            .checked_add(u64::try_from(contact.duplicates).map_err(|_| {
+                NodeError::Protocol("contact data duplicate count exceeds u64".into())
+            })?)
+            .ok_or_else(|| NodeError::Protocol("aggregate data duplicate count overflow".into()))?;
+    let data_remaining =
+        total
+            .data_remaining
+            .checked_add(u64::try_from(contact.remaining).map_err(|_| {
+                NodeError::Protocol("contact data remaining count exceeds u64".into())
+            })?)
+            .ok_or_else(|| NodeError::Protocol("aggregate data remaining count overflow".into()))?;
+    let mutable_remaining = total
+        .mutable_remaining
+        .checked_add(u64::try_from(contact.mutable_remaining).map_err(|_| {
+            NodeError::Protocol("contact mutable remaining count exceeds u64".into())
+        })?)
+        .ok_or_else(|| NodeError::Protocol("aggregate mutable remaining count overflow".into()))?;
+    let deferred_mutable_lanes = total
+        .deferred_mutable_lanes
+        .checked_add(u64::try_from(contact.deferred_mutable_lanes).map_err(|_| {
+            NodeError::Protocol("contact deferred mutable lane count exceeds u64".into())
+        })?)
+        .ok_or_else(|| {
+            NodeError::Protocol("aggregate deferred mutable lane count overflow".into())
+        })?;
+
+    total.data_offered = data_offered;
+    total.data_fetched = data_fetched;
+    total.data_inserted = data_inserted;
+    total.data_duplicates = data_duplicates;
+    total.data_remaining = data_remaining;
+    total.mutable_remaining = mutable_remaining;
+    total.deferred_mutable_lanes = deferred_mutable_lanes;
     Ok(())
 }
 
@@ -11047,6 +11122,10 @@ async fn run_node_actor_inner(
                             fatal_error = Some(error);
                             break;
                         }
+                        if let Err(error) = account_data_receipt(&mut receipt, &server_receipt) {
+                            fatal_error = Some(error);
+                            break;
+                        }
                         if let Err(error) = account_blob_receipt(&mut receipt, &server_receipt) {
                             fatal_error = Some(error);
                             break;
@@ -11124,6 +11203,10 @@ async fn run_node_actor_inner(
                         outbound_tasks.remove(&task);
                         outbound_peers.remove(&peer.carrier.id);
                         if let Err(error) = selected_event_status.record(&peer_receipt) {
+                            fatal_error = Some(error);
+                            break;
+                        }
+                        if let Err(error) = account_data_receipt(&mut receipt, &peer_receipt) {
                             fatal_error = Some(error);
                             break;
                         }
@@ -20077,6 +20160,66 @@ mod tests {
             NodeCustodyClock::platform_supports_finite_ttl(),
             cfg!(target_os = "linux")
         );
+    }
+
+    #[test]
+    fn node_receipt_aggregates_data_counts_across_successful_contacts() {
+        let mut total = NodeReceipt::default();
+        let first = PeerReceipt {
+            offered: 2,
+            fetched: 3,
+            inserted: 2,
+            duplicates: 1,
+            remaining: 4,
+            mutable_remaining: 5,
+            deferred_mutable_lanes: 1,
+            ..PeerReceipt::default()
+        };
+        let second = PeerReceipt {
+            offered: 7,
+            fetched: 11,
+            inserted: 6,
+            duplicates: 5,
+            remaining: 13,
+            mutable_remaining: 17,
+            deferred_mutable_lanes: 2,
+            ..PeerReceipt::default()
+        };
+
+        account_data_receipt(&mut total, &first).expect("first successful contact");
+        account_data_receipt(&mut total, &second).expect("second successful contact");
+
+        assert_eq!(total.data_offered, 9);
+        assert_eq!(total.data_fetched, 14);
+        assert_eq!(total.data_inserted, 8);
+        assert_eq!(total.data_duplicates, 6);
+        assert_eq!(total.data_remaining, 17);
+        assert_eq!(total.mutable_remaining, 22);
+        assert_eq!(total.deferred_mutable_lanes, 3);
+    }
+
+    #[test]
+    fn node_receipt_data_accounting_fails_atomically_on_overflow() {
+        let mut total = NodeReceipt {
+            data_offered: 41,
+            data_fetched: u64::MAX,
+            ..NodeReceipt::default()
+        };
+        let before = total.clone();
+        let contact = PeerReceipt {
+            offered: 1,
+            fetched: 1,
+            ..PeerReceipt::default()
+        };
+
+        let error = account_data_receipt(&mut total, &contact).expect_err("overflow must fail");
+
+        assert!(matches!(
+            error,
+            NodeError::Protocol(message)
+                if message == "aggregate data fetched count overflow"
+        ));
+        assert_eq!(total, before);
     }
 
     #[test]

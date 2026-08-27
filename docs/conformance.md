@@ -352,37 +352,46 @@ agree in one promotion transaction. Focused frame, provider, store, and runtime
 regressions must also cover every proof substitution, source/carrier tuple and
 Result/Ack mismatch, stale/same-epoch lineage, the epoch-advance requirement,
 all exact bounds, and v1-v4/ReceiveOnly absence. This is current-code
-same-implementation loopback automation for one small Blob, with no retained
-execution root or direct-Iroh Blob acceptance receipt. The current live Blob
-application handle is tested separately by `V-BLOB-LIVE`; neither gate claims a
-Blob subscription/status API, route-only Blob relay/custody, the 100+ MiB or RSS
-target, physical-media behavior, mixed implementation, or release acceptance.
+same-implementation loopback automation for one small Blob; by itself it has no
+retained execution root. The current live Blob application handle and the
+separate retained composition of this resume mechanism are covered by
+`V-BLOB-LIVE`. Neither evidence tier claims a Blob subscription/status API,
+route-only Blob relay/custody, the 100+ MiB or RSS target, physical-media
+behavior, mixed implementation, or release acceptance.
 
 A separate dated
-[`V-BLOB-LIVE` retained receipt](implementation/evidence/selected-live-blob-036d068.json)
-now records the bounded live-application composition at good-signature source
-commit `036d068a8d055154beeffe265ceea8cf97079fa6`. Its 8,220 canonical bytes have
+[`V-BLOB-LIVE` retained receipt](implementation/evidence/selected-live-blob-044d90f.json)
+supersedes the earlier v1 observation and records the bounded live-application
+resume composition at good-signature source commit
+`044d90ff07c8e754b3d490cb810d42de3c915e3d`. Its 10,728 canonical bytes have
 SHA-256
-`484eafe504d958881dc7b871fbf788f733d9c8814e02fc27253ece38e6169735`.
-One peerless live publisher proves publication, exact retry, changed-payload
-conflict, bounded two-page read, and source unlink plus parent sync; a later
-two-participant direct-Iroh phase proves positive receiver transfer and
-completed visibility; a final peerless receiver actor reproduces the read after
-graceful reopen. Four retained handles fail closed and both direct bind
-addresses are reacquired. The 49-test independent-oracle checker suite covers
-the canonical projection, exact transcript/runtime relations, private-artifact
-metadata-only inventory, privacy exclusion, and fail-closed replay.
+`4fea2ffbd16608862a67167fb1b8fcb6d5d8b4b82c576aa9a6b7e25ee9c55909`.
+Three participant identities under disjoint credentials and one mission
+authority execute seven phases with at most two live actors. After peerless
+publication and direct seeding, a receiver retains a non-public 16,384-byte
+prefix from the publisher across graceful shutdown and reopen. One contact
+with the different eligible replica advances that exact prefix to 32,768 bytes
+without refetching the source; the replica then supplies the remaining 65,870
+bytes. Exact runtime and typed Store accounting reconstructs 98,638 carrier
+bytes before promotion, authenticated two-page reads, and a final peerless
+graceful reopen. Eleven retained handles fail closed and three direct bind
+addresses are reacquired. The 45-test independent-oracle checker suite covers
+the canonical projection, exact transcript/runtime and prefix relations,
+private-artifact metadata-only inventory, privacy exclusion, and fail-closed
+replay.
 
-This advances only the bounded same-implementation, one-host live Blob
+This advances only the bounded same-implementation, three-party, one-host
+direct-Iroh graceful interruption/reopen and different-peer continuation
 observation. It is not an independent black-box conformance result and does not
-satisfy a separately deployed SUT requirement. The reopen is graceful and
-same-process, not process-crash or power-loss recovery; the run does not
-interrupt a partial transfer and therefore proves neither partial resume nor
-long-offline continuation. Source unlink and parent sync do not establish
-physical-media sanitization, and transcript timing remains producer-attested.
-Physical or representative networking, route-only custody, mixed
-implementations, scale/resource targets, complete MVP acceptance, release
-evidence, and production authorization remain open.
+satisfy a separately deployed SUT requirement. It does not prove process-crash
+or power-loss recovery, long-offline recovery, arbitrary-peer or route-only
+resume, physical-media sanitization, distinct physical hosts, NAT or Internet
+paths, controlled/public relay, BTLE, mixed implementations, scale beyond
+three participants, resource thresholds or long-duration soak, Blob
+subscription/status/TTL/garbage collection, complete MVP acceptance, release
+evidence, Event/State/Record live-application acceptance, or production
+authorization. Intermediate Store inspection and transcript timing remain
+producer-attested.
 
 Focused inventory-selection regressions exercise the same bound at small test
 sizes: the SQLite helper returns exactly the configured cap, requests only cap

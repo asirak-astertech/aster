@@ -594,28 +594,38 @@ source change or an accepted substitute for the clean isolated build.
 
 ## Selected live Blob retained gate
 
-The dated 2026-08-27 retained gate supersedes only the earlier statements above
-that no live Blob execution receipt existed. The canonical
-[`selected-live-blob-036d068.json`](implementation/evidence/selected-live-blob-036d068.json)
-receipt is 8,220 bytes with SHA-256
-`484eafe504d958881dc7b871fbf788f733d9c8814e02fc27253ece38e6169735`
+The dated 2026-08-27 v2 retained gate supersedes the earlier v1 live-Blob
+observation and only the statements above that no retained direct-Iroh Blob
+resume receipt existed. The canonical
+[`selected-live-blob-044d90f.json`](implementation/evidence/selected-live-blob-044d90f.json)
+receipt is 10,728 bytes with SHA-256
+`4fea2ffbd16608862a67167fb1b8fcb6d5d8b4b82c576aa9a6b7e25ee9c55909`
 and binds the run to good-signature source commit
-`036d068a8d055154beeffe265ceea8cf97079fa6`.
+`044d90ff07c8e754b3d490cb810d42de3c915e3d`.
 
-Two distinct participants execute four actor lifetimes with at most two
-concurrent actors. The publisher creates one 65,747-byte Blob while peerless,
-reads its two bounded pages, proves exact noninserting retry and changed-payload
-conflict behavior, removes and parent-syncs both plaintext source files, and
-then transfers directly over Iroh. Twelve positive direct `CONTACT` records
-cross-bind the terminal counters: the publisher fetches zero ranges and bytes,
-while the receiver fetches six ranges and 66,081 bytes with zero deferred work.
-The receiver reads the same two-page Blob after transfer and again after a
-peerless graceful reopen. Four graceful shutdowns, four closed retained
-handles, and two bind reacquisitions pass. Each participant retains one
-two-chunk finalized variant with 66,085 committed ciphertext-file bytes.
-`blob_remaining` is reconciled exactly but is not retained as completion proof;
-authenticated page reads, durable rows, and the completed depot shape provide
-the bounded visibility evidence.
+Three distinct participants execute 11 actor lifetimes in seven exact phases
+with at most two concurrent actors. A live publisher creates one 98,304-byte
+Blob while peerless, proves exact noninserting retry and changed-payload
+conflict behavior, and reads its two bounded pages. A replica first receives
+the complete Blob directly over Iroh. A receiver then takes exactly one contact
+from the publisher, retains a non-public 16,384-byte carrier prefix across a
+graceful actor/store/provider reopen, and takes exactly one contact from the
+different eligible replica. That continuation preserves the first prefix,
+advances it to 32,768 bytes without refetching the source, and remains
+non-public until the replica supplies the exact remaining 65,870 bytes. The
+three phases therefore reconstruct exactly 98,638 carrier bytes, equal to the
+seeded transfer, before whole-Blob promotion and authenticated reads. A final
+peerless graceful receiver reopen reproduces the same two-page read.
+
+Thirty-two positive direct `CONTACT` records cross-bind per-contact and
+terminal runtime accounting. Eleven graceful shutdowns and closed retained
+handles, three bind reacquisitions, typed intermediate Store inspections, and
+the final three-participant metadata-only inventory pass. Each participant
+retains one two-chunk finalized variant with 98,642 committed ciphertext-file
+bytes. Pending prefixes never enter ordinary visibility; exact authenticated
+reads, durable rows, prefix persistence and advancement, transfer accounting,
+and completed depot shape—not `blob_remaining` alone—provide the bounded
+observation.
 
 The raw root is owner-only evidence and contains mission and identity material,
 databases, depot metadata, and ciphertext. It must remain outside source
@@ -640,22 +650,25 @@ a separate clean checkout detached at the exact signed source commit:
 ```sh
 python3 tools/check-selected-live-blob-receipt.py \
   --raw-root /path/to/retained/selected-live-blob-raw-root \
-  --source /path/to/aster-source-detached-at-036d068a8d055154beeffe265ceea8cf97079fa6 \
-  docs/implementation/evidence/selected-live-blob-036d068.json
+  --source /path/to/aster-source-detached-at-044d90ff07c8e754b3d490cb810d42de3c915e3d \
+  docs/implementation/evidence/selected-live-blob-044d90f.json
 python3 tools/test-selected-live-blob-receipt.py
 ```
 
 The raw-root projection reproduced the checked-in receipt byte-for-byte, and
-the independent-oracle fail-closed suite passed 49/49. The source-to-binary-to-
+the independent-oracle fail-closed suite passed 45/45. The source-to-binary-to-
 execution link remains operator-attested rather than cryptographically proven,
 and the admitted source list is not a complete reproducible build closure. The
-restart is a graceful same-process actor/store/provider reopen, not a process-
-crash or power-loss recovery. Transcript timing and source-removal order are
-producer-attested; unlink plus parent sync is not physical-media sanitization.
-The receipt proves neither long-offline nor partial-transfer resume, independent
-black-box conformance, physical or representative NAT/relay/BTLE operation,
-mixed implementations, resource or scale targets, route-only custody, a
-complete MVP, a release artifact, or production authorization.
+interruption and reopens are graceful same-process actor/store/provider events,
+not process-crash or power-loss recovery. Intermediate Store inspection,
+transcript timing, and source-removal order are producer-attested; unlink plus
+parent sync is not physical-media sanitization. The receipt does not claim
+distinct physical hosts; NAT, Internet, controlled/public relay, or BTLE paths;
+an independent implementation; scale beyond three participants; resource
+thresholds or long-duration soak; long-offline recovery; arbitrary-peer or
+route-only Blob resume; Blob subscription, status, TTL, or garbage collection;
+Event, State, or Record live-application acceptance; complete MVP acceptance;
+a release artifact; or production authorization.
 
 ## Controlled Iroh relay software gate
 

@@ -351,17 +351,23 @@ proof plus route and nonrevocation authority. Pending bytes remain outside
 ordinary publication until the exact depot, full-content, and current-lineage
 proofs agree atomically. This is bounded direct, same-implementation automation,
 not route-only Blob relay/custody or Blob-over-controlled-relay acceptance. A
-[retained 8,220-byte live-Blob receipt](implementation/evidence/selected-live-blob-036d068.json)
+[retained 10,728-byte v2 live-Blob receipt](implementation/evidence/selected-live-blob-044d90f.json)
 (SHA-256
-`484eafe504d958881dc7b871fbf788f733d9c8814e02fc27253ece38e6169735`)
-binds source commit `036d068a8d055154beeffe265ceea8cf97079fa6` with
-`Good` signature status; 49 verifier tests pass. Its source-to-execution link
-remains operator-attested, not cryptographically proven. It is one-host,
-same-implementation direct-loopback evidence of peerless publication, later
-complete transfer, bounded live page reads, and a graceful same-process
-actor/store/provider reopen only. It does not prove partial or different-peer
-resume, process-crash, power-loss, or long-offline recovery, physical
-sanitization, independent-implementation interoperability, or release
+`4fea2ffbd16608862a67167fb1b8fcb6d5d8b4b82c576aa9a6b7e25ee9c55909`)
+binds signed source commit `044d90ff07c8e754b3d490cb810d42de3c915e3d`
+with `Good` signature status. Its three participants ran 11 actor lifetimes and
+32 error-free direct `CONTACT` records: a publisher committed while peerless; a replica
+received all 98,638 carrier bytes; a receiver retained an interrupted
+exactly-one-contact 16,384-byte prefix, reopened peerless with that exact
+progress, resumed exactly 16,384 bytes from the different replica without
+refetching the source, fetched the exact remaining 65,870 bytes, reconstructed
+all 98,638 carrier bytes, and reopened peerless for a final authenticated read.
+Its source-to-execution link remains operator-attested, not cryptographically
+proven. This is one-host, same-implementation evidence of graceful same-process
+actor/store/provider reopen only. It does not prove process-crash, power-loss,
+long-offline, arbitrary-peer, or route-only resume; NAT, Internet, relay, or
+BTLE paths; independent-implementation interoperability; scale beyond three
+participants; resource thresholds or soak; physical sanitization; or release
 authorization.
 
 `BlobDepotLimits` reserve canonical ciphertext-file bytes for every durable
@@ -378,8 +384,9 @@ mission/content and identity secrets and locks the store, but deliberately
 preserves the encrypted Blob depot and audited data rows. This is bounded
 cryptographic shredding, not Blob-file deletion or physical sanitization. Blob
 subscription/status, route-only relay/custody, Blob-over-controlled-relay
-acceptance, finite TTL, retention/GC, large/physical acceptance, mixed
-implementations, and representative network evidence remain open.
+acceptance, arbitrary-peer resume, crash/power-loss/long-offline recovery,
+finite TTL, retention/GC, large/physical acceptance, mixed implementations,
+and representative network evidence remain open.
 
 ## Live application command and status flow
 

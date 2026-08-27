@@ -800,18 +800,25 @@ here.
 The current selected `aster-node` schedules this grammar automatically on its
 direct-Iroh contacts after semantic-v5 negotiation, control activation, and an
 exact configured Blob receive selector. A
-[retained 8,220-byte live-Blob receipt](implementation/evidence/selected-live-blob-036d068.json)
+[retained 10,728-byte live-Blob receipt](implementation/evidence/selected-live-blob-044d90f.json)
 (SHA-256
-`484eafe504d958881dc7b871fbf788f733d9c8814e02fc27253ece38e6169735`)
-binds source commit `036d068a8d055154beeffe265ceea8cf97079fa6` with
-`Good` signature status; 49 verifier tests pass. Its source-to-execution link
-remains operator-attested, not cryptographically proven. It is one-host,
-same-implementation direct-loopback evidence of peerless publication, later
-complete transfer, bounded live page reads, and a graceful same-process
-actor/store/provider reopen only. It does not prove partial or different-peer
-resume, process-crash, power-loss, or long-offline recovery, physical
-sanitization, independent-implementation interoperability, operation over the
-controlled Iroh relay, or release authorization.
+`4fea2ffbd16608862a67167fb1b8fcb6d5d8b4b82c576aa9a6b7e25ee9c55909`)
+binds source commit `044d90ff07c8e754b3d490cb810d42de3c915e3d` with
+`Good` signature status; 45 adversarial verifier tests pass. Its
+source-to-execution link remains operator-attested, not cryptographically
+proven. Across three participants and 32 direct-loopback `CONTACT` records, it
+observes peerless publication and seeding, an exactly-one-contact partial
+transfer, exact retained-prefix persistence across a receiver reopen, an
+exactly-one-contact continuation from the different eligible replica with no
+source refetch and exact-complement advancement, exact byte reconstruction and
+promotion, bounded live page reads, and a final receiver reopen. This is
+one-host, same-implementation evidence, and every interruption or restart is a
+graceful same-process actor/store/provider reopen. It does not prove distinct
+physical hosts, NAT or Internet paths, controlled or public relay, BTLE,
+process-crash or power-loss recovery, long-offline recovery, arbitrary-peer or
+route-only resume, scale beyond three participants, resource thresholds or
+soak, physical sanitization, independent-implementation interoperability, or
+release authorization.
 
 For each receiver direction, the Blob source phase completes first through the
 class-separated mutable inventory/difference/Offer/Fetch/result/ack/finish
@@ -1702,10 +1709,13 @@ forbidden. The closed fixed-binary magic, kind, and role registries are in
   authorized fork replacement have no defined root-signed epoch/reset or
   external chain high-water mechanism in this profile.
 - Typed Blob chunk transfer and different-peer range resume are verified in the
-  in-memory reference runtime, and a separate generated 101 MiB local streaming
-  case passes with bounded component buffers. A combined 100+ MiB different-peer
-  run with measured process RSS and live carrier remains an acceptance gap.
-  Zero-byte Blob publication is not supported by envelope format 2.
+  in-memory reference runtime. The separate retained selected-node receipt now
+  observes one bounded exactly-one-contact partial and exactly-one-contact
+  different-eligible-peer resume across graceful same-process reopens on one
+  host. A separate generated 101 MiB local streaming case passes with bounded
+  component buffers, but a combined 100+ MiB different-peer run with measured
+  process RSS and a live carrier remains an acceptance gap. Zero-byte Blob
+  publication is not supported by envelope format 2.
 - A custom hybrid composition needs independent cryptographic review.
 - Literal passive silence cannot request, authenticate interactively, or ACK.
 - The Rust application host owns and pumps configured link instances, while the
