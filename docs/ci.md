@@ -18,7 +18,7 @@ single stable check name **`CI / required`**.
 
 | Check | Runner | Purpose |
 | --- | --- | --- |
-| `quality` | `ubuntu-24.04` | Runs `mise run check`: Rust and Go formatting, Apache-2.0-only project-license and package checks, exact 348-row implementation-requirements traceability, the selected-node dependency boundary, vendored netlink source-equivalence and 13-test compatibility gates, the retained-libp2p-oracle boundary, selected live-mutable and live-Blob receipt checker tests, Clippy with warnings denied, the full Rust workspace test suite, C ABI build and C/C++ header checks, Rust/Python conformance, Python/Go binding tests, and the lab-controller tests. |
+| `quality` | `ubuntu-24.04` | Runs `mise run check`: Rust and Go formatting, Apache-2.0-only project-license and package checks, exact 348-row implementation-requirements traceability, the selected-node dependency boundary, vendored netlink source-equivalence and 13-test compatibility gates, the retained-libp2p-oracle boundary, selected live-Event, live-mutable, and live-Blob receipt checker tests, Clippy with warnings denied, the full Rust workspace test suite, C ABI build and C/C++ header checks, Rust/Python conformance, Python/Go binding tests, and the lab-controller tests. |
 | `macOS tests` | `macos-14` | Runs all Rust workspace tests on the supported Apple runner with Rust 1.97.1. |
 | `Rust 1.91 MSRV` | `ubuntu-24.04` | Checks every workspace target and feature with the declared minimum supported Rust version. |
 | `dependency policy` | `ubuntu-24.04` | Enforces the retained-libp2p-oracle boundary, applies `deny.toml` to the root and fuzz dependency graphs, and audits both lockfiles against a freshly downloaded RustSec database. |
@@ -508,10 +508,75 @@ one-host same-implementation loopback evidence, and the restart is one
 immediate peerless reopen—not indefinite tombstone retention, compaction,
 garbage collection, or delete-wins. It supplies no physical, NAT/Internet,
 controlled/public-relay, BTLE, independent-implementation, scale beyond two,
-resource-threshold, long-duration, Event/Blob-live, or release acceptance.
+resource-threshold, long-duration, Event/Blob-live, or release acceptance from
+that State/Record receipt.
 Durable State/Record subscriptions, selected-node bindings, finite TTL, and
 automatic registered-policy Record merge remain open. Its zero Blob counters
 do not evidence the newer live Blob mechanism.
+
+## Selected live Event retained gate
+
+The v1
+[`selected-live-event-c464129.json`](implementation/evidence/selected-live-event-c464129.json)
+canonical receipt is 9,573 bytes with SHA-256
+`4d71d04e4ebcc9f63c0e84e7f11e83bf1f3d1ad2ca8608486cdcc875b6dfeef0`
+and binds the run to signed source commit
+`c464129d58c250dea2ecbf5f51d7ece0e5aab6d0`. Two distinct carrier and mission
+identities execute seven actor lifetimes with at most two concurrent actors on
+one same-implementation loopback host.
+
+The publisher creates four durable Events while peerless: alpha sequences 1,
+2, and 3 plus one authorized beta Event. One priority-threshold direct contact
+delivers alpha 1 and 3 as attempt 1 and exposes authenticated half-open gap
+`[2,3)`; routine alpha 2 and unsubscribed beta remain withheld. The parent then
+forcibly terminates the receiver child after its two-item poll was flushed
+without acknowledgement. A fresh receiver process reopens the durable
+subscription, receives the same IDs as attempt 2, acknowledges and idempotently
+re-acknowledges both, and reaches an empty poll. A normal direct contact later
+delivers alpha 2 as attempt 1, closes the gap, and completes its ack/re-ack.
+
+The beta query remains empty while unsubscribed. Creating a temporary beta
+subscription advances the selector snapshot and observes
+`PolicyChangedSinceContact`; exact removal and idempotent removal follow. The
+run performs no fresh post-change contact and observes no beta delivery. Its two
+`AwaitingAuthenticatedContact` observations have zero failed attempts, so this
+receipt does not establish positive failed-contact propagation. Control,
+State/Record, and Blob activity remain zero.
+
+The raw root is owner-only evidence containing participant mission bundles,
+identity keys, and stores. Keep it outside source control. The runner/checker
+inventory those six secret files by metadata only and never open, read, or hash
+their contents. A new capture requires a clean, good-signed source checkout and
+a fresh exclusive raw-root path:
+
+```sh
+python3 tools/run-selected-live-event.py \
+  --source /path/to/clean-good-signed-aster-source \
+  --raw-root /private/tmp/aster-selected-live-event-new
+
+python3 tools/check-selected-live-event-receipt.py - \
+  --raw-root /private/tmp/aster-selected-live-event-new \
+  --source /path/to/clean-good-signed-aster-source \
+  --output /private/tmp/event-receipt/selected-live-event-receipt.json
+```
+
+Replaying the checked-in projection requires the externally retained raw root
+and a clean checkout detached at its exact signed source:
+
+```sh
+python3 tools/check-selected-live-event-receipt.py \
+  --raw-root /path/to/retained/selected-live-event-raw-root \
+  --source /path/to/aster-source-detached-at-c464129d58c250dea2ecbf5f51d7ece0e5aab6d0 \
+  docs/implementation/evidence/selected-live-event-c464129.json
+python3 tools/test-selected-live-event-receipt.py
+```
+
+The source/binary/execution link remains operator-attested, not cryptographic
+or reproducible-build proof. This gate claims no distinct physical hosts;
+NAT/Internet, controlled/public relay, or BTLE path; mixed or independent
+implementation; scale/resource/soak result; State, Record, or Blob acceptance;
+post-policy fresh completion or beta delivery; indefinite retention/GC; release
+artifact; or production authorization.
 
 The semantic-v5 direct Blob gate is additive to the earlier stopped/local Blob
 gate. It must cover all Blob interest/source/range/result/ack/finish frame bytes,

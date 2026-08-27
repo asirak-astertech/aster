@@ -31,6 +31,27 @@ typed `SelectedControlHandle`; those bounded Rust-only seams are documented
 below. Linux semantic-v3/v4/v5 finite Event TTL is documented in the
 [selected custody quickstart](selected-custody-api.md).
 
+A [retained 9,573-byte live-Event receipt](../implementation/evidence/selected-live-event-c464129.json)
+(SHA-256
+`4d71d04e4ebcc9f63c0e84e7f11e83bf1f3d1ad2ca8608486cdcc875b6dfeef0`,
+signed source `c464129`) observes this live surface on one same-implementation
+loopback host. The publisher creates three alpha Events and one authorized beta
+Event while peerless. A priority-threshold direct contact delivers alpha
+sequences 1 and 3 and exposes authenticated half-open gap `[2,3)`. After the
+receiver child flushes that unacknowledged poll, the parent forcibly terminates
+it; a fresh process receives the same IDs as attempt 2 and acknowledges plus
+idempotently re-acknowledges them. A normal contact then delivers sequence 2,
+acknowledges/re-acknowledges it, and closes the gap.
+
+The beta Event remains withheld while unsubscribed. A temporary beta
+subscription produces `PolicyChangedSinceContact`, then exact removal and
+idempotent removal; the receipt includes no later contact or beta delivery.
+Both awaiting observations report zero failed attempts, so positive
+failed-contact propagation is not evidenced. This is bounded direct-loopback
+software evidence, not physical, NAT/Internet, relay, BTLE, mixed or independent
+implementation, scale/resource/soak, State/Record/Blob, release, or production
+acceptance.
+
 A [retained 10,728-byte live-Blob receipt](../implementation/evidence/selected-live-blob-044d90f.json)
 (SHA-256
 `4fea2ffbd16608862a67167fb1b8fcb6d5d8b4b82c576aa9a6b7e25ee9c55909`)

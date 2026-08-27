@@ -64,7 +64,20 @@ into outcomes for planning and PR review.
 The selected implementation deliberately exposes different maturity levels:
 
 - **Event** has direct-Iroh networking and one operator-pinned controlled Iroh
-  connectivity relay, plus live Rust and local ConnectRPC APIs.
+  connectivity relay, plus live Rust and local ConnectRPC APIs. A
+  [retained 9,573-byte live-Event receipt](implementation/evidence/selected-live-event-c464129.json)
+  (SHA-256
+  `4d71d04e4ebcc9f63c0e84e7f11e83bf1f3d1ad2ca8608486cdcc875b6dfeef0`,
+  signed source `c464129`) observes four peerless publications—three alpha and
+  one authorized beta—on one same-implementation loopback host. A threshold
+  contact transfers alpha sequences 1 and 3 with authenticated gap `[2,3)`;
+  after a flushed unacknowledged poll and forced receiver-child termination, a
+  fresh process receives the same IDs as attempt 2 and acknowledges/re-acks
+  them. A normal contact delivers sequence 2 and closes the gap. Beta remains
+  withheld; subscribing observes `PolicyChangedSinceContact`, then removal and
+  idempotent removal, with no post-change contact or beta delivery. Awaiting
+  status has zero failed attempts. This is not physical, NAT/Internet, relay,
+  BTLE, mixed-implementation, scale/resource, other-class, or release evidence.
 - **State and Record** have cloneable live Rust handles backed by the running
   actor plus exclusive stopped-node facades, and reconcile directly between
   selected nodes under explicit interests. A
@@ -111,8 +124,10 @@ same-implementation loopback chain with an operator-attested, non-reproducible
 source-to-execution link and metadata-only secret inspection; it is not proof
 of indefinite tombstone retention, garbage collection, delete-wins, physical
 or mixed implementations, NAT/relay, BTLE, scale, resource bounds,
-long-duration operation, release, or Event/Blob-live acceptance. In particular,
-its zero Blob counters do not evidence the newer live Blob handle.
+long-duration operation, release, or Event/Blob-live acceptance. Those are
+limits of the State/Record receipt, not of the separate receipts
+linked above and below; its zero Blob counters do not evidence the newer live
+Blob handle.
 
 A separate [retained 10,728-byte v2 live-Blob receipt](implementation/evidence/selected-live-blob-044d90f.json)
 (SHA-256

@@ -213,8 +213,9 @@ pub struct EventPublishRequest {
 /// Additive publication behavior for one selected Event.
 ///
 /// Durable publication is the default. A finite TTL is source authenticated,
-/// begins at the local custody checkpoint, and can only cross semantic-v3
-/// mission sessions carrying an authenticated cumulative custody claim.
+/// begins at the local custody checkpoint, and can only cross semantic-v3+
+/// mission sessions (v3, v4, or v5) carrying an authenticated cumulative
+/// custody claim.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct EventPublishOptions {
     ttl_ms: Option<u64>,

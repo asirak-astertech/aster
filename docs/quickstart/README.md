@@ -24,6 +24,19 @@ automatic registered-policy Record merge, atomic Event subscription update,
 Blob subscription or convergence status, selected-node language bindings,
 and representative physical or mixed-implementation acceptance remain open.
 
+A [retained 9,573-byte live-Event receipt](../implementation/evidence/selected-live-event-c464129.json)
+(SHA-256
+`4d71d04e4ebcc9f63c0e84e7f11e83bf1f3d1ad2ca8608486cdcc875b6dfeef0`,
+signed source `c464129`) observes four peerless Events, threshold transfer of
+alpha 1 and 3 with authenticated gap `[2,3)`, forced receiver-child termination
+after a flushed unacknowledged poll, fresh-process attempt-2 redelivery with
+ack/re-ack, and Normal transfer of alpha 2 closing the gap. Beta stays withheld;
+a temporary subscription yields `PolicyChangedSinceContact` and is removed
+without another contact or delivery. Awaiting observations have zero failed
+attempts. This is one-host, same-implementation direct-loopback evidence—not
+physical/NAT/relay/BTLE, mixed, scale/resource, other-class, or release
+acceptance.
+
 A [retained 10,728-byte live-Blob receipt](../implementation/evidence/selected-live-blob-044d90f.json)
 (SHA-256
 `4fea2ffbd16608862a67167fb1b8fcb6d5d8b4b82c576aa9a6b7e25ee9c55909`)

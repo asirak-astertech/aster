@@ -436,6 +436,21 @@ is exposed. Absence of a returned gap says only that the locally observed,
 verified positions in that page are contiguous; it is not publisher
 completeness or mesh convergence.
 
+The [retained 9,573-byte live-Event receipt](implementation/evidence/selected-live-event-c464129.json)
+(SHA-256
+`4d71d04e4ebcc9f63c0e84e7f11e83bf1f3d1ad2ca8608486cdcc875b6dfeef0`,
+signed source `c464129`) composes this path on one same-implementation loopback
+host. Four peerless Events include three alpha sequences and one authorized
+beta Event. A priority-threshold contact transfers alpha 1 and 3, exposing
+authenticated gap `[2,3)`; a forced receiver-child termination after the
+flushed unacknowledged poll is followed by fresh-process attempt-2 redelivery
+and ack/re-ack. A normal contact transfers alpha 2 and closes the gap. Beta is
+withheld; subscribing changes the selector snapshot and yields
+`PolicyChangedSinceContact`, then removal, but no post-change contact or beta
+delivery. Awaiting status has zero failed attempts. This is not physical,
+NAT/relay/BTLE, mixed-implementation, scale/resource, other-class, or release
+evidence.
+
 ## One authenticated contact
 
 ```mermaid
@@ -535,7 +550,8 @@ independent implementation, resource evidence, or release acceptance. See the
 
 - [Capability tour](quickstart/capability-tour.md) — fastest visible behavior.
 - [Selected Event API](quickstart/selected-event-api.md) — live publish/query,
-  durable delivery, gaps, unsubscribe, and bounded status.
+  durable delivery, gaps, unsubscribe, bounded status, and the retained
+  [live-Event receipt](implementation/evidence/selected-live-event-c464129.json).
 - [Selected State API](quickstart/selected-state-api.md) — live or stopped
   latest-value projection, recoverable history, and visible tombstones.
 - [Selected Record API](quickstart/selected-record-api.md) — live or stopped

@@ -259,6 +259,20 @@ the separate at-least-100-node target, any resource or hardware gate, physical
 or distributed topology, NAT/relay/BTLE/cross-transport behavior, independent
 interoperability, or release acceptance.
 
+A separate [9,573-byte selected live-Event receipt](implementation/evidence/selected-live-event-c464129.json)
+(SHA-256
+`4d71d04e4ebcc9f63c0e84e7f11e83bf1f3d1ad2ca8608486cdcc875b6dfeef0`,
+signed source `c464129`) is also a bounded reference-implementation observation,
+not a new `A-*` scenario. It records four peerless Events, threshold transfer of
+alpha sequences 1 and 3 with authenticated gap `[2,3)`, forced receiver-child
+termination after a flushed unacknowledged poll, fresh-process attempt-2
+redelivery with ack/re-ack, and Normal transfer of alpha 2 closing the gap. The
+authorized beta Event stays withheld; a temporary beta subscription observes
+`PolicyChangedSinceContact` and is removed without a later contact or beta
+delivery. Awaiting status has zero failed attempts. The run is one-host,
+same-implementation, direct loopback only and supplies no physical, NAT/relay,
+BTLE, mixed/independent, scale/resource, other-class, or release acceptance.
+
 ## Implemented reliability and resource subgates
 
 The authenticated in-memory runtime has a deterministic monotonic retry loop,
