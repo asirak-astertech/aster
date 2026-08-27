@@ -65,7 +65,7 @@ equivalent tests.
 |---|---|---|
 | Selected direct Iroh | Manually admitted exact endpoint ID and socket, authenticated direct UDP/QUIC, and bounded exchange | A retained one-host cone software-namespace cell observed Direct and exact Event delivery across two NAT routers with static operator-known mappings. Carrier authentication is not mission or control/source authorization; discovery/punching, dynamic or representative NAT, physical-network acceptance, and multi-carrier failover remain open. |
 | Selected controlled Iroh relay | One operator-pinned HTTPS relay with explicit trust, either alongside the initial direct locator or with IP disabled | A retained one-host restrictive software-namespace cell blocked direct traffic, observed Relay, and delivered one exact Event through the controlled relay. It is not a temporal direct-first/fallback chronology, representative or physical NAT, public or independently operated relay, an Aster payload-blind relay, State/Record/Blob-over-relay acceptance, or release authorization. |
-| Selected node and CLI | Networked Event and State/Record reconciliation, semantic-v5 direct Blob source/carrier transfer, live Event/State/Record/Blob Rust APIs, stopped Event/State/Record/Blob facades, payload-blind Event relay, restart/idempotency, bounded one-host direct complete-Blob-transfer/read/graceful-reopen evidence, and bounded Unix zeroization | Reference provisioning, no Blob subscription/status API, no State/Record subscriptions or selected-node language bindings, no partial or different-peer Blob resume acceptance, no route-only Blob relay/custody, no Blob-over-controlled-relay acceptance, finite State/Record/Blob TTL and non-Linux finite Event custody, generalized control administration, representative physical or mixed-implementation evidence, or production authorization |
+| Selected node and CLI | Networked Event and State/Record reconciliation, semantic-v5 direct Blob source/carrier transfer, live Event/State/Record/Blob Rust APIs, stopped Event/State/Record/Blob facades, payload-blind Event relay, restart/idempotency, bounded one-host three-participant direct Blob publication/partial/different-peer-resume/read/graceful-reopen evidence, and bounded Unix zeroization | Reference provisioning, no Blob subscription/status API, no State/Record subscriptions or selected-node language bindings, no arbitrary-peer or route-only Blob resume acceptance, no Blob-over-controlled-relay acceptance, finite State/Record/Blob TTL and non-Linux finite Event custody, generalized control administration, representative physical or mixed-implementation evidence, resource/soak evidence, or production authorization |
 | Current semantic in-memory link | Full high-level host contact, authentication, reconciliation, resume, and failure tests | It is a test carrier and is not wired to the selected composition |
 | Current semantic UDP/IP | Nonblocking link, manual endpoint mapping, protected local discovery, rendezvous helpers, opaque relay components | Migration onto the selected node; full host acceptance on physical or operational networks |
 | Current semantic NAT/rendezvous and relay | Bounded rendezvous, endpoint-punching, and opaque-relay helpers with local software tests | Selected-node integration and a two-device representative-NAT direct/fallback result |
@@ -177,17 +177,24 @@ offer/fetch/insert totals with zero Event/control/Blob counters. This is
 same-implementation one-host evidence, not physical, NAT/relay, BTLE, scale,
 resource, mixed-implementation, or release acceptance. The live Blob handle and
 the semantic-v5 direct-Iroh Blob automation now have a separate
-[retained 8,220-byte receipt](implementation/evidence/selected-live-blob-036d068.json)
+[retained 10,728-byte receipt](implementation/evidence/selected-live-blob-044d90f.json)
 (SHA-256
-`484eafe504d958881dc7b871fbf788f733d9c8814e02fc27253ece38e6169735`)
-binding source commit `036d068a8d055154beeffe265ceea8cf97079fa6` with
-`Good` signature status; 49 verifier tests pass. Its source-to-execution link
-remains operator-attested, not cryptographically proven. It is one-host,
-same-implementation direct-loopback evidence of peerless publication, later
-complete transfer, bounded live page reads, and a graceful same-process
-actor/store/provider reopen only. It does not prove partial or different-peer
-resume, process-crash, power-loss, or long-offline recovery, physical
-sanitization, independent-implementation interoperability, or release
+`4fea2ffbd16608862a67167fb1b8fcb6d5d8b4b82c576aa9a6b7e25ee9c55909`)
+binding source commit `044d90ff07c8e754b3d490cb810d42de3c915e3d` with
+`Good` signature status; 45 adversarial verifier tests pass. Its
+source-to-execution link remains operator-attested, not cryptographically
+proven. Across three participants and 32 direct-loopback `CONTACT` records, it
+observes peerless publication and seeding, an exactly-one-contact partial
+transfer, retained-prefix persistence across receiver reopen, an
+exactly-one-contact continuation from the different eligible replica with no
+source refetch and exact-complement advancement, exact byte reconstruction and
+promotion, bounded live page reads, and a final receiver reopen. This is
+one-host, same-implementation evidence, and every interruption or restart is a
+graceful same-process actor/store/provider reopen. It does not prove physical
+hosts, NAT or Internet paths, controlled or public relay, BTLE, process crash
+or power-loss recovery, long-offline recovery, arbitrary-peer or route-only
+resume, scale beyond three participants, resource thresholds or soak,
+physical sanitization, independent-implementation interoperability, or release
 authorization. Blob subscription/status,
 State/Record subscriptions and selected-node bindings, route-only Blob
 relay/custody, Blob-over-controlled-relay acceptance, generalized control

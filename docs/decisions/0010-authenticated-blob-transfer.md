@@ -199,25 +199,39 @@ recorded in [ADR 0009](0009-public-api-boundary.md#live-selected-blob-applicatio
 ## Retained live direct-transfer amendment (2026-08-27)
 
 This amendment supersedes only the preceding statement that the bounded live
-composition has no retained execution receipt. The canonical
-[`selected-live-blob-036d068.json`](../implementation/evidence/selected-live-blob-036d068.json)
-receipt is 8,220 bytes with SHA-256
-`484eafe504d958881dc7b871fbf788f733d9c8814e02fc27253ece38e6169735`
+composition has no retained execution receipt and supersedes the earlier v1
+live-transfer observation. The canonical
+[`selected-live-blob-044d90f.json`](../implementation/evidence/selected-live-blob-044d90f.json)
+receipt is 10,728 bytes with SHA-256
+`4fea2ffbd16608862a67167fb1b8fcb6d5d8b4b82c576aa9a6b7e25ee9c55909`
 and binds good-signature source commit
-`036d068a8d055154beeffe265ceea8cf97079fa6` to one peerless live publication,
-later positive direct-Iroh transfer to an exactly interested receiver,
-whole-Blob visibility and bounded reads, and a final peerless graceful reopen.
-The publisher reports zero fetched ranges and bytes; the receiver reports
-positive range and byte transfer with zero deferred work. Exact durable rows,
-two committed chunks, freshly authenticated reads, and depot completion—not
-`blob_remaining` alone—establish the bounded receiver result.
+`044d90ff07c8e754b3d490cb810d42de3c915e3d` to seven exact phases across three
+participants. After peerless live publication and a direct-Iroh seed, the
+receiver takes one publisher contact and retains a non-public 16,384-byte
+carrier prefix across graceful shutdown and same-process actor/store/provider
+reopen. One contact from the different eligible replica preserves the prefix,
+advances it to 32,768 bytes without refetching the source, and remains
+non-public. The replica then supplies the remaining 65,870 bytes. The partial,
+resume, and finish phases reconstruct exactly 98,638 transferred carrier bytes,
+equal to the seed, before whole-Blob visibility, authenticated bounded reads,
+and a final peerless graceful reopen.
 
-This receipt does not broaden the semantic-v5 carrier decision to route-only
-custody and does not retain the separate three-node different-peer partial-
-resume mechanism. No session is interrupted, so neither partial-transfer resume
-nor long-offline continuation is proved. Reopen is graceful and same-process,
-not crash or power-loss recovery. Source unlink and parent sync do not prove
-physical-media sanitization, and transcript timing remains producer-attested.
-The evidence is not independent black-box conformance, a physical or mixed-
-implementation network result, a resource/scale result, complete MVP
-acceptance, a release artifact, or production authorization.
+Typed intermediate Store inspection, exact per-contact and shutdown
+aggregation, durable rows, two committed chunks, freshly authenticated reads,
+and depot completion—not `blob_remaining` alone—establish the bounded receiver
+result. The independent-oracle checker suite passed 45/45, and the private
+mission, identity, database, depot-marker, and ciphertext contents remain
+metadata-only to the projector.
+
+This receipt does not broaden the semantic-v5 carrier decision to arbitrary-
+peer or route-only Blob resume. It is only a three-party, one-host,
+same-implementation direct-Iroh observation of graceful interruption/reopen and
+different-peer continuation. It does not prove process-crash or power-loss
+recovery, long-offline recovery, physical-media sanitization, distinct physical
+hosts, NAT or Internet paths, controlled/public relay, BTLE, independent
+implementation interoperability, scale beyond three participants, resource
+thresholds or long-duration soak, Blob subscription/status/TTL/garbage
+collection, Event/State/Record live-application acceptance, complete MVP
+acceptance, a release artifact, or production authorization. The
+source/binary/execution link and intermediate Store timing remain
+operator/producer-attested rather than cryptographically proven.

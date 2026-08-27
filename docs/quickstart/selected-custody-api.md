@@ -269,11 +269,14 @@ The selected implementation covers Event and RouteEvent custody only. It does
 not add State/Record custody; their cloneable live handles and separate
 semantic-v4/v5 mutable reconciliation run outside this custody policy in Normal
 and AtLeast, as do the live Blob application surface and semantic-v5 direct Blob
-work. The latter is current same-implementation direct-Iroh automation, not a
-retained Blob acceptance receipt. It does not add finite State/Record TTL or
-subscriptions, Blob subscription/status, Blob custody/TTL/GC, route-only Blob
-relay/custody, selected-node bindings, cross-class priority eviction,
-physical-radio silence or media-sanitization proof, protected provisioning,
-representative/physical NAT or public/default relay acceptance, BTLE,
-long-offline or requirement-scale acceptance, mixed implementations, resource
-proof, or release authorization.
+work. A [separate retained Blob receipt](../implementation/evidence/selected-live-blob-044d90f.json)
+observes only a bounded
+three-participant direct partial/different-eligible-peer resume across graceful
+same-process reopens on one host; it adds no custody acceptance to this guide.
+This slice does not add finite State/Record TTL or subscriptions, Blob
+subscription/status, Blob custody/TTL/GC, arbitrary-peer or route-only Blob
+resume, selected-node bindings, cross-class priority eviction, physical-radio
+silence or media-sanitization proof, protected provisioning,
+representative/physical NAT or Internet, public/default or controlled-relay
+acceptance, BTLE, crash/power-loss or long-offline recovery, scale or resource
+proof, mixed implementations, or release authorization.

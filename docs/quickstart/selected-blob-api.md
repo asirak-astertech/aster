@@ -17,20 +17,25 @@ direct carrier ranges between current content-capable peers. The default offer
 is `[5, 4, 3, 2, 1]`; v1-v4 emit zero Blob frames, and stable wire/ABI, source,
 manifest, and `ASTRBT01` formats remain version 1.
 
-A [retained 8,220-byte live-Blob receipt](../implementation/evidence/selected-live-blob-036d068.json)
+A [retained 10,728-byte live-Blob receipt](../implementation/evidence/selected-live-blob-044d90f.json)
 (SHA-256
-`484eafe504d958881dc7b871fbf788f733d9c8814e02fc27253ece38e6169735`)
-binds source commit `036d068a8d055154beeffe265ceea8cf97079fa6` with
-`Good` signature status; 49 verifier tests pass. Its source-to-execution link
-remains operator-attested, not cryptographically proven. It is one-host,
-same-implementation direct-loopback evidence of peerless publication, later
-complete transfer, bounded live page reads, and a graceful same-process
-actor/store/provider reopen only. It does not prove partial or different-peer
-resume, process-crash, power-loss, or long-offline recovery, physical
-sanitization, independent-implementation interoperability, or release
-authorization. Nothing in this guide claims route-only Blob custody,
-large-Blob/RSS acceptance, representative physical networking, or broader
-acceptance.
+`4fea2ffbd16608862a67167fb1b8fcb6d5d8b4b82c576aa9a6b7e25ee9c55909`)
+binds source commit `044d90ff07c8e754b3d490cb810d42de3c915e3d` with
+`Good` signature status; 45 adversarial verifier tests pass. Its
+source-to-execution link remains operator-attested, not cryptographically
+proven. Across three participants and 32 direct-loopback `CONTACT` records, it
+observes peerless publication and seeding, an exactly-one-contact partial
+transfer, exact retained-prefix persistence across receiver reopen, an
+exactly-one-contact continuation from the different eligible replica with no
+source refetch and exact-complement advancement, exact byte reconstruction and
+promotion, bounded live page reads, and a final receiver reopen. This is
+one-host, same-implementation evidence, and every interruption or restart is a
+graceful same-process actor/store/provider reopen. It does not prove physical
+hosts, NAT or Internet paths, controlled or public relay, BTLE, process crash
+or power-loss recovery, long-offline recovery, arbitrary-peer or route-only
+resume, scale beyond three participants, resource thresholds or soak,
+physical sanitization, independent-implementation interoperability, or release
+authorization.
 
 ## Use the live actor API
 
@@ -198,8 +203,11 @@ content-capable interested receiver can durably stage the source and missing
 carrier ranges, promote only after whole-Blob verification, and read the Blob
 through its own live handle. The receiver's completed publication and page
 reads survive another peerless restart. Current same-implementation loopback
-tests exercise that sequence; there is not yet a retained receipt, physical
-carrier run, or mixed-implementation acceptance artifact for it.
+tests exercise that sequence, and the retained receipt above now observes it
+alongside the bounded interrupted partial/different-eligible-peer continuation.
+That receipt is still one-host direct loopback with graceful same-process
+reopens, not a physical-carrier, crash-recovery, arbitrary-peer,
+mixed-implementation, scale, or resource acceptance artifact.
 
 The provider turns that exact topic/scope and the current epoch into an opaque
 32-byte peer proof inside the protected v5 contact. Every Blob inventory,
@@ -250,11 +258,14 @@ ID, not the last manifest record.
 Normal and `AtLeast` run the v5 lane because `AtLeast` filters Event only.
 `ReceiveOnly` advertises, requests, stages, promotes, and counts zero Blob work.
 The live handle does not change those contact rules and reports no Blob peer or
-convergence status. The selected slice still has no route-only Blob
-relay/custody, Blob subscription, Blob TTL/expiry/GC, metadata-independent
-whole-byte identity or deduplication, 100+ MiB/RSS or resource acceptance,
-representative physical carrier or mixed-implementation acceptance, retained
-live-Blob receipt, or release authorization.
+convergence status. The retained receipt above is only the bounded
+three-participant, one-host, graceful-reopen observation described there. The
+selected slice still has no route-only Blob relay/custody, arbitrary-peer
+resume evidence, Blob subscription, Blob TTL/expiry/GC, metadata-independent
+whole-byte identity or deduplication, 100+ MiB/RSS or resource/soak acceptance,
+representative physical carrier, NAT/Internet, relay, BTLE,
+mixed-implementation, crash/power-loss, or long-offline acceptance, or release
+authorization.
 
 `publish` requires a seekable source because it makes two bounded passes. The
 first computes the whole-content and per-chunk digests with one bounded,

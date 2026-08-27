@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2026 Defense Unicorns, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Create one exclusive raw root for selected live Blob acceptance."""
+"""Create one exclusive raw root for interrupted selected live Blob acceptance."""
 
 from __future__ import annotations
 
@@ -20,11 +20,11 @@ import sys
 from typing import Any
 
 
-RAW_SCHEMA = "aster-selected-live-blob-raw/v1"
-CLAIM = "selected-live-blob-one-host-direct-iroh-peerless-publish-transfer-read-restart-acceptance"
+RAW_SCHEMA = "aster-selected-live-blob-raw/v2"
+CLAIM = "selected-live-blob-one-host-direct-iroh-peerless-publish-seed-interrupt-reopen-different-peer-resume-read-restart-acceptance"
 BINARY_NAME = "aster-live-blob-acceptance"
 TRANSCRIPT_PREFIX = b"LIVE_BLOB\t"
-TRANSCRIPT_RECORDS = 31
+TRANSCRIPT_RECORDS = 81
 MAX_STDOUT_BYTES = 8 * 1024 * 1024
 MAX_TRANSCRIPT_BYTES = 64 * 1024
 RUN_TIMEOUT_SECONDS = 240
