@@ -24,13 +24,23 @@ has a separate durable whole-key delivery mechanism with a
 [retained bounded receipt](../implementation/evidence/selected-live-record-subscription-0c11344.json).
 That Record receipt moves only `DM-5.1-08` and does not broaden this State
 contract. Dynamic network selectors, State/node contact
-status, retained Blob-delivery acceptance and Blob peer/convergence status,
+status, and Blob peer/convergence status,
 selected-node ConnectRPC/C/Go/Python bindings, finite
 TTL, tombstone retention duration,
 expiry, compaction, garbage collection, broader relay acceptance,
 representative physical/mixed-implementation evidence, and release
 authorization remain open. The selected store rejects every finite-TTL State
 object; there is no forwarding-age path to enable yet.
+
+Blob delivery separately has a
+[retained 10,269-byte peerless receipt](../implementation/evidence/selected-live-blob-subscription-26e0a09.json)
+(SHA-256
+`3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675`,
+Good-signed source `26e0a09`) covering one participant, forced attempt-one
+process termination, fresh-process attempt-2 redelivery acknowledged with the
+older token, two exact publications sharing one `BlobId`, and an empty final
+reopen. It adds no State, network/peer-status, selector-separation, TTL/GC,
+physical/mixed, resource/soak, or release evidence to this guide.
 
 ## Run the stopped example
 

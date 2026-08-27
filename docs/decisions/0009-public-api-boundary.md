@@ -443,8 +443,8 @@ This amendment supersedes the earlier present-tense statements that selected
 State has no live application subscription or durable delivery subscription.
 Those statements remain above only as dated boundaries of the stopped and
 semantic-v4 network slices. Record's separate delivery and receipt amendment
-follows below. Blob delivery now has a later current-code amendment, but its
-retained acceptance remains open.
+follows below. Blob delivery has a later current-code amendment, but at this
+State-amendment freeze its retained acceptance remained open.
 
 `SelectedStateHandle` now exposes durable `subscribe`, `poll`, `acknowledge`,
 and `unsubscribe` operations backed by the actor-owned Store. The queue is
@@ -583,3 +583,36 @@ not a retained Linux delivery receipt. It changes no atomic requirement status
 by itself and makes no finite Blob TTL/expiry/GC, route-only custody,
 crash/power-loss, physical/NAT/relay/BTLE, mixed-implementation, large/RSS,
 binding, reproducible-build, release, or production-authority claim.
+
+## Retained selected Blob delivery amendment (2026-08-27)
+
+This amendment supersedes only the preceding present-tense statement that the
+metadata-only queue has no retained delivery receipt. It does not amend the
+older direct-transfer receipt, the application ownership decision, or the
+separation between application selectors and configured network interests. The
+canonical
+[`selected-live-blob-subscription-26e0a09.json`](../implementation/evidence/selected-live-blob-subscription-26e0a09.json)
+receipt is 10,269 bytes with SHA-256
+`3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675`
+and binds Good-signed source commit
+`26e0a090b9a6f644d96b38cfaa23f4e2139ad8b1`.
+
+One participant executes three processes and four actor lifetimes on one
+peerless host. Two exact source publications share one `BlobId`. The
+attempt-one child durably flushes its unacknowledged token and is sent
+`SIGKILL` without a `STOP`; a fresh process receives the same publication as
+attempt 2 and acknowledges it with the persisted attempt-one token. Malformed
+and cross-publication tokens fail closed, both publications are acknowledged
+and idempotently re-acknowledged, and a final parent reopen replays one
+subscription with zero pending, two acknowledged, two cursors, and an empty
+poll. Final Store inspection binds two publications/operations to one finalized
+variant, one chunk, and 207 committed ciphertext bytes.
+
+This is one-host, same-implementation, peerless local-ledger evidence. The
+source/binary/execution link remains operator-attested and not reproducible.
+The receipt claims no network contact, transfer, synchronization,
+peer/convergence status, selector withholding or network-interest separation,
+plaintext delivery or exact-publication read, policy/rekey/revocation behavior,
+power-loss/filesystem-crash recovery, long retention, TTL/expiry/GC, physical
+or mixed implementations, resource thresholds/soak, selected-node language
+bindings, release artifact, or production authorization.

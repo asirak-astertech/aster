@@ -73,6 +73,16 @@ resume, scale beyond three participants, resource thresholds or soak,
 physical sanitization, independent-implementation interoperability, or release
 authorization.
 
+A separate
+[retained 10,269-byte Blob-delivery receipt](../implementation/evidence/selected-live-blob-subscription-26e0a09.json)
+(SHA-256
+`3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675`,
+Good-signed source `26e0a09`) observes peerless forced-process attempt-2
+redelivery, older-token acknowledgement, two exact publications sharing one
+`BlobId`, and an empty final ledger on one host. It adds no Event, network or
+peer-status, selector-separation, TTL/GC, physical/mixed, resource/soak, or
+release acceptance to this guide.
+
 ## Run the live example
 
 Install the pinned toolchain, then create a disposable two-node fixture. The

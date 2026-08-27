@@ -18,7 +18,7 @@ single stable check name **`CI / required`**.
 
 | Check | Runner | Purpose |
 | --- | --- | --- |
-| `quality` | `ubuntu-24.04` | Runs `mise run check`: Rust and Go formatting, Apache-2.0-only project-license and package checks, exact 348-row implementation-requirements traceability, the selected-node dependency boundary, vendored netlink source-equivalence and 13-test compatibility gates, the retained-libp2p-oracle boundary, selected live-Event, live-mutable, live-State-subscription, live-Record-subscription, and live-Blob receipt checker tests, Clippy with warnings denied, the full Rust workspace test suite, C ABI build and C/C++ header checks, Rust/Python conformance, Python/Go binding tests, and the lab-controller tests. |
+| `quality` | `ubuntu-24.04` | Runs `mise run check`: Rust and Go formatting, Apache-2.0-only project-license and package checks, exact 348-row implementation-requirements traceability, the selected-node dependency boundary, vendored netlink source-equivalence and 13-test compatibility gates, the retained-libp2p-oracle boundary, selected live-Event, live-mutable, live-State-subscription, live-Record-subscription, live-Blob, and live-Blob-subscription receipt checker tests, Clippy with warnings denied, the full Rust workspace test suite, C ABI build and C/C++ header checks, Rust/Python conformance, Python/Go binding tests, and the lab-controller tests. |
 | `macOS tests` | `macos-14` | Runs all Rust workspace tests on the supported Apple runner with Rust 1.97.1. |
 | `Rust 1.91 MSRV` | `ubuntu-24.04` | Checks every workspace target and feature with the declared minimum supported Rust version. |
 | `dependency policy` | `ubuntu-24.04` | Enforces the retained-libp2p-oracle boundary, applies `deny.toml` to the root and fuzz dependency graphs, and audits both lockfiles against a freshly downloaded RustSec database. |
@@ -785,8 +785,9 @@ publication. Normal and AtLeast must run the lane because AtLeast is Event-only;
 ReceiveOnly must perform zero Blob work. The separate live Blob gate covers an
 actor-owned handle, peerless publication, later direct synchronization,
 authenticated bounded page reads, restart, and closure, but remains current-code
-same-implementation loopback automation. Neither gate supplies retained
-Blob-delivery acceptance, Blob peer/convergence status, route-only Blob relay,
+same-implementation loopback automation. A separate retained peerless
+Blob-delivery gate is described below; neither network gate supplies Blob
+peer/convergence status, route-only Blob relay,
 a 100+ MiB/RSS or resource test, physical-system or mixed-implementation
 evidence, or release acceptance.
 
@@ -898,6 +899,65 @@ thresholds or long-duration soak; long-offline recovery; arbitrary-peer or
 route-only Blob resume; Blob subscription, status, TTL, or garbage collection;
 Event, State, or Record live-application acceptance; complete MVP acceptance;
 a release artifact; or production authorization.
+
+## Selected live Blob delivery retained gate
+
+The dated 2026-08-27 v1 retained delivery gate supersedes only present-tense
+statements that the metadata-only Blob queue had no retained acceptance. The
+canonical
+[`selected-live-blob-subscription-26e0a09.json`](implementation/evidence/selected-live-blob-subscription-26e0a09.json)
+receipt is 10,269 bytes with SHA-256
+`3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675`
+and binds Good-signed source commit
+`26e0a090b9a6f644d96b38cfaa23f4e2139ad8b1`.
+
+One participant executes three processes and four actor lifetimes on one
+peerless host. Two exact publications share one `BlobId`. The attempt-one child
+flushes an owner-only, fsynced unacknowledged token and is sent `SIGKILL`
+without a graceful `STOP`; a fresh process receives the same publication as
+attempt 2 and acknowledges it with the persisted attempt-one token. The run
+also rejects a malformed token and a token bound to the other exact
+publication, acknowledges and re-acknowledges both publications, then reopens
+in the parent with one replayed subscription, zero pending, two acknowledged,
+two cursors, and an empty poll. Store inspection binds two publications and
+operations to one `BlobId`, one finalized variant, one chunk, and 207 committed
+ciphertext bytes.
+
+A fresh capture requires a clean Good-signed checkout and a new exclusive raw
+root:
+
+```sh
+python3 tools/run-selected-live-blob-subscription.py \
+  --source /path/to/clean-good-signed-aster-source \
+  --raw-root /private/tmp/aster-selected-live-blob-subscription-new
+
+python3 tools/check-selected-live-blob-subscription-receipt.py - \
+  --raw-root /private/tmp/aster-selected-live-blob-subscription-new \
+  --source /path/to/clean-good-signed-aster-source \
+  --output /private/tmp/aster-live-blob-subscription-projection/selected-live-blob-subscription-receipt.json
+```
+
+Replaying the checked-in receipt requires its externally retained raw root and
+a clean checkout detached at the exact signed source commit:
+
+```sh
+python3 tools/check-selected-live-blob-subscription-receipt.py \
+  --raw-root /path/to/retained/selected-live-blob-subscription-raw-root \
+  --source /path/to/aster-source-detached-at-26e0a090b9a6f644d96b38cfaa23f4e2139ad8b1 \
+  docs/implementation/evidence/selected-live-blob-subscription-26e0a09.json
+python3 tools/test-selected-live-blob-subscription-receipt.py
+```
+
+The raw root contains private mission, identity, database, depot-marker, and
+ciphertext artifacts and must stay outside source control; the checker inspects
+them by metadata only. The source/binary/execution link remains
+operator-attested, not cryptographically proven or reproducible. The receipt
+observes no contact or network Blob activity and claims no transfer,
+synchronization, peer/convergence status, selector withholding or
+network-interest separation, exact-publication plaintext read,
+power-loss/filesystem-crash recovery, long retention, TTL/expiry/GC, physical
+or mixed implementation, resource threshold/soak, release artifact, or
+production authorization.
 
 ## Controlled Iroh relay software gate
 

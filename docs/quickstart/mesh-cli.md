@@ -545,11 +545,17 @@ reconciliation. Do not use `put` as evidence for the source-authenticated mesh.
 | `aster-node` | Composition, mission-before-inventory and control-before-data ordering, peer route/interest filtering, exact control/Event/State/Record transfer, semantic-v5 direct Blob source/range automation, live Event/State/Record/Blob handles, durable Event/State/Record delivery plus current-code metadata-only Blob delivery, authority commands, sample applications, bounded same-UID Unix local zeroization lifecycle, receipts, and CLI |
 | `aster-core` | Existing spec-verified hybrid mission session, control envelope, recipient-filtered rekey, and typed source-envelope Event/State/Record/Blob semantics, used rather than rewritten |
 
-No old path is removed until its replacement passes equivalent tests. Current
-open work includes broader Record-delivery partition/carrier acceptance, retained Blob-delivery acceptance,
+No old path is removed until its replacement passes equivalent tests. Blob
+delivery has a separate
+[retained 10,269-byte peerless forced-process-redelivery receipt](../implementation/evidence/selected-live-blob-subscription-26e0a09.json)
+(SHA-256
+`3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675`,
+Good-signed source `26e0a09`), but it does not enlarge this Event-only CLI
+tour. Current open work includes broader Record-delivery partition/carrier acceptance,
 State contact/status and
 materialized-view/synthetic-withdrawal behavior, dynamic State network
-interests, selected-node bindings, broader State/Record partition/relay
+interests, selected-node bindings, network/application Blob selector-separation
+acceptance, broader State/Record partition/relay
 acceptance, Blob peer/convergence status, and Blob resume beyond the bounded retained
 three-participant/different-eligible-peer direct-Iroh observation,
 controlled-relay Blob acceptance, route-only Blob relay/custody, generalized

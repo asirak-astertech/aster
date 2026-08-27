@@ -191,8 +191,9 @@ boundary above remain unchanged.
 
 The live mechanism composes peerless publication with later direct transfer and
 restart. A later current-code amendment adds local metadata-only
-exact-publication delivery, but not Blob peer/convergence status, route-only
-custody, TTL/GC, retained delivery evidence, physical/resource acceptance,
+exact-publication delivery, but at that amendment freeze adds no Blob
+peer/convergence status, route-only custody, TTL/GC, retained delivery evidence,
+physical/resource acceptance,
 mixed-implementation evidence, or release authorization. The authoritative
 application ownership, cancellation, shutdown, and zeroization boundaries are
 recorded in [ADR 0009](0009-public-api-boundary.md#live-selected-blob-application-amendment-2026-08-27).
@@ -236,3 +237,24 @@ collection, Event/State/Record live-application acceptance, complete MVP
 acceptance, a release artifact, or production authorization. The
 source/binary/execution link and intermediate Store timing remain
 operator/producer-attested rather than cryptographically proven.
+
+## Retained peerless delivery amendment (2026-08-27)
+
+Blob application delivery remains separate from the direct source/carrier
+protocol decided here. Its canonical
+[`selected-live-blob-subscription-26e0a09.json`](../implementation/evidence/selected-live-blob-subscription-26e0a09.json)
+receipt is 10,269 bytes with SHA-256
+`3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675`
+and binds Good-signed source `26e0a09`. On one peerless host, one participant
+runs three processes/four actor lifetimes. An attempt-one child is sent
+`SIGKILL` after flushing an unacknowledged token; a fresh process receives
+attempt 2 and acknowledges it with the persisted older token, settles a second
+exact publication sharing the same `BlobId`, and leaves the final reopened
+ledger empty.
+
+This amendment adds no carrier or transport result to this decision. It claims
+no network contact, source/range transfer, peer/convergence status,
+selector/network-interest separation, arbitrary-peer or route-only resume,
+power-loss/filesystem-crash or long-offline recovery, TTL/GC, physical or mixed
+implementation, resource/soak, reproducible build, release artifact, or
+production authorization.

@@ -674,10 +674,21 @@ release acceptance.
 Normal and `AtLeast` run this lane because `AtLeast` is Event-only;
 `ReceiveOnly` sends, requests, stages, promotes, and counts zero Blob work.
 The local delivery-ledger counts are not Blob peer, contact, transfer-progress,
-or convergence status. There is no retained Blob-delivery acceptance,
-route-only Blob relay or custody, Blob TTL/expiry/garbage collection,
+or convergence status. A
+[retained 10,269-byte Blob-delivery receipt](implementation/evidence/selected-live-blob-subscription-26e0a09.json)
+(SHA-256
+`3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675`,
+Good-signed source `26e0a09`) observes one peerless participant across three
+processes and four actor lifetimes. After a flushed unacknowledged attempt-one
+poll, the child receives `SIGKILL`; a fresh process receives attempt 2 and
+acknowledges it with the persisted attempt-one token, rejects a token bound to
+the other exact publication sharing the same `BlobId`, settles both, and leaves
+the final reopened ledger empty. This adds no network, peer-status,
+selector-withholding, or network-interest-separation claim. Route-only Blob
+relay or custody, Blob TTL/expiry/garbage collection,
 metadata-independent whole-byte identity/deduplication, or retained large-file,
-physical, mixed-implementation, and release-acceptance claim.
+power-loss/filesystem-crash, physical, mixed-implementation, resource/soak,
+and release-acceptance claims remain open.
 
 ## Availability controls
 
