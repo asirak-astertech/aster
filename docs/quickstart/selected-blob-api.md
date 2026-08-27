@@ -1,22 +1,99 @@
 # Selected Blob API quickstart
 
-This is the shortest path to Aster's **selected stopped Blob streaming surface**
-and the separate semantic-v5 direct transfer boundary for already-durable
-Blobs.
-It opens the selected mission-bound store while no runtime owns it, streams a
-nonempty file into an encrypted crash-resumable depot, commits one
-source-authenticated publication, and streams the freshly verified bytes back
-to a caller-owned output.
+This is the shortest path to Aster's **selected live Blob application surface**,
+its exclusive stopped streaming facade, and the semantic-v5 direct transfer
+boundary for already-durable Blobs. `RunningNode::selected_blobs()` returns a
+cloneable `SelectedBlobHandle`: an application may durably publish an owned
+regular file while the node has no peers and may read one freshly authenticated
+plaintext page at a time while the actor owns the store. Each live page is at
+most 64 KiB and zeroizes its owned plaintext allocation on drop.
 
-The application facade remains deliberately stopped/exclusive: Blob has no live
-handle, subscription, or selected-node language binding. Separately, semantic
-v5 now reconciles already-durable Blob sources and direct carrier ranges between
-current content-capable peers. The default offer is `[5, 4, 3, 2, 1]`; v1-v4
-emit zero Blob frames, and stable wire/ABI, source, manifest, and `ASTRBT01`
-formats remain version 1. The runnable example below demonstrates local
-durability, bounded-memory streaming, and exact retry. The network section then
-states the opt-in runtime boundary; it does not claim a live Blob application
-API, route-only relay, physical sanitization, or release acceptance.
+The live surface is deliberately small. It has async `publish` and `read_page`,
+but no Blob subscription, peer status, or convergence-status operation. The
+exclusive `SelectedBlobNode` remains available when no runtime owns the same
+store and provides synchronous seekable-source publication plus streaming
+`read_into`. Separately, semantic v5 reconciles already-durable Blob sources and
+direct carrier ranges between current content-capable peers. The default offer
+is `[5, 4, 3, 2, 1]`; v1-v4 emit zero Blob frames, and stable wire/ABI, source,
+manifest, and `ASTRBT01` formats remain version 1.
+
+This branch has mechanism tests but no retained live-Blob execution receipt.
+Nothing in this guide claims route-only Blob custody, large-Blob/RSS acceptance,
+representative physical networking, mixed-implementation interoperability,
+physical sanitization, or release acceptance.
+
+## Use the live actor API
+
+Start the node as described in the [selected Event quickstart](selected-event-api.md),
+then retain a clone of the Blob handle. The configured peer list may be empty;
+publication success means the signed publication and encrypted depot content
+are durable locally, not that any peer received them.
+
+```rust
+use aster_mesh::Priority;
+use aster_node::application::{
+    BlobPublishRequest, BlobReadPageRequest, BlobReadRequest,
+    MAX_SELECTED_BLOB_PAGE_BYTES,
+};
+use std::{fs::File, io::Write};
+
+let blobs = running.selected_blobs();
+let published = blobs
+    .publish(
+        BlobPublishRequest {
+            operation_key: b"my-app/blob/input-v1".to_vec(),
+            topic: topic.clone(),
+            scope: scope.clone(),
+            priority: Priority::Priority,
+            media_type: Some("application/octet-stream".into()),
+            schema_id: Vec::new(),
+        },
+        File::open(input_path)?,
+    )
+    .await?;
+
+let read = BlobReadRequest {
+    id: published.id,
+    topic,
+    scope,
+};
+let mut output = File::create(output_path)?;
+let mut offset = 0;
+loop {
+    let page = blobs
+        .read_page(BlobReadPageRequest {
+            blob: read.clone(),
+            offset,
+            max_bytes: MAX_SELECTED_BLOB_PAGE_BYTES,
+        })
+        .await?;
+    output.write_all(page.as_bytes())?;
+    if page.complete {
+        break;
+    }
+    offset = page.next_offset();
+}
+```
+
+The live publisher accepts a nonempty regular file of at most 64 MiB, with its
+cursor at exactly zero, and fixes the selected chunk size at 64 KiB. The file is
+moved into a bounded, joined worker rather than cloned into the actor command.
+The returned result is durable and operation-key idempotent. Retrying the exact
+operation with the same source and identity metadata recovers the original
+publisher counter and acceptance marker; reusing that operation key for
+different content or metadata fails closed as a conflict.
+
+Cancellation before enqueue cannot publish. Cancellation after enqueue has an
+indeterminate result because the worker may have committed; retry the exact
+operation key to recover the authoritative outcome. Graceful shutdown and live
+zeroization close application admission, reject queued commands, and join the
+Blob worker before releasing the store authority. Retained handles then return
+sanitized `StateUnavailable`. A `BlobReadPage` zeroizes its private plaintext
+buffer on drop, but bytes copied by the application, the caller's source file,
+and externally cloned file descriptors remain caller custody. A blocking or
+hostile filesystem syscall can delay the joined worker and therefore delay
+shutdown or zeroization; no bounded shutdown-latency claim is made for such a
+file provider.
 
 ## Run the example
 
@@ -104,6 +181,16 @@ let mutable_interests = MutableSourceInterests::new(state, record).with_blob(vec
 ]);
 ```
 
+This composes with peerless live publication rather than changing its success
+condition. A source may publish through `selected_blobs()` with no peers, shut
+down, and later restart with an exact configured peer. On a v5 contact, a
+content-capable interested receiver can durably stage the source and missing
+carrier ranges, promote only after whole-Blob verification, and read the Blob
+through its own live handle. The receiver's completed publication and page
+reads survive another peerless restart. Current same-implementation loopback
+tests exercise that sequence; there is not yet a retained receipt, physical
+carrier run, or mixed-implementation acceptance artifact for it.
+
 The provider turns that exact topic/scope and the current epoch into an opaque
 32-byte peer proof inside the protected v5 contact. Every Blob inventory,
 source, and range send requires the authenticated peer to have both the current
@@ -135,11 +222,13 @@ lineage for the same `(BlobID, content group, numeric epoch)` with
 the numeric epoch.
 
 Terminal or stale cleanup therefore does not erase the last physical-lineage
-witness. It removes the pending source, prefixes, chunks, file bytes, finalized
-digest, and all reserved/committed byte accounting, but retains one internal
-unfinished `BLOB_IMPORTS` row. That row is not a publication and cannot be read
-or served; it remains charged to the existing variant cap. An exact-lineage
-retry can refill it, while a different lineage at the same numeric epoch still
+witness. It removes pending source, prefix, and authenticated-cache visibility,
+but deliberately retains the exact depot import, its expected or committed
+chunk rows, any chunk files and finalized digest already present, and their
+reserved/committed accounting. That bounded staging is not a publication and
+cannot be read or served; it remains charged to the configured depot byte,
+chunk, and variant quotas until a future explicit GC protocol. An exact-lineage
+retry can resume it, while a different lineage at the same numeric epoch still
 fails and must advance the epoch.
 
 Source/store/cache transitions are locally serialized. A successful abort
@@ -150,10 +239,12 @@ ID, not the last manifest record.
 
 Normal and `AtLeast` run the v5 lane because `AtLeast` filters Event only.
 `ReceiveOnly` advertises, requests, stages, promotes, and counts zero Blob work.
-The selected slice still has no route-only Blob relay/custody, live Blob handle
-or subscription, Blob TTL/expiry/GC, metadata-independent whole-byte identity
-or deduplication, 100+ MiB/RSS or resource acceptance, physical carrier,
-mixed-implementation, or release receipt.
+The live handle does not change those contact rules and reports no Blob peer or
+convergence status. The selected slice still has no route-only Blob
+relay/custody, Blob subscription, Blob TTL/expiry/GC, metadata-independent
+whole-byte identity or deduplication, 100+ MiB/RSS or resource acceptance,
+representative physical carrier or mixed-implementation acceptance, retained
+live-Blob receipt, or release authorization.
 
 `publish` requires a seekable source because it makes two bounded passes. The
 first computes the whole-content and per-chunk digests with one bounded,
@@ -271,13 +362,12 @@ application output is required.
 
 `StoreLimits` account for signed Blob publications and durable operation rows
 alongside Event, State, Record, control, and route-cache rows. Separate
-`BlobDepotLimits` bound canonical committed ciphertext-file bytes, durable
-per-chunk metadata rows, and epoch-specific import variants. The latter two
-include unfinished resumable imports, so abandoned but structurally valid
-staging consumes admission until a future explicit-GC policy is implemented.
-That count includes the non-public unfinished physical-lineage fence retained
-after terminal or stale network cleanup, even though it has no chunks or byte
-reservation.
+`BlobDepotLimits` bound ciphertext-file bytes reserved by every durable expected
+chunk record, durable per-chunk metadata rows, and epoch-specific import
+variants. Those bounds include both committed content and unfinished resumable
+imports, so abandoned but structurally valid staging retained after terminal or
+stale network cleanup continues to consume byte, chunk, and variant admission
+until a future explicit-GC policy is implemented.
 The defaults are 512 MiB, 100,000 chunk rows, and 4,096 variants. These limits
 do not account for redb allocation, directory blocks, snapshots, backups, swap,
 an attacker-created population of unrelated directory entries, or every host
@@ -292,8 +382,9 @@ secrets are destroyed and the terminal store cannot reopen normally. Physical
 media sanitization is explicitly outside this evidence.
 
 The stopped handle takes the same process-exclusive store authority used by
-the live Event actor and stopped State and Record facades. Stop that actor and
-drop every other stopped facade before opening `SelectedBlobNode`. Continue
+the live actor and stopped State and Record facades. Stop that actor and drop
+every other stopped facade before opening `SelectedBlobNode`; use
+`RunningNode::selected_blobs()` instead while the actor is running. Continue
 with the [selected architecture](../architecture.md), the
 [selected Record API](selected-record-api.md), the
 [selected State API](selected-state-api.md), the

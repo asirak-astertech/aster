@@ -513,6 +513,22 @@ delivery. The canonical manifest is at most 1 MiB and is independently
 implementable from [envelope.md](envelope.md). The current durable Blob service
 can resume local chunk production and reading without whole-Blob RAM growth.
 
+The selected node's application profile fixes canonical chunks at 64 KiB. A
+stopped `SelectedBlobNode` retains synchronous streaming, while
+`RunningNode::selected_blobs()` returns a cloneable live handle. Live publish
+takes ownership of a nonempty regular file positioned at byte zero and admits
+at most 64 MiB/1,024 chunks; live read returns one freshly authenticated,
+zeroize-on-drop page of `1..=64 KiB`. These application chunk/page bounds are
+separate from the semantic-v5 carrier range bound of 16 KiB in §9.2.
+Neither surface treats a redb projection as authorization: it freshly verifies
+the selected source and current policy/lineage and requires the exact
+authenticated `BlobDepotCompletion` capability before opening that depot
+variant. The live page path repeats the authority and completion checks around
+decryption. A contradiction among durable rows, authenticated cache state,
+depot capability, or post-commit verification is `FatalBlobCoherence` and
+terminates the actor after closing application admission; it is not downgraded
+to an ordinary per-request error.
+
 The manifest is the payload of a source-authenticated envelope whose signed
 header commits BlobID, nonzero chunk count, and a route Merkle root. Encrypted
 chunks travel as canonical `ASTRBT01` objects under kind-`2` typed ObjectIDs and
@@ -764,14 +780,15 @@ replacement, but the store deliberately rejects a new physical lineage for the
 same `(BlobID, content group, numeric epoch)` as `PhysicalLineageConflict`;
 republishing or resuming that Blob under a different physical lineage requires
 advancing the numeric epoch. Terminal or stale cleanup MUST preserve that rule:
-it removes the pending source and prefixes, clears the finalized digest, chunk
-rows, reserved and committed bytes, and files, but retains the exact unfinished
-`BLOB_IMPORTS` row as a non-public physical-lineage fence. The fence remains
-charged to the existing `max_variants`/`DEPOT_VARIANT_COUNT` bound; exact-lineage
-retry may refill it, a different same-epoch lineage conflicts, and numeric epoch
-advance consumes another bounded variant. It creates no table, schema, quota, or
-publication. Every open-path audit requires its owner/backing binding and
-nonempty physical lineage; a zero-lineage fence is corruption.
+it removes pending source and prefix visibility but retains the exact depot
+import, expected or committed chunk rows, any chunk files and finalized digest,
+and their reserved/committed accounting. The non-public staging remains charged
+to the existing `max_bytes`, `max_chunks`, and
+`max_variants`/`DEPOT_VARIANT_COUNT` bounds; exact-lineage retry may resume it, a
+different same-epoch lineage conflicts, and numeric epoch advance consumes
+another bounded variant. It creates no table, schema, quota, or publication.
+Every open-path audit requires its owner/backing binding and nonempty physical
+lineage; a zero-lineage fence is corruption.
 
 The requester repeats the proof in every BlobRangeFetch, and the sender
 rechecks proof, route, revocation, source route lineage, and physical content
@@ -779,6 +796,12 @@ lineage before advertising a source and before serving every range. The
 selected v5 lane is therefore direct between current content-capable peers; the
 reference route-only relay design in §8.4 and `envelope.md` is not selected
 here.
+
+The current selected `aster-node` schedules this grammar automatically on its
+direct-Iroh contacts after semantic-v5 negotiation, control activation, and an
+exact configured Blob receive selector. That current-code automation is not a
+retained direct-Iroh Blob acceptance receipt and does not establish operation
+over the controlled Iroh relay.
 
 For each receiver direction, the Blob source phase completes first through the
 class-separated mutable inventory/difference/Offer/Fetch/result/ack/finish
@@ -843,8 +866,8 @@ served only after the same current policy and lineage checks.
 `Normal` and every `AtLeast(priority)` run Blob source and carrier work because
 `AtLeast` filters Event emission only. `ReceiveOnly` initiates, requests,
 advertises, sends, accepts, reserves, and counts zero selected Blob work. This
-slice does not add a live Blob application handle or subscription, selected
-route-only Blob relay/custody, Blob TTL/expiry/garbage collection, a
+slice adds no Blob subscription/status surface, selected route-only Blob
+relay/custody, Blob TTL/expiry/garbage collection, a
 metadata-independent whole-byte identity or deduplication claim, or large-file,
 physical-carrier, mixed-implementation, and release acceptance.
 
@@ -1211,6 +1234,14 @@ Destroying a hardware-backed wrapping key is the preferred persistent mechanism.
 Software cannot promise physical erasure from flash and documentation MUST NOT
 claim it.
 
+The selected Unix unprotected-reference hook is narrower and explicit. It
+closes application admission, joins the live Blob worker, commits terminal
+store lockout, and overwrites/synchronizes/truncates the retained mission bundle
+and carrier-identity files. It preserves redb rows and encrypted Blob depot
+files for terminal-safe inspection. Loss of the retained mission/content
+secrets is bounded cryptographic shredding; it is not ciphertext-file deletion,
+rollback resistance, snapshot/backup/swap removal, or physical sanitization.
+
 Revocation takes effect at an honest disconnected node only after the record
 arrives. It cannot erase keys or plaintext already captured.
 
@@ -1496,9 +1527,9 @@ version, cryptographic suite ID, and object/data-class registries are separate.
 A transport addition changes none of them. `PROTOCOL_VERSION` and the legacy C
 `aster_protocol_version()` report stable replication-wire/profile version `1`;
 the unambiguous replication-wire surfaces also report `1`, while the default and
-highest-supported semantic-version surfaces report `4`.
+highest-supported semantic-version surfaces report `5`.
 
-The current handshake negotiates semantic versions `4`, `3`, `2`, and `1` and the
+The current handshake negotiates semantic versions `5`, `4`, `3`, `2`, and `1` and the
 complete suite `0x0001`. Offers are nonempty, nonzero, duplicate-free canonical
 descending lists of at most 16 values. The responder selects the highest common semantic
 version and its locally preferred complete common suite; the initiator requires
@@ -1522,13 +1553,14 @@ never rewrite stored stable bytes.
 
 Durable ranged-transfer progress records the immutable semantic version under
 which the object was first admitted. A source object first admitted under v1 may
-resume on v1, v2, v3, or v4; a source first admitted under v2, v3, or v4 may
-resume only on v2, v3, or v4. Recognized stable Blob carriers admitted under any supported
-version may resume on any supported version, while extended kinds `3..5` resume
-only on v2, v3, or v4. Migrated progress
+resume on v1, v2, v3, v4, or v5; a source first admitted under v2, v3, v4, or v5
+may resume only on v2, v3, v4, or v5. Recognized stable Blob carriers admitted
+under any supported version may resume on any supported version, while extended
+kinds `3..5` resume only on v2, v3, v4, or v5. Migrated progress
 without trustworthy origin-version provenance is suppressed rather than guessed.
-Selected mutable State/Record transfer itself remains v4-only regardless of the
-stable source object's earlier compatibility provenance.
+Selected mutable State/Record transfer itself remains v4/v5-only and selected
+Blob mechanics v5-only regardless of the stable source object's earlier
+compatibility provenance.
 Eligibility filtering occurs before page limits so incompatible early rows
 cannot starve later compatible work.
 
@@ -1566,6 +1598,9 @@ outbound, and replay limits:
 | selected mutable object | 1 MiB | oversized State/Record bytes fail before durable admission; malformed or unauthorized bytes remain fatal |
 | selected mutable class | 4,096 rows and 16 MiB encoded source bytes, independently for State and Record | an otherwise valid new object receives `DeferredCapacity`; no existing mutable row is pruned |
 | mutable fairness cursor | 256 configured mission peers, 4 peer/class/local-mode rows each, 1,024 rows total | startup rejects an overbound configured set and prunes rows for peers no longer configured; ordinary data quota cannot consume the reserve |
+| live application command lane | 32 commands shared by Event, State, Record, and Blob; one queued command for the joined Blob worker | a full Blob worker queue returns explicit `ResourceLimit`; shutdown and zeroization close both admissions and join the worker |
+| live Blob publication | one owned nonempty regular file at byte-zero cursor, at most 64 MiB and 1,024 fixed 64-KiB chunks | invalid shape is rejected; overbound input returns `ResourceLimit`; a source changed across the two passes returns conflict and cannot silently rebind the operation |
+| live Blob plaintext page | `1..=64 KiB`, spanning at most two canonical chunks | zero or overbound requests are rejected; the returned allocation zeroizes on drop; durable/cache/depot coherence loss is actor-fatal |
 | logical sends per pump | 128 | remaining due work keeps its monotonic deadline |
 | UDP datagrams examined per adapter poll | 64 | yields `None`; a later poll may continue queued input |
 | discardable unauthenticated carrier failures per runtime pump | 64 | yields with the contact intact; subsequent valid input can progress |

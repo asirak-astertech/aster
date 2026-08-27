@@ -11,12 +11,17 @@ The selected Event surface now provides live and stopped-state publish, bounded
 query, durable subscribe/poll/ack, idempotent unsubscribe, and authenticated gap
 inspection. A live `SelectedEventHandle` additionally reports bounded peer and
 last-contact Event status while the actor owns the store. That status is not a
-State/Record convergence signal. State and Record now reconcile already durable
-objects on semantic-v4/v5 contacts, but still have no live application handle.
-Semantic v5 separately transfers already-durable Blobs directly between current
-content-capable peers; the Blob application facade remains stopped. V1-v4 emit
-zero Blob frames. Route-only Blob relay/custody, Blob TTL/GC, and live Blob
-access/subscription remain open. Non-Linux finite Event TTL, atomic subscription update,
+State/Record/Blob convergence signal. State and Record reconcile already
+durable objects on semantic-v4/v5 contacts and expose their own cloneable live
+handles. `RunningNode::selected_blobs()` now adds peerless-capable durable
+regular-file publication and authenticated reads of at most one
+zeroize-on-drop 64-KiB page; it does not add Blob subscription or convergence
+status. Semantic v5 separately transfers already-durable Blobs directly between
+current content-capable peers, including after a peerless publish and later
+restart. V1-v4 emit zero Blob frames. Route-only Blob relay/custody, Blob
+TTL/GC, large/RSS acceptance, representative physical or mixed-implementation
+acceptance, and a retained live-Blob receipt remain open. Non-Linux finite Event
+TTL, atomic subscription update,
 selected-node language bindings, a production provisioning/SecretStore backend,
 protected stock CLI startup, generalized multi-family control policy, and
 automatic/atomic revoke-plus-rekey remediation remain open. The stopped
@@ -450,6 +455,16 @@ query, poll, gap, and status results are freshly policy-bound. Shutdown and
 zeroization close handle admission and reject queued work before the actor
 releases its authority. The stopped `SelectedEventNode` remains useful when no
 runtime owns that same state directory.
+
+The State and Record handles share that bounded application lane. Blob commands
+enter the same admission boundary and are then dispatched to one bounded,
+joined blocking worker because publication owns a regular file. A live Blob
+page contains at most 64 KiB in a private zeroize-on-drop allocation. Graceful
+shutdown and zeroization close Blob admission and join that worker before store
+authority is released; retained Blob handles then fail with sanitized
+`StateUnavailable`. Caller-copied page bytes and caller-owned source files are
+outside node zeroization. See the [selected Blob quickstart](selected-blob-api.md)
+for the exact cancellation and blocking-filesystem limits.
 
 Operations return a sanitized `ApplicationError`. Use its stable `kind()` for
 control flow; raw store tables, transfer identities, source-envelope failures,

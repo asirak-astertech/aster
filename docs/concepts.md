@@ -153,10 +153,10 @@ eligible current content peer can resume it after reopen. Pending bytes are not
 an application-visible Blob; redb promotes only after exact depot,
 full-content, and current-lineage completion. V1-v4 emit zero Blob frames. The
 selected lane is direct content-capable only, not route-only relay/custody.
-Terminal or stale cleanup reclaims pending chunks and bytes but retains one
-bounded, non-public unfinished physical-lineage fence. Exact-lineage retry may
-refill it; a different lineage for the same Blob/content-group/numeric epoch
-requires an epoch advance.
+Terminal or stale cleanup removes pending source/prefix/cache visibility but
+retains bounded, non-public, quota-charged depot import and chunk staging as the
+physical-lineage fence. Exact-lineage retry may resume it; a different lineage
+for the same Blob/content-group/numeric epoch requires an epoch advance.
 
 Use State, Event, or Record to publish small metadata that refers to a Blob ID.
 That lets consumers decide whether and when to fetch the large content.

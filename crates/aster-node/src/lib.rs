@@ -8,19 +8,19 @@
 //! [`EventEmissionPolicy`] control (including receive-only operation), while
 //! v1/v2 remain compatible for durable Events. Its application boundary also
 //! composes source-authenticated latest-value State, explicit-conflict Record,
-//! and streaming immutable Blob operations. [`RunningNode::selected_state`] and
-//! [`RunningNode::selected_records`] return cloneable handles that share the
-//! running actor's bounded Event/State/Record command lane; the corresponding
-//! stopped facades retain exclusive maintenance/application access. State and
+//! and immutable Blob operations. [`RunningNode::selected_state`],
+//! [`RunningNode::selected_records`], and [`RunningNode::selected_blobs`] return
+//! cloneable handles that share the running actor's bounded application lane;
+//! live Blob work is isolated on a bounded worker and returns only bounded,
+//! zeroize-on-drop plaintext pages. The corresponding stopped facades retain
+//! exclusive maintenance/application access and streaming Blob I/O. State and
 //! Record additionally use class-specific, explicitly interested reconciliation
-//! lanes; semantic v5 adds an explicitly interested, resumable Blob lane. Blob
-//! application access remains stopped/exclusive even though durable Blob data
-//! can cross a live contact. Shutdown and zeroization close live application
+//! lanes; semantic v5 adds an explicitly interested, resumable Blob lane.
+//! Shutdown and zeroization close live application
 //! admission before releasing the actor's store authority, so retained handles
 //! fail closed with [`application::ApplicationErrorKind::StateUnavailable`].
-//! Finite State/Record TTL, durable subscriptions and selected-node bindings,
-//! live Blob access, representative physical/mixed-implementation acceptance,
-//! and retained live State/Record receipts remain open.
+//! Representative physical/mixed-implementation acceptance and a retained live
+//! Blob receipt remain open.
 //! The caller-identified opaque API remains isolated for compatibility and is
 //! not advertised by the production Event reconciliation path.
 
@@ -33,7 +33,7 @@ mod identity;
 pub mod mission;
 mod runtime;
 
-pub use aster_redb_store::{CustodyQuota, StoreLimits};
+pub use aster_redb_store::{BlobDepotLimits, CustodyQuota, StoreLimits};
 pub use control_admin::{
     ControlAdminError, ControlAdminErrorKind, MAX_SELECTED_REKEY_RECIPIENTS,
     MAX_SELECTED_REKEY_REGISTRY_BYTES, MAX_SELECTED_REKEY_TOPIC_GRANTS, RegistryGenerationWitness,

@@ -12,8 +12,9 @@ understand Aster's wire format or cryptography before building an application.
 3. Choose an integration path. Most applications should begin with the
    [local ConnectRPC agent](quickstart/connect-agent.md); Rust applications can
    use the [selected Event](quickstart/selected-event-api.md),
-   [State](quickstart/selected-state-api.md), or
-   [Record](quickstart/selected-record-api.md) API directly.
+   [State](quickstart/selected-state-api.md),
+   [Record](quickstart/selected-record-api.md), or
+   [Blob](quickstart/selected-blob-api.md) API directly.
 4. Read [Selected architecture](architecture.md) and
    [Security](security.md) before designing a deployment.
 
@@ -25,7 +26,7 @@ understand Aster's wire format or cryptography before building an application.
 | See Aster work quickly | [Capability tour](quickstart/capability-tour.md) |
 | Call Aster from Connect, gRPC, or gRPC-Web | [Local ConnectRPC agent](quickstart/connect-agent.md) |
 | Use the live Event API from Rust | [Selected Event API](quickstart/selected-event-api.md) |
-| Use live State or Record from Rust | [Selected State API](quickstart/selected-state-api.md) or [Selected Record API](quickstart/selected-record-api.md) |
+| Use live State, Record, or Blob from Rust | [Selected State API](quickstart/selected-state-api.md), [Selected Record API](quickstart/selected-record-api.md), or [Selected Blob API](quickstart/selected-blob-api.md) |
 | Explore current State, Record, or Blob behavior | [State](quickstart/selected-state-api.md), [Record](quickstart/selected-record-api.md), or [Blob](quickstart/selected-blob-api.md) |
 | Use the semantic API from Rust, Python, Go, or C | [Language quickstarts](quickstart/README.md) |
 | See examples for every data class | [Application recipes](application-recipes.md) |
@@ -72,9 +73,15 @@ The selected implementation deliberately exposes different maturity levels:
   projection, explicit Record conflict/resolution, restart, and handle closure
   on one loopback host. Their subscriptions, selected-node bindings, finite TTL,
   and representative physical/mixed acceptance remain open.
-- **Blob** supports authenticated local publication, verified streaming, and
-  selected direct range transfer with durable resume state; its live API,
-  route-only relay/custody, and representative remote evidence remain open.
+- **Blob** has a cloneable `RunningNode::selected_blobs()` Rust handle for
+  peerless-capable durable regular-file publication and authenticated reads of
+  at most one 64-KiB, zeroize-on-drop plaintext page. Its exclusive stopped
+  streaming facade remains available when no actor owns the store. Semantic v5
+  can later synchronize the already-durable source and carrier ranges directly
+  between current content-capable peers, with durable restart/resume state.
+  Blob subscription/status convergence, route-only custody, retained live-path
+  receipt, large/RSS acceptance, and representative physical or
+  mixed-implementation evidence remain open.
 - The broader semantic Rust implementation and language bindings remain the
   proven migration source for behavior not yet composed into the selected node.
 
@@ -95,7 +102,8 @@ closed retained handles, and zero Event/control/Blob counters. This is one-host,
 same-implementation loopback evidence with an operator-attested,
 non-reproducible source-to-execution link and metadata-only secret inspection;
 it is not physical, NAT/relay, BTLE, independent-implementation, scale,
-resource, long-duration, release, or Event/Blob-live acceptance.
+resource, long-duration, release, or Event/Blob-live acceptance. In particular,
+its zero Blob counters do not evidence the newer live Blob handle.
 
 Aster remains an evaluation-stage reference implementation. Do not infer
 production authorization from code presence or a passing demo. The

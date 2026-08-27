@@ -41,6 +41,10 @@ pub const MAX_BLOB_CHUNKS: u64 =
     (MAX_BLOB_MANIFEST_BYTES - MANIFEST_FIXED_LEN - MAX_ENCODED_METADATA_LEN) / MANIFEST_RECORD_LEN;
 const MAX_MEDIA_TYPE_LEN: usize = 255;
 const MAX_SCHEMA_ID_LEN: usize = 1024;
+/// Maximum UTF-8 bytes in selected Blob media-type identity metadata.
+pub const MAX_BLOB_MEDIA_TYPE_BYTES: usize = MAX_MEDIA_TYPE_LEN;
+/// Maximum bytes in selected Blob schema identity metadata.
+pub const MAX_BLOB_SCHEMA_ID_BYTES: usize = MAX_SCHEMA_ID_LEN;
 const GCM_TAG_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
 const MANIFEST_VERSION: u16 = 1;
@@ -770,6 +774,19 @@ pub trait BlobStore {
     ) -> Result<(), Self::StoreError> {
         self.begin_blob(manifest)
     }
+
+    /// Selects one exact existing physical variant for authenticated reads.
+    ///
+    /// The conservative default preserves compatibility for adapters whose
+    /// begin operation is idempotent. Durable adapters should override this
+    /// hook when reads must never create storage or enter a write transaction.
+    fn select_blob_for_read_with_lineage(
+        &mut self,
+        manifest: &BlobManifest,
+        lineage: BlobPhysicalLineage,
+    ) -> Result<(), Self::StoreError> {
+        self.begin_blob_with_lineage(manifest, lineage)
+    }
     fn put_plaintext_digest(
         &mut self,
         id: BlobId,
@@ -834,6 +851,14 @@ impl<S: BlobStore + ?Sized> BlobStore for &mut S {
         lineage: BlobPhysicalLineage,
     ) -> Result<(), Self::StoreError> {
         (**self).begin_blob_with_lineage(manifest, lineage)
+    }
+
+    fn select_blob_for_read_with_lineage(
+        &mut self,
+        manifest: &BlobManifest,
+        lineage: BlobPhysicalLineage,
+    ) -> Result<(), Self::StoreError> {
+        (**self).select_blob_for_read_with_lineage(manifest, lineage)
     }
 
     fn put_plaintext_digest(
@@ -917,7 +942,7 @@ impl<S: BlobStore + ?Sized> BlobStore for &mut S {
 #[derive(Debug)]
 pub enum BlobError {
     Io(io::Error),
-    Store(String),
+    Store(Box<dyn Error + Send + Sync>),
     InvalidChunkSize,
     InvalidMetadata,
     InvalidManifest,
@@ -951,6 +976,7 @@ impl Error for BlobError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
+            Self::Store(error) => Some(error.as_ref()),
             _ => None,
         }
     }
@@ -962,8 +988,8 @@ impl From<io::Error> for BlobError {
     }
 }
 
-fn store_error(error: impl Error) -> BlobError {
-    BlobError::Store(error.to_string())
+fn store_error(error: impl Error + Send + Sync + 'static) -> BlobError {
+    BlobError::Store(Box::new(error))
 }
 
 struct BlobSecret([u8; 32]);
@@ -1027,6 +1053,19 @@ pub struct BlobReadStats {
     ///
     /// A generic store adapter may use additional independently bounded
     /// buffers; this is not a whole-operation peak-memory measurement.
+    pub peak_working_buffer_bytes: usize,
+}
+
+/// Statistics from one independently authenticated bounded Blob range.
+///
+/// Only chunks intersecting the requested range are decrypted. The exact
+/// source-authenticated manifest still binds the whole Blob, while this result
+/// makes no claim that unseen plaintext chunks were re-read during this call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlobRangeReadStats {
+    pub plaintext_bytes: u64,
+    pub verified_chunks: u64,
+    /// Largest byte-buffer capacity used by the core Blob engine during this call.
     pub peak_working_buffer_bytes: usize,
 }
 
@@ -1749,9 +1788,9 @@ impl FileBlobStore {
         fs::create_dir_all(path.as_ref())?;
         let (used_bytes, used_chunks) = scan_store_usage(path.as_ref())?;
         if used_bytes > config.max_bytes || used_chunks > config.max_chunks {
-            return Err(BlobError::Store(
-                "existing Blob store exceeds configured quota".into(),
-            ));
+            return Err(BlobError::Store(Box::new(io::Error::other(
+                "existing Blob store exceeds configured quota",
+            ))));
         }
         Ok(Self {
             root: path.as_ref().to_path_buf(),
@@ -2762,6 +2801,41 @@ impl<S: BlobStore> ReferenceBlobService<S> {
         BlobReader::new(&mut self.store, access, manifest)
     }
 
+    /// Reads one exact range by authenticating only its intersecting chunks.
+    ///
+    /// Unlike [`Self::reader`], this operation does not walk or re-hash the
+    /// plaintext prefix before `offset`. The authenticated manifest binds every
+    /// chunk and the whole-Blob identity; each disclosed chunk is independently
+    /// checked against its ciphertext digest, AEAD tag, and plaintext digest.
+    pub fn read_range(
+        &mut self,
+        manifest: VerifiedBlobManifest,
+        offset: u64,
+        output: &mut [u8],
+    ) -> Result<BlobRangeReadStats, BlobError> {
+        let access = self.access()?;
+        validate_manifest(manifest.manifest())?;
+        if manifest.0.content_group != access.content_group
+            || manifest.0.content_epoch != access.epoch
+        {
+            return Err(BlobError::AuthenticationFailed);
+        }
+        // Range reads use a fresh store adapter in the live application path.
+        // Select the exact provider-owned physical variant before any indexed
+        // chunk lookup; durable adapters must reject a conflicting manifest or
+        // lineage rather than silently reading another import.
+        self.store
+            .select_blob_for_read_with_lineage(manifest.manifest(), access.physical_lineage)
+            .map_err(store_error)?;
+        read_verified_range(
+            &mut self.store,
+            &access,
+            manifest.manifest(),
+            offset,
+            output,
+        )
+    }
+
     pub(crate) fn install_authenticated_manifest<R: Read + Seek>(
         &mut self,
         input: &mut R,
@@ -3391,6 +3465,7 @@ impl<'a, S: BlobStore> BlobWriter<'a, S> {
         let mut call_peak = buffer.capacity();
         let mut verified = 0u64;
         let mut committed = 0u64;
+        let mut saw_existing = false;
         for index in 0..manifest.chunk_count {
             if let Some(record) = self
                 .store
@@ -3398,6 +3473,7 @@ impl<'a, S: BlobStore> BlobWriter<'a, S> {
                 .map_err(store_error)?
             {
                 validate_record(manifest, index, &record)?;
+                saw_existing = true;
                 verified = verified.saturating_add(1);
                 continue;
             }
@@ -3438,6 +3514,32 @@ impl<'a, S: BlobStore> BlobWriter<'a, S> {
             buffer.zeroize();
             committed = committed.saturating_add(1);
             verified = verified.saturating_add(1);
+        }
+        // A resumed/deduplicated pass which would report completion must
+        // re-read every source chunk against the immutable first-pass digest
+        // set. Intermediate bounded resume passes remain proportional to newly
+        // committed work, while a fresh two-pass publication already checked
+        // every source chunk immediately before encrypting it.
+        if saw_existing && verified == manifest.chunk_count {
+            for index in 0..manifest.chunk_count {
+                let expected = manifest.plaintext_len(index)?;
+                let offset = index
+                    .checked_mul(u64::from(manifest.chunk_size))
+                    .ok_or(BlobError::LengthOverflow)?;
+                source.seek(SeekFrom::Start(offset))?;
+                read_exact_chunk(source, &mut buffer, expected)?;
+                call_peak = call_peak.max(buffer.capacity());
+                let expected_digest = self
+                    .store
+                    .plaintext_digest(manifest.id, index)
+                    .map_err(store_error)?
+                    .ok_or(BlobError::InvalidManifest)?;
+                if sha256(&buffer) != expected_digest {
+                    buffer.zeroize();
+                    return Err(BlobError::SourceChanged);
+                }
+                buffer.zeroize();
+            }
         }
         buffer.zeroize();
         self.observed_peak_working_buffer_bytes =
@@ -3614,37 +3716,16 @@ impl<S: BlobStore> BlobReader<S> {
     fn load_next_chunk_inner(&mut self) -> Result<(), BlobError> {
         let manifest = &self.manifest.0;
         let index = self.next_chunk;
-        let record = self
-            .store
-            .chunk_record(manifest.id, index)
-            .map_err(store_error)?
-            .ok_or(BlobError::MissingChunk)?;
-        validate_record(manifest, index, &record)?;
-        if !self
-            .store
-            .read_verified_chunk(manifest.id, index, &mut self.buffer)
-            .map_err(store_error)?
-        {
-            return Err(BlobError::MissingChunk);
-        }
+        read_authenticated_chunk(
+            &mut self.store,
+            &self.access,
+            manifest,
+            index,
+            &mut self.buffer,
+        )?;
         self.observed_peak_working_buffer_bytes = self
             .observed_peak_working_buffer_bytes
             .max(self.buffer.capacity());
-        if self.buffer.len()
-            != usize::try_from(record.ciphertext_len).map_err(|_| BlobError::LengthOverflow)?
-            || sha256(&self.buffer) != record.ciphertext_sha256
-        {
-            self.buffer.zeroize();
-            return Err(BlobError::AuthenticationFailed);
-        }
-        decrypt_chunk(&self.access, manifest, index, &mut self.buffer)?;
-        if self.buffer.len()
-            != usize::try_from(record.plaintext_len).map_err(|_| BlobError::LengthOverflow)?
-            || sha256(&self.buffer) != record.plaintext_sha256
-        {
-            self.buffer.zeroize();
-            return Err(BlobError::AuthenticationFailed);
-        }
         let plaintext_bytes = self
             .plaintext_bytes
             .checked_add(u64::try_from(self.buffer.len()).map_err(|_| BlobError::LengthOverflow)?)
@@ -3680,6 +3761,131 @@ impl<S: BlobStore> Drop for BlobReader<S> {
     fn drop(&mut self) {
         self.buffer.zeroize();
     }
+}
+
+fn read_verified_range<S: BlobStore>(
+    store: &mut S,
+    access: &BlobAccess,
+    manifest: &BlobManifest,
+    offset: u64,
+    output: &mut [u8],
+) -> Result<BlobRangeReadStats, BlobError> {
+    let result = read_verified_range_inner(store, access, manifest, offset, output);
+    if result.is_err() {
+        output.zeroize();
+    }
+    result
+}
+
+fn read_verified_range_inner<S: BlobStore>(
+    store: &mut S,
+    access: &BlobAccess,
+    manifest: &BlobManifest,
+    offset: u64,
+    output: &mut [u8],
+) -> Result<BlobRangeReadStats, BlobError> {
+    validate_manifest(manifest)?;
+    let output_len = u64::try_from(output.len()).map_err(|_| BlobError::LengthOverflow)?;
+    let end = offset
+        .checked_add(output_len)
+        .filter(|end| *end <= manifest.total_len)
+        .ok_or(BlobError::InvalidChunkIndex)?;
+    if output.is_empty() {
+        return Ok(BlobRangeReadStats {
+            plaintext_bytes: 0,
+            verified_chunks: 0,
+            peak_working_buffer_bytes: 0,
+        });
+    }
+    let chunk_size = u64::from(manifest.chunk_size);
+    let first_chunk = offset / chunk_size;
+    let last_chunk = (end - 1) / chunk_size;
+    let capacity = usize::try_from(manifest.chunk_size)
+        .map_err(|_| BlobError::LengthOverflow)?
+        .checked_add(GCM_TAG_LEN)
+        .ok_or(BlobError::LengthOverflow)?;
+    let mut buffer = Zeroizing::new(Vec::with_capacity(capacity));
+    (|| {
+        let mut written = 0usize;
+        for index in first_chunk..=last_chunk {
+            read_authenticated_chunk(store, access, manifest, index, &mut buffer)?;
+            let chunk_start = index
+                .checked_mul(chunk_size)
+                .ok_or(BlobError::LengthOverflow)?;
+            let chunk_end = chunk_start
+                .checked_add(u64::try_from(buffer.len()).map_err(|_| BlobError::LengthOverflow)?)
+                .ok_or(BlobError::LengthOverflow)?;
+            let selected_start = offset.max(chunk_start);
+            let selected_end = end.min(chunk_end);
+            let source_start = usize::try_from(selected_start - chunk_start)
+                .map_err(|_| BlobError::LengthOverflow)?;
+            let source_end = usize::try_from(selected_end - chunk_start)
+                .map_err(|_| BlobError::LengthOverflow)?;
+            let count = source_end
+                .checked_sub(source_start)
+                .ok_or(BlobError::AuthenticationFailed)?;
+            let destination_end = written
+                .checked_add(count)
+                .ok_or(BlobError::LengthOverflow)?;
+            output
+                .get_mut(written..destination_end)
+                .ok_or(BlobError::AuthenticationFailed)?
+                .copy_from_slice(
+                    buffer
+                        .get(source_start..source_end)
+                        .ok_or(BlobError::AuthenticationFailed)?,
+                );
+            written = destination_end;
+            buffer.zeroize();
+            buffer.clear();
+        }
+        if written != output.len() {
+            return Err(BlobError::AuthenticationFailed);
+        }
+        Ok(BlobRangeReadStats {
+            plaintext_bytes: output_len,
+            verified_chunks: last_chunk - first_chunk + 1,
+            peak_working_buffer_bytes: buffer.capacity(),
+        })
+    })()
+}
+
+fn read_authenticated_chunk<S: BlobStore>(
+    store: &mut S,
+    access: &BlobAccess,
+    manifest: &BlobManifest,
+    index: u64,
+    buffer: &mut Vec<u8>,
+) -> Result<(), BlobError> {
+    buffer.zeroize();
+    buffer.clear();
+    let record = store
+        .chunk_record(manifest.id, index)
+        .map_err(store_error)?
+        .ok_or(BlobError::MissingChunk)?;
+    validate_record(manifest, index, &record)?;
+    if !store
+        .read_verified_chunk(manifest.id, index, buffer)
+        .map_err(store_error)?
+    {
+        return Err(BlobError::MissingChunk);
+    }
+    if buffer.len()
+        != usize::try_from(record.ciphertext_len).map_err(|_| BlobError::LengthOverflow)?
+        || sha256(buffer) != record.ciphertext_sha256
+    {
+        buffer.zeroize();
+        return Err(BlobError::AuthenticationFailed);
+    }
+    decrypt_chunk(access, manifest, index, buffer)?;
+    if buffer.len()
+        != usize::try_from(record.plaintext_len).map_err(|_| BlobError::LengthOverflow)?
+        || sha256(buffer) != record.plaintext_sha256
+    {
+        buffer.zeroize();
+        return Err(BlobError::AuthenticationFailed);
+    }
+    Ok(())
 }
 
 fn validate_chunk_size(chunk_size: u32) -> Result<(), BlobError> {
@@ -4788,6 +4994,49 @@ mod tests {
     }
 
     #[test]
+    fn deduplicated_chunks_are_rehashed_against_the_prepared_source() {
+        let chunk_size = MIN_BLOB_CHUNK_SIZE;
+        let length = usize::try_from(chunk_size).expect("chunk size") * 2 + 17;
+        let mut source = io::Cursor::new(vec![0x41; length]);
+        let mut scratch = io::Cursor::new(Vec::new());
+        let mut store = FileStore::new().expect("dedup source store");
+        let mut writer = BlobWriter::new(&mut store, access(0x41, 1));
+        let manifest = writer
+            .prepare(
+                &mut source,
+                &mut scratch,
+                chunk_size,
+                BlobMetadata::new(None, Vec::new()).expect("metadata"),
+            )
+            .expect("prepare source");
+        let partial = writer
+            .encrypt_some(&mut source, &manifest, 1)
+            .expect("commit first chunk");
+        assert_eq!(partial.newly_committed_chunks, 1);
+        assert!(!partial.complete);
+
+        source.get_mut()[0] ^= 1;
+        assert!(matches!(
+            writer.encrypt_some(&mut source, &manifest, u64::MAX),
+            Err(BlobError::SourceChanged)
+        ));
+        source.get_mut()[0] ^= 1;
+        let completed = writer
+            .encrypt_some(&mut source, &manifest, u64::MAX)
+            .expect("complete unchanged source");
+        assert!(completed.complete);
+
+        let second_chunk = usize::try_from(chunk_size).expect("chunk size") + 3;
+        source.get_mut()[second_chunk] ^= 1;
+        assert!(matches!(
+            writer.encrypt_some(&mut source, &manifest, u64::MAX),
+            Err(BlobError::SourceChanged)
+        ));
+        drop(writer);
+        assert_eq!(store.commits, manifest.chunk_count());
+    }
+
+    #[test]
     fn generated_100mb_blob_is_bounded_resumable_deduplicated_and_verified() {
         let length = 101 * 1024 * 1024 + 123;
         let mut source = GeneratedSource::new(length);
@@ -4845,6 +5094,52 @@ mod tests {
         assert_eq!(sink.position, length);
         assert!(stats.peak_working_buffer_bytes <= MAX_BLOB_CHUNK_SIZE as usize + GCM_TAG_LEN);
         drop(reader);
+
+        let tail_offset = length - 1;
+        let mut tail = [0u8; 1];
+        let tail_stats = read_verified_range(
+            &mut store,
+            &access(17, 4),
+            &manifest,
+            tail_offset,
+            &mut tail,
+        )
+        .unwrap_or_else(|error| panic!("tail range failed: {error}"));
+        assert_eq!(tail, [GeneratedSource::byte_at(tail_offset)]);
+        assert_eq!(tail_stats.plaintext_bytes, 1);
+        assert_eq!(tail_stats.verified_chunks, 1);
+
+        let crossing_offset = u64::from(manifest.chunk_size()) - 7;
+        let mut crossing = [0u8; 20];
+        let crossing_stats = read_verified_range(
+            &mut store,
+            &access(17, 4),
+            &manifest,
+            crossing_offset,
+            &mut crossing,
+        )
+        .unwrap_or_else(|error| panic!("cross-chunk range failed: {error}"));
+        assert_eq!(crossing_stats.verified_chunks, 2);
+        for (index, byte) in crossing.iter().enumerate() {
+            assert_eq!(
+                *byte,
+                GeneratedSource::byte_at(
+                    crossing_offset + u64::try_from(index).expect("range index fits u64"),
+                )
+            );
+        }
+        let mut outside = [0xa5; 2];
+        assert!(
+            read_verified_range(
+                &mut store,
+                &access(17, 4),
+                &manifest,
+                length - 1,
+                &mut outside,
+            )
+            .is_err()
+        );
+        assert_eq!(outside, [0; 2]);
 
         store
             .tamper(5)

@@ -161,6 +161,7 @@ pub(crate) fn admin_error(operation: &'static str, error: NodeError) -> ControlA
         | NodeError::Store(_)
         | NodeError::Reconciliation(_)
         | NodeError::Carrier(_)
+        | NodeError::FatalBlobCoherence(_)
         | NodeError::EmissionPolicyChanged
         | NodeError::CustodySendSkipped
         | NodeError::Io(_)

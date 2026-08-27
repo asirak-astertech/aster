@@ -25,7 +25,7 @@ use redb::{ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle};
 
 use super::*;
 
-pub use depot::{BlobDepot, BlobDepotCompletion};
+pub use depot::{AuthenticatedBlobReadDepot, BlobDepot, BlobDepotCompletion};
 
 pub(crate) const BLOB_PUBLICATIONS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.semantic-blob-publications.v1");
@@ -135,7 +135,7 @@ pub const BLOB_CARRIER_OBJECT_ID_BYTES: usize = 33;
 pub const BLOB_CARRIER_PREFIX_KEY_BYTES: usize = 32 + BLOB_CARRIER_OBJECT_ID_BYTES;
 /// Fixed carrier cursor length (`source transfer || typed ObjectID`).
 pub const BLOB_CARRIER_FETCH_CURSOR_BYTES: usize = 32 + BLOB_CARRIER_OBJECT_ID_BYTES;
-/// Default aggregate redb-marked chunk-file byte cap (512 MiB).
+/// Default aggregate expected chunk-file byte reservation cap (512 MiB).
 pub const DEFAULT_MAX_BLOB_DEPOT_BYTES: u64 = 512 * 1024 * 1024;
 /// Default aggregate durable chunk-metadata row cap.
 ///
@@ -144,18 +144,19 @@ pub const DEFAULT_MAX_BLOB_DEPOT_BYTES: u64 = 512 * 1024 * 1024;
 pub const DEFAULT_MAX_BLOB_DEPOT_CHUNKS: u64 = 100_000;
 /// Default aggregate durable epoch-specific import-row cap.
 ///
-/// An unfinished import consumes this cap.
+/// Every durable import row, public or unpublished, consumes this cap.
 pub const DEFAULT_MAX_BLOB_DEPOT_VARIANTS: u64 = 4_096;
 
 /// Dedicated durable-admission limits for one mission-bound Blob depot.
 ///
-/// `max_bytes` counts redb-marked chunk-file bytes, including each fixed file
-/// header. `max_chunks` counts all durable chunk metadata rows, including
-/// unfinished digest/expected-record staging. `max_variants` counts all durable
-/// import rows, including unfinished imports. Abandoned staging remains durable
-/// until a future explicit garbage-collection design; writable reopen reclaims
-/// only unmarked physical artifacts. These limits intentionally do not bound
-/// unmarked, temporary, or hostile untracked filesystem allocation.
+/// `max_bytes` reserves the canonical chunk-file bytes, including each fixed
+/// file header, for every durable expected chunk record; committed files are a
+/// subset. `max_chunks` counts all durable chunk metadata rows, including
+/// digest/expected-record staging. `max_variants` counts every durable import
+/// row, public or unpublished. Abandoned staging remains durable until a future
+/// explicit garbage-collection design; writable reopen reclaims only unmarked
+/// physical artifacts. These limits intentionally do not bound unmarked,
+/// temporary, or hostile untracked filesystem allocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BlobDepotLimits {
     max_bytes: u64,
@@ -164,6 +165,13 @@ pub struct BlobDepotLimits {
 }
 
 impl BlobDepotLimits {
+    /// Conservative selected-profile depot limits.
+    pub const DEFAULT: Self = Self {
+        max_bytes: DEFAULT_MAX_BLOB_DEPOT_BYTES,
+        max_chunks: DEFAULT_MAX_BLOB_DEPOT_CHUNKS,
+        max_variants: DEFAULT_MAX_BLOB_DEPOT_VARIANTS,
+    };
+
     /// Constructs nonzero aggregate physical depot limits.
     pub const fn new(
         max_bytes: u64,
@@ -180,7 +188,7 @@ impl BlobDepotLimits {
         })
     }
 
-    /// Maximum aggregate redb-marked chunk-file bytes.
+    /// Maximum aggregate bytes reserved by durable expected chunk records.
     pub const fn max_bytes(self) -> u64 {
         self.max_bytes
     }
@@ -190,7 +198,7 @@ impl BlobDepotLimits {
         self.max_chunks
     }
 
-    /// Maximum durable import rows, including unfinished imports.
+    /// Maximum durable import rows, public or unpublished.
     pub const fn max_variants(self) -> u64 {
         self.max_variants
     }
@@ -198,11 +206,7 @@ impl BlobDepotLimits {
 
 impl Default for BlobDepotLimits {
     fn default() -> Self {
-        Self {
-            max_bytes: DEFAULT_MAX_BLOB_DEPOT_BYTES,
-            max_chunks: DEFAULT_MAX_BLOB_DEPOT_CHUNKS,
-            max_variants: DEFAULT_MAX_BLOB_DEPOT_VARIANTS,
-        }
+        Self::DEFAULT
     }
 }
 
@@ -447,6 +451,13 @@ fn blob_error(error: BlobStoreError) -> StoreError {
     StoreError::Blob(error)
 }
 
+fn blob_preflight_decode_error(error: StoreError, reason: &'static str) -> StoreError {
+    match error {
+        StoreError::SemanticInvariant(_) => blob_error(BlobStoreError::SchemaInvariant(reason)),
+        error => error,
+    }
+}
+
 /// Exact SHA-256 identity of one stable source-sealed Blob manifest envelope.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct BlobTransferId([u8; 32]);
@@ -562,13 +573,10 @@ impl BlobCarrierPrefixStatus {
         if self.complete() {
             return None;
         }
-        Some(
-            self.prefix_len
-                ..self
-                    .prefix_len
-                    .saturating_add(MAX_BLOB_NETWORK_RANGE_BYTES as u64)
-                    .min(self.total_len),
-        )
+        let remaining = self.total_len.checked_sub(self.prefix_len)?;
+        let bound = u64::try_from(MAX_BLOB_NETWORK_RANGE_BYTES).ok()?;
+        let end = self.prefix_len.checked_add(remaining.min(bound))?;
+        Some(self.prefix_len..end)
     }
 }
 
@@ -630,8 +638,55 @@ pub struct BlobSourceProjection {
     pub physical_lineage: [u8; 32],
     pub manifest_digest: [u8; 32],
     pub blob_id: BlobId,
+    pub total_len: u64,
+    pub chunk_size: u32,
+    pub chunk_count: u64,
     /// Digest of exact durable authenticated metadata plus the sealed length.
     pub metadata_fingerprint: [u8; 32],
+}
+
+impl BlobSourceProjection {
+    /// Re-derives this compact projection from one exact content-verified
+    /// source envelope instead of trusting independently decoded redb fields.
+    ///
+    /// This binds every encoded header field (including the causal counter and
+    /// priority), the physical variant identity, both provider lineages, and
+    /// the sealed length before a runtime cache may use the projection as an
+    /// authentication capability.
+    pub fn matches_verified(
+        &self,
+        blob: &ContentVerifiedBlobEnvelope,
+        sealed: &[u8],
+    ) -> Result<bool, StoreError> {
+        blob.verify_exact_sealed(sealed)
+            .map_err(|error| blob_error(BlobStoreError::Verification(error.to_string())))?;
+        let sealed_len =
+            u64::try_from(sealed.len()).map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
+        let metadata = BlobMetadata {
+            transfer_id: BlobTransferId::new(blob.envelope_id()),
+            semantic_id: BlobSemanticId::new(blob.item_id()),
+            blob_id: blob.blob_id(),
+            variant_id: blob_variant_id(
+                blob.blob_id(),
+                blob.manifest().content_group(),
+                blob.manifest().content_epoch(),
+            ),
+            manifest_digest: *blob.manifest_digest(),
+            route_lineage: Some(*blob.route_lineage().binding()),
+            physical_lineage: Some(*blob.physical_lineage().binding()),
+            header: blob.header().clone(),
+        };
+        Ok(self
+            == &blob_source_projection(
+                &metadata,
+                sealed_len,
+                depot::BlobSourceShape {
+                    total_len: blob.manifest().total_len(),
+                    chunk_size: blob.manifest().chunk_size(),
+                    chunk_count: blob.manifest().chunk_count(),
+                },
+            )?)
+    }
 }
 
 /// Durable lifecycle state wrapped around a state-neutral source projection.
@@ -897,16 +952,28 @@ pub enum BlobPublicationDisposition {
     Alternate,
 }
 
-/// One retained signed publication requiring fresh source/content verification.
+/// One projection-only retained publication in an exact read plan.
+///
+/// Sealed source bytes are deliberately absent. Alternates can be matched to
+/// startup-authenticated claims without allocating their envelopes; only the
+/// uniquely selected current candidate is exact-loaded for plaintext use.
+/// A live page therefore relies on its startup-authenticated alternate claim
+/// plus this Store's exclusive-writer immutability and does not rehash every
+/// inactive alternate envelope on every page.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlobReadCandidate {
-    blob: StoredBlob,
+    projection: BlobSourceProjection,
+    acceptance_marker: u64,
     disposition: Option<BlobPublicationDisposition>,
 }
 
 impl BlobReadCandidate {
-    pub const fn blob(&self) -> &StoredBlob {
-        &self.blob
+    pub const fn projection(&self) -> &BlobSourceProjection {
+        &self.projection
+    }
+
+    pub const fn acceptance_marker(&self) -> u64 {
+        self.acceptance_marker
     }
 
     pub const fn disposition(&self) -> Option<BlobPublicationDisposition> {
@@ -1008,6 +1075,13 @@ struct PendingBlobCarrierRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct CompletedBlobRangeSourceSnapshot {
+    metadata: BlobMetadata,
+    projection: BlobSourceProjection,
+    acceptance_marker: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct BlobCarrierPrefixRecord {
     source: BlobTransferId,
     total_len: u64,
@@ -1020,12 +1094,91 @@ struct BlobNetworkStagingUsage {
     bytes: u64,
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_BLOB_NETWORK_GLOBAL_AUDITS: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
+    static TEST_BLOB_READ_PLAN_ROWS_VISITED: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
+    static TEST_BLOB_SOURCE_BYTES_LOADED: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
+    static TEST_BLOB_CAPACITY_CONTENT_ROWS_VISITED: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
+    static TEST_BLOB_FRONTIER_ROWS_VISITED: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
+    static TEST_PENDING_BLOB_SOURCE_ROWS_VISITED: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+fn test_blob_network_global_audits() -> u64 {
+    TEST_BLOB_NETWORK_GLOBAL_AUDITS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn test_blob_read_work_counts() -> (u64, u64) {
+    (
+        TEST_BLOB_READ_PLAN_ROWS_VISITED.with(std::cell::Cell::get),
+        TEST_BLOB_SOURCE_BYTES_LOADED.with(std::cell::Cell::get),
+    )
+}
+
+#[cfg(test)]
+fn test_blob_capacity_content_rows_visited() -> u64 {
+    TEST_BLOB_CAPACITY_CONTENT_ROWS_VISITED.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn record_test_blob_frontier_row() {
+    TEST_BLOB_FRONTIER_ROWS_VISITED.with(|count| count.set(count.get().saturating_add(1)));
+}
+
+#[cfg(test)]
+fn test_blob_frontier_rows_visited() -> u64 {
+    TEST_BLOB_FRONTIER_ROWS_VISITED.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn test_pending_blob_source_rows_visited() -> u64 {
+    TEST_PENDING_BLOB_SOURCE_ROWS_VISITED.with(std::cell::Cell::get)
+}
+
 #[derive(Default)]
 pub(crate) struct BlobAuditSnapshot {
     pub stats: BlobStoreStats,
 }
 
 impl Store {
+    #[cfg(test)]
+    fn set_blob_carrier_range_post_read_gate(
+        &self,
+        reached: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self
+            .blob_carrier_range_post_read_gate
+            .lock()
+            .expect("Blob carrier-range post-read gate lock") = Some((reached, release));
+    }
+
+    #[cfg(test)]
+    fn set_blob_carrier_commit_post_snapshot_gate(
+        &self,
+        reached: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self
+            .blob_carrier_commit_post_snapshot_gate
+            .lock()
+            .expect("Blob carrier-commit post-snapshot gate lock") = Some((reached, release));
+    }
+
     /// Returns the dedicated physical limits configured for this handle.
     pub const fn blob_depot_limits(&self) -> BlobDepotLimits {
         self.blob_depot_limits
@@ -1036,6 +1189,153 @@ impl Store {
         self.require_live()?;
         self.require_bound_mission()?;
         BlobDepot::open(self)
+    }
+
+    /// Acquires the owner-bound mutation adapter for one local Blob publish
+    /// without a global depot audit.
+    ///
+    /// Existing roots are opened under the common depot mutex with exact
+    /// Store/backing/owner binding. A missing root is created only for a
+    /// canonically empty durable Blob namespace.
+    pub fn blob_depot_for_local_publish(&self) -> Result<BlobDepot<'_>, StoreError> {
+        self.require_live()?;
+        self.require_bound_mission()?;
+        BlobDepot::open_network_mutation(self, true)
+    }
+
+    /// Mints a completion for one freshly verified local publish without a
+    /// global depot audit or publication-row dependency.
+    pub fn completed_local_blob(
+        &self,
+        blob: &ContentVerifiedBlobEnvelope,
+        manifest_bytes: &[u8],
+    ) -> Result<BlobDepotCompletion, StoreError> {
+        self.require_live()?;
+        self.require_bound_mission()?;
+        let mut depot = BlobDepot::open_network_mutation(self, false)?;
+        depot.completed_blob(blob, manifest_bytes)
+    }
+
+    /// Opens only the exact finalized depot variant authorized by `completion`.
+    ///
+    /// Unlike [`Self::blob_depot`], this page-read path does not perform a
+    /// global Blob schema audit, create the depot root, or enter a write
+    /// transaction. It still acquires the common depot mutex, rechecks live
+    /// state and the exact Store/backing/owner binding, and rejects a stale or
+    /// foreign nonconstructible completion capability.
+    pub fn blob_depot_for_authenticated_read(
+        &self,
+        completion: &BlobDepotCompletion,
+    ) -> Result<AuthenticatedBlobReadDepot<'_>, StoreError> {
+        self.require_live()?;
+        self.require_bound_mission()?;
+        BlobDepot::open_authenticated_read(self, completion)
+    }
+
+    /// Mints one exact completion capability for an authenticated pending
+    /// network source without opening the unrestricted globally audited depot.
+    ///
+    /// The common depot mutex is acquired before the pending snapshot. Current
+    /// policy, source identity, sealed envelope, transfer plan, owner/backing
+    /// binding, import, every committed chunk, and every physical file are
+    /// rechecked while the lock remains held. The fixed root must already
+    /// exist; this seam never creates it.
+    pub fn completed_pending_blob_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        source: BlobTransferId,
+        blob: &ContentVerifiedBlobEnvelope,
+        manifest_bytes: &[u8],
+        plan: &VerifiedBlobTransferPlan,
+    ) -> Result<BlobDepotCompletion, StoreError> {
+        self.require_live()?;
+        let authority = self.require_bound_mission()?;
+        let mut depot = BlobDepot::open_network_mutation(self, false)?;
+        let read = self.database.begin_read()?;
+        let pending = read
+            .open_table(BLOB_PENDING_SOURCES)?
+            .get(source.as_bytes().as_slice())?
+            .map(|value| decode_pending_blob_source(value.value()))
+            .transpose()?
+            .ok_or_else(|| blob_error(BlobStoreError::PendingSourceMissing))?;
+        enforce_blob_policy_read(&read, authority, policy, &pending.metadata.header)?;
+        require_pending_blob_plan(&pending, plan)?;
+        blob.verify_exact_sealed(&pending.sealed)
+            .map_err(|error| blob_error(BlobStoreError::Verification(error.to_string())))?;
+        if pending.metadata.transfer_id != source
+            || BlobTransferId::new(blob.envelope_id()) != source
+            || pending.metadata.semantic_id != BlobSemanticId::new(blob.item_id())
+            || pending.metadata.blob_id != blob.blob_id()
+            || pending.metadata.manifest_digest != *blob.manifest_digest()
+            || pending.route_lineage != *blob.route_lineage().binding()
+            || pending.physical_lineage != *blob.physical_lineage().binding()
+            || plan.source_envelope().into_bytes() != *source.as_bytes()
+        {
+            return Err(blob_error(BlobStoreError::CompletionMismatch));
+        }
+        drop(read);
+        depot.completed_blob(blob, manifest_bytes)
+    }
+
+    /// Mints one exact completion capability for a retained completed source
+    /// without a global Blob audit or root creation.
+    ///
+    /// This policy-neutral seam is suitable for incremental startup replay:
+    /// the caller supplies a source/content-verified envelope, while the Store
+    /// rechecks the exact completed projection, acceptance marker, sealed row,
+    /// owner/backing binding, finalized import, chunk markers, and files under
+    /// the common depot mutex.
+    pub fn completed_retained_blob(
+        &self,
+        projection: &BlobSourceProjection,
+        retention: BlobSourceRetention,
+        blob: &ContentVerifiedBlobEnvelope,
+        manifest_bytes: &[u8],
+        sealed: &[u8],
+    ) -> Result<BlobDepotCompletion, StoreError> {
+        self.require_live()?;
+        self.require_bound_mission()?;
+        let acceptance_marker = match retention {
+            BlobSourceRetention::Completed { acceptance_marker } => acceptance_marker,
+            BlobSourceRetention::Pending => {
+                return Err(blob_error(BlobStoreError::CompletionMismatch));
+            }
+        };
+        let mut depot = BlobDepot::open_network_mutation(self, false)?;
+        let read = self.database.begin_read()?;
+        let metadata = read
+            .open_table(BLOB_PUBLICATIONS)?
+            .get(projection.transfer_id.as_bytes().as_slice())?
+            .map(|value| decode_blob_metadata(value.value()))
+            .transpose()?
+            .ok_or_else(|| blob_error(BlobStoreError::CompletionMismatch))?;
+        let bytes = read.open_table(BLOB_BYTES)?;
+        let exact_sealed = bytes
+            .get(projection.transfer_id.as_bytes().as_slice())?
+            .ok_or_else(|| blob_error(BlobStoreError::CompletionMismatch))?;
+        let marker = read
+            .open_table(BLOB_ACCEPTANCE_MARKERS)?
+            .get(projection.transfer_id.as_bytes().as_slice())?
+            .map(|value| value.value())
+            .ok_or_else(|| blob_error(BlobStoreError::CompletionMismatch))?;
+        let sealed_len = u64::try_from(exact_sealed.value().len())
+            .map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
+        let shape = durable_blob_source_shape_read(&read, &metadata, true)?;
+        let durable_projection = blob_source_projection(&metadata, sealed_len, shape)?;
+        blob.verify_exact_sealed(sealed)
+            .map_err(|error| blob_error(BlobStoreError::Verification(error.to_string())))?;
+        if durable_projection != *projection
+            || marker != acceptance_marker
+            || exact_sealed.value() != sealed
+            || BlobTransferId::new(blob.envelope_id()) != projection.transfer_id
+            || !projection.matches_verified(blob, sealed)?
+        {
+            return Err(blob_error(BlobStoreError::CompletionMismatch));
+        }
+        drop(exact_sealed);
+        drop(bytes);
+        drop(read);
+        depot.completed_blob(blob, manifest_bytes)
     }
 
     /// Reserves the next Blob publication dot under exact settled policy.
@@ -1063,15 +1363,18 @@ impl Store {
             ))
         })?;
         let prefix = event_domain_prefix(topic, scope)?;
+        let upper = blob_content_prefix_upper_bound(&prefix)?;
         let frontier = read.open_table(CAUSAL_FRONTIER)?;
         let mut context = VersionVector::default();
         let mut direct_publishers = 0usize;
-        for row in frontier.iter()? {
+        for row in frontier.range::<&[u8]>((
+            std::ops::Bound::<&[u8]>::Included(prefix.as_slice()),
+            std::ops::Bound::<&[u8]>::Excluded(upper.as_slice()),
+        ))? {
             let (key, value) = row?;
             let key = key.value();
-            if !key.starts_with(&prefix) {
-                continue;
-            }
+            #[cfg(test)]
+            record_test_blob_frontier_row();
             if key.len() != prefix.len() + 32 || value.value() == 0 {
                 return Err(blob_error(BlobStoreError::SchemaInvariant(
                     "causal frontier contains an invalid Blob-domain row",
@@ -1129,13 +1432,31 @@ impl Store {
         let existing = read
             .open_table(BLOB_OPERATIONS)?
             .get(request.operation.as_bytes())?
-            .map(|value| decode_blob_operation_record(value.value()))
+            .map(|value| {
+                decode_blob_operation_record(value.value()).map_err(|error| {
+                    blob_preflight_decode_error(error, "Blob operation row is malformed")
+                })
+            })
             .transpose()?;
         match existing {
             Some(existing) if existing.intent_digest != request.intent.digest() => {
                 Err(blob_error(BlobStoreError::OperationConflict))
             }
-            Some(existing) => load_blob_from_read(&read, existing.transfer_id),
+            Some(existing) => load_blob_from_read(&read, existing.transfer_id)
+                .map_err(|error| {
+                    blob_preflight_decode_error(
+                        error,
+                        "Blob operation publication row is malformed",
+                    )
+                })?
+                .map_or_else(
+                    || {
+                        Err(blob_error(BlobStoreError::SchemaInvariant(
+                            "Blob operation points to a missing publication",
+                        )))
+                    },
+                    |blob| Ok(Some(blob)),
+                ),
             None => Ok(None),
         }
     }
@@ -1197,7 +1518,9 @@ impl Store {
         let authority = self.require_bound_mission()?;
         let read = self.database.begin_read()?;
         require_control_policy_read(&read, authority, policy)?;
-        blob_read_plan_read(&read, *policy, topic, scope, blob_id)
+        blob_read_plan_read(&read, *policy, topic, scope, blob_id).map_err(|error| {
+            blob_preflight_decode_error(error, "Blob read projection row is malformed")
+        })
     }
 
     /// Rechecks exact policy and the complete freshly verified Blob publication set.
@@ -1219,6 +1542,40 @@ impl Store {
             return Err(blob_error(BlobStoreError::ReadPlanChanged));
         }
         Ok(())
+    }
+
+    /// Exact-loads one projection-only read candidate under the same settled
+    /// policy, cloning only that source's sealed envelope bytes.
+    pub fn load_blob_read_candidate_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        candidate: &BlobReadCandidate,
+    ) -> Result<StoredBlob, StoreError> {
+        self.require_live()?;
+        let authority = self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        require_control_policy_read(&read, authority, policy)?;
+        let stored = load_blob_from_read(&read, candidate.projection.transfer_id)?
+            .ok_or_else(|| blob_error(BlobStoreError::CompletionMismatch))?;
+        let metadata = BlobMetadata {
+            transfer_id: stored.transfer_id,
+            semantic_id: stored.semantic_id,
+            blob_id: stored.blob_id,
+            variant_id: stored.variant_id,
+            manifest_digest: stored.manifest_digest,
+            route_lineage: stored.route_lineage,
+            physical_lineage: stored.physical_lineage,
+            header: stored.header.clone(),
+        };
+        let shape = durable_blob_source_shape_read(&read, &metadata, true)?;
+        let sealed_len = u64::try_from(stored.sealed.len())
+            .map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
+        if stored.acceptance_marker != candidate.acceptance_marker
+            || blob_source_projection(&metadata, sealed_len, shape)? != candidate.projection
+        {
+            return Err(blob_error(BlobStoreError::CompletionMismatch));
+        }
+        Ok(stored)
     }
 
     /// Returns a typed, disjoint inventory of signed Blob publication transfers.
@@ -1352,12 +1709,12 @@ impl Store {
 
         // Ensure the mission-bound depot root/owner marker exists before the
         // redb import becomes durable, while retaining the single-owner lock.
-        let _depot_guard = BlobDepot::open(self)?;
+        let _depot_guard = BlobDepot::open_network_mutation(self, true)?;
         self.require_live()?;
         let write = self.database.begin_write()?;
         enforce_live_write(&write)?;
         enforce_blob_policy_write(&write, authority, policy, &pending.metadata.header)?;
-        let audit = audit_blob_network_tables_write(&write, Some(authority))?;
+        let staging = blob_network_staging_usage_write(&write, authority)?;
 
         if let Some(accepted) = load_blob_from_write(&write, transfer_id)? {
             if accepted.semantic_id != pending.metadata.semantic_id
@@ -1392,7 +1749,7 @@ impl Store {
         } else {
             0
         };
-        require_blob_network_staging_capacity(audit.staging, incoming_rows, incoming_bytes)?;
+        require_blob_network_staging_capacity(staging, incoming_rows, incoming_bytes)?;
 
         depot::stage_verified_plan_write(&write, self.blob_depot_limits, plan)?;
         if existing.is_none() {
@@ -1402,13 +1759,11 @@ impl Store {
             update_blob_network_staging_usage(
                 &write,
                 BlobNetworkStagingUsage {
-                    rows: audit
-                        .staging
+                    rows: staging
                         .rows
                         .checked_add(1)
                         .ok_or(StoreError::ItemCountAccountingOverflow)?,
-                    bytes: audit
-                        .staging
+                    bytes: staging
                         .bytes
                         .checked_add(incoming_bytes)
                         .ok_or(StoreError::PayloadByteAccountingOverflow)?,
@@ -1482,8 +1837,9 @@ impl Store {
                         "completed Blob source is missing its acceptance marker",
                     ))
                 })?;
+            let shape = durable_blob_source_shape_read(&read, &metadata, true)?;
             return Ok(Some(RetainedBlobSource {
-                source: blob_source_projection(&metadata, sealed_len)?,
+                source: blob_source_projection(&metadata, sealed_len, shape)?,
                 retention: BlobSourceRetention::Completed { acceptance_marker },
             }));
         }
@@ -1491,8 +1847,9 @@ impl Store {
             .map(|pending| {
                 let sealed_len = u64::try_from(pending.sealed.len())
                     .map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
+                let shape = durable_blob_source_shape_read(&read, &pending.metadata, false)?;
                 Ok::<_, StoreError>(RetainedBlobSource {
-                    source: blob_source_projection(&pending.metadata, sealed_len)?,
+                    source: blob_source_projection(&pending.metadata, sealed_len, shape)?,
                     retention: BlobSourceRetention::Pending,
                 })
             })
@@ -1551,8 +1908,9 @@ impl Store {
                     ))
                 })?;
             seen.insert(source);
+            let shape = durable_blob_source_shape_read(&read, &metadata, true)?;
             retained.push(RetainedBlobSource {
-                source: blob_source_projection(&metadata, sealed_len)?,
+                source: blob_source_projection(&metadata, sealed_len, shape)?,
                 retention: BlobSourceRetention::Completed { acceptance_marker },
             });
         }
@@ -1570,8 +1928,9 @@ impl Store {
             }
             let sealed_len = u64::try_from(pending.sealed.len())
                 .map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
+            let shape = durable_blob_source_shape_read(&read, &pending.metadata, false)?;
             retained.push(RetainedBlobSource {
-                source: blob_source_projection(&pending.metadata, sealed_len)?,
+                source: blob_source_projection(&pending.metadata, sealed_len, shape)?,
                 retention: BlobSourceRetention::Pending,
             });
         }
@@ -1579,6 +1938,54 @@ impl Store {
         drop(read);
         for item in &retained {
             visitor(item);
+        }
+        Ok(())
+    }
+
+    /// Visits only pending Blob source projections from one redb snapshot.
+    ///
+    /// This never opens or scans completed publication/source-byte tables. A
+    /// supplied policy is checked exactly and filters stale-epoch or revoked
+    /// pending publishers; `None` is policy-neutral for cache cleanup before a
+    /// caller performs its own authenticated current-lineage decision.
+    pub fn visit_pending_blob_sources(
+        &self,
+        policy: Option<&ControlPolicySnapshot>,
+        mut visitor: impl FnMut(&BlobSourceProjection),
+    ) -> Result<(), StoreError> {
+        self.require_live()?;
+        let authority = self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        if let Some(policy) = policy {
+            require_control_policy_read(&read, authority, policy)?;
+        }
+        let pending = read.open_table(BLOB_PENDING_SOURCES)?;
+        let mut projections = Vec::with_capacity(
+            usize::try_from(pending.len()?).map_err(|_| StoreError::ItemCountAccountingOverflow)?,
+        );
+        for row in pending.iter()? {
+            let (_, value) = row?;
+            #[cfg(test)]
+            TEST_PENDING_BLOB_SOURCE_ROWS_VISITED
+                .with(|count| count.set(count.get().saturating_add(1)));
+            let pending = decode_pending_blob_source(value.value())?;
+            if policy.is_some() && !blob_header_is_current_read(&read, &pending.metadata.header)? {
+                continue;
+            }
+            let sealed_len = u64::try_from(pending.sealed.len())
+                .map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
+            let shape = durable_blob_source_shape_read(&read, &pending.metadata, false)?;
+            projections.push(blob_source_projection(
+                &pending.metadata,
+                sealed_len,
+                shape,
+            )?);
+        }
+        projections.sort_unstable_by_key(|projection| projection.transfer_id);
+        drop(pending);
+        drop(read);
+        for projection in &projections {
+            visitor(projection);
         }
         Ok(())
     }
@@ -1603,12 +2010,60 @@ impl Store {
         policy: &ControlPolicySnapshot,
     ) -> Result<Vec<BlobSourceProjection>, StoreError> {
         let mut output = Vec::new();
-        self.visit_retained_blob_sources(Some(policy), |item| {
-            if item.retention == BlobSourceRetention::Pending {
-                output.push(item.source.clone());
-            }
-        })?;
+        self.visit_pending_blob_sources(Some(policy), |source| output.push(source.clone()))?;
         Ok(output)
+    }
+
+    /// Selects at most one current pending source after `after`, wrapping once.
+    ///
+    /// Selection is lexicographic by transfer identity and uses one durable
+    /// read snapshot. It returns only projection metadata; it never opens the
+    /// depot, decrypts content, or finalizes a capacity-deferred source.
+    pub fn next_pending_blob_source_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        after: Option<BlobTransferId>,
+    ) -> Result<Option<BlobSourceProjection>, StoreError> {
+        self.require_live()?;
+        let authority = self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        require_control_policy_read(&read, authority, policy)?;
+        let pending = read.open_table(BLOB_PENDING_SOURCES)?;
+        if let Some(after) = after {
+            let bounds = (
+                std::ops::Bound::<&[u8]>::Excluded(after.as_bytes().as_slice()),
+                std::ops::Bound::<&[u8]>::Unbounded,
+            );
+            for row in pending.range::<&[u8]>(bounds)? {
+                let (key, value) = row?;
+                if let Some(projection) =
+                    current_pending_projection_read(&read, key.value(), value.value())?
+                {
+                    return Ok(Some(projection));
+                }
+            }
+            for row in pending.iter()? {
+                let (key, value) = row?;
+                if key.value() > after.as_bytes().as_slice() {
+                    break;
+                }
+                if let Some(projection) =
+                    current_pending_projection_read(&read, key.value(), value.value())?
+                {
+                    return Ok(Some(projection));
+                }
+            }
+            return Ok(None);
+        }
+        for row in pending.iter()? {
+            let (key, value) = row?;
+            if let Some(projection) =
+                current_pending_projection_read(&read, key.value(), value.value())?
+            {
+                return Ok(Some(projection));
+            }
+        }
+        Ok(None)
     }
 
     /// Reads the durable Blob carrier-fetch position for one authenticated peer.
@@ -1650,7 +2105,7 @@ impl Store {
         let authority = self.require_bound_mission()?;
         let write = self.database.begin_write()?;
         enforce_live_write(&write)?;
-        let audit = audit_blob_network_tables_write(&write, Some(authority))?;
+        let cursor_count = blob_carrier_cursor_count_write(&write, authority)?;
         let current = write
             .open_table(BLOB_CARRIER_FETCH_CURSORS)?
             .get(peer.as_slice())?
@@ -1663,7 +2118,7 @@ impl Store {
             return Ok(false);
         }
         if current.is_none()
-            && audit.carrier_cursors
+            && cursor_count
                 >= u64::try_from(MAX_BLOB_CARRIER_FETCH_CURSOR_PEERS)
                     .map_err(|_| StoreError::ItemCountAccountingOverflow)?
         {
@@ -1696,17 +2151,18 @@ impl Store {
         }
         let write = self.database.begin_write()?;
         enforce_live_write(&write)?;
-        audit_blob_network_tables_write(&write, Some(authority))?;
+        blob_carrier_cursor_count_write(&write, authority)?;
         let stale = {
             let table = write.open_table(BLOB_CARRIER_FETCH_CURSORS)?;
             let mut stale = Vec::new();
             for row in table.iter()? {
-                let (key, _) = row?;
+                let (key, value) = row?;
                 let peer: NodeId = key.value().try_into().map_err(|_| {
                     blob_error(BlobStoreError::CarrierCursorInvariant(
                         "carrier cursor peer key has invalid length",
                     ))
                 })?;
+                BlobCarrierFetchCursor::decode(value.value())?;
                 if !configured.contains(&peer) {
                     stale.push(peer);
                 }
@@ -1763,31 +2219,34 @@ impl Store {
     ) -> Result<BlobCarrierAppendOutcome, StoreError> {
         self.require_live()?;
         let authority = self.require_bound_mission()?;
-        if bytes.is_empty()
-            || bytes.len() > MAX_BLOB_NETWORK_RANGE_BYTES
-            || total_len == 0
+        if total_len == 0
             || total_len > MAX_BLOB_NETWORK_CARRIER_BYTES
-            || offset
-                .checked_add(
-                    u64::try_from(bytes.len())
-                        .map_err(|_| StoreError::PayloadByteAccountingOverflow)?,
-                )
-                .is_none_or(|end| end > total_len)
+            || canonical_blob_carrier_range_len(total_len, offset) != Some(bytes.len())
         {
             return Err(blob_error(BlobStoreError::InvalidCarrierRange(
-                "range is empty, overbound, overflowing, or beyond the exact total",
+                "range is not the exact canonical 16-KiB carrier complement",
             )));
         }
         let write = self.database.begin_write()?;
         enforce_live_write(&write)?;
         require_control_policy_write(&write, authority, policy)?;
-        let audit = audit_blob_network_tables_write(&write, Some(authority))?;
+        let staging = blob_network_staging_usage_write(&write, authority)?;
         let pending = write
             .open_table(BLOB_PENDING_SOURCES)?
             .get(source.as_bytes().as_slice())?
             .map(|value| decode_pending_blob_source(value.value()))
             .transpose()?
             .ok_or_else(|| blob_error(BlobStoreError::PendingSourceMissing))?;
+        if pending.metadata.transfer_id != source
+            || write
+                .open_table(BLOB_PUBLICATIONS)?
+                .get(source.as_bytes().as_slice())?
+                .is_some()
+        {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "pending Blob source identity or visibility is inconsistent",
+            )));
+        }
         enforce_blob_policy_write(&write, authority, policy, &pending.metadata.header)?;
         let expected = pending_blob_carrier(&pending, object)
             .ok_or_else(|| blob_error(BlobStoreError::InvalidCarrierObjectId))?;
@@ -1860,20 +2319,18 @@ impl Store {
             .checked_sub(old_bytes)
             .ok_or(StoreError::PayloadByteAccountingOverflow)?;
         let incoming_rows = u64::from(existing.is_none());
-        require_blob_network_staging_capacity(audit.staging, incoming_rows, incoming_bytes)?;
+        require_blob_network_staging_capacity(staging, incoming_rows, incoming_bytes)?;
         write
             .open_table(BLOB_CARRIER_PREFIXES)?
             .insert(key.as_slice(), encoded.as_slice())?;
         update_blob_network_staging_usage(
             &write,
             BlobNetworkStagingUsage {
-                rows: audit
-                    .staging
+                rows: staging
                     .rows
                     .checked_add(incoming_rows)
                     .ok_or(StoreError::ItemCountAccountingOverflow)?,
-                bytes: audit
-                    .staging
+                bytes: staging
                     .bytes
                     .checked_add(incoming_bytes)
                     .ok_or(StoreError::PayloadByteAccountingOverflow)?,
@@ -1924,7 +2381,7 @@ impl Store {
         let authority = self.require_bound_mission()?;
         let write = self.database.begin_write()?;
         enforce_live_write(&write)?;
-        let audit = audit_blob_network_tables_write(&write, Some(authority))?;
+        let staging = blob_network_staging_usage_write(&write, authority)?;
         let key = blob_carrier_prefix_key(source, object);
         let encoded = write
             .open_table(BLOB_CARRIER_PREFIXES)?
@@ -1937,6 +2394,24 @@ impl Store {
         if record.source != source {
             return Err(blob_error(BlobStoreError::CarrierPrefixConflict));
         }
+        let pending = write
+            .open_table(BLOB_PENDING_SOURCES)?
+            .get(source.as_bytes().as_slice())?
+            .map(|value| decode_pending_blob_source(value.value()))
+            .transpose()?
+            .ok_or_else(|| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob carrier prefix is orphaned from its pending source",
+                ))
+            })?;
+        if pending.metadata.transfer_id != source
+            || pending_blob_carrier(&pending, object)
+                .is_none_or(|expected| expected.total_len != record.total_len)
+        {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob carrier prefix differs from its authenticated pending source",
+            )));
+        }
         write
             .open_table(BLOB_CARRIER_PREFIXES)?
             .remove(key.as_slice())?;
@@ -1944,12 +2419,12 @@ impl Store {
         update_blob_network_staging_usage(
             &write,
             BlobNetworkStagingUsage {
-                rows: audit.staging.rows.checked_sub(1).ok_or_else(|| {
+                rows: staging.rows.checked_sub(1).ok_or_else(|| {
                     blob_error(BlobStoreError::SchemaInvariant(
                         "Blob staging row counter underflows on abort",
                     ))
                 })?,
-                bytes: audit.staging.bytes.checked_sub(removed).ok_or_else(|| {
+                bytes: staging.bytes.checked_sub(removed).ok_or_else(|| {
                     blob_error(BlobStoreError::SchemaInvariant(
                         "Blob staging byte counter underflows on abort",
                     ))
@@ -1961,17 +2436,24 @@ impl Store {
     }
 
     /// Atomically removes one exact terminally poisoned pending source and all
-    /// of its carrier prefixes. An unshared, unpublished depot variant releases
-    /// every chunk reservation in the same transaction, while its bounded
-    /// import row remains as a durable same-epoch physical-lineage fence. Its
-    /// now-unmarked files are then safely reclaimed.
+    /// of its carrier prefixes.
+    ///
+    /// Depot import/chunk staging is deliberately retained and remains charged
+    /// to the configured physical quotas. That fail-closed choice avoids an
+    /// unbounded global reference scan on a contact-triggered abort and
+    /// preserves the same-epoch physical-lineage fence. A future explicit
+    /// garbage-collection protocol may reclaim such abandoned staging.
     pub fn abort_pending_blob_source(&self, source: BlobTransferId) -> Result<bool, StoreError> {
         self.require_live()?;
         let authority = self.require_bound_mission()?;
-        let depot = BlobDepot::open(self)?;
+        let _depot_guard = self
+            .blob_depot_lock
+            .lock()
+            .map_err(|_| blob_error(BlobStoreError::DepotIntegrity("depot lock is poisoned")))?;
+        self.require_live()?;
         let write = self.database.begin_write()?;
         enforce_live_write(&write)?;
-        let audit = audit_blob_network_tables_write(&write, Some(authority))?;
+        let staging = blob_network_staging_usage_write(&write, authority)?;
         let encoded_pending = write
             .open_table(BLOB_PENDING_SOURCES)?
             .get(source.as_bytes().as_slice())?
@@ -1980,90 +2462,13 @@ impl Store {
             return Ok(false);
         };
         let pending = decode_pending_blob_source(&encoded_pending)?;
-        let variant = pending.metadata.variant_id;
-
-        let mut shared = false;
-        for row in write.open_table(BLOB_PUBLICATIONS)?.iter()? {
-            let (_, value) = row?;
-            if decode_blob_metadata(value.value())?.variant_id == variant {
-                shared = true;
-                break;
-            }
+        if pending.metadata.transfer_id != source {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "pending Blob source key differs from its authenticated identity",
+            )));
         }
-        if !shared {
-            for row in write.open_table(BLOB_PENDING_SOURCES)?.iter()? {
-                let (key, value) = row?;
-                if key.value() == source.as_bytes().as_slice() {
-                    continue;
-                }
-                if decode_pending_blob_source(value.value())?
-                    .metadata
-                    .variant_id
-                    == variant
-                {
-                    shared = true;
-                    break;
-                }
-            }
-        }
-
-        let mut prefix_rows = Vec::new();
-        let mut removed_bytes = staging_entry_bytes(32, encoded_pending.len())?;
-        for row in write.open_table(BLOB_CARRIER_PREFIXES)?.iter()? {
-            let (key, value) = row?;
-            let (row_source, _) = parse_blob_carrier_prefix_key(key.value())?;
-            if row_source == source {
-                removed_bytes = removed_bytes
-                    .checked_add(staging_entry_bytes(key.value().len(), value.value().len())?)
-                    .ok_or(StoreError::PayloadByteAccountingOverflow)?;
-                prefix_rows.push(key.value().to_vec());
-            }
-        }
-        write
-            .open_table(BLOB_PENDING_SOURCES)?
-            .remove(source.as_bytes().as_slice())?;
-        {
-            let mut prefixes = write.open_table(BLOB_CARRIER_PREFIXES)?;
-            for key in &prefix_rows {
-                prefixes.remove(key.as_slice())?;
-            }
-        }
-        if !shared {
-            depot::retire_unshared_import_chunks_write(&write, variant)?;
-        }
-        let removed_rows = 1u64
-            .checked_add(
-                u64::try_from(prefix_rows.len())
-                    .map_err(|_| StoreError::ItemCountAccountingOverflow)?,
-            )
-            .ok_or(StoreError::ItemCountAccountingOverflow)?;
-        update_blob_network_staging_usage(
-            &write,
-            BlobNetworkStagingUsage {
-                rows: audit
-                    .staging
-                    .rows
-                    .checked_sub(removed_rows)
-                    .ok_or_else(|| {
-                        blob_error(BlobStoreError::SchemaInvariant(
-                            "Blob staging row counter underflows on source abort",
-                        ))
-                    })?,
-                bytes: audit
-                    .staging
-                    .bytes
-                    .checked_sub(removed_bytes)
-                    .ok_or_else(|| {
-                        blob_error(BlobStoreError::SchemaInvariant(
-                            "Blob staging byte counter underflows on source abort",
-                        ))
-                    })?,
-            },
-        )?;
+        remove_pending_source_rows_write(&write, staging, source, &pending)?;
         write.commit()?;
-        if !shared {
-            depot.reclaim_unmarked()?;
-        }
         Ok(true)
     }
 
@@ -2080,15 +2485,25 @@ impl Store {
     ) -> Result<BlobCarrierCommitOutcome, StoreError> {
         self.require_live()?;
         let authority = self.require_bound_mission()?;
+        let mut depot = BlobDepot::open_network_mutation(self, false)?;
         let (pending, staged) = {
             let read = self.database.begin_read()?;
-            inspect_blob_network_tables_read(&read)?;
             let pending = read
                 .open_table(BLOB_PENDING_SOURCES)?
                 .get(source.as_bytes().as_slice())?
                 .map(|value| decode_pending_blob_source(value.value()))
                 .transpose()?
                 .ok_or_else(|| blob_error(BlobStoreError::PendingSourceMissing))?;
+            if pending.metadata.transfer_id != source
+                || read
+                    .open_table(BLOB_PUBLICATIONS)?
+                    .get(source.as_bytes().as_slice())?
+                    .is_some()
+            {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "pending Blob source identity or visibility is inconsistent",
+                )));
+            }
             enforce_blob_policy_read(&read, authority, policy, &pending.metadata.header)?;
             require_pending_blob_plan(&pending, plan)?;
             let expected = pending_blob_carrier(&pending, object)
@@ -2113,7 +2528,28 @@ impl Store {
 
         let expected = pending_blob_carrier(&pending, object)
             .ok_or_else(|| blob_error(BlobStoreError::InvalidCarrierObjectId))?;
-        let mut depot = self.blob_depot()?;
+        #[cfg(test)]
+        if let Some((reached, release)) = self
+            .blob_carrier_commit_post_snapshot_gate
+            .lock()
+            .map_err(|_| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob carrier-commit post-snapshot gate lock is poisoned",
+                ))
+            })?
+            .take()
+        {
+            reached.send(()).map_err(|_| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob carrier-commit post-snapshot gate observer disappeared",
+                ))
+            })?;
+            release.recv().map_err(|_| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob carrier-commit post-snapshot gate release disappeared",
+                ))
+            })?;
+        }
         CoreBlobStore::begin_blob_with_lineage(
             &mut depot,
             plan.manifest(),
@@ -2154,12 +2590,10 @@ impl Store {
                 *plan.manifest_digest(),
             )?;
         }
-        drop(depot);
-
         if let Some(staged) = staged {
             let write = self.database.begin_write()?;
             enforce_live_write(&write)?;
-            let audit = audit_blob_network_tables_write(&write, Some(authority))?;
+            let staging = blob_network_staging_usage_write(&write, authority)?;
             let current_pending = write
                 .open_table(BLOB_PENDING_SOURCES)?
                 .get(source.as_bytes().as_slice())?
@@ -2184,12 +2618,12 @@ impl Store {
             update_blob_network_staging_usage(
                 &write,
                 BlobNetworkStagingUsage {
-                    rows: audit.staging.rows.checked_sub(1).ok_or_else(|| {
+                    rows: staging.rows.checked_sub(1).ok_or_else(|| {
                         blob_error(BlobStoreError::SchemaInvariant(
                             "Blob staging row counter underflows on carrier commit",
                         ))
                     })?,
-                    bytes: audit.staging.bytes.checked_sub(removed).ok_or_else(|| {
+                    bytes: staging.bytes.checked_sub(removed).ok_or_else(|| {
                         blob_error(BlobStoreError::SchemaInvariant(
                             "Blob staging byte counter underflows on carrier commit",
                         ))
@@ -2214,42 +2648,20 @@ impl Store {
     ) -> Result<Vec<BlobCarrierPrefixStatus>, StoreError> {
         self.require_live()?;
         let authority = self.require_bound_mission()?;
-        let pending = {
-            let read = self.database.begin_read()?;
-            let pending = read
-                .open_table(BLOB_PENDING_SOURCES)?
-                .get(source.as_bytes().as_slice())?
-                .map(|value| decode_pending_blob_source(value.value()))
-                .transpose()?
-                .ok_or_else(|| blob_error(BlobStoreError::PendingSourceMissing))?;
-            enforce_blob_policy_read(&read, authority, policy, &pending.metadata.header)?;
-            require_pending_blob_plan(&pending, plan)?;
-            pending
-        };
-        let mut depot = self.blob_depot()?;
-        CoreBlobStore::begin_blob_with_lineage(
-            &mut depot,
-            plan.manifest(),
-            plan.physical_lineage(),
-        )?;
-        let mut committed = BTreeSet::new();
-        for carrier in &pending.carriers {
-            let record = plan.chunk_records()[usize::try_from(carrier.index)
-                .map_err(|_| StoreError::ItemCountAccountingOverflow)?];
-            if CoreBlobStore::chunk_record(&mut depot, plan.manifest().id(), carrier.index)?
-                == Some(record)
-            {
-                committed.insert(carrier.object);
-            }
-        }
-        drop(depot);
-
         let read = self.database.begin_read()?;
+        let pending = read
+            .open_table(BLOB_PENDING_SOURCES)?
+            .get(source.as_bytes().as_slice())?
+            .map(|value| decode_pending_blob_source(value.value()))
+            .transpose()?
+            .ok_or_else(|| blob_error(BlobStoreError::PendingSourceMissing))?;
         enforce_blob_policy_read(&read, authority, policy, &pending.metadata.header)?;
+        require_pending_blob_plan(&pending, plan)?;
+        let committed = depot::committed_pending_plan_chunks_read(&read, plan)?;
         let prefixes = read.open_table(BLOB_CARRIER_PREFIXES)?;
         let mut work = Vec::new();
         for carrier in &pending.carriers {
-            if committed.contains(&carrier.object) {
+            if committed.contains(&carrier.index) {
                 continue;
             }
             let key = blob_carrier_prefix_key(source, carrier.object);
@@ -2296,6 +2708,7 @@ impl Store {
     pub fn read_completed_blob_carrier_range_with_policy(
         &self,
         policy: &ControlPolicySnapshot,
+        completion: &BlobDepotCompletion,
         lineage: &CurrentBlobLineage,
         source: BlobTransferId,
         object: BlobCarrierObjectId,
@@ -2316,47 +2729,107 @@ impl Store {
             || lineage.blob_id() != plan.manifest().id()
             || lineage.manifest_digest() != plan.manifest_digest()
             || lineage.physical_lineage() != plan.physical_lineage()
+            || completion.variant_id()
+                != blob_variant_id(
+                    plan.manifest().id(),
+                    plan.manifest().content_group(),
+                    plan.manifest().content_epoch(),
+                )
+            || completion.blob_id() != plan.manifest().id()
+            || completion.content_epoch() != plan.manifest().content_epoch()
+            || completion.manifest_digest() != plan.manifest_digest()
+            || completion.physical_lineage() != plan.physical_lineage().binding()
+            || completion.total_len() != plan.manifest().total_len()
+            || completion.chunk_size() != plan.manifest().chunk_size()
+            || completion.chunk_count() != plan.manifest().chunk_count()
         {
             return Err(blob_error(BlobStoreError::CompletionMismatch));
         }
-        let stored = {
+        let carrier_total = plan
+            .carrier_total_len(object.as_bytes())
+            .map_err(|error| blob_error(BlobStoreError::Verification(error.to_string())))?;
+        let range_bound = u64::try_from(MAX_BLOB_NETWORK_RANGE_BYTES)
+            .map_err(|_| StoreError::ItemCountAccountingOverflow)?;
+        let expected_len = carrier_total
+            .checked_sub(offset)
+            .filter(|remaining| *remaining > 0)
+            .map(|remaining| remaining.min(range_bound));
+        if !offset.is_multiple_of(range_bound)
+            || expected_len
+                != Some(
+                    u64::try_from(max_bytes)
+                        .map_err(|_| StoreError::ItemCountAccountingOverflow)?,
+                )
+        {
+            return Err(blob_error(BlobStoreError::InvalidCarrierRange(
+                "served range is not the canonical output-coupled carrier page",
+            )));
+        }
+        let initial_stored = {
             let read = self.database.begin_read()?;
             require_control_policy_read(&read, authority, policy)?;
-            let stored = load_blob_from_read(&read, source)?;
+            let stored =
+                completed_blob_range_source_snapshot_read(&read, source).map_err(|error| {
+                    blob_preflight_decode_error(error, "completed Blob range source is malformed")
+                })?;
             let Some(stored) = stored else {
                 return Ok(None);
             };
-            enforce_blob_policy_read(&read, authority, policy, &stored.header)?;
-            if stored.blob_id != plan.manifest().id()
-                || stored.manifest_digest != *plan.manifest_digest()
-                || stored.route_lineage != Some(*lineage.route_lineage().binding())
-                || stored.physical_lineage != Some(*lineage.physical_lineage().binding())
+            enforce_blob_policy_read(&read, authority, policy, &stored.metadata.header)?;
+            if stored.metadata.variant_id != completion.variant_id()
+                || stored.projection.blob_id != plan.manifest().id()
+                || stored.projection.manifest_digest != *plan.manifest_digest()
+                || stored.projection.route_lineage != *lineage.route_lineage().binding()
+                || stored.projection.physical_lineage != *lineage.physical_lineage().binding()
+                || stored.projection.total_len != plan.manifest().total_len()
+                || stored.projection.chunk_size != plan.manifest().chunk_size()
+                || stored.projection.chunk_count != plan.manifest().chunk_count()
             {
                 return Err(blob_error(BlobStoreError::CompletionMismatch));
             }
             stored
         };
-        let _ = stored;
-        let mut depot = self.blob_depot()?;
-        CoreBlobStore::begin_blob_with_lineage(
-            &mut depot,
-            plan.manifest(),
-            plan.physical_lineage(),
-        )?;
+        let carrier_index = plan
+            .carrier_index(object.as_bytes())
+            .map_err(|error| blob_error(BlobStoreError::Verification(error.to_string())))?;
+        let mut depot = self.blob_depot_for_authenticated_read(completion)?;
+        depot.recheck_completion_range(completion, carrier_index, 1)?;
         let range = plan
             .read_carrier_range(&mut depot, object.as_bytes(), offset, max_bytes)
             .map_err(|error| blob_error(BlobStoreError::Verification(error.to_string())))?;
         drop(depot);
+        #[cfg(test)]
+        if let Some((reached, release)) = self
+            .blob_carrier_range_post_read_gate
+            .lock()
+            .map_err(|_| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob carrier-range post-read gate lock is poisoned",
+                ))
+            })?
+            .take()
+        {
+            reached.send(()).map_err(|_| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob carrier-range post-read gate observer disappeared",
+                ))
+            })?;
+            release.recv().map_err(|_| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob carrier-range post-read gate release disappeared",
+                ))
+            })?;
+        }
         let read = self.database.begin_read()?;
         require_control_policy_read(&read, authority, policy)?;
-        let stored = load_blob_from_read(&read, source)?
-            .ok_or_else(|| blob_error(BlobStoreError::ReadPlanChanged))?;
-        enforce_blob_policy_read(&read, authority, policy, &stored.header)?;
-        if stored.route_lineage != Some(*lineage.route_lineage().binding())
-            || stored.physical_lineage != Some(*lineage.physical_lineage().binding())
-            || stored.manifest_digest != *plan.manifest_digest()
-        {
-            return Err(blob_error(BlobStoreError::ReadPlanChanged));
+        let stored = completed_blob_range_source_snapshot_read(&read, source)
+            .map_err(|error| {
+                blob_preflight_decode_error(error, "completed Blob range source is malformed")
+            })?
+            .ok_or_else(|| blob_error(BlobStoreError::CompletionMismatch))?;
+        enforce_blob_policy_read(&read, authority, policy, &stored.metadata.header)?;
+        if stored != initial_stored {
+            return Err(blob_error(BlobStoreError::CompletionMismatch));
         }
         Ok(Some(range))
     }
@@ -2396,6 +2869,51 @@ impl Store {
             return Err(blob_error(BlobStoreError::CompletionMismatch));
         }
 
+        // Capacity-deferred retries must not repeatedly scan an already
+        // completed 64-MiB depot. This read-only redb preflight binds the
+        // exact pending source, plan, and current policy, then checks every
+        // ordinary publication capacity gate. The final write transaction
+        // repeats all checks after the physical completion proof.
+        {
+            let preflight = self.database.begin_read()?;
+            require_control_policy_read(&preflight, authority, policy)?;
+            let pending = preflight
+                .open_table(BLOB_PENDING_SOURCES)?
+                .get(source.as_bytes().as_slice())?
+                .map(|value| decode_pending_blob_source(value.value()))
+                .transpose()?;
+            let accepted = preflight
+                .open_table(BLOB_PUBLICATIONS)?
+                .get(source.as_bytes().as_slice())?
+                .is_some();
+            if pending.is_none() && !accepted {
+                return Err(blob_error(BlobStoreError::PendingSourceMissing));
+            }
+            if let Some(pending) = pending.as_ref() {
+                require_pending_blob_plan(pending, plan)?;
+                enforce_blob_policy_read(&preflight, authority, policy, &pending.metadata.header)?;
+                if pending.metadata.transfer_id != source
+                    || pending.metadata.blob_id != plan.manifest().id()
+                    || pending.metadata.manifest_digest != *plan.manifest_digest()
+                    || pending.metadata.route_lineage != Some(*lineage.route_lineage().binding())
+                    || pending.metadata.physical_lineage
+                        != Some(*lineage.physical_lineage().binding())
+                    || BlobTransferId::new(Sha256::digest(&pending.sealed).into()) != source
+                {
+                    return Err(blob_error(BlobStoreError::CompletionMismatch));
+                }
+                if !accepted {
+                    require_blob_apply_capacity_read(
+                        &preflight,
+                        self.limits,
+                        &pending.metadata,
+                        u64::try_from(pending.sealed.len())
+                            .map_err(|_| StoreError::PayloadByteAccountingOverflow)?,
+                    )?;
+                }
+            }
+        }
+
         let _depot_guard = self
             .blob_depot_lock
             .lock()
@@ -2405,7 +2923,7 @@ impl Store {
 
         let write = self.database.begin_write()?;
         enforce_live_write(&write)?;
-        let audit = audit_blob_network_tables_write(&write, Some(authority))?;
+        let staging = blob_network_staging_usage_write(&write, authority)?;
         let pending = write
             .open_table(BLOB_PENDING_SOURCES)?
             .get(source.as_bytes().as_slice())?
@@ -2478,7 +2996,7 @@ impl Store {
             }
             remove_pending_source_rows_write(
                 &write,
-                audit,
+                staging,
                 source,
                 pending.as_ref().expect("pending branch"),
             )?;
@@ -2541,15 +3059,25 @@ impl Store {
             &metadata.header.scope,
             metadata.blob_id,
         )?;
+        let content_upper = blob_content_prefix_upper_bound(&content_prefix)?;
         let mut publication_count = 0usize;
-        for row in write.open_table(BLOB_CONTENT_INDEX)?.iter()? {
-            let (key, _) = row?;
-            if key.value().starts_with(&content_prefix) {
-                publication_count = publication_count
-                    .checked_add(1)
-                    .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        let content = write.open_table(BLOB_CONTENT_INDEX)?;
+        for row in content.range::<&[u8]>((
+            std::ops::Bound::<&[u8]>::Included(content_prefix.as_slice()),
+            std::ops::Bound::<&[u8]>::Excluded(content_upper.as_slice()),
+        ))? {
+            let _ = row?;
+            #[cfg(test)]
+            TEST_BLOB_CAPACITY_CONTENT_ROWS_VISITED
+                .with(|count| count.set(count.get().saturating_add(1)));
+            publication_count = publication_count
+                .checked_add(1)
+                .ok_or(StoreError::ItemCountAccountingOverflow)?;
+            if publication_count >= MAX_BLOB_PUBLICATIONS_PER_CONTENT {
+                break;
             }
         }
+        drop(content);
         if publication_count >= MAX_BLOB_PUBLICATIONS_PER_CONTENT {
             return Err(blob_error(BlobStoreError::PublicationLimitExceeded {
                 current: publication_count,
@@ -2625,7 +3153,7 @@ impl Store {
         )?;
         remove_pending_source_rows_write(
             &write,
-            audit,
+            staging,
             source,
             pending.as_ref().expect("pending branch"),
         )?;
@@ -2782,14 +3310,22 @@ impl Store {
             &prepared.header.scope,
             prepared.blob_id,
         )?;
+        let content_upper = blob_content_prefix_upper_bound(&content_prefix)?;
         let content = write.open_table(BLOB_CONTENT_INDEX)?;
         let mut publication_count = 0usize;
-        for row in content.iter()? {
-            let (key, _) = row?;
-            if key.value().starts_with(&content_prefix) {
-                publication_count = publication_count
-                    .checked_add(1)
-                    .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        for row in content.range::<&[u8]>((
+            std::ops::Bound::<&[u8]>::Included(content_prefix.as_slice()),
+            std::ops::Bound::<&[u8]>::Excluded(content_upper.as_slice()),
+        ))? {
+            let _ = row?;
+            #[cfg(test)]
+            TEST_BLOB_CAPACITY_CONTENT_ROWS_VISITED
+                .with(|count| count.set(count.get().saturating_add(1)));
+            publication_count = publication_count
+                .checked_add(1)
+                .ok_or(StoreError::ItemCountAccountingOverflow)?;
+            if publication_count >= MAX_BLOB_PUBLICATIONS_PER_CONTENT {
+                break;
             }
         }
         drop(content);
@@ -3084,9 +3620,215 @@ fn blob_header_is_current_read(
     Ok(header.key_epoch == current_epoch)
 }
 
+fn durable_blob_source_shape_read(
+    read: &redb::ReadTransaction,
+    metadata: &BlobMetadata,
+    completed: bool,
+) -> Result<depot::BlobSourceShape, StoreError> {
+    let route = metadata.header.blob_route.ok_or_else(|| {
+        blob_error(BlobStoreError::SchemaInvariant(
+            "retained Blob source is missing its authenticated route commitment",
+        ))
+    })?;
+    let physical_lineage = metadata
+        .physical_lineage
+        .ok_or_else(|| blob_error(BlobStoreError::PhysicalLineageMigrationRequired))?;
+    depot::blob_source_shape_read(
+        read,
+        metadata.variant_id,
+        metadata.blob_id,
+        metadata.header.key_epoch,
+        physical_lineage,
+        metadata.manifest_digest,
+        route.chunk_count(),
+        completed,
+    )
+}
+
+fn require_blob_apply_capacity_read(
+    read: &redb::ReadTransaction,
+    limits: StoreLimits,
+    metadata: &BlobMetadata,
+    incoming: u64,
+) -> Result<(), StoreError> {
+    let frontier_prefix = event_domain_prefix(&metadata.header.topic, &metadata.header.scope)?;
+    let frontier_upper = blob_content_prefix_upper_bound(&frontier_prefix)?;
+    let frontier = read.open_table(CAUSAL_FRONTIER)?;
+    let mut direct_publishers = 0usize;
+    let mut incoming_present = false;
+    for row in frontier.range::<&[u8]>((
+        std::ops::Bound::<&[u8]>::Included(frontier_prefix.as_slice()),
+        std::ops::Bound::<&[u8]>::Excluded(frontier_upper.as_slice()),
+    ))? {
+        let (key, value) = row?;
+        let key = key.value();
+        if key.len() != frontier_prefix.len() + 32 || value.value() == 0 {
+            return Err(StoreError::SemanticInvariant(
+                "causal frontier contains an invalid row",
+            ));
+        }
+        direct_publishers = direct_publishers
+            .checked_add(1)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        if key[frontier_prefix.len()..] == metadata.header.stamp.dot.publisher {
+            incoming_present = true;
+        }
+    }
+    if direct_publishers > MAX_CAUSAL_CONTEXT_ENTRIES {
+        return Err(StoreError::SemanticInvariant(
+            "causal frontier exceeds the proven context bound",
+        ));
+    }
+    if !incoming_present && direct_publishers == MAX_CAUSAL_CONTEXT_ENTRIES {
+        return Err(blob_error(BlobStoreError::CausalFrontierLimitExceeded {
+            current: direct_publishers,
+            limit: MAX_CAUSAL_CONTEXT_ENTRIES,
+        }));
+    }
+
+    let content_prefix = blob_content_prefix(
+        &metadata.header.topic,
+        &metadata.header.scope,
+        metadata.blob_id,
+    )?;
+    let content_upper = blob_content_prefix_upper_bound(&content_prefix)?;
+    let content = read.open_table(BLOB_CONTENT_INDEX)?;
+    let mut publication_count = 0usize;
+    for row in content.range::<&[u8]>((
+        std::ops::Bound::<&[u8]>::Included(content_prefix.as_slice()),
+        std::ops::Bound::<&[u8]>::Excluded(content_upper.as_slice()),
+    ))? {
+        let _ = row?;
+        #[cfg(test)]
+        TEST_BLOB_CAPACITY_CONTENT_ROWS_VISITED
+            .with(|count| count.set(count.get().saturating_add(1)));
+        publication_count = publication_count
+            .checked_add(1)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        if publication_count >= MAX_BLOB_PUBLICATIONS_PER_CONTENT {
+            break;
+        }
+    }
+    if publication_count >= MAX_BLOB_PUBLICATIONS_PER_CONTENT {
+        return Err(blob_error(BlobStoreError::PublicationLimitExceeded {
+            current: publication_count,
+            limit: MAX_BLOB_PUBLICATIONS_PER_CONTENT,
+        }));
+    }
+
+    let aggregate = read.open_table(METADATA)?;
+    let total = aggregate_usage(&aggregate)?;
+    if total
+        .items
+        .checked_add(1)
+        .ok_or(StoreError::ItemCountAccountingOverflow)?
+        > limits.max_items()
+    {
+        return Err(StoreError::ItemLimitExceeded {
+            current: total.items,
+            limit: limits.max_items(),
+        });
+    }
+    if total
+        .bytes
+        .checked_add(incoming)
+        .ok_or(StoreError::PayloadByteAccountingOverflow)?
+        > limits.max_total_payload_bytes()
+    {
+        return Err(StoreError::PayloadByteLimitExceeded {
+            current: total.bytes,
+            incoming,
+            limit: limits.max_total_payload_bytes(),
+        });
+    }
+    let control = CustodyUsage {
+        items: aggregate
+            .get(CONTROL_ITEM_COUNT)?
+            .map_or(0, |value| value.value()),
+        bytes: aggregate
+            .get(CONTROL_TOTAL_BYTES)?
+            .map_or(0, |value| value.value())
+            .checked_add(
+                aggregate
+                    .get(CONTROL_PUBLICATION_INTENT_TOTAL_BYTES)?
+                    .map_or(0, |value| value.value()),
+            )
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?,
+    };
+    let tombstone_payload = custody::selected_tombstone_payload_usage_read(read)?;
+    let tombstone = CustodyUsage {
+        items: tombstone_payload
+            .items
+            .checked_add(
+                aggregate
+                    .get(EVENT_TOMBSTONE_OPERATION_COUNT)?
+                    .map_or(0, |value| value.value()),
+            )
+            .ok_or(StoreError::ItemCountAccountingOverflow)?,
+        bytes: tombstone_payload
+            .bytes
+            .checked_add(
+                aggregate
+                    .get(EVENT_TOMBSTONE_OPERATION_TOTAL_BYTES)?
+                    .map_or(0, |value| value.value()),
+            )
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?,
+    };
+    let ordinary = CustodyUsage {
+        items: total
+            .items
+            .checked_sub(control.items)
+            .and_then(|value| value.checked_sub(tombstone.items))
+            .ok_or(StoreError::SemanticInvariant(
+                "classified aggregate item accounting exceeds total usage",
+            ))?,
+        bytes: total
+            .bytes
+            .checked_sub(control.bytes)
+            .and_then(|value| value.checked_sub(tombstone.bytes))
+            .ok_or(StoreError::SemanticInvariant(
+                "classified aggregate byte accounting exceeds total usage",
+            ))?,
+    };
+    let (item_reserve, byte_reserve) = custody::custody_emergency_reserve(limits);
+    let max_items = limits
+        .max_items()
+        .checked_sub(item_reserve)
+        .ok_or(StoreError::ItemCountAccountingOverflow)?;
+    if ordinary
+        .items
+        .checked_add(1)
+        .ok_or(StoreError::ItemCountAccountingOverflow)?
+        > max_items
+    {
+        return Err(StoreError::ItemLimitExceeded {
+            current: ordinary.items,
+            limit: max_items,
+        });
+    }
+    let max_bytes = limits
+        .max_total_payload_bytes()
+        .checked_sub(byte_reserve)
+        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    if ordinary
+        .bytes
+        .checked_add(incoming)
+        .ok_or(StoreError::PayloadByteAccountingOverflow)?
+        > max_bytes
+    {
+        return Err(StoreError::PayloadByteLimitExceeded {
+            current: ordinary.bytes,
+            incoming,
+            limit: max_bytes,
+        });
+    }
+    Ok(())
+}
+
 fn blob_source_projection(
     metadata: &BlobMetadata,
     sealed_len: u64,
+    shape: depot::BlobSourceShape,
 ) -> Result<BlobSourceProjection, StoreError> {
     let route_lineage = metadata
         .route_lineage
@@ -3094,11 +3836,34 @@ fn blob_source_projection(
     let physical_lineage = metadata
         .physical_lineage
         .ok_or_else(|| blob_error(BlobStoreError::PhysicalLineageMigrationRequired))?;
+    let route = metadata.header.blob_route.ok_or_else(|| {
+        blob_error(BlobStoreError::SchemaInvariant(
+            "retained Blob source is missing its authenticated route commitment",
+        ))
+    })?;
+    let expected_chunks = shape
+        .total_len
+        .checked_add(u64::from(shape.chunk_size).saturating_sub(1))
+        .filter(|_| shape.chunk_size != 0)
+        .map(|bytes| bytes / u64::from(shape.chunk_size));
+    if shape.total_len == 0
+        || shape.chunk_size != SELECTED_BLOB_CHUNK_SIZE
+        || shape.chunk_count == 0
+        || shape.chunk_count != route.chunk_count()
+        || expected_chunks != Some(shape.chunk_count)
+    {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "retained Blob source has a noncanonical durable content shape",
+        )));
+    }
     let encoded = encode_blob_metadata(metadata.clone())?;
     let mut digest = Sha256::new();
     digest.update(BLOB_SOURCE_PROJECTION_DOMAIN);
     digest.update(&encoded);
     digest.update(sealed_len.to_be_bytes());
+    digest.update(shape.total_len.to_be_bytes());
+    digest.update(shape.chunk_size.to_be_bytes());
+    digest.update(shape.chunk_count.to_be_bytes());
     Ok(BlobSourceProjection {
         transfer_id: metadata.transfer_id,
         semantic_id: metadata.semantic_id,
@@ -3111,6 +3876,9 @@ fn blob_source_projection(
         physical_lineage,
         manifest_digest: metadata.manifest_digest,
         blob_id: metadata.blob_id,
+        total_len: shape.total_len,
+        chunk_size: shape.chunk_size,
+        chunk_count: shape.chunk_count,
         metadata_fingerprint: digest.finalize().into(),
     })
 }
@@ -3176,13 +3944,16 @@ fn blob_read_plan_read(
     blob_id: BlobId,
 ) -> Result<BlobReadPlan, StoreError> {
     let prefix = blob_content_prefix(topic, scope, blob_id)?;
+    let upper = blob_content_prefix_upper_bound(&prefix)?;
     let content = read.open_table(BLOB_CONTENT_INDEX)?;
     let mut rows = Vec::new();
-    for row in content.iter()? {
+    for row in content.range::<&[u8]>((
+        std::ops::Bound::<&[u8]>::Included(prefix.as_slice()),
+        std::ops::Bound::<&[u8]>::Excluded(upper.as_slice()),
+    ))? {
         let (key, value) = row?;
-        if !key.value().starts_with(&prefix) {
-            continue;
-        }
+        #[cfg(test)]
+        TEST_BLOB_READ_PLAN_ROWS_VISITED.with(|count| count.set(count.get().saturating_add(1)));
         if rows.len() >= MAX_BLOB_PUBLICATIONS_PER_CONTENT {
             return Err(blob_error(BlobStoreError::PublicationLimitExceeded {
                 current: rows.len() + 1,
@@ -3190,13 +3961,13 @@ fn blob_read_plan_read(
             }));
         }
         let transfer = parse_blob_transfer_id("Blob content index", value.value())?;
-        rows.push(load_blob_from_read(read, transfer)?.ok_or_else(|| {
-            blob_error(BlobStoreError::SchemaInvariant(
-                "Blob content index points to a missing publication",
-            ))
-        })?);
+        rows.push(blob_read_candidate_projection_read(
+            read,
+            transfer,
+            key.value(),
+        )?);
     }
-    rows.sort_by_key(|blob| blob.semantic_id);
+    rows.sort_by_key(|candidate| candidate.projection.semantic_id);
     let current_epoch = read
         .open_table(CONTROL_SCOPE_EPOCHS)?
         .get(scope.as_str())?
@@ -3204,30 +3975,30 @@ fn blob_read_plan_read(
         .transpose()?
         .map_or(1, |(epoch, _)| epoch);
     let mut active = Vec::with_capacity(rows.len());
-    for blob in &rows {
+    for candidate in &rows {
         active.push(
-            blob.header.key_epoch == current_epoch
-                && !control_principal_revoked_read(read, blob.header.stamp.dot.publisher)?,
+            candidate.projection.epoch == current_epoch
+                && !control_principal_revoked_read(read, candidate.projection.publisher)?,
         );
     }
     let selected = rows
         .iter()
         .zip(&active)
         .filter(|(_, active)| **active)
-        .map(|(blob, _)| blob.semantic_id)
+        .map(|(candidate, _)| candidate.projection.semantic_id)
         .max();
     let candidates = rows
         .into_iter()
         .zip(active)
-        .map(|(blob, active)| BlobReadCandidate {
-            disposition: if !active {
+        .map(|(mut candidate, active)| {
+            candidate.disposition = if !active {
                 None
-            } else if Some(blob.semantic_id) == selected {
+            } else if Some(candidate.projection.semantic_id) == selected {
                 Some(BlobPublicationDisposition::Current)
             } else {
                 Some(BlobPublicationDisposition::Alternate)
-            },
-            blob,
+            };
+            candidate
         })
         .collect();
     Ok(BlobReadPlan {
@@ -3237,6 +4008,107 @@ fn blob_read_plan_read(
         blob_id,
         candidates,
     })
+}
+
+fn blob_read_candidate_projection_read(
+    read: &redb::ReadTransaction,
+    transfer_id: BlobTransferId,
+    indexed_content_key: &[u8],
+) -> Result<BlobReadCandidate, StoreError> {
+    let metadata = read
+        .open_table(BLOB_PUBLICATIONS)?
+        .get(transfer_id.as_bytes().as_slice())?
+        .map(|value| decode_blob_metadata(value.value()))
+        .transpose()?
+        .ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Blob content index points to a missing publication",
+            ))
+        })?;
+    if metadata.transfer_id != transfer_id
+        || blob_content_key(
+            &metadata.header.topic,
+            &metadata.header.scope,
+            metadata.blob_id,
+            metadata.semantic_id,
+        )? != indexed_content_key
+    {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob content index disagrees with its exact publication",
+        )));
+    }
+    let sealed_len = {
+        let bytes = read.open_table(BLOB_BYTES)?;
+        let sealed = bytes
+            .get(transfer_id.as_bytes().as_slice())?
+            .ok_or_else(|| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob publication is missing exact source bytes",
+                ))
+            })?;
+        u64::try_from(sealed.value().len())
+            .map_err(|_| StoreError::PayloadByteAccountingOverflow)?
+    };
+    let acceptance_marker = read
+        .open_table(BLOB_ACCEPTANCE_MARKERS)?
+        .get(transfer_id.as_bytes().as_slice())?
+        .map(|value| value.value())
+        .ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Blob publication is missing its acceptance marker",
+            ))
+        })?;
+    if acceptance_marker == 0 {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob publication has an invalid acceptance marker",
+        )));
+    }
+    let shape = durable_blob_source_shape_read(read, &metadata, true)?;
+    Ok(BlobReadCandidate {
+        projection: blob_source_projection(&metadata, sealed_len, shape)?,
+        acceptance_marker,
+        disposition: None,
+    })
+}
+
+fn completed_blob_range_source_snapshot_read(
+    read: &redb::ReadTransaction,
+    transfer_id: BlobTransferId,
+) -> Result<Option<CompletedBlobRangeSourceSnapshot>, StoreError> {
+    let Some(metadata) = read
+        .open_table(BLOB_PUBLICATIONS)?
+        .get(transfer_id.as_bytes().as_slice())?
+        .map(|value| decode_blob_metadata(value.value()))
+        .transpose()?
+    else {
+        return Ok(None);
+    };
+    if metadata.transfer_id != transfer_id {
+        return Err(blob_error(BlobStoreError::CompletionMismatch));
+    }
+    let sealed_len = {
+        let bytes = read.open_table(BLOB_BYTES)?;
+        let sealed = bytes
+            .get(transfer_id.as_bytes().as_slice())?
+            .ok_or_else(|| blob_error(BlobStoreError::CompletionMismatch))?;
+        if BlobTransferId::new(Sha256::digest(sealed.value()).into()) != transfer_id {
+            return Err(blob_error(BlobStoreError::CompletionMismatch));
+        }
+        u64::try_from(sealed.value().len())
+            .map_err(|_| StoreError::PayloadByteAccountingOverflow)?
+    };
+    let acceptance_marker = read
+        .open_table(BLOB_ACCEPTANCE_MARKERS)?
+        .get(transfer_id.as_bytes().as_slice())?
+        .map(|value| value.value())
+        .filter(|marker| *marker != 0)
+        .ok_or_else(|| blob_error(BlobStoreError::CompletionMismatch))?;
+    let shape = durable_blob_source_shape_read(read, &metadata, true)?;
+    Ok(Some(CompletedBlobRangeSourceSnapshot {
+        projection: blob_source_projection(&metadata, sealed_len, shape)?,
+        metadata,
+        acceptance_marker,
+    }))
 }
 
 fn load_blob_from_read(
@@ -3253,7 +4125,12 @@ fn load_blob_from_read(
             let sealed = read
                 .open_table(BLOB_BYTES)?
                 .get(transfer_id.as_bytes().as_slice())?
-                .map(|value| value.value().to_vec())
+                .map(|value| {
+                    #[cfg(test)]
+                    TEST_BLOB_SOURCE_BYTES_LOADED
+                        .with(|count| count.set(count.get().saturating_add(1)));
+                    value.value().to_vec()
+                })
                 .ok_or_else(|| {
                     blob_error(BlobStoreError::SchemaInvariant(
                         "Blob publication is missing exact source bytes",
@@ -4285,6 +5162,8 @@ fn audit_blob_network_rows(
     chunks: &impl ReadableTable<&'static [u8], &'static [u8]>,
     mission_authority: Option<NodeId>,
 ) -> Result<BlobNetworkAudit, StoreError> {
+    #[cfg(test)]
+    TEST_BLOB_NETWORK_GLOBAL_AUDITS.with(|count| count.set(count.get().saturating_add(1)));
     let pending_sources = pending.len()?;
     let carrier_prefixes = carriers.len()?;
     let rows = pending_sources
@@ -4434,14 +5313,6 @@ fn audit_blob_network_rows(
     })
 }
 
-fn audit_blob_network_tables_write(
-    write: &redb::WriteTransaction,
-    mission_authority: Option<NodeId>,
-) -> Result<BlobNetworkAudit, StoreError> {
-    let publications = write.open_table(BLOB_PUBLICATIONS)?;
-    audit_blob_network_tables_write_with_publications(write, mission_authority, &publications)
-}
-
 fn audit_blob_network_tables_write_with_publications(
     write: &redb::WriteTransaction,
     mission_authority: Option<NodeId>,
@@ -4465,13 +5336,6 @@ fn audit_blob_network_tables_write_with_publications(
     )
 }
 
-fn inspect_blob_network_tables_read(
-    read: &redb::ReadTransaction,
-) -> Result<BlobNetworkAudit, StoreError> {
-    let publications = read.open_table(BLOB_PUBLICATIONS)?;
-    inspect_blob_network_tables_read_with_publications(read, &publications)
-}
-
 fn inspect_blob_network_tables_read_with_publications(
     read: &redb::ReadTransaction,
     publications: &impl ReadableTable<&'static [u8], &'static [u8]>,
@@ -4492,6 +5356,85 @@ fn inspect_blob_network_tables_read_with_publications(
         &chunks,
         read_mission_binding_read(read)?,
     )
+}
+
+/// Rechecks only the durable authority and aggregate staging counters needed
+/// by one exact network mutation. A full row audit is performed when the Store
+/// opens; every hot mutation subsequently updates these counters atomically
+/// with its touched rows.
+fn blob_network_staging_usage_write(
+    write: &redb::WriteTransaction,
+    authority: NodeId,
+) -> Result<BlobNetworkStagingUsage, StoreError> {
+    match read_mission_binding(write)? {
+        Some(bound) if bound == authority => {}
+        Some(bound) => {
+            return Err(StoreError::MissionAuthorityMismatch {
+                bound,
+                received: authority,
+            });
+        }
+        None => return Err(StoreError::MissionNotBound),
+    }
+    let metadata = write.open_table(BLOB_NETWORK_METADATA)?;
+    if metadata.len()? != 3
+        || metadata
+            .get(BLOB_NETWORK_SCHEMA_VERSION_FIELD)?
+            .map(|value| value.value())
+            != Some(BLOB_NETWORK_SCHEMA_VERSION)
+    {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob network metadata schema is incomplete or unknown",
+        )));
+    }
+    let rows = metadata
+        .get(BLOB_NETWORK_STAGING_ROWS)?
+        .map(|value| value.value())
+        .ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Blob network row counter is missing",
+            ))
+        })?;
+    let bytes = metadata
+        .get(BLOB_NETWORK_STAGING_BYTES)?
+        .map(|value| value.value())
+        .ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Blob network byte counter is missing",
+            ))
+        })?;
+    if rows > MAX_BLOB_NETWORK_STAGING_ROWS || bytes > MAX_BLOB_NETWORK_STAGING_BYTES {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob network staging counters exceed their durable caps",
+        )));
+    }
+    Ok(BlobNetworkStagingUsage { rows, bytes })
+}
+
+fn blob_carrier_cursor_count_write(
+    write: &redb::WriteTransaction,
+    authority: NodeId,
+) -> Result<u64, StoreError> {
+    match read_mission_binding(write)? {
+        Some(bound) if bound == authority => {}
+        Some(bound) => {
+            return Err(StoreError::MissionAuthorityMismatch {
+                bound,
+                received: authority,
+            });
+        }
+        None => return Err(StoreError::MissionNotBound),
+    }
+    let count = write.open_table(BLOB_CARRIER_FETCH_CURSORS)?.len()?;
+    if count
+        > u64::try_from(MAX_BLOB_CARRIER_FETCH_CURSOR_PEERS)
+            .map_err(|_| StoreError::ItemCountAccountingOverflow)?
+    {
+        return Err(blob_error(BlobStoreError::CarrierCursorInvariant(
+            "carrier cursor table exceeds its peer bound",
+        )));
+    }
+    Ok(count)
 }
 
 pub(crate) const fn depot_owner_token_fields() -> [&'static str; 4] {
@@ -4917,16 +5860,44 @@ fn decode_pending_blob_source(bytes: &[u8]) -> Result<PendingBlobSourceRecord, S
     })
 }
 
+fn current_pending_projection_read(
+    read: &redb::ReadTransaction,
+    key: &[u8],
+    value: &[u8],
+) -> Result<Option<BlobSourceProjection>, StoreError> {
+    let source = parse_blob_transfer_id("pending Blob source table", key)?;
+    let pending = decode_pending_blob_source(value)?;
+    if pending.metadata.transfer_id != source {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "pending Blob source key differs from its exact metadata",
+        )));
+    }
+    if !blob_header_is_current_read(read, &pending.metadata.header)? {
+        return Ok(None);
+    }
+    let sealed_len = u64::try_from(pending.sealed.len())
+        .map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
+    let shape = durable_blob_source_shape_read(read, &pending.metadata, false)?;
+    Ok(Some(blob_source_projection(
+        &pending.metadata,
+        sealed_len,
+        shape,
+    )?))
+}
+
 fn encode_blob_carrier_prefix(record: &BlobCarrierPrefixRecord) -> Result<Vec<u8>, StoreError> {
+    let prefix_len = u64::try_from(record.prefix.len()).ok();
+    let range_bound = u64::try_from(MAX_BLOB_NETWORK_RANGE_BYTES)
+        .map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
     if record.total_len == 0
         || record.total_len > MAX_BLOB_NETWORK_CARRIER_BYTES
         || record.prefix.is_empty()
-        || u64::try_from(record.prefix.len())
-            .ok()
-            .is_none_or(|length| length > record.total_len)
+        || prefix_len.is_none_or(|length| {
+            length > record.total_len || (length < record.total_len && length % range_bound != 0)
+        })
     {
         return Err(blob_error(BlobStoreError::InvalidCarrierRange(
-            "durable prefix length or total is outside its bound",
+            "durable prefix is neither aligned partial progress nor an exact complete tail",
         )));
     }
     let prefix_len = u32::try_from(record.prefix.len()).map_err(|_| {
@@ -4975,6 +5946,14 @@ fn decode_blob_carrier_prefix(bytes: &[u8]) -> Result<BlobCarrierPrefixRecord, S
         ))
     })?;
     Ok(record)
+}
+
+fn canonical_blob_carrier_range_len(total_len: u64, offset: u64) -> Option<usize> {
+    let bound = u64::try_from(MAX_BLOB_NETWORK_RANGE_BYTES).ok()?;
+    if total_len == 0 || offset >= total_len || !offset.is_multiple_of(bound) {
+        return None;
+    }
+    usize::try_from((total_len - offset).min(bound)).ok()
 }
 
 fn staging_entry_bytes(key_len: usize, value_len: usize) -> Result<u64, StoreError> {
@@ -5056,7 +6035,7 @@ fn pending_blob_source_projection(record: PendingBlobSourceRecord) -> PendingBlo
 
 fn remove_pending_source_rows_write(
     write: &redb::WriteTransaction,
-    audit: BlobNetworkAudit,
+    staging: BlobNetworkStagingUsage,
     source: BlobTransferId,
     expected: &PendingBlobSourceRecord,
 ) -> Result<(), StoreError> {
@@ -5068,16 +6047,28 @@ fn remove_pending_source_rows_write(
     if decode_pending_blob_source(&encoded_pending)? != *expected {
         return Err(blob_error(BlobStoreError::PendingSourceConflict));
     }
-    let mut prefix_rows = Vec::new();
+    if expected.metadata.transfer_id != source {
+        return Err(blob_error(BlobStoreError::PendingSourceConflict));
+    }
+    let mut prefix_rows = Vec::with_capacity(expected.carriers.len());
     let mut removed_bytes = staging_entry_bytes(32, encoded_pending.len())?;
-    for row in write.open_table(BLOB_CARRIER_PREFIXES)?.iter()? {
-        let (key, value) = row?;
-        let (row_source, _) = parse_blob_carrier_prefix_key(key.value())?;
-        if row_source == source {
+    for carrier in &expected.carriers {
+        let key = blob_carrier_prefix_key(source, carrier.object);
+        let encoded = write
+            .open_table(BLOB_CARRIER_PREFIXES)?
+            .get(key.as_slice())?
+            .map(|value| value.value().to_vec());
+        if let Some(encoded) = encoded {
+            let record = decode_blob_carrier_prefix(&encoded)?;
+            if record.source != source || record.total_len != carrier.total_len {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob carrier prefix differs from its authenticated pending source",
+                )));
+            }
             removed_bytes = removed_bytes
-                .checked_add(staging_entry_bytes(key.value().len(), value.value().len())?)
+                .checked_add(staging_entry_bytes(key.len(), encoded.len())?)
                 .ok_or(StoreError::PayloadByteAccountingOverflow)?;
-            prefix_rows.push(key.value().to_vec());
+            prefix_rows.push(key);
         }
     }
     write
@@ -5098,24 +6089,16 @@ fn remove_pending_source_rows_write(
     update_blob_network_staging_usage(
         write,
         BlobNetworkStagingUsage {
-            rows: audit
-                .staging
-                .rows
-                .checked_sub(removed_rows)
-                .ok_or_else(|| {
-                    blob_error(BlobStoreError::SchemaInvariant(
-                        "Blob staging row counter underflows on source removal",
-                    ))
-                })?,
-            bytes: audit
-                .staging
-                .bytes
-                .checked_sub(removed_bytes)
-                .ok_or_else(|| {
-                    blob_error(BlobStoreError::SchemaInvariant(
-                        "Blob staging byte counter underflows on source removal",
-                    ))
-                })?,
+            rows: staging.rows.checked_sub(removed_rows).ok_or_else(|| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob staging row counter underflows on source removal",
+                ))
+            })?,
+            bytes: staging.bytes.checked_sub(removed_bytes).ok_or_else(|| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob staging byte counter underflows on source removal",
+                ))
+            })?,
         },
     )
 }
@@ -5278,6 +6261,23 @@ fn blob_content_prefix(
     Ok(output)
 }
 
+fn blob_content_prefix_upper_bound(prefix: &[u8]) -> Result<Vec<u8>, StoreError> {
+    let mut upper = prefix.to_vec();
+    let index = upper
+        .iter()
+        .rposition(|byte| *byte != u8::MAX)
+        .ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Blob content-index prefix has no finite successor",
+            ))
+        })?;
+    upper[index] = upper[index]
+        .checked_add(1)
+        .expect("successor byte was checked below u8::MAX");
+    upper.truncate(index + 1);
+    Ok(upper)
+}
+
 fn blob_content_key(
     topic: &Topic,
     scope: &Scope,
@@ -5305,6 +6305,7 @@ fn parse_blob_transfer_id(
 mod tests {
     use std::io::Cursor;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use aster_mesh::{
@@ -5565,17 +6566,309 @@ mod tests {
             let total = u64::try_from(carrier.bytes().len()).expect("carrier total");
             let mut offset = 0u64;
             for range in carrier.bytes().chunks(MAX_BLOB_NETWORK_RANGE_BYTES) {
+                let audits = test_blob_network_global_audits();
                 target
                     .append_blob_carrier_prefix_with_policy(
                         policy, transfer, object, total, offset, range,
                     )
                     .expect("append exact carrier range");
+                assert_eq!(
+                    test_blob_network_global_audits(),
+                    audits,
+                    "one carrier append cannot perform a global Blob-network audit"
+                );
                 offset += u64::try_from(range.len()).expect("range length");
             }
+            let audits = test_blob_network_global_audits();
             target
                 .commit_complete_blob_carrier_with_policy(policy, transfer, object, plan)
                 .expect("commit exact carrier");
+            assert_eq!(
+                test_blob_network_global_audits(),
+                audits,
+                "one carrier commit cannot perform a global Blob-network audit"
+            );
         }
+    }
+
+    #[test]
+    fn pending_carrier_work_for_multiple_sources_is_redb_only_and_read_only() {
+        let source_root = BlobTestRoot::new("pending-work-source");
+        let target_root = BlobTestRoot::new("pending-work-target");
+        let mut services = blob_services(0xb0);
+        let source = Store::open_for_mission(&source_root.database, services.authority)
+            .expect("pending-work source store");
+        let target = Store::open_for_mission(&target_root.database, services.authority)
+            .expect("pending-work target store");
+        let policy = target
+            .control_policy_snapshot()
+            .expect("pending-work policy");
+        for index in 0..8u8 {
+            let plaintext = vec![0x80 | index; 64 + usize::from(index)];
+            let prepared = prepared_blob(&plaintext);
+            publish_blob(
+                &target,
+                &mut services,
+                &prepared,
+                &plaintext,
+                1,
+                format!("pending-work-completed-{index}").as_bytes(),
+            );
+        }
+        let mut pending = Vec::new();
+        for plaintext in [
+            vec![0x31; SELECTED_BLOB_CHUNK_SIZE as usize + 7],
+            vec![0x52; 2 * SELECTED_BLOB_CHUNK_SIZE as usize + 11],
+        ] {
+            let prepared = prepared_blob(&plaintext);
+            let proof = prepare_blob_proof(&source, &mut services, &prepared, &plaintext, 1);
+            let plan = proof
+                .blob
+                .transfer_plan(&proof.manifest_bytes)
+                .expect("pending-work transfer plan");
+            let transfer = BlobTransferId::new(proof.blob.envelope_id());
+            assert_eq!(
+                target
+                    .stage_verified_blob_source_with_policy(
+                        &policy,
+                        &proof.blob,
+                        &proof.sealed,
+                        &plan,
+                    )
+                    .expect("stage pending-work source"),
+                BlobSourceStageOutcome::Inserted
+            );
+            pending.push((transfer, plan));
+        }
+
+        let pending_visits_before = test_pending_blob_source_rows_visited();
+        let mut pending_only = Vec::new();
+        target
+            .visit_pending_blob_sources(None, |source| pending_only.push(source.transfer_id))
+            .expect("visit pending-only projections");
+        pending_only.sort_unstable();
+        assert_eq!(pending_only, {
+            let mut expected = pending
+                .iter()
+                .map(|(transfer, _)| *transfer)
+                .collect::<Vec<_>>();
+            expected.sort_unstable();
+            expected
+        });
+        assert_eq!(
+            test_pending_blob_source_rows_visited() - pending_visits_before,
+            u64::try_from(pending.len()).expect("pending row count"),
+            "completed sources leaked into the pending-only visitor"
+        );
+
+        let before_io = depot::test_depot_io_counts(&target);
+        let before_stats = target.blob_stats().expect("pending-work initial stats");
+        let mut ordered_sources = pending
+            .iter()
+            .map(|(transfer, _)| *transfer)
+            .collect::<Vec<_>>();
+        ordered_sources.sort_unstable();
+        assert_eq!(
+            target
+                .next_pending_blob_source_with_policy(&policy, None)
+                .expect("select first pending source")
+                .map(|source| source.transfer_id),
+            ordered_sources.first().copied()
+        );
+        assert_eq!(
+            target
+                .next_pending_blob_source_with_policy(&policy, ordered_sources.first().copied())
+                .expect("select successor pending source")
+                .map(|source| source.transfer_id),
+            ordered_sources.get(1).copied()
+        );
+        assert_eq!(
+            target
+                .next_pending_blob_source_with_policy(&policy, ordered_sources.get(1).copied())
+                .expect("wrap pending source selection")
+                .map(|source| source.transfer_id),
+            ordered_sources.first().copied()
+        );
+        for (transfer, plan) in &pending {
+            let work = target
+                .pending_blob_carrier_work_with_policy(&policy, *transfer, plan)
+                .expect("enumerate exact pending carrier work");
+            assert_eq!(
+                u64::try_from(work.len()).expect("pending work count"),
+                plan.manifest().chunk_count()
+            );
+            assert_eq!(
+                target
+                    .pending_blob_remaining_count_with_policy(&policy, *transfer, plan)
+                    .expect("count exact pending carrier work"),
+                plan.manifest().chunk_count()
+            );
+        }
+        assert_eq!(
+            depot::test_depot_io_counts(&target),
+            before_io,
+            "pending work queries cannot open, audit, or mutate the physical depot"
+        );
+        assert_eq!(
+            target.blob_stats().expect("pending-work final stats"),
+            before_stats,
+            "pending work queries are durable-state neutral"
+        );
+    }
+
+    #[test]
+    fn carrier_cursor_read_and_cas_are_global_audit_free() {
+        let root = BlobTestRoot::new("carrier-cursor-hot-path");
+        let services = blob_services(0xaf);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("carrier cursor store");
+        let peer = services.publisher.identity();
+        let source = BlobTransferId::new([0x41; 32]);
+        let mut object = [0x52; BLOB_CARRIER_OBJECT_ID_BYTES];
+        object[0] = 2;
+        let cursor = BlobCarrierFetchCursor::new(
+            source,
+            BlobCarrierObjectId::new(object).expect("typed carrier cursor object"),
+        );
+
+        let audits = test_blob_network_global_audits();
+        assert_eq!(
+            store
+                .blob_carrier_fetch_cursor(peer)
+                .expect("absent cursor read"),
+            None
+        );
+        assert_eq!(
+            test_blob_network_global_audits(),
+            audits,
+            "an unavailable range that does not call CAS cannot trigger a global audit"
+        );
+
+        assert!(
+            store
+                .compare_and_advance_blob_carrier_fetch_cursor(peer, None, cursor)
+                .expect("insert exact cursor")
+        );
+        assert_eq!(
+            test_blob_network_global_audits(),
+            audits,
+            "cursor CAS cannot trigger a global Blob-network audit"
+        );
+        assert_eq!(
+            store
+                .blob_carrier_fetch_cursor(peer)
+                .expect("load inserted cursor"),
+            Some(cursor)
+        );
+        assert!(
+            store
+                .compare_and_advance_blob_carrier_fetch_cursor(peer, None, cursor)
+                .expect("idempotent cursor replay")
+        );
+        assert_eq!(test_blob_network_global_audits(), audits);
+    }
+
+    #[test]
+    fn carrier_commit_serializes_abort_after_its_exact_snapshot() {
+        let source_root = BlobTestRoot::new("carrier-commit-abort-source");
+        let target_root = BlobTestRoot::new("carrier-commit-abort-target");
+        let mut services = blob_services(0xae);
+        let source = Store::open_for_mission(&source_root.database, services.authority)
+            .expect("commit-abort source store");
+        let target = Store::open_for_mission(&target_root.database, services.authority)
+            .expect("commit-abort target store");
+        let plaintext = vec![0x6e; SELECTED_BLOB_CHUNK_SIZE as usize];
+        let prepared = prepared_blob(&plaintext);
+        let proof = prepare_blob_proof(&source, &mut services, &prepared, &plaintext, 1);
+        let plan = proof
+            .blob
+            .transfer_plan(&proof.manifest_bytes)
+            .expect("commit-abort transfer plan");
+        let policy = target
+            .control_policy_snapshot()
+            .expect("commit-abort policy");
+        let transfer = BlobTransferId::new(proof.blob.envelope_id());
+        target
+            .stage_verified_blob_source_with_policy(&policy, &proof.blob, &proof.sealed, &plan)
+            .expect("stage commit-abort source");
+        let carrier = {
+            let mut depot = source.blob_depot().expect("source carrier depot");
+            CoreBlobStore::begin_blob_with_lineage(
+                &mut depot,
+                plan.manifest(),
+                plan.physical_lineage(),
+            )
+            .expect("activate source carrier plan");
+            plan.build_carrier(&mut depot, 0)
+                .expect("build commit-abort carrier")
+        };
+        let object = BlobCarrierObjectId::new(carrier.object_id().wire_bytes())
+            .expect("commit-abort carrier id");
+        let total_len = u64::try_from(carrier.bytes().len()).expect("carrier length");
+        let mut offset = 0u64;
+        for range in carrier.bytes().chunks(MAX_BLOB_NETWORK_RANGE_BYTES) {
+            target
+                .append_blob_carrier_prefix_with_policy(
+                    &policy, transfer, object, total_len, offset, range,
+                )
+                .expect("stage complete carrier prefix");
+            offset += u64::try_from(range.len()).expect("carrier range length");
+        }
+
+        let (reached_send, reached_receive) = std::sync::mpsc::sync_channel(0);
+        let (release_send, release_receive) = std::sync::mpsc::sync_channel(0);
+        target.set_blob_carrier_commit_post_snapshot_gate(reached_send, release_receive);
+        let abort_started = std::sync::Barrier::new(2);
+        let (abort_done_send, abort_done_receive) = std::sync::mpsc::channel();
+        let audits = test_blob_network_global_audits();
+        std::thread::scope(|scope| {
+            let commit = scope.spawn(|| {
+                target.commit_complete_blob_carrier_with_policy(&policy, transfer, object, &plan)
+            });
+            reached_receive
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("commit reached its depot-locked exact snapshot");
+            let abort = scope.spawn(|| {
+                abort_started.wait();
+                let result = target.abort_pending_blob_source(transfer);
+                abort_done_send
+                    .send(())
+                    .expect("report completed abort attempt");
+                result
+            });
+            abort_started.wait();
+            assert!(matches!(
+                abort_done_receive.recv_timeout(std::time::Duration::from_millis(100)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            release_send
+                .send(())
+                .expect("release depot-locked carrier commit");
+            assert_eq!(
+                commit
+                    .join()
+                    .expect("join carrier commit")
+                    .expect("commit carrier before abort"),
+                BlobCarrierCommitOutcome::Committed
+            );
+            assert!(
+                abort
+                    .join()
+                    .expect("join pending abort")
+                    .expect("abort after carrier commit")
+            );
+        });
+        assert_eq!(
+            test_blob_network_global_audits(),
+            audits,
+            "commit/abort serialization cannot invoke a global network audit"
+        );
+        assert!(
+            target
+                .pending_blob_source(transfer)
+                .expect("pending source after abort")
+                .is_none()
+        );
     }
 
     #[test]
@@ -5595,11 +6888,17 @@ mod tests {
             .transfer_plan(&proof.manifest_bytes)
             .expect("authenticated transfer plan");
         let policy = target.control_policy_snapshot().expect("target policy");
+        let stage_audits = test_blob_network_global_audits();
         assert_eq!(
             target
                 .stage_verified_blob_source_with_policy(&policy, &proof.blob, &proof.sealed, &plan,)
                 .expect("stage source"),
             BlobSourceStageOutcome::Inserted
+        );
+        assert_eq!(
+            test_blob_network_global_audits(),
+            stage_audits,
+            "source staging cannot perform a global Blob-network audit"
         );
         let before = target
             .blob_source_projection(BlobTransferId::new(proof.blob.envelope_id()))
@@ -5615,6 +6914,9 @@ mod tests {
 
         let first = plan.carrier_id(0).expect("first carrier");
         let first = BlobCarrierObjectId::new(first.wire_bytes()).expect("first object");
+        let first_total = plan
+            .carrier_total_len(first.as_bytes())
+            .expect("first carrier total");
         let hostile = BlobCarrierObjectId::new([2; BLOB_CARRIER_OBJECT_ID_BYTES])
             .expect("syntactic hostile object");
         assert!(matches!(
@@ -5628,14 +6930,44 @@ mod tests {
             ),
             Err(StoreError::Blob(BlobStoreError::InvalidCarrierObjectId))
         ));
+        let before_noncanonical = target.blob_stats().expect("pre-append staging stats");
         assert!(matches!(
             target.append_blob_carrier_prefix_with_policy(
                 &policy,
                 before.source.transfer_id,
                 first,
-                plan.carrier_total_len(first.as_bytes())
-                    .expect("first total")
-                    + 1,
+                first_total,
+                0,
+                &[0],
+            ),
+            Err(StoreError::Blob(BlobStoreError::InvalidCarrierRange(_)))
+        ));
+        assert!(
+            target
+                .blob_carrier_prefix_status(before.source.transfer_id, first)
+                .expect("noncanonical prefix status")
+                .is_none()
+        );
+        assert_eq!(
+            target.blob_stats().expect("post-rejection staging stats"),
+            before_noncanonical
+        );
+        let mut malformed_durable_prefix = Vec::new();
+        malformed_durable_prefix.push(BLOB_CARRIER_PREFIX_VERSION);
+        malformed_durable_prefix.extend_from_slice(before.source.transfer_id.as_bytes());
+        malformed_durable_prefix.extend_from_slice(&first_total.to_be_bytes());
+        malformed_durable_prefix.extend_from_slice(&1u32.to_be_bytes());
+        malformed_durable_prefix.push(0);
+        assert!(matches!(
+            decode_blob_carrier_prefix(&malformed_durable_prefix),
+            Err(StoreError::Blob(BlobStoreError::SchemaInvariant(_)))
+        ));
+        assert!(matches!(
+            target.append_blob_carrier_prefix_with_policy(
+                &policy,
+                before.source.transfer_id,
+                first,
+                first_total + 1,
                 0,
                 &[0],
             ),
@@ -5653,18 +6985,29 @@ mod tests {
                 .expect("remaining carriers"),
             0
         );
+        let before_completion_io = depot::test_depot_io_counts(&target);
         let depot_completion = target
-            .blob_depot()
-            .and_then(|mut depot| depot.completed_blob(&proof.blob, &proof.manifest_bytes))
-            .expect("target depot completion");
-        let content_completion = {
-            let mut depot = target.blob_depot().expect("target content depot");
-            CoreBlobStore::begin_blob_with_lineage(
-                &mut depot,
-                plan.manifest(),
-                plan.physical_lineage(),
+            .completed_pending_blob_with_policy(
+                &policy,
+                before.source.transfer_id,
+                &proof.blob,
+                &proof.manifest_bytes,
+                &plan,
             )
-            .expect("activate target content plan");
+            .expect("target pending depot completion");
+        let after_completion_io = depot::test_depot_io_counts(&target);
+        assert_eq!(
+            after_completion_io.full_open_audits, before_completion_io.full_open_audits,
+            "pending completion mint cannot perform a global depot audit"
+        );
+        assert_eq!(
+            after_completion_io.root_creations, before_completion_io.root_creations,
+            "pending completion mint cannot create a depot root"
+        );
+        let content_completion = {
+            let depot = target
+                .blob_depot_for_authenticated_read(&depot_completion)
+                .expect("target authenticated content depot");
             let mut service = services
                 .reader
                 .blob_service_with_store(&blob_scope(), &blob_topic(), 1, depot)
@@ -5677,6 +7020,7 @@ mod tests {
             .reader
             .verify_current_blob_lineage(&proof.blob)
             .expect("current lineages");
+        let apply_audits = test_blob_network_global_audits();
         let applied = target
             .apply_verified_blob_with_policy(
                 &policy,
@@ -5686,6 +7030,11 @@ mod tests {
                 &content_completion,
             )
             .expect("promote Blob");
+        assert_eq!(
+            test_blob_network_global_audits(),
+            apply_audits,
+            "source promotion cannot perform a global Blob-network audit"
+        );
         assert!(matches!(applied, ApplyOutcome::Inserted { .. }));
         let after = target
             .blob_source_projection(before.source.transfer_id)
@@ -5717,9 +7066,34 @@ mod tests {
                 .expect("duplicate promotion"),
             ApplyOutcome::Duplicate { .. }
         ));
+        let before_malformed_io = depot::test_depot_io_counts(&target);
+        let malformed = target
+            .read_completed_blob_carrier_range_with_policy(
+                &policy,
+                &depot_completion,
+                &lineage,
+                before.source.transfer_id,
+                first,
+                1,
+                1,
+                &plan,
+            )
+            .expect_err("noncanonical carrier range must fail before depot open");
+        assert!(matches!(
+            malformed,
+            StoreError::Blob(BlobStoreError::InvalidCarrierRange(_))
+        ));
+        assert_eq!(
+            depot::test_depot_io_counts(&target),
+            before_malformed_io,
+            "malformed range tuple cannot open or mutate the depot"
+        );
+        let before_range_io = depot::test_depot_io_counts(&target);
+        let before_range_source_work = test_blob_read_work_counts();
         let range = target
             .read_completed_blob_carrier_range_with_policy(
                 &policy,
+                &depot_completion,
                 &lineage,
                 before.source.transfer_id,
                 first,
@@ -5730,6 +7104,107 @@ mod tests {
             .expect("serve range")
             .expect("completed carrier");
         assert!(!range.1.is_empty());
+        let after_range_io = depot::test_depot_io_counts(&target);
+        assert_eq!(
+            after_range_io.full_open_audits,
+            before_range_io.full_open_audits
+        );
+        assert_eq!(
+            after_range_io.begin_write_transactions,
+            before_range_io.begin_write_transactions
+        );
+        assert_eq!(
+            after_range_io.root_creations,
+            before_range_io.root_creations
+        );
+        assert_eq!(
+            after_range_io.authenticated_read_opens,
+            before_range_io.authenticated_read_opens + 1
+        );
+        assert_eq!(
+            test_blob_read_work_counts().1,
+            before_range_source_work.1,
+            "carrier range pre/post checks cannot clone source-envelope bytes"
+        );
+
+        let accepted = target
+            .get_blob(before.source.transfer_id)
+            .expect("load accepted range source")
+            .expect("accepted range source")
+            .acceptance_marker;
+        let (reached_send, reached_receive) = std::sync::mpsc::sync_channel(0);
+        let (release_send, release_receive) = std::sync::mpsc::sync_channel(0);
+        target.set_blob_carrier_range_post_read_gate(reached_send, release_receive);
+        let before_fault_io = depot::test_depot_io_counts(&target);
+        let postcheck_error = std::thread::scope(|scope| {
+            let served = scope.spawn(|| {
+                target.read_completed_blob_carrier_range_with_policy(
+                    &policy,
+                    &depot_completion,
+                    &lineage,
+                    before.source.transfer_id,
+                    first,
+                    0,
+                    MAX_BLOB_NETWORK_RANGE_BYTES,
+                    &plan,
+                )
+            });
+            reached_receive
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("range reached its final source postcheck");
+            let mutation = (|| -> Result<(), StoreError> {
+                let write = target.database.begin_write()?;
+                write.open_table(BLOB_ACCEPTANCE_MARKERS)?.insert(
+                    before.source.transfer_id.as_bytes().as_slice(),
+                    accepted
+                        .checked_add(1)
+                        .ok_or(StoreError::AcceptanceMarkerExhausted)?,
+                )?;
+                write.commit()?;
+                Ok(())
+            })();
+            release_send
+                .send(())
+                .expect("release final source postcheck");
+            mutation.expect("commit post-read source mutation");
+            served
+                .join()
+                .expect("join post-read range")
+                .expect_err("exact post-read source drift must fail closed")
+        });
+        assert!(matches!(
+            postcheck_error,
+            StoreError::Blob(BlobStoreError::CompletionMismatch)
+        ));
+        let restore = target
+            .database
+            .begin_write()
+            .expect("begin acceptance marker restoration");
+        restore
+            .open_table(BLOB_ACCEPTANCE_MARKERS)
+            .expect("open marker table for restoration")
+            .insert(before.source.transfer_id.as_bytes().as_slice(), accepted)
+            .expect("restore acceptance marker");
+        restore
+            .commit()
+            .expect("commit acceptance marker restoration");
+        let after_fault_io = depot::test_depot_io_counts(&target);
+        assert_eq!(
+            after_fault_io.full_open_audits,
+            before_fault_io.full_open_audits
+        );
+        assert_eq!(
+            after_fault_io.begin_write_transactions,
+            before_fault_io.begin_write_transactions
+        );
+        assert_eq!(
+            after_fault_io.root_creations,
+            before_fault_io.root_creations
+        );
+        assert_eq!(
+            after_fault_io.authenticated_read_opens,
+            before_fault_io.authenticated_read_opens + 1
+        );
         drop(target);
         let reopened = Store::open_for_mission(&target_root.database, services.authority)
             .expect("reopen target");
@@ -6115,7 +7590,7 @@ mod tests {
     }
 
     #[test]
-    fn network_blob_reservation_deduplicates_and_terminal_abort_reclaims() {
+    fn network_blob_reservation_deduplicates_and_terminal_abort_retains_bounded_staging() {
         let source_root = BlobTestRoot::new("network-reservation-source");
         let target_root = BlobTestRoot::new("network-reservation-target");
         let mut services = blob_services(0xb2);
@@ -6239,11 +7714,13 @@ mod tests {
                 .expect("reopened competing source absent")
                 .is_none()
         );
+        let abort_audits = test_blob_network_global_audits();
         assert!(
             target
                 .abort_pending_blob_source(BlobTransferId::new(first.blob.envelope_id()))
                 .expect("abort first shared source")
         );
+        assert_eq!(test_blob_network_global_audits(), abort_audits);
         assert_eq!(
             target
                 .blob_stats()
@@ -6251,17 +7728,19 @@ mod tests {
                 .reserved_file_bytes,
             reserved
         );
+        let final_abort_audits = test_blob_network_global_audits();
         assert!(
             target
                 .abort_pending_blob_source(BlobTransferId::new(second.blob.envelope_id()))
                 .expect("abort final source")
         );
+        assert_eq!(test_blob_network_global_audits(), final_abort_audits);
         assert_eq!(
             target
                 .blob_stats()
-                .expect("reservation reclaimed")
+                .expect("abandoned reservation retained")
                 .reserved_file_bytes,
-            0
+            reserved
         );
         drop(target);
         let reopened = Store::open_with_limits_and_blob_depot_limits_for_mission(
@@ -6270,10 +7749,29 @@ mod tests {
             BlobDepotLimits::new(reserved_limit, 16, 4).expect("reopen limits"),
             services.authority,
         )
-        .expect("reopen reclaimed target");
+        .expect("reopen bounded abandoned target");
         let stats = reopened.blob_stats().expect("reopened stats");
-        assert_eq!(stats.reserved_file_bytes, 0);
+        assert_eq!(stats.reserved_file_bytes, reserved);
         assert_eq!(stats.pending_sources, 0);
+        for transfer in [
+            BlobTransferId::new(first.blob.envelope_id()),
+            BlobTransferId::new(second.blob.envelope_id()),
+        ] {
+            assert!(
+                reopened
+                    .blob_source_projection(transfer)
+                    .expect("abandoned source projection")
+                    .is_none(),
+                "quota-charged depot staging is not a pending or completed source"
+            );
+            assert!(
+                reopened
+                    .get_blob(transfer)
+                    .expect("abandoned source visibility")
+                    .is_none(),
+                "quota-charged depot staging cannot gain semantic visibility"
+            );
+        }
         assert_eq!(
             stats.variants, 1,
             "the bounded variant slot remains charged to its lineage fence"
@@ -6316,15 +7814,24 @@ mod tests {
                 .expect("abort old lineage")
         );
         assert!(
-            !target_root.chunk_path(old_variant, 0).exists(),
-            "retirement must reclaim the now-unmarked ciphertext file"
+            target_root.chunk_path(old_variant, 0).is_file(),
+            "abandoned ciphertext remains quota-charged without an explicit GC protocol"
         );
         let retired_stats = target.blob_stats().expect("retired lineage stats");
         assert_eq!(retired_stats.variants, 1);
-        assert_eq!(retired_stats.finalized_variants, 0);
-        assert_eq!(retired_stats.committed_chunks, 0);
-        assert_eq!(retired_stats.committed_file_bytes, 0);
-        assert_eq!(retired_stats.reserved_file_bytes, 0);
+        assert_eq!(
+            retired_stats.finalized_variants,
+            old_stats.finalized_variants
+        );
+        assert_eq!(retired_stats.committed_chunks, old_stats.committed_chunks);
+        assert_eq!(
+            retired_stats.committed_file_bytes,
+            old_stats.committed_file_bytes
+        );
+        assert_eq!(
+            retired_stats.reserved_file_bytes,
+            old_stats.reserved_file_bytes
+        );
         assert_eq!(retired_stats.pending_sources, 0);
         assert!(retired_stats.network_staging_bytes < old_stats.network_staging_bytes);
         drop(target);
@@ -6587,6 +8094,7 @@ mod tests {
             .expect("current lineage");
         let transfer = BlobTransferId::new(proof.blob.envelope_id());
         let before = target.blob_stats().expect("before capacity failure");
+        let before_io = depot::test_depot_io_counts(&target);
         assert!(matches!(
             target.apply_verified_blob_with_policy(
                 &policy,
@@ -6598,6 +8106,11 @@ mod tests {
             Err(StoreError::ItemLimitExceeded { .. })
                 | Err(StoreError::PayloadByteLimitExceeded { .. })
         ));
+        assert_eq!(
+            depot::test_depot_io_counts(&target).full_completion_rechecks,
+            before_io.full_completion_rechecks,
+            "capacity-deferred promotion cannot rescan completed Blob files"
+        );
         assert_eq!(target.blob_stats().expect("no mutation"), before);
         assert!(target.get_blob(transfer).expect("no publication").is_none());
         assert!(
@@ -7007,6 +8520,375 @@ mod tests {
                 .expect("strict Blob inspection")
                 .blob_stats,
             partitioned
+        );
+    }
+
+    #[test]
+    fn operation_preflight_rejects_orphan_without_depot_work() {
+        let root = BlobTestRoot::new("orphan-operation-preflight");
+        let mut services = blob_services(0x60);
+        let plaintext = vec![0x60; 2_049];
+        let prepared = prepared_blob(&plaintext);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("orphan-operation store");
+        let (_, operation, intent) = publish_blob(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            b"orphan-operation",
+        );
+        let policy = store
+            .control_policy_snapshot()
+            .expect("orphan operation policy");
+        let before_io = depot::test_depot_io_counts(&store);
+        let write = store
+            .database
+            .begin_write()
+            .expect("truncated operation mutation write");
+        write
+            .open_table(BLOB_OPERATIONS)
+            .expect("truncated operation table")
+            .insert(operation.as_bytes(), [0u8].as_slice())
+            .expect("truncate operation row");
+        write.commit().expect("commit truncated operation row");
+        let truncated = store
+            .blob_for_operation_with_policy(
+                &policy,
+                &BlobOperationRequest::new(&operation, &intent),
+            )
+            .expect_err("truncated operation cannot become an ordinary error");
+        assert!(matches!(
+            truncated,
+            StoreError::Blob(BlobStoreError::SchemaInvariant(_))
+        ));
+
+        let encoded = encode_blob_operation_record(BlobOperationRecord {
+            transfer_id: BlobTransferId::new([0xf7; 32]),
+            intent_digest: intent.digest(),
+        });
+        let write = store
+            .database
+            .begin_write()
+            .expect("orphan operation mutation write");
+        write
+            .open_table(BLOB_OPERATIONS)
+            .expect("orphan operation table")
+            .insert(operation.as_bytes(), encoded.as_slice())
+            .expect("orphan operation mutation");
+        write.commit().expect("commit orphan operation");
+        let orphan = store
+            .blob_for_operation_with_policy(
+                &policy,
+                &BlobOperationRequest::new(&operation, &intent),
+            )
+            .expect_err("present operation cannot resolve as ordinary absence");
+        assert!(matches!(
+            orphan,
+            StoreError::Blob(BlobStoreError::SchemaInvariant(_))
+        ));
+        assert_eq!(
+            depot::test_depot_io_counts(&store),
+            before_io,
+            "operation preflight cannot open or mutate the depot"
+        );
+    }
+
+    #[test]
+    fn read_plan_preflight_rejects_orphan_content_index_without_depot_work() {
+        let root = BlobTestRoot::new("orphan-content-preflight");
+        let mut services = blob_services(0x5f);
+        let plaintext = vec![0x5f; 2_049];
+        let prepared = prepared_blob(&plaintext);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("orphan-content store");
+        let (stored, _, _) = publish_blob(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            b"orphan-content",
+        );
+        let key = blob_content_key(
+            &stored.header.topic,
+            &stored.header.scope,
+            stored.blob_id,
+            stored.semantic_id,
+        )
+        .expect("orphan content-index key");
+        let policy = store
+            .control_policy_snapshot()
+            .expect("orphan content policy");
+        let before_io = depot::test_depot_io_counts(&store);
+        let write = store
+            .database
+            .begin_write()
+            .expect("truncated content-index mutation write");
+        write
+            .open_table(BLOB_CONTENT_INDEX)
+            .expect("truncated content-index table")
+            .insert(key.as_slice(), [0xf6].as_slice())
+            .expect("truncate content-index value");
+        write.commit().expect("commit truncated content index");
+        let truncated_index = store
+            .prepare_blob_read_with_policy(
+                &policy,
+                &stored.header.topic,
+                &stored.header.scope,
+                stored.blob_id,
+            )
+            .expect_err("truncated content index cannot produce a read plan");
+        assert!(matches!(
+            truncated_index,
+            StoreError::Blob(BlobStoreError::SchemaInvariant(_))
+        ));
+
+        let write = store
+            .database
+            .begin_write()
+            .expect("orphan content-index mutation write");
+        write
+            .open_table(BLOB_CONTENT_INDEX)
+            .expect("orphan content-index table")
+            .insert(key.as_slice(), [0xf6; 32].as_slice())
+            .expect("orphan content-index mutation");
+        write.commit().expect("commit orphan content index");
+        let orphan_index = store
+            .prepare_blob_read_with_policy(
+                &policy,
+                &stored.header.topic,
+                &stored.header.scope,
+                stored.blob_id,
+            )
+            .expect_err("orphan content index cannot produce an empty or partial plan");
+        assert!(matches!(
+            orphan_index,
+            StoreError::Blob(BlobStoreError::SchemaInvariant(_))
+        ));
+
+        let write = store
+            .database
+            .begin_write()
+            .expect("truncated publication mutation write");
+        write
+            .open_table(BLOB_CONTENT_INDEX)
+            .expect("restore content-index table")
+            .insert(key.as_slice(), stored.transfer_id.as_bytes().as_slice())
+            .expect("restore content-index transfer");
+        write
+            .open_table(BLOB_PUBLICATIONS)
+            .expect("truncated publication table")
+            .insert(stored.transfer_id.as_bytes().as_slice(), [0u8].as_slice())
+            .expect("truncate publication metadata");
+        write.commit().expect("commit truncated publication row");
+        let truncated_publication = store
+            .prepare_blob_read_with_policy(
+                &policy,
+                &stored.header.topic,
+                &stored.header.scope,
+                stored.blob_id,
+            )
+            .expect_err("truncated publication cannot produce a read plan");
+        assert!(matches!(
+            truncated_publication,
+            StoreError::Blob(BlobStoreError::SchemaInvariant(_))
+        ));
+        assert_eq!(
+            depot::test_depot_io_counts(&store),
+            before_io,
+            "read-plan preflight cannot open or mutate the depot"
+        );
+    }
+
+    #[test]
+    fn projection_read_plan_bounds_prefix_work_and_exact_loads_one_source() {
+        let root = BlobTestRoot::new("projection-read-plan-work");
+        let mut services = blob_services(0x5e);
+        let plaintext = vec![0x5e; 2_049];
+        let prepared = prepared_blob(&plaintext);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("projection read-plan store");
+        let (stored, _, _) = publish_blob(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            b"projection-read-plan",
+        );
+        let base_metadata = {
+            let read = store.database.begin_read().expect("read base metadata");
+            let table = read
+                .open_table(BLOB_PUBLICATIONS)
+                .expect("base publication table");
+            let value = table
+                .get(stored.transfer_id.as_bytes().as_slice())
+                .expect("base publication lookup")
+                .expect("base publication");
+            decode_blob_metadata(value.value()).expect("decode base publication")
+        };
+
+        let write = store
+            .database
+            .begin_write()
+            .expect("projection fixture write");
+        {
+            let mut publications = write
+                .open_table(BLOB_PUBLICATIONS)
+                .expect("projection publication table");
+            let mut bytes = write
+                .open_table(BLOB_BYTES)
+                .expect("projection bytes table");
+            let mut markers = write
+                .open_table(BLOB_ACCEPTANCE_MARKERS)
+                .expect("projection marker table");
+            let mut content = write
+                .open_table(BLOB_CONTENT_INDEX)
+                .expect("projection content table");
+            for index in 0..(MAX_BLOB_PUBLICATIONS_PER_CONTENT - 1) {
+                let mut transfer_digest = Sha256::new();
+                transfer_digest.update(b"aster/test/projection-transfer");
+                transfer_digest.update((index as u64).to_be_bytes());
+                let transfer = BlobTransferId::new(transfer_digest.finalize().into());
+                let mut semantic_digest = Sha256::new();
+                semantic_digest.update(b"aster/test/projection-semantic");
+                semantic_digest.update((index as u64).to_be_bytes());
+                let semantic = BlobSemanticId::new(semantic_digest.finalize().into());
+                let mut metadata = base_metadata.clone();
+                metadata.transfer_id = transfer;
+                metadata.semantic_id = semantic;
+                metadata.header.stamp.dot.counter = u64::try_from(index)
+                    .expect("fixture index")
+                    .checked_add(10_000)
+                    .expect("fixture counter");
+                let encoded = encode_blob_metadata(metadata).expect("encode projection fixture");
+                publications
+                    .insert(transfer.as_bytes().as_slice(), encoded.as_slice())
+                    .expect("insert projection publication");
+                bytes
+                    .insert(transfer.as_bytes().as_slice(), [0x5e].as_slice())
+                    .expect("insert projection bytes");
+                markers
+                    .insert(
+                        transfer.as_bytes().as_slice(),
+                        u64::try_from(index)
+                            .expect("fixture marker index")
+                            .checked_add(2)
+                            .expect("fixture marker"),
+                    )
+                    .expect("insert projection marker");
+                let key = blob_content_key(
+                    &stored.header.topic,
+                    &stored.header.scope,
+                    stored.blob_id,
+                    semantic,
+                )
+                .expect("projection content key");
+                content
+                    .insert(key.as_slice(), transfer.as_bytes().as_slice())
+                    .expect("insert projection content row");
+            }
+            let unrelated_blob = BlobId::from_bytes([0xfe; 32]);
+            for index in 0..4_096u64 {
+                let mut semantic_bytes = [0u8; 32];
+                semantic_bytes[24..].copy_from_slice(&index.to_be_bytes());
+                let key = blob_content_key(
+                    &stored.header.topic,
+                    &stored.header.scope,
+                    unrelated_blob,
+                    BlobSemanticId::new(semantic_bytes),
+                )
+                .expect("unrelated content key");
+                content
+                    .insert(key.as_slice(), [0xa5; 32].as_slice())
+                    .expect("insert unrelated content row");
+            }
+        }
+        {
+            let unrelated_topic = Topic::new("unrelated-blob-domain").expect("unrelated topic");
+            let unrelated_scope =
+                Scope::new("mission/unrelated-blob-domain").expect("unrelated scope");
+            let mut key = event_domain_prefix(&unrelated_topic, &unrelated_scope)
+                .expect("unrelated frontier prefix");
+            key.extend_from_slice(&[0xdd; 32]);
+            write
+                .open_table(CAUSAL_FRONTIER)
+                .expect("unrelated frontier table")
+                .insert(key.as_slice(), 1)
+                .expect("insert unrelated frontier row");
+        }
+        write.commit().expect("commit projection fixture");
+
+        let policy = store
+            .control_policy_snapshot()
+            .expect("projection read policy");
+        let frontier_before = test_blob_frontier_rows_visited();
+        store
+            .reserve_blob_with_policy(
+                &policy,
+                services.publisher.identity(),
+                &stored.header.topic,
+                &stored.header.scope,
+            )
+            .expect("bounded target-domain frontier reserve");
+        assert_eq!(
+            test_blob_frontier_rows_visited() - frontier_before,
+            1,
+            "unrelated causal-frontier domains were visited"
+        );
+        let before = test_blob_read_work_counts();
+        let plan = store
+            .prepare_blob_read_with_policy(
+                &policy,
+                &stored.header.topic,
+                &stored.header.scope,
+                stored.blob_id,
+            )
+            .expect("projection-only read plan");
+        let after_plan = test_blob_read_work_counts();
+        assert_eq!(plan.candidates().len(), MAX_BLOB_PUBLICATIONS_PER_CONTENT);
+        assert_eq!(
+            after_plan.0 - before.0,
+            MAX_BLOB_PUBLICATIONS_PER_CONTENT as u64
+        );
+        assert_eq!(after_plan.1, before.1, "plan cloned source bytes");
+
+        store
+            .require_blob_read_plan_with_policy(&policy, &plan)
+            .expect("projection-only plan recheck");
+        let after_recheck = test_blob_read_work_counts();
+        assert_eq!(
+            after_recheck.0 - after_plan.0,
+            MAX_BLOB_PUBLICATIONS_PER_CONTENT as u64
+        );
+        assert_eq!(after_recheck.1, before.1, "recheck cloned source bytes");
+
+        store
+            .load_blob_read_candidate_with_policy(
+                &policy,
+                plan.current().expect("selected projection"),
+            )
+            .expect("exact-load selected source");
+        let after_selected = test_blob_read_work_counts();
+        assert_eq!(after_selected.1 - before.1, 1);
+
+        let capacity_before = test_blob_capacity_content_rows_visited();
+        let read = store
+            .database
+            .begin_read()
+            .expect("capacity preflight read");
+        let capacity = require_blob_apply_capacity_read(&read, store.limits, &base_metadata, 1)
+            .expect_err("content publication cap");
+        assert!(matches!(
+            capacity,
+            StoreError::Blob(BlobStoreError::PublicationLimitExceeded { .. })
+        ));
+        assert_eq!(
+            test_blob_capacity_content_rows_visited() - capacity_before,
+            MAX_BLOB_PUBLICATIONS_PER_CONTENT as u64,
+            "unrelated content-index rows were visited by capacity preflight"
         );
     }
 
@@ -7856,14 +9738,69 @@ mod tests {
     fn completion_capability_is_bound_to_one_exact_store_instance() {
         let first_root = BlobTestRoot::new("completion-instance-first");
         let second_root = BlobTestRoot::new("completion-instance-second");
+        let empty_root = BlobTestRoot::new("completion-instance-empty");
         let mut services = blob_services(0x7d);
-        let plaintext = vec![0x7d; 2_048];
+        let plaintext = vec![0x7d; SELECTED_BLOB_CHUNK_SIZE as usize + 2_048];
         let prepared = prepared_blob(&plaintext);
         let first =
             Store::open_for_mission(&first_root.database, services.authority).expect("first store");
         let second = Store::open_for_mission(&second_root.database, services.authority)
             .expect("second store");
+        let empty =
+            Store::open_for_mission(&empty_root.database, services.authority).expect("empty store");
         let proof = prepare_blob_proof(&first, &mut services, &prepared, &plaintext, 1);
+        let exact_metadata = BlobMetadata {
+            transfer_id: BlobTransferId::new(proof.blob.envelope_id()),
+            semantic_id: BlobSemanticId::new(proof.blob.item_id()),
+            blob_id: proof.blob.blob_id(),
+            variant_id: blob_variant_id(
+                proof.blob.blob_id(),
+                proof.blob.manifest().content_group(),
+                proof.blob.manifest().content_epoch(),
+            ),
+            manifest_digest: *proof.blob.manifest_digest(),
+            route_lineage: Some(*proof.blob.route_lineage().binding()),
+            physical_lineage: Some(*proof.blob.physical_lineage().binding()),
+            header: proof.blob.header().clone(),
+        };
+        let exact_projection = blob_source_projection(
+            &exact_metadata,
+            u64::try_from(proof.sealed.len()).expect("sealed length"),
+            depot::BlobSourceShape {
+                total_len: proof.blob.manifest().total_len(),
+                chunk_size: proof.blob.manifest().chunk_size(),
+                chunk_count: proof.blob.manifest().chunk_count(),
+            },
+        )
+        .expect("exact authenticated projection");
+        assert!(
+            exact_projection
+                .matches_verified(&proof.blob, &proof.sealed)
+                .expect("match exact verified source")
+        );
+        let mut forged_metadata = exact_metadata;
+        forged_metadata.header.stamp.dot.counter = forged_metadata
+            .header
+            .stamp
+            .dot
+            .counter
+            .checked_add(1)
+            .expect("forged counter");
+        let forged_projection = blob_source_projection(
+            &forged_metadata,
+            u64::try_from(proof.sealed.len()).expect("sealed length"),
+            depot::BlobSourceShape {
+                total_len: proof.blob.manifest().total_len(),
+                chunk_size: proof.blob.manifest().chunk_size(),
+                chunk_count: proof.blob.manifest().chunk_count(),
+            },
+        )
+        .expect("forged durable projection");
+        assert!(
+            !forged_projection
+                .matches_verified(&proof.blob, &proof.sealed)
+                .expect("reject forged durable header")
+        );
         let second_finished =
             finish_variant(&second, &services.publisher, &prepared, &plaintext, 1)
                 .expect("install identical second-store variant");
@@ -7872,6 +9809,142 @@ mod tests {
             proof.blob.manifest_digest(),
             "both stores contain the same exact finalized variant"
         );
+        first
+            .blob_depot()
+            .and_then(|mut depot| depot.recheck_completion(&proof.completion))
+            .expect("completion remains exact in its issuing store");
+        let before_mutators = depot::test_depot_io_counts(&first);
+        {
+            let mut read_only = first
+                .blob_depot_for_authenticated_read(&proof.completion)
+                .expect("open mutation-incapable authenticated depot");
+            let record = CoreBlobStore::chunk_record(&mut read_only, prepared.id(), 0)
+                .expect("read exact chunk record")
+                .expect("committed first chunk record");
+            assert!(CoreBlobStore::begin_blob(&mut read_only, proof.blob.manifest()).is_err());
+            assert!(
+                CoreBlobStore::begin_blob_with_lineage(
+                    &mut read_only,
+                    proof.blob.manifest(),
+                    proof.blob.physical_lineage(),
+                )
+                .is_err()
+            );
+            assert!(
+                CoreBlobStore::put_plaintext_digest(&mut read_only, prepared.id(), 0, [0x55; 32],)
+                    .is_err()
+            );
+            assert!(
+                CoreBlobStore::put_expected_chunk_record(&mut read_only, prepared.id(), 0, record,)
+                    .is_err()
+            );
+            assert!(
+                CoreBlobStore::commit_verified_chunk(
+                    &mut read_only,
+                    prepared.id(),
+                    0,
+                    record,
+                    &[],
+                )
+                .is_err()
+            );
+            assert!(
+                CoreBlobStore::finalize_blob(
+                    &mut read_only,
+                    prepared.id(),
+                    *proof.blob.manifest_digest(),
+                )
+                .is_err()
+            );
+        }
+        let after_mutators = depot::test_depot_io_counts(&first);
+        assert_eq!(
+            after_mutators.full_open_audits,
+            before_mutators.full_open_audits
+        );
+        assert_eq!(
+            after_mutators.begin_write_transactions,
+            before_mutators.begin_write_transactions
+        );
+        assert_eq!(
+            after_mutators.root_creations,
+            before_mutators.root_creations
+        );
+        assert_eq!(
+            after_mutators.authenticated_read_opens,
+            before_mutators.authenticated_read_opens + 1
+        );
+        let before_range = first.blob_stats().expect("stats before bounded range");
+        let before_io = depot::test_depot_io_counts(&first);
+        {
+            let mut service = services
+                .publisher
+                .blob_service_with_store(
+                    &blob_scope(),
+                    &blob_topic(),
+                    1,
+                    first
+                        .blob_depot_for_authenticated_read(&proof.completion)
+                        .expect("fresh authenticated range depot"),
+                )
+                .expect("fresh range service");
+            let mut tail = [0u8; 1];
+            let tail_stats = service
+                .read_range_for_verified(
+                    &proof.blob,
+                    u64::try_from(plaintext.len() - 1).expect("tail offset"),
+                    &mut tail,
+                )
+                .expect("fresh redb tail range");
+            assert_eq!(tail, [0x7d]);
+            assert_eq!(tail_stats.plaintext_bytes, 1);
+            assert_eq!(tail_stats.verified_chunks, 1);
+
+            let mut crossing = [0u8; 16];
+            let crossing_stats = service
+                .read_range_for_verified(
+                    &proof.blob,
+                    u64::from(SELECTED_BLOB_CHUNK_SIZE) - 8,
+                    &mut crossing,
+                )
+                .expect("fresh redb cross-chunk range");
+            assert_eq!(crossing, [0x7d; 16]);
+            assert_eq!(crossing_stats.plaintext_bytes, 16);
+            assert_eq!(crossing_stats.verified_chunks, 2);
+        }
+        let after_io = depot::test_depot_io_counts(&first);
+        assert_eq!(after_io.full_open_audits, before_io.full_open_audits);
+        assert_eq!(
+            after_io.begin_write_transactions,
+            before_io.begin_write_transactions
+        );
+        assert_eq!(after_io.root_creations, before_io.root_creations);
+        assert_eq!(
+            after_io.authenticated_read_opens,
+            before_io.authenticated_read_opens + 1
+        );
+        assert_eq!(
+            first.blob_stats().expect("stats after bounded range"),
+            before_range,
+            "exact range selection cannot manufacture or mutate durable depot state"
+        );
+
+        let mut rebound_to_empty = proof.completion.clone();
+        rebound_to_empty.authority = Arc::clone(&empty.blob_completion_authority);
+        rebound_to_empty.backing_identity = empty.backing_identity;
+        let empty_before = depot::test_depot_io_counts(&empty);
+        assert!(!empty_root.depot().exists());
+        empty
+            .blob_depot_for_authenticated_read(&rebound_to_empty)
+            .err()
+            .expect("authenticated read cannot create an absent depot root");
+        let empty_after = depot::test_depot_io_counts(&empty);
+        assert_eq!(empty_after.root_creations, empty_before.root_creations);
+        assert_eq!(
+            empty_after.begin_write_transactions,
+            empty_before.begin_write_transactions
+        );
+        assert!(!empty_root.depot().exists());
 
         let policy = second.control_policy_snapshot().expect("second policy");
         let reservation = second
@@ -7899,6 +9972,22 @@ mod tests {
         let mut replayed = proof.completion.clone();
         replayed.backing_identity = second.backing_identity;
         let error = second
+            .blob_depot_for_authenticated_read(&replayed)
+            .err()
+            .expect("another Store instance cannot open an authenticated read depot");
+        assert!(matches!(
+            error,
+            StoreError::Blob(BlobStoreError::CompletionMismatch)
+        ));
+        let error = second
+            .blob_depot()
+            .and_then(|mut depot| depot.recheck_completion(&replayed))
+            .expect_err("another Store instance cannot recheck a completion capability");
+        assert!(matches!(
+            error,
+            StoreError::Blob(BlobStoreError::CompletionMismatch)
+        ));
+        let error = second
             .commit_reserved_blob_once_with_policy(
                 &policy,
                 &request,
@@ -7915,6 +10004,160 @@ mod tests {
         let stats = second.blob_stats().expect("second stats after rejection");
         assert_eq!(stats.publications, 0);
         assert_eq!(stats.operations, 0);
+
+        let write = first
+            .database
+            .begin_write()
+            .expect("missing-range-chunk mutation write");
+        depot::remove_completion_chunk_state_for_test(&write, proof.completion.variant_id(), 1)
+            .expect("remove one requested completion chunk");
+        write
+            .commit()
+            .expect("commit missing requested completion chunk");
+        let before_missing = depot::test_depot_io_counts(&first);
+        let missing = first
+            .blob_depot_for_authenticated_read(&proof.completion)
+            .and_then(|mut depot| depot.recheck_completion_range(&proof.completion, 1, 1))
+            .expect_err("missing requested chunk must invalidate bounded completion");
+        assert!(matches!(
+            missing,
+            StoreError::Blob(BlobStoreError::CompletionMismatch)
+        ));
+        let after_missing = depot::test_depot_io_counts(&first);
+        assert_eq!(
+            after_missing.full_open_audits,
+            before_missing.full_open_audits
+        );
+        assert_eq!(
+            after_missing.begin_write_transactions,
+            before_missing.begin_write_transactions
+        );
+        assert_eq!(after_missing.root_creations, before_missing.root_creations);
+        assert_eq!(
+            after_missing.authenticated_read_opens,
+            before_missing.authenticated_read_opens + 1
+        );
+    }
+
+    #[test]
+    fn retained_completion_mints_are_linear_in_exact_variant_chunks() {
+        let root = BlobTestRoot::new("retained-completion-linear");
+        let mut services = blob_services(0x7e);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("retained completion store");
+        let mut retained = Vec::new();
+        for variant in 0..8u8 {
+            let plaintext =
+                vec![variant; SELECTED_BLOB_CHUNK_SIZE as usize + usize::from(variant) + 1];
+            let prepared = prepared_blob(&plaintext);
+            let proof = prepare_blob_proof(&store, &mut services, &prepared, &plaintext, 1);
+            let operation = BlobOperationKey::new(format!("retained-{variant}").into_bytes())
+                .expect("retained operation");
+            let intent = BlobPublicationIntent::new(
+                services.publisher.identity(),
+                blob_topic(),
+                blob_scope(),
+                Priority::Immediate,
+                prepared.id(),
+            )
+            .expect("retained intent");
+            let outcome = store
+                .commit_reserved_blob_once_with_policy(
+                    &proof.policy,
+                    &BlobOperationRequest::new(&operation, &intent),
+                    &proof.reservation,
+                    &proof.blob,
+                    &proof.sealed,
+                    &proof.completion,
+                )
+                .expect("commit retained variant");
+            let projection = store
+                .blob_source_projection(outcome.blob().transfer_id)
+                .expect("retained projection lookup")
+                .expect("retained projection");
+            retained.push((proof, projection));
+        }
+
+        let before = depot::test_depot_io_counts(&store);
+        let mut expected_rows = 0u64;
+        for (proof, projection) in &retained {
+            let completion = store
+                .completed_retained_blob(
+                    &projection.source,
+                    projection.retention,
+                    &proof.blob,
+                    &proof.manifest_bytes,
+                    &proof.sealed,
+                )
+                .expect("mint retained completion");
+            assert_eq!(completion.blob_id(), proof.blob.blob_id());
+            expected_rows = expected_rows
+                .checked_add(proof.blob.manifest().chunk_count())
+                .expect("expected chunk rows");
+        }
+        let after = depot::test_depot_io_counts(&store);
+        assert_eq!(after.full_open_audits, before.full_open_audits);
+        assert_eq!(
+            after.begin_write_transactions,
+            before.begin_write_transactions
+        );
+        assert_eq!(after.root_creations, before.root_creations);
+        assert_eq!(
+            after.completion_chunk_rows_visited - before.completion_chunk_rows_visited,
+            expected_rows,
+            "unrelated variants leaked into exact completion proofs"
+        );
+    }
+
+    #[test]
+    fn completion_capability_rejects_every_exact_import_identity_mutation() {
+        for (index, field) in [
+            "whole_plaintext_sha256",
+            "media_type",
+            "schema_id",
+            "total_len",
+            "chunk_size",
+            "physical_lineage",
+            "finalized_manifest_digest",
+            "chunk_count",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let root = BlobTestRoot::new(field);
+            let mut services = blob_services(0xa0 + u8::try_from(index).expect("mutation index"));
+            let plaintext = vec![0xa5; 2_048];
+            let prepared = prepared_blob(&plaintext);
+            let store =
+                Store::open_for_mission(&root.database, services.authority).expect("case store");
+            let proof = prepare_blob_proof(&store, &mut services, &prepared, &plaintext, 1);
+            let write = store.database.begin_write().expect("import mutation write");
+            depot::corrupt_completion_import_for_test(&write, proof.completion.variant_id(), field)
+                .expect("mutate exact completion import");
+            write.commit().expect("commit import mutation");
+
+            let error = depot::verify_completion(&store, &proof.completion)
+                .expect_err("old completion capability rejects changed import");
+            assert!(
+                matches!(error, StoreError::Blob(_)),
+                "completion recheck must fail in the Blob domain for {field}: {error:?}"
+            );
+            assert!(
+                store
+                    .blob_depot_for_authenticated_read(&proof.completion)
+                    .is_err(),
+                "authenticated read open must reject mutated {field}"
+            );
+            assert!(
+                store
+                    .blob_depot()
+                    .and_then(|mut depot| {
+                        depot.completed_blob(&proof.blob, &proof.manifest_bytes)
+                    })
+                    .is_err(),
+                "completion mint must reject mutated {field}"
+            );
+        }
     }
 
     #[test]

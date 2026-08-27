@@ -7,11 +7,11 @@
 
 use crate::{
     blob::{
-        AuthenticatedBlobRoute, BlobError, BlobId, BlobManifest, BlobPhysicalLineage, BlobReader,
-        BlobRouteCommitment, BlobStore, InspectedBlobManifest, MAX_BLOB_MANIFEST_BYTES,
-        ReferenceBlobService, VerifiedBlobContentCompletion, VerifiedBlobManifest,
-        VerifiedBlobTransferPlan, content_group_id, inspect_selected_blob_manifest,
-        verify_source_authenticated_store_completion,
+        AuthenticatedBlobRoute, BlobError, BlobId, BlobManifest, BlobPhysicalLineage,
+        BlobRangeReadStats, BlobReader, BlobRouteCommitment, BlobStore, InspectedBlobManifest,
+        MAX_BLOB_MANIFEST_BYTES, ReferenceBlobService, VerifiedBlobContentCompletion,
+        VerifiedBlobManifest, VerifiedBlobTransferPlan, content_group_id,
+        inspect_selected_blob_manifest, verify_source_authenticated_store_completion,
     },
     crypto::ReferenceEnvelopeSealer,
     envelope::{EnvelopeError, EnvelopeHeader, EnvelopeSealer, SealRequest, SealedEnvelope},
@@ -728,6 +728,27 @@ impl<S: BlobStore> ReferenceBlobService<S> {
     ) -> Result<BlobReader<&'_ mut S>, BlobError> {
         self.validate_verified_blob_binding(blob)?;
         self.reader(VerifiedBlobManifest::new(blob.manifest().clone()))
+    }
+
+    /// Reads one exact source-authenticated range without walking its plaintext prefix.
+    ///
+    /// Only chunks intersecting `offset..offset + output.len()` are decrypted,
+    /// and every disclosed chunk is independently checked against the exact
+    /// authenticated manifest. The caller must separately preserve any
+    /// higher-level authorization and freshness checks around this bounded
+    /// content operation.
+    pub fn read_range_for_verified(
+        &mut self,
+        blob: &ContentVerifiedBlobEnvelope,
+        offset: u64,
+        output: &mut [u8],
+    ) -> Result<BlobRangeReadStats, BlobError> {
+        self.validate_verified_blob_binding(blob)?;
+        self.read_range(
+            VerifiedBlobManifest::new(blob.manifest().clone()),
+            offset,
+            output,
+        )
     }
 
     /// Freshly streams and authenticates every exact manifest chunk, including

@@ -2597,6 +2597,28 @@ pub(crate) fn selected_tombstone_payload_usage_write(
     })
 }
 
+pub(crate) fn selected_tombstone_payload_usage_read(
+    read: &redb::ReadTransaction,
+) -> Result<CustodyUsage, StoreError> {
+    let custody = read.open_table(CUSTODY_METADATA)?;
+    let total_items = metadata_value(&custody, CUSTODY_ITEM_COUNT_KEY)?;
+    let total_bytes = metadata_value(&custody, CUSTODY_TOTAL_BYTES_KEY)?;
+    let ordinary_items = metadata_value(&custody, CUSTODY_ORDINARY_ITEM_COUNT_KEY)?;
+    let ordinary_bytes = metadata_value(&custody, CUSTODY_ORDINARY_TOTAL_BYTES_KEY)?;
+    Ok(CustodyUsage {
+        items: total_items
+            .checked_sub(ordinary_items)
+            .ok_or(CustodyStoreError::Invariant(
+                "selected tombstone item accounting is invalid",
+            ))?,
+        bytes: total_bytes
+            .checked_sub(ordinary_bytes)
+            .ok_or(CustodyStoreError::Invariant(
+                "selected tombstone byte accounting is invalid",
+            ))?,
+    })
+}
+
 fn selected_tombstone_usage_write(
     write: &redb::WriteTransaction,
 ) -> Result<CustodyUsage, StoreError> {

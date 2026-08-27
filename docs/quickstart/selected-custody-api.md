@@ -9,8 +9,22 @@ mutable lanes. Under v5 they also run direct content-capable Blob transfer for
 already-durable objects. `AtLeast` is an Event threshold only. `ReceiveOnly`
 initiates or discloses no State/Record/Blob lane or work. V1-v4 emit zero Blob
 frames. State and Record have separate cloneable live actor handles, but those
-operations do not enter Event custody; the Blob application facade remains
-stopped.
+operations do not enter Event custody. Blob likewise has a separate cloneable
+live handle: publish consumes an already-open regular nonempty file at cursor
+zero with a 64-MiB/1,024 canonical 64-KiB-chunk ceiling, and a live absolute-
+offset page read returns at most 64 KiB in zeroize-on-drop plaintext. These Blob
+operations require a fresh selected source, current policy/lineage, and the
+exact authenticated `BlobDepotCompletion` capability; they do not enter Event
+custody or turn `AtLeast` into a Blob threshold.
+
+The live Blob handle shares the 32-slot application command lane and delegates
+file work to a joined worker of capacity one. Any contradiction among durable
+rows, authenticated cache state, depot completion, or post-commit verification
+is fatal coherence: the actor closes all application admission and terminates
+instead of returning an ordinary per-request failure. Shutdown and terminal
+zeroization also close and join that worker; zeroization cryptographically
+shreds mission/content and carrier-identity secrets while preserving audited
+rows and encrypted depot ciphertext, and makes no physical-sanitization claim.
 
 This is an additive configuration surface. Existing callers of `start_node`
 retain durable Event publication, default store limits, and normal emission.
@@ -254,10 +268,12 @@ equivalent deterministic whole-contact partial claim is made for v1/v2.
 The selected implementation covers Event and RouteEvent custody only. It does
 not add State/Record custody; their cloneable live handles and separate
 semantic-v4/v5 mutable reconciliation run outside this custody policy in Normal
-and AtLeast, as does semantic-v5 direct Blob work. It does not add finite
-State/Record TTL or subscriptions, Blob custody/TTL/GC, route-only Blob relay, a
-live Blob handle, selected-node bindings, cross-class priority eviction,
-physical-radio silence, protected provisioning, representative/physical NAT or
-public/default relay acceptance, BTLE,
-long-offline or requirement-scale acceptance, mixed implementations, or release
-authorization.
+and AtLeast, as do the live Blob application surface and semantic-v5 direct Blob
+work. The latter is current same-implementation direct-Iroh automation, not a
+retained Blob acceptance receipt. It does not add finite State/Record TTL or
+subscriptions, Blob subscription/status, Blob custody/TTL/GC, route-only Blob
+relay/custody, selected-node bindings, cross-class priority eviction,
+physical-radio silence or media-sanitization proof, protected provisioning,
+representative/physical NAT or public/default relay acceptance, BTLE,
+long-offline or requirement-scale acceptance, mixed implementations, resource
+proof, or release authorization.

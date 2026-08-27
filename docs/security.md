@@ -228,6 +228,15 @@ provisioning can shut down gracefully, but the selected same-UID local
 software-zeroization path has no provider destroyer and cannot destroy the
 provider artifact, opaque reference, or provider-held secret.
 
+For the selected unprotected-reference path on Unix, local zeroization closes
+all application admission, joins the live Blob worker, terminally locks the
+mission-bound store, and overwrites/synchronizes/truncates the retained mission
+bundle and carrier-identity files. Redb rows and the encrypted Blob depot are
+deliberately preserved for terminal-safe audit. Destroying the retained
+mission/content secrets makes that depot unavailable through normal operation;
+this is bounded cryptographic shredding, not proof that ciphertext files,
+filesystem history, swap, snapshots, backups, or physical media were erased.
+
 Relative state and protected-file paths for live `NodeConfig` construction and
 the stopped Event/admin opens are resolved against one captured absolute
 current directory before a caller provider or loader can change the process
@@ -568,12 +577,13 @@ lineage for the same `(BlobID, content group, numeric epoch)` fails with
 `PhysicalLineageConflict`. Republishing or resuming that Blob after same-epoch
 key replacement under a different physical lineage requires advancing the
 numeric epoch. Terminal or stale cleanup does not erase this witness. It retires
-all unshared chunks, clears finalized digest and reserved/committed byte
-authority, and reclaims files, while retaining the exact unfinished
-`BLOB_IMPORTS` row as a non-public physical-lineage fence. That row remains
+pending source and prefix visibility while retaining the exact depot import,
+expected or committed chunk rows, any chunk files and finalized digest, and
+their reserved/committed accounting. That bounded non-public staging remains
 owner/backing-bound, audited on every open path, and charged to the existing
-variant cap. Exact-lineage retry may refill it; a missing physical lineage is
-corruption, and another lineage at the same numeric epoch still conflicts.
+byte, chunk, and variant caps. Exact-lineage retry may resume it; a missing
+physical lineage is corruption, and another lineage at the same numeric epoch
+still conflicts.
 
 The source envelope and complete manifest plan are authenticated and staged
 before any carrier range is requested. Prefix progress is durable under the
@@ -623,12 +633,33 @@ network tables may be added to the prior nine-table Blob schema only when the
 group is wholly absent and owner attribution is valid; read-only and partial-
 group opens never create or repair tables.
 
+The application boundary uses the same authority rather than a second Blob
+store. `RunningNode::selected_blobs()` returns a cloneable handle whose publish
+operation accepts ownership only of a nonempty regular file positioned at byte
+zero and caps it at 64 MiB/1,024 fixed 64-KiB chunks. The source length is
+checked across both bounded passes so a concurrent change cannot silently
+change the authenticated intent. A read returns one freshly authenticated
+`1..=64 KiB` plaintext page in a zeroize-on-drop allocation and rechecks policy,
+source selection, current lineage, and the exact depot completion capability
+around decryption. The shared application lane is capped at 32 commands and a
+single joined Blob worker accepts at most one queued Blob command; saturation
+is explicit and shutdown/zeroization joins ownership rather than detaching key-
+bearing work. A blocking syscall in a hostile regular-file provider can still
+delay that join, so no fixed teardown-latency claim is made.
+
+Ordinary application failures are sanitized. A durable row/cache mismatch,
+invalid authenticated depot capability, page-integrity failure, or post-commit
+verification contradiction is `FatalBlobCoherence`: the worker closes shared
+admission and terminates the actor rather than serving through divergent
+authorities. This is a local fail-closed mechanism, not retained network or
+release acceptance.
+
 Normal and `AtLeast` run this lane because `AtLeast` is Event-only;
 `ReceiveOnly` sends, requests, stages, promotes, and counts zero Blob work.
-There is no selected live Blob application handle/subscription, route-only Blob
-relay or custody, Blob TTL/expiry/garbage collection, metadata-independent
-whole-byte identity/deduplication, or large-file, physical, mixed-implementation,
-and release-acceptance claim.
+There is no Blob subscription/status surface, route-only Blob relay or custody,
+Blob TTL/expiry/garbage collection, metadata-independent whole-byte
+identity/deduplication, or retained large-file, physical,
+mixed-implementation, and release-acceptance claim.
 
 ## Availability controls
 

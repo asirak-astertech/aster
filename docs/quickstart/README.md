@@ -15,12 +15,14 @@ through the running actor plus stopped/exclusive latest-value access, causal
 projection, recoverable versions, and visible authenticated tombstones. The
 [selected Record quickstart](selected-record-api.md) demonstrates live and
 stopped durable revisions, explicit conflict siblings, and exact-guard
-application resolution. The stopped/local
-[selected Blob quickstart](selected-blob-api.md) demonstrates bounded-memory
-streaming, immutable metadata-bound identity, crash-resumable encrypted chunks,
-and exact durable retry. Durable State/Record subscriptions, automatic
-registered-policy Record merge, atomic Event subscription update, live Blob
-access, selected-node language bindings, and representative physical or
+application resolution. The [selected Blob quickstart](selected-blob-api.md)
+demonstrates the cloneable live handle's peerless-capable durable regular-file
+publication and bounded zeroize-on-drop page reads, as well as the exclusive
+stopped streaming facade, immutable metadata-bound identity, crash-resumable
+encrypted chunks, and exact durable retry. Durable State/Record subscriptions,
+automatic registered-policy Record merge, atomic Event subscription update,
+Blob subscription or convergence status, selected-node language bindings,
+retained live-Blob evidence, and representative physical or
 mixed-implementation acceptance remain open.
 
 The alpha [local ConnectRPC agent](connect-agent.md) exposes that live Event
@@ -41,7 +43,8 @@ Choose the API closest to your application:
 | Rust (selected stopped State slice) | `aster-node::application::SelectedStateNode` | [Selected State API](selected-state-api.md#use-the-stopped-api) |
 | Rust (selected live Record slice) | `aster_node::start_node` + `SelectedRecordHandle` | [Selected Record API](selected-record-api.md#use-the-live-actor-api) |
 | Rust (selected stopped Record slice) | `aster-node::application::SelectedRecordNode` | [Selected Record API](selected-record-api.md#use-the-stopped-api) |
-| Rust (selected stopped Blob slice) | `aster-node::application::SelectedBlobNode` | [Selected Blob API](selected-blob-api.md) |
+| Rust (selected live Blob slice) | `aster_node::start_node` + `RunningNode::selected_blobs()` | [Selected Blob API](selected-blob-api.md#use-the-live-actor-api) |
+| Rust (selected stopped Blob slice) | `aster-node::application::SelectedBlobNode` | [Selected Blob API](selected-blob-api.md#use-the-stopped-streaming-api) |
 | Rust | Native high-level `ApplicationNode` | [Rust](rust.md) |
 | Python | Dependency-free `ctypes` wrapper over the native library | [Python](python.md) |
 | Go | cgo wrapper over the native library | [Go](go.md) |
@@ -60,8 +63,9 @@ process test. The selected Rust State and Record guides use the production-lane
 store and security composition through either the running actor's shared
 bounded command lane or an exclusive stopped facade. The Record guide adds
 explicit conflict annotation and guarded resolution. The selected Rust Blob
-guide streams immutable content through an encrypted local depot without
-exposing source-envelope or provider internals. The language examples remain
+guide either sends bounded commands through the running actor's cloneable
+handle or streams through the exclusive stopped facade, without exposing
+source-envelope or provider internals. The language examples remain
 intentionally offline exercises. After one works, continue with
 [Carriers and contacts](../transports.md) to understand live synchronization.
 The fixture path is unprotected compatibility/test ingestion. Caller-composed
