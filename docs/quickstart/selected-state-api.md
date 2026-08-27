@@ -24,7 +24,8 @@ has a separate durable whole-key delivery mechanism with a
 [retained bounded receipt](../implementation/evidence/selected-live-record-subscription-0c11344.json).
 That Record receipt moves only `DM-5.1-08` and does not broaden this State
 contract. Dynamic network selectors, State/node contact
-status, Blob delivery, selected-node ConnectRPC/C/Go/Python bindings, finite
+status, retained Blob-delivery acceptance and Blob peer/convergence status,
+selected-node ConnectRPC/C/Go/Python bindings, finite
 TTL, tombstone retention duration,
 expiry, compaction, garbage collection, broader relay acceptance,
 representative physical/mixed-implementation evidence, and release

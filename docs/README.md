@@ -97,8 +97,8 @@ The selected implementation deliberately exposes different maturity levels:
   [retained 10,357-byte receipt](implementation/evidence/selected-live-record-subscription-0c11344.json)
   covering a whole conflict, forced-process attempt-2 redelivery, guarded
   resolution, a successor projection, selector separation, and final peerless
-  reopen. That receipt moves only `DM-5.1-08`; Blob delivery remains open. State
-  contact/status and
+  reopen. That receipt moves only `DM-5.1-08`; Blob delivery now has a separate
+  current-code mechanism but no retained acceptance. State contact/status and
   materialized-view/synthetic-withdrawal behavior, dynamic State network
   interests, selected-node bindings, finite TTL,
   tombstone retention duration/garbage collection, and representative
@@ -106,15 +106,18 @@ The selected implementation deliberately exposes different maturity levels:
   remain open.
 - **Blob** has a cloneable `RunningNode::selected_blobs()` Rust handle for
   peerless-capable durable regular-file publication and authenticated reads of
-  at most one 64-KiB, zeroize-on-drop plaintext page. Its exclusive stopped
-  streaming facade remains available when no actor owns the store. Semantic v5
+  at most one 64-KiB, zeroize-on-drop plaintext page, plus durable metadata-only
+  publication delivery keyed by exact source-publication identity. Its exclusive
+  stopped streaming facade retains the same delivery lifecycle when no actor
+  owns the store. Semantic v5
   can later synchronize the already-durable source and carrier ranges directly
   between current content-capable peers, with durable restart/resume state and
   bounded retained one-host interrupted/reopened/different-peer resume,
-  completion, read, and reopen evidence. Blob subscription/status convergence,
-  route-only custody, arbitrary-peer resume, crash/power-loss/long-offline
-  recovery, large/RSS acceptance, and representative physical or
-  mixed-implementation evidence remain open.
+  completion, read, and reopen evidence; that receipt predates the delivery
+  ledger. Retained Blob-delivery acceptance, peer/convergence status, route-only
+  custody, arbitrary-peer resume, crash/power-loss/long-offline recovery,
+  large/RSS acceptance, and representative physical or mixed-implementation
+  evidence remain open.
 - The broader semantic Rust implementation and language bindings remain the
   proven migration source for behavior not yet composed into the selected node.
 

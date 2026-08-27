@@ -785,10 +785,10 @@ publication. Normal and AtLeast must run the lane because AtLeast is Event-only;
 ReceiveOnly must perform zero Blob work. The separate live Blob gate covers an
 actor-owned handle, peerless publication, later direct synchronization,
 authenticated bounded page reads, restart, and closure, but remains current-code
-same-implementation loopback automation. Neither gate is a retained Blob
-execution root, subscription/status surface, route-only Blob relay, 100+
-MiB/RSS or resource test, physical system, mixed implementation, or release
-acceptance.
+same-implementation loopback automation. Neither gate supplies retained
+Blob-delivery acceptance, Blob peer/convergence status, route-only Blob relay,
+a 100+ MiB/RSS or resource test, physical-system or mixed-implementation
+evidence, or release acceptance.
 
 Representative focused commands include:
 

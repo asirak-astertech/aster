@@ -22,11 +22,13 @@
 #![forbid(unsafe_code)]
 
 mod blob;
+mod blob_subscription;
 mod custody;
 mod record_subscription;
 mod state_subscription;
 
 pub use blob::*;
+pub use blob_subscription::*;
 pub use custody::*;
 pub use record_subscription::*;
 pub use state_subscription::*;
@@ -3184,6 +3186,8 @@ pub struct StoreInspection {
     pub state_subscription_stats: StateSubscriptionStats,
     /// Record whole-projection selector and ledger counts from the same transaction.
     pub record_subscription_stats: RecordSubscriptionStats,
+    /// Blob immutable-publication selector and ledger counts from the same transaction.
+    pub blob_subscription_stats: BlobSubscriptionStats,
     /// Mission-wide Flash control counts from the same audited read transaction.
     pub control_stats: ControlStoreStats,
     /// Mission-bound custody, quota, lease, retry, and retirement counts.
@@ -3478,6 +3482,44 @@ pub enum StoreError {
     RecordKeyEpochStale { current: u64, received: u64 },
     /// A Record claims a provisioned future epoch that is not durably active.
     RecordKeyEpochNotActive { current: u64, received: u64 },
+    /// A durable Blob subscription operation key was empty or over its bound.
+    InvalidBlobSubscriptionKey { length: usize },
+    /// The dedicated durable Blob subscription cap was reached.
+    BlobSubscriptionLimitExceeded { current: u64, limit: u64 },
+    /// The dedicated unacknowledged Blob delivery cap was reached.
+    BlobPendingDeliveryLimitExceeded { current: u64, limit: u64 },
+    /// The durable Blob acknowledgement-receipt cap was reached.
+    BlobAcknowledgementReceiptLimitExceeded { current: u64, limit: u64 },
+    /// Pending and acknowledged Blob delivery rows exhausted their shared bound.
+    BlobDeliveryLedgerLimitExceeded { current: u64, limit: u64 },
+    /// A Blob subscription operation key was replayed with another specification.
+    BlobSubscriptionConflict,
+    /// The requested durable Blob subscription does not exist.
+    BlobSubscriptionNotFound,
+    /// One bounded Blob subscription poll limit was invalid.
+    BlobSubscriptionPollLimitExceeded { requested: usize, maximum: usize },
+    /// A prepared Blob poll no longer matches its exact snapshot or ledger.
+    BlobSubscriptionPlanChanged,
+    /// A selected Blob publication was never durably delivered by this subscription.
+    BlobDeliveryNotFound,
+    /// Opaque Blob delivery-token bytes have an unknown version or zero counter.
+    InvalidBlobDeliveryToken,
+    /// A Blob delivery token is not bound to the supplied subscription and publication.
+    BlobDeliveryTokenBindingMismatch,
+    /// The durable Blob delivery-attempt counter is exhausted.
+    BlobDeliveryAttemptExhausted,
+    /// The durable Blob visibility-tenure counter is exhausted.
+    BlobDeliveryTenureExhausted,
+    /// An acknowledgement token belongs to another incarnation of the stable subscription ID.
+    BlobSubscriptionIncarnationChanged { current: u64, received: u64 },
+    /// An acknowledgement token belongs to another active-publication tenure.
+    BlobDeliveryTenureChanged { current: u64, received: u64 },
+    /// An acknowledgement token names an attempt not issued in its tenure.
+    BlobDeliveryAttemptChanged { current: u64, received: u64 },
+    /// The durable Blob selector generation changed after poll preparation.
+    BlobSelectorGenerationChanged,
+    /// A durable Blob subscription table or index disagreed with its authority row.
+    BlobInvariant(&'static str),
     /// One Event cursor request exceeded the explicit page bound.
     EventPageLimitExceeded {
         /// Requested number of rows.
@@ -3979,6 +4021,71 @@ impl fmt::Display for StoreError {
             Self::RecordKeyEpochNotActive { current, received } => write!(
                 formatter,
                 "Record key epoch {received} is not the active scope epoch {current}"
+            ),
+            Self::InvalidBlobSubscriptionKey { length } => write!(
+                formatter,
+                "Blob subscription key length {length} is outside 1..={MAX_BLOB_SUBSCRIPTION_KEY_BYTES}"
+            ),
+            Self::BlobSubscriptionLimitExceeded { current, limit } => write!(
+                formatter,
+                "Blob subscription count {current} is at dedicated limit {limit}"
+            ),
+            Self::BlobPendingDeliveryLimitExceeded { current, limit } => write!(
+                formatter,
+                "pending Blob delivery count {current} is at dedicated limit {limit}"
+            ),
+            Self::BlobAcknowledgementReceiptLimitExceeded { current, limit } => write!(
+                formatter,
+                "Blob acknowledgement receipt count {current} is at dedicated limit {limit}"
+            ),
+            Self::BlobDeliveryLedgerLimitExceeded { current, limit } => write!(
+                formatter,
+                "combined pending and acknowledged Blob delivery count {current} exceeds shared limit {limit}"
+            ),
+            Self::BlobSubscriptionConflict => formatter
+                .write_str("Blob subscription retry differs from its durable specification"),
+            Self::BlobSubscriptionNotFound => {
+                formatter.write_str("durable Blob subscription was not found")
+            }
+            Self::BlobSubscriptionPollLimitExceeded { requested, maximum } => write!(
+                formatter,
+                "Blob subscription poll request {requested} exceeds maximum {maximum}"
+            ),
+            Self::BlobSubscriptionPlanChanged => {
+                formatter.write_str("durable Blob subscription poll state changed; prepare again")
+            }
+            Self::BlobDeliveryNotFound => {
+                formatter.write_str("Blob publication was not delivered by this subscription")
+            }
+            Self::InvalidBlobDeliveryToken => {
+                formatter.write_str("Blob delivery token bytes are invalid")
+            }
+            Self::BlobDeliveryTokenBindingMismatch => formatter
+                .write_str("Blob delivery token is bound to another subscription or publication"),
+            Self::BlobDeliveryAttemptExhausted => {
+                formatter.write_str("Blob delivery attempt counter is exhausted")
+            }
+            Self::BlobDeliveryTenureExhausted => {
+                formatter.write_str("Blob delivery tenure counter is exhausted")
+            }
+            Self::BlobSubscriptionIncarnationChanged { current, received } => write!(
+                formatter,
+                "Blob subscription incarnation changed from token {received} to {current}"
+            ),
+            Self::BlobDeliveryTenureChanged { current, received } => write!(
+                formatter,
+                "Blob delivery tenure changed from token {received} to {current}"
+            ),
+            Self::BlobDeliveryAttemptChanged { current, received } => write!(
+                formatter,
+                "Blob delivery token attempt {received} was not issued through {current}"
+            ),
+            Self::BlobSelectorGenerationChanged => {
+                formatter.write_str("durable Blob receive-selector state changed")
+            }
+            Self::BlobInvariant(reason) => write!(
+                formatter,
+                "durable Blob subscription invariant failed: {reason}"
             ),
             Self::EventPageLimitExceeded { requested, maximum } => write!(
                 formatter,
@@ -17086,6 +17193,7 @@ fn audit_semantic_tables(
     audit_event_subscription_tables(write)?;
     state_subscription::audit_state_subscription_tables(write, exact_legacy_state_extensions)?;
     record_subscription::audit_record_subscription_tables(write, exact_legacy_record_extensions)?;
+    blob_subscription::audit_blob_subscription_tables(write)?;
     Ok(blob_audit.stats)
 }
 
@@ -22488,6 +22596,7 @@ fn inspect_readable(
     let event_subscription_stats = event_subscription_stats_read(&read)?;
     let state_subscription_stats = state_subscription::inspect_state_subscription_tables(&read)?;
     let record_subscription_stats = record_subscription::inspect_record_subscription_tables(&read)?;
+    let blob_subscription_stats = blob_subscription::inspect_blob_subscription_tables(&read)?;
     let control_stats = inspect_control_tables(&read, mission_authority)?.unwrap_or_default();
     let aggregate_items = [
         ITEM_COUNT,
@@ -22529,6 +22638,7 @@ fn inspect_readable(
         event_subscription_stats,
         state_subscription_stats,
         record_subscription_stats,
+        blob_subscription_stats,
         control_stats,
         custody_stats,
         mission_authority,

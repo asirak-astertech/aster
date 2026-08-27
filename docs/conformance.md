@@ -369,9 +369,11 @@ all exact bounds, and v1-v4/ReceiveOnly absence. This is current-code
 same-implementation loopback automation for one small Blob; by itself it has no
 retained execution root. The current live Blob application handle and the
 separate retained composition of this resume mechanism are covered by
-`V-BLOB-LIVE`. Neither evidence tier claims a Blob subscription/status API,
-route-only Blob relay/custody, the 100+ MiB or RSS target, physical-media
-behavior, mixed implementation, or release acceptance.
+`V-BLOB-LIVE`. Both tiers predate the current metadata-only Blob delivery queue
+and therefore claim no retained delivery evidence. The queue's local ledger
+counts are not peer/convergence status. Neither evidence tier claims route-only
+Blob relay/custody, the 100+ MiB or RSS target, physical-media behavior, mixed
+implementation, or release acceptance.
 
 A separate dated
 [`V-BLOB-LIVE` retained receipt](implementation/evidence/selected-live-blob-044d90f.json)

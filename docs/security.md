@@ -647,6 +647,23 @@ is explicit and shutdown/zeroization joins ownership rather than detaching key-
 bearing work. A blocking syscall in a hostile regular-file provider can still
 delay that join, so no fixed teardown-latency claim is made.
 
+Blob application delivery is a separate durable metadata ledger, not a second
+content path. A selector is mission-local intent and cannot add network
+interest, route authority, content authority, or a depot capability. Poll
+rebinds every candidate to its startup-authenticated projection and current
+policy, then exact-loads and rechecks each deliverable source envelope and
+completed depot before committing an attempt, but returns no plaintext,
+manifest, sealed envelope, key, nonce, chunk, carrier state, or path. Delivery
+identity is the source-authenticated semantic publication ID rather than
+`BlobId`, so distinct publishers/counters/priorities sharing immutable content
+cannot consume one another's work. Opaque acknowledgement tokens bind the
+subscription incarnation, publication, tenure, and attempt; durable cursors
+prevent removed/recreated-selector ABA. An earlier issued nonzero attempt at or
+below the durable high-water remains valid within the same pending publication
+tenure for crash-safe acknowledgement; wrong-tenure, wrong-incarnation,
+cross-binding, malformed, and future/unissued tokens fail closed. Ledger counts
+are bounded and structurally audited.
+
 Ordinary application failures are sanitized. A durable row/cache mismatch,
 invalid authenticated depot capability, page-integrity failure, or post-commit
 verification contradiction is `FatalBlobCoherence`: the worker closes shared
@@ -656,10 +673,11 @@ release acceptance.
 
 Normal and `AtLeast` run this lane because `AtLeast` is Event-only;
 `ReceiveOnly` sends, requests, stages, promotes, and counts zero Blob work.
-There is no Blob subscription/status surface, route-only Blob relay or custody,
-Blob TTL/expiry/garbage collection, metadata-independent whole-byte
-identity/deduplication, or retained large-file, physical,
-mixed-implementation, and release-acceptance claim.
+The local delivery-ledger counts are not Blob peer, contact, transfer-progress,
+or convergence status. There is no retained Blob-delivery acceptance,
+route-only Blob relay or custody, Blob TTL/expiry/garbage collection,
+metadata-independent whole-byte identity/deduplication, or retained large-file,
+physical, mixed-implementation, and release-acceptance claim.
 
 ## Availability controls
 

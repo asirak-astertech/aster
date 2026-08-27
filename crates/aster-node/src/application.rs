@@ -55,10 +55,13 @@ mod record;
 mod state;
 pub(crate) use blob::SelectedBlobCommand;
 pub use blob::{
-    BlobDepotLimits, BlobId, BlobPublishRequest, BlobPublishResult, BlobReadPage,
-    BlobReadPageRequest, BlobReadRequest, BlobReadResult, MAX_SELECTED_BLOB_PAGE_BYTES,
-    MAX_SELECTED_LIVE_BLOB_BYTES, MAX_SELECTED_LIVE_BLOB_CHUNKS, SelectedBlobHandle,
-    SelectedBlobNode, SelectedBlobOptions,
+    BLOB_DELIVERY_TOKEN_BYTES, BlobAcknowledgement, BlobDelivery, BlobDeliveryPage,
+    BlobDeliveryStatus, BlobDeliveryToken, BlobDepotLimits, BlobId, BlobPollRequest,
+    BlobPublicationId, BlobPublishRequest, BlobPublishResult, BlobReadPage, BlobReadPageRequest,
+    BlobReadRequest, BlobReadResult, BlobSubscription, BlobSubscriptionId, BlobSubscriptionRequest,
+    BlobUnsubscribe, MAX_SELECTED_BLOB_DELIVERIES, MAX_SELECTED_BLOB_PAGE_BYTES,
+    MAX_SELECTED_BLOB_SUBSCRIPTION_SCAN, MAX_SELECTED_LIVE_BLOB_BYTES,
+    MAX_SELECTED_LIVE_BLOB_CHUNKS, SelectedBlobHandle, SelectedBlobNode, SelectedBlobOptions,
 };
 pub(crate) use record::SelectedRecordCommand;
 pub use record::{
@@ -806,9 +809,12 @@ impl SelectedEventCommand {
 /// One bounded high-level application command owned by the running node actor.
 ///
 /// The wrapper keeps Event, State, Record, and Blob operations on one admission and
-/// fairness lane. Event, State, and Record subscription changes require the actor's
-/// selector-write lease; plaintext operations for every class remain behind
-/// the same mission-bound store authority.
+/// fairness lane. Event, State, and Record subscription changes execute while
+/// holding the actor's selector-write lease. Blob commands are handed to the
+/// separate joined worker, where selector changes replay current policy and
+/// commit under the Store's exact policy transaction instead of relying on an
+/// enqueue-only outer lease. Plaintext operations for every class remain
+/// behind the same mission-bound store authority.
 pub(crate) enum SelectedApplicationCommand {
     Event(SelectedEventCommand),
     State(SelectedStateCommand),
@@ -1811,6 +1817,7 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         | StoreError::InvalidEventSubscriptionKey { .. }
         | StoreError::InvalidStateSubscriptionKey { .. }
         | StoreError::InvalidRecordSubscriptionKey { .. }
+        | StoreError::InvalidBlobSubscriptionKey { .. }
         | StoreError::EventPageLimitExceeded { .. }
         | StoreError::EventSubscriptionNotFound
         | StoreError::EventSubscriptionNotConsumable
@@ -1832,6 +1839,14 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         | StoreError::RecordSubscriptionIncarnationChanged { .. }
         | StoreError::RecordDeliveryTenureChanged { .. }
         | StoreError::RecordDeliveryAttemptChanged { .. }
+        | StoreError::BlobSubscriptionNotFound
+        | StoreError::BlobSubscriptionPollLimitExceeded { .. }
+        | StoreError::BlobDeliveryNotFound
+        | StoreError::InvalidBlobDeliveryToken
+        | StoreError::BlobDeliveryTokenBindingMismatch
+        | StoreError::BlobSubscriptionIncarnationChanged { .. }
+        | StoreError::BlobDeliveryTenureChanged { .. }
+        | StoreError::BlobDeliveryAttemptChanged { .. }
         | StoreError::EventReplicationNotSelected
         | StoreError::EventReplicationNotConsumable
         | StoreError::InvalidSemanticEvent(_)
@@ -1863,6 +1878,8 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         | StoreError::StateSelectorGenerationChanged
         | StoreError::RecordSubscriptionPlanChanged
         | StoreError::RecordSelectorGenerationChanged
+        | StoreError::BlobSubscriptionPlanChanged
+        | StoreError::BlobSelectorGenerationChanged
         | StoreError::EventSubscriptionPlanChanged
         | StoreError::EventGapScanPlanChanged
         | StoreError::EventSelectorRevisionChanged => ApplicationErrorKind::PolicyUnsettled,
@@ -1882,7 +1899,8 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         | StoreError::RecordProjectionPlanChanged
         | StoreError::EventSubscriptionConflict
         | StoreError::StateSubscriptionConflict
-        | StoreError::RecordSubscriptionConflict => ApplicationErrorKind::Conflict,
+        | StoreError::RecordSubscriptionConflict
+        | StoreError::BlobSubscriptionConflict => ApplicationErrorKind::Conflict,
         StoreError::ItemLimitExceeded { .. }
         | StoreError::EventOperationLimitExceeded { .. }
         | StoreError::EventOperationByteLimitExceeded { .. }
@@ -1911,6 +1929,12 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         | StoreError::RecordDeliveryLedgerLimitExceeded { .. }
         | StoreError::RecordDeliveryAttemptExhausted
         | StoreError::RecordDeliveryTenureExhausted
+        | StoreError::BlobSubscriptionLimitExceeded { .. }
+        | StoreError::BlobPendingDeliveryLimitExceeded { .. }
+        | StoreError::BlobAcknowledgementReceiptLimitExceeded { .. }
+        | StoreError::BlobDeliveryLedgerLimitExceeded { .. }
+        | StoreError::BlobDeliveryAttemptExhausted
+        | StoreError::BlobDeliveryTenureExhausted
         | StoreError::PayloadByteLimitExceeded { .. }
         | StoreError::AcceptanceMarkerExhausted
         | StoreError::ItemCountAccountingOverflow
@@ -1940,6 +1964,7 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         | StoreError::SemanticInvariant(_)
         | StoreError::StateInvariant(_)
         | StoreError::RecordInvariant(_)
+        | StoreError::BlobInvariant(_)
         | StoreError::SemanticNamespaceCollision { .. }
         | StoreError::ControlVerification(_)
         | StoreError::InvalidControl(_)

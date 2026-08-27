@@ -9,8 +9,10 @@
 //! v1/v2 remain compatible for durable Events. Its application boundary also
 //! composes source-authenticated latest-value State, explicit-conflict Record,
 //! and immutable Blob operations. State exposes durable positive-current-version
-//! delivery, while Record exposes durable whole-projection delivery that never
-//! splits an explicit conflict or runs merge code. [`RunningNode::selected_state`],
+//! delivery, Record exposes durable whole-projection delivery that never splits
+//! an explicit conflict or runs merge code, and Blob exposes durable metadata-
+//! only delivery for each exact signed immutable publication. Blob bytes remain
+//! behind the separate authenticated read surface. [`RunningNode::selected_state`],
 //! [`RunningNode::selected_records`], and [`RunningNode::selected_blobs`] return
 //! cloneable handles that share the running actor's bounded application lane;
 //! live Blob work is isolated on a bounded worker and returns only bounded,

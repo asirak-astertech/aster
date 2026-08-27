@@ -45,17 +45,20 @@ v1-v3 contain no State/Record mechanics and v1-v4 emit zero Blob frames.
 `RunningNode::selected_records()` exposes async `publish`, `query`, guarded
 `resolve`, `subscribe`, `poll`, `acknowledge`, and `unsubscribe`;
 `RunningNode::selected_blobs()` exposes async durable regular-file
-`publish` and authenticated `read_page`. Blob pages are at most 64 KiB and own a
-zeroize-on-drop plaintext allocation. Clones use the actor's bounded application
-admission rather than opening another writer; Blob work is dispatched to one
-bounded joined worker. Graceful shutdown and live zeroization close admission,
-reject queued work, and join that worker before authority release, so retained
-handles fail with sanitized `StateUnavailable`. Caller-copied Blob bytes and
-caller-owned source files remain outside node zeroization. Durable Blob
-delivery, State contact/status and materialized-view/synthetic-withdrawal
-behavior, dynamic State network interests, ConnectRPC/C/Go/Python selected-node
-bindings, finite TTL, and representative physical or mixed-implementation
-acceptance remain open. A
+`publish`, authenticated `read_page`, durable metadata-only `subscribe`, `poll`,
+`acknowledge`, `unsubscribe`, and local `delivery_status`. Blob pages are at
+most 64 KiB and own a zeroize-on-drop plaintext allocation; deliveries identify
+exact signed publications and carry no plaintext. Clones use the actor's bounded
+application admission rather than opening another writer; Blob work is
+dispatched to one bounded joined worker. Graceful shutdown and live zeroization
+close admission, reject queued work, and join that worker before authority
+release, so retained handles fail with sanitized `StateUnavailable`.
+Caller-copied Blob bytes and caller-owned source files remain outside node
+zeroization. Retained Blob-delivery acceptance, Blob peer/convergence status,
+State contact/status and materialized-view/synthetic-withdrawal behavior,
+dynamic State network interests, ConnectRPC/C/Go/Python selected-node bindings,
+finite TTL, and representative physical or mixed-implementation acceptance
+remain open. A
 [retained 7,752-byte v2 live-path receipt](implementation/evidence/selected-live-mutable-6cabb4c.json)
 (SHA-256
 `054945ecf94e8bfba1b130f6a5f47e9b1e0e17ad69f3b1472085a1d10f05eeaa`,
@@ -123,9 +126,10 @@ convergence. The Blob network slice is 16-KiB peer-neutral resume with
 completion-gated visibility. Terminal/stale cleanup retains one bounded,
 non-public, quota-charged depot import and any expected/committed chunk staging
 after removing source/prefix/cache visibility, so a different same-epoch
-lineage still requires epoch advance. It adds no Blob subscription/status
-convergence, route-only custody, TTL/GC, pure-byte deduplication, large/RSS
-acceptance, or representative physical or mixed-implementation acceptance.
+lineage still requires epoch advance. That network slice adds no retained
+application-delivery evidence or Blob peer/convergence status, route-only
+custody, TTL/GC, pure-byte deduplication, large/RSS acceptance, or
+representative physical or mixed-implementation acceptance.
 
 A [retained 10,728-byte v2 live-Blob receipt](implementation/evidence/selected-live-blob-044d90f.json)
 (SHA-256
@@ -274,8 +278,10 @@ as a conflict. After a later v5 direct contact, an eligible receiver can expose
 the completed Blob through its own live handle and retain it across restart.
 See the [selected Blob quickstart](quickstart/selected-blob-api.md) for the full
 Rust example and its cancellation, closure, and zeroization limits. That path
-has no Blob subscription/status API; its retained live-path evidence is bounded
-to the receipt and nonclaims above.
+also has a durable metadata-only publication queue with exact token-bound
+acknowledgement and local ledger counts. Its frozen retained live-path receipt
+predates that queue, so delivery currently has focused mechanism tests rather
+than retained acceptance; Blob peer/convergence status remains absent.
 
 ## Query current local data
 
@@ -327,8 +333,12 @@ Record separately exposes a retained-bounded durable whole-key active-head queue
 see [Subscribe to whole-key active-head projections](quickstart/selected-record-api.md#subscribe-to-whole-key-active-head-projections).
 It acknowledges a complete head set rather than independent siblings and
 requires a fresh exact query for a resolution guard. Blob selected-node
-delivery remains open. Neither mutable queue is a materialized view, transition
-feed, or dynamic network-interest controller.
+separately delivers metadata for each exact source-authenticated immutable
+publication and leaves plaintext retrieval on the existing Blob read surface;
+see [Subscribe to immutable publication metadata](quickstart/selected-blob-api.md#subscribe-to-immutable-publication-metadata).
+None of these queues is a dynamic network-interest controller, and the Blob
+delivery status is not peer or convergence status. Neither mutable queue is a
+materialized view or transition feed.
 
 ## Publish an atomic batch
 

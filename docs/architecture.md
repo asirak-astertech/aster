@@ -388,8 +388,11 @@ and private modes; the non-Unix fallback is not credited with equivalent
 filesystem hardening. Terminal software zeroization destroys the retained
 mission/content and identity secrets and locks the store, but deliberately
 preserves the encrypted Blob depot and audited data rows. This is bounded
-cryptographic shredding, not Blob-file deletion or physical sanitization. Blob
-subscription/status, route-only relay/custody, Blob-over-controlled-relay
+cryptographic shredding, not Blob-file deletion or physical sanitization.
+Current code has a durable metadata-only exact-publication Blob delivery
+ledger; its local counts are not peer or convergence status. Retained
+delivery acceptance, Blob peer/convergence status, route-only relay/custody,
+Blob-over-controlled-relay
 acceptance, arbitrary-peer resume, crash/power-loss/long-offline recovery,
 finite TTL, retention/GC, large/physical acceptance, mixed implementations,
 and representative network evidence remain open.

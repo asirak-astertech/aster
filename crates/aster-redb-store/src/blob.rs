@@ -3125,6 +3125,9 @@ impl Store {
             .open_table(BLOB_ACCEPTANCE_MARKERS)?
             .insert(source.as_bytes().as_slice(), marker)?;
         write
+            .open_table(BLOB_ACCEPTANCE_ORDER)?
+            .insert(marker, source.as_bytes().as_slice())?;
+        write
             .open_table(BLOB_PUBLICATIONS)?
             .insert(source.as_bytes().as_slice(), encoded_metadata.as_slice())?;
         write.open_table(BLOB_SEMANTIC_ITEMS)?.insert(
@@ -3376,6 +3379,9 @@ impl Store {
         write
             .open_table(BLOB_ACCEPTANCE_MARKERS)?
             .insert(prepared.transfer_id.as_bytes().as_slice(), marker)?;
+        write
+            .open_table(BLOB_ACCEPTANCE_ORDER)?
+            .insert(marker, prepared.transfer_id.as_bytes().as_slice())?;
         write.open_table(BLOB_PUBLICATIONS)?.insert(
             prepared.transfer_id.as_bytes().as_slice(),
             prepared.encoded_metadata.as_slice(),
@@ -4204,6 +4210,262 @@ fn load_blob_from_write(
             })
         })
         .transpose()
+}
+
+/// Compact publication identity used by the durable application-delivery ledger.
+///
+/// This deliberately excludes source bytes and depot/provider details.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BlobSubscriptionIdentity {
+    pub transfer_id: BlobTransferId,
+    pub semantic_id: BlobSemanticId,
+    pub topic: Topic,
+    pub scope: Scope,
+    pub acceptance_marker: u64,
+}
+
+fn blob_subscription_identity_from_metadata(
+    metadata: &BlobMetadata,
+    acceptance_marker: u64,
+) -> Result<BlobSubscriptionIdentity, StoreError> {
+    if acceptance_marker == 0 {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob subscription identity has a zero acceptance marker",
+        )));
+    }
+    Ok(BlobSubscriptionIdentity {
+        transfer_id: metadata.transfer_id,
+        semantic_id: metadata.semantic_id,
+        topic: metadata.header.topic.clone(),
+        scope: metadata.header.scope.clone(),
+        acceptance_marker,
+    })
+}
+
+pub(crate) fn blob_subscription_identity_for_transfer_write(
+    write: &redb::WriteTransaction,
+    transfer_id: BlobTransferId,
+) -> Result<Option<BlobSubscriptionIdentity>, StoreError> {
+    let Some(metadata) = write
+        .open_table(BLOB_PUBLICATIONS)?
+        .get(transfer_id.as_bytes().as_slice())?
+        .map(|value| decode_blob_metadata(value.value()))
+        .transpose()?
+    else {
+        return Ok(None);
+    };
+    if metadata.transfer_id != transfer_id {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob subscription identity differs from its publication key",
+        )));
+    }
+    let marker = write
+        .open_table(BLOB_ACCEPTANCE_MARKERS)?
+        .get(transfer_id.as_bytes().as_slice())?
+        .map(|value| value.value())
+        .ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Blob subscription identity is missing its acceptance marker",
+            ))
+        })?;
+    if write
+        .open_table(BLOB_SEMANTIC_ITEMS)?
+        .get(metadata.semantic_id.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec())
+        .as_deref()
+        != Some(transfer_id.as_bytes().as_slice())
+    {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob subscription identity differs from its semantic index",
+        )));
+    }
+    Ok(Some(blob_subscription_identity_from_metadata(
+        &metadata, marker,
+    )?))
+}
+
+pub(crate) fn blob_subscription_identity_write(
+    write: &redb::WriteTransaction,
+    semantic_id: BlobSemanticId,
+) -> Result<Option<BlobSubscriptionIdentity>, StoreError> {
+    let transfer = write
+        .open_table(BLOB_SEMANTIC_ITEMS)?
+        .get(semantic_id.as_bytes().as_slice())?
+        .map(|value| parse_blob_transfer_id("Blob semantic item table", value.value()))
+        .transpose()?;
+    transfer
+        .map(|transfer| blob_subscription_identity_for_transfer_write(write, transfer))
+        .transpose()
+        .map(Option::flatten)
+}
+
+pub(crate) fn blob_subscription_identity_read(
+    read: &redb::ReadTransaction,
+    semantic_id: BlobSemanticId,
+) -> Result<Option<BlobSubscriptionIdentity>, StoreError> {
+    let Some(transfer) = read
+        .open_table(BLOB_SEMANTIC_ITEMS)?
+        .get(semantic_id.as_bytes().as_slice())?
+        .map(|value| parse_blob_transfer_id("Blob semantic item table", value.value()))
+        .transpose()?
+    else {
+        return Ok(None);
+    };
+    let metadata = read
+        .open_table(BLOB_PUBLICATIONS)?
+        .get(transfer.as_bytes().as_slice())?
+        .map(|value| decode_blob_metadata(value.value()))
+        .transpose()?
+        .ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Blob semantic index points to a missing publication",
+            ))
+        })?;
+    if metadata.transfer_id != transfer || metadata.semantic_id != semantic_id {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob semantic index differs from its publication",
+        )));
+    }
+    let marker = read
+        .open_table(BLOB_ACCEPTANCE_MARKERS)?
+        .get(transfer.as_bytes().as_slice())?
+        .map(|value| value.value())
+        .ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Blob subscription identity is missing its acceptance marker",
+            ))
+        })?;
+    Ok(Some(blob_subscription_identity_from_metadata(
+        &metadata, marker,
+    )?))
+}
+
+pub(crate) fn blob_subscription_projection_read(
+    read: &redb::ReadTransaction,
+    transfer_id: BlobTransferId,
+) -> Result<Option<(BlobSourceProjection, u64)>, StoreError> {
+    let Some(metadata) = read
+        .open_table(BLOB_PUBLICATIONS)?
+        .get(transfer_id.as_bytes().as_slice())?
+        .map(|value| decode_blob_metadata(value.value()))
+        .transpose()?
+    else {
+        return Ok(None);
+    };
+    if metadata.transfer_id != transfer_id {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob subscription projection differs from its publication key",
+        )));
+    }
+    let content_key = blob_content_key(
+        &metadata.header.topic,
+        &metadata.header.scope,
+        metadata.blob_id,
+        metadata.semantic_id,
+    )?;
+    if read
+        .open_table(BLOB_CONTENT_INDEX)?
+        .get(content_key.as_slice())?
+        .map(|value| value.value().to_vec())
+        .as_deref()
+        != Some(transfer_id.as_bytes().as_slice())
+    {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob subscription projection differs from its content index",
+        )));
+    }
+    let candidate = blob_read_candidate_projection_read(read, transfer_id, &content_key)?;
+    Ok(Some((candidate.projection, candidate.acceptance_marker)))
+}
+
+pub(crate) fn blob_subscription_projection_matches_write(
+    write: &redb::WriteTransaction,
+    transfer_id: BlobTransferId,
+    acceptance_marker: u64,
+    projection: &BlobSourceProjection,
+) -> Result<bool, StoreError> {
+    let Some(metadata) = write
+        .open_table(BLOB_PUBLICATIONS)?
+        .get(transfer_id.as_bytes().as_slice())?
+        .map(|value| decode_blob_metadata(value.value()))
+        .transpose()?
+    else {
+        return Ok(false);
+    };
+    if metadata.transfer_id != transfer_id {
+        return Ok(false);
+    }
+    let Some(sealed_len) = write
+        .open_table(BLOB_BYTES)?
+        .get(transfer_id.as_bytes().as_slice())?
+        .map(|value| u64::try_from(value.value().len()))
+        .transpose()
+        .map_err(|_| StoreError::PayloadByteAccountingOverflow)?
+    else {
+        return Ok(false);
+    };
+    if write
+        .open_table(BLOB_SEMANTIC_ITEMS)?
+        .get(metadata.semantic_id.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec())
+        .as_deref()
+        != Some(transfer_id.as_bytes().as_slice())
+    {
+        return Ok(false);
+    }
+    let content_key = blob_content_key(
+        &metadata.header.topic,
+        &metadata.header.scope,
+        metadata.blob_id,
+        metadata.semantic_id,
+    )?;
+    if write
+        .open_table(BLOB_CONTENT_INDEX)?
+        .get(content_key.as_slice())?
+        .map(|value| value.value().to_vec())
+        .as_deref()
+        != Some(transfer_id.as_bytes().as_slice())
+    {
+        return Ok(false);
+    }
+    if write
+        .open_table(BLOB_ACCEPTANCE_MARKERS)?
+        .get(transfer_id.as_bytes().as_slice())?
+        .map(|value| value.value())
+        != Some(acceptance_marker)
+    {
+        return Ok(false);
+    }
+    let route = metadata.header.blob_route.ok_or_else(|| {
+        blob_error(BlobStoreError::SchemaInvariant(
+            "retained Blob source is missing its authenticated route commitment",
+        ))
+    })?;
+    let physical_lineage = metadata
+        .physical_lineage
+        .ok_or_else(|| blob_error(BlobStoreError::PhysicalLineageMigrationRequired))?;
+    let shape = depot::blob_source_shape_write(
+        write,
+        metadata.variant_id,
+        metadata.blob_id,
+        metadata.header.key_epoch,
+        physical_lineage,
+        metadata.manifest_digest,
+        route.chunk_count(),
+        true,
+    )?;
+    Ok(blob_source_projection(&metadata, sealed_len, shape)? == *projection)
+}
+
+pub(crate) fn blob_subscription_exact_source_matches_write(
+    write: &redb::WriteTransaction,
+    transfer_id: BlobTransferId,
+) -> Result<bool, StoreError> {
+    let bytes = write.open_table(BLOB_BYTES)?;
+    let Some(sealed) = bytes.get(transfer_id.as_bytes().as_slice())? else {
+        return Ok(false);
+    };
+    Ok(BlobTransferId::new(Sha256::digest(sealed.value()).into()) == transfer_id)
 }
 
 fn transfer_id_exists_outside_blob(
@@ -9045,10 +9307,36 @@ mod tests {
             write
                 .delete_table(BLOB_CARRIER_FETCH_CURSORS)
                 .expect("carrier cursors");
+            write
+                .delete_table(BLOB_ACCEPTANCE_ORDER)
+                .expect("acceptance order");
+            write
+                .delete_table(super::super::blob_subscription::BLOB_SUBSCRIPTIONS)
+                .expect("subscriptions");
+            write
+                .delete_table(super::super::blob_subscription::BLOB_SUBSCRIPTION_PENDING)
+                .expect("pending deliveries");
+            write
+                .delete_table(super::super::blob_subscription::BLOB_DELIVERY_ACKNOWLEDGEMENTS)
+                .expect("acknowledgements");
+            write
+                .delete_table(super::super::blob_subscription::BLOB_DELIVERY_CURSORS)
+                .expect("delivery cursors");
             {
                 let mut metadata = write.open_table(METADATA).expect("metadata");
                 for field in blob_global_metadata_fields() {
                     metadata.remove(field).expect("remove Blob counter");
+                }
+                for field in [
+                    super::super::blob_subscription::BLOB_SUBSCRIPTION_COUNT,
+                    super::super::blob_subscription::BLOB_PENDING_DELIVERY_COUNT,
+                    super::super::blob_subscription::BLOB_ACKNOWLEDGEMENT_COUNT,
+                    super::super::blob_subscription::BLOB_DELIVERY_CURSOR_COUNT,
+                    super::super::blob_subscription::BLOB_SELECTOR_GENERATION,
+                ] {
+                    metadata
+                        .remove(field)
+                        .expect("remove Blob delivery counter");
                 }
             }
             write.commit().expect("commit whole-absent schema");
@@ -11524,6 +11812,606 @@ mod tests {
         assert_eq!(
             variant_store.blob_stats().expect("variant-cap stats"),
             before_second
+        );
+    }
+
+    fn all_blob_subscription_candidates_deliverable(
+        plan: &BlobSubscriptionPollPlan,
+    ) -> BlobSubscriptionPollSelection {
+        BlobSubscriptionPollSelection {
+            deliverable: plan
+                .candidates()
+                .iter()
+                .map(|candidate| candidate.projection().semantic_id)
+                .collect(),
+            inactive: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn blob_subscription_retries_acks_reopens_and_fences_selector_aba() {
+        let root = BlobTestRoot::new("subscription-ledger");
+        let mut services = blob_services(0xd1);
+        let plaintext = vec![0xd1; 1_024];
+        let prepared = prepared_blob(&plaintext);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("subscription store");
+        let first = publish_blob(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            b"blob-subscription-first",
+        )
+        .0;
+        let second = publish_blob(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            b"blob-subscription-second",
+        )
+        .0;
+        assert_eq!(first.blob_id, second.blob_id);
+        assert_ne!(first.semantic_id, second.semantic_id);
+
+        let policy = store
+            .control_policy_snapshot()
+            .expect("subscription policy");
+        let key = BlobSubscriptionKey::new(b"blob-subscription".to_vec()).expect("key");
+        let spec = BlobSubscriptionSpec {
+            topic: blob_topic(),
+            scope: blob_scope(),
+            include_descendant_scopes: false,
+        };
+        let created = store
+            .create_blob_subscription_with_policy(&policy, &key, spec.clone())
+            .expect("create subscription");
+        assert!(created.inserted);
+        assert_eq!(
+            store
+                .create_blob_subscription_with_policy(&policy, &key, spec.clone())
+                .expect("idempotent create"),
+            BlobSubscriptionCreateOutcome {
+                id: created.id,
+                inserted: false,
+            }
+        );
+        let plan = store
+            .prepare_blob_subscription_poll_with_policy(&policy, created.id, 1, 8)
+            .expect("first plan");
+        assert_eq!(plan.candidates().len(), 2);
+        assert_eq!(
+            plan.candidates()
+                .iter()
+                .map(|candidate| candidate.projection().blob_id)
+                .collect::<Vec<_>>(),
+            vec![first.blob_id, first.blob_id]
+        );
+        let first_page = store
+            .commit_blob_subscription_poll_with_policy(
+                &policy,
+                &plan,
+                &all_blob_subscription_candidates_deliverable(&plan),
+            )
+            .expect("first commit");
+        assert_eq!(first_page.deliveries.len(), 1);
+        assert!(first_page.has_more);
+        assert_eq!(first_page.deliveries[0].attempt, 1);
+        let first_delivery = first_page.deliveries[0].clone();
+
+        let retry_plan = store
+            .prepare_blob_subscription_poll_with_policy(&policy, created.id, 1, 8)
+            .expect("retry plan");
+        let retry_page = store
+            .commit_blob_subscription_poll_with_policy(
+                &policy,
+                &retry_plan,
+                &all_blob_subscription_candidates_deliverable(&retry_plan),
+            )
+            .expect("retry commit");
+        assert_eq!(retry_page.deliveries.len(), 1);
+        assert_eq!(
+            retry_page.deliveries[0].semantic_id,
+            first_delivery.semantic_id
+        );
+        assert_eq!(retry_page.deliveries[0].attempt, 2);
+        assert_eq!(
+            store
+                .acknowledge_blob_delivery_with_policy(
+                    &policy,
+                    created.id,
+                    first_delivery.semantic_id,
+                    first_delivery.token,
+                )
+                .expect("acknowledge earlier attempt token"),
+            BlobDeliveryAck::Acknowledged
+        );
+        assert_eq!(
+            store
+                .acknowledge_blob_delivery_with_policy(
+                    &policy,
+                    created.id,
+                    first_delivery.semantic_id,
+                    retry_page.deliveries[0].token,
+                )
+                .expect("reacknowledge retried token"),
+            BlobDeliveryAck::AlreadyAcknowledged
+        );
+
+        let other_key = BlobSubscriptionKey::new(b"other-subscription".to_vec()).expect("key");
+        let other = store
+            .create_blob_subscription_with_policy(&policy, &other_key, spec.clone())
+            .expect("other subscription");
+        assert!(matches!(
+            store.acknowledge_blob_delivery_with_policy(
+                &policy,
+                other.id,
+                first_delivery.semantic_id,
+                first_delivery.token,
+            ),
+            Err(StoreError::BlobDeliveryTokenBindingMismatch)
+        ));
+        assert!(matches!(
+            store.acknowledge_blob_delivery_with_policy(
+                &policy,
+                created.id,
+                second.semantic_id,
+                first_delivery.token,
+            ),
+            Err(StoreError::BlobDeliveryTokenBindingMismatch)
+        ));
+        let mut malformed = *first_delivery.token.as_bytes();
+        malformed[0] = 0xff;
+        assert!(matches!(
+            BlobDeliveryToken::from_bytes(malformed),
+            Err(StoreError::InvalidBlobDeliveryToken)
+        ));
+
+        let next_plan = store
+            .prepare_blob_subscription_poll_with_policy(&policy, created.id, 2, 8)
+            .expect("next plan");
+        let next_page = store
+            .commit_blob_subscription_poll_with_policy(
+                &policy,
+                &next_plan,
+                &BlobSubscriptionPollSelection {
+                    deliverable: vec![second.semantic_id],
+                    inactive: vec![first_delivery.semantic_id],
+                },
+            )
+            .expect("next commit");
+        assert_eq!(next_page.deliveries.len(), 1);
+        assert_ne!(
+            next_page.deliveries[0].semantic_id,
+            first_delivery.semantic_id
+        );
+        assert_eq!(
+            store
+                .acknowledge_blob_delivery_with_policy(
+                    &policy,
+                    created.id,
+                    next_page.deliveries[0].semantic_id,
+                    next_page.deliveries[0].token,
+                )
+                .expect("acknowledge second publication"),
+            BlobDeliveryAck::Acknowledged
+        );
+        assert!(matches!(
+            store.acknowledge_blob_delivery_with_policy(
+                &policy,
+                created.id,
+                first_delivery.semantic_id,
+                first_delivery.token,
+            ),
+            Err(StoreError::BlobDeliveryNotFound)
+        ));
+        let reactivation_plan = store
+            .prepare_blob_subscription_poll_with_policy(&policy, created.id, 2, 8)
+            .expect("reactivation plan");
+        let reactivation_page = store
+            .commit_blob_subscription_poll_with_policy(
+                &policy,
+                &reactivation_plan,
+                &all_blob_subscription_candidates_deliverable(&reactivation_plan),
+            )
+            .expect("reactivation commit");
+        assert_eq!(reactivation_page.deliveries.len(), 1);
+        assert_eq!(
+            reactivation_page.deliveries[0].semantic_id,
+            first_delivery.semantic_id
+        );
+        assert_eq!(reactivation_page.deliveries[0].attempt, 1);
+        assert_ne!(reactivation_page.deliveries[0].token, first_delivery.token);
+        assert!(matches!(
+            store.acknowledge_blob_delivery_with_policy(
+                &policy,
+                created.id,
+                first_delivery.semantic_id,
+                first_delivery.token,
+            ),
+            Err(StoreError::BlobDeliveryTenureChanged { .. })
+        ));
+        assert_eq!(
+            store
+                .acknowledge_blob_delivery_with_policy(
+                    &policy,
+                    created.id,
+                    first_delivery.semantic_id,
+                    reactivation_page.deliveries[0].token,
+                )
+                .expect("acknowledge reactivated publication"),
+            BlobDeliveryAck::Acknowledged
+        );
+        let stats = store.blob_subscription_stats().expect("ledger stats");
+        assert_eq!(stats.subscriptions, 2);
+        assert_eq!(stats.pending_deliveries, 0);
+        assert_eq!(stats.acknowledged_deliveries, 2);
+        assert_eq!(stats.delivery_cursors, 2);
+        drop(store);
+
+        let reopened = Store::open_for_mission(&root.database, services.authority)
+            .expect("subscription reopen");
+        assert_eq!(
+            reopened.blob_subscription_stats().expect("reopen stats"),
+            stats
+        );
+        let reopened_policy = reopened.control_policy_snapshot().expect("reopen policy");
+        let quiet = reopened
+            .prepare_blob_subscription_poll_with_policy(&reopened_policy, created.id, 2, 8)
+            .expect("quiet plan");
+        assert!(
+            reopened
+                .commit_blob_subscription_poll_with_policy(
+                    &reopened_policy,
+                    &quiet,
+                    &all_blob_subscription_candidates_deliverable(&quiet),
+                )
+                .expect("quiet commit")
+                .deliveries
+                .is_empty()
+        );
+        assert!(
+            reopened
+                .remove_blob_subscription_with_policy(&reopened_policy, created.id)
+                .expect("remove selector")
+                .removed
+        );
+        let recreated = reopened
+            .create_blob_subscription_with_policy(
+                &reopened_policy,
+                &key,
+                BlobSubscriptionSpec {
+                    include_descendant_scopes: true,
+                    ..spec
+                },
+            )
+            .expect("recreate selector");
+        assert_eq!(recreated.id, created.id);
+        assert!(matches!(
+            reopened.acknowledge_blob_delivery_with_policy(
+                &reopened_policy,
+                recreated.id,
+                first_delivery.semantic_id,
+                first_delivery.token,
+            ),
+            Err(StoreError::BlobSubscriptionIncarnationChanged { .. })
+        ));
+        assert_eq!(
+            reopened.blob_subscription_stats().expect("recreated stats"),
+            BlobSubscriptionStats {
+                subscriptions: 2,
+                selector_generation: stats.selector_generation + 2,
+                ..BlobSubscriptionStats::default()
+            }
+        );
+    }
+
+    #[test]
+    fn blob_subscription_rejects_nonexhaustive_selection_and_full_projection_change() {
+        let root = BlobTestRoot::new("subscription-plan-change");
+        let mut services = blob_services(0xd4);
+        let plaintext = vec![0xd4; 768];
+        let prepared = prepared_blob(&plaintext);
+        let store =
+            Store::open_for_mission(&root.database, services.authority).expect("plan-change store");
+        let published = publish_blob(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            b"blob-subscription-plan-change",
+        )
+        .0;
+        let policy = store.control_policy_snapshot().expect("plan-change policy");
+        let created = store
+            .create_blob_subscription_with_policy(
+                &policy,
+                &BlobSubscriptionKey::new(b"plan-change-selector".to_vec()).expect("key"),
+                BlobSubscriptionSpec {
+                    topic: blob_topic(),
+                    scope: blob_scope(),
+                    include_descendant_scopes: false,
+                },
+            )
+            .expect("plan-change selector");
+        let plan = store
+            .prepare_blob_subscription_poll_with_policy(&policy, created.id, 1, 8)
+            .expect("plan-change poll");
+        assert_eq!(plan.candidates().len(), 1);
+        for selection in [
+            BlobSubscriptionPollSelection::default(),
+            BlobSubscriptionPollSelection {
+                deliverable: vec![published.semantic_id, published.semantic_id],
+                inactive: Vec::new(),
+            },
+            BlobSubscriptionPollSelection {
+                deliverable: vec![published.semantic_id],
+                inactive: vec![published.semantic_id],
+            },
+        ] {
+            assert!(matches!(
+                store.commit_blob_subscription_poll_with_policy(&policy, &plan, &selection),
+                Err(StoreError::BlobSubscriptionPlanChanged)
+            ));
+        }
+
+        let original_sealed = {
+            let read = store.database.begin_read().expect("source bytes read");
+            read.open_table(BLOB_BYTES)
+                .expect("source bytes")
+                .get(published.transfer_id.as_bytes().as_slice())
+                .expect("source lookup")
+                .expect("source row")
+                .value()
+                .to_vec()
+        };
+        {
+            let write = store.database.begin_write().expect("source mutation write");
+            let mut corrupted = original_sealed.clone();
+            corrupted[0] ^= 0x01;
+            write
+                .open_table(BLOB_BYTES)
+                .expect("source bytes")
+                .insert(
+                    published.transfer_id.as_bytes().as_slice(),
+                    corrupted.as_slice(),
+                )
+                .expect("replace same-length source bytes");
+            write.commit().expect("commit source mutation");
+        }
+        assert!(matches!(
+            store.commit_blob_subscription_poll_with_policy(
+                &policy,
+                &plan,
+                &all_blob_subscription_candidates_deliverable(&plan),
+            ),
+            Err(StoreError::BlobSubscriptionPlanChanged)
+        ));
+
+        {
+            let write = store.database.begin_write().expect("source restore write");
+            write
+                .open_table(BLOB_BYTES)
+                .expect("source bytes")
+                .insert(
+                    published.transfer_id.as_bytes().as_slice(),
+                    original_sealed.as_slice(),
+                )
+                .expect("restore exact source bytes");
+            write.commit().expect("commit source restore");
+        }
+        {
+            let write = store
+                .database
+                .begin_write()
+                .expect("metadata mutation write");
+            let encoded = write
+                .open_table(BLOB_PUBLICATIONS)
+                .expect("publications")
+                .get(published.transfer_id.as_bytes().as_slice())
+                .expect("publication lookup")
+                .expect("publication row")
+                .value()
+                .to_vec();
+            let mut metadata = decode_blob_metadata(&encoded).expect("decode publication");
+            metadata.header.stamp.dot.counter += 1;
+            let encoded = encode_blob_metadata(metadata).expect("encode changed publication");
+            write
+                .open_table(BLOB_PUBLICATIONS)
+                .expect("publications")
+                .insert(
+                    published.transfer_id.as_bytes().as_slice(),
+                    encoded.as_slice(),
+                )
+                .expect("replace publication");
+            write.commit().expect("commit metadata mutation");
+        }
+        assert!(matches!(
+            store.commit_blob_subscription_poll_with_policy(
+                &policy,
+                &plan,
+                &all_blob_subscription_candidates_deliverable(&plan),
+            ),
+            Err(StoreError::BlobSubscriptionPlanChanged)
+        ));
+    }
+
+    #[test]
+    fn blob_subscription_schema_backfills_predecessor_publications_and_rejects_partial_current_group()
+     {
+        let root = BlobTestRoot::new("subscription-migration");
+        let mut services = blob_services(0xd2);
+        let plaintext = vec![0xd2; 512];
+        let prepared = prepared_blob(&plaintext);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("migration source store");
+        let published = publish_blob(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            b"blob-subscription-migration",
+        )
+        .0;
+        drop(store);
+
+        {
+            let database = Database::open(&root.database).expect("raw predecessor database");
+            let write = database.begin_write().expect("predecessor write");
+            write
+                .delete_table(BLOB_ACCEPTANCE_ORDER)
+                .expect("delete acceptance order");
+            write
+                .delete_table(super::super::blob_subscription::BLOB_SUBSCRIPTIONS)
+                .expect("delete subscriptions");
+            write
+                .delete_table(super::super::blob_subscription::BLOB_SUBSCRIPTION_PENDING)
+                .expect("delete pending");
+            write
+                .delete_table(super::super::blob_subscription::BLOB_DELIVERY_ACKNOWLEDGEMENTS)
+                .expect("delete acknowledgements");
+            write
+                .delete_table(super::super::blob_subscription::BLOB_DELIVERY_CURSORS)
+                .expect("delete cursors");
+            {
+                let mut metadata = write.open_table(METADATA).expect("metadata");
+                for field in [
+                    super::super::blob_subscription::BLOB_SUBSCRIPTION_COUNT,
+                    super::super::blob_subscription::BLOB_PENDING_DELIVERY_COUNT,
+                    super::super::blob_subscription::BLOB_ACKNOWLEDGEMENT_COUNT,
+                    super::super::blob_subscription::BLOB_DELIVERY_CURSOR_COUNT,
+                    super::super::blob_subscription::BLOB_SELECTOR_GENERATION,
+                ] {
+                    metadata.remove(field).expect("remove extension metadata");
+                }
+            }
+            write.commit().expect("commit predecessor shape");
+        }
+
+        let old_inspection = Store::inspect_existing(&root.database).expect("inspect predecessor");
+        assert_eq!(old_inspection.blob_stats.publications, 1);
+        assert_eq!(
+            old_inspection.blob_subscription_stats,
+            BlobSubscriptionStats::default()
+        );
+        let migrated = Store::open_for_mission(&root.database, services.authority)
+            .expect("migrate predecessor");
+        assert_eq!(
+            migrated.blob_subscription_stats().expect("migrated stats"),
+            BlobSubscriptionStats::default()
+        );
+        {
+            let read = migrated.database.begin_read().expect("order read");
+            let order = read
+                .open_table(BLOB_ACCEPTANCE_ORDER)
+                .expect("acceptance order");
+            assert_eq!(
+                order
+                    .get(published.acceptance_marker)
+                    .expect("order lookup")
+                    .expect("backfilled row")
+                    .value(),
+                published.transfer_id.as_bytes().as_slice()
+            );
+        }
+
+        let policy = migrated
+            .control_policy_snapshot()
+            .expect("migration policy");
+        let created = migrated
+            .create_blob_subscription_with_policy(
+                &policy,
+                &BlobSubscriptionKey::new(b"migration-selector".to_vec()).expect("key"),
+                BlobSubscriptionSpec {
+                    topic: blob_topic(),
+                    scope: blob_scope(),
+                    include_descendant_scopes: false,
+                },
+            )
+            .expect("create migrated selector");
+        assert_eq!(
+            migrated
+                .prepare_blob_subscription_poll_with_policy(&policy, created.id, 1, 8)
+                .expect("migrated plan")
+                .candidates()
+                .len(),
+            1
+        );
+        drop(migrated);
+
+        {
+            let database = Database::open(&root.database).expect("raw partial database");
+            let write = database.begin_write().expect("partial write");
+            write
+                .delete_table(BLOB_ACCEPTANCE_ORDER)
+                .expect("delete current order");
+            write.commit().expect("commit partial group");
+        }
+        assert!(Store::inspect_existing(&root.database).is_err());
+        assert!(Store::open_for_mission(&root.database, services.authority).is_err());
+    }
+
+    #[test]
+    fn blob_subscription_count_and_poll_limits_are_enforced() {
+        let root = BlobTestRoot::new("subscription-caps");
+        let services = blob_services(0xd3);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("subscription cap store");
+        let policy = store.control_policy_snapshot().expect("cap policy");
+        let spec = BlobSubscriptionSpec {
+            topic: blob_topic(),
+            scope: blob_scope(),
+            include_descendant_scopes: false,
+        };
+        let mut first = None;
+        for index in 0..MAX_BLOB_SUBSCRIPTIONS {
+            let id = store
+                .create_blob_subscription_with_policy(
+                    &policy,
+                    &BlobSubscriptionKey::new(format!("blob-cap-{index}").into_bytes())
+                        .expect("bounded key"),
+                    spec.clone(),
+                )
+                .expect("bounded subscription")
+                .id;
+            first.get_or_insert(id);
+        }
+        let first = first.expect("first subscription");
+        assert!(matches!(
+            store.create_blob_subscription_with_policy(
+                &policy,
+                &BlobSubscriptionKey::new(b"blob-cap-overflow".to_vec()).expect("overflow key"),
+                spec,
+            ),
+            Err(StoreError::BlobSubscriptionLimitExceeded {
+                current: MAX_BLOB_SUBSCRIPTIONS,
+                limit: MAX_BLOB_SUBSCRIPTIONS,
+            })
+        ));
+        assert!(matches!(
+            store.prepare_blob_subscription_poll_with_policy(&policy, first, 0, 1),
+            Err(StoreError::BlobSubscriptionPollLimitExceeded { .. })
+        ));
+        assert!(matches!(
+            store.prepare_blob_subscription_poll_with_policy(
+                &policy,
+                first,
+                1,
+                MAX_BLOB_SUBSCRIPTION_SCAN + 1,
+            ),
+            Err(StoreError::BlobSubscriptionPollLimitExceeded { .. })
+        ));
+        assert_eq!(
+            store
+                .blob_subscription_stats()
+                .expect("bounded subscription stats")
+                .subscriptions,
+            MAX_BLOB_SUBSCRIPTIONS
         );
     }
 }
