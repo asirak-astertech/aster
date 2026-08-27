@@ -1,0 +1,9 @@
+# Bounded three-agent propagation smoke. Keep this sequence aligned with ADR 0032.
+isolate 2
+send 0 smoke-through-isolation
+wait-seen m1 0,1 30
+assert-unseen m1 2
+stop 0
+rejoin 2
+wait-seen m1 2 30
+quit

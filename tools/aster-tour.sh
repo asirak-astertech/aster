@@ -5,7 +5,17 @@ set -eu
 tour_mode="${1:-quick}"
 script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 repo_root="$(CDPATH= cd -- "$script_dir/.." && pwd)"
+tour_view="$script_dir/aster_tour_ui.py"
+tour_view_mode="${ASTER_TOUR_VIEW:-auto}"
 aster_bin="${ASTER_TOUR_BIN:-}"
+
+case "$tour_view_mode" in
+  auto|tui|plain|raw) ;;
+  *)
+    echo "ASTER_TOUR_VIEW must be one of: auto, tui, plain, raw" >&2
+    exit 2
+    ;;
+esac
 
 if [ -n "${ASTER_TOUR_PARENT:-}" ]; then
   tour_parent="$ASTER_TOUR_PARENT"
@@ -16,16 +26,84 @@ else
 fi
 
 if [ -e "$tour_parent/cargo-build.json" ] || \
+  [ -e "$tour_parent/cargo-build.stderr" ] || \
   [ -e "$tour_parent/aster-bin.path" ]; then
   echo "tour parent already contains a retained run: $tour_parent" >&2
   exit 2
 fi
 
+if [ ! -r "$tour_view" ]; then
+  echo "tour presenter is not readable: $tour_view" >&2
+  exit 2
+fi
+
+active_presenter_pid=""
+presenter_signal_pending=0
+presenter_signal_status=0
+
+forward_presenter_signal() {
+  presenter_signal_name="$1"
+  presenter_signal_status="$2"
+  presenter_signal_pending=1
+  if [ -n "$active_presenter_pid" ]; then
+    kill -s "$presenter_signal_name" "$active_presenter_pid" 2>/dev/null || :
+  fi
+}
+
+run_presenter() {
+  active_presenter_pid=""
+  presenter_signal_pending=0
+  presenter_signal_status=0
+  # TERM is not inherited as ignored by asynchronous POSIX-shell children, so
+  # use it to carry an early Ctrl-C safely until the presenter installs traps.
+  trap 'forward_presenter_signal TERM 130' INT
+  trap 'forward_presenter_signal TERM 143' TERM
+  trap 'forward_presenter_signal HUP 129' HUP
+
+  "$@" &
+  active_presenter_pid=$!
+  if [ "$presenter_signal_pending" -eq 1 ]; then
+    kill -s "$presenter_signal_name" "$active_presenter_pid" 2>/dev/null || :
+  fi
+
+  while :; do
+    if wait "$active_presenter_pid"; then
+      presenter_status=0
+    else
+      presenter_status=$?
+    fi
+    if [ "$presenter_signal_pending" -eq 1 ]; then
+      presenter_signal_pending=0
+      if kill -0 "$active_presenter_pid" 2>/dev/null; then
+        continue
+      fi
+    fi
+    break
+  done
+
+  active_presenter_pid=""
+  trap - INT TERM HUP
+  if [ "$presenter_signal_status" -ne 0 ]; then
+    presenter_status="$presenter_signal_status"
+  fi
+  return "$presenter_status"
+}
+
 if [ -z "${ASTER_TOUR_BIN:-}" ]; then
-  echo "Building the Aster CLI for this checkout..."
   build_receipt="$tour_parent/cargo-build.json"
-  cargo build --locked --manifest-path "$repo_root/Cargo.toml" \
-    -p aster-node --bin aster --message-format=json >"$build_receipt"
+  build_stderr="$tour_parent/cargo-build.stderr"
+  if run_presenter python3 "$tour_view" build \
+    --view "$tour_view_mode" \
+    --stdout-receipt "$build_receipt" \
+    --stderr-receipt "$build_stderr" -- \
+    cargo build --locked --manifest-path "$repo_root/Cargo.toml" \
+      -p aster-node --bin aster --message-format=json; then
+    :
+  else
+    build_status=$?
+    echo "Build receipts retained under: $tour_parent" >&2
+    exit "$build_status"
+  fi
   aster_bin="$(python3 -c 'import json, sys; objects = (json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()); paths = [obj["executable"] for obj in objects if obj.get("reason") == "compiler-artifact" and obj.get("executable") and obj.get("target", {}).get("name") == "aster" and "bin" in obj.get("target", {}).get("kind", [])]; print(paths[-1])' "$build_receipt")"
 fi
 
@@ -54,39 +132,66 @@ run_tour() {
     return 2
   fi
 
-  echo
-  echo "==> Aster $name tour ($nodes nodes)"
-  if [ -n "$base_port" ]; then
-    echo "Using explicit base port: $base_port"
+  if [ "$tour_view_mode" != "raw" ]; then
+    echo
+    echo "Aster $name tour ($nodes independent nodes)"
+    if [ -n "$base_port" ]; then
+      echo "  Explicit loopback port block starts at $base_port"
+    fi
   fi
+
+  show_artifacts() {
+    if [ "$tour_view_mode" = "raw" ]; then
+      if python3 "$tour_view" artifacts --root "$root" \
+        --demo-receipt "$demo_stdout" --inspect-receipt "$inspect_stdout" >&2; then
+        :
+      else
+        echo "warning: could not present retained artifact locations" >&2
+      fi
+    else
+      if python3 "$tour_view" artifacts --root "$root" \
+        --demo-receipt "$demo_stdout" --inspect-receipt "$inspect_stdout"; then
+        :
+      else
+        echo "warning: could not present retained artifact locations" >&2
+      fi
+    fi
+  }
 
   demo_command() {
     if [ "$scenario" = "default" ]; then
       if [ -n "$base_port" ]; then
-        "$aster_bin" demo --nodes "$nodes" --root "$root" \
-          --base-port "$base_port"
+        run_presenter python3 "$tour_view" demo --tour "$name" --nodes "$nodes" \
+          --demo-root "$root" --view "$tour_view_mode" \
+          --stdout-receipt "$demo_stdout" --stderr-receipt "$demo_stderr" -- \
+          "$aster_bin" demo --nodes "$nodes" --root "$root" \
+            --base-port "$base_port"
       else
-        "$aster_bin" demo --nodes "$nodes" --root "$root"
+        run_presenter python3 "$tour_view" demo --tour "$name" --nodes "$nodes" \
+          --demo-root "$root" --view "$tour_view_mode" \
+          --stdout-receipt "$demo_stdout" --stderr-receipt "$demo_stderr" -- \
+          "$aster_bin" demo --nodes "$nodes" --root "$root"
       fi
     elif [ -n "$base_port" ]; then
-      "$aster_bin" demo --nodes "$nodes" --scenario "$scenario" \
-        --root "$root" --base-port "$base_port"
+      run_presenter python3 "$tour_view" demo --tour "$name" --nodes "$nodes" \
+        --demo-root "$root" --view "$tour_view_mode" \
+        --stdout-receipt "$demo_stdout" --stderr-receipt "$demo_stderr" -- \
+        "$aster_bin" demo --nodes "$nodes" --scenario "$scenario" \
+          --root "$root" --base-port "$base_port"
     else
-      "$aster_bin" demo --nodes "$nodes" --scenario "$scenario" --root "$root"
+      run_presenter python3 "$tour_view" demo --tour "$name" --nodes "$nodes" \
+        --demo-root "$root" --view "$tour_view_mode" \
+        --stdout-receipt "$demo_stdout" --stderr-receipt "$demo_stderr" -- \
+        "$aster_bin" demo --nodes "$nodes" --scenario "$scenario" --root "$root"
     fi
   }
 
-  if demo_command >"$demo_stdout" 2>"$demo_stderr"; then
+  if demo_command; then
     :
   else
     demo_status=$?
-    cat "$demo_stdout"
-    cat "$demo_stderr" >&2
+    show_artifacts
     return "$demo_status"
-  fi
-  cat "$demo_stdout"
-  if [ -s "$demo_stderr" ]; then
-    cat "$demo_stderr" >&2
   fi
 
   : >"$inspect_stdout"
@@ -98,22 +203,30 @@ run_tour() {
       :
     else
       inspect_status=$?
-      cat "$inspect_stdout"
-      cat "$inspect_stderr" >&2
+      if ! cat "$inspect_stdout"; then
+        echo "warning: could not display partial inspection receipt" >&2
+      fi
+      if ! cat "$inspect_stderr" >&2; then
+        echo "warning: could not display inspection stderr" >&2
+      fi
+      show_artifacts
       return "$inspect_status"
     fi
     node=$((node + 1))
   done
-  cat "$inspect_stdout"
+  if python3 "$tour_view" inspect --tour "$name" --nodes "$nodes" \
+    --view "$tour_view_mode" --receipt "$inspect_stdout"; then
+    :
+  else
+    echo "warning: could not present retained inspection receipt" >&2
+  fi
   if [ -s "$inspect_stderr" ]; then
-    cat "$inspect_stderr" >&2
+    if ! cat "$inspect_stderr" >&2; then
+      echo "warning: could not display inspection stderr" >&2
+    fi
   fi
 
-  echo "Artifacts retained at: $root"
-  echo "Parent receipt:        $demo_stdout"
-  echo "Inspection receipt:    $inspect_stdout"
-  echo "Application receipts:  rg '^APPLICATION ' '$root/logs'"
-  echo "Contact receipts:      rg '^CONTACT ' '$root/logs'"
+  show_artifacts
 }
 
 requested_base_port="${ASTER_TOUR_BASE_PORT:-}"

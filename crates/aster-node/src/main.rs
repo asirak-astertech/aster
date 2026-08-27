@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeSet,
     env,
-    fs::OpenOptions,
+    fs::{self, OpenOptions},
     io::{self, Read},
     num::NonZeroU64,
     path::{Path, PathBuf},
@@ -13,7 +13,7 @@ use aster_iroh::{
     MAX_RELAY_CA_ROOT_BYTES, MAX_RELAY_CA_ROOT_TOTAL_BYTES, MAX_RELAY_CA_ROOTS,
     MAX_RELAY_URL_BYTES, PinnedRelay,
 };
-use aster_mesh::{Scope, ScopeRekeyRecipient, Topic};
+use aster_mesh::{ProvisioningAccess, ReferenceProvisioner, Scope, ScopeRekeyRecipient, Topic};
 use aster_node::{
     DemoScenario, MissionExpectedPeer, MutableSourceInterests, NodeApplication, NodeConfig,
     NodeIdentity, RegistryGenerationWitness, RevocationRequest, ScopeRekeyRequest,
@@ -22,9 +22,16 @@ use aster_node::{
     format_receipt_field, inspect_store, mission::UnprotectedReferenceMission, parse_item_id,
     parse_node_id, put_opaque, run_demo_scenario, run_node, run_node_with_forwarding, zeroize_node,
 };
+use zeroize::Zeroize as _;
 
 const MAX_PUT_BYTES: u64 = 1024 * 1024;
 const MAX_REKEY_REGISTRY_BYTES: u64 = 16 * 1024 * 1024;
+const PLAYGROUND_MIN_NODES: usize = 2;
+const PLAYGROUND_MAX_NODES: usize = 32;
+const PLAYGROUND_SCOPE: &str = "demo/playground";
+const PLAYGROUND_TOPIC: &str = "mesh.messages";
+const PLAYGROUND_EPOCH: u64 = 1;
+const PLAYGROUND_MISSION_BUNDLE_FILE: &str = "mission.unprotected-reference.bundle";
 
 fn main() -> ExitCode {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -296,6 +303,28 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 format_path_field(&state),
             );
         }
+        "playground-init" => {
+            let nodes = arguments.required("--nodes")?.parse::<usize>()?;
+            let root = arguments.required_path("--root")?;
+            arguments.finish()?;
+            let receipts = initialize_playground(nodes, &root)?;
+            println!(
+                "PLAYGROUND_INIT status=pass nodes={} scope={} topic={} epoch={} provisioning=unprotected-reference root={}",
+                receipts.len(),
+                PLAYGROUND_SCOPE,
+                PLAYGROUND_TOPIC,
+                PLAYGROUND_EPOCH,
+                format_path_field(&root),
+            );
+            for receipt in receipts {
+                println!(
+                    "PLAYGROUND_NODE index={} carrier_id={} mission_id={}",
+                    receipt.index,
+                    receipt.carrier_id,
+                    aster_node::format_node_id(receipt.mission_id),
+                );
+            }
+        }
         "demo" => {
             let nodes = arguments.required("--nodes")?.parse()?;
             let root = arguments.required_path("--root")?;
@@ -314,6 +343,92 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         command => return Err(format!("unknown command {command:?}; run `aster help`").into()),
     }
     Ok(())
+}
+
+#[derive(Debug)]
+struct PlaygroundNodeReceipt {
+    index: usize,
+    carrier_id: String,
+    mission_id: [u8; 32],
+}
+
+fn validate_playground_node_count(nodes: usize) -> Result<(), Box<dyn std::error::Error>> {
+    if !(PLAYGROUND_MIN_NODES..=PLAYGROUND_MAX_NODES).contains(&nodes) {
+        return Err(format!(
+            "playground node count must be within {PLAYGROUND_MIN_NODES}..={PLAYGROUND_MAX_NODES}"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn initialize_playground(
+    nodes: usize,
+    root: &Path,
+) -> Result<Vec<PlaygroundNodeReceipt>, Box<dyn std::error::Error>> {
+    validate_playground_node_count(nodes)?;
+    match fs::symlink_metadata(root) {
+        Ok(_) => {
+            return Err(format!("playground root already exists: {}", root.display()).into());
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    let access = ProvisioningAccess::member(
+        Scope::new(PLAYGROUND_SCOPE)?,
+        vec![PLAYGROUND_EPOCH],
+        vec![Topic::new(PLAYGROUND_TOPIC)?],
+    )?;
+    let mut authority_seed = aster_iroh::SecretKey::generate().to_bytes();
+    let provisioner = ReferenceProvisioner::from_seed(authority_seed);
+    authority_seed.zeroize();
+    let mut provisioner = provisioner?;
+
+    if let Some(parent) = root
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    create_owner_only_directory(root)?;
+
+    let mut receipts = Vec::with_capacity(nodes);
+    for index in 0..nodes {
+        let state = root.join(format!("node-{index}"));
+        create_owner_only_directory(&state)?;
+        let identity = NodeIdentity::load_or_create(&state)?;
+        let serial = u64::try_from(index)
+            .map_err(|_| "playground node index overflows u64")?
+            .checked_add(1)
+            .ok_or("playground node serial overflow")?;
+        let bundle = provisioner.issue_node(serial, std::slice::from_ref(&access))?;
+        let mission = UnprotectedReferenceMission::persist(
+            state.join(PLAYGROUND_MISSION_BUNDLE_FILE),
+            bundle.to_bytes()?,
+        )?;
+        receipts.push(PlaygroundNodeReceipt {
+            index,
+            carrier_id: identity.id().to_string(),
+            mission_id: mission.identity(),
+        });
+    }
+    Ok(receipts)
+}
+
+fn create_owner_only_directory(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder.create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir(path)
+    }
 }
 
 fn read_put_source(path: &Path) -> io::Result<Vec<u8>> {
@@ -534,6 +649,7 @@ fn print_help() {
            aster init --state DIR\n\
            aster put --state DIR --id HEX64 --file PATH  # maximum 1,048,576 bytes\n\
            aster inspect --state DIR\n\
+           aster playground-init --nodes N --root DIR\n\
            aster zeroize --state DIR \\
              --mission-bundle-unprotected-reference FILE [--wait-seconds SEC]\n\
            aster control-revoke --state DIR \\
@@ -562,6 +678,9 @@ fn print_help() {
          checks. On Unix the explicitly named unprotected-reference bundle requires owner-only\n\
          permissions; unsupported platforms fail closed. It is NOT production-secure at-rest\n\
          provisioning, and the selected Iroh carrier identity is not mission authorization.\n\
+         playground-init creates 2 through 32 distinct all-member bundles for exact scope\n\
+         demo/playground and topic mesh.messages beneath a fresh owner-only root. The root must\n\
+         not already exist. This evaluation-only command does not start nodes or allocate ports.\n\
          Controlled relay routing is an explicit single-URL opt-in. WebPKI uses embedded roots;\n\
          der-roots requires bounded explicit DER CA files. No insecure TLS, hosted lookup, or public\n\
          relay fallback is enabled. The operator-supplied initial route set is bounded; authenticated\n\
@@ -707,6 +826,132 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.0);
         }
+    }
+
+    struct TestRoot(PathBuf);
+
+    impl TestRoot {
+        fn new(label: &str) -> Self {
+            let sequence = NEXT_PATH.fetch_add(1, Ordering::Relaxed);
+            Self(env::temp_dir().join(format!(
+                "aster-node-main-{}-{sequence}-{label}",
+                std::process::id()
+            )))
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn playground_node_count_is_bounded() {
+        assert!(validate_playground_node_count(PLAYGROUND_MIN_NODES).is_ok());
+        assert!(validate_playground_node_count(PLAYGROUND_MAX_NODES).is_ok());
+        assert!(validate_playground_node_count(PLAYGROUND_MIN_NODES - 1).is_err());
+        assert!(validate_playground_node_count(PLAYGROUND_MAX_NODES + 1).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn playground_provisions_unique_nodes_from_one_mission_authority() {
+        let root = TestRoot::new("playground-unique");
+        let receipts = initialize_playground(3, root.path()).expect("initialize playground");
+
+        assert_eq!(receipts.len(), 3);
+        assert_eq!(
+            receipts
+                .iter()
+                .map(|receipt| receipt.index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            receipts
+                .iter()
+                .map(|receipt| receipt.carrier_id.as_str())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            receipts.len()
+        );
+        assert_eq!(
+            receipts
+                .iter()
+                .map(|receipt| receipt.mission_id)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            receipts.len()
+        );
+
+        let mut authorities = BTreeSet::new();
+        for receipt in &receipts {
+            let state = root.path().join(format!("node-{}", receipt.index));
+            let mission =
+                UnprotectedReferenceMission::load(state.join(PLAYGROUND_MISSION_BUNDLE_FILE))
+                    .expect("load persisted mission");
+            assert_eq!(mission.identity(), receipt.mission_id);
+            authorities.insert(mission.mission_authority_id());
+            let identity = NodeIdentity::load_existing(&state).expect("load persisted identity");
+            assert_eq!(identity.id().to_string(), receipt.carrier_id);
+        }
+        assert_eq!(authorities.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn playground_directories_and_bundles_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = TestRoot::new("playground-permissions");
+        initialize_playground(2, root.path()).expect("initialize playground");
+
+        assert_eq!(
+            fs::metadata(root.path())
+                .expect("root metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        for index in 0..2 {
+            let state = root.path().join(format!("node-{index}"));
+            assert_eq!(
+                fs::metadata(&state)
+                    .expect("state metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(state.join(PLAYGROUND_MISSION_BUNDLE_FILE))
+                    .expect("mission metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn playground_refuses_an_existing_root_without_mutating_it() {
+        let root = TestRoot::new("playground-existing-root");
+        fs::create_dir(root.path()).expect("create existing root");
+        let marker = root.path().join("keep-me");
+        fs::write(&marker, b"unchanged").expect("write marker");
+
+        let error = initialize_playground(2, root.path()).expect_err("reject existing root");
+
+        assert!(error.to_string().contains("playground root already exists"));
+        assert_eq!(fs::read(&marker).expect("read marker"), b"unchanged");
+        assert!(!root.path().join("node-0").exists());
     }
 
     #[test]

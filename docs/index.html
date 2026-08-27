@@ -187,6 +187,7 @@
     .klass .for { color: var(--white); font-size: 15px; }
     .klass p { font-size: 15px; }
     .start-grid { align-items: start; display: grid; gap: 56px; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); }
+    .start-grid > *, .cmd { min-width: 0; }
     .cmd { display: flex; flex-direction: column; gap: 10px; }
     .cmd pre {
       background: var(--bg-deep);
@@ -353,9 +354,9 @@
         <h1 id="hero-title" style="font-size: clamp(36px, 6vw, 64px); font-weight: 500; max-width: 900px;">Keep data moving when the network disappears.</h1>
         <p style="font-size: 21px; max-width: 780px; color: #d4d6e2;">Aster is an offline-first data mesh for applications that cannot depend on continuous connectivity or trusted infrastructure. Publish to a local node, carry protected data across direct peers or payload-blind relays, and reconcile it according to explicit data-class semantics.</p>
         <div style="display: flex; gap: 16px; flex-wrap: wrap; justify-content: center; margin-top: 8px;">
-          <a class="btn btn-primary" href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/quickstart/connect-agent.md">Connect your app</a>
-          <a class="btn btn-secondary" href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/quickstart/capability-tour.md">Run the tour</a>
-          <a class="btn btn-secondary" href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/architecture.md">Explore architecture</a>
+          <a class="btn btn-primary" href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/quickstart/capability-tour.md">Run the live tour</a>
+          <a class="btn btn-secondary" href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/quickstart/message-playground.md">Open the playground</a>
+          <a class="btn btn-secondary" href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/quickstart/connect-agent.md">Connect your app</a>
         </div>
         <div style="display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; font: 13px ui-monospace, Menlo, monospace;">
           <span style="padding: 6px 12px; border-radius: 999px; border: 1px solid #ffffff24;">Apache-2.0</span>
@@ -364,15 +365,17 @@
           <span style="padding: 6px 12px; border-radius: 999px; border: 1px solid #ffffff24;">Evaluation-stage project</span>
         </div>
         <div class="codecard">
-          <div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="t">payload-blind relay capability tour</span></div>
+          <div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="t">live relay tour · updates while real processes run</span></div>
           <pre>mise install
 mise run tour-relay
 
-<span class="cm"># abridged receipt</span>
-<span class="out">PING  status=received · source_authenticated=true</span>
-<span class="out">RELAY status=pass · content_access=denied</span>
-<span class="out">PONG  status=received · causal_observation=verified</span>
-<span class="out">DEMO_RESULT status=pass · nodes=3 · processes=13</span></pre>
+<span class="out">ASTER · PAYLOAD-BLIND RELAY                  00:18</span>
+Move protected Events through a relay that cannot read them
+
+<span class="out">● n0 Origin ─── ● n1 Blind relay ─── ○ n2 Responder</span>
+<span class="out">━━━━━━────  2 / 7 verified phases</span>
+◒ Relay delivers Ping
+  running: n1, n2 · direct Iroh · hybrid-PQ mission</pre>
         </div>
       </div>
     </section>
@@ -471,7 +474,7 @@ mise run tour-relay
             <div class="q">Immutable content</div>
             <h3>Blob</h3>
             <div class="for">Imagery, maps, attachments, model files</div>
-            <p>Immutable chunks are bound to an authenticated manifest and stored through crash-resumable encrypted local staging. Rust applications can publish an owned regular file through <code>RunningNode::selected_blobs()</code> while peerless, read one authenticated zeroize-on-drop page of at most 64 KiB, and consume durable metadata-only notifications for exact source-authenticated publications. Local delivery-ledger counts are not peer or convergence status. Semantic v5 can later transfer the durable source and bounded missing carrier prefixes directly between content-capable peers, including across restart. A <a href="implementation/evidence/selected-live-blob-044d90f.json">retained 10,728-byte receipt</a> (SHA-256 <code>4fea2ffbd16608862a67167fb1b8fcb6d5d8b4b82c576aa9a6b7e25ee9c55909</code>) binds source commit <code>044d90ff07c8e754b3d490cb810d42de3c915e3d</code> with <code>Good</code> signature status, with 45 adversarial verifier tests passing. Its source-to-execution link remains operator-attested, not cryptographically proven. Across three participants and 32 direct-loopback <code>CONTACT</code> records, it observes peerless publication and seeding, an exactly-one-contact partial transfer, exact retained-prefix persistence across receiver reopen, an exactly-one-contact continuation from the different eligible replica with no source refetch and exact-complement advancement, exact byte reconstruction and promotion, bounded live page reads, and a final receiver reopen. This is one-host, same-implementation evidence, and every interruption or restart is a graceful same-process actor/store/provider reopen. It does not prove physical hosts, NAT or Internet paths, controlled or public relay, BTLE, process crash or power-loss recovery, long-offline recovery, arbitrary-peer or route-only resume, scale beyond three participants, resource thresholds or soak, physical sanitization, independent-implementation interoperability, or release authorization. That frozen receipt predates the delivery queue. A separate <a href="implementation/evidence/selected-live-blob-subscription-26e0a09.json">retained 10,269-byte Blob-delivery receipt</a> (SHA-256 <code>3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675</code>, Good-signed source <code>26e0a09</code>) observes one peerless participant across three processes/four actor lifetimes: <code>SIGKILL</code> after a flushed attempt-one poll, fresh-process attempt-2 redelivery acknowledged with the persisted older token, two exact publications sharing one <code>BlobId</code>, and an empty final reopened ledger. It claims no network/peer status, selector separation, TTL/GC, physical or mixed systems, resource/soak, reproducible build, or release authorization.</p>
+            <p>Immutable chunks are bound to an authenticated manifest and stored through crash-resumable encrypted local staging. The live Rust API supports peerless durable publication, bounded authenticated reads, metadata-only delivery, and direct resumable transfer between content-capable peers. Route-only custody, TTL and garbage collection, representative physical or mixed-implementation acceptance, and release authorization remain open.</p>
           </article>
         </div>
       </div>
@@ -488,7 +491,7 @@ mise run tour-relay
           <article class="card">
             <div class="icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20v-8"></path><circle cx="12" cy="12" r="2"></circle><path d="M7.8 7.8a6 6 0 0 0 0 8.4M16.2 7.8a6 6 0 0 1 0 8.4"></path><path d="M4.9 4.9a10 10 0 0 0 0 14.2M19.1 4.9a10 10 0 0 1 0 14.2"></path></svg></div>
             <h3>Separate carrier from protocol</h3>
-            <p>The IP runtime uses direct Iroh or one exact operator-pinned controlled Iroh connectivity relay, while mission identity, source authenticity, and data semantics remain independent. The controlled relay is connectivity infrastructure, not an Aster node, store, route grant, or payload-blind Event relay. A retained one-host receipt observes exact Event delivery and no-op replay through one cone/direct and one restrictive/controlled-relay Docker Linux namespace-NAT cell. It is not discovery or punching, temporal fallback chronology, representative or physical NAT, public Internet or public/default relay, independent implementation, or release evidence. Hosted lookup, public/default relay substitution, and port mapping remain disabled; the carrier boundary is designed for additional carriers without changing the application model.</p>
+            <p>The IP runtime uses direct Iroh or one exact operator-pinned connectivity relay, while mission identity, source authenticity, and data semantics remain independent. The controlled relay is connectivity infrastructure—not an Aster node, store, route grant, or payload-blind Event relay. Hosted lookup, public/default relay substitution, and port mapping remain disabled; the carrier boundary is designed for additional carriers without changing the application model.</p>
           </article>
           <article class="card">
             <div class="icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 5 6v5c0 4.4 3 8.3 7 9.5 4-1.2 7-5.1 7-9.5V6l-7-3z"></path><path d="m9.5 12 1.8 1.8 3.4-3.6"></path></svg></div>
@@ -523,12 +526,12 @@ mise run tour-relay
       <div class="wrap start-grid">
         <div style="display: flex; flex-direction: column; gap: 16px;">
           <div class="eyebrow">Try the mesh</div>
-          <h2 style="font-size: clamp(28px, 4.5vw, 40px); font-weight: 500;">See offline-first delivery in one command</h2>
-          <p style="font-size: 18px;">The relay tour launches three independent nodes, publishes before a contact exists, carries a sealed Event through a relay that cannot read it, and verifies the source and causal reply at the destination.</p>
+          <h2 style="font-size: clamp(28px, 4.5vw, 40px); font-weight: 500;">Watch the mesh work, then take control</h2>
+          <p style="font-size: 18px;">The live tour verifies a deterministic offline and relay path as it unfolds. The playground keeps 2 through 32 independent local node processes running so you can choose a publisher, send synthetic messages, and isolate, stop, or rejoin nodes while exact Event observations update.</p>
           <div style="display: flex; gap: 16px; flex-wrap: wrap; margin-top: 8px;">
-            <a class="btn btn-primary" href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/quickstart/capability-tour.md">Run the tour</a>
+            <a class="btn btn-primary" href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/quickstart/capability-tour.md">Run the live tour</a>
+            <a class="btn btn-secondary" href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/quickstart/message-playground.md">Open the playground</a>
             <a class="btn btn-secondary" href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/quickstart/connect-agent.md">Connect an app</a>
-            <a class="btn btn-secondary" href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/concepts.md">Explore the data model</a>
           </div>
         </div>
         <div style="display: flex; flex-direction: column; gap: 22px;">
@@ -539,16 +542,20 @@ cd aster
 mise install</pre>
           </div>
           <div class="cmd">
-            <div style="display: flex; align-items: center; gap: 12px; color: #fff; font-weight: 600;"><span class="flow-num" style="width: 30px; height: 30px; font-size: 14px;">2</span> Run the payload-blind relay tour</div>
+            <div style="display: flex; align-items: center; gap: 12px; color: #fff; font-weight: 600;"><span class="flow-num" style="width: 30px; height: 30px; font-size: 14px;">2</span> Watch a verified path unfold live</div>
             <pre>mise run tour-relay</pre>
           </div>
           <div class="cmd">
-            <div style="display: flex; align-items: center; gap: 12px; color: #fff; font-weight: 600;"><span class="flow-num" style="width: 30px; height: 30px; font-size: 14px;">3</span> Read the key fields in the receipt</div>
-            <pre><span class="cmt"># abridged</span>
-<span class="out">PING  ... source_authenticated=true</span>
-<span class="out">RELAY ... content_access=denied</span>
-<span class="out">PONG  ... causal_observation=verified</span>
-<span class="out">DEMO_RESULT status=pass ... nodes=3 processes=13</span></pre>
+            <div style="display: flex; align-items: center; gap: 12px; color: #fff; font-weight: 600;"><span class="flow-num" style="width: 30px; height: 30px; font-size: 14px;">3</span> Choose 2–32 local demo nodes</div>
+            <pre>mise run playground -- --nodes 5</pre>
+          </div>
+          <div class="cmd">
+            <div style="display: flex; align-items: center; gap: 12px; color: #fff; font-weight: 600;"><span class="flow-num" style="width: 30px; height: 30px; font-size: 14px;">4</span> Send messages and change availability</div>
+            <pre>send 0 hello from the left
+isolate 2
+send 1 retained during isolation
+rejoin 2
+status</pre>
           </div>
         </div>
       </div>
@@ -560,9 +567,11 @@ mise install</pre>
           <div class="icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 9v4"></path><path d="M12 17h.01"></path><path d="M10.3 3.9 2.6 17a2 2 0 0 0 1.7 3h15.4a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"></path></svg></div>
           <div style="display: flex; flex-direction: column; gap: 10px;">
             <h3>Built for evaluation. Explicit about what is left.</h3>
-            <p>Aster is an early reference implementation for protocol evaluation, application integration, and controlled capability testing—not production deployment. Applications can publish and consume Events through live Rust and ConnectRPC APIs. State and Record expose cloneable live Rust handles backed by the running actor plus exclusive stopped facades. State adds a durable at-least-once positive-current-version queue in Rust (not a materialized view or synthetic-withdrawal feed), and Record adds durable whole-key active-head delivery with non-authorizing conflict sibling IDs and fresh-query-only resolution guards; both synchronize over direct Iroh contacts. Blob exposes a cloneable live Rust handle for peerless-capable durable regular-file publication, authenticated zeroize-on-drop pages of at most 64 KiB, and current-code metadata-only exact-publication delivery, plus an exclusive stopped streaming facade. A <a href="implementation/evidence/selected-live-mutable-6cabb4c.json">7,752-byte v2 retained receipt</a> (SHA-256 <code>054945ecf94e8bfba1b130f6a5f47e9b1e0e17ad69f3b1472085a1d10f05eeaa</code>) binds signed source <code>6cabb4c</code> to peerless State/Record publication and direct convergence across two participants, six actor lifetimes with at most two concurrent, eight direct <code>CONTACT</code> records, aggregate 7/7/7 offer/fetch/insert counts, guarded Record conflict/reject/resolve/supersede/restart, six shutdowns, four closed handles, and zero Event/control/Blob counters. State first retains two exact concurrent heads, then a causal successor that observes and supersedes both; after the other actor observes that successor, its authenticated empty tombstone observes and supersedes all three predecessors, remains current at both actors, and survives one immediate peerless restart. This is a producer-attested ordered, one-host, same-implementation loopback chain with an operator-attested, non-reproducible source-to-execution link and metadata-only secret inspection—not indefinite tombstone retention, garbage collection, delete-wins, physical or mixed implementations, NAT/relay, BTLE, scale, resource, long-duration, Event/Blob-live, or release acceptance; its zero Blob counters do not evidence the newer live Blob mechanism. A separate <a href="implementation/evidence/selected-live-state-subscription-8912fc3.json">9,656-byte retained State-delivery receipt</a> (SHA-256 <code>7d0b568dd4d57c3f2967da55953896829261877513c59c51a0b274eeda69485f</code>, signed source <code>8912fc3</code>) observes forced receiver-process termination after a flushed unacknowledged poll, fresh-process attempt-2 redelivery and acknowledgement, static network/application selector separation, causal ancestor suppression, a current tombstone, and final peerless subscription replay on one same-implementation loopback host. It is not a State status or materialized-view/synthetic-withdrawal result, dynamic network-interest mutation, physical/NAT/relay/BTLE or mixed-implementation evidence, scale beyond two, a resource/soak result, or release authorization. A separate <a href="implementation/evidence/selected-live-record-subscription-0c11344.json">10,357-byte v1 retained Record-delivery receipt</a> (SHA-256 <code>ba0e2bf47291f7e87000b85fa280cc957f3710ac800def82a51fb9b4657a1b48</code>) binds Good-signed source commit <code>0c1134411953f4bb52133b50aff9989cd4ce3930</code>. On one same-implementation direct-loopback host, two participants ran three processes and seven actor lifetimes: six graceful and one forced <code>SIGKILL</code>. Five publications produced three network inserts over eight <code>CONTACT</code> records, with exact 3/3/3 offer/fetch/insert counts and zero duplicate transfers. A complete two-head edit/tombstone conflict remained one delivery at <code>delivery_limit=1</code> and <code>scan_limit=16</code>. After the receiver was sent <code>SIGKILL</code> following its flushed durable unacknowledged attempt-one conflict poll, a fresh process received the same projection at attempt two with a rotated 89-byte token. Resolution required a fresh exact query guard covering both heads, produced a new successor projection, and left both originals as query-only superseded history. Network-interested/application-unmatched beta was retained without delivery, while application-matched/network-uninterested gamma was withheld; the subscription did not mutate network interest. A final peerless reopen replayed the subscription with an empty acknowledged queue, the resolved current successor, and two query-only superseded originals. This receipt moves only <code>DM-5.1-08</code>; it provides no finite-TTL/GC, physical/NAT/relay/BTLE, mixed-implementation, scale/resource/soak, selected-node bindings, automatic-merge, reproducible source-to-binary, or release credit. Semantic v5 can later transfer an already-durable Blob source and bounded carrier ranges directly between current content-capable peers, including across restart. A separate <a href="implementation/evidence/selected-live-blob-044d90f.json">retained live-Blob receipt</a> supplies only the bounded one-host, same-implementation, three-participant direct proof described above: 32 contact records include an exactly-one-contact partial phase and exactly-one-contact continuation from the different eligible replica, with exact prefix persistence, complement advancement, reconstruction, promotion, reads, and final graceful reopen. It does not prove NAT or Internet paths, relay, BTLE, crash or power-loss recovery, long-offline recovery, arbitrary-peer or route-only resume, scale beyond three, resource/soak thresholds, physical sanitization, independent interoperability, or release authorization. A separate <a href="implementation/evidence/selected-live-blob-subscription-26e0a09.json">retained 10,269-byte Blob-delivery receipt</a> (SHA-256 <code>3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675</code>, Good-signed source <code>26e0a09</code>) observes one peerless participant across three processes/four actor lifetimes, <code>SIGKILL</code> after a flushed attempt-one poll, fresh-process attempt-2 redelivery acknowledged with the persisted older token, two exact publications sharing one <code>BlobId</code>, and an empty final ledger. It claims no network/peer status, selector separation, TTL/GC, power-loss/filesystem-crash recovery, physical or mixed systems, resource/soak, reproducible build, or release authorization. Blob peer/convergence status remains open; local delivery-ledger counts are not synchronization status. A separate retained receipt observes one cone/direct and one restrictive/controlled-relay software namespace-NAT cell on one Darwin arm64 host, moving only <code>DM-5.8-07</code>, <code>DM-5.8-09</code>, and <code>DM-11-03</code> within their bounded statuses. It is not discovery or punching, temporal fallback chronology, representative or physical NAT, public Internet or public/default relay, BTLE or cross-transport, mixed implementation, resource-threshold, complete-MVP, or release evidence. Production authorization depends on the tracked security, interoperability, platform, operations, and acceptance gates.</p>
+            <p>Aster is an evaluation-stage reference implementation for protocol evaluation, application integration, and controlled capability testing—not production deployment. Event, State, Record, and Blob have live Rust APIs; Event also has a local ConnectRPC API. The live surfaces, one-host demos, and retained receipts each have explicit bounded claim limits. Production authorization still depends on the tracked security, interoperability, platform, operations, and representative acceptance gates. Follow Project status for exact evidence and remaining gaps.</p>
             <div style="display: flex; gap: 24px; flex-wrap: wrap; font-weight: 600;">
               <a href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/implementation/requirements-status.md">Project status →</a>
+              <a href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/quickstart/capability-tour.md">Live tour →</a>
+              <a href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/quickstart/message-playground.md">Message playground →</a>
               <a href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/quickstart/connect-agent.md">ConnectRPC guide →</a>
               <a href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/architecture.md">Architecture →</a>
               <a href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/security.md">Security model →</a>
