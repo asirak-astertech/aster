@@ -434,3 +434,37 @@ implementation interoperability, scale beyond three participants, resource
 thresholds or long-duration soak, Blob subscription/status/TTL/garbage
 collection, Event/State/Record live-application acceptance, complete MVP
 acceptance, a release artifact, or production authorization.
+
+## Live selected State delivery amendment (2026-08-27)
+
+This amendment supersedes the earlier present-tense statements that selected
+State has no live application subscription or durable delivery subscription.
+Those statements remain above only as dated boundaries of the stopped and
+semantic-v4 network slices. Record and Blob delivery subscriptions remain open.
+
+`SelectedStateHandle` now exposes durable `subscribe`, `poll`, `acknowledge`,
+and `unsubscribe` operations backed by the actor-owned Store. The queue is
+at-least-once and delivers only freshly verified positive Current State
+versions. A current authenticated tombstone is a delivered State version, not a
+synthetic withdrawal. The API is not a materialized view or transition feed and
+emits no Current-to-None event when a key has no Current version.
+
+Application subscriptions and configured network interests are separate
+surfaces. Creating or replaying a subscription does not mutate `NodeConfig`,
+expand network receive policy, or authorize transfer. Delivery tokens are
+opaque, bound to the subscription, State identity, incarnation, tenure, and
+attempt, and exact acknowledgement is idempotent; superseded pending versions
+are retired rather than delivered as current.
+
+The canonical
+[`selected-live-state-subscription-8912fc3.json`](../implementation/evidence/selected-live-state-subscription-8912fc3.json)
+receipt retains one bounded two-participant, three-process, one-host direct-Iroh
+observation. It includes forced receiver-process termination after a flushed
+unacknowledged poll, fresh-process attempt-two redelivery and acknowledgement,
+selector separation, causal ancestor suppression, an explicit current
+tombstone, and final peerless replay. The source/binary/execution link is
+operator-attested and the causal schedule is producer-attested. This amendment
+does not claim physical/NAT/relay/BTLE operation, mixed implementations, scale,
+resource or soak thresholds, indefinite tombstone retention, dynamic network
+interest, Record/Blob delivery, selected-node bindings, a release artifact, or
+production authorization.

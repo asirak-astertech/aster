@@ -273,10 +273,12 @@ work. A [separate retained Blob receipt](../implementation/evidence/selected-liv
 observes only a bounded
 three-participant direct partial/different-eligible-peer resume across graceful
 same-process reopens on one host; it adds no custody acceptance to this guide.
-This slice does not add finite State/Record TTL or subscriptions, Blob
-subscription/status, Blob custody/TTL/GC, arbitrary-peer or route-only Blob
-resume, selected-node bindings, cross-class priority eviction, physical-radio
-silence or media-sanitization proof, protected provisioning,
-representative/physical NAT or Internet, public/default or controlled-relay
-acceptance, BTLE, crash/power-loss or long-offline recovery, scale or resource
-proof, mixed implementations, or release authorization.
+This slice does not add finite State/Record TTL. State's separate durable
+positive-current-version application subscription runs outside custody and is
+documented in the [selected State API](selected-state-api.md). This slice adds
+no Record subscription, Blob subscription/status, Blob custody/TTL/GC,
+arbitrary-peer or route-only Blob resume, selected-node bindings, cross-class
+priority eviction, physical-radio silence or media-sanitization proof, protected
+provisioning, representative/physical NAT or Internet, public/default or
+controlled-relay acceptance, BTLE, crash/power-loss or long-offline recovery,
+scale or resource proof, mixed implementations, or release authorization.

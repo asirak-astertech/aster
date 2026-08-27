@@ -40,7 +40,8 @@ current content-capable peers. The
 selected handshake offers `[5, 4, 3, 2, 1]`. Event keeps v1-v5 compatibility;
 v1-v3 contain no State/Record mechanics and v1-v4 emit zero Blob frames.
 
-`RunningNode::selected_state()` exposes async `publish` and `query`;
+`RunningNode::selected_state()` exposes async `publish`, `query`, `subscribe`,
+`poll`, `acknowledge`, and `unsubscribe`;
 `RunningNode::selected_records()` exposes async `publish`, `query`, and guarded
 `resolve`; `RunningNode::selected_blobs()` exposes async durable regular-file
 `publish` and authenticated `read_page`. Blob pages are at most 64 KiB and own a
@@ -49,10 +50,11 @@ admission rather than opening another writer; Blob work is dispatched to one
 bounded joined worker. Graceful shutdown and live zeroization close admission,
 reject queued work, and join that worker before authority release, so retained
 handles fail with sanitized `StateUnavailable`. Caller-copied Blob bytes and
-caller-owned source files remain outside node zeroization. Durable State/Record
-subscriptions, Blob subscription or convergence status, ConnectRPC/C/Go/Python
-selected-node bindings, finite TTL, and representative physical or
-mixed-implementation acceptance remain open. A
+caller-owned source files remain outside node zeroization. Durable Record/Blob
+delivery, State contact/status and materialized-view/synthetic-withdrawal
+behavior, dynamic State network interests, ConnectRPC/C/Go/Python selected-node
+bindings, finite TTL, and representative physical or mixed-implementation
+acceptance remain open. A
 [retained 7,752-byte v2 live-path receipt](implementation/evidence/selected-live-mutable-6cabb4c.json)
 (SHA-256
 `054945ecf94e8bfba1b130f6a5f47e9b1e0e17ad69f3b1472085a1d10f05eeaa`,
@@ -64,6 +66,19 @@ producer-attested ordered, one-host, same-implementation loopback chain—not
 indefinite tombstone retention, garbage collection, delete-wins, physical or
 mixed implementations, scale, or release acceptance. Its zero Blob counters
 make it neither live-Blob evidence nor a claim about the newer Blob mechanism.
+
+A separate
+[retained 9,656-byte State-delivery receipt](implementation/evidence/selected-live-state-subscription-8912fc3.json)
+(SHA-256
+`7d0b568dd4d57c3f2967da55953896829261877513c59c51a0b274eeda69485f`,
+signed source `8912fc3`) observes forced termination after a flushed
+unacknowledged State poll and fresh-process attempt-2 redelivery,
+acknowledgement, idempotent re-acknowledgement, and empty poll. Its one-host,
+same-implementation run also retains static network/application selector
+separation, causal ancestor suppression, a current tombstone, and final
+peerless subscription replay. It is not State status, a materialized-view or
+synthetic-withdrawal feed, dynamic network-interest mutation, physical/mixed
+or scale/resource evidence, or release authorization.
 
 Selected State/Record lanes are separated by class and receiver direction. They
 use Offer `MutableApplyResult`, Fetch `MutableFetchResult` plus required
@@ -279,6 +294,12 @@ Stopping before acknowledgment can cause redelivery. That is the intended
 at-least-once contract. Acknowledging a projected current State or Record head
 does not promote a causally superseded ancestor into new work; concurrent Record
 siblings are acknowledged independently.
+
+For the selected production-lane Rust node, State alone currently exposes this
+delivery pattern as a freshly authenticated positive-current-version queue;
+see [Deliver positive current State versions durably](quickstart/selected-state-api.md#deliver-positive-current-state-versions-durably).
+Record and Blob selected-node delivery remain open, and the State queue is not
+a materialized view, transition feed, or dynamic network-interest controller.
 
 ## Publish an atomic batch
 

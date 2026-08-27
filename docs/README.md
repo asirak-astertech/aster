@@ -80,14 +80,24 @@ The selected implementation deliberately exposes different maturity levels:
   BTLE, mixed-implementation, scale/resource, other-class, or release evidence.
 - **State and Record** have cloneable live Rust handles backed by the running
   actor plus exclusive stopped-node facades, and reconcile directly between
-  selected nodes under explicit interests. A
+  selected nodes under explicit interests. State additionally has durable
+  positive-current-version delivery in Rust. A
   [retained bounded v2 receipt](implementation/evidence/selected-live-mutable-6cabb4c.json)
   covers peerless publication, direct convergence, exact concurrent State
   heads, a causally later successor, a visible authenticated tombstone through
   one immediate peerless restart, explicit Record conflict/resolution, and
-  handle closure on one loopback host. Their subscriptions, selected-node
-  bindings, finite TTL, tombstone retention duration/garbage collection, and
-  representative physical/mixed acceptance remain open.
+  handle closure on one loopback host. A separate
+  [retained 9,656-byte State-delivery receipt](implementation/evidence/selected-live-state-subscription-8912fc3.json)
+  binds signed source `8912fc3` and observes, on one same-implementation
+  loopback host, a flushed unacknowledged poll, forced receiver-process
+  termination, fresh-process attempt-2 redelivery and acknowledgement,
+  selector withholding, causal ancestor suppression, an explicit current
+  tombstone, and one final peerless subscription replay. Record/Blob delivery,
+  State contact/status and materialized-view/synthetic-withdrawal behavior,
+  dynamic State network interests, selected-node bindings, finite TTL,
+  tombstone retention duration/garbage collection, and representative
+  physical/mixed acceptance, scale/resource evidence, and release authorization
+  remain open.
 - **Blob** has a cloneable `RunningNode::selected_blobs()` Rust handle for
   peerless-capable durable regular-file publication and authenticated reads of
   at most one 64-KiB, zeroize-on-drop plaintext page. Its exclusive stopped

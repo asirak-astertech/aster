@@ -15,8 +15,10 @@ semantic-v4/v5 mission-authenticated, class- and direction-specific Negentropy
 lane when the receiver configures an exact topic/scope interest.
 
 Durable positive-current-version application delivery is available through the
-selected Rust surface. It is not a synthetic-withdrawal or materialized-view
-feed. Configured `NodeConfig` State interests remain the network receive
+selected Rust surface and has a
+[retained bounded receipt](../implementation/evidence/selected-live-state-subscription-8912fc3.json).
+It is not a synthetic-withdrawal or materialized-view feed. Configured
+`NodeConfig` State interests remain the network receive
 policy in this slice; subscriptions do not dynamically replace them. Dynamic
 network selectors, State/node contact status, Record/Blob delivery, selected-
 node ConnectRPC/C/Go/Python bindings, finite TTL, tombstone retention duration,
@@ -194,8 +196,31 @@ cargo test --locked -p aster-node \
 ```
 
 These focused commands are source-level current-code automation and do not by
-themselves create a retained acceptance receipt. The separate retained run
-below binds its claim to signed source and a frozen canonical projection.
+themselves create retained evidence. A separate
+[9,656-byte v1 receipt](../implementation/evidence/selected-live-state-subscription-8912fc3.json)
+(SHA-256
+`7d0b568dd4d57c3f2967da55953896829261877513c59c51a0b274eeda69485f`)
+binds signed source commit `8912fc33571449d1beb4a4cb0f204b5dcd44e8c2`
+to one bounded run. Two same-implementation participants used three processes,
+10 actor lifetimes, and 10 positive direct contacts on one loopback host. The
+receiver process was forcibly terminated after a flushed unacknowledged poll;
+a fresh process replayed the durable subscription, redelivered the same State
+identity as attempt 2, acknowledged it, accepted idempotent
+re-acknowledgement, and then polled empty.
+
+The same run observes five exact State offer/fetch/insert transfers, six
+publications, an authorized but network-uninterested withheld State, a
+network-interested but application-unsubscribed retained State, acknowledged
+and superseded ancestor suppression, one causal successor, and an explicit
+current tombstone through a final peerless subscription replay. The application
+subscription never mutates the configured network interest. This is
+producer-attested, one-host, same-implementation evidence with an
+operator-attested rather than cryptographically proven source-to-execution
+link. It does not establish a State contact/status API, materialized projection
+or synthetic withdrawal feed, dynamic network interests, indefinite tombstone
+retention or garbage collection, physical/NAT/relay/BTLE paths, independent or
+mixed implementations, scale beyond two participants, resource/soak bounds,
+or release authorization.
 
 ## Reconcile live State over a contact
 
