@@ -6,6 +6,15 @@
 - Status: normative for the implemented reference profile
 - Date: 2026-08-25
 
+This document is normative only for profile/suite `0x0001`. The additive
+profile/suite `0x0002` uses new exact provisioning, credential, Event/control,
+and channel-bound handshake forms whose bounded reference implementation is
+documented in
+[classical-iroh-security-profile.md](classical-iroh-security-profile.md). A
+decoder MUST use the exact profile/suite context and MUST NOT reinterpret a
+failure under one specification as the other. A complete normative grammar for
+profile `0x0002` remains an interoperability gate.
+
 The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY**
 are normative. This document defines the base fixed binary security objects
 emitted or accepted by the reference profile. The semantic-version-2/3/v4/v5 batch

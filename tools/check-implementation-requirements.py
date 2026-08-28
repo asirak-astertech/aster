@@ -499,6 +499,148 @@ def selected_claim(
     }
 
 
+SECURITY_PROFILE_DECISION = (
+    "docs/decisions/0033-policy-selected-security-profiles.md"
+)
+SECURITY_PROFILE_DISPOSITION = (
+    "docs/implementation/security-profile-requirements-disposition.md"
+)
+SECURITY_PROFILE_REFERENCE = "docs/classical-iroh-security-profile.md"
+SECURITY_PROFILE_ARTIFACTS = (
+    f"{SECURITY_PROFILE_DISPOSITION}; {SECURITY_PROFILE_DECISION}"
+)
+SECURITY_PROFILE_IMPLEMENTATION_ARTIFACTS = (
+    f"{SECURITY_PROFILE_ARTIFACTS}; {SECURITY_PROFILE_REFERENCE}"
+)
+
+# Decision 0033 refines the applicability of exact hash-bound requirements
+# without changing their source rows or manufacturing implementation evidence.
+# These suffixes are applied after selected-evidence overrides so the generated
+# trace preserves the existing claim boundary while making current policy
+# explicit.
+PROFILE_DISPOSITIONS: dict[str, dict[str, str]] = {
+    "DM-6-01": {
+        "disposition": "continue-selected-implementation-under-profile-policy",
+        "remaining_gap": (
+            "Profile `0x0002` specifies and same-implementation-tests "
+            "independently sealed semantic-v1 Event route/content bytes plus "
+            "carrier-protected ephemeral contact bytes, but it is not in the "
+            "stock runtime and has no retained at-rest or packet-capture evidence."
+        ),
+    },
+    "DM-6-02": {
+        "disposition": "continue-selected-implementation-under-profile-policy",
+        "remaining_gap": (
+            "Profile `0x0002` same-implementation-tests carrier-independent "
+            "Event/control integrity and exporter-bound mission authorization. "
+            "Offline/file binding, stock runtime integration, retained hostile/"
+            "capture evidence, and independent review remain open."
+        ),
+    },
+    "DM-6-03": {
+        "disposition": "continue-selected-implementation-under-profile-policy",
+        "remaining_gap": (
+            "Profile `0x0002` same-implementation-tests separation of Iroh "
+            "endpoint identity from P-256 Aster mission authority and exact "
+            "exporter/peer binding. Offline/file binding, stock runtime "
+            "integration, protected provisioning, retained hostile/capture "
+            "evidence, and independent review remain open."
+        ),
+    },
+    "DM-6-09": {
+        "disposition": "continue-selected-implementation-under-profile-policy",
+        "remaining_gap": (
+            "Profile `0x0002` declares its exposure budget, independently "
+            "encrypts persistent Event route metadata, and uses QUIC for "
+            "ephemeral contact bytes. Stock runtime integration, retained "
+            "capture/local-at-rest evidence, and independent review remain open."
+        ),
+    },
+    "DM-6-11": {
+        "disposition": "continue-selected-implementation-under-profile-policy",
+        "remaining_gap": (
+            "Profile `0x0002` declares every currently permitted observer/field "
+            "and same-implementation-tests route/content separation. Packet-"
+            "capture and local-at-rest acceptance remain open."
+        ),
+    },
+    "DM-6-12": {
+        "disposition": "continue-selected-implementation-under-profile-policy",
+        "remaining_gap": (
+            "Profile `0x0002` declares its exact unavoidable public envelope, "
+            "carrier, and local-index exposure; capture verification for every "
+            "claimed carrier/profile remains open."
+        ),
+    },
+    "DM-6-25": {
+        "disposition": "continue-selected-implementation-under-profile-policy",
+        "remaining_gap": (
+            "Profile `0x0001` retains observed hybrid key establishment; additive "
+            "`0x0002` adds exact singleton profile identifiers/policy but not "
+            "stock runtime selection between profiles. Required-hybrid no-"
+            "overlap enforcement in the stock runtime and snapshot-resistant "
+            "policy state remain open."
+        ),
+    },
+    "DM-6-26": {
+        "disposition": "continue-selected-implementation-under-profile-policy",
+        "remaining_gap": (
+            "Profile `0x0001` retains observed hybrid signatures; additive "
+            "`0x0002` adds exact P-256 Event/control credentials without "
+            "rewriting suite-`0x0001` objects. Profile-`0x0002` State, Record, "
+            "Blob, batch, bridge, and rekey forms remain open."
+        ),
+    },
+    "DM-6-29": {
+        "disposition": "implement-and-verify-profile-policy",
+        "remaining_gap": (
+            "Additive `0x0002` supplies a second versioned profile and an "
+            "authority-signed singleton selected/required policy. General offer/"
+            "overlap negotiation, stock runtime/CLI selection, complete "
+            "classical data/lifecycle coverage, retained mixed-version evidence, "
+            "and independent interoperability remain open."
+        ),
+    },
+    "DM-6-30": {
+        "disposition": "implement-and-verify-profile-policy",
+        "remaining_gap": (
+            "Profile `0x0002` rejects exact ALPN, profile, suite, generation, "
+            "authority, channel, and peer mismatches and provides an opt-in local "
+            "generation high-water seam. Authenticated offers, runtime-wide "
+            "cross-attempt fallback prohibition, required-hybrid no-overlap "
+            "enforcement in the stock runtime, snapshot-resistant rollback, "
+            "retained downgrade evidence, and independent verification remain open."
+        ),
+    },
+    "DM-11-22": {
+        "disposition": "implement-and-verify-profile-policy",
+        "remaining_gap": (
+            "Profile `0x0002` declares a bounded metadata exposure budget and "
+            "independently protects sealed Event route metadata, but it is not a "
+            "named MVP runtime and lacks complete class/lifecycle, retained "
+            "capture, and local-at-rest acceptance."
+        ),
+    },
+    "DM-12-10": {
+        "disposition": "profile-scoped-external-gate",
+        "remaining_gap": (
+            "Decision 0033 scopes capture acceptance to zero payload plaintext "
+            "and no metadata beyond the declared profile exposure budget, rather "
+            "than zero protected metadata on every carrier; retain representative "
+            "capture evidence for each claimed profile."
+        ),
+    },
+    "DM-14-23": {
+        "disposition": "profile-scoped-governance-gate",
+        "remaining_gap": (
+            "Decision 0033 makes validated hybrid-PQ module availability a gate "
+            "only for production profiles that select, permit, or require that "
+            "composition; record the exact profile-specific module disposition."
+        ),
+    },
+}
+
+
 PROFILE_EVIDENCE = (
     "crates/aster-profile/src/item.rs; requirements-owned reconciliation key "
     "and canonical inventory mechanics; Event transfer identity enters this "
@@ -1279,6 +1421,21 @@ RELEVANT_ARTIFACTS = {
     "DM-2-11": "data-mesh-requirements.md",
     "DM-2-12": "data-mesh-requirements.md",
     "DM-2-13": "data-mesh-requirements.md",
+    "DM-6-01": SECURITY_PROFILE_IMPLEMENTATION_ARTIFACTS,
+    "DM-6-02": SECURITY_PROFILE_IMPLEMENTATION_ARTIFACTS,
+    "DM-6-03": SECURITY_PROFILE_IMPLEMENTATION_ARTIFACTS,
+    "DM-6-04": SECURITY_PROFILE_REFERENCE,
+    "DM-6-05": SECURITY_PROFILE_REFERENCE,
+    "DM-6-06": SECURITY_PROFILE_REFERENCE,
+    "DM-6-07": SECURITY_PROFILE_REFERENCE,
+    "DM-6-09": SECURITY_PROFILE_IMPLEMENTATION_ARTIFACTS,
+    "DM-6-10": SECURITY_PROFILE_REFERENCE,
+    "DM-6-11": SECURITY_PROFILE_IMPLEMENTATION_ARTIFACTS,
+    "DM-6-12": SECURITY_PROFILE_IMPLEMENTATION_ARTIFACTS,
+    "DM-6-25": SECURITY_PROFILE_IMPLEMENTATION_ARTIFACTS,
+    "DM-6-26": SECURITY_PROFILE_IMPLEMENTATION_ARTIFACTS,
+    "DM-6-29": SECURITY_PROFILE_IMPLEMENTATION_ARTIFACTS,
+    "DM-6-30": SECURITY_PROFILE_IMPLEMENTATION_ARTIFACTS,
     "DM-7-02": "bindings/c",
     "DM-7-03": "docs/bindings/pattern.md",
     "DM-7-04": "docs/bindings/pattern.md; bindings/c; bindings/go; bindings/python",
@@ -1301,6 +1458,8 @@ RELEVANT_ARTIFACTS = {
     "DM-10-04": "docs/protocol.md; docs/deprecation-policy.md",
     "DM-10-05": "docs/protocol.md; docs/deprecation-policy.md",
     "DM-10-06": "docs/deprecation-policy.md",
+    "DM-11-22": SECURITY_PROFILE_IMPLEMENTATION_ARTIFACTS,
+    "DM-12-10": SECURITY_PROFILE_IMPLEMENTATION_ARTIFACTS,
     "DM-13-01": "docs/protocol.md; docs/wire.cddl; docs/envelope.md",
     "DM-13-02": "crates/aster-core; crates/aster-host",
     "DM-13-03": "crates/aster-ffi; bindings/c",
@@ -1314,6 +1473,7 @@ RELEVANT_ARTIFACTS = {
     "DM-13-11": "deny.toml; docs/decisions; docs/evaluations/0005",
     "DM-14-20": "docs/evaluations/0005; docs/decisions/0025-requirements-first-foss-architecture-evaluation.md",
     "DM-14-21": "docs/evaluations/0005/responsibility-map.md; docs/decisions/0025-requirements-first-foss-architecture-evaluation.md",
+    "DM-14-23": SECURITY_PROFILE_ARTIFACTS,
 }
 
 PROVEN_SEMANTIC_SOURCES: dict[str, str] = {
@@ -1648,6 +1808,7 @@ def expected_rows(matrix_rows: list[dict[str, str]]) -> list[dict[str, str]]:
     matrix_ids = {row["id"] for row in matrix_rows}
     mapped_ids = (
         set(SELECTED_OVERRIDES)
+        | set(PROFILE_DISPOSITIONS)
         | set(PROVEN_SEMANTIC_SOURCES)
         | set(RELEVANT_ARTIFACTS)
     )
@@ -1665,6 +1826,14 @@ def expected_rows(matrix_rows: list[dict[str, str]]) -> list[dict[str, str]]:
                 row["disposition"] = "continue-selected-implementation"
             elif matrix_row["id"] == "DM-8-05":
                 row["disposition"] = "dependency-admission-block"
+        profile_disposition = PROFILE_DISPOSITIONS.get(matrix_row["id"])
+        if profile_disposition is not None:
+            row["disposition"] = profile_disposition["disposition"]
+            row["remaining_gap"] = (
+                row["remaining_gap"]
+                + " "
+                + profile_disposition["remaining_gap"]
+            )
         rows.append(row)
     return rows
 

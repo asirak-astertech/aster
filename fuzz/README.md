@@ -31,6 +31,12 @@ mutations of a freshly sealed valid envelope carrying exactly 4,096 causal
 predecessors. Its retained `M` seed is a nonsecret mutation recipe; credentials
 and generated envelope bytes are never written to the retained corpus.
 
+`classical_profile_decode` uses the public profile-`0x0002` APIs to exercise
+exact provisioning dispatch, source Event route/content verification, and
+first-flight mission parsing. Its retained `B`, `E`, and `H` files are nonsecret
+mutation recipes; canonical credentials, envelopes, and handshake bytes are
+created in memory and are not retained in the corpus.
+
 Each smoke campaign runs 10,000 cases with a fixed seed and a 262,144-byte
 maximum input. Retained corpora are copied to a temporary directory before each
 campaign, so libFuzzer cannot mutate the checked-in seed corpus. Targets without

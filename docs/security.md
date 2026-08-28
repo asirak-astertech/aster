@@ -2,6 +2,14 @@
 
 - Version: 0.1.0
 - Status: reference design; production security and integration gates unsatisfied
+- Profile policy: [Decision 0033](decisions/0033-policy-selected-security-profiles.md)
+  and its [requirements disposition](implementation/security-profile-requirements-disposition.md)
+
+This document primarily describes suite/profile `0x0001` and the stock selected
+runtime. The additive, evaluation-only profile `0x0002` boundary is documented
+separately in [Classical P-256 / Iroh-QUIC security profile](classical-iroh-security-profile.md).
+Decision 0033 makes metadata exposure and classical versus hybrid-PQ use
+policy-selectable; neither profile reinterprets the other's bytes or evidence.
 
 ## Find a section
 
@@ -13,6 +21,25 @@
 | What do revocation and zeroization mean? | [Authority custody](#authority-custody-and-control-continuity) and [revocation meaning](#revocation-meaning) |
 | How is availability bounded? | [Causal evidence](#causal-evidence-and-bounded-state) and [availability controls](#availability-controls) |
 | What blocks production authorization? | [Mesh cryptographic provider status](#mesh-cryptographic-provider-status) and [security test gates](#security-test-gates) |
+
+## Implemented profile boundary
+
+Two versioned profile implementations now exist, with deliberately different
+supported surfaces and integration maturity. Profile `0x0002` is a bounded
+Event/control evaluation slice, not a complete MVP/product profile:
+
+| Profile | Implemented boundary | Runtime status |
+|---|---|---|
+| `0x0001` `hybrid-pq-aster-record-v1` | Hybrid source/control objects, four-flight mission session, and `ASTRFR01` application records through semantic v5 | Stock selected node/runtime |
+| `0x0002` `classical-p256-iroh-quic-v1` | Provisioned singleton policy, P-256 semantic-v1 Event/control objects, Iroh TLS-exporter-bound mission session, and raw QUIC application exchanges | Additive library/two-node mission path; not selected by stock `run_node` or CLI |
+
+Profile `0x0002` has no ML-DSA or ML-KEM operation in its runtime path and adds
+no Aster application-record layer over QUIC. It still performs P-256 mission
+authorization and separately protects sealed source Event bytes at rest.
+Combined builds retain the profile-`0x0001` code and PQ dependencies. Its exact
+metadata budget, five-second open-connection keepalive behavior, persistent
+policy-binding limitations, unsupported forms, and remaining release gates are
+declared in the profile boundary document.
 
 ## Assets and adversary
 
@@ -259,6 +286,11 @@ inspection, swap, DMA, backups, or crash dumps unless the selected platform and
 deployment add those controls.
 
 ## Mandatory controls
+
+The suite-specific controls below remain mandatory for current complete suite
+`0x0001`. The profile-invariant controls and applicability of future profiles
+are recorded separately in the
+[security-profile requirements disposition](implementation/security-profile-requirements-disposition.md).
 
 - Canonical ordered semantic-version and complete-suite offers, with selection
   bound into the transcript, KDF, key confirmations, and hybrid authentication;
@@ -845,10 +877,12 @@ The reference provider uses `aes-gcm`, `hkdf`, `sha2`, `p256`, `ml-kem`, and
 nor FIPS 140-3 validation. The public API cannot select primitives; an internal
 provider boundary allows a CMVP-backed module.
 
-Production is blocked until deployment assurance identifies a current CMVP
-certificate, exact module/version/operational environment and approved mode,
-coverage for all suite operations, self-tests, and an independently reviewed
-hybrid combiner.
+Production use of suite `0x0001` is blocked until deployment assurance
+identifies a current CMVP certificate, exact module/version/operational
+environment and approved mode, coverage for all suite operations, self-tests,
+and an independently reviewed hybrid combiner. Every future production profile
+has its own applicable module and review gate; a hybrid-PQ module gate does not
+apply to a profile that excludes PQ.
 
 ## Security test gates
 

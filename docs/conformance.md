@@ -13,10 +13,20 @@ contract are a plan, not a shipped executable feature.
 Passing the reference implementation against itself is necessary but is not the
 independent-interoperability acceptance claim.
 
-Fixed security-object bytes and bounds come from [envelope.md](envelope.md) and
-the semantic-v2/v3/v4/v5 batch profile in [protocol.md](protocol.md) §6.1; replication
-CBOR comes from [wire.cddl](wire.cddl). A test harness MUST retain those
-namespaces and must not normalize a rejected encoding.
+Profile-`0x0001` fixed security-object bytes and bounds come from
+[envelope.md](envelope.md) and the semantic-v2/v3/v4/v5 batch profile in
+[protocol.md](protocol.md) §6.1; replication CBOR comes from
+[wire.cddl](wire.cddl). The bounded profile-`0x0002` implementation is
+documented separately in the
+[classical Iroh-QUIC profile](classical-iroh-security-profile.md). A test
+harness MUST retain those namespaces and must not normalize a rejected encoding
+or retry another profile after a profile/ALPN/policy failure.
+
+The shipped conformance runner and checked-in corpora remain profile-`0x0001`
+artifacts. Profile `0x0002` currently has same-implementation unit and real-Iroh
+integration tests only; complete normative byte grammar, independent vectors,
+packet captures, and a black-box SUT lane remain open and receive no
+conformance credit.
 
 The shipped `aster-conformance` runner provides four stable entry points:
 
@@ -238,7 +248,7 @@ and deployment cryptographic requirements remain open gates.
 | A-06 | emission | threshold suppresses lower Event lanes without discarding them while v4/v5 State/Record and v5 Blob still run; ReceiveOnly exposes no mutable or Blob lane; PassiveOnly behavior matches declared physical mode |
 | A-07 | revocation/rekey | after control arrival, revoked handshake fails and fresh epoch is unreadable with revoked keys |
 | A-08 | NAT | direct UDP path forms through test cone NAT; restrictive case uses separately deployed opaque relay |
-| A-09 | capture confidentiality | payload/topic/scope/priority/publisher canaries absent from all carrier captures |
+| A-09 | capture confidentiality | payload plaintext is absent; protected metadata is absent unless the exact declared security-profile exposure budget permits it, and observed leakage does not exceed that budget |
 | A-10 | independent implementation | separately authored SUT passes the same corpus against the reference |
 | A-11 | blob resume | 100+ MB stream interrupts mid-block set and resumes with another peer without whole-blob RAM growth |
 | A-12 | broadcast | one physical advertisement satisfies at least two listeners; duplicate/NACK repair remains bounded |
@@ -520,13 +530,19 @@ but there is no protected broadcast replication capsule or implemented
 suppression, repair aggregation, and loop-bounding protocol. The Rust host can
 pump a configured link, but no concrete physical BTLE controller is shipped.
 
-The reference passes A-09's handshake subgate: a runtime capture test reassembles
-all four tiny-MTU flights and finds neither peer's mission, credential,
-credential body, NodeID, nor route-grant commitment canaries. Full A-09 still
-requires captures covering source, custody, protected replication, and each
-physical carrier. It excludes correlation already available from
-link/network/rendezvous identifiers before the first Aster flight and does not
-assert traffic-flow confidentiality.
+The current security construction using suite `0x0001` passes A-09's handshake
+subgate: a runtime capture test reassembles all four tiny-MTU flights and finds
+neither peer's mission, credential, credential body, NodeID, nor route-grant
+commitment canaries. Full A-09 still requires captures covering source,
+custody, protected replication, and each physical carrier claimed by the
+release profile. For the current security construction using suite `0x0001`,
+all named protected metadata canaries remain required absent. A future profile
+instead must declare its exact exposure budget under
+[Decision 0033](decisions/0033-policy-selected-security-profiles.md), and its
+captures must reveal no payload plaintext or metadata beyond that budget. A-09
+excludes correlation already available from link/network/rendezvous
+identifiers before the first Aster flight unless a named profile mechanism
+claims to hide it, and does not assert traffic-flow confidentiality.
 
 ## Durability and fault scenarios
 

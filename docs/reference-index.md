@@ -31,6 +31,8 @@ For a shorter path based on what you are trying to accomplish, start at the
 - [Envelope and security-object specification](envelope.md)
 - [Wire grammar](wire.cddl)
 - [Security model](security.md)
+- [Classical P-256 / Iroh-QUIC security profile](classical-iroh-security-profile.md)
+- [Security-profile requirements disposition](implementation/security-profile-requirements-disposition.md)
 - [Compatibility and deprecation policy](deprecation-policy.md)
 - [Source requirements](../data-mesh-requirements.md)
 
@@ -101,3 +103,4 @@ design chose its major boundaries.
 - [0030 — Admit a bounded Event-first local ConnectRPC agent](decisions/0030-event-first-local-connect-agent.md)
 - [0031 — Keep live tour presentation separate from raw receipts](decisions/0031-live-tour-presentation.md)
 - [0032 — Keep interactive Event exploration separate from acceptance tours](decisions/0032-interactive-event-message-playground.md)
+- [0033 — Select security properties through authenticated mission profiles](decisions/0033-policy-selected-security-profiles.md)

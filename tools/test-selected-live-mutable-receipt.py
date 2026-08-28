@@ -1166,7 +1166,7 @@ class SelectedLiveMutableReceiptTests(unittest.TestCase):
         self.assertNotIn(self.fixture.missions["node-a"].encode("ascii"), first)
         self.assertNotIn(self.fixture.secret, first)
         self.assertNotIn(b"127.0.0.1", first)
-        self.assertNotIn(b"4242", first)
+        self.assertFalse(CHECKER.contains_exact_scalar(parsed, {"4242"}, {4242}))
 
     def test_identity_and_authority_domain_mutations_fail_closed(self) -> None:
         self.fixture.mutate_transcript(2, "carrier_id", self.fixture.carriers["node-a"])

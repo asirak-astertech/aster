@@ -2,24 +2,30 @@
 //!
 //! An Iroh endpoint identity authenticates the carrier connection. It does not
 //! establish Aster mission membership. This module binds an observed carrier
-//! peer to a separately provisioned, expected mission [`NodeId`] and delegates
-//! the complete hybrid four-flight handshake and ordered application-frame
-//! protection to `aster-core`.
+//! peer to a separately provisioned, expected mission [`NodeId`]. It preserves
+//! the complete hybrid handshake and record layer while also exposing an exact
+//! classical mission handshake bound to an `IrohQuicV1` TLS exporter.
 //!
 //! The handshake state types intentionally expose no application-frame API.
-//! Only [`MissionSession`], produced after the fourth flight and an exact peer
-//! identity check, can seal or open application bytes.
+//! Only [`MissionSession`] or [`CarrierBoundClassicalMissionSession`], produced
+//! after the fourth flight and an exact peer identity check, can expose their
+//! profile's protected application path.
 
-use aster_iroh::{CarrierError, Connection, EndpointId, SecretKey};
+use aster_iroh::{
+    CarrierError, CarrierSecurityProfile, ChannelBindingContext as IrohChannelBindingContext,
+    Connection, EndpointId, SecretKey,
+};
 use aster_mesh::{
+    ApplicationProtection, AuthenticatedChannelBinding, ClassicalAuthenticatedSession,
+    ClassicalProvisioningBundle, ClassicalSessionInitiator, ClassicalSessionResponder,
     CustodyClaims, CustodyExpectation, MAX_PROTECTED_PROVISIONING_BYTES,
     MAX_UNPROTECTED_PROVISIONING_BYTES, NodeId, ProvisioningBundle, ProvisioningLoadId,
     ProvisioningProtectionError, ProvisioningSecretLoader, ProvisioningSecretRef,
     ProvisioningSecretStoreError, ProvisioningUnprotector, ReferenceAuthenticatedSession,
     ReferenceEnvelopeSealer, ReferenceSessionAwaitingFinished, ReferenceSessionInitiator,
-    ReferenceSessionResponder, ReferenceSessionResponderPending, UnprotectedProvisioning,
-    VerifiedCustodyClaims, engine::EnvelopeError, load_provisioning_secret,
-    unprotect_provisioning_artifact,
+    ReferenceSessionResponder, ReferenceSessionResponderPending, SecurityProfileId,
+    UnprotectedProvisioning, VerifiedCustodyClaims, VerifiedSecurityProfile, engine::EnvelopeError,
+    load_provisioning_secret, unprotect_provisioning_artifact,
 };
 use std::{
     error::Error,
@@ -45,6 +51,9 @@ const SOFTWARE_ERASURE_DESCRIPTOR_HEADER_BYTES: usize = 37;
 const MAX_SOFTWARE_ERASURE_PATH_BYTES: usize =
     MAX_SOFTWARE_ERASURE_DESCRIPTOR_BYTES - SOFTWARE_ERASURE_DESCRIPTOR_HEADER_BYTES;
 const ERASE_BUFFER_BYTES: usize = 8 * 1024;
+const CLASSICAL_CHANNEL_BINDING_CONTEXT_MAGIC: &[u8; 8] = b"ASTRCB01";
+/// Exact bytes in a canonical carrier-bound classical mission context.
+pub const CLASSICAL_CHANNEL_BINDING_CONTEXT_BYTES: usize = 8 + 2 + 8 + 32 * 6;
 
 /// Kind of local plaintext secret named by a software-erasure descriptor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -870,6 +879,86 @@ impl UnprotectedReferenceMission {
     }
 }
 
+/// Parsed profile-`0x0002` credentials retained as zeroizing plaintext bytes.
+///
+/// This type is intentionally explicit about its unprotected in-process
+/// custody. It validates the complete authority-signed classical profile and
+/// owns canonical bytes so each contact receives a fresh, single-use core
+/// handshake bundle without retaining duplicate decoded private keys.
+#[derive(Clone)]
+pub struct UnprotectedClassicalMission {
+    encoded: Arc<Mutex<UnprotectedProvisioning>>,
+    identity: NodeId,
+    security_profile: VerifiedSecurityProfile,
+}
+
+impl UnprotectedClassicalMission {
+    /// Validates and owns canonical unprotected profile-`0x0002` bundle bytes.
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, MissionProvisioningError> {
+        let encoded = UnprotectedProvisioning::new(bytes)?;
+        let bundle = ClassicalProvisioningBundle::from_bytes(encoded.expose())?;
+        let identity = bundle.node_principal();
+        let security_profile = bundle.verified_security_profile();
+        if security_profile.profile_id() != SecurityProfileId::ClassicalP256IrohQuicV1
+            || security_profile.required_profile_id() != security_profile.profile_id()
+            || security_profile.profile().application_protection()
+                != ApplicationProtection::AuthenticatedCarrierRequired
+        {
+            return Err(MissionProvisioningError::Invalid(EnvelopeError(
+                "classical mission requires the exact Iroh-QUIC security profile".into(),
+            )));
+        }
+        drop(bundle);
+        Ok(Self {
+            encoded: Arc::new(Mutex::new(encoded)),
+            identity,
+            security_profile,
+        })
+    }
+
+    /// Authority-authenticated classical mission node principal.
+    pub const fn identity(&self) -> NodeId {
+        self.identity
+    }
+
+    /// Exact authority-authenticated security-profile policy.
+    pub const fn verified_security_profile(&self) -> VerifiedSecurityProfile {
+        self.security_profile
+    }
+
+    fn fresh_bundle(&self) -> Result<ClassicalProvisioningBundle, MissionSessionError> {
+        let encoded = self.encoded.lock().map_err(|_| {
+            MissionSessionError::Authentication(EnvelopeError(
+                "classical mission provisioning state is poisoned".into(),
+            ))
+        })?;
+        let bundle = ClassicalProvisioningBundle::from_bytes(encoded.expose())?;
+        if bundle.node_principal() != self.identity
+            || bundle.verified_security_profile() != self.security_profile
+        {
+            return Err(MissionSessionError::Authentication(EnvelopeError(
+                "classical mission provisioning changed after validation".into(),
+            )));
+        }
+        Ok(bundle)
+    }
+}
+
+impl fmt::Debug for UnprotectedClassicalMission {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UnprotectedClassicalMission")
+            .field("identity", &"[REDACTED]")
+            .field("profile", &self.security_profile.profile_id())
+            .field(
+                "policy_generation",
+                &self.security_profile.policy_generation(),
+            )
+            .field("credential_bytes", &"[REDACTED]")
+            .finish()
+    }
+}
+
 fn read_bounded_protected_artifact(path: &Path) -> Result<Vec<u8>, MissionProvisioningError> {
     let path_metadata = std::fs::symlink_metadata(path)?;
     if !path_metadata.file_type().is_file() {
@@ -1192,7 +1281,7 @@ impl MissionProvisioningError {
 /// Exact carrier-to-mission identity binding configured for one peer.
 ///
 /// `carrier_id` is the Iroh identity authenticated by QUIC. `mission_id` is the
-/// authority-provisioned Aster identity authenticated by the hybrid mission
+/// authority-provisioned Aster identity authenticated by the selected mission
 /// handshake. They are deliberately different fields and different types.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MissionPeerBinding {
@@ -1230,6 +1319,65 @@ impl MissionPeerBinding {
     }
 }
 
+/// Canonical role-ordered context supplied to the Iroh TLS exporter.
+///
+/// The exact `ASTRCB01` encoding is:
+///
+/// `magic || profile_u16 || generation_u64 || policy_authority[32] ||
+/// mission_principal[32] || initiator_carrier[32] || initiator_mission[32] ||
+/// responder_carrier[32] || responder_mission[32]`.
+///
+/// Initiator and responder order is semantic, never lexical. Reversing roles,
+/// changing either identity, or changing the authenticated policy therefore
+/// yields a different TLS exporter binding.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ClassicalChannelBindingContext([u8; CLASSICAL_CHANNEL_BINDING_CONTEXT_BYTES]);
+
+impl ClassicalChannelBindingContext {
+    /// Encodes one exact classical profile and both role-bound identities.
+    pub fn new(
+        profile: VerifiedSecurityProfile,
+        initiator: MissionPeerBinding,
+        responder: MissionPeerBinding,
+    ) -> Result<Self, MissionSessionError> {
+        if profile.profile_id() != SecurityProfileId::ClassicalP256IrohQuicV1
+            || profile.required_profile_id() != profile.profile_id()
+            || profile.profile().application_protection()
+                != ApplicationProtection::AuthenticatedCarrierRequired
+        {
+            return Err(MissionSessionError::Authentication(EnvelopeError(
+                "channel-binding context requires the exact classical Iroh-QUIC profile".into(),
+            )));
+        }
+        let mut encoded = [0u8; CLASSICAL_CHANNEL_BINDING_CONTEXT_BYTES];
+        encoded[..8].copy_from_slice(CLASSICAL_CHANNEL_BINDING_CONTEXT_MAGIC);
+        encoded[8..10].copy_from_slice(&profile.profile_id_u16().to_be_bytes());
+        encoded[10..18].copy_from_slice(&profile.policy_generation().to_be_bytes());
+        encoded[18..50].copy_from_slice(&profile.policy_authority_id());
+        encoded[50..82].copy_from_slice(&profile.mission_principal());
+        encoded[82..114].copy_from_slice(initiator.carrier_id().as_bytes());
+        encoded[114..146].copy_from_slice(&initiator.mission_id());
+        encoded[146..178].copy_from_slice(responder.carrier_id().as_bytes());
+        encoded[178..210].copy_from_slice(&responder.mission_id());
+        Ok(Self(encoded))
+    }
+
+    /// Borrows the exact canonical exporter-context bytes.
+    pub fn as_bytes(&self) -> &[u8; CLASSICAL_CHANNEL_BINDING_CONTEXT_BYTES] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ClassicalChannelBindingContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClassicalChannelBindingContext")
+            .field("encoded_len", &self.0.len())
+            .field("identities", &"[REDACTED]")
+            .finish()
+    }
+}
+
 /// Fail-closed error from carrier binding, mission authentication, or protected frames.
 #[derive(Debug)]
 pub enum MissionSessionError {
@@ -1240,7 +1388,12 @@ pub enum MissionSessionError {
         expected: EndpointId,
         observed: EndpointId,
     },
-    /// The hybrid-authenticated Aster identity did not match configuration.
+    /// A carrier-bound profile was attempted over the wrong exact ALPN profile.
+    CarrierSecurityProfileMismatch {
+        required: CarrierSecurityProfile,
+        observed: CarrierSecurityProfile,
+    },
+    /// The mission-handshake-authenticated Aster identity did not match configuration.
     MissionIdentityMismatch {
         expected: NodeId,
         authenticated: NodeId,
@@ -1256,6 +1409,10 @@ impl fmt::Display for MissionSessionError {
             Self::CarrierIdentityMismatch { expected, observed } => write!(
                 formatter,
                 "carrier identity mismatch: expected {expected}, observed {observed}"
+            ),
+            Self::CarrierSecurityProfileMismatch { required, observed } => write!(
+                formatter,
+                "carrier security profile mismatch: required {required:?}, observed {observed:?}"
             ),
             Self::MissionIdentityMismatch {
                 expected,
@@ -1276,7 +1433,9 @@ impl Error for MissionSessionError {
         match self {
             Self::Carrier(error) => Some(error),
             Self::Authentication(error) => Some(error),
-            Self::CarrierIdentityMismatch { .. } | Self::MissionIdentityMismatch { .. } => None,
+            Self::CarrierIdentityMismatch { .. }
+            | Self::CarrierSecurityProfileMismatch { .. }
+            | Self::MissionIdentityMismatch { .. } => None,
         }
     }
 }
@@ -1631,6 +1790,338 @@ async fn respond_over_iroh_inner(
     }
 }
 
+fn classical_channel_binding(
+    connection: &Connection,
+    mission: &UnprotectedClassicalMission,
+    peer: MissionPeerBinding,
+    local_is_initiator: bool,
+) -> Result<AuthenticatedChannelBinding, MissionSessionError> {
+    if connection.security_profile() != CarrierSecurityProfile::IrohQuicV1 {
+        return Err(MissionSessionError::CarrierSecurityProfileMismatch {
+            required: CarrierSecurityProfile::IrohQuicV1,
+            observed: connection.security_profile(),
+        });
+    }
+    let peer = peer.verify_observed_carrier(connection.remote_id())?;
+    let local = MissionPeerBinding::new(connection.local_id(), mission.identity());
+    let (initiator, responder) = if local_is_initiator {
+        (local, peer)
+    } else {
+        (peer, local)
+    };
+    let context = ClassicalChannelBindingContext::new(
+        mission.verified_security_profile(),
+        initiator,
+        responder,
+    )?;
+    let exporter_context = IrohChannelBindingContext::new(context.as_bytes())?;
+    let binding = connection.channel_binding(exporter_context)?;
+    AuthenticatedChannelBinding::new(binding.as_bytes().to_vec()).map_err(Into::into)
+}
+
+struct ClassicalConnectionGuard(Option<Connection>);
+
+impl ClassicalConnectionGuard {
+    fn new(connection: Connection) -> Self {
+        Self(Some(connection))
+    }
+
+    fn connection(&self) -> &Connection {
+        self.0
+            .as_ref()
+            .expect("classical connection guard is armed until session construction")
+    }
+
+    fn into_connection(mut self) -> Connection {
+        self.0
+            .take()
+            .expect("classical connection guard is armed until session construction")
+    }
+}
+
+impl Drop for ClassicalConnectionGuard {
+    fn drop(&mut self) {
+        if let Some(connection) = self.0.as_ref() {
+            connection.close();
+        }
+    }
+}
+
+/// Runs the initiator side of the carrier-bound classical four-flight handshake.
+///
+/// This function takes ownership of the exact `IrohQuicV1` connection. No
+/// application access is returned until flight four, the authority-authenticated
+/// profile policy, the TLS exporter, and the configured carrier/mission peer
+/// binding all authenticate. Every failure closes the owned connection.
+pub async fn initiate_classical_over_iroh(
+    connection: Connection,
+    mission: &UnprotectedClassicalMission,
+    peer: MissionPeerBinding,
+) -> Result<CarrierBoundClassicalMissionSession, MissionSessionError> {
+    let connection = ClassicalConnectionGuard::new(connection);
+    let handshake = async {
+        let channel_binding =
+            classical_channel_binding(connection.connection(), mission, peer, true)?;
+        let (initiator, first) =
+            ClassicalSessionInitiator::start(mission.fresh_bundle()?, channel_binding)?;
+        let second = connection.connection().request(&first).await?;
+        let (pending, third) = initiator.receive_server(&second)?;
+        let fourth = connection.connection().request(&third).await?;
+        pending.receive_finished(&fourth).map_err(Into::into)
+    }
+    .await;
+    match handshake {
+        Ok(inner) => CarrierBoundClassicalMissionSession::bind(
+            inner,
+            connection.into_connection(),
+            mission.identity(),
+            peer,
+            mission.verified_security_profile(),
+        ),
+        Err(error) => Err(error),
+    }
+}
+
+/// Runs the responder side of the carrier-bound classical four-flight handshake.
+///
+/// The returned session owns the exact exporter-bound connection. Rejected
+/// policy, context, carrier identity, mission identity, or flight bytes close
+/// that connection and never enter the legacy hybrid path.
+pub async fn respond_classical_over_iroh(
+    connection: Connection,
+    mission: &UnprotectedClassicalMission,
+    peer: MissionPeerBinding,
+) -> Result<CarrierBoundClassicalMissionSession, MissionSessionError> {
+    let connection = ClassicalConnectionGuard::new(connection);
+    let handshake = respond_classical_over_iroh_inner(connection.connection(), mission, peer).await;
+    match handshake {
+        Ok(inner) => CarrierBoundClassicalMissionSession::bind(
+            inner,
+            connection.into_connection(),
+            mission.identity(),
+            peer,
+            mission.verified_security_profile(),
+        ),
+        Err(error) => Err(error),
+    }
+}
+
+async fn respond_classical_over_iroh_inner(
+    connection: &Connection,
+    mission: &UnprotectedClassicalMission,
+    peer: MissionPeerBinding,
+) -> Result<ClassicalAuthenticatedSession, MissionSessionError> {
+    let channel_binding = classical_channel_binding(connection, mission, peer, false)?;
+    let responder = ClassicalSessionResponder::open(mission.fresh_bundle()?, channel_binding)?;
+    let mut first_transition = None;
+    let first_exchange = connection
+        .respond_once(|first| match responder.receive_client(first) {
+            Ok((pending, second)) => {
+                first_transition = Some(Ok(pending));
+                Ok((second, false))
+            }
+            Err(error) => {
+                first_transition = Some(Err(MissionSessionError::from(error)));
+                Err(CarrierError::Transport(
+                    "classical mission handshake rejected before flight two".into(),
+                ))
+            }
+        })
+        .await;
+    let pending = match (first_exchange, first_transition) {
+        (_, Some(Err(error))) => return Err(error),
+        (Err(error), _) => return Err(error.into()),
+        (Ok(false), Some(Ok(pending))) => pending,
+        (Ok(true), Some(Ok(_))) => {
+            return Err(CarrierError::Transport(
+                "classical mission carrier reported early handshake completion".into(),
+            )
+            .into());
+        }
+        (Ok(_), None) => {
+            return Err(CarrierError::Transport(
+                "classical mission carrier skipped the first handshake transition".into(),
+            )
+            .into());
+        }
+    };
+
+    let expected_profile = mission.verified_security_profile();
+    let mut second_transition = None;
+    let second_exchange = connection
+        .respond_once(|third| match pending.receive_client_auth(third) {
+            Ok((mut session, fourth)) => {
+                match validate_classical_authenticated_session(&mut session, peer, expected_profile)
+                {
+                    Ok(()) => {
+                        second_transition = Some(Ok(session));
+                        Ok((fourth, true))
+                    }
+                    Err(error) => {
+                        second_transition = Some(Err(error));
+                        Err(CarrierError::Transport(
+                            "classical mission authorization rejected before flight four".into(),
+                        ))
+                    }
+                }
+            }
+            Err(error) => {
+                second_transition = Some(Err(MissionSessionError::from(error)));
+                Err(CarrierError::Transport(
+                    "classical mission handshake rejected before flight four".into(),
+                ))
+            }
+        })
+        .await;
+    match (second_exchange, second_transition) {
+        (_, Some(Err(error))) => Err(error),
+        (Err(error), _) => Err(error.into()),
+        (Ok(true), Some(Ok(session))) => Ok(session),
+        (Ok(false), Some(Ok(_))) => Err(CarrierError::Transport(
+            "classical mission carrier did not report completed handshake".into(),
+        )
+        .into()),
+        (Ok(_), None) => Err(CarrierError::Transport(
+            "classical mission carrier skipped the second handshake transition".into(),
+        )
+        .into()),
+    }
+}
+
+fn validate_classical_authenticated_session(
+    inner: &mut ClassicalAuthenticatedSession,
+    peer: MissionPeerBinding,
+    expected_profile: VerifiedSecurityProfile,
+) -> Result<(), MissionSessionError> {
+    let authenticated = inner.peer_identity();
+    if authenticated != peer.mission_id() {
+        inner.zeroize();
+        return Err(MissionSessionError::MissionIdentityMismatch {
+            expected: peer.mission_id(),
+            authenticated,
+        });
+    }
+    if inner.verified_security_profile() != expected_profile
+        || inner.application_protection() != ApplicationProtection::AuthenticatedCarrierRequired
+    {
+        inner.zeroize();
+        return Err(MissionSessionError::Authentication(EnvelopeError(
+            "authenticated classical session changed its required profile".into(),
+        )));
+    }
+    Ok(())
+}
+
+/// Fully authenticated classical mission authorization owning one exact QUIC connection.
+///
+/// Ordinary application bytes must use [`Self::connection`] directly and are
+/// therefore protected once by Iroh QUIC. This type deliberately exposes no
+/// `ASTRFR01` sealing or opening API.
+pub struct CarrierBoundClassicalMissionSession {
+    inner: ClassicalAuthenticatedSession,
+    connection: Connection,
+    local_identity: NodeId,
+    peer: MissionPeerBinding,
+    security_profile: VerifiedSecurityProfile,
+}
+
+impl CarrierBoundClassicalMissionSession {
+    fn bind(
+        mut inner: ClassicalAuthenticatedSession,
+        connection: Connection,
+        local_identity: NodeId,
+        peer: MissionPeerBinding,
+        expected_profile: VerifiedSecurityProfile,
+    ) -> Result<Self, MissionSessionError> {
+        if connection.security_profile() != CarrierSecurityProfile::IrohQuicV1 {
+            inner.zeroize();
+            connection.close();
+            return Err(MissionSessionError::CarrierSecurityProfileMismatch {
+                required: CarrierSecurityProfile::IrohQuicV1,
+                observed: connection.security_profile(),
+            });
+        }
+        if let Err(error) =
+            validate_classical_authenticated_session(&mut inner, peer, expected_profile)
+        {
+            connection.close();
+            return Err(error);
+        }
+        Ok(Self {
+            inner,
+            connection,
+            local_identity,
+            peer,
+            security_profile: expected_profile,
+        })
+    }
+
+    /// Local authority-authenticated mission node identity for this adjacency.
+    pub const fn local_identity(&self) -> NodeId {
+        self.local_identity
+    }
+
+    /// Exact carrier-to-mission peer binding authenticated for this adjacency.
+    pub const fn peer(&self) -> MissionPeerBinding {
+        self.peer
+    }
+
+    /// Authority-authenticated complete profile and policy generation.
+    pub const fn verified_security_profile(&self) -> VerifiedSecurityProfile {
+        self.security_profile
+    }
+
+    /// Authenticated semantic protocol version selected by the classical core profile.
+    pub const fn semantic_version(&self) -> u16 {
+        self.inner.semantic_version()
+    }
+
+    /// Authority-signed route-grant commitments authenticated for the peer.
+    pub fn peer_route_grant_commitments(&self) -> &[[u8; 32]] {
+        self.inner.peer_route_grant_commitments()
+    }
+
+    /// Non-secret identifier for this completed authenticated mission session.
+    pub const fn session_id(&self) -> [u8; 32] {
+        self.inner.session_id()
+    }
+
+    /// Exact Iroh connection whose TLS exporter is authenticated by this session.
+    ///
+    /// Use its bounded request/respond operations for ordinary raw application
+    /// bytes. No Aster record-encryption layer is added in this profile.
+    pub const fn connection(&self) -> &Connection {
+        &self.connection
+    }
+
+    /// Closes the owned connection and erases session-derived authentication state.
+    pub fn close(&mut self) {
+        self.connection.close();
+        self.inner.zeroize();
+    }
+}
+
+impl fmt::Debug for CarrierBoundClassicalMissionSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CarrierBoundClassicalMissionSession")
+            .field("profile", &self.security_profile.profile_id())
+            .field(
+                "policy_generation",
+                &self.security_profile.policy_generation(),
+            )
+            .field("identities", &"[REDACTED]")
+            .field("session_state", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl Drop for CarrierBoundClassicalMissionSession {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 /// Hybrid-authenticated, peer-bound mission session for application frames.
 pub struct MissionSession {
     inner: ReferenceAuthenticatedSession,
@@ -1725,12 +2216,12 @@ impl fmt::Debug for MissionSession {
 mod tests {
     use super::*;
     use crate::frame::{EventDirection, Frame};
-    use aster_iroh::{Endpoint, EndpointConfig, ExpectedPeer, SecretKey};
+    use aster_iroh::{CarrierSecurityProfile, Endpoint, EndpointConfig, ExpectedPeer, SecretKey};
     use aster_mesh::{
-        ProvisioningAccess, ProvisioningLoadReceipt, ReferenceEnvelopeSealer, ReferenceProvisioner,
-        Scope, Topic,
+        ClassicalProvisioner, ClassicalProvisioningAccess, ProvisioningAccess,
+        ProvisioningLoadReceipt, ReferenceEnvelopeSealer, ReferenceProvisioner, Scope, Topic,
     };
-    use std::{collections::BTreeSet, net::SocketAddr};
+    use std::{collections::BTreeSet, net::SocketAddr, time::Duration};
 
     struct IssuedNode {
         bundle: Vec<u8>,
@@ -1904,6 +2395,334 @@ mod tests {
             .into_iter()
             .find(SocketAddr::is_ipv4)
             .expect("IPv4 loopback binding")
+    }
+
+    fn classical_access() -> ClassicalProvisioningAccess {
+        ClassicalProvisioningAccess::member(
+            Scope::new("test/classical-mission").expect("scope"),
+            vec![1],
+            vec![Topic::new("mesh").expect("topic")],
+        )
+        .expect("classical access")
+    }
+
+    fn issue_classical(
+        provisioner: &mut ClassicalProvisioner,
+        serial: u64,
+    ) -> UnprotectedClassicalMission {
+        let bundle = provisioner
+            .issue_node(serial, &[classical_access()])
+            .expect("issue classical node");
+        UnprotectedClassicalMission::from_bytes(bundle.to_bytes().expect("encode classical bundle"))
+            .expect("parse classical mission")
+    }
+
+    async fn bind_carrier(profile: CarrierSecurityProfile) -> Endpoint {
+        Endpoint::bind_with_security_profile(
+            SecretKey::generate(),
+            EndpointConfig::direct("127.0.0.1:0".parse().expect("carrier address")),
+            profile,
+        )
+        .await
+        .expect("bind carrier")
+    }
+
+    #[test]
+    fn classical_channel_binding_context_is_exact_role_ordered_and_redacted() {
+        let provisioner = ClassicalProvisioner::from_seed([0x81; 32], 17).expect("provisioner");
+        let profile = provisioner.verified_security_profile();
+        let initiator = MissionPeerBinding::new(SecretKey::generate().public(), [0x11; 32]);
+        let responder = MissionPeerBinding::new(SecretKey::generate().public(), [0x22; 32]);
+        let context =
+            ClassicalChannelBindingContext::new(profile, initiator, responder).expect("context");
+        assert_eq!(
+            context.as_bytes().len(),
+            CLASSICAL_CHANNEL_BINDING_CONTEXT_BYTES
+        );
+        assert_eq!(&context.as_bytes()[..8], b"ASTRCB01");
+        assert_eq!(
+            &context.as_bytes()[8..10],
+            &SecurityProfileId::ClassicalP256IrohQuicV1
+                .as_u16()
+                .to_be_bytes()
+        );
+        assert_eq!(&context.as_bytes()[10..18], &17u64.to_be_bytes());
+        assert_eq!(&context.as_bytes()[18..50], &profile.policy_authority_id());
+        assert_eq!(&context.as_bytes()[50..82], &profile.mission_principal());
+        assert_eq!(
+            &context.as_bytes()[82..114],
+            initiator.carrier_id().as_bytes()
+        );
+        assert_eq!(&context.as_bytes()[114..146], &initiator.mission_id());
+        assert_eq!(
+            &context.as_bytes()[146..178],
+            responder.carrier_id().as_bytes()
+        );
+        assert_eq!(&context.as_bytes()[178..210], &responder.mission_id());
+        assert_ne!(
+            context,
+            ClassicalChannelBindingContext::new(profile, responder, initiator)
+                .expect("reversed context")
+        );
+        let debug = format!("{context:?}");
+        assert!(!debug.contains(&initiator.carrier_id().to_string()));
+        assert!(!debug.contains("11111111"));
+    }
+
+    #[test]
+    fn responder_authorization_rejects_peer_and_profile_before_flight_four_release() {
+        fn binding() -> AuthenticatedChannelBinding {
+            AuthenticatedChannelBinding::new(vec![0x91; 32]).expect("channel binding")
+        }
+
+        fn responder_session(
+            initiator: &UnprotectedClassicalMission,
+            responder: &UnprotectedClassicalMission,
+        ) -> (ClassicalAuthenticatedSession, Vec<u8>) {
+            let (initiator_state, first) = ClassicalSessionInitiator::start(
+                initiator.fresh_bundle().expect("initiator"),
+                binding(),
+            )
+            .expect("start initiator");
+            let responder_state = ClassicalSessionResponder::open(
+                responder.fresh_bundle().expect("responder"),
+                binding(),
+            )
+            .expect("open responder");
+            let (responder_pending, second) = responder_state
+                .receive_client(&first)
+                .expect("receive first");
+            let (_initiator_pending, third) = initiator_state
+                .receive_server(&second)
+                .expect("receive second");
+            responder_pending
+                .receive_client_auth(&third)
+                .expect("receive third")
+        }
+
+        let mut provisioner = ClassicalProvisioner::from_seed([0x92; 32], 51).expect("provisioner");
+        let initiator = issue_classical(&mut provisioner, 1);
+        let responder = issue_classical(&mut provisioner, 2);
+        let exact_profile = responder.verified_security_profile();
+        let correct_peer =
+            MissionPeerBinding::new(SecretKey::generate().public(), initiator.identity());
+
+        let (mut wrong_peer_session, fourth) = responder_session(&initiator, &responder);
+        assert!(!fourth.is_empty());
+        let wrong_peer = MissionPeerBinding::new(correct_peer.carrier_id(), [0x93; 32]);
+        assert!(matches!(
+            validate_classical_authenticated_session(
+                &mut wrong_peer_session,
+                wrong_peer,
+                exact_profile,
+            ),
+            Err(MissionSessionError::MissionIdentityMismatch { .. })
+        ));
+        assert!(wrong_peer_session.is_zeroized());
+
+        let wrong_profile = ClassicalProvisioner::from_seed([0x92; 32], 52)
+            .expect("new generation")
+            .verified_security_profile();
+        let (mut wrong_profile_session, fourth) = responder_session(&initiator, &responder);
+        assert!(!fourth.is_empty());
+        assert!(matches!(
+            validate_classical_authenticated_session(
+                &mut wrong_profile_session,
+                correct_peer,
+                wrong_profile,
+            ),
+            Err(MissionSessionError::Authentication(_))
+        ));
+        assert!(wrong_profile_session.is_zeroized());
+    }
+
+    #[tokio::test]
+    async fn real_iroh_classical_mission_binds_both_identities_and_raw_exchange() {
+        let server = bind_carrier(CarrierSecurityProfile::IrohQuicV1).await;
+        let client = bind_carrier(CarrierSecurityProfile::IrohQuicV1).await;
+        let mut provisioner = ClassicalProvisioner::from_seed([0x82; 32], 23).expect("provisioner");
+        let initiator = issue_classical(&mut provisioner, 1);
+        let responder = issue_classical(&mut provisioner, 2);
+        let profile = provisioner.verified_security_profile();
+        let initiator_peer = MissionPeerBinding::new(server.id(), responder.identity());
+        let responder_peer = MissionPeerBinding::new(client.id(), initiator.identity());
+        let allowed = BTreeSet::from([client.id()]);
+        let server_task = tokio::spawn({
+            let server = server.clone();
+            let responder = responder.clone();
+            async move {
+                let connection = server.accept(&allowed).await.expect("accept carrier");
+                let mut session =
+                    respond_classical_over_iroh(connection, &responder, responder_peer)
+                        .await
+                        .expect("respond classical");
+                assert_eq!(session.local_identity(), responder.identity());
+                assert_eq!(session.peer(), responder_peer);
+                assert_eq!(session.verified_security_profile(), profile);
+                assert_eq!(session.verified_security_profile().policy_generation(), 23);
+                assert_eq!(
+                    session.connection().security_profile(),
+                    CarrierSecurityProfile::IrohQuicV1
+                );
+                assert!(
+                    session
+                        .connection()
+                        .respond_once(|raw| {
+                            assert_eq!(raw, b"raw-quic-ping");
+                            Ok((b"raw-quic-pong".to_vec(), true))
+                        })
+                        .await
+                        .expect("raw QUIC response")
+                );
+                let session_id = session.session_id();
+                session.close();
+                session_id
+            }
+        });
+
+        let connection = client
+            .connect(ExpectedPeer {
+                id: server.id(),
+                address: loopback(&server),
+            })
+            .await
+            .expect("connect carrier");
+        let mut session = initiate_classical_over_iroh(connection, &initiator, initiator_peer)
+            .await
+            .expect("initiate classical");
+        assert_eq!(session.local_identity(), initiator.identity());
+        assert_eq!(session.peer(), initiator_peer);
+        assert_eq!(session.verified_security_profile(), profile);
+        let session_id = session.session_id();
+        assert_eq!(
+            session
+                .connection()
+                .request(b"raw-quic-ping")
+                .await
+                .expect("raw QUIC request"),
+            b"raw-quic-pong"
+        );
+        session.close();
+        assert_eq!(server_task.await.expect("server task"), session_id);
+        client.close().await;
+        server.close().await;
+    }
+
+    async fn assert_classical_handshake_fails(
+        initiator: UnprotectedClassicalMission,
+        responder: UnprotectedClassicalMission,
+        initiator_expected_mission: NodeId,
+    ) {
+        let mut config = EndpointConfig::direct("127.0.0.1:0".parse().expect("address"));
+        config.connect_timeout = Duration::from_secs(2);
+        config.exchange_timeout = Duration::from_secs(2);
+        let server = Endpoint::bind_with_security_profile(
+            SecretKey::generate(),
+            config,
+            CarrierSecurityProfile::IrohQuicV1,
+        )
+        .await
+        .expect("server");
+        let client = Endpoint::bind_with_security_profile(
+            SecretKey::generate(),
+            config,
+            CarrierSecurityProfile::IrohQuicV1,
+        )
+        .await
+        .expect("client");
+        let allowed = BTreeSet::from([client.id()]);
+        let responder_peer = MissionPeerBinding::new(client.id(), initiator.identity());
+        let server_task = tokio::spawn({
+            let server = server.clone();
+            async move {
+                let connection = server.accept(&allowed).await.expect("accept carrier");
+                respond_classical_over_iroh(connection, &responder, responder_peer).await
+            }
+        });
+        let connection = client
+            .connect(ExpectedPeer {
+                id: server.id(),
+                address: loopback(&server),
+            })
+            .await
+            .expect("connect carrier");
+        let initiator_result = initiate_classical_over_iroh(
+            connection,
+            &initiator,
+            MissionPeerBinding::new(server.id(), initiator_expected_mission),
+        )
+        .await;
+        assert!(initiator_result.is_err());
+        assert!(server_task.await.expect("server task").is_err());
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn classical_channel_binding_rejects_policy_generation_and_peer_context_tamper() {
+        let mut generation_31 =
+            ClassicalProvisioner::from_seed([0x83; 32], 31).expect("generation 31");
+        let mut generation_32 =
+            ClassicalProvisioner::from_seed([0x83; 32], 32).expect("generation 32");
+        let initiator = issue_classical(&mut generation_31, 1);
+        let responder_wrong_generation = issue_classical(&mut generation_32, 2);
+        let wrong_generation_identity = responder_wrong_generation.identity();
+        assert_classical_handshake_fails(
+            initiator.clone(),
+            responder_wrong_generation,
+            wrong_generation_identity,
+        )
+        .await;
+
+        let responder = issue_classical(&mut generation_31, 2);
+        assert_classical_handshake_fails(initiator, responder, [0x56; 32]).await;
+    }
+
+    #[tokio::test]
+    async fn classical_mission_refuses_legacy_carrier_without_mixed_fallback() {
+        let server = bind_carrier(CarrierSecurityProfile::HybridAsterRecordV1).await;
+        let client = bind_carrier(CarrierSecurityProfile::HybridAsterRecordV1).await;
+        let mut provisioner = ClassicalProvisioner::from_seed([0x84; 32], 41).expect("provisioner");
+        let initiator = issue_classical(&mut provisioner, 1);
+        let responder = issue_classical(&mut provisioner, 2);
+        let initiator_peer = MissionPeerBinding::new(server.id(), responder.identity());
+        let allowed = BTreeSet::from([client.id()]);
+        let responder_peer = MissionPeerBinding::new(client.id(), initiator.identity());
+        let server_task = tokio::spawn({
+            let server = server.clone();
+            async move {
+                let connection = server
+                    .accept(&allowed)
+                    .await
+                    .expect("accept legacy carrier");
+                respond_classical_over_iroh(connection, &responder, responder_peer).await
+            }
+        });
+        let connection = client
+            .connect(ExpectedPeer {
+                id: server.id(),
+                address: loopback(&server),
+            })
+            .await
+            .expect("connect legacy carrier");
+        let initiator_result =
+            initiate_classical_over_iroh(connection, &initiator, initiator_peer).await;
+        assert!(matches!(
+            initiator_result,
+            Err(MissionSessionError::CarrierSecurityProfileMismatch {
+                required: CarrierSecurityProfile::IrohQuicV1,
+                observed: CarrierSecurityProfile::HybridAsterRecordV1,
+            })
+        ));
+        assert!(matches!(
+            server_task.await.expect("server task"),
+            Err(MissionSessionError::CarrierSecurityProfileMismatch {
+                required: CarrierSecurityProfile::IrohQuicV1,
+                observed: CarrierSecurityProfile::HybridAsterRecordV1,
+            })
+        ));
+        client.close().await;
+        server.close().await;
     }
 
     #[tokio::test]

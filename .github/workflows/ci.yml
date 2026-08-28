@@ -30,7 +30,10 @@ jobs:
   quality:
     name: quality
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # The single-threaded workspace suite now regularly exceeds 30 minutes on
+    # hosted runners. Keep every quality gate intact and leave enough headroom
+    # for runner variance instead of cancelling an otherwise healthy run.
+    timeout-minutes: 45
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"

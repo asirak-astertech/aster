@@ -1882,7 +1882,12 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         | StoreError::BlobSelectorGenerationChanged
         | StoreError::EventSubscriptionPlanChanged
         | StoreError::EventGapScanPlanChanged
-        | StoreError::EventSelectorRevisionChanged => ApplicationErrorKind::PolicyUnsettled,
+        | StoreError::EventSelectorRevisionChanged
+        | StoreError::SecurityProfileMismatch { .. }
+        | StoreError::SecurityPolicyGenerationRollback { .. }
+        | StoreError::SecurityPolicyGenerationAdvanceRequired { .. } => {
+            ApplicationErrorKind::PolicyUnsettled
+        }
         StoreError::IdentityConflict { .. }
         | StoreError::SemanticRepresentationConflict { .. }
         | StoreError::StateRepresentationConflict { .. }
@@ -1978,6 +1983,7 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         | StoreError::ControlPublicationIntentConflict { .. }
         | StoreError::TransferNamespaceCollision { .. }
         | StoreError::MutableTransferCursorInvariant(_)
+        | StoreError::SecurityProfilePolicyInvariant(_)
         | StoreError::ZeroizationInvariant(_)
         | StoreError::InvalidZeroizationDescriptor { .. }
         | StoreError::ZeroizationIntentConflict
