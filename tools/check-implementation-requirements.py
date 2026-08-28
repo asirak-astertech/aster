@@ -1060,6 +1060,20 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
         f"{RECEIPT}; exact Event duplicate acceptance and durable application operations were reused, and a separate equal-inventory contact transferred nothing",
         "Verify duplicate delivery, cyclic and broadcast loop suppression, and bounded routing over the network.",
     ),
+    "DM-5.7-01": selected_claim(
+        "open",
+        "aster-iroh + aster-node",
+        "crates/aster-iroh/src/lib.rs; crates/aster-node/src/runtime.rs; "
+        "crates/aster-node/src/main.rs; crates/aster-agent/src/main.rs; "
+        "docs/evaluations/0005/nearby-discovery-selection.md; a default-off "
+        "official Iroh mDNS adapter can resolve exact pre-provisioned carrier "
+        "IDs during a maximum-30-second demo/evaluation window, but no retained "
+        "selected-production-lane advertise-to-authenticated-delivery evidence is mapped",
+        "Complete two-physical-host advertise, discover, carrier-authenticate, "
+        "mission-authenticate, and Event-delivery evidence; add upstream "
+        "hostile-cardinality bounds plus packet, CPU, RSS, task, file-descriptor, "
+        "and energy qualification before production selection or credit.",
+    ),
     "DM-5.7-02": selected_claim(
         "observed-bounded",
         "aster-node",
@@ -1069,8 +1083,16 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     "DM-5.7-03": selected_claim(
         "implemented-uncredited",
         "aster-node",
-        f"{CUSTODY_SLICE}; the selected direct-Iroh endpoint disables hosted discovery in every emission mode, and ReceiveOnly additionally forbids contact initiation while accepting bounded authenticated inbound v3/v4/v5 Event work and disclosing zero mutable/Blob work",
-        "AtLeast still initiates configured contacts, and discovery is not dynamically controlled by its threshold. This is not physical RF silence, packet-capture evidence, BTLE behavior, mixed implementations, or release acceptance.",
+        f"{CUSTODY_SLICE}; docs/evaluations/0005/nearby-discovery-selection.md; "
+        "default direct-Iroh installs no lookup, explicit nearby discovery is "
+        "accepted only from initial Normal policy, is cleared automatically at "
+        "expiry or shutdown, and is synchronously cleared before a public live "
+        "move away from Normal returns, while ReceiveOnly "
+        "additionally forbids contact initiation and discloses zero mutable/Blob work",
+        "Retain packet captures proving zero discovery traffic in constrained "
+        "and receive-only modes and state the permitted authenticated-inbound "
+        "transport-control traffic. This is not yet physical RF silence, BTLE "
+        "behavior, mixed implementations, or release acceptance.",
     ),
     "DM-5.8-06": selected_claim(
         "implemented-uncredited",

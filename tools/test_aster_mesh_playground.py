@@ -66,6 +66,13 @@ def initialized_root(parent: Path, nodes: int) -> playground.InitResult:
 
 
 class InitializerParsingTests(unittest.TestCase):
+    def test_hello_roster_names_are_fixed_unique_and_cover_the_node_bound(self) -> None:
+        self.assertEqual(len(playground.HELLO_NODE_NAMES), playground.MAX_NODES)
+        self.assertEqual(len(set(playground.HELLO_NODE_NAMES)), playground.MAX_NODES)
+        self.assertEqual(playground.HELLO_NODE_NAMES[:3], ("atlas", "beacon", "cove"))
+        for name in playground.HELLO_NODE_NAMES:
+            self.assertRegex(name, r"^[a-z]{3,12}$")
+
     def test_exact_initializer_contract_is_accepted(self) -> None:
         root = Path("/tmp/playground root/mesh")
         result = playground.parse_initializer_output(initializer_bytes(root, 3), root, 3)
@@ -155,6 +162,50 @@ class RenderingTests(unittest.TestCase):
         for line in lines:
             line.encode("ascii")
         self.assertTrue(any("Commands:" in line for line in lines))
+
+    def test_field_notes_dashboard_names_route_provenance_and_evidence_boundary(self) -> None:
+        snapshot = {
+            "experience": "hello",
+            "networkProvenance": "nearby",
+            "nearbyWindowSeconds": 10,
+            "selectedNode": 1,
+            "isolated": [],
+            "nodes": [
+                {
+                    "index": 0,
+                    "name": "atlas",
+                    "activated": True,
+                    "status": "ready",
+                    "authenticatedNeighbors": [1],
+                },
+                {
+                    "index": 1,
+                    "name": "beacon",
+                    "activated": True,
+                    "status": "ready",
+                    "authenticatedNeighbors": [0],
+                },
+                {
+                    "index": 2,
+                    "name": "cove",
+                    "activated": False,
+                    "status": "available",
+                    "authenticatedNeighbors": [],
+                },
+            ],
+            "events": [],
+        }
+        lines = playground.render_dashboard(snapshot, 100, 20, True)
+        rendered = "\n".join(lines)
+        self.assertIn("ASTER FIELD NOTES", rendered)
+        self.assertIn("atlas", rendered)
+        self.assertIn("beacon*", rendered)
+        self.assertIn("cove", rendered)
+        self.assertIn("ROUTE nearby", rendered)
+        self.assertIn("no fallback", rendered)
+        self.assertIn("not discovery metadata", rendered)
+        self.assertIn("exact QueryEvents", rendered)
+        self.assertIn("● atlas ─── ● beacon* ··· ○ cove", rendered)
 
     def test_raw_and_plain_views_never_emit_live_terminal_controls(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -658,7 +709,13 @@ class FakeClient:
 
 
 class ControllerAndScriptTests(unittest.TestCase):
-    def make_controller(self, nodes: int = 3):
+    def make_controller(
+        self,
+        nodes: int = 3,
+        *,
+        hello: bool = False,
+        network_provenance: str = "direct",
+    ):
         temporary = tempfile.TemporaryDirectory()
         init = initialized_root(Path(temporary.name), nodes)
         network = FakeNetwork(init)
@@ -673,6 +730,8 @@ class ControllerAndScriptTests(unittest.TestCase):
             process_factory=network.process_factory,
             client_factory=network.client_factory,
             port_reservations=[FakeReservation(19000 + index) for index in range(nodes)],
+            hello=hello,
+            network_provenance=network_provenance,
         )
         controller.start()
         return temporary, network, output, sink, controller
@@ -699,6 +758,100 @@ class ControllerAndScriptTests(unittest.TestCase):
             controller.close()
             sink.close()
             self.assertTrue(all(process.stopped for process in network.processes))
+            temporary.cleanup()
+
+    def test_invitation_hello_stages_named_nodes_and_human_commands(self) -> None:
+        temporary, network, output, sink, controller = self.make_controller(
+            hello=True,
+            network_provenance="invitation",
+        )
+        try:
+            self.assertEqual(network.commands, [])
+            self.assertEqual(
+                [(node.name, node.activated, node.status) for node in controller.nodes],
+                [
+                    ("atlas", False, "available"),
+                    ("beacon", False, "available"),
+                    ("cove", False, "available"),
+                ],
+            )
+            processor = playground.CommandProcessor(controller)
+            with self.assertRaisesRegex(playground.PlaygroundError, "add or use"):
+                processor.execute("note written before anyone exists")
+
+            processor.execute("add atlas")
+            self.assertEqual(controller.selected_index, 0)
+            self.assertEqual(len(network.commands), 1)
+            self.assertIn("--peer", network.commands[0])
+            self.assertNotIn("--nearby-peer", network.commands[0])
+            self.assertEqual(
+                network.commands[0][network.commands[0].index("--sync-ms") + 1],
+                str(playground.HELLO_SYNC_MILLISECONDS),
+            )
+            processor.execute("note written before anyone else exists")
+            processor.execute("add beacon")
+            self.assertEqual(len(network.commands), 2)
+            processor.execute("use atlas")
+            processor.execute("sleep atlas")
+            self.assertEqual(controller.nodes[0].status, "stopped")
+            processor.execute("wake atlas")
+            self.assertEqual(controller.nodes[0].status, "ready")
+            processor.execute("wait-seen last atlas,beacon 2")
+            self.assertEqual(controller.resolve_alias("last").seen, {0, 1})
+            self.assertIn("ROUTE invitation", output.getvalue())
+            self.assertIn("fallback=none", output.getvalue())
+            self.assertIn("published-by=atlas", output.getvalue())
+        finally:
+            controller.close()
+            sink.close()
+            temporary.cleanup()
+
+    def test_nearby_hello_uses_only_bounded_identity_hints_and_reopens_windows(self) -> None:
+        temporary, network, output, sink, controller = self.make_controller(
+            hello=True,
+            network_provenance="nearby",
+        )
+        try:
+            processor = playground.CommandProcessor(controller)
+            processor.execute("add atlas")
+            self.assertEqual(len(network.commands), 1)
+            processor.execute("note cache this note")
+            processor.execute("add beacon")
+            self.assertEqual(
+                len(network.commands),
+                3,
+                "adding beacon restarts atlas so both ten-second windows overlap",
+            )
+            processor.execute("add cove")
+            self.assertEqual(
+                len(network.commands),
+                6,
+                "the activated three-node roster receives one overlapping nearby window",
+            )
+
+            for command in network.commands:
+                self.assertNotIn("--peer", command)
+                self.assertIn("--nearby-peer", command)
+                self.assertEqual(
+                    command[command.index("--sync-ms") + 1],
+                    str(playground.HELLO_SYNC_MILLISECONDS),
+                )
+                self.assertEqual(
+                    command[command.index("--nearby-window") + 1],
+                    str(playground.HELLO_NEARBY_WINDOW_SECONDS),
+                )
+                for offset, value in enumerate(command):
+                    if value == "--nearby-peer":
+                        hint = command[offset + 1]
+                        carrier, mission = hint.split("=", 1)
+                        self.assertRegex(carrier, r"^[0-9a-f]{64}$")
+                        self.assertRegex(mission, r"^[0-9a-f]{64}$")
+                        self.assertNotIn("127.0.0.1", hint)
+            self.assertEqual(controller.network_provenance, "nearby")
+            self.assertIn("ROUTE nearby window=10s fallback=none", output.getvalue())
+        finally:
+            controller.close()
+            sink.close()
             temporary.cleanup()
 
     def test_scripted_send_exact_presence_wait_and_restart(self) -> None:
@@ -1122,7 +1275,25 @@ class ArgumentAndModeTests(unittest.TestCase):
         self.assertEqual(arguments.nodes, 8)
         self.assertEqual(arguments.view, "raw")
         self.assertEqual(arguments.script, "-")
+        self.assertFalse(arguments.hello)
+        self.assertIsNone(arguments.network)
+        hello = playground.build_parser().parse_args(
+            [
+                "--aster",
+                "/tmp/aster",
+                "--agent",
+                "/tmp/aster-agent",
+                "--nodes",
+                "3",
+                "--hello",
+                "--network",
+                "nearby",
+            ]
+        )
+        self.assertTrue(hello.hello)
+        self.assertEqual(hello.network, "nearby")
         self.assertIn("assert-unseen MESSAGE NODE[,NODE...]", playground.HELP_TEXT)
+        self.assertIn("add NAME", playground.HELLO_HELP_TEXT)
         smoke = MODULE_PATH.parent / "testdata" / "aster-mesh-playground-real.commands"
         self.assertIn("assert-unseen m1 2", smoke.read_text(encoding="utf-8"))
 
@@ -1206,6 +1377,43 @@ class ArgumentAndModeTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 2)
         self.assertIn(b"must be set together", result.stderr)
+
+    def test_hello_wrapper_requires_a_visible_noninteractive_route_choice(self) -> None:
+        wrapper = MODULE_PATH.with_name("aster-hello.sh")
+        environment = dict(os.environ)
+        environment.pop("ASTER_HELLO_NETWORK", None)
+        result = subprocess.run(
+            ["/bin/sh", str(wrapper)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(b"requires a human network choice", result.stderr)
+        self.assertIn(b"nearby", result.stderr)
+        self.assertIn(b"invitation", result.stderr)
+
+    def test_playground_wrapper_builds_the_discovery_enabled_agent(self) -> None:
+        wrapper = MODULE_PATH.with_name("aster-mesh-playground.sh")
+        text = wrapper.read_text(encoding="utf-8")
+        self.assertIn("--features aster-agent/nearby-discovery", text)
+        syntax = subprocess.run(
+            ["/bin/sh", "-n", str(wrapper)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(syntax.returncode, 0, syntax.stderr.decode("utf-8", errors="replace"))
+        hello = MODULE_PATH.with_name("aster-hello.sh")
+        syntax = subprocess.run(
+            ["/bin/sh", "-n", str(hello)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(syntax.returncode, 0, syntax.stderr.decode("utf-8", errors="replace"))
 
 
 if __name__ == "__main__":

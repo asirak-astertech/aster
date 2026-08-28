@@ -1,5 +1,9 @@
 # Discovery and runtime admission arm
 
+> Historical experiment summary. Detailed harnesses, raw logs, and execution
+> records are retained separately; only linked public summaries and active tests
+> are maintained in this repository.
+
 Status: **complete bounded policy arm; automatic discovery remains open**
 
 Authority: `data-mesh-requirements.md` only, SHA-256
@@ -38,6 +42,16 @@ produced the expected identity/address hint but the discovered dial timed out.
 rust-libp2p emitted no matching mDNS event. The fixed Quinn/mdns-sd control
 resolved no address. The policy evaluator does not convert any of those results
 into a pass.
+
+The selected-stack follow-on now implements the official Iroh provider behind a
+default-off feature for an exclusive, maximum-30-second demo/evaluation window.
+It accepts only a pre-provisioned carrier-to-mission roster, publishes no Aster
+mission or application metadata, and tears down on expiry, shutdown, or a move
+away from normal emission policy. A separately selected invitation route
+remains the zero-idle, multicast-blocked baseline; there is no silent fallback.
+This is implementation of the bounded evaluation seam, not closure of the
+automatic-discovery result. See
+[nearby-discovery-selection.md](nearby-discovery-selection.md).
 
 ## What the exact candidates can buy
 
@@ -158,7 +172,7 @@ cause another bounded dial. `DM-6-23` freshness therefore receives no credit.
 | `DM-9-21` provisional per-scope scale | Decision curve only | Hint-table counts are not mesh scale and 128 is not a requirement threshold. |
 
 The detailed atomic mapping is preserved in
-[`requirements-map.csv`](../../../docs/evaluations/0005/requirement-maps/discovery.csv).
+[`requirements-map.csv`](requirement-maps/discovery.csv).
 
 ## Delete/delete/delete disposition
 

@@ -6,6 +6,7 @@ For a shorter path based on what you are trying to accomplish, start at the
 
 ## Tutorials and integration
 
+- [Aster Field Notes human hello](quickstart/hello.md)
 - [Capability tour](quickstart/capability-tour.md)
 - [Real-process Event message playground](quickstart/message-playground.md)
 - [Live mesh CLI](quickstart/mesh-cli.md)
@@ -104,3 +105,5 @@ design chose its major boundaries.
 - [0031 — Keep live tour presentation separate from raw receipts](decisions/0031-live-tour-presentation.md)
 - [0032 — Keep interactive Event exploration separate from acceptance tours](decisions/0032-interactive-event-message-playground.md)
 - [0033 — Select security properties through authenticated mission profiles](decisions/0033-policy-selected-security-profiles.md)
+- [0034 — Use short-lived Iroh mDNS only for nearby evaluation](decisions/0034-short-lived-iroh-nearby-discovery.md)
+- [0035 — Introduce Aster through staged Field Notes](decisions/0035-field-notes-human-introduction.md)

@@ -9,6 +9,7 @@ publish = false
 
 [features]
 fuzzing = []
+nearby-discovery = ["aster-iroh/nearby-discovery"]
 
 [lib]
 name = "aster_node"

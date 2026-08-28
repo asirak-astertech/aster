@@ -37,6 +37,7 @@ run = [
   "cargo clippy --locked --workspace --all-targets --all-features -- -D warnings",
   "cargo test --locked --workspace --all-features",
   "sh tools/test-aster-mesh-playground-real.sh",
+  "sh tools/test-aster-hello-real.sh",
   "cargo build --locked -p aster-ffi",
   "cc -std=c11 -Wall -Wextra -Werror -pedantic -Ibindings/c -fsyntax-only bindings/c/header_smoke.c",
   "c++ -std=c++17 -Wall -Wextra -Werror -pedantic -Ibindings/c -fsyntax-only bindings/c/header_smoke.cpp",
@@ -65,6 +66,14 @@ run = "sh ./tools/run-fuzz-smoke.sh"
 [tasks.playground]
 description = "Launch a bounded interactive real-process Event message playground"
 run = "sh ./tools/aster-mesh-playground.sh"
+
+[tasks.hello]
+description = "Open the human-driven three-node Aster Field Notes hello experience"
+run = "sh ./tools/aster-hello.sh"
+
+[tasks.hello-smoke]
+description = "Exercise the human-driven Field Notes introduction with real agents"
+run = "sh ./tools/test-aster-hello-real.sh"
 
 [tasks.playground-smoke]
 description = "Exercise delayed Event movement across three real agent processes"

@@ -14,13 +14,15 @@ use aster_iroh::{
     MAX_RELAY_URL_BYTES, PinnedRelay,
 };
 use aster_mesh::{ProvisioningAccess, ReferenceProvisioner, Scope, ScopeRekeyRecipient, Topic};
+#[cfg(feature = "nearby-discovery")]
+use aster_node::MissionNearbyPeer;
 use aster_node::{
     DemoScenario, MissionExpectedPeer, MutableSourceInterests, NodeApplication, NodeConfig,
     NodeIdentity, RegistryGenerationWitness, RevocationRequest, ScopeRekeyRequest,
     SelectedControlAdmin, SelectedForwardingConfig, SourceInterestSelector,
     ensure_state_accepts_normal_operation, format_control_transfer_id, format_path_field,
     format_receipt_field, inspect_store, mission::UnprotectedReferenceMission, parse_item_id,
-    parse_node_id, put_opaque, run_demo_scenario, run_node, run_node_with_forwarding, zeroize_node,
+    parse_node_id, put_opaque, run_demo_scenario, run_node_with_forwarding, zeroize_node,
 };
 use zeroize::Zeroize as _;
 
@@ -195,6 +197,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .iter()
                 .map(|peer| peer.parse::<MissionExpectedPeer>())
                 .collect::<Result<Vec<_>, _>>()?;
+            #[cfg(feature = "nearby-discovery")]
+            let nearby_peers = arguments
+                .repeated("--nearby-peer")?
+                .iter()
+                .map(|peer| peer.parse::<MissionNearbyPeer>())
+                .collect::<Result<Vec<_>, _>>()?;
+            #[cfg(feature = "nearby-discovery")]
+            let nearby_window = arguments
+                .optional("--nearby-window")?
+                .map(|seconds| seconds.parse::<u64>())
+                .transpose()?;
             let state_interests = arguments
                 .repeated("--state-interest")?
                 .iter()
@@ -253,25 +266,26 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 run_for,
                 application,
             };
-            match controlled_relay {
-                Some((relay, true)) => {
-                    run_node_with_forwarding(
-                        config,
-                        SelectedForwardingConfig::default().with_controlled_relay_only(relay),
-                    )
-                    .await?;
-                }
-                Some((relay, false)) => {
-                    run_node_with_forwarding(
-                        config,
-                        SelectedForwardingConfig::default().with_controlled_relay(relay),
-                    )
-                    .await?;
-                }
-                None => {
-                    run_node(config).await?;
-                }
+            let mut forwarding = SelectedForwardingConfig::default();
+            if let Some((relay, relay_only)) = controlled_relay {
+                forwarding = if relay_only {
+                    forwarding.with_controlled_relay_only(relay)
+                } else {
+                    forwarding.with_controlled_relay(relay)
+                };
             }
+            #[cfg(feature = "nearby-discovery")]
+            if nearby_peers.is_empty() {
+                if nearby_window.is_some() {
+                    return Err("--nearby-window requires at least one --nearby-peer".into());
+                }
+            } else {
+                forwarding = forwarding.with_nearby_discovery(
+                    nearby_peers,
+                    Duration::from_secs(nearby_window.unwrap_or(10)),
+                )?;
+            }
+            run_node_with_forwarding(config, forwarding).await?;
         }
         "zeroize" => {
             let state = arguments.required_path("--state")?;
@@ -664,6 +678,8 @@ fn print_help() {
            aster node --state DIR --bind IP:PORT \\
              --mission-bundle-unprotected-reference FILE \\
              [--peer CARRIER_ID@IP:PORT=MISSION_NODE_ID_HEX64 ...] \\
+             [--nearby-peer CARRIER_ID=MISSION_NODE_ID_HEX64 ...] \\
+             [--nearby-window SECONDS] \\
              [--state-interest TOPIC@SCOPE ...] [--record-interest TOPIC@SCOPE ...] \\
              [--blob-interest TOPIC@SCOPE ...] \\
              [--controlled-relay-url HTTPS_URL \\
@@ -682,8 +698,10 @@ fn print_help() {
          demo/playground and topic mesh.messages beneath a fresh owner-only root. The root must\n\
          not already exist. This evaluation-only command does not start nodes or allocate ports.\n\
          Controlled relay routing is an explicit single-URL opt-in. WebPKI uses embedded roots;\n\
-         der-roots requires bounded explicit DER CA files. No insecure TLS, hosted lookup, or public\n\
-         relay fallback is enabled. The operator-supplied initial route set is bounded; authenticated\n\
+         der-roots requires bounded explicit DER CA files. No insecure TLS or public relay fallback\n\
+         is enabled. Nearby flags exist only in explicitly discovery-enabled demo/evaluation builds;\n\
+         they expose carrier IDs and direct address hints for a bounded window, never mission or\n\
+         application metadata. The operator-supplied initial route set is bounded; authenticated\n\
          Iroh NAT negotiation may add direct paths after connection. --controlled-relay-only disables\n\
          IP transport. Carrier path and transition fields are bounded observations, never\n\
          authorization; NAT acceptance remains explicitly unclaimed.\n\

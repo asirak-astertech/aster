@@ -1,5 +1,9 @@
 # Real-process Event message playground
 
+For a guided, named, staged first experience, start with
+[Aster Field Notes](hello.md). This page documents the broader numeric
+2-through-32-node exploratory surface retained underneath it.
+
 The message playground is an exploratory companion to the deterministic
 [capability tours](capability-tour.md). It starts a user-selected number of
 real Aster agent processes, gives every process an independent identity and
