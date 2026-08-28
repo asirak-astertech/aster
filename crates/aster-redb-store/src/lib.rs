@@ -147,6 +147,17 @@ const MUTABLE_TRANSFER_CURSORS: TableDefinition<&[u8], &[u8]> =
 const MUTABLE_TRANSFER_CURSOR_KEY_BYTES: usize = 34;
 const MUTABLE_TRANSFER_CURSOR_VALUE_BYTES: usize = 32;
 const MISSION_AUTHORITY_ID: &str = "mission_authority_id";
+// Security-profile policy is an additive, explicitly selected store binding.
+// Legacy opens neither create nor require this table. The one retained record
+// repeats the stable mission authority so a profile/generation high-water can
+// never be detached from the mission domain that authenticated it.
+const SECURITY_PROFILE_POLICY: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("aster.security-profile-policy.v1");
+const SECURITY_PROFILE_POLICY_KEY: &str = "binding";
+const SECURITY_PROFILE_POLICY_MAGIC: &[u8; 8] = b"ASTRSPB1";
+const SECURITY_PROFILE_POLICY_BODY_BYTES: usize = 8 + 32 + 2 + 8;
+const SECURITY_PROFILE_POLICY_RECORD_BYTES: usize = SECURITY_PROFILE_POLICY_BODY_BYTES + 32;
+const SECURITY_PROFILE_POLICY_DIGEST_DOMAIN: &[u8] = b"aster/security-profile-policy-binding/v1";
 const SEMANTIC_ITEM_COUNT: &str = "semantic_event_item_count";
 const SEMANTIC_TOTAL_BYTES: &str = "semantic_event_total_bytes";
 const LAST_SEMANTIC_ACCEPTANCE_MARKER: &str = "last_semantic_acceptance_marker";
@@ -3222,6 +3233,35 @@ impl StoreBackingIdentity {
     }
 }
 
+/// Durable authenticated security-policy selection for one mission store.
+///
+/// `profile_id` is an opaque registry identifier, not a numeric strength rank.
+/// `policy_generation` is the authenticated monotonic policy high-water retained
+/// for this exact mission authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SecurityProfilePolicyBinding {
+    mission_authority: NodeId,
+    profile_id: u16,
+    policy_generation: u64,
+}
+
+impl SecurityProfilePolicyBinding {
+    /// Stable mission authority whose authenticated policy established this binding.
+    pub const fn mission_authority(self) -> NodeId {
+        self.mission_authority
+    }
+
+    /// Exact opaque security-profile registry identifier.
+    pub const fn profile_id(self) -> u16 {
+        self.profile_id
+    }
+
+    /// Highest authenticated policy generation accepted through the binding path.
+    pub const fn policy_generation(self) -> u64 {
+        self.policy_generation
+    }
+}
+
 /// Failures from the durable accepted-item authority.
 #[derive(Debug)]
 pub enum StoreError {
@@ -3580,6 +3620,14 @@ pub enum StoreError {
     MissionNotBound,
     /// A token or requested reopen belongs to another stable mission authority.
     MissionAuthorityMismatch { bound: NodeId, received: NodeId },
+    /// A policy-aware reopen requested a different complete security profile.
+    SecurityProfileMismatch { bound: u16, received: u16 },
+    /// An authenticated policy generation moved below the durable high-water.
+    SecurityPolicyGenerationRollback { high_water: u64, received: u64 },
+    /// Ordinary reopen cannot advance the authenticated policy high-water.
+    SecurityPolicyGenerationAdvanceRequired { high_water: u64, received: u64 },
+    /// Durable security-profile policy state is partial, malformed, or mission-detached.
+    SecurityProfilePolicyInvariant(&'static str),
     /// A configured mutable-transfer peer set exceeds its durable bound.
     MutableTransferCursorPeerLimitExceeded { requested: usize, limit: usize },
     /// Inserting a new mutable-transfer cursor would exceed its dedicated row bound.
@@ -4172,6 +4220,28 @@ impl fmt::Display for StoreError {
             Self::MissionAuthorityMismatch { .. } => {
                 formatter.write_str("semantic Event token belongs to a different mission authority")
             }
+            Self::SecurityProfileMismatch { bound, received } => write!(
+                formatter,
+                "security profile {received:#06x} differs from durable profile {bound:#06x}"
+            ),
+            Self::SecurityPolicyGenerationRollback {
+                high_water,
+                received,
+            } => write!(
+                formatter,
+                "security-policy generation {received} is below durable high-water {high_water}"
+            ),
+            Self::SecurityPolicyGenerationAdvanceRequired {
+                high_water,
+                received,
+            } => write!(
+                formatter,
+                "security-policy generation {received} exceeds durable high-water {high_water}; use the explicit binding path"
+            ),
+            Self::SecurityProfilePolicyInvariant(reason) => write!(
+                formatter,
+                "durable security-profile policy invariant failed: {reason}"
+            ),
             Self::MutableTransferCursorPeerLimitExceeded { requested, limit } => write!(
                 formatter,
                 "mutable-transfer cursor peer count {requested} exceeds limit {limit}"
@@ -4772,6 +4842,18 @@ type BlobCarrierCommitPostSnapshotGate = (
     std::sync::mpsc::Receiver<()>,
 );
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SecurityProfilePolicyOpenMode {
+    InitializeOrValidate,
+    BindOrAdvance,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SecurityProfilePolicyExpectation {
+    binding: SecurityProfilePolicyBinding,
+    mode: SecurityProfilePolicyOpenMode,
+}
+
 /// One exact backing-file handle to the durable accepted-item and acceptance-marker domain.
 ///
 /// Writable construction passes a validated file descriptor directly to redb;
@@ -5071,6 +5153,110 @@ impl Store {
         Self::open_with_limits_for_mission(path, StoreLimits::default(), mission_authority)
     }
 
+    /// Opens or initializes the exact security-profile policy binding for a mission store.
+    ///
+    /// A store without this additive binding records `profile_id` and
+    /// `policy_generation` atomically with its stable mission authority. An
+    /// existing binding accepts only the same profile and generation. A lower
+    /// generation is rejected as rollback; a higher generation is rejected
+    /// with [`StoreError::SecurityPolicyGenerationAdvanceRequired`] so an
+    /// ordinary reopen can never advance policy state implicitly. Use
+    /// [`Self::open_for_mission_and_bind_security_profile_policy`] only after
+    /// authenticating a newer policy.
+    ///
+    /// `profile_id` is opaque. Numeric ordering has no strength meaning.
+    pub fn open_for_mission_with_security_profile_policy(
+        path: impl AsRef<Path>,
+        mission_authority: NodeId,
+        profile_id: u16,
+        policy_generation: u64,
+    ) -> Result<Self, StoreError> {
+        Self::open_for_mission_with_security_profile_policy_mode(
+            path.as_ref(),
+            SecurityProfilePolicyBinding {
+                mission_authority,
+                profile_id,
+                policy_generation,
+            },
+            SecurityProfilePolicyOpenMode::InitializeOrValidate,
+        )
+    }
+
+    /// Explicitly binds or advances an authenticated mission security policy.
+    ///
+    /// This has the same exact-profile and rollback checks as ordinary
+    /// policy-aware reopen, but it may advance to a higher authenticated policy
+    /// generation. It never changes the durable profile ID. Same-generation
+    /// calls are idempotent.
+    pub fn open_for_mission_and_bind_security_profile_policy(
+        path: impl AsRef<Path>,
+        mission_authority: NodeId,
+        profile_id: u16,
+        policy_generation: u64,
+    ) -> Result<Self, StoreError> {
+        Self::open_for_mission_with_security_profile_policy_mode(
+            path.as_ref(),
+            SecurityProfilePolicyBinding {
+                mission_authority,
+                profile_id,
+                policy_generation,
+            },
+            SecurityProfilePolicyOpenMode::BindOrAdvance,
+        )
+    }
+
+    fn open_for_mission_with_security_profile_policy_mode(
+        path: &Path,
+        binding: SecurityProfilePolicyBinding,
+        mode: SecurityProfilePolicyOpenMode,
+    ) -> Result<Self, StoreError> {
+        if binding.policy_generation == 0 {
+            return Err(StoreError::SecurityProfilePolicyInvariant(
+                "policy generation must be nonzero",
+            ));
+        }
+        let expectation = SecurityProfilePolicyExpectation { binding, mode };
+        let readable_preflight = if path.exists() {
+            match reject_terminal_normal_open(path) {
+                Ok(()) => true,
+                Err(error) if error.is_read_only_repair_required() => false,
+                Err(error) => return Err(error),
+            }
+        } else {
+            false
+        };
+        if readable_preflight {
+            match inspect_mission_binding_read_only(path) {
+                Ok(Some(bound)) if bound != binding.mission_authority => {
+                    return Err(StoreError::MissionAuthorityMismatch {
+                        bound,
+                        received: binding.mission_authority,
+                    });
+                }
+                Ok(_) => {}
+                Err(error) if error.is_read_only_repair_required() => {}
+                Err(error) => return Err(error),
+            }
+            match inspect_security_profile_policy_read_only(path) {
+                Ok(Some(current)) => {
+                    validate_security_profile_policy_expectation(current, expectation)?;
+                }
+                Ok(None) => {}
+                Err(error) if error.is_read_only_repair_required() => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let store = Self::open_with_limits_internal(
+            path,
+            StoreLimits::default(),
+            BlobDepotLimits::default(),
+            Some(binding.mission_authority),
+            Some(expectation),
+        )?;
+        debug_assert_eq!(store.mission_authority, Some(binding.mission_authority));
+        Ok(store)
+    }
+
     /// Opens a mission-bound store with explicit item/byte limits.
     pub fn open_with_limits_for_mission(
         path: impl AsRef<Path>,
@@ -5120,6 +5306,7 @@ impl Store {
             limits,
             blob_depot_limits,
             Some(mission_authority),
+            None,
         )?;
         debug_assert_eq!(store.mission_authority, Some(mission_authority));
         Ok(store)
@@ -5215,7 +5402,13 @@ impl Store {
         path: impl AsRef<Path>,
         limits: StoreLimits,
     ) -> Result<Self, StoreError> {
-        Self::open_with_limits_internal(path.as_ref(), limits, BlobDepotLimits::default(), None)
+        Self::open_with_limits_internal(
+            path.as_ref(),
+            limits,
+            BlobDepotLimits::default(),
+            None,
+            None,
+        )
     }
 
     fn open_with_limits_internal(
@@ -5223,6 +5416,7 @@ impl Store {
         limits: StoreLimits,
         blob_depot_limits: BlobDepotLimits,
         expected_mission_authority: Option<NodeId>,
+        expected_security_profile_policy: Option<SecurityProfilePolicyExpectation>,
     ) -> Result<Self, StoreError> {
         let path = std::path::absolute(path).map_err(StoreError::StorePath)?;
         if path.exists() {
@@ -5244,6 +5438,9 @@ impl Store {
         enforce_live_write(&write)?;
         if let Some(expected) = expected_mission_authority {
             check_expected_mission_binding(&write, expected)?;
+        }
+        if let Some(expected) = expected_security_profile_policy {
+            bind_security_profile_policy_write(&write, expected)?;
         }
         let (item_count, total_payload_bytes, max_acceptance_marker) = {
             let items = write.open_table(ITEMS)?;
@@ -5369,6 +5566,13 @@ impl Store {
                 .insert(MISSION_AUTHORITY_ID, expected.as_slice())?;
             mission_authority = Some(expected);
         }
+        let security_profile_policy =
+            inspect_security_profile_policy_write(&write, mission_authority)?;
+        if expected_security_profile_policy.is_some() && security_profile_policy.is_none() {
+            return Err(StoreError::SecurityProfilePolicyInvariant(
+                "policy-aware open did not retain its binding",
+            ));
+        }
         custody::audit_custody_tables_write(&write, limits, mission_authority)?;
         write.commit()?;
 
@@ -5418,6 +5622,17 @@ impl Store {
     /// Returns the stable mission authority binding, when provisioned.
     pub const fn mission_authority(&self) -> Option<NodeId> {
         self.mission_authority
+    }
+
+    /// Reads the additive durable security-profile policy binding, when present.
+    ///
+    /// Legacy stores and stores opened only through legacy APIs may return
+    /// `None`. This read never creates or advances policy state.
+    pub fn security_profile_policy_binding(
+        &self,
+    ) -> Result<Option<SecurityProfilePolicyBinding>, StoreError> {
+        let read = self.database.begin_read()?;
+        inspect_security_profile_policy_read(&read, self.mission_authority)
     }
 
     /// Reads one durable local mutable-transfer scheduling cursor.
@@ -15299,6 +15514,248 @@ fn reject_terminal_normal_open(path: &Path) -> Result<(), StoreError> {
     }
 }
 
+fn encode_security_profile_policy_binding(binding: SecurityProfilePolicyBinding) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(SECURITY_PROFILE_POLICY_RECORD_BYTES);
+    encoded.extend_from_slice(SECURITY_PROFILE_POLICY_MAGIC);
+    encoded.extend_from_slice(binding.mission_authority.as_slice());
+    encoded.extend_from_slice(&binding.profile_id.to_be_bytes());
+    encoded.extend_from_slice(&binding.policy_generation.to_be_bytes());
+    debug_assert_eq!(encoded.len(), SECURITY_PROFILE_POLICY_BODY_BYTES);
+    let mut digest = Sha256::new();
+    digest.update(SECURITY_PROFILE_POLICY_DIGEST_DOMAIN);
+    digest.update(&encoded);
+    encoded.extend_from_slice(&digest.finalize());
+    debug_assert_eq!(encoded.len(), SECURITY_PROFILE_POLICY_RECORD_BYTES);
+    encoded
+}
+
+fn decode_security_profile_policy_binding(
+    encoded: &[u8],
+) -> Result<SecurityProfilePolicyBinding, StoreError> {
+    if encoded.len() != SECURITY_PROFILE_POLICY_RECORD_BYTES {
+        return Err(StoreError::SecurityProfilePolicyInvariant(
+            "binding record has invalid length",
+        ));
+    }
+    if &encoded[..SECURITY_PROFILE_POLICY_MAGIC.len()] != SECURITY_PROFILE_POLICY_MAGIC {
+        return Err(StoreError::SecurityProfilePolicyInvariant(
+            "binding record has invalid version magic",
+        ));
+    }
+    let mut digest = Sha256::new();
+    digest.update(SECURITY_PROFILE_POLICY_DIGEST_DOMAIN);
+    digest.update(&encoded[..SECURITY_PROFILE_POLICY_BODY_BYTES]);
+    let expected_digest: [u8; 32] = digest.finalize().into();
+    if &encoded[SECURITY_PROFILE_POLICY_BODY_BYTES..] != expected_digest.as_slice() {
+        return Err(StoreError::SecurityProfilePolicyInvariant(
+            "binding record checksum does not match",
+        ));
+    }
+    let authority_start = SECURITY_PROFILE_POLICY_MAGIC.len();
+    let authority_end = authority_start + 32;
+    let mission_authority = encoded[authority_start..authority_end]
+        .try_into()
+        .map_err(|_| {
+            StoreError::SecurityProfilePolicyInvariant(
+                "binding record has invalid mission authority",
+            )
+        })?;
+    let profile_end = authority_end + 2;
+    let profile_id = u16::from_be_bytes(encoded[authority_end..profile_end].try_into().map_err(
+        |_| {
+            StoreError::SecurityProfilePolicyInvariant(
+                "binding record has invalid profile identifier",
+            )
+        },
+    )?);
+    let policy_generation = u64::from_be_bytes(
+        encoded[profile_end..SECURITY_PROFILE_POLICY_BODY_BYTES]
+            .try_into()
+            .map_err(|_| {
+                StoreError::SecurityProfilePolicyInvariant(
+                    "binding record has invalid policy generation",
+                )
+            })?,
+    );
+    if policy_generation == 0 {
+        return Err(StoreError::SecurityProfilePolicyInvariant(
+            "binding policy generation must be nonzero",
+        ));
+    }
+    Ok(SecurityProfilePolicyBinding {
+        mission_authority,
+        profile_id,
+        policy_generation,
+    })
+}
+
+fn validate_security_profile_policy_mission(
+    binding: SecurityProfilePolicyBinding,
+    mission_authority: Option<NodeId>,
+) -> Result<(), StoreError> {
+    match mission_authority {
+        Some(authority) if authority == binding.mission_authority => Ok(()),
+        Some(_) => Err(StoreError::SecurityProfilePolicyInvariant(
+            "binding authority differs from the stable mission authority",
+        )),
+        None => Err(StoreError::SecurityProfilePolicyInvariant(
+            "binding exists without a stable mission authority",
+        )),
+    }
+}
+
+fn validate_security_profile_policy_expectation(
+    current: SecurityProfilePolicyBinding,
+    expected: SecurityProfilePolicyExpectation,
+) -> Result<bool, StoreError> {
+    if current.mission_authority != expected.binding.mission_authority {
+        return Err(StoreError::SecurityProfilePolicyInvariant(
+            "binding authority differs from the requested mission authority",
+        ));
+    }
+    if current.profile_id != expected.binding.profile_id {
+        return Err(StoreError::SecurityProfileMismatch {
+            bound: current.profile_id,
+            received: expected.binding.profile_id,
+        });
+    }
+    if expected.binding.policy_generation < current.policy_generation {
+        return Err(StoreError::SecurityPolicyGenerationRollback {
+            high_water: current.policy_generation,
+            received: expected.binding.policy_generation,
+        });
+    }
+    if expected.binding.policy_generation == current.policy_generation {
+        return Ok(false);
+    }
+    match expected.mode {
+        SecurityProfilePolicyOpenMode::InitializeOrValidate => {
+            Err(StoreError::SecurityPolicyGenerationAdvanceRequired {
+                high_water: current.policy_generation,
+                received: expected.binding.policy_generation,
+            })
+        }
+        SecurityProfilePolicyOpenMode::BindOrAdvance => Ok(true),
+    }
+}
+
+fn inspect_security_profile_policy_read(
+    read: &redb::ReadTransaction,
+    mission_authority: Option<NodeId>,
+) -> Result<Option<SecurityProfilePolicyBinding>, StoreError> {
+    if read
+        .list_multimap_tables()?
+        .any(|table| table.name() == SECURITY_PROFILE_POLICY.name())
+    {
+        return Err(StoreError::SecurityProfilePolicyInvariant(
+            "binding table has the wrong table kind",
+        ));
+    }
+    if !read
+        .list_tables()?
+        .any(|table| table.name() == SECURITY_PROFILE_POLICY.name())
+    {
+        return Ok(None);
+    }
+    let table = read.open_table(SECURITY_PROFILE_POLICY)?;
+    if table.len()? != 1 {
+        return Err(StoreError::SecurityProfilePolicyInvariant(
+            "binding table must contain exactly one record",
+        ));
+    }
+    let encoded = table.get(SECURITY_PROFILE_POLICY_KEY)?.ok_or(
+        StoreError::SecurityProfilePolicyInvariant("binding table is missing its canonical record"),
+    )?;
+    let binding = decode_security_profile_policy_binding(encoded.value())?;
+    validate_security_profile_policy_mission(binding, mission_authority)?;
+    Ok(Some(binding))
+}
+
+fn inspect_security_profile_policy_write(
+    write: &redb::WriteTransaction,
+    mission_authority: Option<NodeId>,
+) -> Result<Option<SecurityProfilePolicyBinding>, StoreError> {
+    if write
+        .list_multimap_tables()?
+        .any(|table| table.name() == SECURITY_PROFILE_POLICY.name())
+    {
+        return Err(StoreError::SecurityProfilePolicyInvariant(
+            "binding table has the wrong table kind",
+        ));
+    }
+    if !write
+        .list_tables()?
+        .any(|table| table.name() == SECURITY_PROFILE_POLICY.name())
+    {
+        return Ok(None);
+    }
+    let table = write.open_table(SECURITY_PROFILE_POLICY)?;
+    if table.len()? != 1 {
+        return Err(StoreError::SecurityProfilePolicyInvariant(
+            "binding table must contain exactly one record",
+        ));
+    }
+    let encoded = table.get(SECURITY_PROFILE_POLICY_KEY)?.ok_or(
+        StoreError::SecurityProfilePolicyInvariant("binding table is missing its canonical record"),
+    )?;
+    let binding = decode_security_profile_policy_binding(encoded.value())?;
+    validate_security_profile_policy_mission(binding, mission_authority)?;
+    Ok(Some(binding))
+}
+
+fn inspect_security_profile_policy_read_only(
+    path: &Path,
+) -> Result<Option<SecurityProfilePolicyBinding>, StoreError> {
+    let database = redb::Builder::new().open_read_only(path)?;
+    let read = database.begin_read()?;
+    let mission_authority = if read
+        .list_tables()?
+        .any(|table| table.name() == SEMANTIC_DOMAIN.name())
+    {
+        let domain = read.open_table(SEMANTIC_DOMAIN)?;
+        domain
+            .get(MISSION_AUTHORITY_ID)?
+            .map(|value| parse_node_id("semantic mission authority", value.value()))
+            .transpose()?
+    } else {
+        None
+    };
+    inspect_security_profile_policy_read(&read, mission_authority)
+}
+
+fn bind_security_profile_policy_write(
+    write: &redb::WriteTransaction,
+    expected: SecurityProfilePolicyExpectation,
+) -> Result<(), StoreError> {
+    let mission_authority = read_mission_binding(write)?;
+    let current = inspect_security_profile_policy_write(write, mission_authority)?;
+    match current {
+        Some(current) => {
+            if validate_security_profile_policy_expectation(current, expected)? {
+                let encoded = encode_security_profile_policy_binding(expected.binding);
+                write
+                    .open_table(SECURITY_PROFILE_POLICY)?
+                    .insert(SECURITY_PROFILE_POLICY_KEY, encoded.as_slice())?;
+            }
+        }
+        None => {
+            if let Some(authority) = mission_authority
+                && authority != expected.binding.mission_authority
+            {
+                return Err(StoreError::MissionAuthorityMismatch {
+                    bound: authority,
+                    received: expected.binding.mission_authority,
+                });
+            }
+            let encoded = encode_security_profile_policy_binding(expected.binding);
+            write
+                .open_table(SECURITY_PROFILE_POLICY)?
+                .insert(SECURITY_PROFILE_POLICY_KEY, encoded.as_slice())?;
+        }
+    }
+    Ok(())
+}
+
 fn inspect_mission_binding_read_only(path: &Path) -> Result<Option<NodeId>, StoreError> {
     let database = redb::Builder::new().open_read_only(path)?;
     let read = database.begin_read()?;
@@ -22579,6 +23036,7 @@ fn inspect_readable(
 
     let (mut event_stats, state_stats, record_stats, blob_stats, mission_authority) =
         inspect_semantic_readable(&read)?;
+    let _security_profile_policy = inspect_security_profile_policy_read(&read, mission_authority)?;
     let table_names = read
         .list_tables()?
         .map(|table| table.name().to_owned())
@@ -24273,6 +24731,210 @@ mod tests {
         assert_eq!(
             std::fs::read(&file.0).expect("read after rejected reopen"),
             bytes_before
+        );
+    }
+
+    #[test]
+    fn security_profile_policy_binding_is_additive_to_legacy_store_bytes() {
+        let file = TestFile::new("security-profile-policy-additive");
+        let authority = [0xa1; 32];
+        let retained = item(0xa2);
+
+        let legacy = Store::open_for_mission(&file.0, authority).expect("legacy mission store");
+        legacy
+            .apply(retained, b"legacy retained bytes")
+            .expect("retain legacy item");
+        assert_eq!(
+            legacy
+                .security_profile_policy_binding()
+                .expect("legacy binding read"),
+            None
+        );
+        drop(legacy);
+
+        let database = redb::Builder::new()
+            .open_read_only(&file.0)
+            .expect("legacy read-only store");
+        let read = database.begin_read().expect("legacy read transaction");
+        assert!(
+            !read
+                .list_tables()
+                .expect("legacy table names")
+                .any(|table| table.name() == SECURITY_PROFILE_POLICY.name()),
+            "legacy open must not create the additive policy table"
+        );
+        drop(read);
+        drop(database);
+
+        let rebound = Store::open_for_mission(&file.0, authority).expect("legacy reopen");
+        assert_eq!(
+            rebound
+                .security_profile_policy_binding()
+                .expect("legacy reopen binding read"),
+            None
+        );
+        assert_eq!(
+            rebound.get(retained).expect("legacy retained item"),
+            Some(b"legacy retained bytes".to_vec())
+        );
+        drop(rebound);
+
+        let policy_bound =
+            Store::open_for_mission_with_security_profile_policy(&file.0, authority, 0x0002, 7)
+                .expect("additive policy bind");
+        assert_eq!(
+            policy_bound
+                .security_profile_policy_binding()
+                .expect("policy binding read"),
+            Some(SecurityProfilePolicyBinding {
+                mission_authority: authority,
+                profile_id: 0x0002,
+                policy_generation: 7,
+            })
+        );
+        assert_eq!(
+            policy_bound.get(retained).expect("retained after bind"),
+            Some(b"legacy retained bytes".to_vec())
+        );
+    }
+
+    #[test]
+    fn zero_security_policy_generation_is_rejected_without_creating_a_store() {
+        let file = TestFile::new("security-profile-policy-zero-generation");
+        assert!(matches!(
+            Store::open_for_mission_with_security_profile_policy(&file.0, [0xa0; 32], 0x0002, 0,),
+            Err(StoreError::SecurityProfilePolicyInvariant(
+                "policy generation must be nonzero"
+            ))
+        ));
+        assert!(!file.0.exists());
+    }
+
+    #[test]
+    fn wrong_security_profile_reopen_is_read_only_and_exact() {
+        let file = TestFile::new("security-profile-policy-wrong-profile");
+        let authority = [0xb1; 32];
+        let store =
+            Store::open_for_mission_with_security_profile_policy(&file.0, authority, 0x0002, 11)
+                .expect("initial policy bind");
+        let binding = store
+            .security_profile_policy_binding()
+            .expect("binding read")
+            .expect("binding present");
+        assert_eq!(binding.mission_authority(), authority);
+        assert_eq!(binding.profile_id(), 0x0002);
+        assert_eq!(binding.policy_generation(), 11);
+        drop(store);
+
+        let bytes_before = std::fs::read(&file.0).expect("bound store bytes");
+        assert!(matches!(
+            Store::open_for_mission_with_security_profile_policy(&file.0, authority, 0x0003, 11,),
+            Err(StoreError::SecurityProfileMismatch {
+                bound: 0x0002,
+                received: 0x0003,
+            })
+        ));
+        assert_eq!(
+            std::fs::read(&file.0).expect("bytes after ordinary wrong-profile reopen"),
+            bytes_before
+        );
+
+        assert!(matches!(
+            Store::open_for_mission_and_bind_security_profile_policy(
+                &file.0, authority, 0x0003, 12,
+            ),
+            Err(StoreError::SecurityProfileMismatch {
+                bound: 0x0002,
+                received: 0x0003,
+            })
+        ));
+        assert_eq!(
+            std::fs::read(&file.0).expect("bytes after explicit wrong-profile bind"),
+            bytes_before
+        );
+
+        let reopened =
+            Store::open_for_mission_with_security_profile_policy(&file.0, authority, 0x0002, 11)
+                .expect("exact policy reopen");
+        assert_eq!(
+            reopened
+                .security_profile_policy_binding()
+                .expect("reopened binding"),
+            Some(binding)
+        );
+    }
+
+    #[test]
+    fn security_policy_generation_high_water_advances_only_through_explicit_bind() {
+        let file = TestFile::new("security-profile-policy-generation");
+        let authority = [0xc1; 32];
+        let initial =
+            Store::open_for_mission_with_security_profile_policy(&file.0, authority, 0x0002, 21)
+                .expect("initial policy bind");
+        drop(initial);
+
+        let same =
+            Store::open_for_mission_with_security_profile_policy(&file.0, authority, 0x0002, 21)
+                .expect("same-generation reopen");
+        drop(same);
+
+        let bytes_before_advance = std::fs::read(&file.0).expect("pre-advance store bytes");
+        assert!(matches!(
+            Store::open_for_mission_with_security_profile_policy(&file.0, authority, 0x0002, 22,),
+            Err(StoreError::SecurityPolicyGenerationAdvanceRequired {
+                high_water: 21,
+                received: 22,
+            })
+        ));
+        assert_eq!(
+            std::fs::read(&file.0).expect("bytes after implicit advance rejection"),
+            bytes_before_advance
+        );
+
+        let advanced = Store::open_for_mission_and_bind_security_profile_policy(
+            &file.0, authority, 0x0002, 22,
+        )
+        .expect("explicit policy advance");
+        assert_eq!(
+            advanced
+                .security_profile_policy_binding()
+                .expect("advanced binding")
+                .expect("advanced binding present")
+                .policy_generation(),
+            22
+        );
+        drop(advanced);
+
+        let same_explicit = Store::open_for_mission_and_bind_security_profile_policy(
+            &file.0, authority, 0x0002, 22,
+        )
+        .expect("same explicit bind is idempotent");
+        drop(same_explicit);
+
+        let bytes_before_rollback = std::fs::read(&file.0).expect("pre-rollback store bytes");
+        assert!(matches!(
+            Store::open_for_mission_with_security_profile_policy(&file.0, authority, 0x0002, 21,),
+            Err(StoreError::SecurityPolicyGenerationRollback {
+                high_water: 22,
+                received: 21,
+            })
+        ));
+        assert_eq!(
+            std::fs::read(&file.0).expect("bytes after ordinary rollback rejection"),
+            bytes_before_rollback
+        );
+        assert!(matches!(
+            Store::open_for_mission_and_bind_security_profile_policy(
+                &file.0, authority, 0x0002, 20,
+            ),
+            Err(StoreError::SecurityPolicyGenerationRollback {
+                high_water: 22,
+                received: 20,
+            })
+        ));
+        assert_eq!(
+            std::fs::read(&file.0).expect("bytes after explicit rollback rejection"),
+            bytes_before_rollback
         );
     }
 

@@ -44,7 +44,12 @@ pub use control_admin::{
     RevocationRequest, ScopeRekeyRequest, SelectedControlAdmin, SelectedControlHandle,
 };
 pub use identity::{IdentityError, NodeIdentity};
-pub use mission::MissionProvisioningOrigin;
+pub use mission::{
+    CLASSICAL_CHANNEL_BINDING_CONTEXT_BYTES, CarrierBoundClassicalMissionSession,
+    ClassicalChannelBindingContext, MissionPeerBinding, MissionProvisioningOrigin,
+    MissionSessionError, UnprotectedClassicalMission, initiate_classical_over_iroh,
+    respond_classical_over_iroh,
+};
 pub use runtime::{
     ControlPublicationReceipt, DemoScenario, EventEmissionPolicy,
     MAX_CUSTODY_FINALIZATION_CHARGE_MS, MissionExpectedPeer, MutableSourceInterests,

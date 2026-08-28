@@ -5,7 +5,7 @@
 //! provider-authenticated [`EnvelopeHeader`] across a persistence boundary.
 
 use crate::{
-    crypto::ReferenceEnvelopeSealer,
+    crypto::{ClassicalEnvelopeSealer, ReferenceEnvelopeSealer},
     envelope::{EnvelopeError, EnvelopeHeader, EnvelopeSealer, SealRequest, SealedEnvelope},
     model::{DataClass, Dot, ItemId, NodeId, Priority, Scope, Topic, VersionVector},
 };
@@ -478,6 +478,92 @@ impl ReferenceEnvelopeSealer {
     /// A provider with the grant must successfully authenticate and open the
     /// content to mint [`ContentVerifiedEventEnvelope`]; ciphertext corruption
     /// is an error and can never be converted into a strong capability.
+    pub fn verify_event_content(
+        &mut self,
+        event: RouteVerifiedEventEnvelope,
+        sealed: &[u8],
+    ) -> Result<EventContentVerification, EnvelopeError> {
+        event.verify_exact_sealed(sealed)?;
+        if event.mission_authority_id() != self.mission_authority_id() {
+            return Err(EnvelopeError(
+                "source Event capability belongs to another mission authority".into(),
+            ));
+        }
+        match <Self as EnvelopeSealer>::open_payload_if_authorized(self, &event.envelope, sealed)? {
+            None => Ok(EventContentVerification::RouteOnly(event)),
+            Some(payload) => {
+                if u64::try_from(payload.len()).ok() != Some(event.content_len()) {
+                    return Err(EnvelopeError(
+                        "source Event payload length differs from authenticated metadata".into(),
+                    ));
+                }
+                Ok(EventContentVerification::ContentVerified {
+                    event: ContentVerifiedEventEnvelope::from_opened(event, &payload),
+                    payload,
+                })
+            }
+        }
+    }
+}
+
+impl ClassicalEnvelopeSealer {
+    /// Tests whether the exact classical route grant which authenticated cached
+    /// source data remains installed.
+    pub fn is_current_source_route_lineage(
+        &self,
+        scope: &Scope,
+        epoch: u64,
+        lineage: SourceRouteLineage,
+    ) -> bool {
+        self.current_source_route_grant_commitment(scope, epoch)
+            .is_some_and(|current| current == lineage.0)
+    }
+
+    /// Event-named compatibility check for the exact classical route lineage.
+    pub fn is_current_event_route_lineage(
+        &self,
+        scope: &Scope,
+        epoch: u64,
+        lineage: EventRouteLineage,
+    ) -> bool {
+        self.current_event_route_grant_commitment(scope, epoch)
+            .is_some_and(|current| current == SourceRouteLineage::from(lineage).0)
+    }
+
+    /// Authenticates source identity and protected Event metadata using the
+    /// provisioned exact classical profile.
+    pub fn verify_event(
+        &mut self,
+        sealed: &[u8],
+    ) -> Result<RouteVerifiedEventEnvelope, EnvelopeError> {
+        let (verified, route_commitment) = self.inspect_event_route_with_lineage(sealed)?;
+        RouteVerifiedEventEnvelope::from_verified(
+            verified,
+            sealed,
+            self.mission_authority_id(),
+            EventRouteLineage::from_commitment(route_commitment),
+        )
+    }
+
+    /// Authenticates a classical Event and requires its stable node principal
+    /// to equal `expected`.
+    pub fn verify_event_from(
+        &mut self,
+        expected: NodeId,
+        sealed: &[u8],
+    ) -> Result<RouteVerifiedEventEnvelope, EnvelopeError> {
+        let event = self.verify_event(sealed)?;
+        if event.publisher() != expected {
+            return Err(EnvelopeError(
+                "source Event publisher differs from expected identity".into(),
+            ));
+        }
+        Ok(event)
+    }
+
+    /// Attempts content authentication for an exact route-verified classical
+    /// Event, preserving the same typed admission capability as the legacy
+    /// provider.
     pub fn verify_event_content(
         &mut self,
         event: RouteVerifiedEventEnvelope,

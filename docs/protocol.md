@@ -9,6 +9,13 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** ar
 normative. The protocol specification, not the Rust representation, is the
 interoperability authority.
 
+Sections describing suite/profile `0x0001` remain exact. The additive
+semantic-v1 `classical-p256-iroh-quic-v1` profile (`0x0002`) and its distinct
+reference source/contact boundary are documented in
+[classical-iroh-security-profile.md](classical-iroh-security-profile.md); it
+does not reinterpret a semantic version or any profile-`0x0001` byte. Complete
+normative profile-`0x0002` byte grammar and independent vectors remain open.
+
 ## Find a section
 
 | Need | Sections |
@@ -43,7 +50,7 @@ The protocol has five independent layers:
 | Layer | Responsibility |
 |---|---|
 | Carrier | stream/datagram delimiting, opaque fragmentation, MTU adaptation |
-| Adjacency | mutual authentication, replay protection, and encrypted pairwise sessions; a future profile must define any protected broadcast capsule |
+| Adjacency | mutual authentication, replay protection, and encrypted pairwise sessions; the selected profile may use Aster records or an exact authenticated carrier binding, and a future profile must define any protected broadcast capsule |
 | Source envelope | immutable source-authenticated route wrapper and end-to-end content ciphertext |
 | Replication | exact inventories, offers/wants, resumable data, durable receipts |
 | Class reducer | State, Event, Record, Blob, tombstone, conflict, and projection semantics |

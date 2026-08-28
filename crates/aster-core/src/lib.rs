@@ -146,16 +146,29 @@ pub use blob::{
 };
 #[cfg(all(feature = "sqlite-store", feature = "adapter-sdk"))]
 pub use crypto::{
-    ProvisioningAccess, ProvisioningBundle, ReferenceAuthenticatedSession, ReferenceEnvelopeSealer,
-    ReferenceNode, ReferenceProvisioner, ReferenceSessionAwaitingFinished,
-    ReferenceSessionInitiator, ReferenceSessionResponder, ReferenceSessionResponderPending,
-    ScopeRekeyPlan, ScopeRekeyRecipient, open_reference_node,
+    ApplicationProtection, AuthenticatedChannelBinding, CLASSICAL_SECURITY_PROFILE_ID,
+    CLASSICAL_SUITE_ID, ClassicalAuthenticatedSession, ClassicalEnvelopeSealer,
+    ClassicalProvisioner, ClassicalProvisioningAccess, ClassicalProvisioningBundle,
+    ClassicalSessionAwaitingFinished, ClassicalSessionInitiator, ClassicalSessionResponder,
+    ClassicalSessionResponderPending, HYBRID_SECURITY_PROFILE_ID, ProfileEnvelopeSealer,
+    ProfileProvisioningBundle, ProvisioningAccess, ProvisioningBundle,
+    ReferenceAuthenticatedSession, ReferenceEnvelopeSealer, ReferenceNode, ReferenceProvisioner,
+    ReferenceSessionAwaitingFinished, ReferenceSessionInitiator, ReferenceSessionResponder,
+    ReferenceSessionResponderPending, ScopeRekeyPlan, ScopeRekeyRecipient, SecurityProfile,
+    SecurityProfileId, VerifiedSecurityProfile, open_reference_node,
 };
 #[cfg(all(feature = "reference-session", not(feature = "adapter-sdk")))]
 pub use crypto::{
-    ProvisioningAccess, ProvisioningBundle, ReferenceAuthenticatedSession, ReferenceEnvelopeSealer,
-    ReferenceProvisioner, ReferenceSessionAwaitingFinished, ReferenceSessionInitiator,
-    ReferenceSessionResponder, ReferenceSessionResponderPending, ScopeRekeyRecipient,
+    ApplicationProtection, AuthenticatedChannelBinding, CLASSICAL_SECURITY_PROFILE_ID,
+    CLASSICAL_SUITE_ID, ClassicalAuthenticatedSession, ClassicalEnvelopeSealer,
+    ClassicalProvisioner, ClassicalProvisioningAccess, ClassicalProvisioningBundle,
+    ClassicalSessionAwaitingFinished, ClassicalSessionInitiator, ClassicalSessionResponder,
+    ClassicalSessionResponderPending, HYBRID_SECURITY_PROFILE_ID, ProfileEnvelopeSealer,
+    ProfileProvisioningBundle, ProvisioningAccess, ProvisioningBundle,
+    ReferenceAuthenticatedSession, ReferenceEnvelopeSealer, ReferenceProvisioner,
+    ReferenceSessionAwaitingFinished, ReferenceSessionInitiator, ReferenceSessionResponder,
+    ReferenceSessionResponderPending, ScopeRekeyRecipient, SecurityProfile, SecurityProfileId,
+    VerifiedSecurityProfile,
 };
 #[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
 pub use custody::{

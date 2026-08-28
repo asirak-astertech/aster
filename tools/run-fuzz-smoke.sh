@@ -17,18 +17,22 @@ fragment_corpus="$fuzz_smoke_dir/fragment-corpus"
 envelope_corpus="$fuzz_smoke_dir/envelope-corpus"
 selected_frame_corpus="$fuzz_smoke_dir/selected-frame-corpus"
 selected_negentropy_corpus="$fuzz_smoke_dir/selected-negentropy-corpus"
+classical_profile_corpus="$fuzz_smoke_dir/classical-profile-corpus"
 wire_artifacts="$fuzz_smoke_dir/wire-artifacts"
 fragment_artifacts="$fuzz_smoke_dir/fragment-artifacts"
 envelope_artifacts="$fuzz_smoke_dir/envelope-artifacts"
 selected_frame_artifacts="$fuzz_smoke_dir/selected-frame-artifacts"
 selected_negentropy_artifacts="$fuzz_smoke_dir/selected-negentropy-artifacts"
+classical_profile_artifacts="$fuzz_smoke_dir/classical-profile-artifacts"
 mkdir -p "$wire_corpus" "$fragment_corpus" "$envelope_corpus" \
-    "$selected_frame_corpus" "$selected_negentropy_corpus" \
+    "$selected_frame_corpus" "$selected_negentropy_corpus" "$classical_profile_corpus" \
     "$wire_artifacts" "$fragment_artifacts" "$envelope_artifacts" \
-    "$selected_frame_artifacts" "$selected_negentropy_artifacts"
+    "$selected_frame_artifacts" "$selected_negentropy_artifacts" \
+    "$classical_profile_artifacts"
 cp -R "$project_dir/fuzz/corpus/wire_decode/." "$wire_corpus/"
 cp -R "$project_dir/fuzz/corpus/fragment_decode/." "$fragment_corpus/"
 cp -R "$project_dir/fuzz/corpus/envelope_inspect/." "$envelope_corpus/"
+cp -R "$project_dir/fuzz/corpus/classical_profile_decode/." "$classical_profile_corpus/"
 
 cd "$project_dir"
 cargo +nightly-2026-08-18 fuzz run --fuzz-dir fuzz wire_decode "$wire_corpus" -- \
@@ -46,3 +50,6 @@ cargo +nightly-2026-08-18 fuzz run --fuzz-dir fuzz selected_frame_decode "$selec
 cargo +nightly-2026-08-18 fuzz run --fuzz-dir fuzz selected_negentropy "$selected_negentropy_corpus" -- \
     -runs=10000 -max_len=262144 -seed=2026082302 \
     -artifact_prefix="$selected_negentropy_artifacts/" -print_final_stats=1
+cargo +nightly-2026-08-18 fuzz run --fuzz-dir fuzz classical_profile_decode "$classical_profile_corpus" -- \
+    -runs=10000 -max_len=262144 -seed=2026082801 \
+    -artifact_prefix="$classical_profile_artifacts/" -print_final_stats=1

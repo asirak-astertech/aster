@@ -51,6 +51,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "classical_profile_decode"
+path = "fuzz_targets/classical_profile_decode.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 
 [patch.crates-io]

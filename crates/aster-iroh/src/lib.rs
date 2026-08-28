@@ -36,6 +36,114 @@ pub use iroh::{EndpointId, RelayUrl, SecretKey};
 /// item encoding or reconciliation profile.
 pub const ALPN: &[u8] = b"aster-carrier/1";
 
+/// ALPN for the Iroh-QUIC-protected carrier profile.
+///
+/// This is deliberately distinct from [`ALPN`]. An endpoint advertises and
+/// dials exactly one carrier security profile, so a profile mismatch fails the
+/// QUIC handshake instead of retrying a different profile.
+pub const IROH_QUIC_ALPN: &[u8] = b"aster-carrier-iroh-quic/1";
+
+const CHANNEL_BINDING_EXPORTER_LABEL: &[u8] = b"EXPORTER-Aster-Iroh-Channel-Binding-v1";
+const CHANNEL_BINDING_CONTEXT_DOMAIN: &[u8] = b"aster-iroh/channel-binding/context/v1";
+
+/// Length of the channel-binding value derived from one QUIC TLS session.
+pub const CHANNEL_BINDING_BYTES: usize = 32;
+
+/// Keepalive interval for an open `IrohQuicV1` connection and its default path.
+///
+/// An idle connection is therefore not traffic-free. Bounded contacts should
+/// close their owned connection when work completes instead of retaining it
+/// indefinitely. The default legacy carrier profile intentionally leaves QUIC
+/// keepalives unset to preserve its existing idle-transport behavior.
+pub const CONNECTION_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Maximum caller-owned context accepted for one channel-binding derivation.
+pub const MAX_CHANNEL_BINDING_CONTEXT_BYTES: usize = 4 * 1024;
+
+/// Exact carrier protection selected before an Iroh handshake begins.
+///
+/// This selection is carrier-only. Higher layers remain responsible for
+/// authenticating the Aster mission profile and enforcing its policy minimum.
+/// The default preserves the original `aster-carrier/1` wire behavior.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CarrierSecurityProfile {
+    /// Existing carrier framing used with the Aster hybrid mission record layer.
+    #[default]
+    HybridAsterRecordV1,
+    /// Iroh QUIC protects ephemeral carrier frames for a channel-bound mission exchange.
+    IrohQuicV1,
+}
+
+impl CarrierSecurityProfile {
+    /// Returns the exact ALPN advertised and dialed for this carrier profile.
+    pub const fn alpn(self) -> &'static [u8] {
+        match self {
+            Self::HybridAsterRecordV1 => ALPN,
+            Self::IrohQuicV1 => IROH_QUIC_ALPN,
+        }
+    }
+}
+
+const fn connection_keepalive_interval(
+    security_profile: CarrierSecurityProfile,
+) -> Option<Duration> {
+    match security_profile {
+        CarrierSecurityProfile::HybridAsterRecordV1 => None,
+        CarrierSecurityProfile::IrohQuicV1 => Some(CONNECTION_KEEPALIVE_INTERVAL),
+    }
+}
+
+/// Caller-owned, bounded context for deriving an exact QUIC channel binding.
+///
+/// The Aster mission layer should supply one canonical encoding that includes
+/// its complete security-profile identifier, authenticated policy generation,
+/// both carrier endpoint identities, and both mission identities. The carrier
+/// treats those bytes as opaque and additionally binds its selected ALPN.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct ChannelBindingContext<'a>(&'a [u8]);
+
+impl<'a> ChannelBindingContext<'a> {
+    /// Validates a nonempty canonical application context.
+    pub fn new(bytes: &'a [u8]) -> Result<Self, CarrierError> {
+        if bytes.is_empty() || bytes.len() > MAX_CHANNEL_BINDING_CONTEXT_BYTES {
+            return Err(CarrierError::Configuration(format!(
+                "channel-binding context must be within 1..={MAX_CHANNEL_BINDING_CONTEXT_BYTES} bytes"
+            )));
+        }
+        Ok(Self(bytes))
+    }
+
+    fn as_bytes(self) -> &'a [u8] {
+        self.0
+    }
+}
+
+impl fmt::Debug for ChannelBindingContext<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ChannelBindingContext")
+            .field("bytes", &self.0.len())
+            .finish()
+    }
+}
+
+/// Opaque binding to one exact Iroh QUIC TLS session and application context.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ChannelBinding([u8; CHANNEL_BINDING_BYTES]);
+
+impl ChannelBinding {
+    /// Borrows the fixed-length binding for a higher-layer authenticated transcript.
+    pub fn as_bytes(&self) -> &[u8; CHANNEL_BINDING_BYTES] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ChannelBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ChannelBinding([REDACTED])")
+    }
+}
+
 const RESPONSE_CONSUMED_MARKER: &[u8] = b"\0";
 
 /// Default upper bound for one opaque request or response.
@@ -394,12 +502,22 @@ pub struct Endpoint {
     inner: IrohEndpoint,
     config: EndpointConfig,
     relay_url: Option<RelayUrl>,
+    security_profile: CarrierSecurityProfile,
 }
 
 impl Endpoint {
     /// Binds a direct endpoint using a caller-supplied secret.
     pub async fn bind(secret: SecretKey, config: EndpointConfig) -> Result<Self, CarrierError> {
-        Self::bind_inner(secret, config, None, false).await
+        Self::bind_with_security_profile(secret, config, CarrierSecurityProfile::default()).await
+    }
+
+    /// Binds a direct endpoint to exactly one carrier security profile.
+    pub async fn bind_with_security_profile(
+        secret: SecretKey,
+        config: EndpointConfig,
+        security_profile: CarrierSecurityProfile,
+    ) -> Result<Self, CarrierError> {
+        Self::bind_inner(secret, config, None, false, security_profile).await
     }
 
     /// Binds an endpoint to exactly one operator-pinned custom relay.
@@ -408,7 +526,23 @@ impl Endpoint {
         config: EndpointConfig,
         relay: PinnedRelay,
     ) -> Result<Self, CarrierError> {
-        Self::bind_inner(secret, config, Some(relay), false).await
+        Self::bind_with_relay_and_security_profile(
+            secret,
+            config,
+            relay,
+            CarrierSecurityProfile::default(),
+        )
+        .await
+    }
+
+    /// Binds an endpoint to one pinned relay and one carrier security profile.
+    pub async fn bind_with_relay_and_security_profile(
+        secret: SecretKey,
+        config: EndpointConfig,
+        relay: PinnedRelay,
+        security_profile: CarrierSecurityProfile,
+    ) -> Result<Self, CarrierError> {
+        Self::bind_inner(secret, config, Some(relay), false, security_profile).await
     }
 
     /// Binds a relay-only endpoint with no direct IP transport.
@@ -420,7 +554,23 @@ impl Endpoint {
         config: EndpointConfig,
         relay: PinnedRelay,
     ) -> Result<Self, CarrierError> {
-        Self::bind_inner(secret, config, Some(relay), true).await
+        Self::bind_relay_only_with_security_profile(
+            secret,
+            config,
+            relay,
+            CarrierSecurityProfile::default(),
+        )
+        .await
+    }
+
+    /// Binds a relay-only endpoint to exactly one carrier security profile.
+    pub async fn bind_relay_only_with_security_profile(
+        secret: SecretKey,
+        config: EndpointConfig,
+        relay: PinnedRelay,
+        security_profile: CarrierSecurityProfile,
+    ) -> Result<Self, CarrierError> {
+        Self::bind_inner(secret, config, Some(relay), true, security_profile).await
     }
 
     async fn bind_inner(
@@ -428,6 +578,7 @@ impl Endpoint {
         config: EndpointConfig,
         relay: Option<PinnedRelay>,
         relay_only: bool,
+        security_profile: CarrierSecurityProfile,
     ) -> Result<Self, CarrierError> {
         if config.connect_timeout.is_zero() {
             return Err(CarrierError::Configuration(
@@ -445,7 +596,13 @@ impl Endpoint {
             ));
         }
         let window = config.max_exchange_bytes as u32;
-        let transport = QuicTransportConfig::builder()
+        let mut transport = QuicTransportConfig::builder();
+        if let Some(keepalive_interval) = connection_keepalive_interval(security_profile) {
+            transport = transport
+                .keep_alive_interval(keepalive_interval)
+                .default_path_keep_alive_interval(keepalive_interval);
+        }
+        let transport = transport
             .max_concurrent_bidi_streams(VarInt::from_u32(16))
             .max_concurrent_uni_streams(VarInt::from_u32(0))
             .stream_receive_window(VarInt::from_u32(window))
@@ -468,7 +625,7 @@ impl Endpoint {
             .net_report_config(net_report_config)
             .transport_config(transport)
             .clear_ip_transports()
-            .alpns(vec![ALPN.to_vec()]);
+            .alpns(vec![security_profile.alpn().to_vec()]);
         if !relay_only {
             builder = builder
                 .bind_addr(config.bind)
@@ -489,12 +646,18 @@ impl Endpoint {
             inner,
             config,
             relay_url: relay.map(|relay| relay.url),
+            security_profile,
         })
     }
 
     /// Returns the authenticated endpoint identity.
     pub fn id(&self) -> EndpointId {
         self.inner.id()
+    }
+
+    /// Returns the exact carrier profile this endpoint advertises and dials.
+    pub fn security_profile(&self) -> CarrierSecurityProfile {
+        self.security_profile
     }
 
     /// Returns the actual local sockets after binding.
@@ -560,7 +723,7 @@ impl Endpoint {
     ) -> Result<Connection, CarrierError> {
         let inner = timeout(
             self.config.connect_timeout,
-            self.inner.connect(address, ALPN),
+            self.inner.connect(address, self.security_profile.alpn()),
         )
         .await
         .map_err(|_| CarrierError::Timeout("connect"))?
@@ -568,10 +731,13 @@ impl Endpoint {
         if inner.remote_id() != expected_id {
             return Err(CarrierError::UnauthorizedPeer(inner.remote_id()));
         }
+        self.ensure_negotiated_profile(&inner)?;
         Ok(Connection::new(
             inner,
+            self.id(),
             self.config.exchange_timeout,
             self.config.max_exchange_bytes,
+            self.security_profile,
         ))
     }
 
@@ -591,10 +757,26 @@ impl Endpoint {
             inner.close(1u8.into(), b"unauthorized peer");
             return Err(CarrierError::UnauthorizedPeer(remote));
         }
+        self.ensure_negotiated_profile(&inner)?;
         Ok(Connection::new(
             inner,
+            self.id(),
             self.config.exchange_timeout,
             self.config.max_exchange_bytes,
+            self.security_profile,
+        ))
+    }
+
+    fn ensure_negotiated_profile(
+        &self,
+        connection: &iroh::endpoint::Connection,
+    ) -> Result<(), CarrierError> {
+        if connection.alpn() == self.security_profile.alpn() {
+            return Ok(());
+        }
+        connection.close(1u8.into(), b"carrier profile mismatch");
+        Err(CarrierError::Transport(
+            "negotiated carrier security profile mismatch".into(),
         ))
     }
 
@@ -665,16 +847,20 @@ impl PathWitness {
 #[derive(Clone)]
 pub struct Connection {
     inner: iroh::endpoint::Connection,
+    local_id: EndpointId,
     exchange_timeout: Duration,
     max_exchange_bytes: usize,
     path_witness: Arc<Mutex<PathWitness>>,
+    security_profile: CarrierSecurityProfile,
 }
 
 impl Connection {
     fn new(
         inner: iroh::endpoint::Connection,
+        local_id: EndpointId,
         exchange_timeout: Duration,
         max_exchange_bytes: usize,
+        security_profile: CarrierSecurityProfile,
     ) -> Self {
         // Subscribe before the snapshot. Path events are not replayed, so the
         // opposite order has a window in which a selection change can vanish.
@@ -717,15 +903,76 @@ impl Connection {
         });
         Self {
             inner,
+            local_id,
             exchange_timeout,
             max_exchange_bytes,
             path_witness,
+            security_profile,
         }
+    }
+
+    /// Returns this connection's local carrier endpoint identity.
+    pub fn local_id(&self) -> EndpointId {
+        self.local_id
     }
 
     /// Returns the authenticated remote endpoint identity.
     pub fn remote_id(&self) -> EndpointId {
         self.inner.remote_id()
+    }
+
+    /// Returns the exact carrier security profile negotiated for this connection.
+    pub fn security_profile(&self) -> CarrierSecurityProfile {
+        self.security_profile
+    }
+
+    /// Derives a domain-separated binding to this exact QUIC TLS session.
+    ///
+    /// The exporter label and output size are fixed by this crate. Callers can
+    /// vary only a validated application context; the selected carrier ALPN is
+    /// incorporated automatically. The returned bytes should be authenticated
+    /// by the higher-layer mission transcript before application inventory is
+    /// exchanged.
+    pub fn channel_binding(
+        &self,
+        context: ChannelBindingContext<'_>,
+    ) -> Result<ChannelBinding, CarrierError> {
+        let application_context = context.as_bytes();
+        let alpn = self.security_profile.alpn();
+        let mut exporter_context = Vec::with_capacity(
+            CHANNEL_BINDING_CONTEXT_DOMAIN.len()
+                + 1
+                + std::mem::size_of::<u16>()
+                + alpn.len()
+                + std::mem::size_of::<u32>()
+                + application_context.len(),
+        );
+        exporter_context.extend_from_slice(CHANNEL_BINDING_CONTEXT_DOMAIN);
+        exporter_context.push(0);
+        exporter_context.extend_from_slice(
+            &u16::try_from(alpn.len())
+                .expect("carrier ALPN length is statically bounded")
+                .to_be_bytes(),
+        );
+        exporter_context.extend_from_slice(alpn);
+        exporter_context.extend_from_slice(
+            &u32::try_from(application_context.len())
+                .expect("validated channel-binding context fits u32")
+                .to_be_bytes(),
+        );
+        exporter_context.extend_from_slice(application_context);
+
+        let mut binding = [0u8; CHANNEL_BINDING_BYTES];
+        self.inner
+            .export_keying_material(
+                &mut binding,
+                CHANNEL_BINDING_EXPORTER_LABEL,
+                &exporter_context,
+            )
+            .map_err(|_| {
+                CarrierError::Transport("QUIC TLS channel-binding derivation failed".into())
+            })?;
+        Ok(ChannelBinding(binding))
     }
 
     /// Returns a bounded observation of the selected network path.
@@ -1084,6 +1331,23 @@ mod tests {
             .expect("IPv4 loopback binding")
     }
 
+    async fn connect_pair(server: &Endpoint, client: &Endpoint) -> (Connection, Connection) {
+        let allowed = BTreeSet::from([client.id()]);
+        let server_task = tokio::spawn({
+            let server = server.clone();
+            async move { server.accept(&allowed).await.expect("accept") }
+        });
+        let client_connection = client
+            .connect(ExpectedPeer {
+                id: server.id(),
+                address: loopback(server),
+            })
+            .await
+            .expect("connect");
+        let server_connection = server_task.await.expect("server task");
+        (server_connection, client_connection)
+    }
+
     #[cfg(feature = "test-utils")]
     fn relay_test_config() -> EndpointConfig {
         let mut config = EndpointConfig::direct("127.0.0.1:0".parse().expect("address"));
@@ -1152,6 +1416,14 @@ mod tests {
         )
         .await
         .expect("client");
+        assert_eq!(
+            server.security_profile(),
+            CarrierSecurityProfile::HybridAsterRecordV1
+        );
+        assert_eq!(
+            client.security_profile(),
+            CarrierSecurityProfile::HybridAsterRecordV1
+        );
         let allowed = BTreeSet::from([client.id()]);
         let server_task = tokio::spawn({
             let server = server.clone();
@@ -1179,6 +1451,11 @@ mod tests {
             })
             .await
             .expect("connect");
+        assert_eq!(connection.inner.alpn(), ALPN);
+        assert_eq!(
+            connection.security_profile(),
+            CarrierSecurityProfile::HybridAsterRecordV1
+        );
         assert_eq!(connection.request(b"ping").await.expect("request"), b"ping");
         wait_for_path(&connection, SelectedPath::Direct).await;
         connection
@@ -1191,6 +1468,235 @@ mod tests {
         assert!(!after_close.transitions_saturated);
         client.close().await;
         server.close().await;
+    }
+
+    #[test]
+    fn carrier_security_profile_alpns_are_exact_and_distinct() {
+        assert_eq!(
+            CarrierSecurityProfile::default(),
+            CarrierSecurityProfile::HybridAsterRecordV1
+        );
+        assert_eq!(CarrierSecurityProfile::default().alpn(), ALPN);
+        assert_eq!(CarrierSecurityProfile::IrohQuicV1.alpn(), IROH_QUIC_ALPN);
+        assert_ne!(ALPN, IROH_QUIC_ALPN);
+    }
+
+    #[test]
+    fn keepalives_are_limited_to_the_iroh_quic_security_profile() {
+        assert_eq!(
+            connection_keepalive_interval(CarrierSecurityProfile::HybridAsterRecordV1),
+            None
+        );
+        assert_eq!(
+            connection_keepalive_interval(CarrierSecurityProfile::IrohQuicV1),
+            Some(CONNECTION_KEEPALIVE_INTERVAL)
+        );
+    }
+
+    #[test]
+    fn channel_binding_context_is_bounded_and_debug_values_are_redacted() {
+        assert!(matches!(
+            ChannelBindingContext::new(&[]),
+            Err(CarrierError::Configuration(_))
+        ));
+        assert!(matches!(
+            ChannelBindingContext::new(&vec![0; MAX_CHANNEL_BINDING_CONTEXT_BYTES + 1]),
+            Err(CarrierError::Configuration(_))
+        ));
+        let context = ChannelBindingContext::new(b"context-secret-marker").expect("context");
+        assert_eq!(
+            format!("{context:?}"),
+            "ChannelBindingContext { bytes: 21 }"
+        );
+        let binding = ChannelBinding([0x5a; CHANNEL_BINDING_BYTES]);
+        assert_eq!(format!("{binding:?}"), "ChannelBinding([REDACTED])");
+    }
+
+    #[tokio::test]
+    async fn matching_peers_derive_the_same_exact_quic_channel_binding() {
+        let config = EndpointConfig::direct("127.0.0.1:0".parse().expect("address"));
+        let server = Endpoint::bind_with_security_profile(
+            SecretKey::generate(),
+            config,
+            CarrierSecurityProfile::IrohQuicV1,
+        )
+        .await
+        .expect("server");
+        let client = Endpoint::bind_with_security_profile(
+            SecretKey::generate(),
+            config,
+            CarrierSecurityProfile::IrohQuicV1,
+        )
+        .await
+        .expect("client");
+        assert_eq!(
+            server.security_profile(),
+            CarrierSecurityProfile::IrohQuicV1
+        );
+        assert_eq!(
+            client.security_profile(),
+            CarrierSecurityProfile::IrohQuicV1
+        );
+
+        let (server_connection, client_connection) = connect_pair(&server, &client).await;
+        assert_eq!(server_connection.local_id(), server.id());
+        assert_eq!(server_connection.remote_id(), client.id());
+        assert_eq!(client_connection.local_id(), client.id());
+        assert_eq!(client_connection.remote_id(), server.id());
+        assert_eq!(server_connection.inner.alpn(), IROH_QUIC_ALPN);
+        assert_eq!(client_connection.inner.alpn(), IROH_QUIC_ALPN);
+        assert_eq!(
+            server_connection.security_profile(),
+            CarrierSecurityProfile::IrohQuicV1
+        );
+        assert_eq!(
+            client_connection.security_profile(),
+            CarrierSecurityProfile::IrohQuicV1
+        );
+
+        let context = ChannelBindingContext::new(b"canonical-mission-contact-context")
+            .expect("binding context");
+        let server_binding = server_connection
+            .channel_binding(context)
+            .expect("server binding");
+        let client_binding = client_connection
+            .channel_binding(context)
+            .expect("client binding");
+        assert_eq!(server_binding, client_binding);
+        assert_ne!(server_binding.as_bytes(), &[0u8; CHANNEL_BINDING_BYTES]);
+
+        server_connection.close();
+        client_connection.close();
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn channel_bindings_separate_contexts_and_fresh_quic_connections() {
+        let config = EndpointConfig::direct("127.0.0.1:0".parse().expect("address"));
+        let server = Endpoint::bind_with_security_profile(
+            SecretKey::generate(),
+            config,
+            CarrierSecurityProfile::IrohQuicV1,
+        )
+        .await
+        .expect("server");
+        let client = Endpoint::bind_with_security_profile(
+            SecretKey::generate(),
+            config,
+            CarrierSecurityProfile::IrohQuicV1,
+        )
+        .await
+        .expect("client");
+        let first_context =
+            ChannelBindingContext::new(b"mission-contact-context-1").expect("first context");
+        let second_context =
+            ChannelBindingContext::new(b"mission-contact-context-2").expect("second context");
+
+        let (first_server, first_client) = connect_pair(&server, &client).await;
+        let first_binding = first_client
+            .channel_binding(first_context)
+            .expect("first binding");
+        let other_context_binding = first_client
+            .channel_binding(second_context)
+            .expect("other-context binding");
+        assert_ne!(first_binding, other_context_binding);
+        assert_eq!(
+            first_binding,
+            first_server
+                .channel_binding(first_context)
+                .expect("matching first binding")
+        );
+        first_client.close();
+        first_server.close();
+
+        let (second_server, second_client) = connect_pair(&server, &client).await;
+        let second_connection_binding = second_client
+            .channel_binding(first_context)
+            .expect("second-connection binding");
+        assert_eq!(
+            second_connection_binding,
+            second_server
+                .channel_binding(first_context)
+                .expect("matching second binding")
+        );
+        assert_ne!(first_binding, second_connection_binding);
+
+        second_client.close();
+        second_server.close();
+        client.close().await;
+        server.close().await;
+    }
+
+    async fn assert_mixed_profiles_fail(
+        server_profile: CarrierSecurityProfile,
+        client_profile: CarrierSecurityProfile,
+    ) {
+        let mut config = EndpointConfig::direct("127.0.0.1:0".parse().expect("address"));
+        config.connect_timeout = Duration::from_secs(2);
+        let server =
+            Endpoint::bind_with_security_profile(SecretKey::generate(), config, server_profile)
+                .await
+                .expect("server");
+        let client =
+            Endpoint::bind_with_security_profile(SecretKey::generate(), config, client_profile)
+                .await
+                .expect("client");
+        let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn({
+            let server = server.clone();
+            async move {
+                let incoming = timeout(config.connect_timeout, server.inner.accept())
+                    .await
+                    .expect("server observed incoming before deadline")
+                    .expect("server remained open");
+                observed_tx.send(()).expect("observation receiver open");
+                timeout(config.connect_timeout, incoming).await
+            }
+        });
+
+        let result = client
+            .connect(ExpectedPeer {
+                id: server.id(),
+                address: loopback(&server),
+            })
+            .await;
+        assert!(
+            matches!(result, Err(CarrierError::Transport(_))),
+            "mixed profile unexpectedly connected or failed outside the handshake"
+        );
+        timeout(config.connect_timeout, observed_rx)
+            .await
+            .expect("server observation deadline")
+            .expect("server observation sender");
+        let handshake = server_task.await.expect("server task");
+        assert!(
+            matches!(handshake, Ok(Err(_))),
+            "server handshake accepted a mixed carrier profile"
+        );
+        assert!(
+            timeout(Duration::from_millis(250), server.inner.accept())
+                .await
+                .is_err(),
+            "client retried or fell back after the profile mismatch"
+        );
+
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn mixed_carrier_profiles_fail_without_retry_or_fallback() {
+        assert_mixed_profiles_fail(
+            CarrierSecurityProfile::HybridAsterRecordV1,
+            CarrierSecurityProfile::IrohQuicV1,
+        )
+        .await;
+        assert_mixed_profiles_fail(
+            CarrierSecurityProfile::IrohQuicV1,
+            CarrierSecurityProfile::HybridAsterRecordV1,
+        )
+        .await;
     }
 
     #[tokio::test]

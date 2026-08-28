@@ -12,7 +12,22 @@
 //! different [`CryptoProvider`] backed by a validated module and retain the AND-composition and
 //! transcript rules defined here.
 
+mod classical;
+mod facade;
+mod profile;
 mod reference;
+
+pub use classical::{
+    AuthenticatedChannelBinding, ClassicalAuthenticatedSession, ClassicalEnvelopeSealer,
+    ClassicalProvisioner, ClassicalProvisioningAccess, ClassicalProvisioningBundle,
+    ClassicalSessionAwaitingFinished, ClassicalSessionInitiator, ClassicalSessionResponder,
+    ClassicalSessionResponderPending,
+};
+pub use facade::{ProfileEnvelopeSealer, ProfileProvisioningBundle};
+pub use profile::{
+    ApplicationProtection, CLASSICAL_SECURITY_PROFILE_ID, CLASSICAL_SUITE_ID,
+    HYBRID_SECURITY_PROFILE_ID, SecurityProfile, SecurityProfileId, VerifiedSecurityProfile,
+};
 
 pub(crate) use reference::{
     PendingBatchItem, VerifiedBatchItem, VerifiedBatchProof, VerifiedBridgeAuthorization,

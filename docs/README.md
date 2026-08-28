@@ -17,8 +17,10 @@ understand Aster's wire format or cryptography before building an application.
    [State](quickstart/selected-state-api.md),
    [Record](quickstart/selected-record-api.md), or
    [Blob](quickstart/selected-blob-api.md) API directly.
-4. Read [Selected architecture](architecture.md) and
-   [Security](security.md) before designing a deployment.
+4. Read [Selected architecture](architecture.md), [Security](security.md), the
+   [classical Iroh-QUIC profile](classical-iroh-security-profile.md), and the
+   adopted [security-profile requirements disposition](implementation/security-profile-requirements-disposition.md)
+   before designing a deployment.
 
 ## Choose a guide by goal
 
@@ -39,8 +41,9 @@ understand Aster's wire format or cryptography before building an application.
 | Choose between State, Event, Record, and Blob | [Choosing a data class](concepts.md#choosing-a-data-class) |
 | Handle conflicts, deletion, priority, or expiry | [Framework mechanisms](concepts.md#framework-mechanisms) |
 | Design a binding | [Binding pattern](bindings/pattern.md) |
-| Implement an independent compatible node | [Protocol](protocol.md), [wire grammar](wire.cddl), and [security objects](envelope.md) |
-| Assess progress, security, or production blockers | [Capability roadmap](implementation/capability-roadmap.md), [Security](security.md), [Conformance](conformance.md), and [requirements status](implementation/requirements-status.md) |
+| Implement an independent compatible profile-`0x0001` node | [Protocol](protocol.md), [wire grammar](wire.cddl), and [security objects](envelope.md) |
+| Review the additive profile-`0x0002` implementation boundary | [Classical Iroh-QUIC profile](classical-iroh-security-profile.md); complete normative byte grammar, independent vectors, and a black-box conformance lane remain open |
+| Assess progress, security policy, or production blockers | [Capability roadmap](implementation/capability-roadmap.md), [Security-profile requirements disposition](implementation/security-profile-requirements-disposition.md), [Security](security.md), [Conformance](conformance.md), and [requirements status](implementation/requirements-status.md) |
 | Review development inputs and public provenance | [Public development provenance record](provenance/independent-development-record.md) and [public source register](provenance/public-source-register.csv) |
 | Run validation or interpret evidence | [CI](ci.md), [Conformance](conformance.md), and the [lab guide](../lab/README.md) |
 
@@ -53,6 +56,7 @@ understand Aster's wire format or cryptography before building an application.
 | **Integration guide** | Connect Aster to an application, platform, or carrier | Describes supported seams and explicit gaps |
 | **Specification** | Define interoperable bytes and behavior | Normative for protocol compatibility |
 | **Decision or proposal** | Record why a boundary exists or how an experiment is scoped | Historical design record; proposals are non-normative |
+| **Requirements disposition** | Record reviewed applicability without rewriting the hash-bound source | Current planning/profile authority for the exact rows it names; not implementation evidence |
 | **Evidence** | State what has been tested and what remains gated | Authority for implementation and release claims |
 
 If a tutorial and a specification appear to disagree, the specification is
@@ -60,7 +64,12 @@ authoritative for interoperability. The
 [requirements status](implementation/requirements-status.md) is authoritative
 for which production requirements the selected composition has reached. The
 [capability roadmap](implementation/capability-roadmap.md) groups those details
-into outcomes for planning and PR review.
+into outcomes for planning and PR review. The
+[security-profile disposition](implementation/security-profile-requirements-disposition.md)
+controls current applicability for its exact metadata and post-quantum rows;
+the protocol and security-object specifications define profile `0x0001`; the
+[classical Iroh-QUIC profile](classical-iroh-security-profile.md) defines the
+additive, evaluation-only profile `0x0002` boundary.
 
 ## Capability snapshot
 
