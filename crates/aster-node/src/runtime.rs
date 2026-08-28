@@ -26,6 +26,8 @@ use std::os::unix::{
 #[cfg(test)]
 use std::sync::LazyLock;
 
+#[cfg(feature = "nearby-discovery")]
+use aster_iroh::NearbyDiscoveryStopHandle;
 use aster_iroh::{
     CarrierError, Endpoint, EndpointConfig, EndpointId, ExpectedPeer, PeerRoute, PinnedRelay,
     SelectedPath,
@@ -118,6 +120,9 @@ use aster_redb_store::{
 
 pub(crate) const STORE_FILE: &str = "mesh.redb";
 const MAX_CONFIGURED_PEERS: usize = MAX_MUTABLE_TRANSFER_CURSOR_PEERS;
+#[cfg(feature = "nearby-discovery")]
+/// Maximum lifetime of one explicit demo/evaluation nearby-discovery window.
+pub const MAX_NEARBY_DISCOVERY_WINDOW: Duration = aster_iroh::MAX_NEARBY_DISCOVERY_WINDOW;
 const MAX_INBOUND_CONTACTS: usize = 16;
 const MAX_OUTBOUND_CONTACTS: usize = 16;
 const APPLICATION_COMMAND_CAPACITY: usize = 32;
@@ -462,6 +467,96 @@ pub struct MissionExpectedPeer {
     pub carrier: ExpectedPeer,
     /// Authority-provisioned Aster mission identity.
     pub mission: NodeId,
+}
+
+/// Pre-provisioned carrier and mission identities whose socket locator may be
+/// learned only during an explicit nearby-discovery window.
+#[cfg(feature = "nearby-discovery")]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct MissionNearbyPeer {
+    /// Exact Iroh carrier identity; discovery cannot replace this authority.
+    pub carrier: EndpointId,
+    /// Independently authenticated, authority-provisioned mission identity.
+    pub mission: NodeId,
+}
+
+#[cfg(feature = "nearby-discovery")]
+impl fmt::Display for MissionNearbyPeer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}={}",
+            self.carrier,
+            format_node_id(self.mission)
+        )
+    }
+}
+
+#[cfg(feature = "nearby-discovery")]
+impl FromStr for MissionNearbyPeer {
+    type Err = NodeError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (carrier, mission) = value.split_once('=').ok_or_else(|| {
+            NodeError::Configuration("nearby peer must be CARRIER_ID=MISSION_NODE_ID_HEX64".into())
+        })?;
+        if mission.contains('=') {
+            return Err(NodeError::Configuration(
+                "nearby peer contains more than one mission identity separator".into(),
+            ));
+        }
+        Ok(Self {
+            carrier: carrier.parse().map_err(|error| {
+                NodeError::Configuration(format!("invalid nearby carrier id: {error}"))
+            })?,
+            mission: parse_node_id(mission)?,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum PeerLocator {
+    Direct(SocketAddr),
+    #[cfg(feature = "nearby-discovery")]
+    Nearby,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ConfiguredPeer {
+    carrier: EndpointId,
+    mission: NodeId,
+    locator: PeerLocator,
+}
+
+impl ConfiguredPeer {
+    const fn locator_name(self) -> &'static str {
+        match self.locator {
+            PeerLocator::Direct(_) => "direct",
+            #[cfg(feature = "nearby-discovery")]
+            PeerLocator::Nearby => "nearby",
+        }
+    }
+}
+
+impl From<MissionExpectedPeer> for ConfiguredPeer {
+    fn from(peer: MissionExpectedPeer) -> Self {
+        Self {
+            carrier: peer.carrier.id,
+            mission: peer.mission,
+            locator: PeerLocator::Direct(peer.carrier.address),
+        }
+    }
+}
+
+#[cfg(feature = "nearby-discovery")]
+impl From<MissionNearbyPeer> for ConfiguredPeer {
+    fn from(peer: MissionNearbyPeer) -> Self {
+        Self {
+            carrier: peer.carrier,
+            mission: peer.mission,
+            locator: PeerLocator::Nearby,
+        }
+    }
 }
 
 impl fmt::Display for MissionExpectedPeer {
@@ -999,6 +1094,8 @@ pub struct SelectedForwardingConfig {
     blob_depot_limits: BlobDepotLimits,
     scope_quotas: Vec<CustodyQuota>,
     controlled_relay: Option<ControlledRelayRouting>,
+    #[cfg(feature = "nearby-discovery")]
+    nearby_discovery: Option<NearbyDiscoveryRouting>,
 }
 
 /// One explicitly selected, operator-controlled relay route.
@@ -1011,6 +1108,14 @@ struct ControlledRelayRouting {
     relay_only: bool,
 }
 
+/// Demo/evaluation-only local-network lookup configuration.
+#[cfg(feature = "nearby-discovery")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NearbyDiscoveryRouting {
+    peers: Vec<MissionNearbyPeer>,
+    window: Duration,
+}
+
 impl SelectedForwardingConfig {
     /// Creates a forwarding configuration with explicit aggregate store limits.
     pub const fn new(emission_policy: EventEmissionPolicy, store_limits: StoreLimits) -> Self {
@@ -1020,6 +1125,8 @@ impl SelectedForwardingConfig {
             blob_depot_limits: BlobDepotLimits::DEFAULT,
             scope_quotas: Vec::new(),
             controlled_relay: None,
+            #[cfg(feature = "nearby-discovery")]
+            nearby_discovery: None,
         }
     }
 
@@ -1119,6 +1226,43 @@ impl SelectedForwardingConfig {
             .as_ref()
             .is_some_and(|routing| routing.relay_only)
     }
+
+    /// Selects one short-lived local-network locator window for an exact
+    /// pre-provisioned carrier-to-mission roster.
+    ///
+    /// This evaluation-only mode is intentionally exclusive with direct peer
+    /// routes and controlled relays. It is not a source of membership or
+    /// authorization and remains unavailable unless the crate feature is
+    /// explicitly enabled.
+    #[cfg(feature = "nearby-discovery")]
+    pub fn with_nearby_discovery(
+        mut self,
+        peers: Vec<MissionNearbyPeer>,
+        window: Duration,
+    ) -> Result<Self, NodeError> {
+        if window < Duration::from_secs(1)
+            || window > MAX_NEARBY_DISCOVERY_WINDOW
+            || window.subsec_nanos() != 0
+        {
+            return Err(NodeError::Configuration(format!(
+                "nearby discovery window must be within 1..={} seconds",
+                MAX_NEARBY_DISCOVERY_WINDOW.as_secs()
+            )));
+        }
+        if peers.is_empty() || peers.len() > MAX_CONFIGURED_PEERS {
+            return Err(NodeError::Configuration(format!(
+                "nearby peer count must be within 1..={MAX_CONFIGURED_PEERS}"
+            )));
+        }
+        self.nearby_discovery = Some(NearbyDiscoveryRouting { peers, window });
+        Ok(self)
+    }
+
+    /// Returns the explicit nearby-discovery window, when selected.
+    #[cfg(feature = "nearby-discovery")]
+    pub fn nearby_discovery_window(&self) -> Option<Duration> {
+        self.nearby_discovery.as_ref().map(|routing| routing.window)
+    }
 }
 
 impl Default for SelectedForwardingConfig {
@@ -1129,6 +1273,8 @@ impl Default for SelectedForwardingConfig {
             blob_depot_limits: BlobDepotLimits::default(),
             scope_quotas: Vec::new(),
             controlled_relay: None,
+            #[cfg(feature = "nearby-discovery")]
+            nearby_discovery: None,
         }
     }
 }
@@ -1953,6 +2099,8 @@ pub struct RunningNode {
     selected_controls: SelectedControlHandle,
     application_admission: Arc<AtomicBool>,
     emission_policy: Arc<LiveEmissionPolicy>,
+    #[cfg(feature = "nearby-discovery")]
+    nearby_discovery_stop: Option<NearbyDiscoveryStopHandle>,
     shutdown: Option<mpsc::Sender<()>>,
     task: Option<JoinHandle<Result<NodeReceipt, NodeError>>>,
 }
@@ -1995,7 +2143,17 @@ impl RunningNode {
     /// application/control frame send and durable receive commit. A changed
     /// revision closes that contact so later work starts from a fresh policy.
     pub fn set_event_emission_policy(&self, policy: EventEmissionPolicy) -> Result<u64, NodeError> {
-        self.emission_policy.update(policy)
+        let revision = self.emission_policy.update(policy)?;
+        #[cfg(feature = "nearby-discovery")]
+        if policy != EventEmissionPolicy::Normal
+            && let Some(stop) = &self.nearby_discovery_stop
+        {
+            // Clear the lookup registry and drop its provider before this
+            // public policy mutation returns. Once stopped, a nearby window
+            // cannot be reopened by returning to Normal.
+            stop.stop();
+        }
+        Ok(revision)
     }
 
     /// Requests graceful shutdown, closes command admission, and waits for cleanup.
@@ -10008,6 +10166,69 @@ fn validate_node_config(config: &NodeConfig) -> Result<BTreeMap<EndpointId, Node
     Ok(allowed)
 }
 
+fn configured_runtime_peers(
+    config: &NodeConfig,
+    _forwarding: &SelectedForwardingConfig,
+    direct: BTreeMap<EndpointId, NodeId>,
+) -> Result<(BTreeMap<EndpointId, NodeId>, Vec<ConfiguredPeer>), NodeError> {
+    #[cfg(feature = "nearby-discovery")]
+    if let Some(nearby) = &_forwarding.nearby_discovery {
+        if !config.peers.is_empty() {
+            return Err(NodeError::Configuration(
+                "nearby discovery cannot be combined with direct peer routes".into(),
+            ));
+        }
+        if _forwarding.controlled_relay.is_some() {
+            return Err(NodeError::Configuration(
+                "nearby discovery cannot be combined with a controlled relay".into(),
+            ));
+        }
+        if _forwarding.emission_policy != EventEmissionPolicy::Normal {
+            return Err(NodeError::Configuration(
+                "nearby discovery requires the Normal emission policy".into(),
+            ));
+        }
+        let peers = nearby
+            .peers
+            .iter()
+            .copied()
+            .map(ConfiguredPeer::from)
+            .collect::<Vec<_>>();
+        let allowed = peers
+            .iter()
+            .map(|peer| (peer.carrier, peer.mission))
+            .collect::<BTreeMap<_, _>>();
+        if allowed.len() != peers.len() {
+            return Err(NodeError::Configuration(
+                "nearby peer endpoint identities must be unique".into(),
+            ));
+        }
+        let missions = peers
+            .iter()
+            .map(|peer| peer.mission)
+            .collect::<BTreeSet<_>>();
+        if missions.len() != peers.len() {
+            return Err(NodeError::Configuration(
+                "nearby peer mission identities must be unique".into(),
+            ));
+        }
+        if missions.contains(&config.mission.identity()) {
+            return Err(NodeError::Configuration(
+                "a node cannot configure its own mission identity as a nearby peer".into(),
+            ));
+        }
+        return Ok((allowed, peers));
+    }
+
+    let peers = config
+        .peers
+        .iter()
+        .copied()
+        .map(ConfiguredPeer::from)
+        .collect();
+    Ok((direct, peers))
+}
+
 fn execute_selected_event_command(
     application: &mut SelectedEventNode,
     store: &Store,
@@ -10427,14 +10648,18 @@ pub async fn start_node_with_forwarding(
             ready_sender,
         ),
     ));
-    if ready_receiver.await.is_err() {
-        return match task.await.map_err(node_actor_join_error)? {
-            Err(error) => Err(error),
-            Ok(_) => Err(NodeError::Protocol(
-                "running node stopped before readiness".into(),
-            )),
-        };
-    }
+    let ready = match ready_receiver.await {
+        Ok(ready) => ready,
+        Err(_) => {
+            return match task.await.map_err(node_actor_join_error)? {
+                Err(error) => Err(error),
+                Ok(_) => Err(NodeError::Protocol(
+                    "running node stopped before readiness".into(),
+                )),
+            };
+        }
+    };
+    let _bound_sockets = ready.bound_sockets;
     Ok(RunningNode {
         selected_events,
         selected_state,
@@ -10443,6 +10668,8 @@ pub async fn start_node_with_forwarding(
         selected_controls,
         application_admission,
         emission_policy,
+        #[cfg(feature = "nearby-discovery")]
+        nearby_discovery_stop: ready.nearby_discovery_stop,
         shutdown: Some(shutdown_sender),
         task: Some(task),
     })
@@ -10478,9 +10705,15 @@ struct NodeActorChannels {
     application_admission: Arc<AtomicBool>,
     control_receiver: mpsc::Receiver<SelectedControlCommand>,
     shutdown_receiver: mpsc::Receiver<()>,
-    ready: oneshot::Sender<Vec<SocketAddr>>,
+    ready: oneshot::Sender<NodeReady>,
     #[cfg(all(test, unix))]
     test_control: Option<RunNodeActorTestControl>,
+}
+
+struct NodeReady {
+    bound_sockets: Vec<SocketAddr>,
+    #[cfg(feature = "nearby-discovery")]
+    nearby_discovery_stop: Option<NearbyDiscoveryStopHandle>,
 }
 
 impl NodeActorChannels {
@@ -10489,7 +10722,7 @@ impl NodeActorChannels {
         application_admission: Arc<AtomicBool>,
         control_receiver: mpsc::Receiver<SelectedControlCommand>,
         shutdown_receiver: mpsc::Receiver<()>,
-        ready: oneshot::Sender<Vec<SocketAddr>>,
+        ready: oneshot::Sender<NodeReady>,
     ) -> Self {
         Self {
             application_receiver,
@@ -10509,7 +10742,7 @@ async fn run_node_actor(
     application_receiver: mpsc::Receiver<SelectedApplicationCommand>,
     application_admission: Arc<AtomicBool>,
     shutdown_receiver: mpsc::Receiver<()>,
-    ready: oneshot::Sender<Vec<SocketAddr>>,
+    ready: oneshot::Sender<NodeReady>,
 ) -> Result<NodeReceipt, NodeError> {
     let forwarding = SelectedForwardingConfig::default();
     let emission_policy = Arc::new(LiveEmissionPolicy::new(forwarding.emission_policy()));
@@ -10561,8 +10794,10 @@ async fn run_node_actor_inner(
             })
         })
         .transpose()?;
-    let peer_missions = validate_node_config(&config)?;
+    let direct_peer_missions = validate_node_config(&config)?;
     validate_forwarding_config(&forwarding)?;
+    let (peer_missions, configured_peers) =
+        configured_runtime_peers(&config, &forwarding, direct_peer_missions)?;
     let allowed = peer_missions.keys().copied().collect::<BTreeSet<_>>();
     let mission_authority = config.mission.mission_authority_id();
     fs::create_dir_all(&config.state)?;
@@ -10696,6 +10931,12 @@ async fn run_node_actor_inner(
         Some(_) => "deferred",
         None => "not-applicable",
     };
+    #[cfg(feature = "nearby-discovery")]
+    let mut nearby_session = forwarding
+        .nearby_discovery
+        .as_ref()
+        .map(|routing| endpoint.start_nearby_discovery(routing.window))
+        .transpose()?;
     let (zeroization_sender, mut zeroization_receiver) = mpsc::channel(1);
     let bound_sockets = endpoint.bound_sockets();
     let sockets = if bound_sockets.is_empty() {
@@ -10723,9 +10964,22 @@ async fn run_node_actor_inner(
         ),
         None => ("direct", "none".into(), "none"),
     };
+    #[cfg(feature = "nearby-discovery")]
+    let carrier_route = if forwarding.nearby_discovery.is_some() {
+        "nearby-discovery-evaluation"
+    } else {
+        carrier_route
+    };
+    #[cfg(feature = "nearby-discovery")]
+    let nearby_window_seconds = forwarding
+        .nearby_discovery
+        .as_ref()
+        .map_or(0, |routing| routing.window.as_secs());
+    #[cfg(not(feature = "nearby-discovery"))]
+    let nearby_window_seconds = 0;
     let provisioning_origin = config.provisioning_origin().receipt_label();
     println!(
-        "READY selected=true pid={} carrier_id={} mission_id={} mission_authority={} sockets={} state={} peers={} application={} carrier_route={} controlled_relay_url={} controlled_relay_trust={} controlled_relay_readiness={} public_relay_fallback=false hosted_discovery=false nat_traversal=not-claimed path_observation=not-authorization mission_auth=hybrid-pq provisioning={} semantics=source-authenticated-event reconciliation_classes={} controls=source-authenticated-flash commit_before_activate=true content_admission=capability-gated",
+        "READY selected=true pid={} carrier_id={} mission_id={} mission_authority={} sockets={} state={} peers={} application={} carrier_route={} controlled_relay_url={} controlled_relay_trust={} controlled_relay_readiness={} public_relay_fallback=false hosted_discovery=false nearby_discovery={} nearby_window_seconds={} discovery_metadata={} discovery_authority=none nat_traversal=not-claimed path_observation=not-authorization mission_auth=hybrid-pq provisioning={} semantics=source-authenticated-event reconciliation_classes={} controls=source-authenticated-flash commit_before_activate=true content_admission=capability-gated",
         std::process::id(),
         local_id,
         format_node_id(config.mission.identity()),
@@ -10738,12 +10992,67 @@ async fn run_node_actor_inner(
         format_receipt_field(&relay_url),
         relay_trust,
         relay_readiness,
+        if nearby_window_seconds == 0 {
+            "disabled"
+        } else {
+            "active-evaluation"
+        },
+        nearby_window_seconds,
+        if nearby_window_seconds == 0 {
+            "none"
+        } else {
+            "carrier-id-and-direct-address-only"
+        },
         provisioning_origin,
         READY_RECONCILIATION_CLASSES,
     );
     // Cancellation before the readiness handoff skips all operational work but
     // still follows the single task/endpoint cleanup path below.
-    let owner_ready = ready.send(bound_sockets).is_ok();
+    #[cfg(feature = "nearby-discovery")]
+    let nearby_discovery_stop = nearby_session.as_ref().map(|session| session.stop_handle());
+    let owner_ready = ready
+        .send(NodeReady {
+            bound_sockets,
+            #[cfg(feature = "nearby-discovery")]
+            nearby_discovery_stop,
+        })
+        .is_ok();
+    #[cfg(feature = "nearby-discovery")]
+    let mut nearby_window_task = if owner_ready {
+        nearby_session.take().map(|session| {
+            let window = forwarding
+                .nearby_discovery
+                .as_ref()
+                .expect("nearby session has matching routing")
+                .window;
+            let live_policy = emission_policy.clone();
+            let initial_policy = live_policy
+                .snapshot()
+                .expect("validated live emission policy");
+            tokio::spawn(async move {
+                let deadline = tokio::time::Instant::now() + window;
+                let reason = loop {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        break "window-expired";
+                    }
+                    sleep(remaining.min(Duration::from_millis(250))).await;
+                    match live_policy.snapshot() {
+                        Ok(snapshot) if snapshot == initial_policy => {}
+                        _ => break "emission-policy-changed",
+                    }
+                };
+                session.stop();
+                println!(
+                    "DISCOVERY status=closed mode=nearby-evaluation reason={} window_seconds={}",
+                    reason,
+                    window.as_secs()
+                );
+            })
+        })
+    } else {
+        None
+    };
     #[cfg(all(test, unix))]
     let (
         before_loop_ready,
@@ -10820,7 +11129,7 @@ async fn run_node_actor_inner(
     tokio::pin!(stop);
     let mut receipt = NodeReceipt::default();
     let mut selected_event_status =
-        SelectedEventStatusTracker::new(config.peers.iter().map(|peer| peer.mission).collect());
+        SelectedEventStatusTracker::new(configured_peers.iter().map(|peer| peer.mission).collect());
     let mut application_commands_open = true;
     let mut pending_application_command = None::<SelectedApplicationCommand>;
     let mut control_commands_open = true;
@@ -10836,10 +11145,10 @@ async fn run_node_actor_inner(
         JoinSet::new();
     let mut inbound_peers = BTreeSet::new();
     let mut inbound_tasks = BTreeMap::<TaskId, EndpointId>::new();
-    let mut outbound: JoinSet<(MissionExpectedPeer, Result<CompletedPeerContact, NodeError>)> =
+    let mut outbound: JoinSet<(ConfiguredPeer, Result<CompletedPeerContact, NodeError>)> =
         JoinSet::new();
     let mut outbound_peers = BTreeSet::new();
-    let mut outbound_tasks = BTreeMap::<TaskId, MissionExpectedPeer>::new();
+    let mut outbound_tasks = BTreeMap::<TaskId, ConfiguredPeer>::new();
     let mut next_outbound_peer = 0usize;
     let mut application_cursor = 0u64;
     let mut initial_application_receipt_emitted = false;
@@ -11066,7 +11375,7 @@ async fn run_node_actor_inner(
                 if !emission_snapshot.policy.permits_contact_initiation() {
                     continue;
                 }
-                let peer_count = config.peers.len();
+                let peer_count = configured_peers.len();
                 if peer_count == 0 {
                     continue;
                 }
@@ -11076,10 +11385,10 @@ async fn run_node_actor_inner(
                     if outbound.len() >= MAX_OUTBOUND_CONTACTS {
                         break;
                     }
-                    let peer = &config.peers[(start + offset) % peer_count];
+                    let peer = &configured_peers[(start + offset) % peer_count];
                     // Exactly one endpoint initiates each configured edge. This avoids
                     // symmetric connect/accept deadlocks without assigning topology meaning.
-                    if local_id >= peer.carrier.id || !outbound_peers.insert(peer.carrier.id) {
+                    if local_id >= peer.carrier || !outbound_peers.insert(peer.carrier) {
                         continue;
                     }
                     let store = store.clone();
@@ -11304,7 +11613,7 @@ async fn run_node_actor_inner(
                 match completed {
                     Some(Ok((task, (peer, Ok(peer_receipt))))) => {
                         outbound_tasks.remove(&task);
-                        outbound_peers.remove(&peer.carrier.id);
+                        outbound_peers.remove(&peer.carrier);
                         if let Err(error) = selected_event_status.record(&peer_receipt) {
                             fatal_error = Some(error);
                             break;
@@ -11323,9 +11632,10 @@ async fn run_node_actor_inner(
                         }
                         receipt.contacts += 1;
                         println!(
-                            "CONTACT direction=out carrier_peer={} mission_peer={} rounds={} control_offered={} control_fetched={} control_retained={} control_duplicates={} control_activated={} control_remaining={} offered={} fetched={} inserted={} duplicates={} remaining={} deferred_event_lanes={} mutable_remaining={} deferred_mutable_lanes={} blob_ranges_fetched={} blob_bytes_fetched={} blob_remaining={} blob_deferred={} handshake_frames={} handshake_bytes={} protected_frames={} protected_bytes={} carrier_path={} carrier_path_transitions={} carrier_path_transitions_saturated={} path_observation=not-authorization mission_auth=hybrid-pq semantics=source-authenticated-event reconciliation_classes={} controls=source-authenticated-flash content_admission=capability-gated status={}",
-                            peer.carrier.id,
+                            "CONTACT direction=out carrier_peer={} mission_peer={} locator={} rounds={} control_offered={} control_fetched={} control_retained={} control_duplicates={} control_activated={} control_remaining={} offered={} fetched={} inserted={} duplicates={} remaining={} deferred_event_lanes={} mutable_remaining={} deferred_mutable_lanes={} blob_ranges_fetched={} blob_bytes_fetched={} blob_remaining={} blob_deferred={} handshake_frames={} handshake_bytes={} protected_frames={} protected_bytes={} carrier_path={} carrier_path_transitions={} carrier_path_transitions_saturated={} path_observation=not-authorization mission_auth=hybrid-pq semantics=source-authenticated-event reconciliation_classes={} controls=source-authenticated-flash content_admission=capability-gated status={}",
+                            peer.carrier,
                             format_node_id(peer_receipt.mission_peer.expect("successful mission contact has peer identity")),
+                            peer.locator_name(),
                             peer_receipt.rounds,
                             peer_receipt.controls_offered,
                             peer_receipt.controls_fetched,
@@ -11358,21 +11668,21 @@ async fn run_node_actor_inner(
                     }
                     Some(Ok((task, (peer, Err(error))))) => {
                         outbound_tasks.remove(&task);
-                        outbound_peers.remove(&peer.carrier.id);
+                        outbound_peers.remove(&peer.carrier);
                         if actor_fatal_contact_error(&error, config.mission.identity()) {
                             fatal_error = Some(error);
                             break;
                         }
                         receipt.contact_errors += 1;
-                        eprintln!("CONTACT direction=out carrier_peer={} expected_mission_peer={} status=error error={}", peer.carrier.id, format_node_id(peer.mission), format_receipt_field(&error.to_string()));
+                        eprintln!("CONTACT direction=out carrier_peer={} expected_mission_peer={} status=error error={}", peer.carrier, format_node_id(peer.mission), format_receipt_field(&error.to_string()));
                     }
                     Some(Err(error)) => {
                         let peer = outbound_tasks.remove(&error.id());
                         if let Some(peer) = peer {
-                            outbound_peers.remove(&peer.carrier.id);
+                            outbound_peers.remove(&peer.carrier);
                         }
                         receipt.contact_errors += 1;
-                        eprintln!("CONTACT direction=out carrier_peer={} status=error error={}", peer.map_or_else(|| "unknown".into(), |peer| peer.carrier.id.to_string()), format_receipt_field(&format!("task failed: {error}")));
+                        eprintln!("CONTACT direction=out carrier_peer={} status=error error={}", peer.map_or_else(|| "unknown".into(), |peer| peer.carrier.to_string()), format_receipt_field(&format!("task failed: {error}")));
                     }
                     None => {}
                 }
@@ -11458,6 +11768,11 @@ async fn run_node_actor_inner(
     if let Some(accept_task) = accept_task {
         accept_task.abort();
         let _ = accept_task.await;
+    }
+    #[cfg(feature = "nearby-discovery")]
+    if let Some(task) = nearby_window_task.take() {
+        task.abort();
+        let _ = task.await;
     }
     drop(accepted_receiver);
     inbound.shutdown().await;
@@ -11715,7 +12030,7 @@ async fn sync_once_with_policy(
         OutboundContact {
             store,
             mission,
-            peer,
+            peer: peer.into(),
             policy_lock,
             emission_policy,
             emission_snapshot: snapshot,
@@ -11731,7 +12046,7 @@ async fn sync_once_with_policy(
 struct OutboundContact {
     store: Arc<Store>,
     mission: UnprotectedReferenceMission,
-    peer: MissionExpectedPeer,
+    peer: ConfiguredPeer,
     policy_lock: Arc<RwLock<()>>,
     emission_policy: Arc<LiveEmissionPolicy>,
     emission_snapshot: EmissionPolicySnapshot,
@@ -11778,21 +12093,33 @@ async fn sync_session(
     } = contact;
     emission_policy.require(emission_snapshot)?;
     drive_custody_maintenance(&store, &custody_clock, &[])?;
-    let connection = match controlled_relay {
-        Some(routing) => {
+    let connection = match (controlled_relay, peer.locator) {
+        (Some(routing), PeerLocator::Direct(address)) => {
             let direct_addresses = if routing.relay_only {
                 Vec::new()
             } else {
-                vec![peer.carrier.address]
+                vec![address]
             };
-            let route = PeerRoute::new(
-                peer.carrier.id,
-                direct_addresses,
-                routing.relay.url().clone(),
-            )?;
+            let route =
+                PeerRoute::new(peer.carrier, direct_addresses, routing.relay.url().clone())?;
             endpoint.connect_route(&route).await?
         }
-        None => endpoint.connect(peer.carrier).await?,
+        (None, PeerLocator::Direct(address)) => {
+            endpoint
+                .connect(ExpectedPeer {
+                    id: peer.carrier,
+                    address,
+                })
+                .await?
+        }
+        #[cfg(feature = "nearby-discovery")]
+        (None, PeerLocator::Nearby) => endpoint.connect_discovered(peer.carrier).await?,
+        #[cfg(feature = "nearby-discovery")]
+        (Some(_), PeerLocator::Nearby) => {
+            return Err(NodeError::Configuration(
+                "nearby discovery cannot use a controlled relay".into(),
+            ));
+        }
     };
     emission_policy.require(emission_snapshot)?;
     let guard = ContactEmissionGuard {
@@ -16408,7 +16735,7 @@ async fn sync_authenticated_session(
     store: Arc<Store>,
     connection: &aster_iroh::Connection,
     credentials: UnprotectedReferenceMission,
-    peer: MissionExpectedPeer,
+    peer: ConfiguredPeer,
     policy_lock: Arc<RwLock<()>>,
     mutable_interests: &MutableSourceInterests,
 ) -> Result<CompletedPeerContact, NodeError> {
@@ -16420,7 +16747,7 @@ async fn sync_authenticated_session(
     let (mut mission, handshake) = initiate_over_iroh_metered(
         connection,
         credentials.fresh_bundle()?,
-        MissionPeerBinding::new(peer.carrier.id, peer.mission),
+        MissionPeerBinding::new(peer.carrier, peer.mission),
     )
     .await?;
     let mut receipt = authenticated_receipt(connection, &mission, handshake)?;
@@ -25978,6 +26305,7 @@ mod tests {
                 .await
                 .expect("left responder becomes ready")
                 .expect("left responder readiness")
+                .bound_sockets
                 .into_iter()
                 .find(SocketAddr::is_ipv4)
                 .expect("left responder IPv4 endpoint");
@@ -26035,6 +26363,7 @@ mod tests {
                 .await
                 .expect("right responder becomes ready")
                 .expect("right responder readiness")
+                .bound_sockets
                 .into_iter()
                 .find(SocketAddr::is_ipv4)
                 .expect("right responder IPv4 endpoint");
@@ -31032,7 +31361,8 @@ mod tests {
                         address: loopback(&server),
                     },
                     mission: server_mission_id,
-                },
+                }
+                .into(),
                 policy_lock: Arc::new(RwLock::new(())),
                 emission_policy: client_policy,
                 emission_snapshot: snapshot,
@@ -32272,7 +32602,8 @@ mod tests {
                             address: loopback(&server),
                         },
                         mission: server_mission.identity(),
-                    },
+                    }
+                    .into(),
                     policy_lock: Arc::new(RwLock::new(())),
                     emission_policy: client_policy,
                     emission_snapshot: snapshot,
@@ -32696,7 +33027,7 @@ mod tests {
             OutboundContact {
                 store: server_store.clone(),
                 mission: server_mission,
-                peer: expected_peer(0xcafe, 65_000),
+                peer: expected_peer(0xcafe, 65_000).into(),
                 policy_lock: Arc::new(RwLock::new(())),
                 emission_policy: server_policy,
                 emission_snapshot: snapshot,
@@ -35733,11 +36064,295 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "nearby-discovery")]
+    fn nearby_peer(seed: u64) -> MissionNearbyPeer {
+        let direct = expected_peer(seed, 20_000);
+        MissionNearbyPeer {
+            carrier: direct.carrier.id,
+            mission: direct.mission,
+        }
+    }
+
+    #[cfg(feature = "nearby-discovery")]
+    fn nearby_node_config(name: &str, peers: Vec<MissionExpectedPeer>) -> NodeConfig {
+        NodeConfig {
+            state: root(name),
+            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            mission: test_mission(),
+            peers,
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_millis(1),
+            run_for: Some(Duration::from_millis(1)),
+            application: NodeApplication::Relay,
+        }
+    }
+
+    #[cfg(feature = "nearby-discovery")]
+    fn configured_nearby_peers(
+        config: &NodeConfig,
+        forwarding: &SelectedForwardingConfig,
+    ) -> Result<(BTreeMap<EndpointId, NodeId>, Vec<ConfiguredPeer>), NodeError> {
+        let direct = validate_node_config(config)?;
+        configured_runtime_peers(config, forwarding, direct)
+    }
+
+    #[cfg(feature = "nearby-discovery")]
+    fn nearby_forwarding(peers: Vec<MissionNearbyPeer>) -> SelectedForwardingConfig {
+        SelectedForwardingConfig::default()
+            .with_nearby_discovery(peers, Duration::from_secs(1))
+            .expect("valid nearby test forwarding")
+    }
+
     #[test]
     fn inspection_of_absent_state_does_not_create_it() {
         let state = root("inspect-absent");
         assert!(inspect_store(&state).is_err());
         assert!(!state.exists());
+    }
+
+    #[cfg(feature = "nearby-discovery")]
+    #[test]
+    fn nearby_peer_parser_round_trips_only_the_identity_pair() {
+        let peer = nearby_peer(800);
+        let encoded = peer.to_string();
+        assert_eq!(
+            encoded.parse::<MissionNearbyPeer>().expect("round trip"),
+            peer
+        );
+        assert!(
+            !encoded.contains('@'),
+            "nearby syntax must not contain a socket"
+        );
+
+        let mission = format_node_id(peer.mission);
+        for malformed in [
+            String::new(),
+            peer.carrier.to_string(),
+            format!("{}={mission}=extra", peer.carrier),
+            format!("not-an-endpoint={mission}"),
+            format!("{}=abcd", peer.carrier),
+        ] {
+            assert!(
+                malformed.parse::<MissionNearbyPeer>().is_err(),
+                "accepted malformed nearby peer: {malformed}"
+            );
+        }
+    }
+
+    #[cfg(feature = "nearby-discovery")]
+    #[test]
+    fn nearby_window_and_roster_bounds_fail_closed() {
+        let peer = nearby_peer(801);
+        assert!(
+            SelectedForwardingConfig::default()
+                .with_nearby_discovery(vec![peer], Duration::ZERO)
+                .is_err()
+        );
+        assert!(
+            SelectedForwardingConfig::default()
+                .with_nearby_discovery(vec![peer], Duration::from_nanos(1))
+                .is_err(),
+            "sub-second windows must not be truncated to a disabled receipt"
+        );
+        assert!(
+            SelectedForwardingConfig::default()
+                .with_nearby_discovery(vec![peer], Duration::from_millis(1_500))
+                .is_err(),
+            "fractional-second windows must not be truncated in readiness receipts"
+        );
+        assert!(
+            SelectedForwardingConfig::default()
+                .with_nearby_discovery(Vec::new(), Duration::from_secs(1))
+                .is_err()
+        );
+        assert!(
+            SelectedForwardingConfig::default()
+                .with_nearby_discovery(vec![peer], MAX_NEARBY_DISCOVERY_WINDOW)
+                .is_ok(),
+            "the exact documented maximum is valid"
+        );
+        assert!(
+            SelectedForwardingConfig::default()
+                .with_nearby_discovery(
+                    vec![peer],
+                    MAX_NEARBY_DISCOVERY_WINDOW + Duration::from_nanos(1),
+                )
+                .is_err()
+        );
+    }
+
+    #[cfg(feature = "nearby-discovery")]
+    #[test]
+    fn nearby_feature_leaves_default_manual_routing_unchanged() {
+        let peer = expected_peer(802, 20_802);
+        let config = nearby_node_config("nearby-default-manual", vec![peer]);
+        let forwarding = SelectedForwardingConfig::default();
+        let (allowed, configured) =
+            configured_nearby_peers(&config, &forwarding).expect("manual configuration");
+
+        assert_eq!(forwarding.nearby_discovery_window(), None);
+        assert_eq!(allowed, BTreeMap::from([(peer.carrier.id, peer.mission)]));
+        assert_eq!(configured, vec![ConfiguredPeer::from(peer)]);
+        assert_eq!(
+            configured[0].locator,
+            PeerLocator::Direct(peer.carrier.address)
+        );
+    }
+
+    #[cfg(feature = "nearby-discovery")]
+    #[test]
+    fn nearby_roster_rejects_duplicate_and_self_identities() {
+        let config = nearby_node_config("nearby-roster-rejections", Vec::new());
+        let first = nearby_peer(803);
+        let second = nearby_peer(804);
+
+        let duplicate_carrier = MissionNearbyPeer {
+            carrier: first.carrier,
+            mission: second.mission,
+        };
+        let error =
+            configured_nearby_peers(&config, &nearby_forwarding(vec![first, duplicate_carrier]))
+                .expect_err("duplicate nearby carrier must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("endpoint identities must be unique")
+        );
+
+        let duplicate_mission = MissionNearbyPeer {
+            carrier: second.carrier,
+            mission: first.mission,
+        };
+        let error =
+            configured_nearby_peers(&config, &nearby_forwarding(vec![first, duplicate_mission]))
+                .expect_err("duplicate nearby mission must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("mission identities must be unique")
+        );
+
+        let self_mission = MissionNearbyPeer {
+            carrier: second.carrier,
+            mission: config.mission.identity(),
+        };
+        let error = configured_nearby_peers(&config, &nearby_forwarding(vec![self_mission]))
+            .expect_err("self mission identity must fail");
+        assert!(error.to_string().contains("own mission identity"));
+    }
+
+    #[cfg(feature = "nearby-discovery")]
+    #[test]
+    fn nearby_routing_rejects_manual_relay_and_non_normal_combinations() {
+        let nearby = nearby_peer(805);
+        let manual = expected_peer(806, 20_806);
+
+        let mixed_config = nearby_node_config("nearby-mixed-routing", vec![manual]);
+        let error = configured_nearby_peers(&mixed_config, &nearby_forwarding(vec![nearby]))
+            .expect_err("manual and nearby routes must not mix");
+        assert!(error.to_string().contains("direct peer routes"));
+
+        let config = nearby_node_config("nearby-exclusive-routing", Vec::new());
+        let relay = PinnedRelay::new("https://relay.example.invalid".parse().expect("relay URL"))
+            .expect("pinned relay");
+        let forwarding = SelectedForwardingConfig::default()
+            .with_controlled_relay(relay)
+            .with_nearby_discovery(vec![nearby], Duration::from_secs(1))
+            .expect("bounded nearby selection");
+        let error = configured_nearby_peers(&config, &forwarding)
+            .expect_err("relay and nearby routes must not mix");
+        assert!(error.to_string().contains("controlled relay"));
+
+        for policy in [
+            EventEmissionPolicy::at_least(Priority::Routine),
+            EventEmissionPolicy::ReceiveOnly,
+        ] {
+            let forwarding = SelectedForwardingConfig::new(policy, StoreLimits::default())
+                .with_nearby_discovery(vec![nearby], Duration::from_secs(1))
+                .expect("bounded nearby selection");
+            let error = configured_nearby_peers(&config, &forwarding)
+                .expect_err("non-Normal nearby routing must fail");
+            assert!(error.to_string().contains("Normal emission policy"));
+        }
+    }
+
+    #[cfg(feature = "nearby-discovery")]
+    #[tokio::test]
+    async fn nearby_routing_rejects_the_local_carrier_identity_before_discovery() {
+        let state = root("nearby-self-carrier");
+        fs::create_dir_all(&state).expect("state root");
+        let local = NodeIdentity::load_or_create(&state).expect("local carrier identity");
+        let local_id = local.id();
+        drop(local);
+        let config = NodeConfig {
+            state: state.clone(),
+            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            mission: test_mission(),
+            peers: Vec::new(),
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_millis(1),
+            run_for: Some(Duration::from_millis(1)),
+            application: NodeApplication::Relay,
+        };
+        let forwarding = nearby_forwarding(vec![MissionNearbyPeer {
+            carrier: local_id,
+            mission: nearby_peer(807).mission,
+        }]);
+
+        let error = run_node_with_forwarding(config, forwarding)
+            .await
+            .expect_err("self carrier identity must fail");
+        assert!(
+            error.to_string().contains("own endpoint identity"),
+            "unexpected rejection: {error}"
+        );
+        fs::remove_dir_all(state).expect("cleanup self-carrier state");
+    }
+
+    #[cfg(feature = "nearby-discovery")]
+    #[tokio::test]
+    async fn live_non_normal_policy_synchronously_and_permanently_stops_nearby_discovery() {
+        let state = root("nearby-live-policy-stop");
+        let config = NodeConfig {
+            state: state.clone(),
+            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            mission: test_mission(),
+            peers: Vec::new(),
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_secs(60),
+            run_for: None,
+            application: NodeApplication::Relay,
+        };
+        let forwarding = SelectedForwardingConfig::default()
+            .with_nearby_discovery(vec![nearby_peer(808)], MAX_NEARBY_DISCOVERY_WINDOW)
+            .expect("bounded nearby forwarding");
+        let running = start_node_with_forwarding(config, forwarding)
+            .await
+            .expect("start nearby node");
+        let stop = running
+            .nearby_discovery_stop
+            .as_ref()
+            .expect("nearby stop handle")
+            .clone();
+        assert!(stop.is_active(), "provider is active at readiness");
+
+        running
+            .set_event_emission_policy(EventEmissionPolicy::ReceiveOnly)
+            .expect("move away from Normal");
+        assert!(
+            !stop.is_active(),
+            "public policy mutation must synchronously stop the provider"
+        );
+        running
+            .set_event_emission_policy(EventEmissionPolicy::Normal)
+            .expect("return to Normal");
+        assert!(
+            !stop.is_active(),
+            "returning to Normal must not reopen the one-shot window"
+        );
+
+        running.shutdown().await.expect("shutdown nearby node");
+        fs::remove_dir_all(state).expect("cleanup nearby policy state");
     }
 
     #[tokio::test]

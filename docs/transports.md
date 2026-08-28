@@ -70,6 +70,7 @@ equivalent tests.
 | Path | Implemented | Boundary |
 |---|---|---|
 | Selected direct Iroh | Manually admitted exact endpoint ID and socket, authenticated direct UDP/QUIC, and bounded exchange | A retained one-host cone software-namespace cell observed Direct and exact Event delivery across two NAT routers with static operator-known mappings. Carrier authentication is not mission or control/source authorization; discovery/punching, dynamic or representative NAT, physical-network acceptance, and multi-carrier failover remain open. |
+| Selected nearby Iroh evaluation | Feature-gated official Iroh mDNS lookup for an exact pre-provisioned endpoint-to-mission roster, direct-address publication only, and a maximum 30-second window | Default off and demo/evaluation only. Native and control comparators have not completed automatic authenticated delivery; upstream discovery maps are uncapped, and physical/resource qualification remains open. |
 | Selected controlled Iroh relay | One operator-pinned HTTPS relay with explicit trust, either alongside the initial direct locator or with IP disabled | A retained one-host restrictive software-namespace cell blocked direct traffic, observed Relay, and delivered one exact Event through the controlled relay. It is not a temporal direct-first/fallback chronology, representative or physical NAT, public or independently operated relay, an Aster payload-blind relay, State/Record/Blob-over-relay acceptance, or release authorization. |
 | Selected node and CLI | Networked Event and State/Record reconciliation, semantic-v5 direct Blob source/carrier transfer, live Event/State/Record/Blob Rust APIs, durable Event stream, State positive-current-version delivery, Record whole-key active-head delivery, and Blob metadata-only publication delivery in Rust, stopped Event/State/Record/Blob facades, payload-blind Event relay, restart/idempotency, bounded retained one-host State, Record, and peerless Blob forced-process-redelivery evidence, three-participant direct Blob publication/partial/different-peer-resume/read/graceful-reopen evidence, and bounded Unix zeroization | Reference provisioning; no State contact/status, materialized-view, or synthetic-withdrawal delivery, Blob peer/convergence status, network/application selector-separation acceptance, or selected-node language bindings; State/Record/Blob application subscriptions do not dynamically change configured network interests; no automatic Record merge, arbitrary-peer or route-only Blob resume acceptance, Blob-over-controlled-relay acceptance, finite State/Record/Blob TTL and non-Linux finite Event custody, generalized control administration, representative physical or mixed-implementation evidence, resource/soak evidence, or production authorization |
 | Current semantic in-memory link | Full high-level host contact, authentication, reconciliation, resume, and failure tests | It is a test carrier and is not wired to the selected composition |
@@ -186,9 +187,9 @@ Configure both sides with exact
 `CARRIER_ID@IP:PORT=MISSION_NODE_ID_HEX64` bindings and pass each local bundle
 through `--mission-bundle-unprotected-reference`. The carrier fails closed when
 its handshake identity is not in the configured allowlist; the node then fails
-closed unless the mission identity also matches. With no controlled relay
-flags, the direct path performs no hosted address lookup, relay discovery, or
-port mapping.
+closed unless the mission identity also matches. With no controlled relay or
+explicitly feature-gated nearby flags, the direct path performs no address
+lookup, relay discovery, or port mapping.
 
 Iroh carrier authentication is not Aster mission authentication and does not
 satisfy zero trust by itself. `aster-node` carries the existing `aster-core`
@@ -200,6 +201,28 @@ route grants remain an upper bound on inventory and Offer; the receiver's
 mission-protected canonical Consume/Carry interest narrows each direction
 further, and empty interest means receive-none. Content grants gate semantic
 acceptance and reaction; revoked mission principals fail closed.
+
+### Short-lived nearby evaluation
+
+An explicitly discovery-enabled build also accepts
+nearby-peer bindings in the form CARRIER_ID=MISSION_NODE_ID_HEX64 plus a
+whole-second nearby window from 1 through 30 seconds. This replaces the manually entered
+socket locator; it does not replace either identity. Direct peer routes and a
+controlled relay are rejected in the same configuration.
+
+The runtime installs the official Iroh mDNS lookup only for that window and
+only under normal emission policy. It publishes direct Iroh carrier addresses
+and carrier identity, with no lookup user data. Mission identity, authority,
+topic, scope, priority, membership, inventory, and application payload stay out
+of DNS-SD records. On-link presence, carrier identity, address, timing, and
+packet size remain observable.
+
+This mode is default-off and evaluation-only. The native provider's peer maps
+are not proven hostile-cardinality bounded, and no retained run has completed
+automatic discovery through authenticated Aster delivery. The exact decision,
+cost history, FOSS comparison, and physical qualification gates are in
+[Nearby discovery FOSS selection](evaluations/0005/nearby-discovery-selection.md).
+
 The live selected Event, State, Record, and Blob handles compose high-level
 operations with this path through the running actor's shared bounded command
 lane. Blob file work is delegated to a joined worker with capacity one; the

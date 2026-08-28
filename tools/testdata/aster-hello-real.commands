@@ -1,0 +1,15 @@
+# Human-driven Field Notes smoke over the explicit invitation route.
+# A note written before the full roster exists must converge after nodes join;
+# a sleeping node must catch up after it wakes.
+add atlas
+note written-before-cove
+add beacon
+add cove
+wait-seen m1 atlas,beacon,cove 30
+sleep atlas
+use cove
+note reply-from-edge
+wait-seen m2 beacon,cove 30
+wake atlas
+wait-seen m2 atlas,beacon,cove 30
+quit

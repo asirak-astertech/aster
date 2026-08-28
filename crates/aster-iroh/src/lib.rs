@@ -16,7 +16,12 @@ use std::{
     time::Duration,
 };
 
+#[cfg(feature = "nearby-discovery")]
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use futures::StreamExt;
+#[cfg(feature = "nearby-discovery")]
+use iroh::address_lookup::{AddrFilter, AddressLookupServices};
 use iroh::{
     Endpoint as IrohEndpoint, EndpointAddr, RelayConfig as IrohRelayConfig, RelayMode,
     TransportAddr,
@@ -26,6 +31,8 @@ use iroh::{
     },
     tls::CaTlsConfig,
 };
+#[cfg(feature = "nearby-discovery")]
+use iroh_mdns_address_lookup::MdnsAddressLookup;
 use tokio::time::timeout;
 
 pub use iroh::{EndpointId, RelayUrl, SecretKey};
@@ -35,6 +42,22 @@ pub use iroh::{EndpointId, RelayUrl, SecretKey};
 /// This version identifies carrier framing only; it does not define an Aster
 /// item encoding or reconciliation profile.
 pub const ALPN: &[u8] = b"aster-carrier/1";
+
+/// Private DNS-SD service label used by the explicit nearby evaluation mode.
+///
+/// The service publishes Iroh endpoint identities and direct transport
+/// addresses only. Aster mission identities, topics, scopes, membership, and
+/// application metadata are never placed in discovery records.
+#[cfg(feature = "nearby-discovery")]
+pub const NEARBY_SERVICE_NAME: &str = "aster-nearby-v1";
+
+/// Shortest accepted lifetime for one nearby-discovery session.
+#[cfg(feature = "nearby-discovery")]
+pub const MIN_NEARBY_DISCOVERY_WINDOW: Duration = Duration::from_secs(1);
+
+/// Longest accepted lifetime for one nearby-discovery session.
+#[cfg(feature = "nearby-discovery")]
+pub const MAX_NEARBY_DISCOVERY_WINDOW: Duration = Duration::from_secs(30);
 
 /// ALPN for the Iroh-QUIC-protected carrier profile.
 ///
@@ -503,6 +526,171 @@ pub struct Endpoint {
     config: EndpointConfig,
     relay_url: Option<RelayUrl>,
     security_profile: CarrierSecurityProfile,
+    #[cfg(feature = "nearby-discovery")]
+    nearby_discovery_occupied: Arc<AtomicBool>,
+}
+
+/// Shared synchronous stop authority for one nearby-discovery session.
+///
+/// A handle is bound to exactly one session generation. Stopping or dropping
+/// an older session cannot clear a newer session on the same endpoint.
+#[cfg(feature = "nearby-discovery")]
+#[derive(Clone)]
+pub struct NearbyDiscoveryStopHandle {
+    state: Arc<NearbyDiscoveryState>,
+}
+
+#[cfg(feature = "nearby-discovery")]
+impl NearbyDiscoveryStopHandle {
+    /// Stops advertising and resolving this session's nearby address hints.
+    ///
+    /// The complete lookup registry and provider ownership are cleared before
+    /// this method returns. Repeated calls are harmless.
+    pub fn stop(&self) {
+        self.state.stop(true);
+    }
+
+    /// Returns whether this exact session still owns its lookup provider.
+    ///
+    /// This is lifecycle observation only, not discovery, connectivity, or
+    /// authorization evidence.
+    pub fn is_active(&self) -> bool {
+        self.state.active.load(Ordering::Acquire)
+    }
+}
+
+/// Exclusive lifetime guard for the optional local-network address lookup.
+///
+/// Dropping or stopping the guard clears the endpoint's complete lookup
+/// registry before dropping the provider. Selected endpoints begin with an
+/// empty registry, and callers cannot stack this mode with another lookup
+/// service through this crate.
+#[cfg(feature = "nearby-discovery")]
+pub struct NearbyDiscoverySession {
+    state: Arc<NearbyDiscoveryState>,
+}
+
+#[cfg(feature = "nearby-discovery")]
+struct NearbyDiscoveryState {
+    services: AddressLookupServices,
+    lookup: Mutex<Option<MdnsAddressLookup>>,
+    active: AtomicBool,
+    endpoint_occupied: Arc<AtomicBool>,
+    expiry: Mutex<Option<tokio::task::AbortHandle>>,
+}
+
+#[cfg(feature = "nearby-discovery")]
+impl NearbyDiscoveryState {
+    fn stop(&self, abort_expiry: bool) {
+        // Hold the ownership lock through provider destruction. Concurrent
+        // stop calls therefore do not return before the first stop has
+        // completed its synchronous clear.
+        {
+            let mut lookup = self
+                .lookup
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(owned_lookup) = lookup.take() else {
+                return;
+            };
+            self.services.clear();
+            drop(owned_lookup);
+            self.active.store(false, Ordering::Release);
+            self.endpoint_occupied.store(false, Ordering::Release);
+        }
+
+        let expiry = self
+            .expiry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if abort_expiry && let Some(expiry) = expiry {
+            expiry.abort();
+        }
+    }
+}
+
+#[cfg(feature = "nearby-discovery")]
+struct NearbyDiscoveryExpiryGuard {
+    state: Arc<NearbyDiscoveryState>,
+    completed: bool,
+}
+
+#[cfg(feature = "nearby-discovery")]
+impl NearbyDiscoveryExpiryGuard {
+    fn expire(mut self) {
+        self.state.stop(false);
+        self.completed = true;
+    }
+}
+
+#[cfg(feature = "nearby-discovery")]
+impl Drop for NearbyDiscoveryExpiryGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            // Runtime cancellation must not strand endpoint singleton
+            // ownership or leave a provider registered.
+            self.state.stop(false);
+        }
+    }
+}
+
+#[cfg(feature = "nearby-discovery")]
+struct NearbyDiscoveryReservation {
+    endpoint_occupied: Arc<AtomicBool>,
+    committed: bool,
+}
+
+#[cfg(feature = "nearby-discovery")]
+impl NearbyDiscoveryReservation {
+    fn acquire(endpoint_occupied: Arc<AtomicBool>) -> Result<Self, CarrierError> {
+        endpoint_occupied
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                CarrierError::Configuration(
+                    "only one nearby-discovery session may be active per endpoint".into(),
+                )
+            })?;
+        Ok(Self {
+            endpoint_occupied,
+            committed: false,
+        })
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+#[cfg(feature = "nearby-discovery")]
+impl Drop for NearbyDiscoveryReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.endpoint_occupied.store(false, Ordering::Release);
+        }
+    }
+}
+
+#[cfg(feature = "nearby-discovery")]
+impl NearbyDiscoverySession {
+    /// Returns a cloneable synchronous stop authority for this exact session.
+    pub fn stop_handle(&self) -> NearbyDiscoveryStopHandle {
+        NearbyDiscoveryStopHandle {
+            state: self.state.clone(),
+        }
+    }
+
+    /// Stops advertising and resolving nearby carrier address hints now.
+    pub fn stop(self) {
+        self.state.stop(true);
+    }
+}
+
+#[cfg(feature = "nearby-discovery")]
+impl Drop for NearbyDiscoverySession {
+    fn drop(&mut self) {
+        self.state.stop(true);
+    }
 }
 
 impl Endpoint {
@@ -647,6 +835,8 @@ impl Endpoint {
             config,
             relay_url: relay.map(|relay| relay.url),
             security_profile,
+            #[cfg(feature = "nearby-discovery")]
+            nearby_discovery_occupied: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -663,6 +853,79 @@ impl Endpoint {
     /// Returns the actual local sockets after binding.
     pub fn bound_sockets(&self) -> Vec<SocketAddr> {
         self.inner.bound_sockets()
+    }
+
+    /// Starts one exclusive, internally time-bounded nearby lookup session.
+    ///
+    /// This is an evaluation/demo mechanism, not an authorization source.
+    /// It uses Iroh's official mDNS address-lookup provider, advertises direct
+    /// IP addresses only, and carries no Aster metadata. The caller must still
+    /// name the exact expected carrier identity before dialing, and the Aster
+    /// mission handshake remains mandatory after carrier authentication. The
+    /// provider stops no later than the caller-supplied one-to-thirty-second
+    /// window even if the returned guard is leaked.
+    #[cfg(feature = "nearby-discovery")]
+    pub fn start_nearby_discovery(
+        &self,
+        window: Duration,
+    ) -> Result<NearbyDiscoverySession, CarrierError> {
+        if !(MIN_NEARBY_DISCOVERY_WINDOW..=MAX_NEARBY_DISCOVERY_WINDOW).contains(&window)
+            || window.subsec_nanos() != 0
+        {
+            return Err(CarrierError::Configuration(format!(
+                "nearby discovery window must be a whole number of seconds within {}..={}",
+                MIN_NEARBY_DISCOVERY_WINDOW.as_secs(),
+                MAX_NEARBY_DISCOVERY_WINDOW.as_secs()
+            )));
+        }
+        let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
+            CarrierError::Configuration("nearby discovery requires an active Tokio runtime".into())
+        })?;
+        let reservation =
+            NearbyDiscoveryReservation::acquire(self.nearby_discovery_occupied.clone())?;
+        let services = self
+            .inner
+            .address_lookup()
+            .map_err(|error| CarrierError::Transport(error.to_string()))?
+            .clone();
+        if !services.is_empty() {
+            return Err(CarrierError::Configuration(
+                "nearby discovery requires an otherwise empty address-lookup registry".into(),
+            ));
+        }
+        // `AddrFilter::ip_only` filters transport addresses, not lookup user
+        // data. Clear user data explicitly before the sole provider is added
+        // so future endpoint-builder changes cannot place mission/application
+        // metadata in this demo/evaluation advertisement.
+        self.inner.set_user_data_for_address_lookup(None);
+        services.set_addr_filter(AddrFilter::ip_only());
+        let lookup = MdnsAddressLookup::builder()
+            .service_name(NEARBY_SERVICE_NAME)
+            .addr_filter(AddrFilter::ip_only())
+            .build(self.id())
+            .map_err(|error| CarrierError::Transport(error.to_string()))?;
+        services.add(lookup.clone());
+        let state = Arc::new(NearbyDiscoveryState {
+            services,
+            lookup: Mutex::new(Some(lookup)),
+            active: AtomicBool::new(true),
+            endpoint_occupied: self.nearby_discovery_occupied.clone(),
+            expiry: Mutex::new(None),
+        });
+        let expiry_guard = NearbyDiscoveryExpiryGuard {
+            state: state.clone(),
+            completed: false,
+        };
+        let expiry = runtime.spawn(async move {
+            tokio::time::sleep(window).await;
+            expiry_guard.expire();
+        });
+        *state
+            .expiry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(expiry.abort_handle());
+        reservation.commit();
+        Ok(NearbyDiscoverySession { state })
     }
 
     /// Waits, within the configured connection deadline, for the pinned relay
@@ -682,6 +945,21 @@ impl Endpoint {
     pub async fn connect(&self, peer: ExpectedPeer) -> Result<Connection, CarrierError> {
         let address = EndpointAddr::new(peer.id).with_ip_addr(peer.address);
         self.connect_address(address, peer.id).await
+    }
+
+    /// Resolves and connects to one exact carrier identity through the
+    /// endpoint's explicitly installed address-lookup service.
+    ///
+    /// No identity is learned from discovery: callers must provision the
+    /// expected endpoint ID before invoking this method. Carrier TLS and the
+    /// independent Aster mission handshake remain separate mandatory gates.
+    #[cfg(feature = "nearby-discovery")]
+    pub async fn connect_discovered(
+        &self,
+        expected_id: EndpointId,
+    ) -> Result<Connection, CarrierError> {
+        self.connect_address(EndpointAddr::new(expected_id), expected_id)
+            .await
     }
 
     /// Connects using the route's initial direct candidates and exact pinned relay.
@@ -1470,6 +1748,61 @@ mod tests {
         server.close().await;
     }
 
+    #[cfg(feature = "nearby-discovery")]
+    #[tokio::test]
+    async fn discovered_connect_uses_an_injected_lookup_without_a_socket_argument() {
+        let mut config = EndpointConfig::direct("127.0.0.1:0".parse().expect("address"));
+        config.connect_timeout = Duration::from_secs(2);
+        let server = Endpoint::bind(SecretKey::generate(), config)
+            .await
+            .expect("server");
+        let client = Endpoint::bind(SecretKey::generate(), config)
+            .await
+            .expect("client");
+
+        let lookup = iroh::address_lookup::MemoryLookup::new();
+        lookup.add_endpoint_info(EndpointAddr::new(server.id()).with_ip_addr(loopback(&server)));
+        let services = client.inner.address_lookup().expect("lookup registry");
+        assert!(services.is_empty(), "selected endpoints start lookup-free");
+        services.add(lookup);
+
+        let allowed = BTreeSet::from([client.id()]);
+        let server_task = tokio::spawn({
+            let server = server.clone();
+            async move {
+                let connection = server.accept(&allowed).await.expect("accept");
+                assert!(
+                    connection
+                        .respond_once(|request| Ok((request.to_vec(), true)))
+                        .await
+                        .expect("respond")
+                );
+                connection
+                    .finish_as_responder()
+                    .await
+                    .expect("finish responder");
+            }
+        });
+
+        let connection = client
+            .connect_discovered(server.id())
+            .await
+            .expect("connect by provisioned endpoint identity");
+        assert_eq!(
+            connection.request(b"lookup").await.expect("request"),
+            b"lookup"
+        );
+        connection
+            .finish_as_initiator()
+            .await
+            .expect("finish initiator");
+        server_task.await.expect("server task");
+
+        services.clear();
+        client.close().await;
+        server.close().await;
+    }
+
     #[test]
     fn carrier_security_profile_alpns_are_exact_and_distinct() {
         assert_eq!(
@@ -1569,6 +1902,221 @@ mod tests {
         client_connection.close();
         client.close().await;
         server.close().await;
+    }
+
+    #[cfg(feature = "nearby-discovery")]
+    #[tokio::test]
+    async fn nearby_discovery_refuses_to_stack_with_an_existing_lookup() {
+        let endpoint = Endpoint::bind(
+            SecretKey::generate(),
+            EndpointConfig::direct("127.0.0.1:0".parse().expect("address")),
+        )
+        .await
+        .expect("endpoint");
+        let services = endpoint.inner.address_lookup().expect("lookup registry");
+        services.add(iroh::address_lookup::MemoryLookup::new());
+
+        let error = match endpoint.start_nearby_discovery(MIN_NEARBY_DISCOVERY_WINDOW) {
+            Ok(_) => panic!("stacked lookup must be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            CarrierError::Configuration(message)
+                if message.contains("otherwise empty address-lookup registry")
+        ));
+
+        services.clear();
+        endpoint
+            .start_nearby_discovery(MIN_NEARBY_DISCOVERY_WINDOW)
+            .expect("failed start rolls endpoint singleton reservation back")
+            .stop();
+        endpoint.close().await;
+    }
+
+    #[cfg(feature = "nearby-discovery")]
+    #[test]
+    fn nearby_discovery_requires_an_entered_tokio_runtime() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let endpoint = runtime
+            .block_on(Endpoint::bind(
+                SecretKey::generate(),
+                EndpointConfig::direct("127.0.0.1:0".parse().expect("address")),
+            ))
+            .expect("endpoint");
+
+        let error = match endpoint.start_nearby_discovery(MIN_NEARBY_DISCOVERY_WINDOW) {
+            Ok(_) => panic!("nearby discovery outside an entered runtime must fail"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            CarrierError::Configuration(message)
+                if message.contains("active Tokio runtime")
+        ));
+
+        runtime.block_on(endpoint.close());
+    }
+
+    #[cfg(feature = "nearby-discovery")]
+    #[tokio::test]
+    async fn nearby_discovery_window_requires_bounded_whole_seconds() {
+        let endpoint = Endpoint::bind(
+            SecretKey::generate(),
+            EndpointConfig::direct("127.0.0.1:0".parse().expect("address")),
+        )
+        .await
+        .expect("endpoint");
+
+        for invalid in [
+            Duration::ZERO,
+            Duration::from_nanos(1),
+            Duration::from_millis(1_500),
+            MAX_NEARBY_DISCOVERY_WINDOW + Duration::from_nanos(1),
+        ] {
+            let error = match endpoint.start_nearby_discovery(invalid) {
+                Ok(_) => panic!("invalid nearby window must fail: {invalid:?}"),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                error,
+                CarrierError::Configuration(message)
+                    if message.contains("whole number of seconds")
+            ));
+        }
+        assert!(
+            !endpoint.nearby_discovery_occupied.load(Ordering::Acquire),
+            "invalid windows cannot reserve endpoint singleton ownership"
+        );
+
+        endpoint.close().await;
+    }
+
+    #[cfg(feature = "nearby-discovery")]
+    #[tokio::test]
+    async fn concurrent_nearby_starts_install_exactly_one_provider() {
+        let endpoint = Endpoint::bind(
+            SecretKey::generate(),
+            EndpointConfig::direct("127.0.0.1:0".parse().expect("address")),
+        )
+        .await
+        .expect("endpoint");
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let first = tokio::spawn({
+            let endpoint = endpoint.clone();
+            let barrier = barrier.clone();
+            async move {
+                barrier.wait().await;
+                endpoint.start_nearby_discovery(MAX_NEARBY_DISCOVERY_WINDOW)
+            }
+        });
+        let second = tokio::spawn({
+            let endpoint = endpoint.clone();
+            let barrier = barrier.clone();
+            async move {
+                barrier.wait().await;
+                endpoint.start_nearby_discovery(MAX_NEARBY_DISCOVERY_WINDOW)
+            }
+        });
+        barrier.wait().await;
+
+        let mut sessions = Vec::new();
+        let mut errors = Vec::new();
+        for result in [
+            first.await.expect("first start task"),
+            second.await.expect("second start task"),
+        ] {
+            match result {
+                Ok(session) => sessions.push(session),
+                Err(error) => errors.push(error),
+            }
+        }
+        assert_eq!(sessions.len(), 1, "exactly one concurrent start succeeds");
+        assert_eq!(errors.len(), 1, "exactly one concurrent start is rejected");
+        assert!(matches!(
+            &errors[0],
+            CarrierError::Configuration(message)
+                if message.contains("only one nearby-discovery session")
+        ));
+        assert_eq!(
+            endpoint
+                .inner
+                .address_lookup()
+                .expect("lookup registry")
+                .len(),
+            1,
+            "the winning session installs one provider"
+        );
+
+        sessions.pop().expect("winning session").stop();
+        assert!(
+            endpoint
+                .inner
+                .address_lookup()
+                .expect("lookup registry")
+                .is_empty()
+        );
+        endpoint.close().await;
+    }
+
+    #[cfg(feature = "nearby-discovery")]
+    #[tokio::test]
+    async fn nearby_stop_is_synchronous_generation_bound_and_expires() {
+        let endpoint = Endpoint::bind(
+            SecretKey::generate(),
+            EndpointConfig::direct("127.0.0.1:0".parse().expect("address")),
+        )
+        .await
+        .expect("endpoint");
+        let services = endpoint.inner.address_lookup().expect("lookup registry");
+
+        let first = endpoint
+            .start_nearby_discovery(MAX_NEARBY_DISCOVERY_WINDOW)
+            .expect("first nearby session");
+        let old_stop = first.stop_handle();
+        assert!(old_stop.is_active());
+        old_stop.stop();
+        assert!(!old_stop.is_active());
+        assert!(
+            services.is_empty(),
+            "stop synchronously clears the provider"
+        );
+
+        let second = endpoint
+            .start_nearby_discovery(MAX_NEARBY_DISCOVERY_WINDOW)
+            .expect("second nearby session");
+        let second_stop = second.stop_handle();
+        old_stop.stop();
+        drop(first);
+        assert!(
+            second_stop.is_active(),
+            "an old stop handle cannot clear a later session"
+        );
+        assert_eq!(services.len(), 1);
+        second_stop.stop();
+        assert!(!second_stop.is_active());
+        assert!(services.is_empty());
+        drop(second);
+
+        let expiring = endpoint
+            .start_nearby_discovery(MIN_NEARBY_DISCOVERY_WINDOW)
+            .expect("expiring nearby session");
+        let expiring_stop = expiring.stop_handle();
+        timeout(Duration::from_secs(3), async {
+            while expiring_stop.is_active() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("internal nearby expiry deadline");
+        assert!(services.is_empty(), "expiry clears the provider registry");
+        assert!(
+            !endpoint.nearby_discovery_occupied.load(Ordering::Acquire),
+            "expiry releases endpoint singleton ownership"
+        );
+
+        drop(expiring);
+        endpoint.close().await;
     }
 
     #[tokio::test]

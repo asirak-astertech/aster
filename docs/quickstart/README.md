@@ -1,7 +1,8 @@
 # Language quickstarts
 
-To see real Aster nodes exchange protected Events before embedding an API, run
-the one-command [capability tour](capability-tour.md). To keep a bounded local
+To meet Aster through a human-driven three-node story, begin with
+[Aster Field Notes](hello.md). For deterministic acceptance receipts, run the
+one-command [capability tour](capability-tour.md). To keep a bounded local
 line running, choose publishers, enter synthetic messages, and change node
 availability, use the [real-process message playground](message-playground.md).
 This page indexes the offline application and language-binding quickstarts.
@@ -111,10 +112,16 @@ through 32 real agent processes around that same Event API. It is a one-host,
 all-member, unprotected-reference demo, not an end-user chat product or scale,
 global-convergence, physical-transport, and release result.
 
+The three-node [Field Notes hello](hello.md) adds staged Atlas/Beacon/Cove
+activation and an explicit choice between ten-second nearby locator windows
+and controller-known one-host invitation routes. It is the human introduction,
+not an automatic-discovery or production evidence claim.
+
 Choose the API closest to your application:
 
 | Language | API you use | Quickstart |
 |---|---|---|
+| Human-driven three-node introduction | `mise run hello` | [Aster Field Notes](hello.md) |
 | Interactive local process demo | `mise run playground -- --nodes N` | [Message playground](message-playground.md) |
 | Rust (selected live Event slice) | `aster_node::start_node` + `SelectedEventHandle` | [Selected Event API](selected-event-api.md) |
 | ConnectRPC client (alpha live Event slice) | local `aster.application.v1alpha1` schema | [Local ConnectRPC agent](connect-agent.md) |

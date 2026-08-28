@@ -7,6 +7,8 @@ use aster_node::{
     MissionExpectedPeer, MutableSourceInterests, NodeApplication, NodeConfig,
     SourceInterestSelector, ensure_state_accepts_normal_operation, format_path_field, start_node,
 };
+#[cfg(feature = "nearby-discovery")]
+use aster_node::{MissionNearbyPeer, SelectedForwardingConfig, start_node_with_forwarding};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -50,6 +52,17 @@ async fn run() -> Result<(), BoxError> {
         .into_iter()
         .map(|peer| peer.parse::<MissionExpectedPeer>())
         .collect::<Result<Vec<_>, _>>()?;
+    #[cfg(feature = "nearby-discovery")]
+    let nearby_peers = arguments
+        .repeated("--nearby-peer")?
+        .into_iter()
+        .map(|peer| peer.parse::<MissionNearbyPeer>())
+        .collect::<Result<Vec<_>, _>>()?;
+    #[cfg(feature = "nearby-discovery")]
+    let nearby_window = arguments
+        .optional("--nearby-window")?
+        .map(|seconds| seconds.parse::<u64>())
+        .transpose()?;
     let state_interests = arguments
         .repeated("--state-interest")?
         .into_iter()
@@ -72,7 +85,7 @@ async fn run() -> Result<(), BoxError> {
     let listen = agent.local_addr()?;
     let client_token = ClientToken::load(&client_token_file)?;
     let mission = UnprotectedReferenceMission::load(&mission_bundle)?;
-    let node = start_node(NodeConfig {
+    let config = NodeConfig {
         state: state.clone(),
         bind: mesh_bind,
         mission,
@@ -81,8 +94,22 @@ async fn run() -> Result<(), BoxError> {
         sync_interval,
         run_for: None,
         application: NodeApplication::Relay,
-    })
-    .await?;
+    };
+    #[cfg(feature = "nearby-discovery")]
+    let node = if nearby_peers.is_empty() {
+        if nearby_window.is_some() {
+            return Err("--nearby-window requires at least one --nearby-peer".into());
+        }
+        start_node(config).await?
+    } else {
+        let forwarding = SelectedForwardingConfig::default().with_nearby_discovery(
+            nearby_peers,
+            Duration::from_secs(nearby_window.unwrap_or(10)),
+        )?;
+        start_node_with_forwarding(config, forwarding).await?
+    };
+    #[cfg(not(feature = "nearby-discovery"))]
+    let node = start_node(config).await?;
     let events = node.selected_events();
 
     println!(
@@ -127,6 +154,8 @@ Usage:
     --client-token-file FILE \
     [--listen 127.0.0.1:8181] \
     [--peer CARRIER_ID@IP:PORT=MISSION_NODE_ID_HEX64 ...] \
+    [--nearby-peer CARRIER_ID=MISSION_NODE_ID_HEX64 ...] \
+    [--nearby-window SECONDS] \
     [--state-interest TOPIC@SCOPE ...] \
     [--record-interest TOPIC@SCOPE ...] [--sync-ms N]
 
@@ -137,7 +166,9 @@ sidecar, not a remotely exposed service. State and Record interests configure
 mesh carriage; their live application RPCs remain unavailable until
 handle-backed APIs exist. The explicitly named unprotected-reference mission
 bundle is non-production provisioning and must remain owner-only on supported
-Unix platforms."#
+Unix platforms. Nearby flags are available only in explicitly discovery-enabled
+demo/evaluation builds; they publish carrier identity and direct address hints
+for a bounded window, never mission or application metadata."#
     );
 }
 

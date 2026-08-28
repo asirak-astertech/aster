@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2026 Defense Unicorns, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Interactive, one-host Aster Event playground.
+"""Interactive, one-host Aster Event playground and Field Notes hello tour.
 
 This controller is deliberately a presentation and application-integration
 exercise.  It provisions disposable reference credentials through
@@ -20,6 +20,14 @@ The playground is bounded to 2..=32 same-implementation processes on one host,
 direct loopback, one durable Event topic/scope, and unprotected-reference
 provisioning.  It is not production authorization or physical-network,
 payload-blind-relay, performance, or requirement-scale evidence.
+
+The opt-in ``--hello`` experience keeps the same technical boundary while
+staging a small, named roster for a human-driven first contact.  Its explicit
+``nearby`` route source gives the selected runtime only pre-provisioned carrier
+and mission identities for a ten-second locator window.  Its explicit
+``invitation`` route source uses the controller's already-known loopback
+locators.  Neither mode can silently fall back to the other, and friendly names
+remain presentation-only metadata.
 """
 
 from __future__ import annotations
@@ -71,6 +79,42 @@ MAX_TRACKED_MESSAGES = 1024
 MAX_COMMAND_LINE_CHARACTERS = MAX_MESSAGE_BYTES + 256
 MAX_INITIALIZER_STDOUT_BYTES = 256 * 1024
 MAX_INITIALIZER_STDERR_BYTES = 256 * 1024
+HELLO_NEARBY_WINDOW_SECONDS = 10
+HELLO_SYNC_MILLISECONDS = 1_000
+HELLO_NODE_NAMES = (
+    "atlas",
+    "beacon",
+    "cove",
+    "drift",
+    "ember",
+    "fjord",
+    "grove",
+    "harbor",
+    "iris",
+    "juno",
+    "kite",
+    "lumen",
+    "mesa",
+    "north",
+    "orbit",
+    "piper",
+    "quill",
+    "ridge",
+    "sol",
+    "tide",
+    "umbra",
+    "vale",
+    "wren",
+    "xeno",
+    "yarrow",
+    "zenith",
+    "aurora",
+    "briar",
+    "coral",
+    "delta",
+    "echo",
+    "fern",
+)
 BOUNDARY = (
     "one host · loopback · Event only · same implementation · "
     "unprotected-reference provisioning"
@@ -897,6 +941,8 @@ class NodeState:
     token_path: Path
     token: str
     mesh_port: int
+    name: str = ""
+    activated: bool = True
     desired_online: bool = True
     status: str = "new"
     generation: int = 0
@@ -942,6 +988,7 @@ class EventSink:
         self.stderr = stderr
         self.unicode = supports_unicode(stdout)
         self.lock = threading.Lock()
+        self.node_names: Dict[int, str] = {}
         journal_path = root / "logs" / "controller.jsonl"
         journal_path.parent.mkdir(parents=True, exist_ok=True)
         self.journal = RotatingByteLog(journal_path)
@@ -956,6 +1003,26 @@ class EventSink:
             raise PlaygroundError("invalid presentation mode")
         with self.lock:
             self.mode = mode
+
+    def set_node_names(self, names: Mapping[int, str]) -> None:
+        """Install bounded presentation-only labels before live output starts."""
+
+        cleaned: Dict[int, str] = {}
+        for index, name in names.items():
+            if not isinstance(index, int) or not 0 <= index < MAX_NODES:
+                raise PlaygroundError("friendly node-name index is outside the playground bound")
+            if name not in HELLO_NODE_NAMES:
+                raise PlaygroundError("friendly node name is outside the built-in bounded roster")
+            cleaned[index] = name
+        with self.lock:
+            self.node_names = cleaned
+
+    def _node_label(self, record: Mapping[str, object]) -> str:
+        try:
+            index = int(record.get("node", -1))
+        except (TypeError, ValueError):
+            return "unknown"
+        return self.node_names.get(index, "n%d" % index)
 
     def emit(self, event_type: str, **fields: object) -> None:
         record: Dict[str, object] = {
@@ -981,36 +1048,46 @@ class EventSink:
             return "  BOUNDED %s" % safe_text(record.get("text", ""), 180)
         if kind == "root":
             return "  ROOT %s" % safe_text(record.get("path", ""), 240)
+        if kind == "network":
+            if record.get("mode") == "nearby":
+                return (
+                    "  ROUTE nearby window=%ss fallback=none "
+                    "metadata=carrier-id+direct-address"
+                    % safe_text(record.get("windowSeconds", "?"))
+                )
+            if record.get("mode") == "invitation":
+                return "  ROUTE invitation controller-known-loopback fallback=none"
+            return ""
         if kind == "node":
             detail = ""
             if record.get("pid") is not None:
                 detail += " pid=%s" % safe_text(record.get("pid"))
             if record.get("reason"):
                 detail += " reason=%s" % safe_text(record.get("reason"), 100)
-            return "  NODE n%s %s%s" % (
-                safe_text(record.get("node")),
+            return "  NODE %s %s%s" % (
+                self._node_label(record),
                 safe_text(record.get("status")),
                 detail,
             )
         if kind == "topology":
-            return "  TOPOLOGY n%s %s" % (
-                safe_text(record.get("node")),
+            return "  TOPOLOGY %s %s" % (
+                self._node_label(record),
                 safe_text(record.get("status")),
             )
         if kind == "message_published":
-            return "  MESSAGE %s published-by=n%s text=%s" % (
+            return "  MESSAGE %s published-by=%s text=%s" % (
                 safe_text(record.get("message")),
-                safe_text(record.get("node")),
+                self._node_label(record),
                 safe_text(record.get("text"), 120),
             )
         if kind == "message_seen":
-            return "  SEEN %s node=n%s exact-event=true" % (
+            return "  SEEN %s node=%s exact-event=true" % (
                 safe_text(record.get("message")),
-                safe_text(record.get("node")),
+                self._node_label(record),
             )
         if kind == "status":
-            return "  STATUS n%s process=%s observer=%s sync=%s contacts=%s failures=%s seen=%s" % (
-                safe_text(record.get("node")),
+            return "  STATUS %s process=%s observer=%s sync=%s contacts=%s failures=%s seen=%s" % (
+                self._node_label(record),
                 safe_text(record.get("process")),
                 safe_text(record.get("observer", "unknown")),
                 safe_text(record.get("sync")),
@@ -1020,9 +1097,9 @@ class EventSink:
             )
         if kind == "observer":
             if record.get("status") == "healthy":
-                return "  OBSERVER n%s healthy" % safe_text(record.get("node"))
-            return "  OBSERVER n%s error=%s" % (
-                safe_text(record.get("node")),
+                return "  OBSERVER %s healthy" % self._node_label(record)
+            return "  OBSERVER %s error=%s" % (
+                self._node_label(record),
                 safe_text(record.get("error", "unavailable"), 180),
             )
         if kind == "wait":
@@ -1059,6 +1136,9 @@ class PlaygroundController:
         process_factory: Callable[..., ManagedProcess] = ManagedProcess,
         client_factory: Callable[[str, str], ConnectJsonClient] = ConnectJsonClient,
         port_reservations: Optional[List[socket.socket]] = None,
+        hello: bool = False,
+        network_provenance: str = "direct",
+        nearby_window_seconds: int = HELLO_NEARBY_WINDOW_SECONDS,
     ) -> None:
         self.root = init.root
         self.agent = agent
@@ -1068,6 +1148,19 @@ class PlaygroundController:
         self.poll_seconds = poll_seconds
         self.process_factory = process_factory
         self.client_factory = client_factory
+        self.hello = hello
+        self.network_provenance = network_provenance
+        self.nearby_window_seconds = nearby_window_seconds
+        self.selected_index: Optional[int] = None
+        if self.hello and self.network_provenance not in {"nearby", "invitation"}:
+            raise PlaygroundError("hello mode requires an explicit nearby or invitation route source")
+        if not self.hello and self.network_provenance != "direct":
+            raise PlaygroundError("network provenance selection is available only in hello mode")
+        if (
+            self.network_provenance == "nearby"
+            and not 1 <= self.nearby_window_seconds <= 30
+        ):
+            raise PlaygroundError("nearby discovery window must be within 1..30 seconds")
         self._lock = threading.RLock()
         self._closed = False
         self._closing = False
@@ -1099,8 +1192,24 @@ class PlaygroundController:
                 token = secrets.token_hex(32)
                 _write_exclusive(token_path, token.encode("ascii"), 0o600)
                 port = int(reservation.getsockname()[1])
+                name = HELLO_NODE_NAMES[item.index] if self.hello else ""
                 self.nodes.append(
-                    NodeState(item, state, mission, token_path, token, port)
+                    NodeState(
+                        item,
+                        state,
+                        mission,
+                        token_path,
+                        token,
+                        port,
+                        name=name,
+                        activated=not self.hello,
+                        desired_online=not self.hello,
+                        status="available" if self.hello else "new",
+                    )
+                )
+            if self.hello:
+                self.sink.set_node_names(
+                    {node.init.index: node.name for node in self.nodes}
                 )
         except BaseException:
             self._close_reservations()
@@ -1127,12 +1236,24 @@ class PlaygroundController:
     def start(self) -> None:
         self.sink.emit("root", path=str(self.root))
         self.sink.emit("boundary", text=BOUNDARY)
+        if self.hello:
+            self.sink.emit(
+                "network",
+                mode=self.network_provenance,
+                windowSeconds=(
+                    self.nearby_window_seconds
+                    if self.network_provenance == "nearby"
+                    else 0
+                ),
+                fallback="none",
+            )
         with self._lock:
             spawned: List[int] = []
             try:
-                for index in range(len(self.nodes)):
-                    self._spawn_node(index)
-                    spawned.append(index)
+                if not self.hello:
+                    for index in range(len(self.nodes)):
+                        self._spawn_node(index)
+                        spawned.append(index)
                 for index in spawned:
                     self._finish_node_start(index)
             except BaseException as error:
@@ -1147,7 +1268,8 @@ class PlaygroundController:
                     if not isinstance(error, (KeyboardInterrupt, SystemExit)):
                         raise PlaygroundError("playground startup and cleanup failed") from error
                 raise
-            self._close_reservations()
+            if not self.hello:
+                self._close_reservations()
         self._poll_thread = threading.Thread(
             target=self._poll_loop,
             name="aster-playground-poller",
@@ -1170,16 +1292,26 @@ class PlaygroundController:
             "--client-token-file",
             str(node.token_path),
             "--sync-ms",
-            "200",
+            str(HELLO_SYNC_MILLISECONDS if self.hello else 200),
         ]
-        for neighbor_index in sorted(self.topology.neighbors(index)):
+        neighbors = sorted(self.topology.neighbors(index))
+        for neighbor_index in neighbors:
             neighbor = self.nodes[neighbor_index]
-            peer = "%s@127.0.0.1:%d=%s" % (
-                neighbor.init.carrier_id,
-                neighbor.mesh_port,
-                neighbor.init.mission_id,
-            )
-            command.extend(["--peer", peer])
+            if self.network_provenance == "nearby":
+                peer = "%s=%s" % (
+                    neighbor.init.carrier_id,
+                    neighbor.init.mission_id,
+                )
+                command.extend(["--nearby-peer", peer])
+            else:
+                peer = "%s@127.0.0.1:%d=%s" % (
+                    neighbor.init.carrier_id,
+                    neighbor.mesh_port,
+                    neighbor.init.mission_id,
+                )
+                command.extend(["--peer", peer])
+        if self.network_provenance == "nearby" and neighbors:
+            command.extend(["--nearby-window", str(self.nearby_window_seconds)])
         return command
 
     def _spawn_node(self, index: int) -> None:
@@ -1505,6 +1637,99 @@ class PlaygroundController:
         self.last_alias = alias
         return alias
 
+    def node_label(self, index: int) -> str:
+        self.topology.validate(index)
+        name = self.nodes[index].name
+        return name if name else "n%d" % index
+
+    def resolve_node(self, value: str) -> int:
+        normalized = value.strip().lower()
+        if not normalized:
+            raise PlaygroundError("node name or index must not be empty")
+        if normalized.startswith("n") and normalized[1:].isdigit():
+            normalized = normalized[1:]
+        if normalized.isdigit():
+            index = int(normalized)
+            self.topology.validate(index)
+            return index
+        for node in self.nodes:
+            if node.name == normalized:
+                return node.init.index
+        if self.hello:
+            available = ", ".join(node.name for node in self.nodes)
+            raise PlaygroundError(
+                "unknown field node %s; choose one of: %s"
+                % (safe_text(value, 32), available)
+            )
+        raise PlaygroundError("node index must be an integer")
+
+    def select_node(self, index: int) -> None:
+        with self._lock:
+            self.topology.validate(index)
+            node = self.nodes[index]
+            if self.hello and not node.activated:
+                raise PlaygroundError("add %s before selecting it" % node.name)
+            self.selected_index = index
+
+    def add_node(self, index: int) -> None:
+        """Activate one pre-provisioned hello-roster slot."""
+
+        with self._lock:
+            if not self.hello:
+                raise PlaygroundError("add is available only in hello mode")
+            self.topology.validate(index)
+            node = self.nodes[index]
+            if node.activated:
+                raise PlaygroundError("%s has already joined the field notebook" % node.name)
+            node.activated = True
+            node.desired_online = True
+            node.status = "stopped"
+
+            restart = []
+            if self.network_provenance == "nearby":
+                restart = [
+                    candidate
+                    for candidate, peer in enumerate(self.nodes)
+                    if candidate != index
+                    and peer.activated
+                    and peer.desired_online
+                    and peer.process is not None
+                ]
+                # Nearby locator publication and lookup are both short-lived.
+                # Restart the small activated roster so every line edge gets
+                # an overlapping explicit window; this never switches to an
+                # invitation route when multicast is unavailable.
+                if restart:
+                    self._stop_indexes(
+                        restart,
+                        reason="opening-nearby-window",
+                        desired=True,
+                    )
+
+            started: List[int] = []
+            try:
+                for item in restart + [index]:
+                    self._spawn_node(item)
+                    started.append(item)
+                for item in started:
+                    self._finish_node_start(item)
+            except BaseException:
+                self.had_process_failure = True
+                self._stop_indexes(
+                    reversed(started),
+                    reason="hello-add-failure",
+                    desired=False,
+                )
+                raise
+            self.selected_index = index
+            self.sink.emit(
+                "info",
+                text=(
+                    "%s joined through %s; route fallback remains disabled."
+                    % (node.name, self.network_provenance)
+                ),
+            )
+
     def send(self, index: int, text: str) -> str:
         payload = text.encode("utf-8")
         if not payload:
@@ -1596,6 +1821,8 @@ class PlaygroundController:
         with self._lock:
             self.topology.validate(index)
             node = self.nodes[index]
+            if self.hello and not node.activated:
+                raise PlaygroundError("add %s before putting it to sleep" % node.name)
             if not node.desired_online and node.process is None:
                 self.sink.emit("info", text="node %d is already stopped" % index)
                 return
@@ -1605,12 +1832,43 @@ class PlaygroundController:
         with self._lock:
             self.topology.validate(index)
             node = self.nodes[index]
+            if self.hello and not node.activated:
+                raise PlaygroundError("add %s before waking it" % node.name)
             if node.process is not None or node.status in {"starting", "ready"}:
                 self.sink.emit("info", text="node %d is already running" % index)
                 return
             node.desired_online = True
-            self._spawn_node(index)
-            self._finish_node_start(index)
+            restart = []
+            if self.network_provenance == "nearby":
+                restart = [
+                    candidate
+                    for candidate, peer in enumerate(self.nodes)
+                    if candidate != index
+                    and peer.activated
+                    and peer.desired_online
+                    and peer.process is not None
+                ]
+                if restart:
+                    self._stop_indexes(
+                        restart,
+                        reason="opening-nearby-window",
+                        desired=True,
+                    )
+            started: List[int] = []
+            try:
+                for item in restart + [index]:
+                    self._spawn_node(item)
+                    started.append(item)
+                for item in started:
+                    self._finish_node_start(item)
+            except BaseException:
+                self.had_process_failure = True
+                self._stop_indexes(
+                    reversed(started),
+                    reason="node-start-failure",
+                    desired=False,
+                )
+                raise
 
     def _stop_indexes(self, indexes: Iterable[int], reason: str, desired: bool) -> None:
         errors: List[str] = []
@@ -1719,10 +1977,11 @@ class PlaygroundController:
             for item in indexes:
                 node = self.nodes[item]
                 peers = ",".join(str(peer) for peer in sorted(self.topology.neighbors(item))) or "none"
+                label = self.node_label(item)
                 parts.append(
-                    "n%d %s observer=%s sync=%s contacts=%d failures=%d seen=%d peers=%s pid=%s"
+                    "%s %s observer=%s sync=%s contacts=%d failures=%d seen=%d peers=%s pid=%s"
                     % (
-                        item,
+                        label,
                         node.status,
                         node.observer,
                         sync_label(node.sync),
@@ -1734,6 +1993,26 @@ class PlaygroundController:
                     )
                 )
             return " | ".join(parts)
+
+    def _authenticated_neighbors(self, index: int) -> List[int]:
+        """Return peers backed by an authenticated-contact status observation."""
+
+        node = self.nodes[index]
+        authenticated: Set[int] = set()
+        for status in node.peers:
+            authorization = str(status.get("authorization", "")).lower()
+            try:
+                contacts = int(status.get("authenticatedContacts", "0"))
+                peer = decode_b64(status.get("peer"), "peer status identity", 32).hex()
+            except (PlaygroundError, TypeError, ValueError):
+                continue
+            if contacts <= 0 or "active" not in authorization or "revoked" in authorization:
+                continue
+            for candidate in self.nodes:
+                if candidate.init.mission_id == peer:
+                    authenticated.add(candidate.init.index)
+                    break
+        return sorted(authenticated)
 
     def resolve_alias(self, value: str) -> EventRecord:
         with self._lock:
@@ -1837,10 +2116,20 @@ class PlaygroundController:
         with self._lock:
             return {
                 "root": str(self.root),
+                "experience": "hello" if self.hello else "playground",
+                "networkProvenance": self.network_provenance,
+                "nearbyWindowSeconds": (
+                    self.nearby_window_seconds
+                    if self.network_provenance == "nearby"
+                    else 0
+                ),
+                "selectedNode": self.selected_index,
                 "isolated": sorted(self.topology.isolated),
                 "nodes": [
                     {
                         "index": index,
+                        "name": node.name,
+                        "activated": node.activated,
                         "status": node.status,
                         "pid": node.pid,
                         "sync": sync_label(node.sync),
@@ -1848,6 +2137,7 @@ class PlaygroundController:
                         "failures": node.failed_contacts,
                         "seen": len(node.seen),
                         "neighbors": sorted(self.topology.neighbors(index)),
+                        "authenticatedNeighbors": self._authenticated_neighbors(index),
                         "observer": node.observer,
                         "observerError": node.observer_error,
                         "error": node.error,
@@ -1918,7 +2208,132 @@ def sync_label(value: object) -> str:
     return text.lower().replace("_", "-")
 
 
+def render_hello_dashboard(
+    snapshot: Mapping[str, object],
+    width: int,
+    height: int,
+    unicode: bool,
+) -> List[str]:
+    """Render the staged Field Notes story without broadening evidence claims."""
+
+    width = max(1, width)
+    height = max(6, height)
+    raw_nodes = snapshot.get("nodes", [])
+    raw_events = snapshot.get("events", [])
+    nodes = [node for node in raw_nodes if isinstance(node, dict)] if isinstance(raw_nodes, list) else []
+    events = [event for event in raw_events if isinstance(event, dict)] if isinstance(raw_events, list) else []
+    isolated = set(snapshot.get("isolated", []))
+    activated = sum(1 for node in nodes if node.get("activated"))
+    awake = sum(1 for node in nodes if node.get("status") == "ready")
+    route = snapshot.get("networkProvenance")
+    if route == "nearby":
+        provenance = (
+            "ROUTE nearby · %ss locator windows · carrier/direct-address hints only · no fallback"
+            % safe_text(snapshot.get("nearbyWindowSeconds", "?"))
+        )
+    else:
+        provenance = "ROUTE invitation · controller-known loopback locators · no fallback"
+
+    lines = [
+        "ASTER FIELD NOTES  %d/%d joined · %d awake" % (activated, len(nodes), awake),
+        BOUNDARY,
+        provenance,
+        "Names stay in this local display; they are not discovery metadata.",
+        "",
+        "Constellation (solid = authenticated contact observed; dots = provisioned roster)",
+    ]
+
+    labels: List[str] = []
+    for node in nodes:
+        status = node.get("status")
+        if status == "ready":
+            marker = "●"
+        elif status in {"starting", "reconfiguring", "stopping"}:
+            marker = "◐"
+        elif status == "failed":
+            marker = "×"
+        else:
+            marker = "○"
+        label = "%s %s" % (marker, safe_text(node.get("name") or "n%s" % node.get("index"), 16))
+        if node.get("index") == snapshot.get("selectedNode"):
+            label += "*"
+        labels.append(label)
+
+    if width >= 64 and labels:
+        current = ""
+        for offset, label in enumerate(labels):
+            separator = ""
+            if offset:
+                left = nodes[offset - 1]
+                right = nodes[offset]
+                left_index = int(left.get("index", offset - 1))
+                right_index = int(right.get("index", offset))
+                if left_index in isolated or right_index in isolated:
+                    separator = "  ×  "
+                else:
+                    left_auth = set(left.get("authenticatedNeighbors", []))
+                    right_auth = set(right.get("authenticatedNeighbors", []))
+                    observed = right_index in left_auth or left_index in right_auth
+                    separator = " ─── " if observed else " ··· "
+            candidate = current + separator + label
+            if current and len(terminal_text(candidate, unicode)) > width:
+                lines.append(current)
+                current = label
+            else:
+                current = candidate
+        if current:
+            lines.append(current)
+    else:
+        for node, label in zip(nodes, labels):
+            state = "not added" if not node.get("activated") else safe_text(node.get("status"), 16)
+            lines.append("  %-18s %s" % (label, state))
+
+    lines.extend(["", "Field notes (presence comes only from exact QueryEvents results)"])
+    if not events:
+        if activated == 0 and nodes:
+            lines.append("  Begin with: add %s" % safe_text(nodes[0].get("name", "atlas"), 16))
+        else:
+            lines.append("  No notes yet. Use: note TEXT")
+    else:
+        available = max(1, min(6, height - len(lines) - 4))
+        names = {
+            int(node.get("index", index)): safe_text(node.get("name") or "n%d" % index, 16)
+            for index, node in enumerate(nodes)
+        }
+        for event in events[-available:]:
+            seen = set(event.get("seen", []))
+            cells = "".join("✓" if int(node.get("index", 0)) in seen else "·" for node in nodes)
+            publisher = event.get("publisherNode")
+            publisher_text = names.get(publisher, "unknown")
+            lines.append(
+                "  %s from %s  %s  [%s] %d/%d"
+                % (
+                    safe_text(event.get("alias", "?"), 12),
+                    publisher_text,
+                    safe_text(event.get("text", ""), max(12, width // 3)),
+                    cells,
+                    len(seen),
+                    len(nodes),
+                )
+            )
+    lines.extend(
+        [
+            "",
+            "Commands: add · use · note · sleep/wake · status · help · quit",
+        ]
+    )
+    rendered = [truncate(line, width, unicode) for line in lines]
+    if len(rendered) <= height:
+        return rendered
+    keep = rendered[:4]
+    command = rendered[-1]
+    middle_budget = max(1, height - len(keep) - 1)
+    return (keep + rendered[-(middle_budget + 1) : -1] + [command])[:height]
+
+
 def render_dashboard(snapshot: Mapping[str, object], width: int, height: int, unicode: bool) -> List[str]:
+    if snapshot.get("experience") == "hello":
+        return render_hello_dashboard(snapshot, width, height, unicode)
     width = max(1, width)
     height = max(6, height)
     nodes = snapshot.get("nodes", [])
@@ -2030,6 +2445,11 @@ HELP_TEXT = (
     "status [NODE] | wait-seen MESSAGE NODE[,NODE...] [SECONDS] | "
     "assert-unseen MESSAGE NODE[,NODE...] | wait-all [SECONDS] | help | quit"
 )
+HELLO_HELP_TEXT = (
+    "add NAME | use NAME | note TEXT | sleep NAME | wake NAME | status [NAME] | "
+    "wait-seen MESSAGE NAME[,NAME...] [SECONDS] | wait-all [SECONDS] | help | quit; "
+    "advanced: send/isolate/rejoin/assert-unseen"
+)
 
 
 class CommandProcessor:
@@ -2044,6 +2464,9 @@ class CommandProcessor:
         except ValueError as error:
             raise PlaygroundError("node index must be an integer") from error
 
+    def _node_index(self, value: str) -> int:
+        return self.controller.resolve_node(value)
+
     def execute(self, line: str) -> bool:
         self.last_notice = ""
         stripped = line.strip()
@@ -2054,36 +2477,70 @@ class CommandProcessor:
         if command in {"quit", "q", "exit"}:
             return True
         if command in {"help", "?"}:
-            self.controller.sink.emit("info", text=HELP_TEXT)
-            self.last_notice = HELP_TEXT
+            help_text = HELLO_HELP_TEXT if self.controller.hello else HELP_TEXT
+            self.controller.sink.emit("info", text=help_text)
+            self.last_notice = help_text
+            return False
+        if command == "add":
+            arguments = remainder.split()
+            if len(arguments) != 1:
+                raise PlaygroundError("usage: add NAME")
+            index = self._node_index(arguments[0])
+            self.controller.add_node(index)
+            name = self.controller.node_label(index)
+            self.last_notice = "%s is awake and selected. Write a field note with: note TEXT" % name
+            return False
+        if command == "use":
+            arguments = remainder.split()
+            if len(arguments) != 1:
+                raise PlaygroundError("usage: use NAME")
+            index = self._node_index(arguments[0])
+            self.controller.select_node(index)
+            self.last_notice = "%s is selected for the next field note." % self.controller.node_label(index)
+            return False
+        if command == "note":
+            text = remainder.strip()
+            if not text:
+                raise PlaygroundError("usage: note TEXT")
+            index = self.controller.selected_index
+            if index is None:
+                raise PlaygroundError("add or use a field node before writing a note")
+            alias = self.controller.send(index, text)
+            self.last_notice = (
+                "%s accepted at %s; exact presence is still being queried."
+                % (alias, self.controller.node_label(index))
+            )
             return False
         if command == "send":
             node_text, separator, text = remainder.strip().partition(" ")
             if not separator or not text:
                 raise PlaygroundError("usage: send NODE TEXT")
-            alias = self.controller.send(self._index(node_text), text)
+            alias = self.controller.send(self._node_index(node_text), text)
             self.last_notice = "%s accepted locally; exact node presence is still being queried." % alias
             return False
-        if command in {"isolate", "rejoin", "stop", "start"}:
+        if command in {"isolate", "rejoin", "stop", "start", "sleep", "wake"}:
             arguments = remainder.split()
             if len(arguments) != 1:
                 raise PlaygroundError("usage: %s NODE" % command)
-            index = self._index(arguments[0])
-            if command == "stop":
+            index = self._node_index(arguments[0])
+            if command in {"stop", "sleep"}:
                 self.controller.stop_node(index)
-            elif command == "start":
+            elif command in {"start", "wake"}:
                 self.controller.start_node(index)
             elif command == "isolate":
                 self.controller.isolate(index)
             else:
                 self.controller.rejoin(index)
-            self.last_notice = "%s n%d completed." % (command, index)
+            self.last_notice = "%s %s completed." % (
+                command,
+                self.controller.node_label(index),
+            )
             return False
         if command == "status":
             arguments = remainder.split()
             if len(arguments) > 1:
                 raise PlaygroundError("usage: status [NODE]")
-            index = self._index(arguments[0]) if arguments else None
+            index = self._node_index(arguments[0]) if arguments else None
             self.controller.status(index)
             self.last_notice = self.controller.status_summary(index)
             return False
@@ -2104,7 +2561,7 @@ class CommandProcessor:
             if len(arguments) not in {2, 3}:
                 raise PlaygroundError("usage: wait-seen MESSAGE NODE[,NODE...] [SECONDS]")
             try:
-                indexes = [self._index(value) for value in arguments[1].split(",") if value]
+                indexes = [self._node_index(value) for value in arguments[1].split(",") if value]
             except PlaygroundError:
                 raise
             if not indexes:
@@ -2124,7 +2581,7 @@ class CommandProcessor:
             arguments = remainder.split()
             if len(arguments) != 2:
                 raise PlaygroundError("usage: assert-unseen MESSAGE NODE[,NODE...]")
-            indexes = [self._index(value) for value in arguments[1].split(",") if value]
+            indexes = [self._node_index(value) for value in arguments[1].split(",") if value]
             if not indexes:
                 raise PlaygroundError("assert-unseen requires at least one node")
             self.controller.assert_unseen(arguments[0], indexes)
@@ -2195,9 +2652,13 @@ def read_command_line(source: TextIO) -> Optional[str]:
 
 def run_repl(processor: CommandProcessor, sink: EventSink, raw: bool) -> None:
     prompt_stream = sys.stderr if raw else sys.stdout
-    sink.emit("info", text=HELP_TEXT)
+    sink.emit(
+        "info",
+        text=HELLO_HELP_TEXT if processor.controller.hello else HELP_TEXT,
+    )
+    prompt = "field-notes> " if processor.controller.hello else "playground> "
     while True:
-        prompt_stream.write("playground> ")
+        prompt_stream.write(prompt)
         prompt_stream.flush()
         try:
             line = read_command_line(sys.stdin)
@@ -2234,7 +2695,11 @@ def run_tui(processor: CommandProcessor, controller: PlaygroundController) -> No
         screen.keypad(True)
         screen.timeout(100)
         command = ""
-        notice = "Type help for commands. Presence is queried, never inferred."
+        notice = (
+            "Begin with add atlas. Nearby and invitation never silently replace each other."
+            if controller.hello
+            else "Type help for commands. Presence is queried, never inferred."
+        )
 
         def redraw() -> None:
             height, width = screen.getmaxyx()
@@ -2251,7 +2716,7 @@ def run_tui(processor: CommandProcessor, controller: PlaygroundController) -> No
                     screen.addnstr(row, 0, line, max(1, width - 1))
                 notice_row = min(content_height, max(0, height - 2))
                 screen.addnstr(notice_row, 0, truncate(notice, max(1, width - 1)), max(1, width - 1))
-                prompt = "command> " + command
+                prompt = ("field-note> " if controller.hello else "command> ") + command
                 screen.addnstr(max(0, height - 1), 0, prompt, max(1, width - 1))
                 screen.move(max(0, height - 1), min(max(0, width - 1), len(prompt)))
                 screen.refresh()
@@ -2314,6 +2779,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--aster", type=Path, required=True, help="path to the aster CLI")
     parser.add_argument("--agent", type=Path, required=True, help="path to aster-agent")
     parser.add_argument("--nodes", type=int, required=True, help="real process count (2..32)")
+    parser.add_argument(
+        "--hello",
+        action="store_true",
+        help="stage a named, human-driven Field Notes hello experience",
+    )
+    parser.add_argument(
+        "--network",
+        choices=("nearby", "invitation"),
+        help="explicit hello route source; no automatic fallback",
+    )
     parser.add_argument("--root", type=Path, help="fresh retained playground root")
     parser.add_argument(
         "--view",
@@ -2363,6 +2838,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not MIN_NODES <= arguments.nodes <= MAX_NODES:
         print("playground error: --nodes must be within 2..32", file=sys.stderr)
         return 2
+    if arguments.hello and arguments.network is None:
+        print(
+            "playground error: --hello requires an explicit --network nearby or invitation",
+            file=sys.stderr,
+        )
+        return 2
+    if not arguments.hello and arguments.network is not None:
+        print("playground error: --network is available only with --hello", file=sys.stderr)
+        return 2
     try:
         startup_timeout = bounded_timeout(
             arguments.startup_timeout,
@@ -2408,9 +2892,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ):
             view = "plain"
         if view in {"plain", "tui"}:
+            if arguments.hello:
+                progress = "ASTER FIELD NOTES  provisioning %d disposable roster slots..." % arguments.nodes
+            else:
+                progress = "ASTER MESH PLAYGROUND  provisioning %d real processes..." % arguments.nodes
             sys.stdout.write(
                 terminal_text(
-                    "ASTER MESH PLAYGROUND  provisioning %d real processes..." % arguments.nodes,
+                    progress,
                     supports_unicode(sys.stdout),
                 )
                 + "\n"
@@ -2424,6 +2912,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             sink,
             startup_timeout=startup_timeout,
             poll_seconds=arguments.poll_ms / 1000.0,
+            hello=arguments.hello,
+            network_provenance=arguments.network or "direct",
         )
         controller.start()
         if view == "tui":

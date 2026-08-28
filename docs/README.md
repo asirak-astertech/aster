@@ -7,8 +7,10 @@ understand Aster's wire format or cryptography before building an application.
 
 1. Read [Core concepts](concepts.md) for the mental model: items, topics,
    scopes, data classes, and contacts.
-2. Run the [capability tour](quickstart/capability-tour.md) to watch real nodes
-   publish offline and synchronize later. Then use the
+2. Start with [Aster Field Notes](quickstart/hello.md) to add named real nodes,
+   write offline, and watch exact observations move. Run the
+   [capability tour](quickstart/capability-tour.md) for deterministic receipts,
+   then use the
    [message playground](quickstart/message-playground.md) to keep a bounded
    local line running and publish synthetic Events through different nodes.
 3. Choose an integration path. Most applications should begin with the
@@ -27,7 +29,8 @@ understand Aster's wire format or cryptography before building an application.
 | I want to… | Read… |
 |---|---|
 | Understand what Aster is and when it fits | [Project overview](../README.md) and [Core concepts](concepts.md) |
-| See Aster work quickly | [Capability tour](quickstart/capability-tour.md) |
+| Meet Aster through a human-driven three-node story | [Aster Field Notes](quickstart/hello.md) |
+| See deterministic acceptance evidence | [Capability tour](quickstart/capability-tour.md) |
 | Send messages through several live local node processes | [Message playground](quickstart/message-playground.md) |
 | Call Aster from Connect, gRPC, or gRPC-Web | [Local ConnectRPC agent](quickstart/connect-agent.md) |
 | Use the live Event API from Rust | [Selected Event API](quickstart/selected-event-api.md) |

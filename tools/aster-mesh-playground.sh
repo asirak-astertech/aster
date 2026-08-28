@@ -85,7 +85,8 @@ if [ -z "$aster_bin" ] || [ -z "$agent_bin" ]; then
     --stdout-receipt "$build_receipt" \
     --stderr-receipt "$build_stderr" -- \
     cargo build --locked --manifest-path "$repo_root/Cargo.toml" \
-      -p aster-node -p aster-agent --bins --message-format=json; then
+      -p aster-node -p aster-agent --bins \
+      --features aster-agent/nearby-discovery --message-format=json; then
     :
   else
     build_status=$?

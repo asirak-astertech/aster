@@ -60,6 +60,8 @@ pub use runtime::{
     format_control_transfer_id, inspect_store, put_opaque, run_demo, run_demo_scenario, run_node,
     run_node_with_forwarding, start_node, start_node_with_forwarding, zeroize_node,
 };
+#[cfg(feature = "nearby-discovery")]
+pub use runtime::{MAX_NEARBY_DISCOVERY_WINDOW, MissionNearbyPeer};
 
 use aster_mesh::NodeId;
 use aster_profile::ItemId;

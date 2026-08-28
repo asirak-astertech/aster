@@ -106,6 +106,27 @@ observation; missing or continuity-lost observation becomes Unknown and records
 loss of fidelity. These fields are operational diagnostics and are never
 authorization or success inputs.
 
+### Nearby discovery metadata boundary
+
+The default selected Iroh endpoint installs no address lookup. An explicitly
+feature-gated demo/evaluation mode may install the official Iroh mDNS provider
+for at most 30 seconds under normal emission policy. Its DNS-SD records carry
+only the Iroh carrier identity and direct IP address hints. Aster configures no
+lookup user data, and node names, mission identities, authorities, topic/scope,
+priority, membership, inventory, and payload are not discovery metadata.
+
+This is best-effort metadata minimization, not metadata secrecy. Any on-link
+observer can still infer Aster service presence, stable carrier identity during
+that identity's lifetime, IP/port, timing, and packet sizes. The mission
+handshake and protected Event metadata begin only after Iroh authenticates an
+exact provisioned carrier identity. Discovery never grants admission.
+
+Continuous discovery is deliberately not selected: prior measurement found
+material recurring traffic, and the provider's internal peer maps are not
+hostile-cardinality bounded. Expiry or shutdown clears the provider, while
+invitation mode produces no recurring discovery traffic. See
+[Nearby discovery FOSS selection](evaluations/0005/nearby-discovery-selection.md).
+
 The controlled Iroh relay is transport infrastructure, not an Aster mission
 node: it has no Aster store or route grant. The payload-blind Aster Event relay
 below is instead a mission node with route-only Event custody, and route-only
