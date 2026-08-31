@@ -1,6 +1,6 @@
 # Production implementation requirements status
 
-- Status date: 2026-08-28
+- Status date: 2026-08-31
 - Requirements authority: [`data-mesh-requirements.md`](../../data-mesh-requirements.md)
 - Requirements SHA-256: `e88bcc6c717a5175a460205fdc084aaa2e1f020a142a84087f9881677da02987`
 - Planning view: [`capability-roadmap.md`](capability-roadmap.md)
@@ -214,10 +214,12 @@ conservative generated claim boundary.
 
 The current generated totals are 43 `implemented-uncredited`, 84
 `observed-bounded`, and 221 `open` rows. The exact selected-mapping count is
-131 and is validated from the generated trace. Thirteen exact rows additionally
-carry the Decision 0033 policy disposition without changing those totals or
-their selected evidence. The selected live Event receipt
-moves exactly `DM-5.1-05` through `DM-5.1-07`, `DM-5.2-06`, `DM-5.2-07`,
+132 and is validated from the generated trace. This corrects the earlier
+2026-08-28 prose value of 131 after re-running the current trace checker; no
+selected status, evidence boundary, requirement disposition, or total changes.
+Thirteen exact rows additionally carry the Decision 0033 policy disposition
+without changing those totals or their selected evidence. The selected live
+Event receipt moves exactly `DM-5.1-05` through `DM-5.1-07`, `DM-5.2-06`, `DM-5.2-07`,
 and `DM-5.5-02` from `implemented-uncredited` to `observed-bounded`. It changes
 no `open` row and strengthens, without another status movement, `DM-5.2-08`,
 `DM-6-06`, `DM-7-16`, and `DM-7-17`. No broader `DM-7` or other class row
@@ -517,7 +519,8 @@ backend and protected stock CLI/bindings, automatic or atomic revocation-to-reke
 remediation, independent interoperability/review, and release/dependency
 admission.
 
-Against the six-item high-leverage closure sequence:
+Against this six-item selected-lane evidence and gap inventory, which is not a
+priority order:
 
 1. **Selected Event live surface — implemented, not accepted complete.** PR C
    composes publish/query/subscribe/poll/ack, unsubscribe, authenticated gaps,
@@ -626,18 +629,14 @@ Against the six-item high-leverage closure sequence:
    signed release — open external/release gates.** No production authorization
    follows from the implementation slices.
 
-The next implementation sequence must extend the bounded item-2 data lanes
-through broader Record-delivery partitions and carriers, networked and longer-
-retention Blob-delivery acceptance, any required State materialized-view or synthetic-withdrawal
-contract, dynamic network-interest administration, Blob peer/convergence
-status,
-broader partition and relay acceptance, larger/resource evidence, process/crash
-and longer-offline Blob recovery, and representative usability acceptance
-without weakening the custody or protected-administration stack. Item 4's admitted
-operational backend, live startup/CLI/bindings, recovery, and coordinated
-lifecycle remain separate work. Items 1 through 5 retain their stated
-acceptance and composition gaps; completing one code slice does not silently
-satisfy those gates.
+The dependency-aware implementation priorities and exit criteria are maintained
+in the [capability roadmap](capability-roadmap.md). Before broader multi-hop,
+long-retention, public-binding, or supported-profile claims, that roadmap now
+gates the relevant work on causal/lifecycle design and runs executable
+conformance, operational security, and physical carrier risk as parallel
+foundational tracks. The inventory above remains the evidence authority for its
+stated gaps; completing one code slice or crossing a planning gate does not
+silently satisfy them.
 
 ### Current live selected Blob mechanism
 
@@ -727,8 +726,8 @@ release authorization remain open.
 
 ### First selected Event API stack
 
-The first sequence item is deliberately split so the selected store keeps one
-authority and each claim can be tested independently:
+The historical Event API work was deliberately split so the selected store
+keeps one authority and each claim can be tested independently:
 
 1. **PR A — foundation:** `SelectedEventNode` publishes arbitrary
    policy-authorized Events idempotently and performs bounded acceptance-marker
@@ -777,7 +776,7 @@ external decisions rather than values inferred by this implementation.
 
 ### First selected State API slice
 
-The next stack begins State without changing the Event wire:
+The later State stack began without changing the Event wire:
 
 1. **Typed source capabilities:** `aster-core::source_state` constrains the
    existing source-envelope provider to State and distinguishes route-verified
@@ -2470,7 +2469,7 @@ only a process-local report about each active configured peer's most recent
 bounded authenticated negotiation. Gap absence remains limited to freshly
 verified positions already observed by the local store. Selector replacement
 remains unsubscribe followed by subscribe, not an atomic update. These checks
-alone do not close State/Record/Blob or any later item in the six-step sequence.
+alone do not close State/Record/Blob or any broader selected-lane capability.
 The prior Blob evidence below is the historical stopped/local freeze; the newer
 semantic-v5 network slice has separate current-code evidence and does not
 relabel this PR-C result.
