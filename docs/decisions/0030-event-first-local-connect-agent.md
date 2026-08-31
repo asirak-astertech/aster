@@ -1,6 +1,5 @@
 # Decision 0030: Admit a bounded Event-first local ConnectRPC agent
 
-> ****
 
 - Status: accepted for an alpha implementation slice; production and release
   gates remain open
@@ -136,3 +135,26 @@ not shipped.
   operational observability, and deployment acceptance.
 - State and Record RPCs remain blocked on live handle-backed application APIs,
   not on their already-present mesh reconciliation lanes.
+
+## Maintenance review — serde_json 1.0.151 (2026-08-31)
+
+The exact direct `serde_json` pin advances from 1.0.145 to 1.0.151. The locked
+runtime graph replaces `ryu` on this path with `zmij` 1.0.23; both direct and
+transitive versions remain exact in `Cargo.lock`. Upstream also raises
+serde_json's compiler floor from Rust 1.61 to 1.71, below Aster's Rust 1.91
+minimum, rejects malformed non-string enum object keys, and adds an unsafe raw
+value constructor behind a feature Aster does not enable.
+
+The provider's finite-float formatter changes from `ryu` to `zmij`. Aster's
+checked-in ConnectRPC schema contains no `float` or `double` fields and the
+resolved serde_json graph enables only the default and `std` features, not
+`arbitrary_precision`, `preserve_order`, or `raw_value`. Consequently this
+maintenance update does not change the selected Protobuf wire profile or any
+currently exposed ConnectRPC JSON field representation. That boundary must be
+reviewed again before adding floating-point fields or enabling another
+serde_json feature.
+
+This review changes no requirement evidence, production authorization, or
+independent-interoperability claim. The locked workspace tests, generated-schema
+checks, dependency policy, MSRV lane, and real ConnectRPC integration remain the
+acceptance evidence.
