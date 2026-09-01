@@ -358,6 +358,7 @@ dependencies = [
  "iroh-relay",
  "rcgen 0.14.9",
  "rustls",
+ "swarm-discovery",
  "tokio",
 ]
 

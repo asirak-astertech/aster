@@ -31,6 +31,7 @@
 #![forbid(unsafe_code)]
 
 pub mod application;
+pub mod bridge_runtime;
 pub mod control_admin;
 mod frame;
 mod identity;
@@ -61,7 +62,9 @@ pub use runtime::{
     run_node_with_forwarding, start_node, start_node_with_forwarding, zeroize_node,
 };
 #[cfg(feature = "nearby-discovery")]
-pub use runtime::{MAX_NEARBY_DISCOVERY_WINDOW, MissionNearbyPeer};
+pub use runtime::{
+    MAX_NEARBY_DISCOVERY_IPV4_INTERFACES, MAX_NEARBY_DISCOVERY_WINDOW, MissionNearbyPeer,
+};
 
 use aster_mesh::NodeId;
 use aster_profile::ItemId;

@@ -1,0 +1,167 @@
+# Copyright 2026 Defense Unicorns, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+# Exactly five long-running nodes form an intentionally disjoint
+# alpha -> parent -> bravo topology. Only the bridge roles are dual-homed.
+# A sixth, networkless one-shot service creates the shared randomized mission
+# and bridge authorization artifacts before any node is allowed to start.
+# These are ordinary unpublished user-defined bridges rather than Docker
+# `internal` networks: swarm-discovery requires a default route to initialize
+# its mDNS socket. Exact membership still prevents direct alpha/bravo contact.
+
+x-image: &image
+  image: ${ASTER_HIERARCHY_MVP_IMAGE:-aster-hierarchy-mvp:local}
+  build:
+    context: ../..
+    dockerfile: docker/hierarchy-mvp/Dockerfile
+
+x-node: &node
+  <<: *image
+  user: "10001:10001"
+  init: true
+  read_only: true
+  restart: "no"
+  command: [run]
+  depends_on:
+    init:
+      condition: service_completed_successfully
+      required: true
+  environment: &node-environment
+    ASTER_STATE_DIR: /state
+    ASTER_DISCOVER_LAN: "1"
+    ASTER_NEARBY_WINDOW: "3"
+    ASTER_SYNC_MS: "500"
+    HOME: /tmp
+  tmpfs:
+    - /tmp:rw,nosuid,nodev,noexec,size=16m,mode=0700,uid=10001,gid=10001
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+  stop_signal: SIGINT
+  stop_grace_period: 15s
+  logging:
+    driver: json-file
+    options:
+      max-size: 2m
+      max-file: "2"
+
+services:
+  init:
+    <<: *image
+    user: "10001:10001"
+    read_only: true
+    restart: "no"
+    command: [init, --root, /provision]
+    network_mode: none
+    environment:
+      HOME: /tmp
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=8m,mode=0700,uid=10001,gid=10001
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - publisher-state:/provision/publisher
+      - bridge-alpha-state:/provision/bridge-alpha
+      - bridge-bravo-state:/provision/bridge-bravo
+      - consumer-state:/provision/consumer
+      - outsider-state:/provision/outsider
+
+  publisher:
+    <<: *node
+    environment:
+      <<: *node-environment
+      ASTER_DISCOVER_LAN: ${ASTER_PUBLISHER_DISCOVER_LAN:-1}
+      ASTER_HIERARCHY_ROLE: publisher
+      ASTER_NEARBY_IPV4_INTERFACES: 172.30.251.10
+    networks:
+      alpha:
+        ipv4_address: 172.30.251.10
+    volumes:
+      - publisher-state:/state
+
+  bridge-alpha:
+    <<: *node
+    environment:
+      <<: *node-environment
+      ASTER_DISCOVER_LAN: ${ASTER_BRIDGE_ALPHA_DISCOVER_LAN:-1}
+      ASTER_HIERARCHY_ROLE: bridge-alpha
+      ASTER_NEARBY_IPV4_INTERFACES: 172.30.251.11,172.30.252.11
+    networks:
+      alpha:
+        ipv4_address: 172.30.251.11
+      parent:
+        ipv4_address: 172.30.252.11
+    volumes:
+      - bridge-alpha-state:/state
+
+  bridge-bravo:
+    <<: *node
+    environment:
+      <<: *node-environment
+      ASTER_DISCOVER_LAN: ${ASTER_BRIDGE_BRAVO_DISCOVER_LAN:-1}
+      ASTER_HIERARCHY_ROLE: bridge-bravo
+      ASTER_NEARBY_IPV4_INTERFACES: 172.30.252.12,172.30.253.12
+    networks:
+      parent:
+        ipv4_address: 172.30.252.12
+      bravo:
+        ipv4_address: 172.30.253.12
+    volumes:
+      - bridge-bravo-state:/state
+
+  consumer:
+    <<: *node
+    environment:
+      <<: *node-environment
+      ASTER_DISCOVER_LAN: ${ASTER_CONSUMER_DISCOVER_LAN:-1}
+      ASTER_HIERARCHY_ROLE: consumer
+      ASTER_NEARBY_IPV4_INTERFACES: 172.30.253.13
+    networks:
+      bravo:
+        ipv4_address: 172.30.253.13
+    volumes:
+      - consumer-state:/state
+
+  outsider:
+    <<: *node
+    environment:
+      <<: *node-environment
+      ASTER_DISCOVER_LAN: ${ASTER_OUTSIDER_DISCOVER_LAN:-1}
+      ASTER_HIERARCHY_ROLE: outsider
+      ASTER_NEARBY_IPV4_INTERFACES: 172.30.252.14
+    networks:
+      parent:
+        ipv4_address: 172.30.252.14
+    volumes:
+      - outsider-state:/state
+
+networks:
+  alpha:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_icc: "true"
+    ipam:
+      config:
+        - subnet: 172.30.251.0/24
+  parent:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_icc: "true"
+    ipam:
+      config:
+        - subnet: 172.30.252.0/24
+  bravo:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_icc: "true"
+    ipam:
+      config:
+        - subnet: 172.30.253.0/24
+
+volumes:
+  publisher-state: {}
+  bridge-alpha-state: {}
+  bridge-bravo-state: {}
+  consumer-state: {}
+  outsider-state: {}

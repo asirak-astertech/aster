@@ -91,6 +91,8 @@ const SEMANTIC_PROTOCOL_V3: u16 = super::SEMANTIC_PROTOCOL_V3;
 const SEMANTIC_PROTOCOL_V4: u16 = super::SEMANTIC_PROTOCOL_V4;
 #[cfg(test)]
 const SEMANTIC_PROTOCOL_V5: u16 = super::SEMANTIC_PROTOCOL_V5;
+#[cfg(test)]
+const SEMANTIC_PROTOCOL_V6: u16 = super::SEMANTIC_PROTOCOL_V6;
 const SUITE_ID: u16 = super::HYBRID_SUITE_ID;
 const PUBLIC_HEADER_LEN: usize = 44;
 const SELECTOR_LEN: usize = 16;
@@ -6349,6 +6351,7 @@ fn parse_batch_envelope(
             | MIN_CUSTODY_SEMANTIC_VERSION
             | super::SEMANTIC_PROTOCOL_V4
             | super::SEMANTIC_PROTOCOL_V5
+            | super::SEMANTIC_PROTOCOL_V6
     ) {
         return Err(authentication_failed());
     }
@@ -9886,7 +9889,7 @@ mod tests {
     }
 
     #[test]
-    fn mission_proof_rejects_stripping_v5_from_the_default_offer() {
+    fn mission_proof_rejects_stripping_v6_from_the_default_offer() {
         let mut provisioner = ReferenceProvisioner::from_seed([0x74; 32])
             .unwrap_or_else(|error| panic!("provisioner failed: {error}"));
         let initiator_bundle = provisioner
@@ -9902,6 +9905,7 @@ mod tests {
         assert_eq!(
             hello.supported_versions,
             vec![
+                SEMANTIC_PROTOCOL_V6,
                 SEMANTIC_PROTOCOL_V5,
                 SEMANTIC_PROTOCOL_V4,
                 SEMANTIC_PROTOCOL_V3,
@@ -9913,6 +9917,7 @@ mod tests {
         assert_eq!(
             hello.supported_versions,
             vec![
+                SEMANTIC_PROTOCOL_V5,
                 SEMANTIC_PROTOCOL_V4,
                 SEMANTIC_PROTOCOL_V3,
                 SEMANTIC_PROTOCOL_V2,
@@ -9944,6 +9949,7 @@ mod tests {
         assert_eq!(
             default_hello.supported_versions,
             vec![
+                SEMANTIC_PROTOCOL_V6,
                 SEMANTIC_PROTOCOL_V5,
                 SEMANTIC_PROTOCOL_V4,
                 SEMANTIC_PROTOCOL_V3,
@@ -9969,8 +9975,8 @@ mod tests {
             .unwrap_or_else(|error| panic!("server finished failed: {error}"));
         assert_eq!(initiator_session.peer_identity(), responder_id);
         assert_eq!(responder_session.peer_identity(), initiator_id);
-        assert_eq!(initiator_session.semantic_version(), SEMANTIC_PROTOCOL_V5);
-        assert_eq!(responder_session.semantic_version(), SEMANTIC_PROTOCOL_V5);
+        assert_eq!(initiator_session.semantic_version(), SEMANTIC_PROTOCOL_V6);
+        assert_eq!(responder_session.semantic_version(), SEMANTIC_PROTOCOL_V6);
 
         let frame = initiator_session
             .seal_frame(b"opaque replication frame")
@@ -12486,7 +12492,7 @@ mod tests {
     }
 
     #[test]
-    fn on_path_rewrite_of_an_offered_v5_selection_to_v4_fails_authentication() {
+    fn on_path_rewrite_of_an_offered_v6_selection_to_v5_fails_authentication() {
         let mut provisioner = ReferenceProvisioner::from_seed([0x8e; 32])
             .unwrap_or_else(|error| panic!("provisioner failed: {error}"));
         let initiator_bundle = provisioner
@@ -12503,6 +12509,7 @@ mod tests {
         assert_eq!(
             hello.supported_versions,
             vec![
+                SEMANTIC_PROTOCOL_V6,
                 SEMANTIC_PROTOCOL_V5,
                 SEMANTIC_PROTOCOL_V4,
                 SEMANTIC_PROTOCOL_V3,
@@ -12517,12 +12524,12 @@ mod tests {
             .unwrap_or_else(|error| panic!("client flight failed: {error}"));
         let mut server_hello = decode_server_flight(&second_flight)
             .unwrap_or_else(|error| panic!("server flight decode failed: {error}"));
-        assert_eq!(server_hello.selected_version, SEMANTIC_PROTOCOL_V5);
+        assert_eq!(server_hello.selected_version, SEMANTIC_PROTOCOL_V6);
 
-        // Version 4 was genuinely offered, so membership checks alone would
+        // Version 5 was genuinely offered, so membership checks alone would
         // accept it. The rewrite must still fail because selection is bound
         // into the transcript, key schedule, confirmation, and server auth.
-        server_hello.selected_version = SEMANTIC_PROTOCOL_V4;
+        server_hello.selected_version = SEMANTIC_PROTOCOL_V5;
         let rewritten = encode_server_flight(&server_hello)
             .unwrap_or_else(|error| panic!("rewritten server flight encode failed: {error}"));
         assert!(initiator.receive_server(&rewritten).is_err());

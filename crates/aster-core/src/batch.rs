@@ -1328,6 +1328,7 @@ pub mod conformance {
                     | crate::MIN_CUSTODY_SEMANTIC_VERSION
                     | crate::wire::SEMANTIC_PROTOCOL_V4
                     | crate::wire::SEMANTIC_PROTOCOL_V5
+                    | crate::wire::SEMANTIC_PROTOCOL_V6
             ) {
                 return Err(format!(
                     "semantic-v{selected_semantic_version} receiver rejects ASTRENV3"
@@ -1338,7 +1339,7 @@ pub mod conformance {
     }
 
     /// Feeds raw ASTRENV3 bytes to the selected-version header decoder and
-    /// proves that semantic v1 rejects them while semantic v2-v5 accept them.
+    /// proves that semantic v1 rejects them while semantic v2-v6 accept them.
     pub fn verify_semantic_v1_envelope_rejection() -> Result<String, String> {
         let header = Envelope3Header {
             object_kind: OBJECT_KIND_BATCH_PROOF,
@@ -1368,6 +1369,11 @@ pub mod conformance {
             != header
         {
             return Err("semantic-v5 ASTRENV3 decoder changed the header".to_owned());
+        }
+        if Envelope3Header::decode_for_semantic_version(&bytes, crate::wire::SEMANTIC_PROTOCOL_V6)?
+            != header
+        {
+            return Err("semantic-v6 ASTRENV3 decoder changed the header".to_owned());
         }
         if Envelope3Header::decode_for_semantic_version(&bytes, 1).is_ok() {
             return Err("semantic-v1 decoder accepted raw ASTRENV3 bytes".to_owned());

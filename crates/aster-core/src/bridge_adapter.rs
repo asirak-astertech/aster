@@ -25,6 +25,9 @@ use std::fmt;
 type ProviderVerifiedEnrollment =
     <ReferenceEnvelopeSealer as BridgeCryptoProvider>::VerifiedEdgeEnrollment;
 
+/// Maximum byte length of one exact selected bridge route wrapper.
+pub const MAX_SELECTED_BRIDGE_WRAPPER_BYTES: usize = bridge::MAX_WRAPPER_TOTAL_BYTES;
+
 struct AuthorizationMaps<'a> {
     records: BTreeMap<[u8; 32], &'a AuthorizationEnvelope>,
     active: BTreeMap<[u8; 32], [u8; 32]>,
@@ -163,6 +166,18 @@ impl SelectedBridgeNarrowingPolicy {
         Ok(Self { topics, priorities })
     }
 
+    /// Exact locally selected topics in canonical order.
+    ///
+    /// An empty iterator means every topic allowed by the authority record.
+    pub fn topics(&self) -> impl ExactSizeIterator<Item = &Topic> {
+        self.topics.iter()
+    }
+
+    /// Exact locally selected priorities in canonical order.
+    pub fn priorities(&self) -> impl ExactSizeIterator<Item = &Priority> {
+        self.priorities.iter()
+    }
+
     fn canonical(&self) -> BridgeNarrowing {
         BridgeNarrowing {
             topics: self.topics.clone(),
@@ -275,6 +290,66 @@ impl VerifiedSelectedBridgeAuthorization {
     pub fn is_enabled(&self) -> bool {
         self.envelope().authorization.enabled.is_some()
     }
+
+    /// Exact bridge identity authorized for this directed edge.
+    pub fn bridge_node_id(&self) -> NodeId {
+        self.envelope().authorization.bridge_node_id
+    }
+
+    /// Exact source scope of this directed edge.
+    pub fn source_scope(&self) -> &Scope {
+        &self.envelope().authorization.source_scope
+    }
+
+    /// Exact target scope of this directed edge.
+    pub fn target_scope(&self) -> &Scope {
+        &self.envelope().authorization.target_scope
+    }
+
+    /// Enabled source route epoch, or `None` for a disabled record.
+    pub fn source_route_epoch(&self) -> Option<u64> {
+        self.envelope()
+            .authorization
+            .enabled
+            .as_ref()
+            .map(|enabled| enabled.source_route_epoch)
+    }
+
+    /// Enabled target route epoch, or `None` for a disabled record.
+    pub fn target_route_epoch(&self) -> Option<u64> {
+        self.envelope()
+            .authorization
+            .enabled
+            .as_ref()
+            .map(|enabled| enabled.target_route_epoch)
+    }
+
+    /// Authority-allowed topics, or `None` for a disabled record.
+    pub fn allowed_topics(&self) -> Option<&[Topic]> {
+        self.envelope()
+            .authorization
+            .enabled
+            .as_ref()
+            .map(|enabled| enabled.topics.as_slice())
+    }
+
+    /// Returns whether the supplied bridge-local policy is a valid narrowing
+    /// of this currently enabled authority record.
+    pub fn validate_narrowing(
+        &self,
+        narrowing: &SelectedBridgeNarrowingPolicy,
+    ) -> Result<(), SelectedBridgeError> {
+        let enabled = self
+            .envelope()
+            .authorization
+            .enabled
+            .as_ref()
+            .ok_or_else(SelectedBridgeError::authentication)?;
+        narrowing
+            .canonical()
+            .validate_subset(enabled)
+            .map_err(|_| SelectedBridgeError::authentication())
+    }
 }
 
 impl fmt::Debug for VerifiedSelectedBridgeAuthorization {
@@ -365,6 +440,11 @@ impl VerifiedSelectedBridgeEventRoute {
     /// Source-authenticated finite custody lifetime, when present.
     pub fn ttl_ms(&self) -> Option<u64> {
         self.source.header().ttl_ms
+    }
+
+    /// Whether the source-authenticated Event is a tombstone.
+    pub fn is_tombstone(&self) -> bool {
+        self.source.header().tombstone
     }
 
     pub fn hop_count(&self) -> u8 {

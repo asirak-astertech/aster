@@ -1,14 +1,15 @@
 #![no_main]
 
+use aster_mesh::MAX_SELECTED_BRIDGE_WRAPPER_BYTES;
 use aster_redb_store::{BlobTransferId, ControlTransferId, EventTransferId};
 use libfuzzer_sys::fuzz_target;
 
-const TAGS: [u8; 67] = [
+const TAGS: [u8; 73] = [
     0x09, 0x0a, 0x0b, 0x0c, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x21, 0x22,
     0x23, 0x24, 0x25, 0x26, 0x31, 0x32, 0x33, 0x34, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48,
     0x49, 0x51, 0x52, 0x53, 0x54, 0x61, 0x62, 0x69, 0x6a, 0x6b, 0x6c, 0x71, 0x72, 0x73, 0x74, 0x75,
     0x76, 0x77, 0x78, 0x79, 0x7a, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x91, 0x92, 0xa1, 0xa2, 0xa5,
-    0xa6, 0xb1, 0xb2,
+    0xa6, 0xb1, 0xb2, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6,
 ];
 
 fn structured_transfer_id(payload: &[u8]) -> EventTransferId {
@@ -226,6 +227,31 @@ fn structured_candidate(input: &[u8]) -> Vec<u8> {
             candidate.push(1);
             candidate.extend_from_slice(&u64::from(*selector).to_be_bytes());
         }
+        0xc1 | 0xc2 => candidate.push(selector & 1),
+        0xc3 => {
+            candidate.extend_from_slice(structured_transfer_id(payload).as_bytes());
+            let route = payload.get(32..).unwrap_or_default();
+            let wrapper_len = (route.len() / 2).min(MAX_SELECTED_BRIDGE_WRAPPER_BYTES);
+            let wrapper = &route[..wrapper_len];
+            let source = &route[wrapper_len..route.len().min(wrapper_len + 1024 * 1024)];
+            candidate.extend_from_slice(
+                &u32::try_from(wrapper.len())
+                    .expect("bounded bridge wrapper length")
+                    .to_be_bytes(),
+            );
+            candidate.extend_from_slice(wrapper);
+            candidate.extend_from_slice(
+                &u32::try_from(source.len())
+                    .expect("bounded bridge source length")
+                    .to_be_bytes(),
+            );
+            candidate.extend_from_slice(source);
+        }
+        0xc4 => {
+            candidate.extend_from_slice(structured_transfer_id(payload).as_bytes());
+            candidate.push(selector % 4);
+        }
+        0xc5 | 0xc6 => candidate.extend_from_slice(&u64::from(*selector).to_be_bytes()),
         0x43 | 0x44 | 0x47 | 0x48 | 0x61 | 0x62 => {}
         _ => unreachable!("tag selected from the complete fixed table"),
     }

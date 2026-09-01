@@ -1,0 +1,14 @@
+**
+!Cargo.toml
+!Cargo.lock
+!LICENSE
+!THIRD_PARTY_NOTICES.md
+!crates/
+!crates/**
+!proto/
+!proto/**
+!third-party/
+!third-party/**
+!docker/
+!docker/hierarchy-mvp/
+!docker/hierarchy-mvp/demo-node-entrypoint.sh
