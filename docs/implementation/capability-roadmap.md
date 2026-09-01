@@ -185,9 +185,61 @@ execution. The IDs below are stable planning labels, not atomic requirement IDs.
 | **P1-3** | **P1 — retire foundational risk** | Operationalize the security and operator lifecycle. | P0 platform/security choices and an early, scoped backend-selection/admission decision sufficient for evaluation; final full-graph admission and independent review remain P3 gates. | The declared target performs protected provision, start/restart, recovery, revoke/rekey, terminalization, and provider destruction through supported runtime/administration surfaces; policy/profile mismatch and rollback fail closed; representative capture stays within the declared exposure budget; retained resource results cover the claimed security profile. |
 | **P1-4** | **P1 — retire foundational risk** | Select and stabilize the multi-carrier contract while executing physical IP and BTLE vertical slices in parallel. | P0 platforms/topology, a stable Event/security harness, and target hardware/environment availability. | A stable selected carrier contract is exercised by physical target devices that mutually authenticate and exchange a protected Event larger than the smallest supported BTLE MTU. Bounded fragmentation/reassembly is exercised under duplicate, reorder, truncation/loss, disconnect/reconnect, and resume, and the receiving application verifies consumption after switching from BTLE to IP. Representative NAT direct/fallback and controlled-relay paths have retained evidence, with discovery and emission behavior bounded to the profile. |
 | **P2-1** | **P2 — complete and integrate capabilities** | Deliver the selected scope, bridge, and policy lifecycle. | P1-1, P1-3, and applicable P1-2 normative decisions; P1-4 only for physical bridge claims. | A retained multi-scope scenario through the selected supported runtime and administration surface exercises join/leave administration, topic/priority filtering, payload-blind forwarding, bandwidth/storage quotas, loop suppression, dynamic policy change, and revocation/rekey. An explicit authorized/unauthorized matrix observes no unauthorized application delivery in its enumerated negative cases within the declared topology. |
-| **P2-2** | **P2 — complete and integrate capabilities** | Retire DDIL, inventory, crash-recovery, and scale risks. | P0 target assumptions plus the relevant P1 lifecycle and carrier contracts. | At cap and cap-plus-one mixed workloads, including the current 100,000-source starvation case, a bounded local inventory reserves or fairly allocates capacity so Blob carrier IDs make progress. Retained measurements show local inventory construction and anti-entropy work proportional to the difference within declared bounds; retaining the [current total-snapshot work](../protocol.md#9-exact-reconciliation-and-resumption) instead requires a stakeholder-reviewed requirements/applicability disposition and corresponding narrower claim. Long-offline and crash/power-loss recovery, large-Blob/RSS behavior, impairment, storage, CPU, idle, and energy gates pass on declared targets at the profile's ratified bounds. |
+| **P2-2** | **P2 — complete and integrate capabilities** | Retire DDIL, inventory, crash-recovery, and scale risks. | P0 target assumptions plus the relevant P1 lifecycle and carrier contracts. | Use the generated [bounded hierarchy scale diagnostic](../quickstart/hierarchy-scale.md) as the next measurement instrument for static Event fan-out, multi-batch progress, small local peer domains, resource behavior, and acknowledged-route duplicate offers; it changes no maturity or retained-evidence status. At cap and cap-plus-one mixed workloads, including the current 100,000-source starvation case, a bounded local inventory reserves or fairly allocates capacity so Blob carrier IDs make progress. Retained measurements show local inventory construction and anti-entropy work proportional to the difference within declared bounds; retaining the [current total-snapshot work](../protocol.md#9-exact-reconciliation-and-resumption) instead requires a stakeholder-reviewed requirements/applicability disposition and corresponding narrower claim. Long-offline and crash/power-loss recovery, large-Blob/RSS behavior, impairment, storage, CPU, idle, and energy gates pass on declared targets at the profile's ratified bounds. |
 | **P2-3** | **P2 — complete and integrate capabilities** | Freeze and validate the adopter surface. | P0 binding choices and a stakeholder-ratified usability target; stable applicable P1 lifecycle/security contracts; and applicable P2-1 policy plus P2-2 status/resource decisions. Samples, status probes, and exploratory studies may advance earlier without closing the target. | For the complete-MVP adopter outcome, the selected-node C ABI and selected first-class bindings expose Event, State, Record, Blob, and required status without transport or cryptographic internals. Independent developers complete the minimal sample within the ratified usability target. A narrower evaluation profile may ship an explicitly named subset without claiming this track complete. |
 | **P3-1** | **P3 — close a production candidate** | Close the complete-MVP production profile. | Every applicable complete-MVP capability exit; every baseline, MVP, and release trace row marked as a [final-stack invariant](../evaluations/0005/requirements-notes.md#final_stack_invariant); and every production-blocking external gate, unless a separately reviewed requirements disposition changes applicability. | An independently specification-built implementation passes the applicable conformance suite; independent cryptographic review and hostile-peer campaigns pass; the profile-specific FIPS/validated-module disposition and a reviewed `DM-8-05` disposition or technical alternative are recorded; full-graph SBOM/license admission, supported and reproducible packages, deprecation policy, representative physical/resource acceptance, and signed release authorization are complete for the exact production profile. |
+
+### Immediate post-hierarchy implementation order
+
+Until a later reviewed roadmap change replaces this queue, a new implementation
+session must take these increments in order. Increasing the fixed Docker tree
+beyond the [bounded hierarchy scale diagnostic](../quickstart/hierarchy-scale.md)
+is explicitly not the next action.
+
+1. **Next — bounded dynamic semantic-v6 Event-bridge configuration.** Add one
+   privileged in-process operation that atomically replaces the complete bridge
+   configuration at a monotonic durable generation. Every update re-verifies
+   the signed authorization chain, local edges, narrowing, limits, and current
+   mission policy. Duplicate retries recover the same receipt; stale, rollback,
+   malformed, foreign-authority, and over-limit updates fail without changing
+   the prior generation; an in-flight contact stops using a generation once it
+   changes; restart restores only the latest committed generation.
+
+   The bounded acceptance scenario starts with one required edge absent and
+   proves non-delivery, adds that authorized edge and delivers one allowed Event
+   across exactly two payload-blind hops, then removes the edge and proves a
+   newly published Event cannot cross. Topic denial remains enforced, restart
+   preserves the removal, and crash-before-commit, duplicate-retry,
+   stale-generation, foreign-authorization, and limit failures leave the prior
+   configuration unchanged. This increment does not add general credential
+   issuance, full member join/leave, automatic route computation, quotas,
+   revocation/rekey of already committed downstream data, cross-class bridging,
+   external administration IPC/bindings, broader scale, or `P2-1` completion.
+
+2. **Then — peer-, generation-, and receiver-state-bound static Event-bridge
+   difference work.** Replace repeated whole-route offers with bounded
+   reconciliation state tied to the authenticated peer, the durable bridge
+   policy generation, and an authenticated receiver-store incarnation or
+   equivalent exact reset/inventory proof. A focused single-peer receipt varies
+   retained routes through 0, 8, 64, 255, and 256. After initial
+   acknowledgement, three completed unchanged authenticated contacts at each
+   size must report zero eligible route rows examined, zero route offers, and
+   zero route applies. Adding one eligible route from the 0-, 8-, 64-, and
+   255-route baselines must examine, offer, and apply exactly that one
+   difference. At 257 eligible routes, preparation fails with a typed capacity
+   result without mutating durable peer progress or receipt state. A receiver
+   rebuilt with the same peer identity and policy generation but a new
+   authenticated store incarnation or reset proof refetches safely; same-store
+   restart remains quiescent; wrong-peer, wrong-generation, wrong-incarnation,
+   stale, and malformed receipts cannot advance progress.
+
+   The existing 64-publisher hierarchy must still deliver and peerlessly recover
+   all 64 allowed routes, promote 32 through each regional bridge, and report
+   both `totalOfferReceiptDelta=0` and `duplicateOfferDelta=0` after settling.
+
+   This second increment does not establish all-class difference proportionality,
+   complete `DM-5.2-18`, dynamic membership, a topology larger than the current
+   diagnostic, target-resource fitness, production capacity, or release credit.
 
 `P1-1` through `P1-4` are parallel lanes after `P0-1`. A lane may merge
 coherent intermediate increments without satisfying its entire exit criterion

@@ -1,7 +1,7 @@
 // Copyright 2026 Defense Unicorns, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Dedicated, bounded alpha -> parent -> bravo hierarchy MVP process.
+//! Dedicated, bounded hierarchy MVP and generated scale-baseline process.
 //!
 //! This binary is intentionally not a general operator surface. `init` creates
 //! one shared set of demo-only unprotected reference artifacts across five
@@ -46,9 +46,12 @@ const MISSION_FILE: &str = "mission.unprotected-reference.bundle";
 const FIRST_AUTHORIZATION_FILE: &str = "bridge-authorization-1.bin";
 const SECOND_AUTHORIZATION_FILE: &str = "bridge-authorization-2.bin";
 const COMPLETE_FILE: &str = ".hierarchy-provisioned-v1";
+const SCALE_COMPLETE_FILE: &str = ".hierarchy-scale-provisioned-v1";
+const SCALE_AUTHORIZATION_COUNT_FILE: &str = ".bridge-authorization-count-v1";
 const ALPHA_SCOPE: &str = "demo/alpha";
 const PARENT_SCOPE: &str = "demo/parent";
 const BRAVO_SCOPE: &str = "demo/bravo";
+const SCALE_ROOT_SCOPE: &str = "demo/root";
 const ALLOWED_TOPIC: &str = "mesh.allowed";
 const DENIED_TOPIC: &str = "mesh.denied";
 const ALLOWED_PAYLOAD: &[u8] = b"HIERARCHY_ALLOWED_PAYLOAD_SENTINEL_4f923b";
@@ -56,6 +59,13 @@ const DENIED_TOPIC_PAYLOAD: &[u8] = b"HIERARCHY_DENIED_TOPIC_SENTINEL_81f2a0";
 const DENIED_PRIORITY_PAYLOAD: &[u8] = b"HIERARCHY_DENIED_PRIORITY_SENTINEL_6d35cc";
 const MAX_AUTHORIZATION_FILE_BYTES: u64 = 65_536;
 const MAX_DISCOVERY_IPV4_INTERFACES: usize = 8;
+const SCALE_LEAF_COUNT: u8 = 8;
+const SCALE_REGIONAL_COUNT: u8 = 2;
+const SCALE_MAX_PUBLISHERS_PER_LEAF: u8 = 8;
+const SCALE_MAX_PUBLISHERS: u8 = SCALE_LEAF_COUNT * SCALE_MAX_PUBLISHERS_PER_LEAF;
+const SCALE_AUTHORIZATION_COUNT: usize = SCALE_LEAF_COUNT as usize + SCALE_REGIONAL_COUNT as usize;
+const SCALE_AUTHORIZATION_COUNT_BYTES: &[u8] = b"10\n";
+const MAX_SCALE_MARKER_BYTES: u64 = 128;
 
 type DemoResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -66,6 +76,10 @@ enum Role {
     BridgeBravo,
     Consumer,
     Outsider,
+    ScalePublisher(u8),
+    ScaleLeaf(u8),
+    ScaleRegional(u8),
+    ScaleRootConsumer,
 }
 
 impl Role {
@@ -76,25 +90,66 @@ impl Role {
             "bridge-bravo" => Ok(Self::BridgeBravo),
             "consumer" => Ok(Self::Consumer),
             "outsider" => Ok(Self::Outsider),
-            _ => Err("unknown hierarchy role".into()),
+            "root-consumer" => Ok(Self::ScaleRootConsumer),
+            _ => {
+                if let Some(index) = parse_numbered_role(value, 'p', 3, SCALE_MAX_PUBLISHERS - 1) {
+                    Ok(Self::ScalePublisher(index))
+                } else if let Some(index) = parse_numbered_role(value, 'l', 2, SCALE_LEAF_COUNT - 1)
+                {
+                    Ok(Self::ScaleLeaf(index))
+                } else if let Some(index) =
+                    parse_numbered_role(value, 'r', 2, SCALE_REGIONAL_COUNT - 1)
+                {
+                    Ok(Self::ScaleRegional(index))
+                } else {
+                    Err("unknown hierarchy role".into())
+                }
+            }
         }
     }
 
-    const fn name(self) -> &'static str {
+    fn name(self) -> String {
         match self {
-            Self::Publisher => "publisher",
-            Self::BridgeAlpha => "bridge-alpha",
-            Self::BridgeBravo => "bridge-bravo",
-            Self::Consumer => "consumer",
-            Self::Outsider => "outsider",
+            Self::Publisher => "publisher".into(),
+            Self::BridgeAlpha => "bridge-alpha".into(),
+            Self::BridgeBravo => "bridge-bravo".into(),
+            Self::Consumer => "consumer".into(),
+            Self::Outsider => "outsider".into(),
+            Self::ScalePublisher(index) => format!("p{index:03}"),
+            Self::ScaleLeaf(index) => format!("l{index:02}"),
+            Self::ScaleRegional(index) => format!("r{index:02}"),
+            Self::ScaleRootConsumer => "root-consumer".into(),
         }
     }
+
+    const fn is_scale_only(self) -> bool {
+        matches!(
+            self,
+            Self::ScalePublisher(_)
+                | Self::ScaleLeaf(_)
+                | Self::ScaleRegional(_)
+                | Self::ScaleRootConsumer
+        )
+    }
+}
+
+fn parse_numbered_role(value: &str, prefix: char, digits: usize, maximum: u8) -> Option<u8> {
+    let suffix = value.strip_prefix(prefix)?;
+    if suffix.len() != digits || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let parsed = suffix.parse::<u8>().ok()?;
+    (parsed <= maximum).then_some(parsed)
 }
 
 #[derive(Debug, Eq, PartialEq)]
 enum Command {
     Init {
         root: PathBuf,
+    },
+    InitScale {
+        root: PathBuf,
+        publishers_per_leaf: u8,
     },
     Run {
         role: Role,
@@ -144,11 +199,15 @@ async fn main() -> ExitCode {
     match parse_command(std::env::args().skip(1).collect()).and_then(|command| {
         match &command {
             Command::Init { root } => provision(root),
+            Command::InitScale {
+                root,
+                publishers_per_leaf,
+            } => provision_scale(root, *publishers_per_leaf),
             Command::Run { .. } => Ok(()),
         }
         .map(|()| command)
     }) {
-        Ok(Command::Init { .. }) => ExitCode::SUCCESS,
+        Ok(Command::Init { .. } | Command::InitScale { .. }) => ExitCode::SUCCESS,
         Ok(command @ Command::Run { .. }) => match run_role(command).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
@@ -177,6 +236,20 @@ fn parse_command(values: Vec<String>) -> DemoResult<Command> {
             reject_remaining(values)?;
             Ok(Command::Init {
                 root: PathBuf::from(root),
+            })
+        }
+        Some("init-scale") => {
+            let root = required_option(&mut values, "--root")?;
+            let publishers_per_leaf = bounded_u8(
+                &required_option(&mut values, "--publishers-per-leaf")?,
+                "publishers-per-leaf",
+                1,
+                SCALE_MAX_PUBLISHERS_PER_LEAF,
+            )?;
+            reject_remaining(values)?;
+            Ok(Command::InitScale {
+                root: PathBuf::from(root),
+                publishers_per_leaf,
             })
         }
         Some("run") => {
@@ -211,7 +284,7 @@ fn parse_command(values: Vec<String>) -> DemoResult<Command> {
                 nearby_ipv4_interfaces,
             })
         }
-        _ => Err("expected init or run command".into()),
+        _ => Err("expected init, init-scale, or run command".into()),
     }
 }
 
@@ -242,6 +315,14 @@ fn positive_u64(value: &str, label: &str) -> DemoResult<u64> {
         return Err(format!("{label} must be positive").into());
     }
     Ok(value)
+}
+
+fn bounded_u8(value: &str, label: &str, minimum: u8, maximum: u8) -> DemoResult<u8> {
+    let parsed = value.parse::<u8>()?;
+    if value != parsed.to_string() || !(minimum..=maximum).contains(&parsed) {
+        return Err(format!("{label} must be within {minimum}..={maximum}").into());
+    }
+    Ok(parsed)
 }
 
 fn discovery_ipv4_interfaces(value: &str) -> DemoResult<Vec<Ipv4Addr>> {
@@ -430,11 +511,319 @@ fn provision(root: &Path) -> DemoResult<()> {
     Ok(())
 }
 
+fn scale_leaf_scope(index: u8) -> String {
+    format!("demo/leaf{index:02}")
+}
+
+fn scale_regional_scope(index: u8) -> String {
+    format!("demo/region{index:02}")
+}
+
+const fn scale_region_for_leaf(leaf: u8) -> u8 {
+    leaf / (SCALE_LEAF_COUNT / SCALE_REGIONAL_COUNT)
+}
+
+const fn scale_leaf_epoch(_index: u8) -> u64 {
+    // Fresh stores publish at epoch 1 until an authenticated scope-epoch
+    // control is applied. Scope names already separate the eight leaves.
+    1
+}
+
+const fn scale_regional_epoch(index: u8) -> u64 {
+    SCALE_LEAF_COUNT as u64 + index as u64 + 1
+}
+
+const fn scale_root_epoch() -> u64 {
+    SCALE_LEAF_COUNT as u64 + SCALE_REGIONAL_COUNT as u64 + 1
+}
+
+fn scale_publisher_count(publishers_per_leaf: u8) -> usize {
+    usize::from(SCALE_LEAF_COUNT) * usize::from(publishers_per_leaf)
+}
+
+fn scale_role_names(publishers_per_leaf: u8) -> Vec<String> {
+    let mut roles = Vec::with_capacity(scale_publisher_count(publishers_per_leaf) + 12);
+    for index in 0..scale_publisher_count(publishers_per_leaf) {
+        roles.push(format!("p{index:03}"));
+    }
+    for index in 0..SCALE_LEAF_COUNT {
+        roles.push(format!("l{index:02}"));
+    }
+    for index in 0..SCALE_REGIONAL_COUNT {
+        roles.push(format!("r{index:02}"));
+    }
+    roles.push("root-consumer".into());
+    roles.push("outsider".into());
+    roles
+}
+
+fn scale_authorization_file(index: usize) -> String {
+    format!("bridge-authorization-{index:02}.bin")
+}
+
+fn scale_complete_bytes(role: &str, publishers_per_leaf: u8) -> Vec<u8> {
+    format!("aster-hierarchy-scale/v1\nrole={role}\npublishers-per-leaf={publishers_per_leaf}\n")
+        .into_bytes()
+}
+
+fn scale_role_loads_authorizations(role: &str) -> bool {
+    role == "root-consumer" || role.starts_with('l') || role.starts_with('r')
+}
+
+fn provision_scale(root: &Path, publishers_per_leaf: u8) -> DemoResult<()> {
+    if !(1..=SCALE_MAX_PUBLISHERS_PER_LEAF).contains(&publishers_per_leaf) {
+        return Err("publishers-per-leaf is outside its bound".into());
+    }
+    let roles = scale_role_names(publishers_per_leaf);
+    let role_roots = roles
+        .iter()
+        .map(|role| (role.as_str(), root.join(role)))
+        .collect::<Vec<_>>();
+    for (_, path) in &role_roots {
+        fs::create_dir_all(path)?;
+    }
+    if role_roots
+        .iter()
+        .all(|(_, path)| path.join(SCALE_COMPLETE_FILE).is_file())
+    {
+        validate_existing_scale_provisioning(&role_roots, publishers_per_leaf)?;
+        println!(
+            "HIERARCHY_SCALE_INIT status=pass disposition=existing publishers={} nodes={} authorities=2 edges=10 leaf_scopes=8 regional_scopes=2 provisioning=unprotected-reference",
+            scale_publisher_count(publishers_per_leaf),
+            roles.len(),
+        );
+        return Ok(());
+    }
+    if role_roots
+        .iter()
+        .any(|(_, path)| directory_has_entries(path))
+    {
+        return Err("hierarchy scale provisioning roots are partially initialized".into());
+    }
+
+    let topics = [ALLOWED_TOPIC, DENIED_TOPIC];
+    let leaf_accesses = (0..SCALE_LEAF_COUNT)
+        .map(|index| relay(&scale_leaf_scope(index), scale_leaf_epoch(index)))
+        .collect::<DemoResult<Vec<_>>>()?;
+    let regional_accesses = (0..SCALE_REGIONAL_COUNT)
+        .map(|index| relay(&scale_regional_scope(index), scale_regional_epoch(index)))
+        .collect::<DemoResult<Vec<_>>>()?;
+    let root_access = relay(SCALE_ROOT_SCOPE, scale_root_epoch())?;
+    let mut authority_accesses = leaf_accesses.clone();
+    authority_accesses.extend(regional_accesses.iter().cloned());
+    authority_accesses.push(root_access.clone());
+
+    let mut provisioner = ReferenceProvisioner::from_seed([0xa6; 32])?;
+    let authority_bundle = provisioner.issue_control_authority(1, &authority_accesses)?;
+    let mut authority = ReferenceEnvelopeSealer::open(authority_bundle)?;
+    let mut next_serial = 2u64;
+
+    let mut publisher_missions = Vec::with_capacity(scale_publisher_count(publishers_per_leaf));
+    for publisher_index in 0..scale_publisher_count(publishers_per_leaf) {
+        let leaf_index = u8::try_from(publisher_index)? / publishers_per_leaf;
+        let bundle = provisioner.issue_node(
+            next_serial,
+            &[member(
+                &scale_leaf_scope(leaf_index),
+                scale_leaf_epoch(leaf_index),
+                &topics,
+            )?],
+        )?;
+        publisher_missions.push((format!("p{publisher_index:03}"), bundle.to_bytes()?));
+        next_serial = next_serial
+            .checked_add(1)
+            .ok_or("scale node serial exhausted")?;
+    }
+
+    let mut leaf_bridges = Vec::with_capacity(usize::from(SCALE_LEAF_COUNT));
+    for leaf_index in 0..SCALE_LEAF_COUNT {
+        let regional_index = scale_region_for_leaf(leaf_index);
+        let bundle = provisioner.issue_node(
+            next_serial,
+            &[
+                leaf_accesses[usize::from(leaf_index)].clone(),
+                regional_accesses[usize::from(regional_index)].clone(),
+            ],
+        )?;
+        let bytes = bundle.to_bytes()?;
+        let sealer = ReferenceEnvelopeSealer::open(bundle)?;
+        leaf_bridges.push((format!("l{leaf_index:02}"), bytes, sealer));
+        next_serial = next_serial
+            .checked_add(1)
+            .ok_or("scale node serial exhausted")?;
+    }
+
+    let mut regional_bridges = Vec::with_capacity(usize::from(SCALE_REGIONAL_COUNT));
+    for regional_index in 0..SCALE_REGIONAL_COUNT {
+        let first_leaf = regional_index * (SCALE_LEAF_COUNT / SCALE_REGIONAL_COUNT);
+        let mut accesses = (first_leaf..first_leaf + (SCALE_LEAF_COUNT / SCALE_REGIONAL_COUNT))
+            .map(|leaf_index| leaf_accesses[usize::from(leaf_index)].clone())
+            .collect::<Vec<_>>();
+        accesses.push(regional_accesses[usize::from(regional_index)].clone());
+        accesses.push(root_access.clone());
+        let bundle = provisioner.issue_node(next_serial, &accesses)?;
+        let bytes = bundle.to_bytes()?;
+        let sealer = ReferenceEnvelopeSealer::open(bundle)?;
+        regional_bridges.push((format!("r{regional_index:02}"), bytes, sealer));
+        next_serial = next_serial
+            .checked_add(1)
+            .ok_or("scale node serial exhausted")?;
+    }
+
+    let mut root_accesses = vec![member(SCALE_ROOT_SCOPE, scale_root_epoch(), &topics)?];
+    for leaf_index in 0..SCALE_LEAF_COUNT {
+        root_accesses.push(content_only(
+            &scale_leaf_scope(leaf_index),
+            scale_leaf_epoch(leaf_index),
+            &topics,
+        )?);
+    }
+    let root_bundle = provisioner.issue_node(next_serial, &root_accesses)?;
+    let root_bytes = root_bundle.to_bytes()?;
+
+    let mut outsider_provisioner = ReferenceProvisioner::from_seed([0xe7; 32])?;
+    let outsider_bundle =
+        outsider_provisioner.issue_node(1, &[relay(SCALE_ROOT_SCOPE, scale_root_epoch())?])?;
+    let outsider_bytes = outsider_bundle.to_bytes()?;
+
+    let policy = SelectedBridgeAuthorizationPolicy::new(
+        vec![topic(ALLOWED_TOPIC)?],
+        vec![Priority::Immediate],
+        2,
+    )?;
+    let mut authorization_bytes = Vec::with_capacity(SCALE_AUTHORIZATION_COUNT);
+    let mut previous = None;
+    for (leaf_index, (_, _, bridge)) in leaf_bridges.iter().enumerate() {
+        let leaf_index = u8::try_from(leaf_index)?;
+        let regional_index = scale_region_for_leaf(leaf_index);
+        let enrollment = SelectedEventBridgeAdapter::create_enrollment(
+            bridge,
+            &scope(&scale_leaf_scope(leaf_index))?,
+            scale_leaf_epoch(leaf_index),
+            &scope(&scale_regional_scope(regional_index))?,
+            scale_regional_epoch(regional_index),
+        )?;
+        let verified = SelectedEventBridgeAdapter::verify_enrollment(&authority, &enrollment)?;
+        let sequence = u64::from(leaf_index) + 1;
+        let authorization = SelectedEventBridgeAdapter::issue_authorization(
+            &mut authority,
+            &verified,
+            BridgeAuthorizationLink::new(sequence, previous, 1)?,
+            &policy,
+        )?;
+        previous = Some(authorization.envelope_id());
+        authorization_bytes.push(authorization.exact_bytes().to_vec());
+    }
+    for (regional_index, (_, _, bridge)) in regional_bridges.iter().enumerate() {
+        let regional_index = u8::try_from(regional_index)?;
+        let enrollment = SelectedEventBridgeAdapter::create_enrollment(
+            bridge,
+            &scope(&scale_regional_scope(regional_index))?,
+            scale_regional_epoch(regional_index),
+            &scope(SCALE_ROOT_SCOPE)?,
+            scale_root_epoch(),
+        )?;
+        let verified = SelectedEventBridgeAdapter::verify_enrollment(&authority, &enrollment)?;
+        let sequence = u64::from(SCALE_LEAF_COUNT) + u64::from(regional_index) + 1;
+        let authorization = SelectedEventBridgeAdapter::issue_authorization(
+            &mut authority,
+            &verified,
+            BridgeAuthorizationLink::new(sequence, previous, 1)?,
+            &policy,
+        )?;
+        previous = Some(authorization.envelope_id());
+        authorization_bytes.push(authorization.exact_bytes().to_vec());
+    }
+    if authorization_bytes.len() != SCALE_AUTHORIZATION_COUNT {
+        return Err("hierarchy scale authorization count mismatch".into());
+    }
+
+    for (role, bytes) in &publisher_missions {
+        write_owner_only(&root.join(role).join(MISSION_FILE), bytes)?;
+    }
+    for (role, bytes, _) in &leaf_bridges {
+        write_owner_only(&root.join(role).join(MISSION_FILE), bytes)?;
+    }
+    for (role, bytes, _) in &regional_bridges {
+        write_owner_only(&root.join(role).join(MISSION_FILE), bytes)?;
+    }
+    write_owner_only(&root.join("root-consumer").join(MISSION_FILE), &root_bytes)?;
+    write_owner_only(&root.join("outsider").join(MISSION_FILE), &outsider_bytes)?;
+
+    for role in roles
+        .iter()
+        .filter(|role| scale_role_loads_authorizations(role))
+    {
+        let state = root.join(role);
+        write_owner_only(
+            &state.join(SCALE_AUTHORIZATION_COUNT_FILE),
+            SCALE_AUTHORIZATION_COUNT_BYTES,
+        )?;
+        for (index, exact) in authorization_bytes.iter().enumerate() {
+            write_owner_only(&state.join(scale_authorization_file(index)), exact)?;
+        }
+    }
+    for (role, path) in &role_roots {
+        write_owner_only(
+            &path.join(SCALE_COMPLETE_FILE),
+            &scale_complete_bytes(role, publishers_per_leaf),
+        )?;
+        File::open(path)?.sync_all()?;
+    }
+    println!(
+        "HIERARCHY_SCALE_INIT status=pass disposition=created publishers={} nodes={} authorities=2 edges=10 leaf_scopes=8 regional_scopes=2 provisioning=unprotected-reference",
+        scale_publisher_count(publishers_per_leaf),
+        roles.len(),
+    );
+    Ok(())
+}
+
 fn directory_has_entries(path: &Path) -> bool {
     fs::read_dir(path)
         .ok()
         .and_then(|mut entries| entries.next())
         .is_some()
+}
+
+fn load_bounded_regular_file(path: &Path, maximum: u64, label: &str) -> DemoResult<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() || metadata.len() == 0 || metadata.len() > maximum {
+        return Err(format!("{label} is missing or outside its bound").into());
+    }
+    fs::read(path).map_err(Into::into)
+}
+
+fn validate_existing_scale_provisioning(
+    role_roots: &[(&str, PathBuf)],
+    publishers_per_leaf: u8,
+) -> DemoResult<()> {
+    for (role, path) in role_roots {
+        if !path.join(MISSION_FILE).is_file() {
+            return Err(format!("{role} scale provisioning is incomplete").into());
+        }
+        let marker = load_bounded_regular_file(
+            &path.join(SCALE_COMPLETE_FILE),
+            MAX_SCALE_MARKER_BYTES,
+            "hierarchy scale marker",
+        )?;
+        if marker != scale_complete_bytes(role, publishers_per_leaf) {
+            return Err(format!("{role} scale marker is not canonical").into());
+        }
+        if scale_role_loads_authorizations(role) {
+            let count = load_bounded_regular_file(
+                &path.join(SCALE_AUTHORIZATION_COUNT_FILE),
+                SCALE_AUTHORIZATION_COUNT_BYTES.len() as u64,
+                "hierarchy scale authorization count",
+            )?;
+            if count != SCALE_AUTHORIZATION_COUNT_BYTES {
+                return Err(format!("{role} scale authorization count is not canonical").into());
+            }
+            for index in 0..SCALE_AUTHORIZATION_COUNT {
+                load_authorization(&path.join(scale_authorization_file(index)))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_existing_provisioning(role_roots: &[(&str, PathBuf)]) -> DemoResult<()> {
@@ -467,19 +856,19 @@ fn write_owner_only(path: &Path, bytes: &[u8]) -> DemoResult<()> {
 }
 
 fn load_authorization(path: &Path) -> DemoResult<Vec<u8>> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.file_type().is_file()
-        || metadata.len() == 0
-        || metadata.len() > MAX_AUTHORIZATION_FILE_BYTES
-    {
-        return Err("bridge authorization file is missing or outside its bound".into());
-    }
-    fs::read(path).map_err(Into::into)
+    load_bounded_regular_file(
+        path,
+        MAX_AUTHORIZATION_FILE_BYTES,
+        "bridge authorization file",
+    )
 }
 
 fn bridge_config(role: Role, state: &Path) -> DemoResult<Option<SelectedEventBridgeConfig>> {
     if matches!(role, Role::Publisher | Role::Outsider) {
         return Ok(None);
+    }
+    if role.is_scale_only() {
+        return Err("scale role cannot load MVP bridge configuration".into());
     }
     let first = load_authorization(&state.join(FIRST_AUTHORIZATION_FILE))?;
     let second = load_authorization(&state.join(SECOND_AUTHORIZATION_FILE))?;
@@ -492,8 +881,80 @@ fn bridge_config(role: Role, state: &Path) -> DemoResult<Option<SelectedEventBri
         Role::BridgeBravo => vec![SelectedEventBridgeEdge::new(second_id, narrowing)],
         Role::Consumer => Vec::new(),
         Role::Publisher | Role::Outsider => unreachable!("non-bridge roles returned above"),
+        Role::ScalePublisher(_)
+        | Role::ScaleLeaf(_)
+        | Role::ScaleRegional(_)
+        | Role::ScaleRootConsumer => unreachable!("scale roles returned above"),
     };
     SelectedEventBridgeConfig::new(vec![first, second], edges, role == Role::Consumer)
+        .map(Some)
+        .map_err(Into::into)
+}
+
+fn load_scale_state(role: Role, state: &Path) -> DemoResult<Option<u8>> {
+    let marker_path = state.join(SCALE_COMPLETE_FILE);
+    if !marker_path.exists() {
+        return Ok(None);
+    }
+    if !role.is_scale_only() && role != Role::Outsider {
+        return Err("MVP role cannot load hierarchy scale state".into());
+    }
+    let marker = load_bounded_regular_file(
+        &marker_path,
+        MAX_SCALE_MARKER_BYTES,
+        "hierarchy scale marker",
+    )?;
+    let role_name = role.name();
+    for publishers_per_leaf in 1..=SCALE_MAX_PUBLISHERS_PER_LEAF {
+        if marker == scale_complete_bytes(&role_name, publishers_per_leaf) {
+            if let Role::ScalePublisher(index) = role
+                && usize::from(index) >= scale_publisher_count(publishers_per_leaf)
+            {
+                return Err("scale publisher role is outside the provisioned bound".into());
+            }
+            return Ok(Some(publishers_per_leaf));
+        }
+    }
+    Err("hierarchy scale marker is not canonical for this role".into())
+}
+
+fn load_scale_authorizations(state: &Path) -> DemoResult<Vec<Vec<u8>>> {
+    let count = load_bounded_regular_file(
+        &state.join(SCALE_AUTHORIZATION_COUNT_FILE),
+        SCALE_AUTHORIZATION_COUNT_BYTES.len() as u64,
+        "hierarchy scale authorization count",
+    )?;
+    if count != SCALE_AUTHORIZATION_COUNT_BYTES {
+        return Err("hierarchy scale authorization count is not canonical".into());
+    }
+    (0..SCALE_AUTHORIZATION_COUNT)
+        .map(|index| load_authorization(&state.join(scale_authorization_file(index))))
+        .collect()
+}
+
+fn scale_bridge_config(role: Role, state: &Path) -> DemoResult<Option<SelectedEventBridgeConfig>> {
+    if matches!(role, Role::ScalePublisher(_) | Role::Outsider) {
+        return Ok(None);
+    }
+    let selected_index = match role {
+        Role::ScaleLeaf(index) => Some(usize::from(index)),
+        Role::ScaleRegional(index) => Some(usize::from(SCALE_LEAF_COUNT) + usize::from(index)),
+        Role::ScaleRootConsumer => None,
+        Role::Publisher | Role::BridgeAlpha | Role::BridgeBravo | Role::Consumer => {
+            return Err("MVP role cannot load hierarchy scale bridge configuration".into());
+        }
+        Role::Outsider | Role::ScalePublisher(_) => unreachable!("returned above"),
+    };
+    let authorizations = load_scale_authorizations(state)?;
+    let narrowing =
+        SelectedBridgeNarrowingPolicy::new(vec![topic(ALLOWED_TOPIC)?], vec![Priority::Immediate])?;
+    let edges = selected_index
+        .map(|index| {
+            let authorization_id: [u8; 32] = Sha256::digest(&authorizations[index]).into();
+            vec![SelectedEventBridgeEdge::new(authorization_id, narrowing)]
+        })
+        .unwrap_or_default();
+    SelectedEventBridgeConfig::new(authorizations, edges, role == Role::ScaleRootConsumer)
         .map(Some)
         .map_err(Into::into)
 }
@@ -510,8 +971,12 @@ async fn run_role(command: Command) -> DemoResult<()> {
     else {
         return Err("run_role received an initializer command".into());
     };
-    if !state.join(COMPLETE_FILE).is_file() {
-        return Err("hierarchy state is not initialized".into());
+    let scale_state = load_scale_state(role, &state)?;
+    if scale_state.is_some() && state.join(COMPLETE_FILE).exists() {
+        return Err("hierarchy state has conflicting provisioning markers".into());
+    }
+    if scale_state.is_none() && (role.is_scale_only() || !state.join(COMPLETE_FILE).is_file()) {
+        return Err("hierarchy state is not initialized for this role".into());
     }
     let mission = UnprotectedReferenceMission::load(state.join(MISSION_FILE))?;
     let mission_id = mission.identity();
@@ -521,7 +986,12 @@ async fn run_role(command: Command) -> DemoResult<()> {
     config.application = NodeApplication::Relay;
     let mut forwarding =
         SelectedForwardingConfig::new(EventEmissionPolicy::Normal, StoreLimits::default());
-    if let Some(bridge) = bridge_config(role, &state)? {
+    let bridge = if scale_state.is_some() {
+        scale_bridge_config(role, &state)?
+    } else {
+        bridge_config(role, &state)?
+    };
+    if let Some(bridge) = bridge {
         forwarding = forwarding.with_event_bridge(bridge);
     }
     #[cfg(feature = "nearby-discovery")]
@@ -549,6 +1019,13 @@ async fn run_role(command: Command) -> DemoResult<()> {
     );
     if role == Role::Publisher {
         publish_fixtures(&running.selected_events()).await?;
+    } else if let Role::ScalePublisher(index) = role {
+        publish_scale_fixtures(
+            &running.selected_events(),
+            index,
+            scale_state.ok_or("scale publisher did not load scale state")?,
+        )
+        .await?;
     }
     running.wait().await?;
     Ok(())
@@ -575,6 +1052,45 @@ async fn publish_fixtures(events: &aster_node::application::SelectedEventHandle)
             fixture.topic,
             fixture.priority_name,
             format_node_id(Sha256::digest(fixture.payload).into()),
+        );
+    }
+    Ok(())
+}
+
+async fn publish_scale_fixtures(
+    events: &aster_node::application::SelectedEventHandle,
+    publisher_index: u8,
+    publishers_per_leaf: u8,
+) -> DemoResult<()> {
+    if publishers_per_leaf == 0 || publishers_per_leaf > SCALE_MAX_PUBLISHERS_PER_LEAF {
+        return Err("scale publisher count is outside its bound".into());
+    }
+    let leaf_index = publisher_index / publishers_per_leaf;
+    if leaf_index >= SCALE_LEAF_COUNT {
+        return Err("scale publisher role is outside its leaf bound".into());
+    }
+    let role = format!("p{publisher_index:03}");
+    for (case, topic_name) in [("allowed", ALLOWED_TOPIC), ("denied", DENIED_TOPIC)] {
+        let payload = format!("HIERARCHY_SCALE_PAYLOAD_SENTINEL_{role}_{case}").into_bytes();
+        let published = events
+            .publish(EventPublishRequest {
+                operation_key: format!("hierarchy-scale/{role}/publish/{case}").into_bytes(),
+                predecessor: None,
+                topic: topic(topic_name)?,
+                scope: scope(&scale_leaf_scope(leaf_index))?,
+                priority: Priority::Immediate,
+                logical_key: format!("hierarchy-scale/{role}/{case}").into_bytes(),
+                payload: payload.clone(),
+                tombstone: false,
+            })
+            .await?;
+        println!(
+            "HIERARCHY_SCALE_SOURCE status=published role={} case={} source_id={} topic={} priority=immediate payload_sha256={}",
+            role,
+            case,
+            published.id,
+            topic_name,
+            format_node_id(Sha256::digest(&payload).into()),
         );
     }
     Ok(())
@@ -639,5 +1155,96 @@ mod tests {
             .is_err()
         );
         assert!(parse_command(vec!["run".into(), "--role".into()]).is_err());
+    }
+
+    #[test]
+    fn scale_parser_accepts_only_canonical_bounded_generation() {
+        assert_eq!(
+            parse_command(vec![
+                "init-scale".into(),
+                "--root".into(),
+                "/tmp/scale".into(),
+                "--publishers-per-leaf".into(),
+                "8".into(),
+            ])
+            .expect("scale init"),
+            Command::InitScale {
+                root: PathBuf::from("/tmp/scale"),
+                publishers_per_leaf: 8,
+            }
+        );
+        for invalid in ["0", "9", "01", "-1", "eight"] {
+            assert!(
+                parse_command(vec![
+                    "init-scale".into(),
+                    "--root".into(),
+                    "/tmp/scale".into(),
+                    "--publishers-per-leaf".into(),
+                    invalid.into(),
+                ])
+                .is_err(),
+                "accepted invalid publishers-per-leaf {invalid}",
+            );
+        }
+
+        for (name, expected) in [
+            ("p000", Role::ScalePublisher(0)),
+            ("p063", Role::ScalePublisher(63)),
+            ("l00", Role::ScaleLeaf(0)),
+            ("l07", Role::ScaleLeaf(7)),
+            ("r00", Role::ScaleRegional(0)),
+            ("r01", Role::ScaleRegional(1)),
+            ("root-consumer", Role::ScaleRootConsumer),
+            ("outsider", Role::Outsider),
+        ] {
+            assert_eq!(Role::parse(name).expect("canonical role"), expected);
+            assert_eq!(expected.name(), name);
+        }
+        for invalid in [
+            "p00",
+            "p0000",
+            "p064",
+            "p-01",
+            "p0a0",
+            "P000",
+            "l0",
+            "l08",
+            "l000",
+            "r0",
+            "r02",
+            "r000",
+            "root_consumer",
+        ] {
+            assert!(
+                Role::parse(invalid).is_err(),
+                "accepted invalid role {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn scale_roles_are_leaf_major_and_exactly_bounded() {
+        let minimum = scale_role_names(1);
+        assert_eq!(minimum.len(), 20);
+        assert_eq!(
+            &minimum[..8],
+            [
+                "p000", "p001", "p002", "p003", "p004", "p005", "p006", "p007"
+            ]
+        );
+        assert_eq!(minimum.last().map(String::as_str), Some("outsider"));
+
+        let maximum = scale_role_names(8);
+        assert_eq!(maximum.len(), 76);
+        assert_eq!(maximum[63], "p063");
+        assert_eq!(maximum[64], "l00");
+        assert_eq!(scale_region_for_leaf(0), 0);
+        assert_eq!(scale_region_for_leaf(3), 0);
+        assert_eq!(scale_region_for_leaf(4), 1);
+        assert_eq!(scale_region_for_leaf(7), 1);
+        assert!((0..SCALE_LEAF_COUNT).all(|index| scale_leaf_epoch(index) == 1));
+        assert_eq!(scale_regional_epoch(0), 9);
+        assert_eq!(scale_regional_epoch(1), 10);
+        assert_eq!(scale_root_epoch(), 11);
     }
 }

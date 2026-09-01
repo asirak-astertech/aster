@@ -24,9 +24,10 @@ COPY docker/hierarchy-mvp/demo-node-entrypoint.sh \
     /usr/local/libexec/aster/hierarchy-demo-node-entrypoint.sh
 COPY LICENSE /usr/share/licenses/aster/LICENSE
 COPY THIRD_PARTY_NOTICES.md /usr/share/licenses/aster/THIRD_PARTY_NOTICES.md
-RUN install -d -o 10001 -g 10001 -m 0700 \
-        /state \
+RUN install -d -o 10001 -g 10001 -m 0755 \
         /provision \
+    && install -d -o 10001 -g 10001 -m 0700 \
+        /state \
         /provision/publisher \
         /provision/bridge-alpha \
         /provision/bridge-bravo \
