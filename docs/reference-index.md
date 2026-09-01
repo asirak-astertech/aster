@@ -7,6 +7,7 @@ For a shorter path based on what you are trying to accomplish, start at the
 ## Tutorials and integration
 
 - [Aster Field Notes human hello](quickstart/hello.md)
+- [Three-host trusted-LAN Event MVP](quickstart/lan-mvp.md)
 - [Capability tour](quickstart/capability-tour.md)
 - [Real-process Event message playground](quickstart/message-playground.md)
 - [Live mesh CLI](quickstart/mesh-cli.md)
@@ -107,3 +108,4 @@ design chose its major boundaries.
 - [0033 — Select security properties through authenticated mission profiles](decisions/0033-policy-selected-security-profiles.md)
 - [0034 — Use short-lived Iroh mDNS only for nearby evaluation](decisions/0034-short-lived-iroh-nearby-discovery.md)
 - [0035 — Introduce Aster through staged Field Notes](decisions/0035-field-notes-human-introduction.md)
+- [0036 — Admit discovered LAN peers through mission authentication](decisions/0036-mission-authenticated-lan-discovery-mvp.md)

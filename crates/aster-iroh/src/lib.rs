@@ -32,7 +32,7 @@ use iroh::{
     tls::CaTlsConfig,
 };
 #[cfg(feature = "nearby-discovery")]
-use iroh_mdns_address_lookup::MdnsAddressLookup;
+use iroh_mdns_address_lookup::{DiscoveryEvent as MdnsDiscoveryEvent, MdnsAddressLookup};
 use tokio::time::timeout;
 
 pub use iroh::{EndpointId, RelayUrl, SecretKey};
@@ -58,6 +58,9 @@ pub const MIN_NEARBY_DISCOVERY_WINDOW: Duration = Duration::from_secs(1);
 /// Longest accepted lifetime for one nearby-discovery session.
 #[cfg(feature = "nearby-discovery")]
 pub const MAX_NEARBY_DISCOVERY_WINDOW: Duration = Duration::from_secs(30);
+
+#[cfg(feature = "nearby-discovery")]
+const NEARBY_DISCOVERY_EVENT_BUFFER: usize = 20;
 
 /// ALPN for the Iroh-QUIC-protected carrier profile.
 ///
@@ -570,6 +573,55 @@ pub struct NearbyDiscoverySession {
     state: Arc<NearbyDiscoveryState>,
 }
 
+/// Sanitized carrier locator observation from a trusted-LAN browse session.
+///
+/// These events expose only Iroh endpoint identities. They carry no addresses,
+/// user data, Aster mission identity, membership, or authorization result.
+/// Discovery is untrusted locator input; callers must authenticate the carrier
+/// and then complete the mandatory Aster mission handshake before exchanging
+/// inventory or application frames.
+#[cfg(feature = "nearby-discovery")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum NearbyDiscoveryEvent {
+    /// An endpoint identity was passively observed by the nearby locator.
+    Discovered {
+        /// Untrusted candidate carrier identity.
+        endpoint_id: EndpointId,
+    },
+    /// The nearby locator expired an endpoint identity.
+    Expired {
+        /// Expired candidate carrier identity.
+        endpoint_id: EndpointId,
+    },
+}
+
+/// Exclusive, time-bounded browser for nearby carrier locator observations.
+///
+/// This is an evaluation mechanism for trusted LANs. Its bounded outward queue
+/// does not make the underlying mDNS implementation a hostile-input boundary,
+/// and its observations never authorize an Aster peer.
+#[cfg(feature = "nearby-discovery")]
+pub struct NearbyDiscoveryBrowser {
+    session: NearbyDiscoverySession,
+    events: tokio::sync::mpsc::Receiver<NearbyDiscoveryEvent>,
+}
+
+/// A subscribed nearby browser that has not installed its lookup provider yet.
+///
+/// Preparation reserves the endpoint-wide nearby-discovery slot and subscribes
+/// to mDNS observations, but it does not advertise or resolve until
+/// [`Self::install`] is called. Dropping an uninstalled preparation aborts its
+/// event forwarder and releases the reservation. This split lets a caller make
+/// the final provider installation synchronous with its own stop authority.
+#[cfg(feature = "nearby-discovery")]
+pub struct PreparedNearbyDiscoveryBrowser {
+    prepared: Option<PreparedNearbyDiscovery>,
+    window: Duration,
+    events: Option<tokio::sync::mpsc::Receiver<NearbyDiscoveryEvent>>,
+    event_forwarder: Option<tokio::task::AbortHandle>,
+}
+
 #[cfg(feature = "nearby-discovery")]
 struct NearbyDiscoveryState {
     services: AddressLookupServices,
@@ -577,6 +629,7 @@ struct NearbyDiscoveryState {
     active: AtomicBool,
     endpoint_occupied: Arc<AtomicBool>,
     expiry: Mutex<Option<tokio::task::AbortHandle>>,
+    event_forwarder: Mutex<Option<tokio::task::AbortHandle>>,
 }
 
 #[cfg(feature = "nearby-discovery")]
@@ -604,6 +657,14 @@ impl NearbyDiscoveryState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
+        let event_forwarder = self
+            .event_forwarder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(event_forwarder) = event_forwarder {
+            event_forwarder.abort();
+        }
         if abort_expiry && let Some(expiry) = expiry {
             expiry.abort();
         }
@@ -639,6 +700,53 @@ impl Drop for NearbyDiscoveryExpiryGuard {
 struct NearbyDiscoveryReservation {
     endpoint_occupied: Arc<AtomicBool>,
     committed: bool,
+}
+
+#[cfg(feature = "nearby-discovery")]
+struct PreparedNearbyDiscovery {
+    runtime: tokio::runtime::Handle,
+    reservation: NearbyDiscoveryReservation,
+    services: AddressLookupServices,
+    lookup: MdnsAddressLookup,
+}
+
+#[cfg(feature = "nearby-discovery")]
+impl PreparedNearbyDiscovery {
+    fn install(
+        self,
+        window: Duration,
+        event_forwarder: Option<tokio::task::AbortHandle>,
+    ) -> NearbyDiscoverySession {
+        let Self {
+            runtime,
+            reservation,
+            services,
+            lookup,
+        } = self;
+        services.add(lookup.clone());
+        let state = Arc::new(NearbyDiscoveryState {
+            services,
+            lookup: Mutex::new(Some(lookup)),
+            active: AtomicBool::new(true),
+            endpoint_occupied: reservation.endpoint_occupied.clone(),
+            expiry: Mutex::new(None),
+            event_forwarder: Mutex::new(event_forwarder),
+        });
+        let expiry_guard = NearbyDiscoveryExpiryGuard {
+            state: state.clone(),
+            completed: false,
+        };
+        let expiry = runtime.spawn(async move {
+            tokio::time::sleep(window).await;
+            expiry_guard.expire();
+        });
+        *state
+            .expiry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(expiry.abort_handle());
+        reservation.commit();
+        NearbyDiscoverySession { state }
+    }
 }
 
 #[cfg(feature = "nearby-discovery")]
@@ -683,6 +791,59 @@ impl NearbyDiscoverySession {
     /// Stops advertising and resolving nearby carrier address hints now.
     pub fn stop(self) {
         self.state.stop(true);
+    }
+}
+
+#[cfg(feature = "nearby-discovery")]
+impl NearbyDiscoveryBrowser {
+    /// Waits for the next sanitized carrier locator observation.
+    ///
+    /// `None` means the browser was stopped, expired, or its provider ended.
+    /// Delivery is best-effort; absence and expiry are not authorization facts.
+    pub async fn next_event(&mut self) -> Option<NearbyDiscoveryEvent> {
+        self.events.recv().await
+    }
+
+    /// Returns a cloneable synchronous stop authority for this exact browser.
+    pub fn stop_handle(&self) -> NearbyDiscoveryStopHandle {
+        self.session.stop_handle()
+    }
+
+    /// Stops the browser and clears its lookup provider now.
+    pub fn stop(self) {
+        self.session.stop();
+    }
+}
+
+#[cfg(feature = "nearby-discovery")]
+impl PreparedNearbyDiscoveryBrowser {
+    /// Installs the subscribed provider and starts its bounded lifetime.
+    pub fn install(mut self) -> NearbyDiscoveryBrowser {
+        let prepared = self
+            .prepared
+            .take()
+            .expect("nearby browser preparation installs exactly once");
+        let events = self
+            .events
+            .take()
+            .expect("nearby browser preparation owns one event receiver");
+        let event_forwarder = self
+            .event_forwarder
+            .take()
+            .expect("nearby browser preparation owns one event forwarder");
+        let session = prepared.install(self.window, Some(event_forwarder));
+        NearbyDiscoveryBrowser { session, events }
+    }
+}
+
+#[cfg(feature = "nearby-discovery")]
+impl Drop for PreparedNearbyDiscoveryBrowser {
+    fn drop(&mut self) {
+        if let Some(event_forwarder) = self.event_forwarder.take() {
+            event_forwarder.abort();
+        }
+        // `PreparedNearbyDiscovery` releases the endpoint reservation on drop
+        // whenever installation did not commit it.
     }
 }
 
@@ -855,20 +1016,11 @@ impl Endpoint {
         self.inner.bound_sockets()
     }
 
-    /// Starts one exclusive, internally time-bounded nearby lookup session.
-    ///
-    /// This is an evaluation/demo mechanism, not an authorization source.
-    /// It uses Iroh's official mDNS address-lookup provider, advertises direct
-    /// IP addresses only, and carries no Aster metadata. The caller must still
-    /// name the exact expected carrier identity before dialing, and the Aster
-    /// mission handshake remains mandatory after carrier authentication. The
-    /// provider stops no later than the caller-supplied one-to-thirty-second
-    /// window even if the returned guard is leaked.
     #[cfg(feature = "nearby-discovery")]
-    pub fn start_nearby_discovery(
+    fn prepare_nearby_discovery(
         &self,
         window: Duration,
-    ) -> Result<NearbyDiscoverySession, CarrierError> {
+    ) -> Result<PreparedNearbyDiscovery, CarrierError> {
         if !(MIN_NEARBY_DISCOVERY_WINDOW..=MAX_NEARBY_DISCOVERY_WINDOW).contains(&window)
             || window.subsec_nanos() != 0
         {
@@ -904,28 +1056,92 @@ impl Endpoint {
             .addr_filter(AddrFilter::ip_only())
             .build(self.id())
             .map_err(|error| CarrierError::Transport(error.to_string()))?;
-        services.add(lookup.clone());
-        let state = Arc::new(NearbyDiscoveryState {
+        Ok(PreparedNearbyDiscovery {
+            runtime,
+            reservation,
             services,
-            lookup: Mutex::new(Some(lookup)),
-            active: AtomicBool::new(true),
-            endpoint_occupied: self.nearby_discovery_occupied.clone(),
-            expiry: Mutex::new(None),
+            lookup,
+        })
+    }
+
+    /// Starts one exclusive, internally time-bounded nearby lookup session.
+    ///
+    /// This is an evaluation/demo mechanism, not an authorization source.
+    /// It uses Iroh's official mDNS address-lookup provider, advertises direct
+    /// IP addresses only, and carries no Aster metadata. The caller must still
+    /// name the exact expected carrier identity before dialing, and the Aster
+    /// mission handshake remains mandatory after carrier authentication. The
+    /// provider stops no later than the caller-supplied one-to-thirty-second
+    /// window even if the returned guard is leaked.
+    #[cfg(feature = "nearby-discovery")]
+    pub fn start_nearby_discovery(
+        &self,
+        window: Duration,
+    ) -> Result<NearbyDiscoverySession, CarrierError> {
+        Ok(self.prepare_nearby_discovery(window)?.install(window, None))
+    }
+
+    /// Prepares one exclusive browser without installing its lookup provider.
+    ///
+    /// This trusted-LAN evaluation API subscribes before installing the mDNS
+    /// provider, because the provider does not replay observations made before
+    /// subscription. It exposes only endpoint identities; discovery supplies
+    /// locator candidates, never Aster authorization. A caller may attempt
+    /// carrier authentication with [`Self::connect_discovered`], but must then
+    /// complete the mandatory Aster mission handshake before reading inventory
+    /// or application frames.
+    ///
+    /// The browser shares the same endpoint-wide exclusivity and whole-second
+    /// one-to-thirty-second lifetime as [`Self::start_nearby_discovery`].
+    #[cfg(feature = "nearby-discovery")]
+    pub async fn prepare_nearby_browser(
+        &self,
+        window: Duration,
+    ) -> Result<PreparedNearbyDiscoveryBrowser, CarrierError> {
+        let prepared = self.prepare_nearby_discovery(window)?;
+
+        // This order is security- and correctness-significant. The upstream
+        // subscriber receives no replay of the provider's existing peer map.
+        let mut source = prepared.lookup.subscribe().await;
+        let (event_sender, event_receiver) =
+            tokio::sync::mpsc::channel(NEARBY_DISCOVERY_EVENT_BUFFER);
+        let event_forwarder = prepared.runtime.spawn(async move {
+            while let Some(event) = source.next().await {
+                let sanitized = match event {
+                    MdnsDiscoveryEvent::Discovered { endpoint_info, .. } => {
+                        NearbyDiscoveryEvent::Discovered {
+                            endpoint_id: endpoint_info.endpoint_id,
+                        }
+                    }
+                    MdnsDiscoveryEvent::Expired { endpoint_id } => {
+                        NearbyDiscoveryEvent::Expired { endpoint_id }
+                    }
+                    _ => continue,
+                };
+                if event_sender.send(sanitized).await.is_err() {
+                    break;
+                }
+            }
         });
-        let expiry_guard = NearbyDiscoveryExpiryGuard {
-            state: state.clone(),
-            completed: false,
-        };
-        let expiry = runtime.spawn(async move {
-            tokio::time::sleep(window).await;
-            expiry_guard.expire();
-        });
-        *state
-            .expiry
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(expiry.abort_handle());
-        reservation.commit();
-        Ok(NearbyDiscoverySession { state })
+        Ok(PreparedNearbyDiscoveryBrowser {
+            prepared: Some(prepared),
+            window,
+            events: Some(event_receiver),
+            event_forwarder: Some(event_forwarder.abort_handle()),
+        })
+    }
+
+    /// Starts one exclusive browser for nearby carrier locator observations.
+    ///
+    /// This convenience API composes [`Self::prepare_nearby_browser`] with
+    /// synchronous provider installation. Callers that must serialize install
+    /// with an external stop authority should use the split API directly.
+    #[cfg(feature = "nearby-discovery")]
+    pub async fn start_nearby_browser(
+        &self,
+        window: Duration,
+    ) -> Result<NearbyDiscoveryBrowser, CarrierError> {
+        Ok(self.prepare_nearby_browser(window).await?.install())
     }
 
     /// Waits, within the configured connection deadline, for the pinned relay
@@ -1022,19 +1238,43 @@ impl Endpoint {
     /// Accepts one connection and rejects identities outside `allowed` before
     /// any application frame is read.
     pub async fn accept(&self, allowed: &BTreeSet<EndpointId>) -> Result<Connection, CarrierError> {
-        let incoming = timeout(self.config.connect_timeout, self.inner.accept())
-            .await
-            .map_err(|_| CarrierError::Timeout("accept"))?
-            .ok_or_else(|| CarrierError::Transport("endpoint stopped accepting".into()))?;
-        let inner = timeout(self.config.connect_timeout, incoming)
-            .await
-            .map_err(|_| CarrierError::Timeout("handshake"))?
-            .map_err(|error| CarrierError::Transport(error.to_string()))?;
+        let inner = self.accept_carrier().await?;
         let remote = inner.remote_id();
         if !allowed.contains(&remote) {
             inner.close(1u8.into(), b"unauthorized peer");
             return Err(CarrierError::UnauthorizedPeer(remote));
         }
+        self.finish_accepted_connection(inner)
+    }
+
+    /// Accepts one carrier-authenticated candidate without a carrier roster.
+    ///
+    /// The returned connection proves possession of its Iroh endpoint identity
+    /// under this endpoint's selected ALPN only. This method performs no Aster
+    /// mission identity, membership, scope, or application authorization. The
+    /// caller must immediately complete the mandatory Aster mission handshake
+    /// and reject an unprovisioned peer before reading inventory or application
+    /// frames. Use [`Self::accept`] when the carrier roster is already known.
+    pub async fn accept_candidate(&self) -> Result<Connection, CarrierError> {
+        let inner = self.accept_carrier().await?;
+        self.finish_accepted_connection(inner)
+    }
+
+    async fn accept_carrier(&self) -> Result<iroh::endpoint::Connection, CarrierError> {
+        let incoming = timeout(self.config.connect_timeout, self.inner.accept())
+            .await
+            .map_err(|_| CarrierError::Timeout("accept"))?
+            .ok_or_else(|| CarrierError::Transport("endpoint stopped accepting".into()))?;
+        timeout(self.config.connect_timeout, incoming)
+            .await
+            .map_err(|_| CarrierError::Timeout("handshake"))?
+            .map_err(|error| CarrierError::Transport(error.to_string()))
+    }
+
+    fn finish_accepted_connection(
+        &self,
+        inner: iroh::endpoint::Connection,
+    ) -> Result<Connection, CarrierError> {
         self.ensure_negotiated_profile(&inner)?;
         Ok(Connection::new(
             inner,
@@ -1994,6 +2234,89 @@ mod tests {
 
     #[cfg(feature = "nearby-discovery")]
     #[tokio::test]
+    async fn nearby_browser_reuses_bounded_window_validation() {
+        let endpoint = Endpoint::bind(
+            SecretKey::generate(),
+            EndpointConfig::direct("127.0.0.1:0".parse().expect("address")),
+        )
+        .await
+        .expect("endpoint");
+
+        for invalid in [
+            Duration::ZERO,
+            Duration::from_millis(1_500),
+            MAX_NEARBY_DISCOVERY_WINDOW + Duration::from_secs(1),
+        ] {
+            let error = match endpoint.start_nearby_browser(invalid).await {
+                Ok(_) => panic!("invalid nearby browser window must fail: {invalid:?}"),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                error,
+                CarrierError::Configuration(message)
+                    if message.contains("whole number of seconds")
+            ));
+        }
+        assert!(
+            !endpoint.nearby_discovery_occupied.load(Ordering::Acquire),
+            "invalid browser windows cannot reserve endpoint singleton ownership"
+        );
+
+        endpoint.close().await;
+    }
+
+    #[cfg(feature = "nearby-discovery")]
+    #[tokio::test]
+    async fn nearby_browser_shares_exclusivity_and_stops_without_multicast_events() {
+        let endpoint = Endpoint::bind(
+            SecretKey::generate(),
+            EndpointConfig::direct("127.0.0.1:0".parse().expect("address")),
+        )
+        .await
+        .expect("endpoint");
+        let services = endpoint.inner.address_lookup().expect("lookup registry");
+        let mut browser = endpoint
+            .start_nearby_browser(MAX_NEARBY_DISCOVERY_WINDOW)
+            .await
+            .expect("browser");
+        let browser_stop = browser.stop_handle();
+        assert!(browser_stop.is_active());
+        assert_eq!(services.len(), 1);
+
+        let error = match endpoint.start_nearby_discovery(MIN_NEARBY_DISCOVERY_WINDOW) {
+            Ok(_) => panic!("browser and rostered lookup must not stack"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            CarrierError::Configuration(message)
+                if message.contains("only one nearby-discovery session")
+        ));
+
+        browser_stop.stop();
+        assert!(!browser_stop.is_active());
+        assert!(services.is_empty());
+        timeout(Duration::from_secs(1), async {
+            while browser.next_event().await.is_some() {}
+        })
+        .await
+        .expect("stopped browser event stream closes");
+
+        let later = endpoint
+            .start_nearby_discovery(MAX_NEARBY_DISCOVERY_WINDOW)
+            .expect("stop releases endpoint singleton ownership");
+        let later_stop = later.stop_handle();
+        drop(browser);
+        assert!(
+            later_stop.is_active(),
+            "dropping an old browser cannot stop a later lookup generation"
+        );
+        later.stop();
+        endpoint.close().await;
+    }
+
+    #[cfg(feature = "nearby-discovery")]
+    #[tokio::test]
     async fn concurrent_nearby_starts_install_exactly_one_provider() {
         let endpoint = Endpoint::bind(
             SecretKey::generate(),
@@ -2464,6 +2787,46 @@ mod tests {
             Ok(_) => panic!("unlisted peer was accepted"),
         }
 
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn accept_candidate_returns_an_unrostered_authenticated_carrier() {
+        let server = Endpoint::bind(
+            SecretKey::generate(),
+            EndpointConfig::direct("127.0.0.1:0".parse().expect("address")),
+        )
+        .await
+        .expect("server");
+        let client = Endpoint::bind(
+            SecretKey::generate(),
+            EndpointConfig::direct("127.0.0.1:0".parse().expect("address")),
+        )
+        .await
+        .expect("client");
+        let client_id = client.id();
+        let server_task = tokio::spawn({
+            let server = server.clone();
+            async move { server.accept_candidate().await.expect("candidate accept") }
+        });
+
+        let client_connection = client
+            .connect(ExpectedPeer {
+                id: server.id(),
+                address: loopback(&server),
+            })
+            .await
+            .expect("connect");
+        let server_connection = server_task.await.expect("server task");
+        assert_eq!(server_connection.remote_id(), client_id);
+        assert_eq!(
+            server_connection.security_profile(),
+            server.security_profile()
+        );
+
+        server_connection.close();
+        client_connection.close();
         client.close().await;
         server.close().await;
     }

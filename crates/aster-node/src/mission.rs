@@ -1,15 +1,17 @@
 //! Mission-authenticated session boundary above the Iroh carrier.
 //!
 //! An Iroh endpoint identity authenticates the carrier connection. It does not
-//! establish Aster mission membership. This module binds an observed carrier
-//! peer to a separately provisioned, expected mission [`NodeId`]. It preserves
-//! the complete hybrid handshake and record layer while also exposing an exact
-//! classical mission handshake bound to an `IrohQuicV1` TLS exporter.
+//! establish Aster mission membership. This module either binds an observed
+//! carrier peer to a separately provisioned, expected mission [`NodeId`], or
+//! admits a discovered peer only after its credential authenticates under the
+//! local mission authority. It preserves the complete hybrid handshake and
+//! record layer while also exposing an exact classical mission handshake bound
+//! to an `IrohQuicV1` TLS exporter.
 //!
 //! The handshake state types intentionally expose no application-frame API.
 //! Only [`MissionSession`] or [`CarrierBoundClassicalMissionSession`], produced
-//! after the fourth flight and an exact peer identity check, can expose their
-//! profile's protected application path.
+//! after the fourth flight and the selected peer-admission check, can expose
+//! their profile's protected application path.
 
 use aster_iroh::{
     CarrierError, CarrierSecurityProfile, ChannelBindingContext as IrohChannelBindingContext,
@@ -1278,11 +1280,14 @@ impl MissionProvisioningError {
     }
 }
 
-/// Exact carrier-to-mission identity binding configured for one peer.
+/// Carrier and mission identities associated with one peer contact.
 ///
 /// `carrier_id` is the Iroh identity authenticated by QUIC. `mission_id` is the
 /// authority-provisioned Aster identity authenticated by the selected mission
-/// handshake. They are deliberately different fields and different types.
+/// handshake. They are deliberately different fields and different types. The
+/// exact-roster path checks this pair against configuration; the discovered
+/// hybrid path records two independently authenticated observations and does
+/// not prove that one principal controls both identities.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MissionPeerBinding {
     carrier_id: EndpointId,
@@ -1290,7 +1295,10 @@ pub struct MissionPeerBinding {
 }
 
 impl MissionPeerBinding {
-    /// Creates an exact expected binding for one peer.
+    /// Creates one carrier-and-mission identity pair.
+    ///
+    /// Exact-roster APIs treat this pair as an expectation. A discovered
+    /// hybrid session constructs it only as two same-contact observations.
     pub const fn new(carrier_id: EndpointId, mission_id: NodeId) -> Self {
         Self {
             carrier_id,
@@ -1298,12 +1306,18 @@ impl MissionPeerBinding {
         }
     }
 
-    /// Iroh endpoint identity expected on the carrier connection.
+    /// Iroh endpoint identity in this pair.
+    ///
+    /// It is expected configuration for an exact-roster session and the
+    /// authenticated connection observation for a discovered session.
     pub const fn carrier_id(&self) -> EndpointId {
         self.carrier_id
     }
 
-    /// Aster mission identity expected inside the authenticated handshake.
+    /// Aster mission identity in this pair.
+    ///
+    /// It is expected configuration for an exact-roster session and the
+    /// authority-authenticated handshake result for a discovered session.
     pub const fn mission_id(&self) -> NodeId {
         self.mission_id
     }
@@ -1316,6 +1330,53 @@ impl MissionPeerBinding {
             });
         }
         Ok(self)
+    }
+}
+
+/// Peer-admission decision retained across the hybrid handshake typestate.
+///
+/// A discovered carrier is not mission authorization. Its mission identity is
+/// populated only from a completed [`ReferenceAuthenticatedSession`], whose
+/// credential has already authenticated under the local bundle's exact mission
+/// authority. The exact-roster variant preserves the additional configured
+/// mission-identity comparison.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HybridPeerAdmission {
+    Exact(MissionPeerBinding),
+    DiscoveredCarrier(EndpointId),
+}
+
+impl HybridPeerAdmission {
+    fn exact(
+        peer: MissionPeerBinding,
+        observed_carrier: EndpointId,
+    ) -> Result<Self, MissionSessionError> {
+        Ok(Self::Exact(peer.verify_observed_carrier(observed_carrier)?))
+    }
+
+    const fn discovered(observed_carrier: EndpointId) -> Self {
+        Self::DiscoveredCarrier(observed_carrier)
+    }
+
+    fn bind(
+        self,
+        mut inner: ReferenceAuthenticatedSession,
+    ) -> Result<MissionSession, MissionSessionError> {
+        let authenticated = inner.peer_identity();
+        let peer = match self {
+            Self::Exact(peer) if authenticated != peer.mission_id => {
+                inner.zeroize();
+                return Err(MissionSessionError::MissionIdentityMismatch {
+                    expected: peer.mission_id,
+                    authenticated,
+                });
+            }
+            Self::Exact(peer) => peer,
+            Self::DiscoveredCarrier(carrier_id) => {
+                MissionPeerBinding::new(carrier_id, authenticated)
+            }
+        };
+        Ok(MissionSession { inner, peer })
     }
 }
 
@@ -1378,7 +1439,7 @@ impl fmt::Debug for ClassicalChannelBindingContext {
     }
 }
 
-/// Fail-closed error from carrier binding, mission authentication, or protected frames.
+/// Fail-closed error from carrier checks, mission authentication, or protected frames.
 #[derive(Debug)]
 pub enum MissionSessionError {
     /// The bounded Iroh carrier failed while exchanging an opaque flight.
@@ -1522,7 +1583,7 @@ impl MissionHandshakeReceipt {
 /// Initiator waiting for the responder's second handshake flight.
 pub struct MissionSessionInitiator {
     inner: ReferenceSessionInitiator,
-    peer: MissionPeerBinding,
+    admission: HybridPeerAdmission,
 }
 
 impl MissionSessionInitiator {
@@ -1535,9 +1596,25 @@ impl MissionSessionInitiator {
         peer: MissionPeerBinding,
         observed_carrier: EndpointId,
     ) -> Result<(Self, MissionHandshakeFlight), MissionSessionError> {
-        let peer = peer.verify_observed_carrier(observed_carrier)?;
+        Self::start_with_admission(bundle, HybridPeerAdmission::exact(peer, observed_carrier)?)
+    }
+
+    fn start_discovered(
+        bundle: ProvisioningBundle,
+        observed_carrier: EndpointId,
+    ) -> Result<(Self, MissionHandshakeFlight), MissionSessionError> {
+        Self::start_with_admission(bundle, HybridPeerAdmission::discovered(observed_carrier))
+    }
+
+    fn start_with_admission(
+        bundle: ProvisioningBundle,
+        admission: HybridPeerAdmission,
+    ) -> Result<(Self, MissionHandshakeFlight), MissionSessionError> {
         let (inner, flight) = ReferenceSessionInitiator::start(bundle)?;
-        Ok((Self { inner, peer }, MissionHandshakeFlight::new(flight)))
+        Ok((
+            Self { inner, admission },
+            MissionHandshakeFlight::new(flight),
+        ))
     }
 
     /// Authenticates the responder's second flight and creates the third.
@@ -1549,7 +1626,7 @@ impl MissionSessionInitiator {
         Ok((
             MissionSessionAwaitingFinished {
                 inner,
-                peer: self.peer,
+                admission: self.admission,
             },
             MissionHandshakeFlight::new(response),
         ))
@@ -1561,7 +1638,8 @@ impl MissionSessionInitiator {
 ///
 /// The carrier performs two independently bounded request/response exchanges:
 /// flights one/two and flights three/four. Any failure closes the connection;
-/// only a fully authenticated, exactly peer-bound session is returned.
+/// a session is returned only after the independently authenticated carrier and
+/// mission identities both match the exact configured expectation.
 pub async fn initiate_over_iroh(
     connection: &Connection,
     bundle: ProvisioningBundle,
@@ -1578,9 +1656,33 @@ pub(crate) async fn initiate_over_iroh_metered(
     bundle: ProvisioningBundle,
     peer: MissionPeerBinding,
 ) -> Result<(MissionSession, MissionHandshakeReceipt), MissionSessionError> {
+    initiate_over_iroh_metered_with_admission(connection, bundle, Some(peer)).await
+}
+
+/// Runs a discovered-peer initiator handshake and receipts it only on full success.
+///
+/// No expected carrier or mission identity is supplied to this mission layer.
+/// The returned binding pairs the carrier identity authenticated by Iroh with
+/// the mission identity authenticated under the local bundle's authority. It
+/// does not promote that observed pair into a durable trust statement.
+#[cfg_attr(not(feature = "nearby-discovery"), allow(dead_code))]
+pub(crate) async fn initiate_discovered_over_iroh_metered(
+    connection: &Connection,
+    bundle: ProvisioningBundle,
+) -> Result<(MissionSession, MissionHandshakeReceipt), MissionSessionError> {
+    initiate_over_iroh_metered_with_admission(connection, bundle, None).await
+}
+
+async fn initiate_over_iroh_metered_with_admission(
+    connection: &Connection,
+    bundle: ProvisioningBundle,
+    exact_peer: Option<MissionPeerBinding>,
+) -> Result<(MissionSession, MissionHandshakeReceipt), MissionSessionError> {
     let result = async {
-        let (initiator, first) =
-            MissionSessionInitiator::start(bundle, peer, connection.remote_id())?;
+        let (initiator, first) = match exact_peer {
+            Some(peer) => MissionSessionInitiator::start(bundle, peer, connection.remote_id())?,
+            None => MissionSessionInitiator::start_discovered(bundle, connection.remote_id())?,
+        };
         let second = connection.request(first.as_bytes()).await?;
         let (pending, third) = initiator.receive_server(&second)?;
         let fourth = connection.request(third.as_bytes()).await?;
@@ -1602,23 +1704,23 @@ pub(crate) async fn initiate_over_iroh_metered(
 /// Initiator waiting for fourth-flight key confirmation.
 ///
 /// This type has no application-frame methods. It becomes usable only after
-/// both key confirmation and the exact expected mission-identity check succeed.
+/// both key confirmation and the selected peer-admission check succeed.
 pub struct MissionSessionAwaitingFinished {
     inner: ReferenceSessionAwaitingFinished,
-    peer: MissionPeerBinding,
+    admission: HybridPeerAdmission,
 }
 
 impl MissionSessionAwaitingFinished {
-    /// Authenticates the fourth flight and checks the expected mission peer.
+    /// Authenticates the fourth flight and applies the selected peer admission.
     pub fn receive_finished(self, flight: &[u8]) -> Result<MissionSession, MissionSessionError> {
-        MissionSession::bind(self.inner.receive_finished(flight)?, self.peer)
+        self.admission.bind(self.inner.receive_finished(flight)?)
     }
 }
 
 /// Responder waiting for the initiator's first handshake flight.
 pub struct MissionSessionResponder {
     inner: ReferenceSessionResponder,
-    peer: MissionPeerBinding,
+    admission: HybridPeerAdmission,
 }
 
 impl MissionSessionResponder {
@@ -1631,10 +1733,23 @@ impl MissionSessionResponder {
         peer: MissionPeerBinding,
         observed_carrier: EndpointId,
     ) -> Result<Self, MissionSessionError> {
-        let peer = peer.verify_observed_carrier(observed_carrier)?;
+        Self::open_with_admission(bundle, HybridPeerAdmission::exact(peer, observed_carrier)?)
+    }
+
+    fn open_discovered(
+        bundle: ProvisioningBundle,
+        observed_carrier: EndpointId,
+    ) -> Result<Self, MissionSessionError> {
+        Self::open_with_admission(bundle, HybridPeerAdmission::discovered(observed_carrier))
+    }
+
+    fn open_with_admission(
+        bundle: ProvisioningBundle,
+        admission: HybridPeerAdmission,
+    ) -> Result<Self, MissionSessionError> {
         Ok(Self {
             inner: ReferenceSessionResponder::open(bundle)?,
-            peer,
+            admission,
         })
     }
 
@@ -1647,7 +1762,7 @@ impl MissionSessionResponder {
         Ok((
             MissionSessionResponderPending {
                 inner,
-                peer: self.peer,
+                admission: self.admission,
             },
             MissionHandshakeFlight::new(response),
         ))
@@ -1656,22 +1771,22 @@ impl MissionSessionResponder {
 
 /// Responder waiting for the initiator's third handshake flight.
 ///
-/// This type has no application-frame methods. The expected mission identity
-/// is checked before the fourth flight is returned to the carrier.
+/// This type has no application-frame methods. The selected peer admission is
+/// applied before the fourth flight is returned to the carrier.
 pub struct MissionSessionResponderPending {
     inner: ReferenceSessionResponderPending,
-    peer: MissionPeerBinding,
+    admission: HybridPeerAdmission,
 }
 
 impl MissionSessionResponderPending {
-    /// Authenticates the third flight, checks the expected mission peer, and
+    /// Authenticates the third flight, applies the selected peer admission, and
     /// returns the completed responder session plus fourth flight.
     pub fn receive_client_auth(
         self,
         flight: &[u8],
     ) -> Result<(MissionSession, MissionHandshakeFlight), MissionSessionError> {
         let (inner, response) = self.inner.receive_client_auth(flight)?;
-        let session = MissionSession::bind(inner, self.peer)?;
+        let session = self.admission.bind(inner)?;
         Ok((session, MissionHandshakeFlight::new(response)))
     }
 }
@@ -1680,7 +1795,7 @@ impl MissionSessionResponderPending {
 /// authenticated Iroh connection.
 ///
 /// The carrier accepts two independently bounded request/response exchanges:
-/// flights one/two and flights three/four. A handshake or binding error is
+/// flights one/two and flights three/four. A handshake or expected-identity error is
 /// retained as a mission error rather than being relabeled as a transport
 /// failure. Any failure closes the connection.
 pub async fn respond_over_iroh(
@@ -1699,7 +1814,29 @@ pub(crate) async fn respond_over_iroh_metered(
     bundle: ProvisioningBundle,
     peer: MissionPeerBinding,
 ) -> Result<(MissionSession, MissionHandshakeReceipt), MissionSessionError> {
-    let result = respond_over_iroh_inner(connection, bundle, peer).await;
+    respond_over_iroh_metered_with_admission(connection, bundle, Some(peer)).await
+}
+
+/// Runs a discovered-peer responder handshake and receipts it only on full success.
+///
+/// The remote mission identity is not accepted from discovery or application
+/// bytes. It is learned only from the completed authority-authenticated core
+/// handshake and then paired with the Iroh-authenticated carrier identity for
+/// this contact; the pair is not a proof of common key ownership.
+#[cfg_attr(not(feature = "nearby-discovery"), allow(dead_code))]
+pub(crate) async fn respond_discovered_over_iroh_metered(
+    connection: &Connection,
+    bundle: ProvisioningBundle,
+) -> Result<(MissionSession, MissionHandshakeReceipt), MissionSessionError> {
+    respond_over_iroh_metered_with_admission(connection, bundle, None).await
+}
+
+async fn respond_over_iroh_metered_with_admission(
+    connection: &Connection,
+    bundle: ProvisioningBundle,
+    exact_peer: Option<MissionPeerBinding>,
+) -> Result<(MissionSession, MissionHandshakeReceipt), MissionSessionError> {
+    let result = respond_over_iroh_inner(connection, bundle, exact_peer).await;
     if result.is_err() {
         connection.close();
     }
@@ -1709,9 +1846,12 @@ pub(crate) async fn respond_over_iroh_metered(
 async fn respond_over_iroh_inner(
     connection: &Connection,
     bundle: ProvisioningBundle,
-    peer: MissionPeerBinding,
+    exact_peer: Option<MissionPeerBinding>,
 ) -> Result<(MissionSession, MissionHandshakeReceipt), MissionSessionError> {
-    let responder = MissionSessionResponder::open(bundle, peer, connection.remote_id())?;
+    let responder = match exact_peer {
+        Some(peer) => MissionSessionResponder::open(bundle, peer, connection.remote_id())?,
+        None => MissionSessionResponder::open_discovered(bundle, connection.remote_id())?,
+    };
     let mut first_transition = None;
     let mut first_lengths = None;
     let first_exchange = connection
@@ -2122,29 +2262,18 @@ impl Drop for CarrierBoundClassicalMissionSession {
     }
 }
 
-/// Hybrid-authenticated, peer-bound mission session for application frames.
+/// Hybrid-authenticated mission session associated with one carrier peer.
 pub struct MissionSession {
     inner: ReferenceAuthenticatedSession,
     peer: MissionPeerBinding,
 }
 
 impl MissionSession {
-    fn bind(
-        mut inner: ReferenceAuthenticatedSession,
-        peer: MissionPeerBinding,
-    ) -> Result<Self, MissionSessionError> {
-        let authenticated = inner.peer_identity();
-        if authenticated != peer.mission_id {
-            inner.zeroize();
-            return Err(MissionSessionError::MissionIdentityMismatch {
-                expected: peer.mission_id,
-                authenticated,
-            });
-        }
-        Ok(Self { inner, peer })
-    }
-
-    /// Exact carrier-to-mission peer binding authenticated for this session.
+    /// Carrier and mission identities authenticated independently for this session.
+    ///
+    /// Exact-roster sessions additionally checked the pair against
+    /// configuration. Discovered hybrid sessions make no common-key-ownership
+    /// claim about the two identities.
     pub const fn peer(&self) -> MissionPeerBinding {
         self.peer
     }
@@ -2721,6 +2850,147 @@ mod tests {
                 observed: CarrierSecurityProfile::HybridAsterRecordV1,
             })
         ));
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn discovered_hybrid_peers_bind_observed_carriers_to_authority_authenticated_identities()
+    {
+        let server = Endpoint::bind(
+            SecretKey::generate(),
+            EndpointConfig::direct("127.0.0.1:0".parse().expect("server address")),
+        )
+        .await
+        .expect("server endpoint");
+        let client = Endpoint::bind(
+            SecretKey::generate(),
+            EndpointConfig::direct("127.0.0.1:0".parse().expect("client address")),
+        )
+        .await
+        .expect("client endpoint");
+
+        let mut provisioner = ReferenceProvisioner::from_seed([0x85; 32]).expect("provisioner");
+        let initiator = issue(&mut provisioner, 1);
+        let responder = issue(&mut provisioner, 2);
+        let initiator_identity = initiator.identity;
+        let responder_identity = responder.identity;
+        let client_id = client.id();
+        let allowed = BTreeSet::from([client_id]);
+        let server_task = tokio::spawn({
+            let server = server.clone();
+            async move {
+                let connection = server.accept(&allowed).await.expect("accept carrier");
+                let (mut session, receipt) =
+                    respond_discovered_over_iroh_metered(&connection, responder.bundle())
+                        .await
+                        .expect("discovered responder handshake");
+                assert_eq!(receipt.frames, 4);
+                assert_eq!(
+                    session.peer(),
+                    MissionPeerBinding::new(client_id, initiator_identity)
+                );
+                assert!(
+                    connection
+                        .respond_once(|protected_ping| {
+                            let ping = session
+                                .open_application_frame(protected_ping)
+                                .map_err(|error| CarrierError::Transport(error.to_string()))?;
+                            assert_eq!(ping, b"discovered ping");
+                            let protected_pong = session
+                                .seal_application_frame(b"discovered pong")
+                                .map_err(|error| CarrierError::Transport(error.to_string()))?;
+                            Ok((protected_pong, true))
+                        })
+                        .await
+                        .expect("discovered protected response")
+                );
+            }
+        });
+
+        let connection = client
+            .connect(ExpectedPeer {
+                id: server.id(),
+                address: loopback(&server),
+            })
+            .await
+            .expect("connect carrier");
+        let (mut session, receipt) =
+            initiate_discovered_over_iroh_metered(&connection, initiator.bundle())
+                .await
+                .expect("discovered initiator handshake");
+        assert_eq!(receipt.frames, 4);
+        assert_eq!(
+            session.peer(),
+            MissionPeerBinding::new(server.id(), responder_identity)
+        );
+        let protected_ping = session
+            .seal_application_frame(b"discovered ping")
+            .expect("protect discovered ping");
+        let protected_pong = connection
+            .request(&protected_ping)
+            .await
+            .expect("exchange discovered ping");
+        assert_eq!(
+            session
+                .open_application_frame(&protected_pong)
+                .expect("authenticate discovered pong"),
+            b"discovered pong"
+        );
+
+        server_task.await.expect("server task");
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn discovered_hybrid_peer_from_different_authority_is_rejected() {
+        let server = Endpoint::bind(
+            SecretKey::generate(),
+            EndpointConfig::direct("127.0.0.1:0".parse().expect("server address")),
+        )
+        .await
+        .expect("server endpoint");
+        let client = Endpoint::bind(
+            SecretKey::generate(),
+            EndpointConfig::direct("127.0.0.1:0".parse().expect("client address")),
+        )
+        .await
+        .expect("client endpoint");
+
+        let mut initiator_authority =
+            ReferenceProvisioner::from_seed([0x86; 32]).expect("initiator authority");
+        let mut responder_authority =
+            ReferenceProvisioner::from_seed([0x87; 32]).expect("responder authority");
+        let initiator = issue(&mut initiator_authority, 1);
+        let responder = issue(&mut responder_authority, 1);
+        let allowed = BTreeSet::from([client.id()]);
+        let server_task = tokio::spawn({
+            let server = server.clone();
+            async move {
+                let connection = server.accept(&allowed).await.expect("accept carrier");
+                respond_discovered_over_iroh_metered(&connection, responder.bundle()).await
+            }
+        });
+
+        let connection = client
+            .connect(ExpectedPeer {
+                id: server.id(),
+                address: loopback(&server),
+            })
+            .await
+            .expect("connect carrier");
+        assert!(
+            initiate_discovered_over_iroh_metered(&connection, initiator.bundle())
+                .await
+                .is_err(),
+            "a different mission authority must not yield an initiator session"
+        );
+        assert!(matches!(
+            server_task.await.expect("server task"),
+            Err(MissionSessionError::Authentication(_))
+        ));
+
         client.close().await;
         server.close().await;
     }

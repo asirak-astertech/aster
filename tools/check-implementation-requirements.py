@@ -400,6 +400,29 @@ CONTROLLED_RELAY_SLICE = (
     "crates/aster-node/tests/mesh_cli.rs::"
     "manual_node_redacts_duplicate_token_bearing_relay_url_before_state_access"
 )
+LAN_DISCOVERY_SLICE = (
+    "crates/aster-iroh/src/lib.rs; crates/aster-node/src/mission.rs; "
+    "crates/aster-node/src/runtime.rs; crates/aster-node/src/main.rs; "
+    "crates/aster-agent/src/main.rs; "
+    "crates/aster-iroh/src/lib.rs::tests::"
+    "nearby_browser_shares_exclusivity_and_stops_without_multicast_events; "
+    "crates/aster-iroh/src/lib.rs::tests::"
+    "accept_candidate_returns_an_unrostered_authenticated_carrier; "
+    "crates/aster-node/src/mission.rs::tests::"
+    "discovered_hybrid_peers_bind_observed_carriers_to_authority_authenticated_identities; "
+    "crates/aster-node/src/mission.rs::tests::"
+    "discovered_hybrid_peer_from_different_authority_is_rejected; "
+    "crates/aster-node/src/runtime.rs::tests::"
+    "automatic_nearby_is_rosterless_bounded_and_exclusive; "
+    "crates/aster-node/src/runtime.rs::tests::"
+    "automatic_nearby_admission_bounds_missions_without_trusting_carrier_pairing; "
+    "crates/aster-node/src/runtime.rs::tests::"
+    "live_non_normal_policy_synchronously_and_permanently_stops_nearby_discovery; "
+    "crates/aster-node/src/main.rs::tests::"
+    "discover_lan_switch_and_conflicts_fail_closed; "
+    "crates/aster-agent/src/main.rs::tests::"
+    "discover_lan_switch_and_conflicts_fail_closed"
+)
 SELECTED_NAT_SLICE = (
     "crates/aster-iroh/src/lib.rs; crates/aster-node/src/runtime.rs; "
     "crates/aster-node/src/main.rs; crates/aster-lab/src/selected_nat_main.rs; "
@@ -1061,18 +1084,23 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
         "Verify duplicate delivery, cyclic and broadcast loop suppression, and bounded routing over the network.",
     ),
     "DM-5.7-01": selected_claim(
-        "open",
+        "implemented-uncredited",
         "aster-iroh + aster-node",
-        "crates/aster-iroh/src/lib.rs; crates/aster-node/src/runtime.rs; "
-        "crates/aster-node/src/main.rs; crates/aster-agent/src/main.rs; "
-        "docs/evaluations/0005/nearby-discovery-selection.md; a default-off "
-        "official Iroh mDNS adapter can resolve exact pre-provisioned carrier "
-        "IDs during a maximum-30-second demo/evaluation window, but no retained "
-        "selected-production-lane advertise-to-authenticated-delivery evidence is mapped",
-        "Complete two-physical-host advertise, discover, carrier-authenticate, "
-        "mission-authenticate, and Event-delivery evidence; add upstream "
-        "hostile-cardinality bounds plus packet, CPU, RSS, task, file-descriptor, "
-        "and energy qualification before production selection or credit.",
+        f"{LAN_DISCOVERY_SLICE}; a default-off --discover-lan mode takes no "
+        "neighbor identity or address, treats mDNS endpoint identities only as "
+        "untrusted locator candidates, authenticates the carrier and an "
+        "independent authority-issued mission identity before inventory, retains "
+        "at most 32 locator candidates and 32 authenticated mission identities, "
+        "uses the existing 16-inbound and 16-outbound contact caps, and repeats "
+        "whole-second discovery windows of at most 30 seconds; exact rostered and "
+        "manual modes remain separate",
+        "Retain the complete advertise, discover, carrier-authenticate, "
+        "mission-authenticate, and Event-delivery chain on at least two physical "
+        "hosts; hard-bound or replace the upstream uncapped discovery maps; "
+        "measure packet, CPU, RSS, task, file-descriptor, and energy behavior; "
+        "and add BTLE discovery. The runnable three-host same-build mDNS/IP "
+        "quickstart is not retained physical-LAN, hostile-input, NAT/WAN, "
+        "mixed-implementation, supported-target, or production evidence.",
     ),
     "DM-5.7-02": selected_claim(
         "observed-bounded",
@@ -1083,22 +1111,39 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     "DM-5.7-03": selected_claim(
         "implemented-uncredited",
         "aster-node",
-        f"{CUSTODY_SLICE}; docs/evaluations/0005/nearby-discovery-selection.md; "
-        "default direct-Iroh installs no lookup, explicit nearby discovery is "
-        "accepted only from initial Normal policy, is cleared automatically at "
-        "expiry or shutdown, and is synchronously cleared before a public live "
-        "move away from Normal returns, while ReceiveOnly "
-        "additionally forbids contact initiation and discloses zero mutable/Blob work",
+        f"{CUSTODY_SLICE}; {LAN_DISCOVERY_SLICE}; "
+        "default direct-Iroh installs no lookup; exact rostered nearby and "
+        "automatic LAN discovery are accepted only from initial Normal policy; "
+        "each provider is cleared at its bounded expiry or shutdown; and the "
+        "automatic controller stops synchronously and permanently before a public "
+        "live move away from Normal returns, while ReceiveOnly additionally "
+        "forbids contact initiation and discloses zero mutable/Blob work",
         "Retain packet captures proving zero discovery traffic in constrained "
         "and receive-only modes and state the permitted authenticated-inbound "
         "transport-control traffic. This is not yet physical RF silence, BTLE "
         "behavior, mixed implementations, or release acceptance.",
     ),
+    "DM-5.7-04": selected_claim(
+        "implemented-uncredited",
+        "aster-iroh + aster-node::mission",
+        f"{LAN_DISCOVERY_SLICE}; an automatically discovered contact yields only "
+        "a carrier-authenticated endpoint identity until both peers complete the "
+        "profile-0x0001 authority-authenticated mission handshake; durable "
+        "revocation and the automatic mission-identity capacity check run before "
+        "control-inventory construction, and credentials issued by a different "
+        "authority yield no mission session",
+        "Retain the complete positive and negative chain on physical hosts and "
+        "complete hostile-input, BTLE, mixed-implementation, protected-"
+        "provisioning, and independent-review gates. The stock hybrid mission "
+        "record is not bound to the Iroh TLS exporter, so carrier and mission "
+        "identities are same-contact observations rather than durable proof of "
+        "common ownership.",
+    ),
     "DM-5.8-06": selected_claim(
         "implemented-uncredited",
         "aster-iroh + aster-node",
-        f"{CONTROLLED_RELAY_SLICE}; the selected Iroh carrier binds direct UDP/QUIC, authenticates the exact endpoint identity, accepts bounded operator-supplied initial IP locators, and current-code real processes complete exact direct contacts while the sole configured controlled relay is unavailable",
-        "This is source plus same-implementation one-host loopback automation, not a supported or released IP-adapter acceptance result. Representative physical IP networks, dynamic or representative NATs, physical NAT hardware or paths, supported-target packaging, mixed implementations, dependency/license admission, retained supported-target acceptance, and release authorization remain open.",
+        f"{CONTROLLED_RELAY_SLICE}; {LAN_DISCOVERY_SLICE}; the selected Iroh carrier binds direct UDP/QUIC, authenticates the endpoint identity, accepts bounded operator-supplied initial IP locators or feature-gated direct mDNS locator candidates, and current-code real processes complete exact direct contacts while the sole configured controlled relay is unavailable",
+        "Manual IP has source plus same-implementation one-host loopback automation, while rosterless LAN discovery has focused mechanism tests only; neither is a supported or released IP-adapter acceptance result. Representative physical IP networks, dynamic or representative NATs, physical NAT hardware or paths, supported-target packaging, mixed implementations, dependency/license admission, retained supported-target acceptance, and release authorization remain open.",
     ),
     "DM-5.8-07": selected_claim(
         "observed-bounded",
@@ -1176,8 +1221,8 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     "DM-6-13": selected_claim(
         "observed-bounded",
         "aster-core + aster-node",
-        f"{MISSION_RECEIPT}; {CONTROL_RECEIPT}; {PROTECTED_RUNTIME_SLICE}; the runtime checks expected mission NodeId independently from Iroh EndpointId before inventory and rejects a durably revoked mission principal; current live Rust NodeConfig/start_node and stopped Event/admin facades accept protected artifacts or opaque secret references",
-        "The retained runtime receipt still uses an unprotected-reference bundle, and the protected live path has current-code automation only. Add a production SecretStore/protection backend, protected stock CLI and bindings, operational identity issuance/recovery, non-Unix and physical zeroization assurance, authority/signer recovery, and independent security acceptance; carrier identity remains deliberately separate.",
+        f"{MISSION_RECEIPT}; {CONTROL_RECEIPT}; {PROTECTED_RUNTIME_SLICE}; {LAN_DISCOVERY_SLICE}; rostered contacts check the expected mission NodeId independently from Iroh EndpointId, while automatic LAN contacts authorize the authority-authenticated mission identity without persisting a carrier-to-mission binding; both reject a durably revoked mission principal before inventory, and current live Rust NodeConfig/start_node and stopped Event/admin facades accept protected artifacts or opaque secret references",
+        "The retained runtime receipt uses exact rostered peers and an unprotected-reference bundle; automatic LAN admission and the protected live path have current-code mechanism tests only. Add a production SecretStore/protection backend, protected stock CLI and bindings, operational identity issuance/recovery, non-Unix and physical zeroization assurance, authority/signer recovery, and independent security acceptance; carrier identity remains deliberately separate.",
     ),
     "DM-6-14": selected_claim(
         "observed-bounded",
@@ -1336,7 +1381,7 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     "DM-11-02": selected_claim(
         "implemented-uncredited",
         "aster-iroh + aster-node",
-        f"{CONTROLLED_RELAY_SLICE}; the selected Rust composition and CLI integrate exact authenticated direct IP contacts plus an explicit singleton controlled-relay option, with current-code real-process direct and relay path evidence",
+        f"{CONTROLLED_RELAY_SLICE}; {LAN_DISCOVERY_SLICE}; the selected Rust composition and CLI integrate exact authenticated direct IP contacts, a default-off rosterless mDNS/IP discovery mode, and an explicit singleton controlled-relay option; direct and relay paths have current-code real-process evidence while rosterless discovery has focused mechanism tests",
         "The IP mechanism exists, but the complete MVP does not. Dynamic, representative, or physical NAT operation, BTLE, physical and supported-target acceptance, bindings, protected operational provisioning, dependency/license admission, mixed implementations, resource evidence, complete-MVP acceptance, and release authorization remain open.",
     ),
     "DM-11-03": selected_claim(
@@ -1426,7 +1471,7 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     "DM-13-04": selected_claim(
         "implemented-uncredited",
         "aster-iroh + aster-node",
-        f"{CONTROLLED_RELAY_SLICE}; aster-iroh exposes bounded direct and singleton controlled-relay IP endpoints, and aster-node composes them into NodeConfig and the selected CLI with exact carrier/mission peer binding and no hosted lookup, public relay fallback, or port mapping",
+        f"{CONTROLLED_RELAY_SLICE}; {LAN_DISCOVERY_SLICE}; aster-iroh exposes bounded direct, default-off rostered and rosterless mDNS, and singleton controlled-relay IP endpoints; aster-node composes them into NodeConfig and the selected CLI without treating discovered carrier identity as mission authority and with no hosted lookup, public relay fallback, or port mapping",
         "Tracked source and current tests exist, but this is not a versioned production release artifact. Supported-target packaging and stability, physical IP and NAT acceptance, mixed implementation, dependency/license admission and SBOM disposition, retained acceptance, and release authorization remain open.",
     ),
 }

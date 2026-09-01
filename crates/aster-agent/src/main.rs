@@ -63,6 +63,8 @@ async fn run() -> Result<(), BoxError> {
         .optional("--nearby-window")?
         .map(|seconds| seconds.parse::<u64>())
         .transpose()?;
+    #[cfg(feature = "nearby-discovery")]
+    let discover_lan = arguments.switch("--discover-lan")?;
     let state_interests = arguments
         .repeated("--state-interest")?
         .into_iter()
@@ -80,6 +82,15 @@ async fn run() -> Result<(), BoxError> {
     );
     arguments.finish()?;
 
+    #[cfg(feature = "nearby-discovery")]
+    let (forwarding, nearby_enabled) = apply_nearby_cli(
+        SelectedForwardingConfig::default(),
+        peers.len(),
+        nearby_peers,
+        discover_lan,
+        nearby_window,
+    )?;
+
     ensure_state_accepts_normal_operation(&state)?;
     let agent = BoundAgent::bind(listen).await?;
     let listen = agent.local_addr()?;
@@ -96,17 +107,10 @@ async fn run() -> Result<(), BoxError> {
         application: NodeApplication::Relay,
     };
     #[cfg(feature = "nearby-discovery")]
-    let node = if nearby_peers.is_empty() {
-        if nearby_window.is_some() {
-            return Err("--nearby-window requires at least one --nearby-peer".into());
-        }
-        start_node(config).await?
-    } else {
-        let forwarding = SelectedForwardingConfig::default().with_nearby_discovery(
-            nearby_peers,
-            Duration::from_secs(nearby_window.unwrap_or(10)),
-        )?;
+    let node = if nearby_enabled {
         start_node_with_forwarding(config, forwarding).await?
+    } else {
+        start_node(config).await?
     };
     #[cfg(not(feature = "nearby-discovery"))]
     let node = start_node(config).await?;
@@ -144,9 +148,47 @@ fn parse_source_interest(value: &str, class: &str) -> Result<SourceInterestSelec
     ))
 }
 
-fn print_help() {
-    println!(
-        r#"Aster process-local ConnectRPC agent
+#[cfg(feature = "nearby-discovery")]
+fn validate_discover_lan_conflicts(
+    discover_lan: bool,
+    direct_peer_count: usize,
+    nearby_peer_count: usize,
+) -> Result<(), BoxError> {
+    if discover_lan && direct_peer_count != 0 {
+        return Err("--discover-lan cannot be combined with --peer".into());
+    }
+    if discover_lan && nearby_peer_count != 0 {
+        return Err("--discover-lan cannot be combined with --nearby-peer".into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "nearby-discovery")]
+fn apply_nearby_cli(
+    forwarding: SelectedForwardingConfig,
+    direct_peer_count: usize,
+    nearby_peers: Vec<MissionNearbyPeer>,
+    discover_lan: bool,
+    nearby_window: Option<u64>,
+) -> Result<(SelectedForwardingConfig, bool), BoxError> {
+    validate_discover_lan_conflicts(discover_lan, direct_peer_count, nearby_peers.len())?;
+    let window = Duration::from_secs(nearby_window.unwrap_or(10));
+    if discover_lan {
+        return Ok((forwarding.with_automatic_nearby_discovery(window)?, true));
+    }
+    if nearby_peers.is_empty() {
+        if nearby_window.is_some() {
+            return Err("--nearby-window requires at least one --nearby-peer".into());
+        }
+        return Ok((forwarding, false));
+    }
+    Ok((
+        forwarding.with_nearby_discovery(nearby_peers, window)?,
+        true,
+    ))
+}
+
+const HELP: &str = r#"Aster process-local ConnectRPC agent
 
 Usage:
   aster-agent --state DIR --mesh-bind IP:PORT \
@@ -155,7 +197,7 @@ Usage:
     [--listen 127.0.0.1:8181] \
     [--peer CARRIER_ID@IP:PORT=MISSION_NODE_ID_HEX64 ...] \
     [--nearby-peer CARRIER_ID=MISSION_NODE_ID_HEX64 ...] \
-    [--nearby-window SECONDS] \
+    [--discover-lan] [--nearby-window SECONDS] \
     [--state-interest TOPIC@SCOPE ...] \
     [--record-interest TOPIC@SCOPE ...] [--sync-ms N]
 
@@ -168,8 +210,13 @@ handle-backed APIs exist. The explicitly named unprotected-reference mission
 bundle is non-production provisioning and must remain owner-only on supported
 Unix platforms. Nearby flags are available only in explicitly discovery-enabled
 demo/evaluation builds; they publish carrier identity and direct address hints
-for a bounded window, never mission or application metadata."#
-    );
+for a bounded window, never mission or application metadata. --discover-lan
+takes no peer identity or address, cannot be combined with --peer or
+--nearby-peer, and admits an mDNS candidate only after the independent mission
+handshake authenticates it and current mission authorization succeeds."#;
+
+fn print_help() {
+    println!("{HELP}");
 }
 
 struct Arguments {
@@ -219,11 +266,88 @@ impl Arguments {
         Ok(output)
     }
 
+    #[cfg(feature = "nearby-discovery")]
+    fn switch(&mut self, flag: &str) -> Result<bool, BoxError> {
+        let matches = self.values.iter().filter(|value| *value == flag).count();
+        if matches > 1 {
+            return Err(format!("{flag} may be specified at most once").into());
+        }
+        let Some(index) = self.values.iter().position(|value| value == flag) else {
+            return Ok(false);
+        };
+        self.values.remove(index);
+        Ok(true)
+    }
+
     fn finish(self) -> Result<(), BoxError> {
         if self.values.is_empty() {
             Ok(())
         } else {
             Err(format!("unexpected arguments: {}", self.values.join(" ")).into())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discover_lan_help_names_identity_free_authorized_mode() {
+        assert!(HELP.contains("[--discover-lan]"));
+        assert!(HELP.contains("takes no peer identity or address"));
+        assert!(HELP.contains("cannot be combined with --peer or\n--nearby-peer"));
+        assert!(HELP.contains("authenticates it and current mission authorization succeeds"));
+    }
+
+    #[cfg(feature = "nearby-discovery")]
+    #[test]
+    fn discover_lan_switch_and_conflicts_fail_closed() {
+        let mut arguments = Arguments::new(["--discover-lan"].into_iter().map(str::to_owned));
+        assert!(arguments.switch("--discover-lan").expect("single switch"));
+        arguments.finish().expect("all arguments consumed");
+
+        let mut duplicate = Arguments::new(
+            ["--discover-lan", "--discover-lan"]
+                .into_iter()
+                .map(str::to_owned),
+        );
+        assert!(duplicate.switch("--discover-lan").is_err());
+        assert!(validate_discover_lan_conflicts(true, 1, 0).is_err());
+        assert!(validate_discover_lan_conflicts(true, 0, 1).is_err());
+        validate_discover_lan_conflicts(true, 0, 0).expect("identity-free discovery");
+    }
+
+    #[cfg(feature = "nearby-discovery")]
+    #[test]
+    fn discover_lan_uses_default_window_and_runtime_bounds() {
+        let (defaulted, enabled) = apply_nearby_cli(
+            SelectedForwardingConfig::default(),
+            0,
+            Vec::new(),
+            true,
+            None,
+        )
+        .expect("default automatic discovery");
+        assert!(enabled);
+        assert!(defaulted.automatic_nearby_discovery());
+        assert_eq!(
+            defaulted.nearby_discovery_window(),
+            Some(Duration::from_secs(10))
+        );
+
+        for seconds in [0, 31] {
+            assert!(
+                apply_nearby_cli(
+                    SelectedForwardingConfig::default(),
+                    0,
+                    Vec::new(),
+                    true,
+                    Some(seconds),
+                )
+                .is_err(),
+                "accepted invalid automatic discovery window {seconds}"
+            );
         }
     }
 }
