@@ -1,4 +1,4 @@
-# Language quickstarts
+# Aster quickstarts
 
 To meet Aster through a human-driven three-node story, begin with
 [Aster Field Notes](hello.md). For deterministic acceptance receipts, run the
@@ -11,6 +11,10 @@ one trusted LAN—or its fast, one-host Docker Compose rehearsal—use the
 To measure 8, 16, or 32 rosterless nodes concurrently on a generated private
 Docker bridge before beginning hierarchy, use the opt-in
 [LAN scale baseline](lan-scale.md).
+To compose isolated discovery domains through two static, payload-blind Event
+bridge hops, run the [hierarchy MVP](../../docker/hierarchy-mvp/README.md), then
+advance through the explicit tiers in the
+[hierarchy scale diagnostic](hierarchy-scale.md).
 This page indexes the offline application and language-binding quickstarts.
 
 For the selected production-lane composition, start with the Rust
@@ -129,6 +133,15 @@ IDs or addresses, stages one Event across A-to-B and B-to-C contacts, verifies
 C's durable reopen, and checks rejection of a separately provisioned outsider.
 It is not retained physical, hostile-LAN, NAT/WAN, or production evidence.
 
+The [hierarchy MVP](../../docker/hierarchy-mvp/README.md) is a five-node,
+three-segment Compose evaluation. Two route-only bridges discover only adjacent
+peers, apply static topic/priority-narrowed authorizations, and carry one Event
+across two semantic-v6 bridge hops without configured remote peer coordinates.
+The [hierarchy scale diagnostic](hierarchy-scale.md) generates eight leaf
+scopes, two regions, and one root at fixed 8-, 32-, or 64-publisher tiers. Both
+are same-host development feedback, not retained physical, hostile-network,
+capacity, complete-MVP, or production evidence.
+
 Choose the API closest to your application:
 
 | Language | API you use | Quickstart |
@@ -136,6 +149,8 @@ Choose the API closest to your application:
 | Human-driven three-node introduction | `mise run hello` | [Aster Field Notes](hello.md) |
 | One-host automatic-discovery rehearsal | `mise run lan-mvp-compose` | [LAN MVP](lan-mvp.md#fast-one-host-docker-rehearsal) |
 | Concurrent 8/16/32-node LAN diagnostic | `mise run lan-scale-compose -- --nodes N` | [LAN scale baseline](lan-scale.md) |
+| Five-node, three-segment static Event hierarchy | `mise run hierarchy-mvp-compose` | [Hierarchy MVP](../../docker/hierarchy-mvp/README.md) |
+| Generated 8/32/64-publisher hierarchy diagnostic | `mise run hierarchy-scale-compose -- --publishers-per-leaf N` | [Hierarchy scale](hierarchy-scale.md) |
 | Three-host trusted-LAN Event evaluation | `aster-agent --discover-lan` | [LAN MVP](lan-mvp.md) |
 | Interactive local process demo | `mise run playground -- --nodes N` | [Message playground](message-playground.md) |
 | Rust (selected live Event slice) | `aster_node::start_node` + `SelectedEventHandle` | [Selected Event API](selected-event-api.md) |

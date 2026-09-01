@@ -2,6 +2,12 @@
 
 set -eu
 
+# Tour state contains mission and identity key material. Do not inherit a
+# collaborative login umask (commonly 0002), which would make newly created
+# node directories group-writable and correctly fail the runtime's local
+# zeroization boundary checks.
+umask 077
+
 tour_mode="${1:-quick}"
 script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 repo_root="$(CDPATH= cd -- "$script_dir/.." && pwd)"

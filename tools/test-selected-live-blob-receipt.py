@@ -1854,6 +1854,9 @@ class SelectedLiveBlobReceiptTests(unittest.TestCase):
         )
         self.assertEqual(tuple(parsed["limitations"]), ORACLE_LIMITATIONS)
         self.assertEqual(tuple(parsed["nonclaims"]), ORACLE_NONCLAIMS)
+        # Exact paths and identifiers are safe whole-document canaries. The
+        # short PID is checked as an exact scalar by render_receipt because its
+        # digits may legitimately occur inside counts or cryptographic digests.
         for forbidden in (
             os.fsencode(self.fixture.root),
             self.fixture.carriers["publisher"].encode("ascii"),
@@ -1864,7 +1867,6 @@ class SelectedLiveBlobReceiptTests(unittest.TestCase):
             self.fixture.partial_staging.encode("ascii"),
             self.fixture.variant_id.encode("ascii"),
             b"127.0.0.1",
-            b"4242",
             self.fixture.secret,
         ):
             self.assertNotIn(forbidden, first)

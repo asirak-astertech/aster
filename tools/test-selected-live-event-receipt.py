@@ -1745,6 +1745,9 @@ class SelectedLiveEventReceiptTests(unittest.TestCase):
         self.assertEqual(status["last_contact_complete_child_coordination_observations"], 1)
         self.assertEqual(status["policy_changed_since_contact_observations"], 1)
         encoded = first.decode("ascii")
+        # Exact paths and identifiers are safe whole-document canaries. Short
+        # PID and port digit strings are checked structurally below because
+        # they may legitimately occur inside counts or cryptographic digests.
         for forbidden in (
             os.fspath(self.fixture.root),
             *self.fixture.carriers.values(),
@@ -1752,9 +1755,6 @@ class SelectedLiveEventReceiptTests(unittest.TestCase):
             self.fixture.authority,
             *self.fixture.event_ids.values(),
             *self.fixture.subscription_ids.values(),
-            "4242",
-            "41000",
-            "41001",
         ):
             self.assertNotIn(forbidden, encoded)
 
@@ -2374,8 +2374,13 @@ class SelectedLiveEventReceiptTests(unittest.TestCase):
         def mutate(data: bytes):
             result = original(data)
             binary = self.fixture.root / "binary/aster-live-event-acceptance"
+            before = binary.stat()
             binary.write_bytes(self.fixture.binary)
             binary.chmod(0o700)
+            os.utime(
+                binary,
+                ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000),
+            )
             return result
 
         with mock.patch.object(CHECKER, "validate_transcript", side_effect=mutate):

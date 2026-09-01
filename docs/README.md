@@ -13,13 +13,20 @@ understand Aster's wire format or cryptography before building an application.
    then use the
    [message playground](quickstart/message-playground.md) to keep a bounded
    local line running and publish synthetic Events through different nodes.
-3. Choose an integration path. Most applications should begin with the
+3. For default-off networking evaluations, continue with the
+   [trusted-LAN MVP](quickstart/lan-mvp.md) and
+   [flat-LAN scale baseline](quickstart/lan-scale.md), then compose isolated
+   discovery domains through the [static hierarchy MVP](../docker/hierarchy-mvp/README.md)
+   and [hierarchy scale diagnostic](quickstart/hierarchy-scale.md). These are
+   bounded procedures and same-host diagnostics, not retained physical or
+   production evidence.
+4. Choose an integration path. Most applications should begin with the
    [local ConnectRPC agent](quickstart/connect-agent.md); Rust applications can
    use the [selected Event](quickstart/selected-event-api.md),
    [State](quickstart/selected-state-api.md),
    [Record](quickstart/selected-record-api.md), or
    [Blob](quickstart/selected-blob-api.md) API directly.
-4. Read [Selected architecture](architecture.md), [Security](security.md), the
+5. Read [Selected architecture](architecture.md), [Security](security.md), the
    [classical Iroh-QUIC profile](classical-iroh-security-profile.md), and the
    adopted [security-profile requirements disposition](implementation/security-profile-requirements-disposition.md)
    before designing a deployment.
@@ -32,6 +39,8 @@ understand Aster's wire format or cryptography before building an application.
 | Meet Aster through a human-driven three-node story | [Aster Field Notes](quickstart/hello.md) |
 | See deterministic acceptance evidence | [Capability tour](quickstart/capability-tour.md) |
 | Send messages through several live local node processes | [Message playground](quickstart/message-playground.md) |
+| Evaluate mission-authenticated automatic discovery on one trusted LAN | [LAN MVP](quickstart/lan-mvp.md) and [LAN scale baseline](quickstart/lan-scale.md) |
+| Compose bounded discovery domains through static Event bridges | [Hierarchy MVP](../docker/hierarchy-mvp/README.md) and [hierarchy scale diagnostic](quickstart/hierarchy-scale.md) |
 | Call Aster from Connect, gRPC, or gRPC-Web | [Local ConnectRPC agent](quickstart/connect-agent.md) |
 | Use the live Event API from Rust | [Selected Event API](quickstart/selected-event-api.md) |
 | Use live State, Record, or Blob from Rust | [Selected State API](quickstart/selected-state-api.md), [Selected Record API](quickstart/selected-record-api.md), or [Selected Blob API](quickstart/selected-blob-api.md) |
@@ -143,6 +152,15 @@ The selected implementation deliberately exposes different maturity levels:
   resume, power-loss/filesystem-crash/long-offline recovery,
   large/RSS acceptance, TTL/expiry/garbage collection, representative physical
   or mixed-implementation evidence, and release authorization remain open.
+- **Nearby discovery and static Event hierarchy** are default-off evaluation
+  surfaces. Mission-authenticated `--discover-lan` contacts require no
+  operator-supplied remote identity or address; semantic v6 adds an opt-in,
+  Event-only bridge lane over authenticated, statically authorized directed
+  edges. The LAN and hierarchy Compose diagnostics exercise bounded local
+  domains, outsider rejection, filtered payload-blind forwarding, and durable
+  reopen behavior. They add no retained physical, hostile-network,
+  mixed-implementation, capacity, complete-MVP, or production credit; dynamic
+  bridge administration and lifecycle remain open.
 - The broader semantic Rust implementation and language bindings remain the
   proven migration source for behavior not yet composed into the selected node.
 

@@ -1024,11 +1024,13 @@ independent interoperability, or release credit is claimed.
 
 ### Semantic-v5 selected Blob network slice
 
-The selected offer is now `[5, 4, 3, 2, 1]`. V5 inherits Event v1-v4 and
-State/Record v4 behavior and adds Blob class `3` source lanes plus one carrier
-range lane. V1-v4 emit and accept zero Blob frames. Stable wire/ABI version 1,
-session framing, `ASTRENV2`/`ASTRENV3`, manifests, `ASTRBT01`, typed ObjectIDs,
-and cryptographic suite remain unchanged.
+The current selected offer is `[6, 5, 4, 3, 2, 1]`. The semantic-v5 slice
+inherits Event v1-v4 and State/Record v4 behavior and adds Blob class `3`
+source lanes plus one carrier range lane. Semantic v6 inherits those ordinary
+lanes unchanged and adds only the opt-in Event-bridge mechanics lane. V1-v4
+emit and accept zero Blob frames. Stable wire/ABI version 1, session framing,
+`ASTRENV2`/`ASTRENV3`, manifests, `ASTRBT01`, typed ObjectIDs, and cryptographic
+suite remain unchanged.
 
 The v5 slice is direct between content-capable peers. Each exact
 topic/scope/epoch interest carries an opaque 32-byte provider proof bound to
@@ -3188,8 +3190,9 @@ build, C11 and C++17 syntax plus linked-runtime smoke tests, Python 12/12, and
 the complete Go suite. At that pre-v4 source freeze, ABI and wire versions were
 1 and the default/highest semantic version was 3, with semantic versions 2 and
 1 retained for negotiated compatibility. Current code instead offers
-`[5, 4, 3, 2, 1]`; v4 and v5 inherit the same Event custody mechanics without
-changing this receipt.
+`[6, 5, 4, 3, 2, 1]`; v4 through v6 inherit the same Event custody mechanics
+without changing this receipt, and v6 separately adds the opt-in Event-bridge
+lane.
 
 This evidence moves exactly `DM-11-15`, `DM-11-17`, `DM-5.4-05`,
 `DM-5.4-09`, `DM-5.4-10`, `DM-5.4-12` through `DM-5.4-19`, `DM-5.4-21`,
