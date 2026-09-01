@@ -21,6 +21,8 @@ run = [
   "python3 tools/test_aster_mesh_playground.py",
   "python3 tools/test_aster_lan_mvp.py",
   "python3 tools/test_aster_lan_mvp_compose.py",
+  "python3 tools/test_aster_lan_scale_compose.py",
+  "sh -n docker/lan-scale/init-state.sh",
   "python3 tools/test-selected-n32-receipt.py",
   "python3 tools/test-selected-iroh-nat-receipt.py",
   "python3 tools/test-selected-live-mutable-receipt.py",
@@ -84,6 +86,10 @@ run = "sh ./tools/test-aster-mesh-playground-real.sh"
 [tasks.lan-mvp-compose]
 description = "Exercise the staged rosterless LAN Event MVP on one Docker bridge"
 run = "python3 tools/aster_lan_mvp_compose.py"
+
+[tasks.lan-scale-compose]
+description = "Measure one generated 8, 16, or 32-node rosterless LAN baseline"
+run = "python3 tools/aster_lan_scale_compose.py"
 
 [tasks.tour]
 description = "Run the fastest two-node causal Ping/Pong capability tour"

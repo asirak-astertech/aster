@@ -14,5 +14,7 @@
 !docker/
 !docker/lan-mvp/
 !docker/lan-mvp/**
+!docker/lan-scale/
+!docker/lan-scale/**
 !tools/
 !tools/aster_lan_mvp.py
