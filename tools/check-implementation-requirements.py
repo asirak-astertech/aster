@@ -99,6 +99,15 @@ EVENT_SLICE = (
     "crates/aster-node/examples/event_application.rs; "
     "docs/quickstart/selected-event-api.md; crates/aster-node/tests/mesh_cli.rs"
 )
+BRIDGE_FOUNDATION_SLICE = (
+    "crates/aster-core/src/bridge_adapter.rs; "
+    "crates/aster-core/src/bridge.rs; "
+    "crates/aster-core/src/crypto/reference.rs; "
+    "crates/aster-redb-store/src/bridge_event.rs; "
+    "crates/aster-core/src/bridge_adapter.rs::tests; "
+    "crates/aster-redb-store/src/bridge_event.rs::tests; "
+    "docs/decisions/0038-select-an-event-bridge-foundation.md"
+)
 EVENT_SUBSCRIPTION_SLICE = (
     "crates/aster-redb-store/src/lib.rs; crates/aster-node/src/frame.rs; "
     "crates/aster-node/src/runtime.rs; crates/aster-node/src/application.rs; "
@@ -1059,6 +1068,24 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
         f"{EVENT_SLICE}; {CUSTODY_SLICE}; {LINUX_CUSTODY_ACCEPTANCE_SLICE}; {LINUX_CUSTODY_RECEIPT}; the retained route-only relay admitted exactly four Events under an exact-scope four-item quota, expired one, retired exactly one lower-priority RouteEvent under explicit stopped-store pressure, persisted a two-item quota, and reopened with exactly two route items",
         "The quota transition was deliberately staged by stopped-store pressure followed by quota lowering; it is not automatic startup down-sizing or sustained physical-capacity pressure. Logical row/source-byte limits do not measure redb/filesystem allocation; other classes lack equivalent custody eviction and complete physical accounting. Scale, mixed implementations, long pressure, and release authorization remain open.",
     ),
+    "DM-5.5-09": selected_claim(
+        "implemented-uncredited",
+        "aster-core + aster-redb-store",
+        f"{BRIDGE_FOUNDATION_SLICE}; the profile-0x0001 selected adapter authenticates one exact directed scope/epoch edge, creates first and nested Event wrappers from an unchanged exact source envelope, and the selected redb store atomically retains provider-verified authorization, source, wrapper, dependency, and active-projection state while reopened rows remain nonauthorizing candidates until fresh verification",
+        "This is an Event-only core-plus-store mechanism. No selected node runtime, bridge inventory or wire lane, administration surface, joined/left scope lifecycle, live multi-network observation, retained receipt, other-class custody, physical system, mixed implementation, scale, or release authorization is supplied.",
+    ),
+    "DM-5.5-10": selected_claim(
+        "implemented-uncredited",
+        "aster-core + aster-redb-store",
+        f"{BRIDGE_FOUNDATION_SLICE}; each selected Event hop requires the exact source topic to be present in the active authorization from the complete supplied chain and in any explicit local narrowing; denied-topic construction fails before a verified route capability exists, and redb promotion additionally requires the referenced authorization to match its durable high-water",
+        "The filter is implemented for the selected profile-0x0001 Event transform and redb commit boundary only. Dynamic policy administration, live wire forwarding, multi-scope runtime behavior, retained negative delivery evidence, other classes, physical/mixed operation, scale, and release authorization remain open.",
+    ),
+    "DM-5.5-11": selected_claim(
+        "implemented-uncredited",
+        "aster-core + aster-redb-store",
+        f"{BRIDGE_FOUNDATION_SLICE}; each selected Event hop intersects the source-authenticated priority with the active authorization mask from the complete supplied chain and explicit local narrowing; denied-priority construction fails before a verified route capability exists, and redb promotion additionally requires the referenced authorization to match its durable high-water",
+        "The filter is implemented for the selected profile-0x0001 Event transform and redb commit boundary only. It is not bridge transmission scheduling or a bandwidth quota; live runtime administration, retained negative delivery evidence, other classes, physical/mixed operation, scale, and release authorization remain open.",
+    ),
     "DM-5.6-01": selected_claim(
         "implemented-uncredited",
         "aster-node",
@@ -1197,6 +1224,12 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
         "observed-bounded", "aster-core + aster-redb-store + aster-node",
         f"{RECEIPT}; the relay exact-forwarded two source-sealed Events with content_access=denied and semantic_acceptance=none",
         "Verify generalized policies, finite custody, all data classes, physical links, and independent review.",
+    ),
+    "DM-6-08": selected_claim(
+        "implemented-uncredited",
+        "aster-core + aster-redb-store",
+        f"{BRIDGE_FOUNDATION_SLICE}; the selected Event bridge authenticates opaque route metadata, copies the unchanged source-sealed envelope under target-scope wrappers, persists opaque exact authorization/source/wrapper bytes plus bounded metadata, and exposes plaintext opening only through a separately content-authorized provider; the selected route-only bridge configuration fails closed on payload opening",
+        "This establishes the selected route-only-provider payload-blind Event store/transform mechanism, not a universal property of providers with content grants and not live network forwarding. No wire/runtime bridge, capture or at-rest receipt, other-class bridge custody, profile-0x0002 bridge, physical/mixed operation, protected operational key custody, scale, hostile-input fitness, complete-MVP credit, or release authorization is supplied.",
     ),
     "DM-6-09": selected_claim(
         "implemented-uncredited", "aster-core + aster-node",

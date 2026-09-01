@@ -1810,6 +1810,10 @@ pub(crate) fn runtime_application_error(
 fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
     match error {
         StoreError::Blob(error) => blob_store_error_kind(error),
+        // The bridge foundation has no selected application surface yet. Any
+        // bridge-store error reaching this classifier is therefore an internal
+        // integrity failure rather than a caller-actionable request result.
+        StoreError::Bridge(_) => ApplicationErrorKind::Integrity,
         StoreError::Custody(error) => custody_store_error_kind(error),
         StoreError::InvalidEventOperationKey { .. }
         | StoreError::InvalidStateOperationKey { .. }

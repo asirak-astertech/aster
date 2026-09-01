@@ -6,8 +6,11 @@
 //! route-verified exact Event transfers; the retained caller-ID opaque
 //! compatibility API; source-authenticated mission-wide Flash controls; and
 //! audited Event/RouteEvent custody age, quota, retirement, lease, retry, and
-//! receipt state. Event, State, Record, and Blob share only their causal ledgers;
-//! custody is selected for Event/RouteEvent only. Blob ciphertext
+//! receipt state. An additive selected Event bridge namespace retains opaque
+//! authorization, source, and wrapper candidates; only freshly verified core
+//! capabilities can promote its process-live route projection. Event, State,
+//! Record, and Blob share only their causal ledgers; custody is selected for
+//! Event/RouteEvent only. Blob ciphertext
 //! chunks live in a paired, fixed depot whose durable markers remain inside the
 //! same redb authority. Opaque IDs cannot collide with or promote into a semantic
 //! or control namespace. Semantic mutation requires a live strong capability from
@@ -23,12 +26,14 @@
 
 mod blob;
 mod blob_subscription;
+mod bridge_event;
 mod custody;
 mod record_subscription;
 mod state_subscription;
 
 pub use blob::*;
 pub use blob_subscription::*;
+pub use bridge_event::*;
 pub use custody::*;
 pub use record_subscription::*;
 pub use state_subscription::*;
@@ -395,11 +400,12 @@ impl MutableTransferCursorMode {
 ///
 /// Both limits count aggregate legacy opaque rows, accepted exact source-sealed
 /// Event, State, Record, and signed Blob representations, durable selected-store
-/// operation mappings, route-only cache entries, exact controls, and canonical
-/// local control-publication intents. Physical Blob-depot files are governed by
-/// [`BlobDepotLimits`] instead of being double-counted here. Unmarked or hostile
-/// untracked filesystem allocation and filesystem/redb overhead remain outside
-/// these logical admission claims.
+/// operation mappings, route-only cache entries, exact controls, canonical
+/// local control-publication intents, and opaque selected Event bridge
+/// authorizations, deduplicated sources, wrappers, and route metadata. Physical
+/// Blob-depot files are governed by [`BlobDepotLimits`] instead of being
+/// double-counted here. Unmarked or hostile untracked filesystem allocation and
+/// filesystem/redb overhead remain outside these logical admission claims.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StoreLimits {
     max_items: u64,
@@ -3201,6 +3207,8 @@ pub struct StoreInspection {
     pub blob_subscription_stats: BlobSubscriptionStats,
     /// Mission-wide Flash control counts from the same audited read transaction.
     pub control_stats: ControlStoreStats,
+    /// Selected opaque Event bridge candidates and process-live projections.
+    pub bridge_event_stats: BridgeStoreStats,
     /// Mission-bound custody, quota, lease, retry, and retirement counts.
     pub custody_stats: CustodyStoreStats,
     /// Stable mission authority binding, when this store has been provisioned.
@@ -3269,6 +3277,8 @@ pub enum StoreError {
     Backend(redb::Error),
     /// Blob publication metadata, policy, or physical-depot failure.
     Blob(BlobStoreError),
+    /// Selected Event bridge authorization, candidate, or promotion failure.
+    Bridge(BridgeStoreError),
     /// Custody, finite-lifetime, quota, lease, or peer-receipt failure.
     Custody(CustodyStoreError),
     /// The selected store path could not be resolved to a stable file identity.
@@ -3731,6 +3741,7 @@ impl fmt::Display for StoreError {
         match self {
             Self::Backend(error) => write!(formatter, "redb storage error: {error}"),
             Self::Blob(error) => write!(formatter, "{error}"),
+            Self::Bridge(error) => write!(formatter, "{error}"),
             Self::Custody(error) => write!(formatter, "{error}"),
             Self::StorePath(error) => write!(formatter, "store path error: {error}"),
             Self::StoreBackingInvariant(reason) => {
@@ -4373,6 +4384,7 @@ impl Error for StoreError {
         match self {
             Self::Backend(error) => Some(error),
             Self::Blob(error) => Some(error),
+            Self::Bridge(error) => Some(error),
             Self::Custody(error) => Some(error),
             Self::StorePath(error) => Some(error),
             _ => None,
@@ -4383,6 +4395,12 @@ impl Error for StoreError {
 impl From<BlobStoreError> for StoreError {
     fn from(error: BlobStoreError) -> Self {
         Self::Blob(error)
+    }
+}
+
+impl From<BridgeStoreError> for StoreError {
+    fn from(error: BridgeStoreError) -> Self {
+        Self::Bridge(error)
     }
 }
 
@@ -5541,6 +5559,8 @@ impl Store {
         )?;
         audit_control_tables(&write)?;
         let mut mission_authority = read_mission_binding(&write)?;
+        let bridge_event_stats =
+            bridge_event::audit_bridge_tables_write(&write, mission_authority, limits, true)?;
         let mutable_transfer_cursors =
             audit_mutable_transfer_cursors_write(&write, mission_authority)?;
         if mission_authority.is_none()
@@ -5552,6 +5572,7 @@ impl Store {
                 || write.open_table(blob::BLOB_CHUNKS)?.len()? != 0
                 || write.open_table(ROUTE_CACHE)?.len()? != 0
                 || write.open_table(CONTROL_RECORDS)?.len()? != 0
+                || bridge_event_stats.aggregate_items()? != 0
                 || mutable_transfer_cursors.rows != 0)
         {
             return Err(StoreError::SemanticInvariant(
@@ -13337,6 +13358,9 @@ where
         blob::BLOB_OPERATION_COUNT,
         ROUTE_CACHE_ITEM_COUNT,
         CONTROL_ITEM_COUNT,
+        bridge_event::BRIDGE_AUTHORIZATION_ITEM_COUNT,
+        bridge_event::BRIDGE_EVENT_SOURCE_ITEM_COUNT,
+        bridge_event::BRIDGE_EVENT_ROUTE_ITEM_COUNT,
     ]
     .into_iter()
     .try_fold(0u64, |total, field| {
@@ -13357,6 +13381,9 @@ where
         ROUTE_CACHE_TOTAL_BYTES,
         CONTROL_TOTAL_BYTES,
         CONTROL_PUBLICATION_INTENT_TOTAL_BYTES,
+        bridge_event::BRIDGE_AUTHORIZATION_TOTAL_BYTES,
+        bridge_event::BRIDGE_EVENT_SOURCE_TOTAL_BYTES,
+        bridge_event::BRIDGE_EVENT_ROUTE_TOTAL_BYTES,
     ]
     .into_iter()
     .try_fold(0u64, |total, field| {
@@ -23056,6 +23083,8 @@ fn inspect_readable(
     let record_subscription_stats = record_subscription::inspect_record_subscription_tables(&read)?;
     let blob_subscription_stats = blob_subscription::inspect_blob_subscription_tables(&read)?;
     let control_stats = inspect_control_tables(&read, mission_authority)?.unwrap_or_default();
+    let bridge_event_stats =
+        bridge_event::inspect_bridge_tables_read_transaction(&read, mission_authority)?;
     let aggregate_items = [
         ITEM_COUNT,
         SEMANTIC_ITEM_COUNT,
@@ -23068,6 +23097,9 @@ fn inspect_readable(
         blob::BLOB_OPERATION_COUNT,
         ROUTE_CACHE_ITEM_COUNT,
         CONTROL_ITEM_COUNT,
+        bridge_event::BRIDGE_AUTHORIZATION_ITEM_COUNT,
+        bridge_event::BRIDGE_EVENT_SOURCE_ITEM_COUNT,
+        bridge_event::BRIDGE_EVENT_ROUTE_ITEM_COUNT,
     ]
     .into_iter()
     .try_fold(0u64, |total, field| {
@@ -23098,6 +23130,7 @@ fn inspect_readable(
         record_subscription_stats,
         blob_subscription_stats,
         control_stats,
+        bridge_event_stats,
         custody_stats,
         mission_authority,
         zeroization,
