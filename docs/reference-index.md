@@ -111,3 +111,4 @@ design chose its major boundaries.
 - [0035 — Introduce Aster through staged Field Notes](decisions/0035-field-notes-human-introduction.md)
 - [0036 — Admit discovered LAN peers through mission authentication](decisions/0036-mission-authenticated-lan-discovery-mvp.md)
 - [0037 — Measure the flat LAN ceiling before adding hierarchy](decisions/0037-bound-concurrent-lan-scale-baseline.md)
+- [0038 — Select an Event bridge foundation before the live hierarchy](decisions/0038-select-an-event-bridge-foundation.md)

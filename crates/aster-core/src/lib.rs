@@ -26,6 +26,8 @@ pub mod api;
 pub(crate) mod bridge;
 #[cfg(all(feature = "reference-session", not(feature = "sqlite-store")))]
 pub(crate) mod bridge;
+#[cfg(feature = "reference-session")]
+pub mod bridge_adapter;
 #[cfg(feature = "sqlite-store")]
 pub(crate) mod bridge_service;
 
@@ -143,6 +145,13 @@ pub use blob::{
     MAX_BLOB_SCHEMA_ID_BYTES, MAX_BLOB_TRANSFER_OBJECT_BYTES, MIN_BLOB_CHUNK_SIZE, PreparedBlob,
     ReferenceBlobService, SELECTED_BLOB_CHUNK_SIZE, VerifiedBlobContentCompletion,
     VerifiedBlobTransferObject, VerifiedBlobTransferPlan, prepare_blob,
+};
+#[cfg(feature = "reference-session")]
+pub use bridge_adapter::{
+    BridgeAuthorizationLink, SelectedBridgeAuthorizationPolicy, SelectedBridgeEnrollment,
+    SelectedBridgeError, SelectedBridgeNarrowingPolicy, SelectedEventBridgeAdapter,
+    VerifiedSelectedBridgeAuthorization, VerifiedSelectedBridgeEnrollment,
+    VerifiedSelectedBridgeEventRoute,
 };
 #[cfg(all(feature = "sqlite-store", feature = "adapter-sdk"))]
 pub use crypto::{
