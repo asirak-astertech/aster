@@ -70,7 +70,7 @@ equivalent tests.
 | Path | Implemented | Boundary |
 |---|---|---|
 | Selected direct Iroh | Manually admitted exact endpoint ID and socket, authenticated direct UDP/QUIC, and bounded exchange | A retained one-host cone software-namespace cell observed Direct and exact Event delivery across two NAT routers with static operator-known mappings. Carrier authentication is not mission or control/source authorization; discovery/punching, dynamic or representative NAT, physical-network acceptance, and multi-carrier failover remain open. |
-| Selected nearby Iroh evaluation | Feature-gated official Iroh mDNS lookup for an exact pre-provisioned endpoint-to-mission roster, direct-address publication only, and a maximum 30-second window | Default off and demo/evaluation only. Native and control comparators have not completed automatic authenticated delivery; upstream discovery maps are uncapped, and physical/resource qualification remains open. |
+| Selected nearby Iroh evaluation | Feature-gated official Iroh mDNS direct-address publication and lookup in two explicit modes: an exact pre-provisioned endpoint-to-mission roster, or mission-authenticated `--discover-lan` admission without an operator-supplied neighbor or locator; each window is at most 30 seconds | Default off and demo/evaluation only. Automatic mode repeats bounded windows, but upstream discovery observation is not globally capped; hostile-LAN, physical/resource, NAT/WAN, and production qualification remain open. |
 | Selected controlled Iroh relay | One operator-pinned HTTPS relay with explicit trust, either alongside the initial direct locator or with IP disabled | A retained one-host restrictive software-namespace cell blocked direct traffic, observed Relay, and delivered one exact Event through the controlled relay. It is not a temporal direct-first/fallback chronology, representative or physical NAT, public or independently operated relay, an Aster payload-blind relay, State/Record/Blob-over-relay acceptance, or release authorization. |
 | Selected node and CLI | Networked Event and State/Record reconciliation, semantic-v5 direct Blob source/carrier transfer, live Event/State/Record/Blob Rust APIs, durable Event stream, State positive-current-version delivery, Record whole-key active-head delivery, and Blob metadata-only publication delivery in Rust, stopped Event/State/Record/Blob facades, payload-blind Event relay, restart/idempotency, bounded retained one-host State, Record, and peerless Blob forced-process-redelivery evidence, three-participant direct Blob publication/partial/different-peer-resume/read/graceful-reopen evidence, and bounded Unix zeroization | Reference provisioning; no State contact/status, materialized-view, or synthetic-withdrawal delivery, Blob peer/convergence status, network/application selector-separation acceptance, or selected-node language bindings; State/Record/Blob application subscriptions do not dynamically change configured network interests; no automatic Record merge, arbitrary-peer or route-only Blob resume acceptance, Blob-over-controlled-relay acceptance, finite State/Record/Blob TTL and non-Linux finite Event custody, generalized control administration, representative physical or mixed-implementation evidence, resource/soak evidence, or production authorization |
 | Current semantic in-memory link | Full high-level host contact, authentication, reconciliation, resume, and failure tests | It is a test carrier and is not wired to the selected composition |
@@ -217,11 +217,32 @@ topic, scope, priority, membership, inventory, and application payload stay out
 of DNS-SD records. On-link presence, carrier identity, address, timing, and
 packet size remain observable.
 
-This mode is default-off and evaluation-only. The native provider's peer maps
-are not proven hostile-cardinality bounded, and no retained run has completed
-automatic discovery through authenticated Aster delivery. The exact decision,
-cost history, FOSS comparison, and physical qualification gates are in
-[Nearby discovery FOSS selection](evaluations/0005/nearby-discovery-selection.md).
+That rostered mode remains available. A separate `--discover-lan` mode takes no
+`--peer` or `--nearby-peer` value and rejects either combination. Each
+whole-second window is 1 through 30 seconds (10 by default); the runtime repeats
+windows while it is running and its emission policy remains Normal. An mDNS
+result is only an untrusted carrier locator. The runtime completes carrier
+authentication, the existing hybrid-PQ mission handshake, and current mission
+authorization before inventory. A carrier candidate from a different mission
+authority is rejected before application exchange.
+
+Automatic mode retains at most 32 outbound locator candidates and at most 32
+distinct mission-authenticated identities for automatic admission before
+inventory. At most 16 inbound contact workers and 16 outbound contact workers
+run concurrently. These are separate bounds, not a global inbound-carrier cap:
+the upstream mDNS provider can observe and retain more peers before Aster's
+candidate, admission, and concurrent-worker boundaries apply.
+
+Both modes are default-off and evaluation-only. Neither proves hostile-LAN
+resource resistance, and no retained physical-host run establishes automatic
+discovery through authenticated Aster delivery. Mission proof is scoped to the
+same contact; this MVP does not bind it to a TLS exporter or prove common
+ownership of the carrier and mission keys. The exact decisions, cost history,
+FOSS comparison, and qualification gates are in
+[Nearby discovery FOSS selection](evaluations/0005/nearby-discovery-selection.md)
+and [ADR 0036](decisions/0036-mission-authenticated-lan-discovery-mvp.md). The
+[three-host LAN Event quickstart](quickstart/lan-mvp.md) gives the bounded
+operator procedure without turning it into physical or production evidence.
 
 The live selected Event, State, Record, and Blob handles compose high-level
 operations with this path through the running actor's shared bounded command

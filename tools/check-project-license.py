@@ -138,17 +138,25 @@ def main() -> None:
         if distribution_hash != EXPECTED_LICENSE_SHA256:
             fail(f"{distribution_root.relative_to(ROOT)} has a noncanonical LICENSE")
 
-    dockerfile = (ROOT / "lab" / "Dockerfile").read_text(encoding="utf-8")
-    if "COPY LICENSE /usr/share/licenses/aster/LICENSE" not in dockerfile:
-        fail("the lab runtime image does not include LICENSE")
-    if (
-        "COPY THIRD_PARTY_NOTICES.md /usr/share/licenses/aster/THIRD_PARTY_NOTICES.md"
-        not in dockerfile
-    ):
-        fail("the lab runtime image does not include third-party notices")
+    dockerfiles = (
+        ROOT / "lab" / "Dockerfile",
+        ROOT / "docker" / "lan-mvp" / "Dockerfile",
+    )
+    for dockerfile_path in dockerfiles:
+        dockerfile = dockerfile_path.read_text(encoding="utf-8")
+        if "COPY LICENSE /usr/share/licenses/aster/LICENSE" not in dockerfile:
+            fail(f"{dockerfile_path.relative_to(ROOT)} does not include LICENSE")
+        if (
+            "COPY THIRD_PARTY_NOTICES.md /usr/share/licenses/aster/THIRD_PARTY_NOTICES.md"
+            not in dockerfile
+        ):
+            fail(
+                f"{dockerfile_path.relative_to(ROOT)} does not include third-party notices"
+            )
     docker_ignore_files = (
         ROOT / ".dockerignore",
         ROOT / "lab" / "Dockerfile.dockerignore",
+        ROOT / "docker" / "lan-mvp" / "Dockerfile.dockerignore",
     )
     for ignore_file in docker_ignore_files:
         if "!LICENSE" not in ignore_file.read_text(encoding="utf-8").splitlines():

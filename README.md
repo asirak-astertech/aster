@@ -38,6 +38,26 @@ stay local to the display and are never discovery metadata. The
 nearby windows, no-silent-fallback rule, invitation option, and exact
 evaluation boundary.
 
+To try automatic discovery across three Ubuntu hosts on one trusted LAN, build
+the feature-gated agents and follow the
+[three-host LAN Event quickstart](docs/quickstart/lan-mvp.md). It uses no
+operator-supplied peer identities or addresses, carries one offline Event from
+A through B to C across separate contacts, verifies restart persistence, and
+rejects a separately provisioned outsider. This is an evaluation procedure,
+not retained physical or production evidence.
+
+For the fastest rehearsal on a native Linux Docker Engine, run the same staged
+acceptance shape on one private Compose bridge:
+
+```sh
+mise run lan-mvp-compose
+```
+
+The controller validates exact delivery, outsider rejection, and peerless
+restart persistence, then removes its project-scoped containers, bridge, and
+volumes plus its uniquely named image. This is same-host development feedback,
+not physical-LAN evidence.
+
 For deterministic acceptance receipts, use the capability tours.
 
 The capability tour starts real processes with independent stores and
@@ -140,7 +160,7 @@ provisioning remain open work.
 | **Record** | Live or stopped conflict-preserving query/publication, exact-sibling guarded resolution, direct-Iroh reconciliation, durable whole-key active-head delivery, and bounded retained one-host conflict, forced-process redelivery, resolution, and reopen evidence | Selected-node bindings, automatic merge execution, finite TTL, relay acceptance, expiry/garbage collection, and representative physical/mixed evidence |
 | **Blob** | Authenticated immutable publication through a cloneable live Rust handle or exclusive stopped facade; bounded zeroize-on-drop pages; durable metadata-only application delivery with exact publication identity and token-bound acknowledgement and bounded retained one-host forced-process-redelivery evidence; direct semantic-v5 source/carrier transfer with durable resume state and bounded retained one-host interrupted/reopened/different-peer evidence | Peer/convergence and transfer-progress status, network/application selector-separation acceptance, route-only relay/custody, arbitrary-peer resume, power-loss/filesystem-crash/long-offline recovery, large/RSS acceptance, representative physical or mixed-implementation evidence, retention, garbage collection, and release authorization |
 | **Security profiles** | Stock runtime profile `0x0001` retains hybrid-PQ source/control, mission handshake, and Aster records. Additive profile `0x0002` exposes a provisioned P-256 semantic-v1 Event/control and exporter-bound two-node Iroh path without a second Aster application record. | Stock runtime/CLI selection, authenticated offers or general negotiation, complete classical data/lifecycle coverage, snapshot-resistant rollback, retained capture/resource evidence, independent interoperability, and release authorization |
-| **Operations** | Manually admitted direct addresses, an operator-pinned controlled relay, a default-off maximum-30-second official Iroh mDNS demo/evaluation adapter, bounded one-host software namespace-NAT acceptance, reference mission provisioning, and bounded same-UID Unix software zeroization | Protected operational provisioning, physically qualified/hostile-bounded production discovery, representative/physical NAT, public/default relay selection, BTLE platform integration, physical sanitization, and release authorization |
+| **Operations** | Manually admitted direct addresses, an operator-pinned controlled relay, default-off official Iroh mDNS evaluation modes for exact rostered peers or mission-authorized `--discover-lan` contacts in repeated maximum-30-second windows, bounded one-host software namespace-NAT acceptance, reference mission provisioning, and bounded same-UID Unix software zeroization | Protected operational provisioning, physically qualified/hostile-bounded production discovery, representative/physical NAT, public/default relay selection, BTLE platform integration, physical sanitization, and release authorization |
 
 The [capability roadmap](docs/implementation/capability-roadmap.md) is the
 planning and merge-review view. The

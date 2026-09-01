@@ -5,6 +5,9 @@ To meet Aster through a human-driven three-node story, begin with
 one-command [capability tour](capability-tour.md). To keep a bounded local
 line running, choose publishers, enter synthetic messages, and change node
 availability, use the [real-process message playground](message-playground.md).
+For an evaluation-only three-host Event flow with automatic mDNS discovery on
+one trusted LAN—or its fast, one-host Docker Compose rehearsal—use the
+[LAN MVP quickstart](lan-mvp.md).
 This page indexes the offline application and language-binding quickstarts.
 
 For the selected production-lane composition, start with the Rust
@@ -117,11 +120,19 @@ activation and an explicit choice between ten-second nearby locator windows
 and controller-known one-host invitation routes. It is the human introduction,
 not an automatic-discovery or production evidence claim.
 
+The [three-host LAN MVP](lan-mvp.md) is a separate feature-gated procedure. It
+uses mission-authenticated automatic discovery without operator-supplied peer
+IDs or addresses, stages one Event across A-to-B and B-to-C contacts, verifies
+C's durable reopen, and checks rejection of a separately provisioned outsider.
+It is not retained physical, hostile-LAN, NAT/WAN, or production evidence.
+
 Choose the API closest to your application:
 
 | Language | API you use | Quickstart |
 |---|---|---|
 | Human-driven three-node introduction | `mise run hello` | [Aster Field Notes](hello.md) |
+| One-host automatic-discovery rehearsal | `mise run lan-mvp-compose` | [LAN MVP](lan-mvp.md#fast-one-host-docker-rehearsal) |
+| Three-host trusted-LAN Event evaluation | `aster-agent --discover-lan` | [LAN MVP](lan-mvp.md) |
 | Interactive local process demo | `mise run playground -- --nodes N` | [Message playground](message-playground.md) |
 | Rust (selected live Event slice) | `aster_node::start_node` + `SelectedEventHandle` | [Selected Event API](selected-event-api.md) |
 | ConnectRPC client (alpha live Event slice) | local `aster.application.v1alpha1` schema | [Local ConnectRPC agent](connect-agent.md) |

@@ -208,6 +208,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .optional("--nearby-window")?
                 .map(|seconds| seconds.parse::<u64>())
                 .transpose()?;
+            #[cfg(feature = "nearby-discovery")]
+            let discover_lan = arguments.switch("--discover-lan")?;
             let state_interests = arguments
                 .repeated("--state-interest")?
                 .iter()
@@ -253,6 +255,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 controlled_relay_ca_der,
                 controlled_relay_only,
             )?;
+            let mut forwarding = SelectedForwardingConfig::default();
+            if let Some((relay, relay_only)) = controlled_relay {
+                forwarding = if relay_only {
+                    forwarding.with_controlled_relay_only(relay)
+                } else {
+                    forwarding.with_controlled_relay(relay)
+                };
+            }
+            #[cfg(feature = "nearby-discovery")]
+            {
+                forwarding = apply_nearby_cli(
+                    forwarding,
+                    peers.len(),
+                    nearby_peers,
+                    discover_lan,
+                    nearby_window,
+                )?;
+            }
             ensure_state_accepts_normal_operation(&state)?;
             let mission = UnprotectedReferenceMission::load(&mission_bundle)?;
             let config = NodeConfig {
@@ -266,25 +286,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 run_for,
                 application,
             };
-            let mut forwarding = SelectedForwardingConfig::default();
-            if let Some((relay, relay_only)) = controlled_relay {
-                forwarding = if relay_only {
-                    forwarding.with_controlled_relay_only(relay)
-                } else {
-                    forwarding.with_controlled_relay(relay)
-                };
-            }
-            #[cfg(feature = "nearby-discovery")]
-            if nearby_peers.is_empty() {
-                if nearby_window.is_some() {
-                    return Err("--nearby-window requires at least one --nearby-peer".into());
-                }
-            } else {
-                forwarding = forwarding.with_nearby_discovery(
-                    nearby_peers,
-                    Duration::from_secs(nearby_window.unwrap_or(10)),
-                )?;
-            }
             run_node_with_forwarding(config, forwarding).await?;
         }
         "zeroize" => {
@@ -656,9 +657,44 @@ fn parse_source_interest(
     ))
 }
 
-fn print_help() {
-    println!(
-        "Aster selected-stack mesh CLI\n\n\
+#[cfg(feature = "nearby-discovery")]
+fn validate_discover_lan_conflicts(
+    discover_lan: bool,
+    direct_peer_count: usize,
+    nearby_peer_count: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if discover_lan && direct_peer_count != 0 {
+        return Err("--discover-lan cannot be combined with --peer".into());
+    }
+    if discover_lan && nearby_peer_count != 0 {
+        return Err("--discover-lan cannot be combined with --nearby-peer".into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "nearby-discovery")]
+fn apply_nearby_cli(
+    forwarding: SelectedForwardingConfig,
+    direct_peer_count: usize,
+    nearby_peers: Vec<MissionNearbyPeer>,
+    discover_lan: bool,
+    nearby_window: Option<u64>,
+) -> Result<SelectedForwardingConfig, Box<dyn std::error::Error>> {
+    validate_discover_lan_conflicts(discover_lan, direct_peer_count, nearby_peers.len())?;
+    let window = Duration::from_secs(nearby_window.unwrap_or(10));
+    if discover_lan {
+        return Ok(forwarding.with_automatic_nearby_discovery(window)?);
+    }
+    if nearby_peers.is_empty() {
+        if nearby_window.is_some() {
+            return Err("--nearby-window requires at least one --nearby-peer".into());
+        }
+        return Ok(forwarding);
+    }
+    Ok(forwarding.with_nearby_discovery(nearby_peers, window)?)
+}
+
+const HELP: &str = "Aster selected-stack mesh CLI\n\n\
          Commands:\n\
            aster init --state DIR\n\
            aster put --state DIR --id HEX64 --file PATH  # maximum 1,048,576 bytes\n\
@@ -679,7 +715,7 @@ fn print_help() {
              --mission-bundle-unprotected-reference FILE \\
              [--peer CARRIER_ID@IP:PORT=MISSION_NODE_ID_HEX64 ...] \\
              [--nearby-peer CARRIER_ID=MISSION_NODE_ID_HEX64 ...] \\
-             [--nearby-window SECONDS] \\
+             [--discover-lan] [--nearby-window SECONDS] \\
              [--state-interest TOPIC@SCOPE ...] [--record-interest TOPIC@SCOPE ...] \\
              [--blob-interest TOPIC@SCOPE ...] \\
              [--controlled-relay-url HTTPS_URL \\
@@ -701,10 +737,13 @@ fn print_help() {
          der-roots requires bounded explicit DER CA files. No insecure TLS or public relay fallback\n\
          is enabled. Nearby flags exist only in explicitly discovery-enabled demo/evaluation builds;\n\
          they expose carrier IDs and direct address hints for a bounded window, never mission or\n\
-         application metadata. The operator-supplied initial route set is bounded; authenticated\n\
-         Iroh NAT negotiation may add direct paths after connection. --controlled-relay-only disables\n\
-         IP transport. Carrier path and transition fields are bounded observations, never\n\
-         authorization; NAT acceptance remains explicitly unclaimed.\n\
+         application metadata. --discover-lan takes no peer identity or address, cannot be combined\n\
+         with --peer or --nearby-peer, and admits an mDNS candidate only after the independent\n\
+         mission handshake authenticates it and current mission authorization succeeds. The\n\
+         operator-supplied initial route set is bounded; authenticated Iroh NAT negotiation may add\n\
+         direct paths after connection.\n\
+         --controlled-relay-only disables IP transport. Carrier path and transition fields are\n\
+         bounded observations, never authorization; NAT acceptance remains explicitly unclaimed.\n\
          Authority commands use the existing recipient-filtered aster-core control format and\n\
          reserve/seal/verify/commit controls idempotently before provider activation. Node/demo\n\
          contacts reconcile those mission-wide Flash controls in a distinct lane before carrying\n\
@@ -726,8 +765,10 @@ fn print_help() {
          state before destroying mission/carrier key contents through retained file descriptors\n\
          and preserves mesh data rows.\n\
          Its receipt proves bounded software erasure only, not flash, snapshot, swap, or backup\n\
-         sanitization; uniquely linked owner-only artifacts are required and replacements are kept."
-    );
+         sanitization; uniquely linked owner-only artifacts are required and replacements are kept.";
+
+fn print_help() {
+    println!("{HELP}");
 }
 
 struct Arguments {
@@ -865,6 +906,67 @@ mod tests {
     impl Drop for TestRoot {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn discover_lan_help_names_identity_free_authorized_mode() {
+        assert!(HELP.contains("[--discover-lan]"));
+        assert!(HELP.contains("takes no peer identity or address"));
+        assert!(HELP.contains("cannot be combined"));
+        assert!(HELP.contains("with --peer or --nearby-peer"));
+        assert!(HELP.contains(
+            "mission handshake authenticates it and current mission authorization succeeds"
+        ));
+    }
+
+    #[cfg(feature = "nearby-discovery")]
+    #[test]
+    fn discover_lan_switch_and_conflicts_fail_closed() {
+        let mut arguments = Arguments::new(["--discover-lan"].into_iter().map(str::to_owned));
+        assert!(arguments.switch("--discover-lan").expect("single switch"));
+        arguments.finish().expect("all arguments consumed");
+
+        let mut duplicate = Arguments::new(
+            ["--discover-lan", "--discover-lan"]
+                .into_iter()
+                .map(str::to_owned),
+        );
+        assert!(duplicate.switch("--discover-lan").is_err());
+        assert!(validate_discover_lan_conflicts(true, 1, 0).is_err());
+        assert!(validate_discover_lan_conflicts(true, 0, 1).is_err());
+        validate_discover_lan_conflicts(true, 0, 0).expect("identity-free discovery");
+    }
+
+    #[cfg(feature = "nearby-discovery")]
+    #[test]
+    fn discover_lan_uses_default_window_and_runtime_bounds() {
+        let defaulted = apply_nearby_cli(
+            SelectedForwardingConfig::default(),
+            0,
+            Vec::new(),
+            true,
+            None,
+        )
+        .expect("default automatic discovery");
+        assert!(defaulted.automatic_nearby_discovery());
+        assert_eq!(
+            defaulted.nearby_discovery_window(),
+            Some(Duration::from_secs(10))
+        );
+
+        for seconds in [0, 31] {
+            assert!(
+                apply_nearby_cli(
+                    SelectedForwardingConfig::default(),
+                    0,
+                    Vec::new(),
+                    true,
+                    Some(seconds),
+                )
+                .is_err(),
+                "accepted invalid automatic discovery window {seconds}"
+            );
         }
     }
 

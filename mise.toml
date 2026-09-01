@@ -19,6 +19,8 @@ run = [
   "python3 tools/check-public-provenance.py",
   "python3 tools/test_aster_tour_ui.py",
   "python3 tools/test_aster_mesh_playground.py",
+  "python3 tools/test_aster_lan_mvp.py",
+  "python3 tools/test_aster_lan_mvp_compose.py",
   "python3 tools/test-selected-n32-receipt.py",
   "python3 tools/test-selected-iroh-nat-receipt.py",
   "python3 tools/test-selected-live-mutable-receipt.py",
@@ -78,6 +80,10 @@ run = "sh ./tools/test-aster-hello-real.sh"
 [tasks.playground-smoke]
 description = "Exercise delayed Event movement across three real agent processes"
 run = "sh ./tools/test-aster-mesh-playground-real.sh"
+
+[tasks.lan-mvp-compose]
+description = "Exercise the staged rosterless LAN Event MVP on one Docker bridge"
+run = "python3 tools/aster_lan_mvp_compose.py"
 
 [tasks.tour]
 description = "Run the fastest two-node causal Ping/Pong capability tour"
