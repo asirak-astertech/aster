@@ -613,13 +613,18 @@ reconciliation, authentication, or scheduling authority. Use the
 ## Semantic protocol versions you may see
 
 Aster separates stable bytes from negotiated behavior. The current selected
-implementation offers semantic versions `[5, 4, 3, 2, 1]` in that descending
+implementation offers semantic versions `[6, 5, 4, 3, 2, 1]` in that descending
 order:
 
 - **Replication wire/profile version 1** identifies the current encoding and
   fixed security-object family.
-- **Semantic version 5** is offered first. It inherits Event, compact-batch,
-  bridge, custody, and semantic-v4 State/Record behavior and adds selected
+- **Semantic version 6** is offered first. It inherits ordinary Event,
+  compact-batch, custody, State/Record, and Blob behavior from version 5 and
+  adds only the opt-in selected Event-bridge mechanics lane. Semantic versions
+  1 through 5 emit zero Event-bridge frames.
+- **Semantic version 5** remains a compatibility option. It inherits Event,
+  compact-batch, authorized cross-scope route, custody, and semantic-v4
+  State/Record behavior and adds selected
   direct content-capable Blob source-before-carrier transfer with
   completion-gated visibility. Semantic versions 1 through 4 emit zero Blob
   frames.

@@ -1673,8 +1673,13 @@ class SelectedLiveMutableReceiptTests(unittest.TestCase):
         def mutate(data: bytes):
             result = original(data)
             binary = self.fixture.root / "binary/aster-live-mutable-acceptance"
+            before = binary.stat()
             binary.write_bytes(self.fixture.binary)
             binary.chmod(0o700)
+            os.utime(
+                binary,
+                ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000),
+            )
             return result
 
         with mock.patch.object(CHECKER, "validate_transcript", side_effect=mutate):

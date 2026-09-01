@@ -1,5 +1,7 @@
 #![cfg(feature = "client")]
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::{
     fs,
     path::PathBuf,
@@ -29,6 +31,9 @@ impl TestState {
             std::process::id()
         ));
         fs::create_dir(&path).expect("create isolated state root");
+        #[cfg(unix)]
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+            .expect("protect isolated state root");
         Self(path)
     }
 }

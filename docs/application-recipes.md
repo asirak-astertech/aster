@@ -33,12 +33,15 @@ The recipes below use the broader semantic language bindings. The selected
 Record have cloneable live Rust handles backed by the running actor; all three
 also retain exclusive stopped Rust facades. State and Record live commands
 share Event's bounded actor lane and the same mission-bound store authority,
-while their objects reconcile over protected semantic-v4/v5 contacts. Blob now
+while their objects reconcile over protected semantic-v4/v5/v6 contacts. Blob now
 has a cloneable live Rust handle plus its exclusive stopped streaming facade;
 semantic v5 separately transfers already-durable Blob objects directly between
 current content-capable peers. The
-selected handshake offers `[5, 4, 3, 2, 1]`. Event keeps v1-v5 compatibility;
-v1-v3 contain no State/Record mechanics and v1-v4 emit zero Blob frames.
+selected handshake offers `[6, 5, 4, 3, 2, 1]`. Semantic v6 inherits the v5
+ordinary Event, State, Record, and Blob behavior and adds only the opt-in
+Event-bridge mechanics lane. Event keeps v1-v6 compatibility; v1-v3 contain no
+State/Record mechanics, v1-v4 emit zero Blob frames, and v1-v5 emit zero
+Event-bridge frames.
 
 `RunningNode::selected_state()` exposes async `publish`, `query`, `subscribe`,
 `poll`, `acknowledge`, and `unsubscribe`;

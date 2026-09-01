@@ -2265,8 +2265,10 @@ index\tserial\tnode_id
             relay_private = provision / "relay" / "private"
             for directory in [private, relay_private, provision / "node-a", provision / "node-b"]:
                 directory.mkdir(parents=True, mode=0o755, exist_ok=True)
+                directory.chmod(0o755)
             for path in [private / "node-a.bundle", private / "node-b.bundle"]:
                 path.write_bytes(b"bundle")
+                path.chmod(0o644)
             for role in ["node-a", "node-b"]:
                 (provision / role / "mesh.redb").write_bytes(b"state")
             with self.assertRaises(orchestrate.LabError):

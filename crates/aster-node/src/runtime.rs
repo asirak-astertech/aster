@@ -22218,7 +22218,7 @@ mod tests {
     }
 
     #[test]
-    fn mutable_v4_v5_gate_budget_and_status_are_class_separated() {
+    fn mutable_v4_v5_and_bridge_v6_gate_budget_and_status_are_class_separated() {
         assert!(!supports_mutable_semantic(1));
         assert!(!supports_mutable_semantic(2));
         assert!(!supports_mutable_semantic(3));
@@ -22228,11 +22228,15 @@ mod tests {
         assert_eq!(mutable_classes_for_semantic(5), &MUTABLE_V5_CLASSES);
         assert_eq!(
             READY_RECONCILIATION_CLASSES,
-            "event,state,record,blob-v5-opt-in"
+            "event,state,record,blob-v5-opt-in,event-bridge-v6-opt-in"
         );
         assert_eq!(contact_reconciliation_classes(1), "event,state,record");
         assert_eq!(contact_reconciliation_classes(4), "event,state,record");
         assert_eq!(contact_reconciliation_classes(5), "event,state,record,blob");
+        assert_eq!(
+            contact_reconciliation_classes(6),
+            "event,state,record,blob,event-bridge-opt-in"
+        );
         assert!(!mutable_classes_for_semantic(1).contains(&MutableClass::Blob));
         assert!(!mutable_classes_for_semantic(2).contains(&MutableClass::Blob));
         assert!(!mutable_classes_for_semantic(3).contains(&MutableClass::Blob));
@@ -25357,6 +25361,20 @@ mod tests {
                 .expect("control finish"),
             Frame::ControlFinished
         );
+
+        if mission.semantic_version() >= MIN_EVENT_BRIDGE_SEMANTIC_VERSION {
+            assert_eq!(
+                request_mission_frame(
+                    connection,
+                    mission,
+                    Frame::BridgeHello { enabled: false },
+                    &mut receipt,
+                )
+                .await
+                .expect("disabled bridge hello"),
+                Frame::BridgeHelloAck { enabled: false }
+            );
+        }
 
         let interest_request = if semantic_v3 {
             let selector_revision = u64::try_from(interest.len()).expect("selector revision");

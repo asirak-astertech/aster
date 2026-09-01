@@ -356,6 +356,7 @@
         <div style="display: flex; gap: 16px; flex-wrap: wrap; justify-content: center; margin-top: 8px;">
           <a class="btn btn-primary" href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/quickstart/capability-tour.md">Run the live tour</a>
           <a class="btn btn-secondary" href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/quickstart/message-playground.md">Open the playground</a>
+          <a class="btn btn-secondary" href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/quickstart/lan-mvp.md">Try LAN discovery</a>
           <a class="btn btn-secondary" href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/quickstart/connect-agent.md">Connect your app</a>
         </div>
         <div style="display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; font: 13px ui-monospace, Menlo, monospace;">
@@ -506,7 +507,7 @@ Move protected Events through a relay that cannot read them
           <article class="card">
             <div class="icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 9 5-9 5-9-5 9-5z"></path><path d="m3 13 9 5 9-5"></path></svg></div>
             <h3>Share by topic and scope</h3>
-            <p>Topics describe what data means. Scopes bound where it may travel. Signed bridge authorizations constrain topic, priority, and hop count.</p>
+            <p>Topics describe what data means. Scopes bound where it may travel. The opt-in semantic-v6 Event bridge uses signed, static directed edges with topic, priority, and hop-count narrowing. Dynamic administration, cross-class bridges, and production qualification remain open.</p>
           </article>
           <article class="card">
             <div class="icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 8 4.5v9L12 21l-8-4.5v-9L12 3z"></path><path d="M12 12 20 7.5M12 12v9M12 12 4 7.5"></path></svg></div>
@@ -527,10 +528,11 @@ Move protected Events through a relay that cannot read them
         <div style="display: flex; flex-direction: column; gap: 16px;">
           <div class="eyebrow">Try the mesh</div>
           <h2 style="font-size: clamp(28px, 4.5vw, 40px); font-weight: 500;">Watch the mesh work, then take control</h2>
-          <p style="font-size: 18px;">The live tour verifies a deterministic offline and relay path as it unfolds. The playground keeps 2 through 32 independent local node processes running so you can choose a publisher, send synthetic messages, and isolate, stop, or rejoin nodes while exact Event observations update.</p>
+          <p style="font-size: 18px;">The live tour verifies a deterministic offline and relay path as it unfolds. The playground keeps 2 through 32 independent local node processes running so you can choose a publisher, send synthetic messages, and isolate, stop, or rejoin nodes while exact Event observations update. Default-off LAN and hierarchy guides separately exercise mission-authenticated discovery and static, payload-blind Event bridges without turning those procedures into retained physical or production evidence.</p>
           <div style="display: flex; gap: 16px; flex-wrap: wrap; margin-top: 8px;">
             <a class="btn btn-primary" href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/quickstart/capability-tour.md">Run the live tour</a>
             <a class="btn btn-secondary" href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/quickstart/message-playground.md">Open the playground</a>
+            <a class="btn btn-secondary" href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docker/hierarchy-mvp/README.md">Try the hierarchy</a>
             <a class="btn btn-secondary" href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/quickstart/connect-agent.md">Connect an app</a>
           </div>
         </div>
@@ -567,7 +569,7 @@ status</pre>
           <div class="icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 9v4"></path><path d="M12 17h.01"></path><path d="M10.3 3.9 2.6 17a2 2 0 0 0 1.7 3h15.4a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"></path></svg></div>
           <div style="display: flex; flex-direction: column; gap: 10px;">
             <h3>Built for evaluation. Explicit about what is left.</h3>
-            <p>Aster is an evaluation-stage reference implementation for protocol evaluation, application integration, and controlled capability testing—not production deployment. Event, State, Record, and Blob have live Rust APIs; Event also has a local ConnectRPC API. The live surfaces, one-host demos, and retained receipts each have explicit bounded claim limits. Production authorization still depends on the tracked security, interoperability, platform, operations, and representative acceptance gates. Follow Project status for exact evidence and remaining gaps.</p>
+            <p>Aster is an evaluation-stage reference implementation for protocol evaluation, application integration, and controlled capability testing—not production deployment. Event, State, Record, and Blob have live Rust APIs; Event also has a local ConnectRPC API. Default-off mission-authenticated LAN discovery and the static Event hierarchy have bounded procedures and same-host diagnostics, not retained physical, hostile-network, capacity, or production evidence. The live surfaces, demos, and retained receipts each have explicit claim limits. Production authorization still depends on the tracked security, interoperability, platform, operations, and representative acceptance gates. Follow Project status for exact evidence and remaining gaps.</p>
             <div style="display: flex; gap: 24px; flex-wrap: wrap; font-weight: 600;">
               <a href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/implementation/requirements-status.md">Project status →</a>
               <a href="https://github.com/defenseunicorns-partnerships/aster/blob/main/docs/quickstart/capability-tour.md">Live tour →</a>
