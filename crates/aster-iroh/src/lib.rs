@@ -18,10 +18,18 @@ use std::{
 
 #[cfg(feature = "nearby-discovery")]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "nearby-discovery")]
+use std::{
+    collections::BTreeMap,
+    net::{IpAddr, Ipv4Addr},
+};
 
 use futures::StreamExt;
 #[cfg(feature = "nearby-discovery")]
-use iroh::address_lookup::{AddrFilter, AddressLookupServices};
+use iroh::address_lookup::{
+    AddrFilter, AddressLookup, AddressLookupServices, EndpointData, EndpointInfo,
+    Error as AddressLookupError, Item as AddressLookupItem, MemoryLookup,
+};
 use iroh::{
     Endpoint as IrohEndpoint, EndpointAddr, RelayConfig as IrohRelayConfig, RelayMode,
     TransportAddr,
@@ -33,6 +41,11 @@ use iroh::{
 };
 #[cfg(feature = "nearby-discovery")]
 use iroh_mdns_address_lookup::{DiscoveryEvent as MdnsDiscoveryEvent, MdnsAddressLookup};
+#[cfg(feature = "nearby-discovery")]
+use swarm_discovery::{
+    Discoverer as SwarmDiscoverer, DropGuard as SwarmDiscoveryGuard, IpClass as SwarmIpClass,
+    Peer as SwarmPeer,
+};
 use tokio::time::timeout;
 
 pub use iroh::{EndpointId, RelayUrl, SecretKey};
@@ -61,6 +74,84 @@ pub const MAX_NEARBY_DISCOVERY_WINDOW: Duration = Duration::from_secs(30);
 
 #[cfg(feature = "nearby-discovery")]
 const NEARBY_DISCOVERY_EVENT_BUFFER: usize = 20;
+
+/// Maximum explicit IPv4 interfaces used by one nearby-discovery session.
+#[cfg(feature = "nearby-discovery")]
+pub const MAX_NEARBY_DISCOVERY_IPV4_INTERFACES: usize = 8;
+
+#[cfg(feature = "nearby-discovery")]
+const MAX_MULTI_INTERFACE_NEARBY_PEERS: usize = 32;
+
+#[cfg(feature = "nearby-discovery")]
+const MAX_MULTI_INTERFACE_NEARBY_ADDRS_PER_PEER: usize = 32;
+
+#[cfg(feature = "nearby-discovery")]
+const MAX_MULTI_INTERFACE_LOCAL_ADDRS: usize = 32;
+
+#[cfg(feature = "nearby-discovery")]
+const NEARBY_ENDPOINT_ID_LABEL_BYTES: usize = 52;
+
+#[cfg(feature = "nearby-discovery")]
+const NEARBY_ENDPOINT_ID_BASE32_ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+
+#[cfg(feature = "nearby-discovery")]
+const MULTI_INTERFACE_NEARBY_PROVENANCE: &str = "aster-nearby-multi-interface-v1";
+
+#[cfg(feature = "nearby-discovery")]
+fn encode_nearby_endpoint_id_label(endpoint_id: EndpointId) -> String {
+    let mut encoded = String::with_capacity(NEARBY_ENDPOINT_ID_LABEL_BYTES);
+    let mut accumulator = 0u16;
+    let mut bits = 0u8;
+    for byte in endpoint_id.as_bytes() {
+        accumulator = (accumulator << 8) | u16::from(*byte);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            let index = usize::from((accumulator >> bits) & 0x1f);
+            encoded.push(char::from(NEARBY_ENDPOINT_ID_BASE32_ALPHABET[index]));
+        }
+        accumulator &= if bits == 0 { 0 } else { (1 << bits) - 1 };
+    }
+    if bits != 0 {
+        let index = usize::from((accumulator << (5 - bits)) & 0x1f);
+        encoded.push(char::from(NEARBY_ENDPOINT_ID_BASE32_ALPHABET[index]));
+    }
+    debug_assert_eq!(encoded.len(), NEARBY_ENDPOINT_ID_LABEL_BYTES);
+    encoded
+}
+
+#[cfg(feature = "nearby-discovery")]
+fn decode_nearby_endpoint_id_label(label: &str) -> Option<EndpointId> {
+    if label.len() != NEARBY_ENDPOINT_ID_LABEL_BYTES
+        || !label
+            .bytes()
+            .all(|byte| NEARBY_ENDPOINT_ID_BASE32_ALPHABET.contains(&byte))
+    {
+        return None;
+    }
+    EndpointId::from_str(label).ok()
+}
+
+#[cfg(feature = "nearby-discovery")]
+fn normalize_nearby_ipv4_interfaces(
+    mut interfaces: Vec<Ipv4Addr>,
+) -> Result<Vec<Ipv4Addr>, CarrierError> {
+    interfaces.sort_unstable();
+    interfaces.dedup();
+    if interfaces.len() > MAX_NEARBY_DISCOVERY_IPV4_INTERFACES {
+        return Err(CarrierError::Configuration(format!(
+            "nearby discovery IPv4 interface count must be within 0..={MAX_NEARBY_DISCOVERY_IPV4_INTERFACES}"
+        )));
+    }
+    if interfaces.iter().any(|interface| {
+        interface.is_unspecified() || interface.is_multicast() || *interface == Ipv4Addr::BROADCAST
+    }) {
+        return Err(CarrierError::Configuration(
+            "nearby discovery IPv4 interfaces must be concrete local unicast addresses".into(),
+        ));
+    }
+    Ok(interfaces)
+}
 
 /// ALPN for the Iroh-QUIC-protected carrier profile.
 ///
@@ -625,11 +716,240 @@ pub struct PreparedNearbyDiscoveryBrowser {
 #[cfg(feature = "nearby-discovery")]
 struct NearbyDiscoveryState {
     services: AddressLookupServices,
-    lookup: Mutex<Option<MdnsAddressLookup>>,
+    lookup: Mutex<Option<NearbyAddressLookup>>,
     active: AtomicBool,
     endpoint_occupied: Arc<AtomicBool>,
     expiry: Mutex<Option<tokio::task::AbortHandle>>,
     event_forwarder: Mutex<Option<tokio::task::AbortHandle>>,
+}
+
+#[cfg(feature = "nearby-discovery")]
+#[derive(Clone)]
+enum NearbyAddressLookup {
+    Official(MdnsAddressLookup),
+    MultiInterface(MultiInterfaceNearbyAddressLookup),
+}
+
+#[cfg(feature = "nearby-discovery")]
+impl fmt::Debug for NearbyAddressLookup {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Official(_) => formatter.write_str("NearbyAddressLookup::Official"),
+            Self::MultiInterface(lookup) => formatter
+                .debug_tuple("NearbyAddressLookup::MultiInterface")
+                .field(lookup)
+                .finish(),
+        }
+    }
+}
+
+#[cfg(feature = "nearby-discovery")]
+impl AddressLookup for NearbyAddressLookup {
+    fn publish(&self, data: &EndpointData) {
+        match self {
+            Self::Official(lookup) => lookup.publish(data),
+            Self::MultiInterface(lookup) => lookup.publish(data),
+        }
+    }
+
+    fn resolve(
+        &self,
+        endpoint_id: EndpointId,
+    ) -> Option<futures::stream::BoxStream<'static, Result<AddressLookupItem, AddressLookupError>>>
+    {
+        match self {
+            Self::Official(lookup) => lookup.resolve(endpoint_id),
+            Self::MultiInterface(lookup) => lookup.resolve(endpoint_id),
+        }
+    }
+}
+
+#[cfg(feature = "nearby-discovery")]
+#[derive(Clone)]
+struct MultiInterfaceNearbyAddressLookup {
+    memory: MemoryLookup,
+    discovery: Arc<Mutex<SwarmDiscoveryGuard>>,
+    peers: MultiInterfaceNearbyPeerCache,
+}
+
+#[cfg(feature = "nearby-discovery")]
+impl fmt::Debug for MultiInterfaceNearbyAddressLookup {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MultiInterfaceNearbyAddressLookup")
+            .field("retained_peers", &self.peers.retained_len())
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "nearby-discovery")]
+impl MultiInterfaceNearbyAddressLookup {
+    fn new(
+        endpoint_id: EndpointId,
+        interfaces: Vec<Ipv4Addr>,
+        runtime: &tokio::runtime::Handle,
+    ) -> Result<Self, CarrierError> {
+        debug_assert!(!interfaces.is_empty());
+        debug_assert!(interfaces.len() <= MAX_NEARBY_DISCOVERY_IPV4_INTERFACES);
+        debug_assert!(interfaces.windows(2).all(|pair| pair[0] < pair[1]));
+
+        let memory = MemoryLookup::with_provenance(MULTI_INTERFACE_NEARBY_PROVENANCE);
+        let peers = MultiInterfaceNearbyPeerCache::new(endpoint_id, memory.clone());
+        let callback_peers = peers.clone();
+        let discoverer = SwarmDiscoverer::new_interactive(
+            NEARBY_SERVICE_NAME.to_owned(),
+            encode_nearby_endpoint_id_label(endpoint_id),
+        )
+        .with_ip_class(SwarmIpClass::V4Only)
+        .with_multicast_interfaces_v4(interfaces)
+        .with_callback(move |candidate, peer| callback_peers.observe(candidate, peer));
+        let discovery = discoverer
+            .spawn(runtime)
+            .map_err(|error| CarrierError::Transport(error.to_string()))?;
+        Ok(Self {
+            memory,
+            discovery: Arc::new(Mutex::new(discovery)),
+            peers,
+        })
+    }
+
+    fn subscribe(&self) -> tokio::sync::mpsc::Receiver<NearbyDiscoveryEvent> {
+        self.peers.subscribe()
+    }
+}
+
+#[cfg(feature = "nearby-discovery")]
+impl AddressLookup for MultiInterfaceNearbyAddressLookup {
+    fn publish(&self, data: &EndpointData) {
+        let mut by_port = BTreeMap::<u16, Vec<IpAddr>>::new();
+        for address in data.ip_addrs().take(MAX_MULTI_INTERFACE_LOCAL_ADDRS) {
+            by_port
+                .entry(address.port())
+                .or_default()
+                .push(address.ip());
+        }
+        let discovery = self
+            .discovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        discovery.remove_all();
+        for (port, addresses) in by_port {
+            discovery.add(port, addresses);
+        }
+    }
+
+    fn resolve(
+        &self,
+        endpoint_id: EndpointId,
+    ) -> Option<futures::stream::BoxStream<'static, Result<AddressLookupItem, AddressLookupError>>>
+    {
+        self.memory.resolve(endpoint_id)
+    }
+}
+
+#[cfg(feature = "nearby-discovery")]
+#[derive(Clone)]
+struct MultiInterfaceNearbyPeerCache {
+    local_endpoint_id: EndpointId,
+    memory: MemoryLookup,
+    retained: Arc<Mutex<BTreeSet<EndpointId>>>,
+    subscribers: Arc<Mutex<Vec<tokio::sync::mpsc::Sender<NearbyDiscoveryEvent>>>>,
+}
+
+#[cfg(feature = "nearby-discovery")]
+impl MultiInterfaceNearbyPeerCache {
+    fn new(local_endpoint_id: EndpointId, memory: MemoryLookup) -> Self {
+        Self {
+            local_endpoint_id,
+            memory,
+            retained: Arc::new(Mutex::new(BTreeSet::new())),
+            subscribers: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn retained_len(&self) -> usize {
+        self.retained
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    fn subscribe(&self) -> tokio::sync::mpsc::Receiver<NearbyDiscoveryEvent> {
+        let (sender, receiver) = tokio::sync::mpsc::channel(NEARBY_DISCOVERY_EVENT_BUFFER);
+        self.subscribers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(sender);
+        receiver
+    }
+
+    fn observe(&self, candidate: &str, peer: &SwarmPeer) {
+        let addresses = (!peer.is_expiry()).then(|| {
+            peer.addrs()
+                .iter()
+                .take(MAX_MULTI_INTERFACE_NEARBY_ADDRS_PER_PEER)
+                .map(|(ip, port)| SocketAddr::new(*ip, *port))
+                .collect::<BTreeSet<_>>()
+        });
+        self.apply(candidate, addresses);
+    }
+
+    fn apply(&self, candidate: &str, addresses: Option<BTreeSet<SocketAddr>>) {
+        let Some(endpoint_id) = decode_nearby_endpoint_id_label(candidate) else {
+            return;
+        };
+        if endpoint_id == self.local_endpoint_id {
+            return;
+        }
+
+        let event = if let Some(addresses) = addresses {
+            let addresses = addresses
+                .into_iter()
+                .take(MAX_MULTI_INTERFACE_NEARBY_ADDRS_PER_PEER)
+                .collect::<BTreeSet<_>>();
+            if addresses.is_empty() {
+                return;
+            }
+            let mut retained = self
+                .retained
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !retained.contains(&endpoint_id) {
+                if retained.len() >= MAX_MULTI_INTERFACE_NEARBY_PEERS {
+                    return;
+                }
+                retained.insert(endpoint_id);
+            }
+            drop(retained);
+            let data = EndpointData::from(addresses);
+            debug_assert!(data.user_data().is_none());
+            self.memory
+                .set_endpoint_info(EndpointInfo::from_parts(endpoint_id, data));
+            NearbyDiscoveryEvent::Discovered { endpoint_id }
+        } else {
+            let removed = self
+                .retained
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&endpoint_id);
+            if !removed {
+                return;
+            }
+            self.memory.remove_endpoint_info(endpoint_id);
+            NearbyDiscoveryEvent::Expired { endpoint_id }
+        };
+        self.notify(event);
+    }
+
+    fn notify(&self, event: NearbyDiscoveryEvent) {
+        self.subscribers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|subscriber| match subscriber.try_send(event) {
+                Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => true,
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
+            });
+    }
 }
 
 #[cfg(feature = "nearby-discovery")]
@@ -707,7 +1027,7 @@ struct PreparedNearbyDiscovery {
     runtime: tokio::runtime::Handle,
     reservation: NearbyDiscoveryReservation,
     services: AddressLookupServices,
-    lookup: MdnsAddressLookup,
+    lookup: NearbyAddressLookup,
 }
 
 #[cfg(feature = "nearby-discovery")]
@@ -1020,6 +1340,7 @@ impl Endpoint {
     fn prepare_nearby_discovery(
         &self,
         window: Duration,
+        interfaces: Vec<Ipv4Addr>,
     ) -> Result<PreparedNearbyDiscovery, CarrierError> {
         if !(MIN_NEARBY_DISCOVERY_WINDOW..=MAX_NEARBY_DISCOVERY_WINDOW).contains(&window)
             || window.subsec_nanos() != 0
@@ -1030,6 +1351,7 @@ impl Endpoint {
                 MAX_NEARBY_DISCOVERY_WINDOW.as_secs()
             )));
         }
+        let interfaces = normalize_nearby_ipv4_interfaces(interfaces)?;
         let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
             CarrierError::Configuration("nearby discovery requires an active Tokio runtime".into())
         })?;
@@ -1051,11 +1373,21 @@ impl Endpoint {
         // metadata in this demo/evaluation advertisement.
         self.inner.set_user_data_for_address_lookup(None);
         services.set_addr_filter(AddrFilter::ip_only());
-        let lookup = MdnsAddressLookup::builder()
-            .service_name(NEARBY_SERVICE_NAME)
-            .addr_filter(AddrFilter::ip_only())
-            .build(self.id())
-            .map_err(|error| CarrierError::Transport(error.to_string()))?;
+        let lookup = if interfaces.is_empty() {
+            NearbyAddressLookup::Official(
+                MdnsAddressLookup::builder()
+                    .service_name(NEARBY_SERVICE_NAME)
+                    .addr_filter(AddrFilter::ip_only())
+                    .build(self.id())
+                    .map_err(|error| CarrierError::Transport(error.to_string()))?,
+            )
+        } else {
+            NearbyAddressLookup::MultiInterface(MultiInterfaceNearbyAddressLookup::new(
+                self.id(),
+                interfaces,
+                &runtime,
+            )?)
+        };
         Ok(PreparedNearbyDiscovery {
             runtime,
             reservation,
@@ -1078,7 +1410,27 @@ impl Endpoint {
         &self,
         window: Duration,
     ) -> Result<NearbyDiscoverySession, CarrierError> {
-        Ok(self.prepare_nearby_discovery(window)?.install(window, None))
+        Ok(self
+            .prepare_nearby_discovery(window, Vec::new())?
+            .install(window, None))
+    }
+
+    /// Starts nearby lookup on an explicit bounded set of local IPv4 interfaces.
+    ///
+    /// The interface list is sorted and deduplicated. An empty list is exactly
+    /// equivalent to [`Self::start_nearby_discovery`] and retains the official
+    /// provider's default-interface behavior. A nonempty list selects Aster's
+    /// bounded adapter over the already-pinned `swarm-discovery` implementation;
+    /// only direct IP endpoint data is advertised or retained.
+    #[cfg(feature = "nearby-discovery")]
+    pub fn start_nearby_discovery_on_ipv4_interfaces(
+        &self,
+        window: Duration,
+        interfaces: Vec<Ipv4Addr>,
+    ) -> Result<NearbyDiscoverySession, CarrierError> {
+        Ok(self
+            .prepare_nearby_discovery(window, interfaces)?
+            .install(window, None))
     }
 
     /// Prepares one exclusive browser without installing its lookup provider.
@@ -1098,31 +1450,60 @@ impl Endpoint {
         &self,
         window: Duration,
     ) -> Result<PreparedNearbyDiscoveryBrowser, CarrierError> {
-        let prepared = self.prepare_nearby_discovery(window)?;
+        self.prepare_nearby_browser_on_ipv4_interfaces(window, Vec::new())
+            .await
+    }
+
+    /// Prepares a nearby browser on explicit local IPv4 multicast interfaces.
+    ///
+    /// Passing an empty list preserves [`Self::prepare_nearby_browser`] behavior.
+    /// Nonempty lists are sorted, deduplicated, bounded, and used for both
+    /// multicast send and receive sockets by the Aster-owned lookup adapter.
+    #[cfg(feature = "nearby-discovery")]
+    pub async fn prepare_nearby_browser_on_ipv4_interfaces(
+        &self,
+        window: Duration,
+        interfaces: Vec<Ipv4Addr>,
+    ) -> Result<PreparedNearbyDiscoveryBrowser, CarrierError> {
+        let prepared = self.prepare_nearby_discovery(window, interfaces)?;
 
         // This order is security- and correctness-significant. The upstream
         // subscriber receives no replay of the provider's existing peer map.
-        let mut source = prepared.lookup.subscribe().await;
         let (event_sender, event_receiver) =
             tokio::sync::mpsc::channel(NEARBY_DISCOVERY_EVENT_BUFFER);
-        let event_forwarder = prepared.runtime.spawn(async move {
-            while let Some(event) = source.next().await {
-                let sanitized = match event {
-                    MdnsDiscoveryEvent::Discovered { endpoint_info, .. } => {
-                        NearbyDiscoveryEvent::Discovered {
-                            endpoint_id: endpoint_info.endpoint_id,
+        let event_forwarder = match &prepared.lookup {
+            NearbyAddressLookup::Official(lookup) => {
+                let mut source = lookup.subscribe().await;
+                prepared.runtime.spawn(async move {
+                    while let Some(event) = source.next().await {
+                        let sanitized = match event {
+                            MdnsDiscoveryEvent::Discovered { endpoint_info, .. } => {
+                                NearbyDiscoveryEvent::Discovered {
+                                    endpoint_id: endpoint_info.endpoint_id,
+                                }
+                            }
+                            MdnsDiscoveryEvent::Expired { endpoint_id } => {
+                                NearbyDiscoveryEvent::Expired { endpoint_id }
+                            }
+                            _ => continue,
+                        };
+                        if event_sender.send(sanitized).await.is_err() {
+                            break;
                         }
                     }
-                    MdnsDiscoveryEvent::Expired { endpoint_id } => {
-                        NearbyDiscoveryEvent::Expired { endpoint_id }
-                    }
-                    _ => continue,
-                };
-                if event_sender.send(sanitized).await.is_err() {
-                    break;
-                }
+                })
             }
-        });
+            NearbyAddressLookup::MultiInterface(lookup) => {
+                let mut source = lookup.subscribe();
+                prepared.runtime.spawn(async move {
+                    while let Some(event) = source.recv().await {
+                        if event_sender.send(event).await.is_err() {
+                            break;
+                        }
+                    }
+                })
+            }
+        };
         Ok(PreparedNearbyDiscoveryBrowser {
             prepared: Some(prepared),
             window,
@@ -1142,6 +1523,21 @@ impl Endpoint {
         window: Duration,
     ) -> Result<NearbyDiscoveryBrowser, CarrierError> {
         Ok(self.prepare_nearby_browser(window).await?.install())
+    }
+
+    /// Starts one nearby browser on explicit local IPv4 multicast interfaces.
+    ///
+    /// An empty list preserves [`Self::start_nearby_browser`] behavior.
+    #[cfg(feature = "nearby-discovery")]
+    pub async fn start_nearby_browser_on_ipv4_interfaces(
+        &self,
+        window: Duration,
+        interfaces: Vec<Ipv4Addr>,
+    ) -> Result<NearbyDiscoveryBrowser, CarrierError> {
+        Ok(self
+            .prepare_nearby_browser_on_ipv4_interfaces(window, interfaces)
+            .await?
+            .install())
     }
 
     /// Waits, within the configured connection deadline, for the pinned relay
@@ -2083,6 +2479,166 @@ mod tests {
         );
         let binding = ChannelBinding([0x5a; CHANNEL_BINDING_BYTES]);
         assert_eq!(format!("{binding:?}"), "ChannelBinding([REDACTED])");
+    }
+
+    #[cfg(feature = "nearby-discovery")]
+    #[test]
+    fn nearby_endpoint_id_labels_are_dns_safe_reversible_and_strict() {
+        for seed in [0u8, 1, 0x5a, 0xff] {
+            let endpoint_id = SecretKey::from_bytes(&[seed; 32]).public();
+            let label = encode_nearby_endpoint_id_label(endpoint_id);
+            assert_eq!(label.len(), NEARBY_ENDPOINT_ID_LABEL_BYTES);
+            assert!(
+                label.len() <= 63,
+                "DNS-SD instance label must fit one label"
+            );
+            assert!(
+                label
+                    .bytes()
+                    .all(|byte| NEARBY_ENDPOINT_ID_BASE32_ALPHABET.contains(&byte))
+            );
+            assert_eq!(decode_nearby_endpoint_id_label(&label), Some(endpoint_id));
+            assert_eq!(
+                EndpointId::from_str(&label).expect("official Iroh base32 parser"),
+                endpoint_id
+            );
+            assert!(
+                decode_nearby_endpoint_id_label(&endpoint_id.to_string()).is_none(),
+                "the 64-byte display form must never re-enter a DNS label"
+            );
+        }
+
+        let valid = encode_nearby_endpoint_id_label(SecretKey::generate().public());
+        let mut invalid_symbol = valid.clone().into_bytes();
+        invalid_symbol[0] = b'0';
+        let invalid_symbol = String::from_utf8(invalid_symbol).expect("ASCII test label");
+        let uppercase = valid.to_ascii_uppercase();
+        let too_long = format!("{valid}a");
+        for malformed in [
+            &valid[..valid.len() - 1],
+            "a",
+            too_long.as_str(),
+            invalid_symbol.as_str(),
+            uppercase.as_str(),
+        ] {
+            assert!(
+                decode_nearby_endpoint_id_label(malformed).is_none(),
+                "accepted malformed discovery label {malformed}"
+            );
+        }
+    }
+
+    #[cfg(feature = "nearby-discovery")]
+    #[tokio::test]
+    async fn multi_interface_provider_constructs_with_dns_safe_endpoint_label() {
+        let endpoint_id = SecretKey::generate().public();
+        assert_eq!(endpoint_id.to_string().len(), 64, "regression precondition");
+        let lookup = MultiInterfaceNearbyAddressLookup::new(
+            endpoint_id,
+            vec![Ipv4Addr::LOCALHOST],
+            &tokio::runtime::Handle::current(),
+        )
+        .expect("52-byte discovery label must construct the provider");
+        drop(lookup);
+    }
+
+    #[cfg(feature = "nearby-discovery")]
+    #[test]
+    fn nearby_ipv4_interfaces_are_normalized_and_fail_closed() {
+        assert_eq!(
+            normalize_nearby_ipv4_interfaces(vec![
+                Ipv4Addr::new(10, 0, 0, 2),
+                Ipv4Addr::new(10, 0, 0, 1),
+                Ipv4Addr::new(10, 0, 0, 2),
+            ])
+            .expect("concrete interfaces"),
+            vec![Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2)]
+        );
+        assert!(normalize_nearby_ipv4_interfaces(Vec::new()).is_ok());
+        for invalid in [
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::new(224, 0, 0, 1),
+            Ipv4Addr::BROADCAST,
+        ] {
+            assert!(
+                normalize_nearby_ipv4_interfaces(vec![invalid]).is_err(),
+                "accepted invalid interface {invalid}"
+            );
+        }
+        let too_many = (1..=MAX_NEARBY_DISCOVERY_IPV4_INTERFACES + 1)
+            .map(|last| Ipv4Addr::new(10, 0, 0, u8::try_from(last).expect("test range")))
+            .collect();
+        assert!(normalize_nearby_ipv4_interfaces(too_many).is_err());
+    }
+
+    #[cfg(feature = "nearby-discovery")]
+    #[tokio::test]
+    async fn multi_interface_peer_cache_is_ip_only_bounded_and_expires() {
+        let local = SecretKey::generate().public();
+        let remote = SecretKey::generate().public();
+        let memory = MemoryLookup::with_provenance(MULTI_INTERFACE_NEARBY_PROVENANCE);
+        let cache = MultiInterfaceNearbyPeerCache::new(local, memory.clone());
+        let mut events = cache.subscribe();
+        let addresses = (1..=MAX_MULTI_INTERFACE_NEARBY_ADDRS_PER_PEER + 8)
+            .map(|suffix| {
+                SocketAddr::from((
+                    [10, 1, 0, u8::try_from(suffix).expect("test address suffix")],
+                    12_345,
+                ))
+            })
+            .collect();
+
+        let remote_label = encode_nearby_endpoint_id_label(remote);
+        cache.apply(&remote_label, Some(addresses));
+        assert_eq!(
+            events.recv().await,
+            Some(NearbyDiscoveryEvent::Discovered {
+                endpoint_id: remote
+            })
+        );
+        let retained = memory
+            .get_endpoint_info(remote)
+            .expect("discovered endpoint retained");
+        assert_eq!(
+            retained.data.ip_addrs().count(),
+            MAX_MULTI_INTERFACE_NEARBY_ADDRS_PER_PEER
+        );
+        assert!(retained.data.user_data().is_none());
+        assert_eq!(retained.data.relay_urls().count(), 0);
+
+        cache.apply(&remote_label, None);
+        assert_eq!(
+            events.recv().await,
+            Some(NearbyDiscoveryEvent::Expired {
+                endpoint_id: remote
+            })
+        );
+        assert!(memory.get_endpoint_info(remote).is_none());
+        assert_eq!(cache.retained_len(), 0);
+    }
+
+    #[cfg(feature = "nearby-discovery")]
+    #[test]
+    fn multi_interface_peer_cache_caps_retained_endpoint_identities() {
+        let local = SecretKey::generate().public();
+        let memory = MemoryLookup::with_provenance(MULTI_INTERFACE_NEARBY_PROVENANCE);
+        let cache = MultiInterfaceNearbyPeerCache::new(local, memory.clone());
+        let address = BTreeSet::from([SocketAddr::from(([10, 2, 0, 1], 12_345))]);
+        for _ in 0..MAX_MULTI_INTERFACE_NEARBY_PEERS {
+            let endpoint_id = SecretKey::generate().public();
+            cache.apply(
+                &encode_nearby_endpoint_id_label(endpoint_id),
+                Some(address.clone()),
+            );
+        }
+        assert_eq!(cache.retained_len(), MAX_MULTI_INTERFACE_NEARBY_PEERS);
+
+        let rejected = SecretKey::generate().public();
+        cache.apply(&encode_nearby_endpoint_id_label(rejected), Some(address));
+        assert_eq!(cache.retained_len(), MAX_MULTI_INTERFACE_NEARBY_PEERS);
+        assert!(memory.get_endpoint_info(rejected).is_none());
+        cache.apply(&"x".repeat(NEARBY_ENDPOINT_ID_LABEL_BYTES + 1), None);
+        assert_eq!(cache.retained_len(), MAX_MULTI_INTERFACE_NEARBY_PEERS);
     }
 
     #[tokio::test]

@@ -9,7 +9,7 @@ publish = false
 
 [features]
 default = []
-nearby-discovery = ["dep:iroh-mdns-address-lookup"]
+nearby-discovery = ["dep:iroh-mdns-address-lookup", "dep:swarm-discovery"]
 test-utils = ["dep:iroh-relay"]
 
 [dependencies]
@@ -18,6 +18,7 @@ iroh.workspace = true
 iroh-mdns-address-lookup = { workspace = true, optional = true }
 iroh-relay = { version = "=1.0.3", default-features = false, features = ["server", "test-utils", "tls-ring"], optional = true }
 rustls.workspace = true
+swarm-discovery = { workspace = true, optional = true }
 tokio.workspace = true
 
 [dev-dependencies]

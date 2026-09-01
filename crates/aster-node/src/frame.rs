@@ -1,4 +1,6 @@
-use aster_mesh::{MAX_CUSTODY_WRAPPER_BYTES, Priority, Scope, Topic};
+use aster_mesh::{
+    MAX_CUSTODY_WRAPPER_BYTES, MAX_SELECTED_BRIDGE_WRAPPER_BYTES, Priority, Scope, Topic,
+};
 use aster_negentropy::{MAX_CARDINALITY_LIMIT, MAX_FRAME_SIZE_LIMIT};
 use aster_redb_store::{
     BlobTransferId, ControlTransferId, EventTransferId, RecordTransferId, StateTransferId,
@@ -74,6 +76,12 @@ const BLOB_RANGE_RESULT: u8 = 0xa5;
 const BLOB_RANGE_RESULT_ACK: u8 = 0xa6;
 const BLOB_CARRIER_FINISH: u8 = 0xb1;
 const BLOB_CARRIER_FINISHED: u8 = 0xb2;
+const BRIDGE_HELLO: u8 = 0xc1;
+const BRIDGE_HELLO_ACK: u8 = 0xc2;
+const BRIDGE_ROUTE_OFFER: u8 = 0xc3;
+const BRIDGE_ROUTE_RESULT: u8 = 0xc4;
+const BRIDGE_FINISH: u8 = 0xc5;
+const BRIDGE_FINISHED: u8 = 0xc6;
 pub(crate) const MAX_OBJECT_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_BLOB_RANGE_BYTES: usize = 16 * 1024;
 pub(crate) const BLOB_CONTENT_PROOF_BYTES: usize = 32;
@@ -175,6 +183,41 @@ impl EventDirection {
             2 => Ok(Self::ToSessionResponder),
             _ => Err(NodeError::Protocol(
                 "Event direction is unknown or missing".into(),
+            )),
+        }
+    }
+}
+
+/// Receiver-local outcome for one fully authenticated semantic-v6 bridge route.
+///
+/// Authentication and policy failures remain fatal and therefore never acquire
+/// a wire disposition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BridgeRouteDisposition {
+    Duplicate,
+    Promoted,
+    StoredInactive,
+    NotSelected,
+}
+
+impl BridgeRouteDisposition {
+    const fn encode(self) -> u8 {
+        match self {
+            Self::Duplicate => 0,
+            Self::Promoted => 1,
+            Self::StoredInactive => 2,
+            Self::NotSelected => 3,
+        }
+    }
+
+    fn decode(value: u8) -> Result<Self, NodeError> {
+        match value {
+            0 => Ok(Self::Duplicate),
+            1 => Ok(Self::Promoted),
+            2 => Ok(Self::StoredInactive),
+            3 => Ok(Self::NotSelected),
+            _ => Err(NodeError::Protocol(
+                "bridge route disposition is unknown".into(),
             )),
         }
     }
@@ -792,6 +835,33 @@ pub(crate) enum Frame {
         direction: EventDirection,
         remaining: u64,
     },
+    /// Negotiates the semantic-v6 bridge lane without disclosing route state.
+    BridgeHello {
+        enabled: bool,
+    },
+    /// Confirms whether the responder has enabled the semantic-v6 bridge lane.
+    BridgeHelloAck {
+        enabled: bool,
+    },
+    /// Offers one exact bridge wrapper/source pair for fresh receiver verification.
+    BridgeRouteOffer {
+        wrapper_id: [u8; 32],
+        wrapper: Vec<u8>,
+        source: Vec<u8>,
+    },
+    /// Reports the durable receiver-local result for one verified bridge route.
+    BridgeRouteResult {
+        wrapper_id: [u8; 32],
+        disposition: BridgeRouteDisposition,
+    },
+    /// Completes one bounded semantic-v6 bridge lane.
+    BridgeFinish {
+        remaining: u64,
+    },
+    /// Acknowledges completion of one bounded semantic-v6 bridge lane.
+    BridgeFinished {
+        remaining: u64,
+    },
 }
 
 impl Frame {
@@ -806,6 +876,7 @@ impl Frame {
                 | Self::MutableObject { .. }
                 | Self::MutableOffer { .. }
                 | Self::BlobRange { .. }
+                | Self::BridgeRouteOffer { .. }
         )
     }
 
@@ -1330,6 +1401,43 @@ impl Frame {
                 *direction,
                 *remaining,
             )?,
+            Self::BridgeHello { enabled } => {
+                output.push(BRIDGE_HELLO);
+                output.push(u8::from(*enabled));
+            }
+            Self::BridgeHelloAck { enabled } => {
+                output.push(BRIDGE_HELLO_ACK);
+                output.push(u8::from(*enabled));
+            }
+            Self::BridgeRouteOffer {
+                wrapper_id,
+                wrapper,
+                source,
+            } => {
+                output.push(BRIDGE_ROUTE_OFFER);
+                output.extend_from_slice(wrapper_id);
+                encode_bytes(
+                    &mut output,
+                    wrapper,
+                    MAX_SELECTED_BRIDGE_WRAPPER_BYTES,
+                    "bridge route wrapper",
+                )?;
+                encode_bytes(&mut output, source, MAX_OBJECT_BYTES, "bridge route source")?;
+            }
+            Self::BridgeRouteResult {
+                wrapper_id,
+                disposition,
+            } => {
+                output.push(BRIDGE_ROUTE_RESULT);
+                output.extend_from_slice(wrapper_id);
+                output.push(disposition.encode());
+            }
+            Self::BridgeFinish { remaining } => {
+                encode_bridge_remaining(&mut output, BRIDGE_FINISH, *remaining)?;
+            }
+            Self::BridgeFinished { remaining } => {
+                encode_bridge_remaining(&mut output, BRIDGE_FINISHED, *remaining)?;
+            }
         }
         Ok(output)
     }
@@ -1842,11 +1950,101 @@ impl Frame {
                     })
                 }
             }
+            BRIDGE_HELLO | BRIDGE_HELLO_ACK => {
+                let enabled = decode_bridge_enabled(body)?;
+                if tag == BRIDGE_HELLO {
+                    Ok(Self::BridgeHello { enabled })
+                } else {
+                    Ok(Self::BridgeHelloAck { enabled })
+                }
+            }
+            BRIDGE_ROUTE_OFFER => {
+                let mut body = body;
+                let wrapper_id: [u8; 32] =
+                    take_exact(&mut body, 32, "bridge route wrapper identifier")?
+                        .try_into()
+                        .map_err(|_| {
+                            NodeError::Protocol(
+                                "bridge route wrapper identifier length differs".into(),
+                            )
+                        })?;
+                let (wrapper, body) = decode_leading_bytes(
+                    body,
+                    MAX_SELECTED_BRIDGE_WRAPPER_BYTES,
+                    "bridge route wrapper",
+                )?;
+                let source = decode_bytes(body, MAX_OBJECT_BYTES, "bridge route source")?;
+                Ok(Self::BridgeRouteOffer {
+                    wrapper_id,
+                    wrapper: wrapper.to_vec(),
+                    source: source.to_vec(),
+                })
+            }
+            BRIDGE_ROUTE_RESULT => {
+                if body.len() != 33 {
+                    return Err(NodeError::Protocol(
+                        "bridge route result length differs".into(),
+                    ));
+                }
+                Ok(Self::BridgeRouteResult {
+                    wrapper_id: body[..32].try_into().map_err(|_| {
+                        NodeError::Protocol("bridge route wrapper identifier length differs".into())
+                    })?,
+                    disposition: BridgeRouteDisposition::decode(body[32])?,
+                })
+            }
+            BRIDGE_FINISH | BRIDGE_FINISHED => {
+                let remaining = decode_bridge_remaining(body)?;
+                if tag == BRIDGE_FINISH {
+                    Ok(Self::BridgeFinish { remaining })
+                } else {
+                    Ok(Self::BridgeFinished { remaining })
+                }
+            }
             _ => Err(NodeError::Protocol(
                 "unknown or malformed mechanics frame".into(),
             )),
         }
     }
+}
+
+fn decode_bridge_enabled(body: &[u8]) -> Result<bool, NodeError> {
+    match body {
+        [0] => Ok(false),
+        [1] => Ok(true),
+        _ => Err(NodeError::Protocol(
+            "bridge enabled flag is not one canonical boolean".into(),
+        )),
+    }
+}
+
+fn encode_bridge_remaining(output: &mut Vec<u8>, tag: u8, remaining: u64) -> Result<(), NodeError> {
+    if remaining > MAX_CARDINALITY_LIMIT as u64 {
+        return Err(NodeError::Protocol(
+            "bridge remaining count exceeds the selected cardinality bound".into(),
+        ));
+    }
+    output.push(tag);
+    output.extend_from_slice(&remaining.to_be_bytes());
+    Ok(())
+}
+
+fn decode_bridge_remaining(body: &[u8]) -> Result<u64, NodeError> {
+    if body.len() != 8 {
+        return Err(NodeError::Protocol(
+            "bridge remaining count length differs".into(),
+        ));
+    }
+    let remaining = u64::from_be_bytes(
+        body.try_into()
+            .map_err(|_| NodeError::Protocol("bridge remaining count differs".into()))?,
+    );
+    if remaining > MAX_CARDINALITY_LIMIT as u64 {
+        return Err(NodeError::Protocol(
+            "bridge remaining count exceeds the selected cardinality bound".into(),
+        ));
+    }
+    Ok(remaining)
 }
 
 fn encode_blob_range_tuple(
@@ -2918,6 +3116,19 @@ mod tests {
                 direction: to_initiator,
                 remaining: 0,
             },
+            Frame::BridgeHello { enabled: true },
+            Frame::BridgeHelloAck { enabled: false },
+            Frame::BridgeRouteOffer {
+                wrapper_id: [0xca; 32],
+                wrapper: b"bridge-wrapper".to_vec(),
+                source: b"bridge-source".to_vec(),
+            },
+            Frame::BridgeRouteResult {
+                wrapper_id: [0xca; 32],
+                disposition: BridgeRouteDisposition::Promoted,
+            },
+            Frame::BridgeFinish { remaining: 1 },
+            Frame::BridgeFinished { remaining: 0 },
         ];
         for frame in frames {
             let encoded = frame.encode().expect("encode");
@@ -3821,5 +4032,158 @@ mod tests {
         let mut oversized = encoded;
         oversized[6..14].copy_from_slice(&(MAX_CARDINALITY_LIMIT as u64 + 1).to_be_bytes());
         assert!(Frame::decode(&oversized).is_err());
+    }
+
+    #[test]
+    fn bridge_v6_frames_are_canonical_and_reject_truncation() {
+        let wrapper_id = [0xc3; 32];
+        assert!(
+            Frame::BridgeRouteOffer {
+                wrapper_id,
+                wrapper: b"wrapper".to_vec(),
+                source: b"source".to_vec(),
+            }
+            .serves_application_or_control_object()
+        );
+        assert!(!Frame::BridgeHello { enabled: true }.serves_application_or_control_object());
+        assert!(
+            !Frame::BridgeRouteResult {
+                wrapper_id,
+                disposition: BridgeRouteDisposition::Promoted,
+            }
+            .serves_application_or_control_object()
+        );
+        let frames = [
+            Frame::BridgeHello { enabled: false },
+            Frame::BridgeHelloAck { enabled: true },
+            Frame::BridgeRouteOffer {
+                wrapper_id,
+                wrapper: b"wrapper".to_vec(),
+                source: b"source".to_vec(),
+            },
+            Frame::BridgeRouteResult {
+                wrapper_id,
+                disposition: BridgeRouteDisposition::Duplicate,
+            },
+            Frame::BridgeRouteResult {
+                wrapper_id,
+                disposition: BridgeRouteDisposition::Promoted,
+            },
+            Frame::BridgeRouteResult {
+                wrapper_id,
+                disposition: BridgeRouteDisposition::StoredInactive,
+            },
+            Frame::BridgeRouteResult {
+                wrapper_id,
+                disposition: BridgeRouteDisposition::NotSelected,
+            },
+            Frame::BridgeFinish {
+                remaining: MAX_CARDINALITY_LIMIT as u64,
+            },
+            Frame::BridgeFinished { remaining: 0 },
+        ];
+        for frame in frames {
+            let encoded = frame.encode().expect("encode bridge frame");
+            assert_eq!(Frame::decode(&encoded).expect("decode bridge frame"), frame);
+            for end in 0..encoded.len() {
+                assert!(
+                    Frame::decode(&encoded[..end]).is_err(),
+                    "accepted bridge frame truncated at {end}"
+                );
+            }
+            let mut trailing = encoded;
+            trailing.push(0);
+            assert!(Frame::decode(&trailing).is_err());
+        }
+    }
+
+    #[test]
+    fn bridge_v6_frames_reject_hostile_flags_dispositions_and_bounds() {
+        let wrapper_id = [0xc4; 32];
+        assert_eq!(MAX_SELECTED_BRIDGE_WRAPPER_BYTES, 524_322);
+
+        let boundary = Frame::BridgeRouteOffer {
+            wrapper_id,
+            wrapper: vec![0; MAX_SELECTED_BRIDGE_WRAPPER_BYTES],
+            source: vec![0; MAX_OBJECT_BYTES],
+        };
+        let boundary_encoded = boundary.encode().expect("bridge route boundary");
+        assert_eq!(
+            Frame::decode(&boundary_encoded).expect("decode bridge route boundary"),
+            boundary
+        );
+
+        let mut unknown_enabled = Frame::BridgeHello { enabled: true }
+            .encode()
+            .expect("bridge hello");
+        unknown_enabled[5] = 2;
+        assert!(Frame::decode(&unknown_enabled).is_err());
+
+        let mut unknown_disposition = Frame::BridgeRouteResult {
+            wrapper_id,
+            disposition: BridgeRouteDisposition::Duplicate,
+        }
+        .encode()
+        .expect("bridge route result");
+        *unknown_disposition
+            .last_mut()
+            .expect("bridge result has disposition") = 4;
+        assert!(Frame::decode(&unknown_disposition).is_err());
+
+        assert!(
+            Frame::BridgeRouteOffer {
+                wrapper_id,
+                wrapper: vec![0; MAX_SELECTED_BRIDGE_WRAPPER_BYTES + 1],
+                source: Vec::new(),
+            }
+            .encode()
+            .is_err()
+        );
+        assert!(
+            Frame::BridgeRouteOffer {
+                wrapper_id,
+                wrapper: Vec::new(),
+                source: vec![0; MAX_OBJECT_BYTES + 1],
+            }
+            .encode()
+            .is_err()
+        );
+
+        let mut oversized_wrapper = MAGIC.to_vec();
+        oversized_wrapper.push(BRIDGE_ROUTE_OFFER);
+        oversized_wrapper.extend_from_slice(&wrapper_id);
+        oversized_wrapper.extend_from_slice(
+            &u32::try_from(MAX_SELECTED_BRIDGE_WRAPPER_BYTES + 1)
+                .expect("wrapper bound fits u32")
+                .to_be_bytes(),
+        );
+        assert!(Frame::decode(&oversized_wrapper).is_err());
+
+        let mut oversized_source = MAGIC.to_vec();
+        oversized_source.push(BRIDGE_ROUTE_OFFER);
+        oversized_source.extend_from_slice(&wrapper_id);
+        oversized_source.extend_from_slice(&0u32.to_be_bytes());
+        oversized_source.extend_from_slice(
+            &u32::try_from(MAX_OBJECT_BYTES + 1)
+                .expect("source bound fits u32")
+                .to_be_bytes(),
+        );
+        assert!(Frame::decode(&oversized_source).is_err());
+
+        assert!(
+            Frame::BridgeFinish {
+                remaining: MAX_CARDINALITY_LIMIT as u64 + 1,
+            }
+            .encode()
+            .is_err()
+        );
+        let mut oversized_remaining = Frame::BridgeFinish {
+            remaining: MAX_CARDINALITY_LIMIT as u64,
+        }
+        .encode()
+        .expect("bridge finish boundary");
+        oversized_remaining[5..13]
+            .copy_from_slice(&(MAX_CARDINALITY_LIMIT as u64 + 1).to_be_bytes());
+        assert!(Frame::decode(&oversized_remaining).is_err());
     }
 }

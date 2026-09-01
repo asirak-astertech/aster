@@ -108,6 +108,18 @@ BRIDGE_FOUNDATION_SLICE = (
     "crates/aster-redb-store/src/bridge_event.rs::tests; "
     "docs/decisions/0038-select-an-event-bridge-foundation.md"
 )
+BRIDGE_RUNTIME_SLICE = (
+    f"{BRIDGE_FOUNDATION_SLICE}; "
+    "crates/aster-node/src/bridge_runtime.rs; "
+    "crates/aster-node/src/frame.rs; "
+    "crates/aster-node/src/runtime.rs; "
+    "crates/aster-node/src/bridge_runtime.rs::tests; "
+    "crates/aster-node/src/frame.rs::tests; "
+    "docs/decisions/0039-compose-a-static-event-hierarchy-over-semantic-v6.md"
+)
+HIERARCHY_MVP_ARTIFACT = (
+    "docker/hierarchy-mvp; tools/aster_hierarchy_mvp_compose.py"
+)
 EVENT_SUBSCRIPTION_SLICE = (
     "crates/aster-redb-store/src/lib.rs; crates/aster-node/src/frame.rs; "
     "crates/aster-node/src/runtime.rs; crates/aster-node/src/application.rs; "
@@ -1070,21 +1082,21 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     ),
     "DM-5.5-09": selected_claim(
         "implemented-uncredited",
-        "aster-core + aster-redb-store",
-        f"{BRIDGE_FOUNDATION_SLICE}; the profile-0x0001 selected adapter authenticates one exact directed scope/epoch edge, creates first and nested Event wrappers from an unchanged exact source envelope, and the selected redb store atomically retains provider-verified authorization, source, wrapper, dependency, and active-projection state while reopened rows remain nonauthorizing candidates until fresh verification",
-        "This is an Event-only core-plus-store mechanism. No selected node runtime, bridge inventory or wire lane, administration surface, joined/left scope lifecycle, live multi-network observation, retained receipt, other-class custody, physical system, mixed implementation, scale, or release authorization is supplied.",
+        "aster-core + aster-redb-store + aster-node",
+        f"{BRIDGE_RUNTIME_SLICE}; the profile-0x0001 selected adapter authenticates exact directed scope/epoch edges and creates first or nested Event wrappers from an unchanged exact source envelope; redb atomically retains provider-verified route state; and the semantic-v6 node lane filters by authenticated-peer route grants, sends bounded rotating batches, durably applies receiver outcomes, and freshly promotes retained candidates after reopen",
+        "This is an Event-only static selected runtime and opt-in same-host evaluation. Supported administration, joined/left scope lifecycle, bandwidth and complete storage quotas, dynamic routing/interest and revocation/rekey policy, retained execution evidence, other-class custody, physical or mixed operation, hostile-input and scale evidence, and release authorization remain open.",
     ),
     "DM-5.5-10": selected_claim(
         "implemented-uncredited",
-        "aster-core + aster-redb-store",
-        f"{BRIDGE_FOUNDATION_SLICE}; each selected Event hop requires the exact source topic to be present in the active authorization from the complete supplied chain and in any explicit local narrowing; denied-topic construction fails before a verified route capability exists, and redb promotion additionally requires the referenced authorization to match its durable high-water",
-        "The filter is implemented for the selected profile-0x0001 Event transform and redb commit boundary only. Dynamic policy administration, live wire forwarding, multi-scope runtime behavior, retained negative delivery evidence, other classes, physical/mixed operation, scale, and release authorization remain open.",
+        "aster-core + aster-redb-store + aster-node",
+        f"{BRIDGE_RUNTIME_SLICE}; each Event hop requires the source topic in the active complete-chain authorization and explicit local narrowing; denied-topic construction fails before a verified route exists, receiver promotion requires the durable authorization high-water, and the semantic-v6 runtime carries only freshly selected verified wrappers",
+        "The exact topic filter is implemented in the static profile-0x0001 Event runtime, with an opt-in same-host negative case but no retained receipt. Dynamic policy administration, bandwidth/storage quotas, other classes, physical/mixed operation, hostile-input and scale evidence, and release authorization remain open.",
     ),
     "DM-5.5-11": selected_claim(
         "implemented-uncredited",
-        "aster-core + aster-redb-store",
-        f"{BRIDGE_FOUNDATION_SLICE}; each selected Event hop intersects the source-authenticated priority with the active authorization mask from the complete supplied chain and explicit local narrowing; denied-priority construction fails before a verified route capability exists, and redb promotion additionally requires the referenced authorization to match its durable high-water",
-        "The filter is implemented for the selected profile-0x0001 Event transform and redb commit boundary only. It is not bridge transmission scheduling or a bandwidth quota; live runtime administration, retained negative delivery evidence, other classes, physical/mixed operation, scale, and release authorization remain open.",
+        "aster-core + aster-redb-store + aster-node",
+        f"{BRIDGE_RUNTIME_SLICE}; each Event hop intersects the source-authenticated priority with the active complete-chain authorization mask and explicit local narrowing; denied-priority construction fails before a verified route exists, receiver promotion requires the durable authorization high-water, and the semantic-v6 runtime carries only freshly selected verified wrappers",
+        "The exact priority filter is implemented in the static profile-0x0001 Event runtime, with an opt-in same-host negative case but no retained receipt. It is not a bandwidth quota or general scheduling policy; dynamic administration, other classes, physical/mixed operation, hostile-input and scale evidence, and release authorization remain open.",
     ),
     "DM-5.6-01": selected_claim(
         "implemented-uncredited",
@@ -1118,15 +1130,17 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
         "untrusted locator candidates, authenticates the carrier and an "
         "independent authority-issued mission identity before inventory, retains "
         "at most 32 locator candidates and 32 authenticated mission identities, "
-        "uses the existing 16-inbound and 16-outbound contact caps, and repeats "
-        "whole-second discovery windows of at most 30 seconds; exact rostered and "
-        "manual modes remain separate",
+        "uses the existing 16-inbound and 16-outbound contact caps, repeats "
+        "whole-second discovery windows of at most 30 seconds, and optionally "
+        "advertises and browses on an explicit sorted, deduplicated, bounded "
+        "IPv4-interface set for multi-homed nodes; empty selection retains the "
+        "default-interface behavior and exact rostered/manual modes remain separate",
         "Retain the complete advertise, discover, carrier-authenticate, "
         "mission-authenticate, and Event-delivery chain on at least two physical "
-        "hosts; hard-bound or replace the upstream uncapped discovery maps; "
+        "hosts; hard-bound or replace all upstream discovery state; "
         "measure packet, CPU, RSS, task, file-descriptor, and energy behavior; "
-        "and add BTLE discovery. The runnable three-host same-build mDNS/IP "
-        "quickstart is not retained physical-LAN, hostile-input, NAT/WAN, "
+        "and add BTLE discovery. Runnable same-build quickstarts and Compose "
+        "evaluations are not retained physical-LAN, hostile-input, NAT/WAN, "
         "mixed-implementation, supported-target, or production evidence.",
     ),
     "DM-5.7-02": selected_claim(
@@ -1227,9 +1241,9 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     ),
     "DM-6-08": selected_claim(
         "implemented-uncredited",
-        "aster-core + aster-redb-store",
-        f"{BRIDGE_FOUNDATION_SLICE}; the selected Event bridge authenticates opaque route metadata, copies the unchanged source-sealed envelope under target-scope wrappers, persists opaque exact authorization/source/wrapper bytes plus bounded metadata, and exposes plaintext opening only through a separately content-authorized provider; the selected route-only bridge configuration fails closed on payload opening",
-        "This establishes the selected route-only-provider payload-blind Event store/transform mechanism, not a universal property of providers with content grants and not live network forwarding. No wire/runtime bridge, capture or at-rest receipt, other-class bridge custody, profile-0x0002 bridge, physical/mixed operation, protected operational key custody, scale, hostile-input fitness, complete-MVP credit, or release authorization is supplied.",
+        "aster-core + aster-redb-store + aster-node",
+        f"{BRIDGE_RUNTIME_SLICE}; the selected Event bridge authenticates opaque route metadata, preserves the unchanged source-sealed envelope under target-scope wrappers, persists opaque exact route state, and carries it through a semantic-v6 runtime in which route-only intermediates never invoke payload opening; only a separately content-authorized target may open the source",
+        "This establishes a static live route-only-provider Event path, not a universal property of providers with content grants. The same-host Compose sentinel/log check is not a retained packet capture or at-rest receipt. Other-class bridge custody, profile-0x0002 bridge, physical/mixed operation, protected operational key custody, scale, hostile-input fitness, complete-MVP credit, and release authorization remain open.",
     ),
     "DM-6-09": selected_claim(
         "implemented-uncredited", "aster-core + aster-node",
@@ -1521,6 +1535,10 @@ RELEVANT_ARTIFACTS = {
     "DM-2-11": "data-mesh-requirements.md",
     "DM-2-12": "data-mesh-requirements.md",
     "DM-2-13": "data-mesh-requirements.md",
+    "DM-5.5-09": HIERARCHY_MVP_ARTIFACT,
+    "DM-5.5-10": HIERARCHY_MVP_ARTIFACT,
+    "DM-5.5-11": HIERARCHY_MVP_ARTIFACT,
+    "DM-5.7-01": HIERARCHY_MVP_ARTIFACT,
     "DM-6-01": SECURITY_PROFILE_IMPLEMENTATION_ARTIFACTS,
     "DM-6-02": SECURITY_PROFILE_IMPLEMENTATION_ARTIFACTS,
     "DM-6-03": SECURITY_PROFILE_IMPLEMENTATION_ARTIFACTS,
@@ -1528,6 +1546,7 @@ RELEVANT_ARTIFACTS = {
     "DM-6-05": SECURITY_PROFILE_REFERENCE,
     "DM-6-06": SECURITY_PROFILE_REFERENCE,
     "DM-6-07": SECURITY_PROFILE_REFERENCE,
+    "DM-6-08": HIERARCHY_MVP_ARTIFACT,
     "DM-6-09": SECURITY_PROFILE_IMPLEMENTATION_ARTIFACTS,
     "DM-6-10": SECURITY_PROFILE_REFERENCE,
     "DM-6-11": SECURITY_PROFILE_IMPLEMENTATION_ARTIFACTS,

@@ -74,6 +74,20 @@ empty. The diagnostic reports container and contact-graph measurements but moves
 no retained evidence status. Thirty-two is the intentional flat-LAN boundary
 before composing scopes through filtered hierarchical bridges.
 
+To try that bounded hierarchy, run the five-node, three-segment
+[hierarchy MVP](docker/hierarchy-mvp/README.md):
+
+```sh
+mise run hierarchy-mvp-compose
+```
+
+The publisher and consumer share no IP segment. Two multi-homed, route-only
+bridges discover adjacent peers without configured peer IDs or peer addresses and
+carry one allowed Event from `alpha` through `parent` to `bravo`; the controller
+also checks topic/priority denial, outsider rejection, payload-blind bridge
+logs, and peerless consumer restart recovery. This is a same-host Docker
+evaluation, not retained scale or physical-network evidence.
+
 For deterministic acceptance receipts, use the capability tours.
 
 The capability tour starts real processes with independent stores and
@@ -175,9 +189,9 @@ provisioning remain open work.
 | **State** | Source-authenticated live or stopped publication/query, causal projection, direct-Iroh reconciliation under explicit interests, durable positive-current-version delivery, and bounded retained one-host evidence including forced-process redelivery | Contact/status and materialized-view/synthetic-withdrawal behavior, dynamic network-interest mutation, selected-node bindings, finite TTL, relay acceptance, expiry/garbage collection, and representative physical/mixed evidence |
 | **Record** | Live or stopped conflict-preserving query/publication, exact-sibling guarded resolution, direct-Iroh reconciliation, durable whole-key active-head delivery, and bounded retained one-host conflict, forced-process redelivery, resolution, and reopen evidence | Selected-node bindings, automatic merge execution, finite TTL, relay acceptance, expiry/garbage collection, and representative physical/mixed evidence |
 | **Blob** | Authenticated immutable publication through a cloneable live Rust handle or exclusive stopped facade; bounded zeroize-on-drop pages; durable metadata-only application delivery with exact publication identity and token-bound acknowledgement and bounded retained one-host forced-process-redelivery evidence; direct semantic-v5 source/carrier transfer with durable resume state and bounded retained one-host interrupted/reopened/different-peer evidence | Peer/convergence and transfer-progress status, network/application selector-separation acceptance, route-only relay/custody, arbitrary-peer resume, power-loss/filesystem-crash/long-offline recovery, large/RSS acceptance, representative physical or mixed-implementation evidence, retention, garbage collection, and release authorization |
-| **Event bridge foundation** | Profile-`0x0001` core operations for authenticated directed edge enrollment and authorization, exact topic/priority narrowing, route-only-provider first and nested Event wrappers, and redb persistence of opaque authorization/source/wrapper candidates with fresh verification and high-water commit required after reopen | Typed bridge transport, selected runtime and administration, bounded current-policy snapshots, live join/leave behavior, bandwidth quotas, dynamic policy and rekey lifecycle, a multi-network demonstration, cross-class bridge custody, bridged-scale evidence, and complete-MVP credit |
+| **Static Event hierarchy** | Profile-`0x0001` authenticated directed edges, exact topic/priority narrowing, route-only first and nested wrappers, durable redb candidates with fresh restart promotion, and a semantic-v6 selected runtime. The opt-in five-node Compose evaluation uses multi-interface mDNS to cross isolated alpha, parent, and bravo IP segments without configured peer coordinates. | Supported bridge administration, live join/leave, bandwidth and complete storage quotas, dynamic routing/interest policy and revocation/rekey lifecycle, cross-class bridge custody, physical/mixed operation, retained bridged-scale evidence, and complete-MVP credit |
 | **Security profiles** | Stock runtime profile `0x0001` retains hybrid-PQ source/control, mission handshake, and Aster records. Additive profile `0x0002` exposes a provisioned P-256 semantic-v1 Event/control and exporter-bound two-node Iroh path without a second Aster application record. | Stock runtime/CLI selection, authenticated offers or general negotiation, complete classical data/lifecycle coverage, snapshot-resistant rollback, retained capture/resource evidence, independent interoperability, and release authorization |
-| **Operations** | Manually admitted direct addresses, an operator-pinned controlled relay, default-off official Iroh mDNS evaluation modes for exact rostered peers or mission-authorized `--discover-lan` contacts in repeated maximum-30-second windows, bounded one-host software namespace-NAT acceptance, reference mission provisioning, and bounded same-UID Unix software zeroization | Protected operational provisioning, physically qualified/hostile-bounded production discovery, representative/physical NAT, public/default relay selection, BTLE platform integration, physical sanitization, and release authorization |
+| **Operations** | Manually admitted direct addresses, an operator-pinned controlled relay, default-off Iroh-compatible mDNS evaluation modes for exact rostered peers or mission-authorized `--discover-lan` contacts in repeated maximum-30-second windows, explicit bounded IPv4 interface selection for multi-homed discovery, bounded one-host software namespace-NAT acceptance, reference mission provisioning, and bounded same-UID Unix software zeroization | Protected operational provisioning, physically qualified/hostile-bounded production discovery, representative/physical NAT, public/default relay selection, BTLE platform integration, physical sanitization, and release authorization |
 
 The [capability roadmap](docs/implementation/capability-roadmap.md) is the
 planning and merge-review view. The

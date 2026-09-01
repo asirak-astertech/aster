@@ -30,7 +30,7 @@ Event/control evaluation slice, not a complete MVP/product profile:
 
 | Profile | Implemented boundary | Runtime status |
 |---|---|---|
-| `0x0001` `hybrid-pq-aster-record-v1` | Hybrid source/control objects, four-flight mission session, and `ASTRFR01` application records through semantic v5 | Stock selected node/runtime |
+| `0x0001` `hybrid-pq-aster-record-v1` | Hybrid source/control objects, four-flight mission session, and `ASTRFR01` application records through semantic v6 | Stock selected node/runtime |
 | `0x0002` `classical-p256-iroh-quic-v1` | Provisioned singleton policy, P-256 semantic-v1 Event/control objects, Iroh TLS-exporter-bound mission session, and raw QUIC application exchanges | Additive library/two-node mission path; not selected by stock `run_node` or CLI |
 
 Profile `0x0002` has no ML-DSA or ML-KEM operation in its runtime path and adds
@@ -152,7 +152,7 @@ implementation, packet-capture confidentiality acceptance, complete-MVP, or
 release evidence. See the [receipt and replay boundary](implementation/requirements-status.md#selected-iroh-nat-retained-receipt).
 
 Aster application relays are not content readers by default. The implemented
-semantic-version-2/3/v4/v5 bridge similarly limits a bridge to rule-specific endpoint routing grants and
+semantic-version-2/3/v4/v5/v6 bridge similarly limits a bridge to rule-specific endpoint routing grants and
 an authority-signed directed-edge authorization. It rewraps the exact immutable
 format-2 source carrier without content access, preserves the source signature
 and origin scope, and exposes a distinct authenticated current scope. A target
@@ -316,18 +316,18 @@ are recorded separately in the
 - Canonical ordered semantic-version and complete-suite offers, with selection
   bound into the transcript, KDF, key confirmations, and hybrid authentication;
   there is no algorithm-by-algorithm mixing. The stable framing/profile remains
-  `1`, the default semantic offer is `[5, 4, 3, 2, 1]`, and profile 1 has one registered
+  `1`, the default semantic offer is `[6, 5, 4, 3, 2, 1]`, and profile 1 has one registered
   complete suite.
 - Both classical and PQ signatures verify; failure is indistinguishable on wire.
-- A compact semantic-version-2/3/v4/v5 batch item is never authenticated by its P-256
+- A compact semantic-version-2/3/v4/v5/v6 batch item is never authenticated by its P-256
   suffix alone: the exact proof credential, authority hybrid signature, source
   hybrid root signature, ciphertext commitment, Merkle path, and item signature
   must all verify. Missing proof means bounded pending state, never delivery.
-- Selected Event/RouteEvent semantic-v3-format custody claims, used by v3, v4, and v5 sessions, use a distinct
+- Selected Event/RouteEvent semantic-v3-format custody claims, used by v3, v4, v5, and v6 sessions, use a distinct
   session-record AAD, bind the exact transfer/source fields, exchange, nonzero
   policy revision, session ID, and checked cumulative age, and are
   replay-checked before store admission.
-- Protected v3-format Event interests used in v3/v4/v5 bind an opaque receiver
+- Protected v3-format Event interests used in v3/v4/v5/v6 bind an opaque receiver
   selector generation.
   Receipts suppress only that generation; `Satisfied` hides Carry versus
   successful Consume, while `ContentAcceptancePending` reveals only that the
@@ -335,7 +335,7 @@ are recorded separately in the
   not a Byzantine peer-state high-water: an authenticated peer can still lie
   about its own retention or restore its own older state.
 - Durable partial-transfer progress preserves its first-admission semantic
-  version. Unknown provenance fails closed, and v2/v3/v4/v5-only objects cannot be
+  version. Unknown provenance fails closed, and v2/v3/v4/v5/v6-only objects cannot be
   resumed or served through a selected-v1 session after restart.
 - Hybrid ephemeral establishment, transcript binding, explicit key confirmation,
   direction/purpose labels, and no 0-RTT data.
@@ -456,7 +456,7 @@ delegated signers.
 
 Both ordinary and bridge stores persist the authenticated signer. Ordinary
 controls share one chain head keyed by stable `authority_id`; bridge
-authorizations use their own semantic-v2/v3/v4/v5 chain, also keyed by that stable root
+authorizations use their own semantic-v2/v3/v4/v5/v6 chain, also keyed by that stable root
 identifier. Neither creates a per-signer history. A signer revoked in the
 contiguous applied prefix cannot contribute another link. If activation reaches
 a staged link signed by an identity revoked earlier in that prefix, the
@@ -555,9 +555,9 @@ claimed or implemented.
 ### Selected semantic-v4 mutable availability and lineage
 
 State and Record reconciliation is enabled only after the hybrid mission
-session selects semantic version 4 or 5. The v1-v3 Event compatibility paths do not
+session selects semantic version 4, 5, or 6. The v1-v3 Event compatibility paths do not
 accept, act on, or expose mutable interests, inventory, IDs, objects, results,
-or finish counts. Within v4/v5, State and Record and both receiver directions are distinct
+or finish counts. Within v4/v5/v6, State and Record and both receiver directions are distinct
 authenticated lanes. Cross-class/direction substitution, result/ack mismatch,
 and finish-remainder mismatch fail the contact.
 
@@ -591,7 +591,7 @@ contain metadata growth and prevent a fixed lexicographic prefix from starving
 later IDs across repeated partial contacts; they are not evidence of physical
 resource sufficiency or adversarial-link liveness.
 
-Normal and `AtLeast` run the v4/v5 State/Record lanes because `AtLeast` is an Event-only
+Normal and `AtLeast` run the v4/v5/v6 State/Record lanes because `AtLeast` is an Event-only
 threshold. `ReceiveOnly` initiates no contact and discloses no mutable interest,
 inventory, ID, or object. Event last-contact status is deliberately separate
 and is not evidence that State/Record converged. Selected State/Record finite
@@ -601,10 +601,10 @@ is made.
 ### Selected semantic-v5 Blob authorization, staging, and visibility
 
 Selected Blob transfer is enabled only after the completed hybrid mission
-session selects semantic version 5. Versions 1 through 4 emit and accept zero
-selected Blob frames. V5 inherits all earlier Event and State/Record security
-rules without changing stable wire/profile, envelope, carrier, or ABI version
-1.
+session selects semantic version 5 or 6. Versions 1 through 4 emit and accept
+zero selected Blob frames. V5 inherits all earlier Event and State/Record
+security rules, and v6 inherits that complete ordinary-lane behavior unchanged,
+without changing stable wire/profile, envelope, carrier, or ABI version 1.
 
 The selected network path is direct between content-capable peers. A protected
 exact `(topic, scope, epoch)` interest includes an opaque 32-byte
@@ -742,6 +742,35 @@ relay or custody, Blob TTL/expiry/garbage collection,
 metadata-independent whole-byte identity/deduplication, or retained large-file,
 power-loss/filesystem-crash, physical, mixed-implementation, resource/soak,
 and release-acceptance claims remain open.
+
+### Selected semantic-v6 Event-bridge isolation
+
+Semantic v6 inherits all v5 ordinary-lane security behavior unchanged and adds
+only the selected Event-bridge mechanics lane. A v1-v5 peer negotiates its
+highest common older version and receives no bridge frame. At v6, every
+endpoint exchanges only a protected canonical enabled bit first; route state is
+exchanged only when both mission-authenticated endpoints have explicitly
+enabled the static bridge role.
+
+Every offer carries exact source-envelope and bridge-route-wrapper bytes inside
+the existing replay-checked `ASTRFR01` channel. The receiver recomputes the
+claimed wrapper digest, freshly authenticates the source, complete delegated
+authorization chain, wrapper hop chain, current scope/epoch policy, and local
+topic/priority selection before committing a route. Authentication, integrity,
+stale-policy, and identity failures fail the contact. `NotSelected` is the sole
+nonfatal policy miss and commits no route; other successful dispositions report
+the receiver's durable active, alternate, or duplicate result without exposing
+its broader inventory.
+
+The forwarding path materializes and transmits only sealed source/wrapper bytes
+and does not open payload plaintext. A content-authorized target may open a
+freshly verified route only after its durable commit; the selected receipt logs
+only payload length and SHA-256 and never the payload bytes. The current static
+composition fails closed when its captured control-policy snapshot changes.
+Dynamic join/leave administration, automatic authorization replacement,
+finite-TTL bridge age, generalized bridge quotas/scale, physical-network
+capture evidence, independent interoperability, and production authorization
+remain outside this version statement.
 
 ## Availability controls
 
@@ -922,7 +951,8 @@ resource-threshold, cryptographic-module, or release claim.
 
 - Bit-level tamper of every envelope/handshake field.
 - signature stripping and classical/PQ downgrade attempts.
-- stripping the current `[5, 4, 3, 2, 1]` offer to `[4, 3, 2, 1]`, `[3, 2, 1]`, `[2, 1]`, or `[1]`,
+- stripping the current `[6, 5, 4, 3, 2, 1]` offer to `[5, 4, 3, 2, 1]`,
+  `[4, 3, 2, 1]`, `[3, 2, 1]`, `[2, 1]`, or `[1]`,
   and the retained `[2, 1]` compatibility offer to `[1]`; the initiator must reject even though
   membership checks alone would accept the selected lower version.
 - malformed public keys/ciphertexts and implicit-rejection behavior.
@@ -980,7 +1010,7 @@ physical-carrier traffic-analysis boundary.
 
 The canonical batch codec, provider authentication, and explicit atomic
 source/store/application path reduce the transferred verification closure for a
-semantic-version-2/3/v4/v5 batch. The default retained-dual policy preserves v1
+semantic-version-2/3/v4/v5/v6 batch. The default retained-dual policy preserves v1
 compatibility at extra signing/storage cost; explicit batch-only cannot reach a
 selected-v1 peer. Reference peer proof-first, compact-first pending/restart,
 v1-rejection, and Blob-carrier tests pass; the required 3 kbps end-to-end

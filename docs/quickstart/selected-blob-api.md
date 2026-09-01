@@ -18,9 +18,9 @@ The exclusive `SelectedBlobNode` remains available when no runtime owns the same
 store and provides the same delivery lifecycle plus synchronous seekable-source
 publication and streaming `read_into`. Separately, semantic v5 reconciles
 already-durable Blob sources and direct carrier ranges between current
-content-capable peers. The default offer is `[5, 4, 3, 2, 1]`; v1-v4 emit zero
-Blob frames, and stable wire/ABI, source, manifest, and `ASTRBT01` formats remain
-version 1.
+content-capable peers, and semantic v6 inherits that Blob lane unchanged. The
+default offer is `[6, 5, 4, 3, 2, 1]`; v1-v4 emit zero Blob frames, and stable
+wire/ABI, source, manifest, and `ASTRBT01` formats remain version 1.
 
 A [retained 10,728-byte live-Blob receipt](../implementation/evidence/selected-live-blob-044d90f.json)
 (SHA-256
@@ -314,7 +314,7 @@ let mutable_interests = MutableSourceInterests::new(state, record).with_blob(vec
 
 This composes with peerless live publication rather than changing its success
 condition. A source may publish through `selected_blobs()` with no peers, shut
-down, and later restart with an exact configured peer. On a v5 contact, a
+down, and later restart with an exact configured peer. On a v5 or v6 contact, a
 content-capable interested receiver can durably stage the source and missing
 carrier ranges, promote only after whole-Blob verification, and read the Blob
 through its own live handle. The receiver's completed publication and page
@@ -326,7 +326,7 @@ reopens, not a physical-carrier, crash-recovery, arbitrary-peer,
 mixed-implementation, scale, or resource acceptance artifact.
 
 The provider turns that exact topic/scope and the current epoch into an opaque
-32-byte peer proof inside the protected v5 contact. Every Blob inventory,
+32-byte peer proof inside the protected v5-or-v6 contact. Every Blob inventory,
 source, and range send requires the authenticated peer to have both the current
 content proof and current route authorization and to remain nonrevoked.
 Route-only peers cannot use the selected Blob lane. The source-envelope and

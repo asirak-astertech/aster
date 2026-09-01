@@ -83,6 +83,7 @@ pub(crate) const SEMANTIC_PROTOCOL_V2: u16 = 2;
 pub(crate) const SEMANTIC_PROTOCOL_V3: u16 = 3;
 pub(crate) const SEMANTIC_PROTOCOL_V4: u16 = 4;
 pub(crate) const SEMANTIC_PROTOCOL_V5: u16 = 5;
+pub(crate) const SEMANTIC_PROTOCOL_V6: u16 = 6;
 pub(crate) const HYBRID_SUITE_ID: u16 = 0x0001;
 
 const NONCE_LEN: usize = 12;
@@ -90,6 +91,7 @@ const HASH_LEN: usize = 32;
 const MAX_OFFERED_VERSIONS: usize = 16;
 const MAX_OFFERED_SUITES: usize = 16;
 pub(crate) const SUPPORTED_SEMANTIC_PROTOCOL_VERSIONS: &[u16] = &[
+    SEMANTIC_PROTOCOL_V6,
     SEMANTIC_PROTOCOL_V5,
     SEMANTIC_PROTOCOL_V4,
     SEMANTIC_PROTOCOL_V3,
@@ -2457,7 +2459,7 @@ mod tests {
         assert!(matches!(
             InitiatorHandshake::start(
                 &mut initiator_provider,
-                vec![SEMANTIC_PROTOCOL_V5 + 1],
+                vec![SEMANTIC_PROTOCOL_V6 + 1],
                 vec![HYBRID_SUITE_ID]
             ),
             Err(CryptoError::UnsupportedProtocolVersion)
@@ -2489,7 +2491,7 @@ mod tests {
         assert_eq!(prepared.public_hello.selected_suite, HYBRID_SUITE_ID);
 
         let mut unsupported_version = hello.clone();
-        unsupported_version.supported_versions = vec![SEMANTIC_PROTOCOL_V5 + 1];
+        unsupported_version.supported_versions = vec![SEMANTIC_PROTOCOL_V6 + 1];
         assert!(matches!(
             ResponderHandshakePrepared::respond(&mut responder_provider, &unsupported_version),
             Err(CryptoError::UnsupportedProtocolVersion)
@@ -2596,6 +2598,7 @@ mod tests {
             assert_eq!(
                 stripped_hello.supported_versions,
                 vec![
+                    SEMANTIC_PROTOCOL_V6,
                     SEMANTIC_PROTOCOL_V5,
                     SEMANTIC_PROTOCOL_V4,
                     SEMANTIC_PROTOCOL_V3,

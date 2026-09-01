@@ -18,6 +18,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "nearby-discovery")]
+use std::net::Ipv4Addr;
 #[cfg(unix)]
 use std::os::unix::{
     ffi::{OsStrExt as _, OsStringExt as _},
@@ -98,12 +100,16 @@ use crate::{
         SelectedRecordCommand, SelectedRecordHandle, SelectedRecordNode, SelectedStateCommand,
         SelectedStateHandle, SelectedStateNode, runtime_application_error,
     },
+    bridge_runtime::{
+        SelectedEventBridgeApplyDisposition, SelectedEventBridgeConfig,
+        SelectedEventBridgeDeliveryReceipt, SelectedEventBridgeRuntime,
+    },
     control_admin::{SelectedControlCommand, SelectedControlHandle, admin_error},
     format_node_id, format_path_field, format_receipt_field,
     frame::{
         BlobInterest, BlobInterestSelector, BlobObjectId, BlobRangeApplyDisposition,
-        BlobRangeDisposition, EventApplyDisposition, EventDirection, EventInterest,
-        EventInterestSelector, Frame, FrameEmissionPolicy, MAX_EVENT_INTEREST_BYTES,
+        BlobRangeDisposition, BridgeRouteDisposition, EventApplyDisposition, EventDirection,
+        EventInterest, EventInterestSelector, Frame, FrameEmissionPolicy, MAX_EVENT_INTEREST_BYTES,
         MAX_OBJECT_BYTES, MutableApplyDisposition, MutableClass, MutableTransferId,
     },
     mission::{
@@ -128,6 +134,10 @@ const MAX_CONFIGURED_PEERS: usize = MAX_MUTABLE_TRANSFER_CURSOR_PEERS;
 #[cfg(feature = "nearby-discovery")]
 /// Maximum lifetime of one explicit demo/evaluation nearby-discovery window.
 pub const MAX_NEARBY_DISCOVERY_WINDOW: Duration = aster_iroh::MAX_NEARBY_DISCOVERY_WINDOW;
+#[cfg(feature = "nearby-discovery")]
+/// Maximum explicit local IPv4 interfaces for one nearby-discovery session.
+pub const MAX_NEARBY_DISCOVERY_IPV4_INTERFACES: usize =
+    aster_iroh::MAX_NEARBY_DISCOVERY_IPV4_INTERFACES;
 /// Maximum carrier candidates retained by automatic LAN discovery.
 pub const MAX_AUTOMATIC_NEARBY_CANDIDATES: usize = 32;
 #[cfg(feature = "nearby-discovery")]
@@ -166,6 +176,9 @@ const EVENT_LANE_DEFER_EXCHANGE_BYTES: usize =
 const EXCHANGE_FRAMES: usize = 2;
 const MIN_MUTABLE_SEMANTIC_VERSION: u16 = 4;
 const MIN_BLOB_NETWORK_SEMANTIC_VERSION: u16 = 5;
+const MIN_EVENT_BRIDGE_SEMANTIC_VERSION: u16 = 6;
+const MAX_EVENT_BRIDGE_ROUTES_PER_DIRECTION: usize = 8;
+type SelectedEventBridgeHandle = Arc<StdMutex<SelectedEventBridgeRuntime>>;
 const MUTABLE_RECONCILIATION_FRAME_BYTES: usize = 16 * 1024;
 const MUTABLE_RECONCILIATION_ROUNDS: u32 = 64;
 const MUTABLE_LANE_PLAINTEXT_BYTES: usize = 4 + 1 + 1 + 1;
@@ -339,10 +352,13 @@ fn mutable_classes_for_semantic(semantic_version: u16) -> &'static [MutableClass
     }
 }
 
-const READY_RECONCILIATION_CLASSES: &str = "event,state,record,blob-v5-opt-in";
+const READY_RECONCILIATION_CLASSES: &str =
+    "event,state,record,blob-v5-opt-in,event-bridge-v6-opt-in";
 
 const fn contact_reconciliation_classes(semantic_version: u16) -> &'static str {
-    if semantic_version >= MIN_BLOB_NETWORK_SEMANTIC_VERSION {
+    if semantic_version >= MIN_EVENT_BRIDGE_SEMANTIC_VERSION {
+        "event,state,record,blob,event-bridge-opt-in"
+    } else if semantic_version >= MIN_BLOB_NETWORK_SEMANTIC_VERSION {
         "event,state,record,blob"
     } else {
         "event,state,record"
@@ -1156,6 +1172,7 @@ pub struct SelectedForwardingConfig {
     store_limits: StoreLimits,
     blob_depot_limits: BlobDepotLimits,
     scope_quotas: Vec<CustodyQuota>,
+    event_bridge: Option<SelectedEventBridgeConfig>,
     controlled_relay: Option<ControlledRelayRouting>,
     #[cfg(feature = "nearby-discovery")]
     nearby_discovery: Option<NearbyDiscoveryRouting>,
@@ -1178,6 +1195,7 @@ struct NearbyDiscoveryRouting {
     peers: Vec<MissionNearbyPeer>,
     window: Duration,
     automatic: bool,
+    ipv4_interfaces: Vec<Ipv4Addr>,
 }
 
 impl SelectedForwardingConfig {
@@ -1188,6 +1206,7 @@ impl SelectedForwardingConfig {
             store_limits,
             blob_depot_limits: BlobDepotLimits::DEFAULT,
             scope_quotas: Vec::new(),
+            event_bridge: None,
             controlled_relay: None,
             #[cfg(feature = "nearby-discovery")]
             nearby_discovery: None,
@@ -1251,6 +1270,17 @@ impl SelectedForwardingConfig {
     /// Exact-scope quotas installed before readiness and network creation.
     pub fn scope_quotas(&self) -> &[CustodyQuota] {
         &self.scope_quotas
+    }
+
+    /// Enables one bounded authority-selected Event bridge role.
+    pub fn with_event_bridge(mut self, bridge: SelectedEventBridgeConfig) -> Self {
+        self.event_bridge = Some(bridge);
+        self
+    }
+
+    /// Returns the selected static Event bridge role, when enabled.
+    pub const fn event_bridge(&self) -> Option<&SelectedEventBridgeConfig> {
+        self.event_bridge.as_ref()
     }
 
     /// Enables one exact initial direct locator alongside one pinned relay.
@@ -1322,6 +1352,7 @@ impl SelectedForwardingConfig {
             peers,
             window,
             automatic: false,
+            ipv4_interfaces: Vec::new(),
         });
         Ok(self)
     }
@@ -1335,6 +1366,23 @@ impl SelectedForwardingConfig {
     /// independently authenticated the remote mission identity on that contact.
     #[cfg(feature = "nearby-discovery")]
     pub fn with_automatic_nearby_discovery(mut self, window: Duration) -> Result<Self, NodeError> {
+        self = self.with_automatic_nearby_discovery_on_ipv4_interfaces(window, Vec::new())?;
+        Ok(self)
+    }
+
+    /// Enables rosterless LAN discovery on explicit local IPv4 interfaces.
+    ///
+    /// The list is sorted and deduplicated, is limited to
+    /// [`MAX_NEARBY_DISCOVERY_IPV4_INTERFACES`], and must contain concrete
+    /// unicast addresses. Passing an empty list is exactly equivalent to
+    /// [`Self::with_automatic_nearby_discovery`] and retains the official
+    /// provider's default-interface behavior.
+    #[cfg(feature = "nearby-discovery")]
+    pub fn with_automatic_nearby_discovery_on_ipv4_interfaces(
+        mut self,
+        window: Duration,
+        mut ipv4_interfaces: Vec<Ipv4Addr>,
+    ) -> Result<Self, NodeError> {
         if window < Duration::from_secs(1)
             || window > MAX_NEARBY_DISCOVERY_WINDOW
             || window.subsec_nanos() != 0
@@ -1344,10 +1392,28 @@ impl SelectedForwardingConfig {
                 MAX_NEARBY_DISCOVERY_WINDOW.as_secs()
             )));
         }
+        ipv4_interfaces.sort_unstable();
+        ipv4_interfaces.dedup();
+        if ipv4_interfaces.len() > MAX_NEARBY_DISCOVERY_IPV4_INTERFACES {
+            return Err(NodeError::Configuration(format!(
+                "automatic nearby discovery IPv4 interface count must be within 0..={MAX_NEARBY_DISCOVERY_IPV4_INTERFACES}"
+            )));
+        }
+        if ipv4_interfaces.iter().any(|interface| {
+            interface.is_unspecified()
+                || interface.is_multicast()
+                || *interface == Ipv4Addr::BROADCAST
+        }) {
+            return Err(NodeError::Configuration(
+                "automatic nearby discovery IPv4 interfaces must be concrete local unicast addresses"
+                    .into(),
+            ));
+        }
         self.nearby_discovery = Some(NearbyDiscoveryRouting {
             peers: Vec::new(),
             window,
             automatic: true,
+            ipv4_interfaces,
         });
         Ok(self)
     }
@@ -1365,6 +1431,16 @@ impl SelectedForwardingConfig {
     pub fn nearby_discovery_window(&self) -> Option<Duration> {
         self.nearby_discovery.as_ref().map(|routing| routing.window)
     }
+
+    /// Returns the normalized explicit local IPv4 discovery interfaces.
+    ///
+    /// An empty slice means the official provider's default-interface behavior.
+    #[cfg(feature = "nearby-discovery")]
+    pub fn nearby_discovery_ipv4_interfaces(&self) -> &[Ipv4Addr] {
+        self.nearby_discovery
+            .as_ref()
+            .map_or(&[], |routing| routing.ipv4_interfaces.as_slice())
+    }
 }
 
 impl Default for SelectedForwardingConfig {
@@ -1374,6 +1450,7 @@ impl Default for SelectedForwardingConfig {
             store_limits: StoreLimits::default(),
             blob_depot_limits: BlobDepotLimits::default(),
             scope_quotas: Vec::new(),
+            event_bridge: None,
             controlled_relay: None,
             #[cfg(feature = "nearby-discovery")]
             nearby_discovery: None,
@@ -1955,6 +2032,14 @@ pub struct PeerReceipt {
     pub protected_frames: usize,
     /// Successfully sealed and opened application wire bytes.
     pub protected_bytes: usize,
+    /// Opaque bridge routes offered by this node during the protected v6 lane.
+    pub bridge_offered: usize,
+    /// Opaque bridge routes freshly authenticated by this node.
+    pub bridge_applied: usize,
+    /// Target-authorized bridge payloads opened only for hash-only delivery receipts.
+    pub bridge_delivered: usize,
+    /// Locally selected bridge routes deferred by the per-direction contact bound.
+    pub bridge_remaining: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2620,7 +2705,10 @@ impl SelectedEventStatusTracker {
 }
 
 const fn selected_event_contact_complete(receipt: &PeerReceipt) -> bool {
-    receipt.remaining == 0 && receipt.controls_remaining == 0 && receipt.deferred_event_lanes == 0
+    receipt.remaining == 0
+        && receipt.controls_remaining == 0
+        && receipt.deferred_event_lanes == 0
+        && receipt.bridge_remaining == 0
 }
 
 /// Read-only logical store receipt.
@@ -11030,6 +11118,7 @@ async fn run_automatic_nearby_discovery(
     endpoint: Endpoint,
     mut browser: aster_iroh::NearbyDiscoveryBrowser,
     window: Duration,
+    ipv4_interfaces: Vec<Ipv4Addr>,
     control: NearbyDiscoveryControl,
     sender: mpsc::Sender<AutomaticNearbyEvent>,
 ) {
@@ -11076,7 +11165,10 @@ async fn run_automatic_nearby_discovery(
             if control.is_stopped() {
                 return;
             }
-            match endpoint.prepare_nearby_browser(window).await {
+            match endpoint
+                .prepare_nearby_browser_on_ipv4_interfaces(window, ipv4_interfaces.clone())
+                .await
+            {
                 Ok(prepared) => {
                     let Some(next) = control.install_prepared(prepared) else {
                         return;
@@ -11220,6 +11312,40 @@ async fn run_node_actor_inner(
         let store_identity = local_store_identity(&store_path)?;
         require_store_backing_identity(store.backing_identity(), store_identity)?;
     }
+    let (event_bridge, bridge_initialization) = match forwarding.event_bridge.clone() {
+        Some(bridge) => {
+            let (runtime, receipt) =
+                SelectedEventBridgeRuntime::initialize(store.clone(), &config.mission, bridge)
+                    .map_err(|error| NodeError::Configuration(error.to_string()))?;
+            (Some(Arc::new(StdMutex::new(runtime))), Some(receipt))
+        }
+        None => (None, None),
+    };
+    if let Some(receipt) = &bridge_initialization {
+        println!(
+            "BRIDGE_INIT status=pass authorizations_verified={} authorizations_applied={} authorizations_existing={} local_edges={} carry_inserted={} carry_existing={} route_candidates={} routes_reverified={} routes_inactive={} active_routes={} restored_deliveries={} payload_plaintext_logged=false",
+            receipt.authorizations_verified,
+            receipt.authorizations_applied,
+            receipt.authorizations_existing,
+            receipt.local_edges,
+            receipt.carry_subscriptions_inserted,
+            receipt.carry_subscriptions_existing,
+            receipt.route_candidates,
+            receipt.routes_reverified,
+            receipt.routes_inactive,
+            receipt.active_routes,
+            receipt.deliveries.len(),
+        );
+        for delivery in &receipt.deliveries {
+            println!(
+                "BRIDGE_RESTORE status=pass source_id={} route_id={} wrapper_id={} active=true payload_plaintext_logged=false",
+                crate::format_item_id(delivery.source_item_id),
+                format_node_id(delivery.bridge_route_id),
+                format_node_id(delivery.wrapper_envelope_id),
+            );
+            emit_bridge_delivery("recovered", delivery);
+        }
+    }
     let policy_lock = Arc::new(RwLock::new(()));
     // Prove every retained Event/route source across both the pre-control and
     // final replayed key views before quota replacement, witness migration, or
@@ -11329,15 +11455,23 @@ async fn run_node_actor_inner(
     #[cfg(feature = "nearby-discovery")]
     let mut nearby_session = match forwarding.nearby_discovery.as_ref() {
         Some(routing) if !routing.automatic => {
-            Some(endpoint.start_nearby_discovery(routing.window)?)
+            Some(endpoint.start_nearby_discovery_on_ipv4_interfaces(
+                routing.window,
+                routing.ipv4_interfaces.clone(),
+            )?)
         }
         _ => None,
     };
     #[cfg(feature = "nearby-discovery")]
     let mut automatic_browser = match forwarding.nearby_discovery.as_ref() {
-        Some(routing) if routing.automatic => {
-            Some(endpoint.start_nearby_browser(routing.window).await?)
-        }
+        Some(routing) if routing.automatic => Some(
+            endpoint
+                .start_nearby_browser_on_ipv4_interfaces(
+                    routing.window,
+                    routing.ipv4_interfaces.clone(),
+                )
+                .await?,
+        ),
         _ => None,
     };
     #[cfg(feature = "nearby-discovery")]
@@ -11404,7 +11538,7 @@ async fn run_node_actor_inner(
     let nearby_window_seconds = 0;
     let provisioning_origin = config.provisioning_origin().receipt_label();
     println!(
-        "READY selected=true pid={} carrier_id={} mission_id={} mission_authority={} sockets={} state={} peers={} application={} carrier_route={} controlled_relay_url={} controlled_relay_trust={} controlled_relay_readiness={} public_relay_fallback=false hosted_discovery=false nearby_discovery={} nearby_window_seconds={} discovery_metadata={} discovery_authority={} discovery_candidate_limit={} nat_traversal=not-claimed path_observation=not-authorization mission_auth=hybrid-pq provisioning={} semantics=source-authenticated-event reconciliation_classes={} controls=source-authenticated-flash commit_before_activate=true content_admission=capability-gated",
+        "READY selected=true pid={} carrier_id={} mission_id={} mission_authority={} sockets={} state={} peers={} application={} carrier_route={} controlled_relay_url={} controlled_relay_trust={} controlled_relay_readiness={} public_relay_fallback=false hosted_discovery=false nearby_discovery={} nearby_window_seconds={} discovery_metadata={} discovery_authority={} discovery_candidate_limit={} nat_traversal=not-claimed path_observation=not-authorization mission_auth=hybrid-pq provisioning={} semantics=source-authenticated-event reconciliation_classes={} controls=source-authenticated-flash commit_before_activate=true content_admission=capability-gated event_bridge={}",
         std::process::id(),
         local_id,
         format_node_id(config.mission.identity()),
@@ -11440,6 +11574,11 @@ async fn run_node_actor_inner(
         },
         provisioning_origin,
         READY_RECONCILIATION_CLASSES,
+        if event_bridge.is_some() {
+            "enabled-static-v6"
+        } else {
+            "disabled"
+        },
     );
     // Cancellation before the readiness handoff skips all operational work but
     // still follows the single task/endpoint cleanup path below.
@@ -11459,6 +11598,12 @@ async fn run_node_actor_inner(
             .as_ref()
             .expect("automatic browser has matching routing")
             .window;
+        let ipv4_interfaces = forwarding
+            .nearby_discovery
+            .as_ref()
+            .expect("automatic browser has matching routing")
+            .ipv4_interfaces
+            .clone();
         let control = nearby_discovery_stop
             .clone()
             .expect("automatic browser has stop control");
@@ -11467,6 +11612,7 @@ async fn run_node_actor_inner(
             endpoint,
             browser,
             window,
+            ipv4_interfaces,
             control,
             automatic_event_sender,
         )))
@@ -11942,6 +12088,7 @@ async fn run_node_actor_inner(
                     let emission_policy = emission_policy.clone();
                     let custody_clock = custody_clock.clone();
                     let event_route_cache = event_route_cache.clone();
+                    let event_bridge = event_bridge.clone();
                     let mission = config.mission.clone();
                     let mutable_interests = config.mutable_interests.clone();
                     let controlled_relay = forwarding.controlled_relay.clone();
@@ -11963,6 +12110,7 @@ async fn run_node_actor_inner(
                                     emission_snapshot,
                                     custody_clock,
                                     event_route_cache,
+                                    event_bridge,
                                     mutable_interests,
                                     controlled_relay,
                                 },
@@ -12027,6 +12175,7 @@ async fn run_node_actor_inner(
                         let emission_policy = emission_policy.clone();
                         let custody_clock = custody_clock.clone();
                         let event_route_cache = event_route_cache.clone();
+                        let event_bridge = event_bridge.clone();
                         let mission = config.mission.clone();
                         let mutable_interests = config.mutable_interests.clone();
                         let expected_peer = peer_missions
@@ -12053,6 +12202,7 @@ async fn run_node_actor_inner(
                                     emission_policy,
                                     custody_clock,
                                     event_route_cache,
+                                    event_bridge,
                                     mutable_interests,
                                 })
                                 .await,
@@ -12107,7 +12257,7 @@ async fn run_node_actor_inner(
                         }
                         receipt.contacts += 1;
                         println!(
-                            "CONTACT direction=in carrier_peer={} mission_peer={} rounds={} control_offered={} control_fetched={} control_retained={} control_duplicates={} control_activated={} control_remaining={} offered={} fetched={} inserted={} duplicates={} remaining={} deferred_event_lanes={} mutable_remaining={} deferred_mutable_lanes={} blob_ranges_fetched={} blob_bytes_fetched={} blob_remaining={} blob_deferred={} handshake_frames={} handshake_bytes={} protected_frames={} protected_bytes={} carrier_path={} carrier_path_transitions={} carrier_path_transitions_saturated={} path_observation=not-authorization mission_auth=hybrid-pq semantics=source-authenticated-event reconciliation_classes={} controls=source-authenticated-flash content_admission=capability-gated status={}",
+                            "CONTACT direction=in carrier_peer={} mission_peer={} rounds={} control_offered={} control_fetched={} control_retained={} control_duplicates={} control_activated={} control_remaining={} offered={} fetched={} inserted={} duplicates={} remaining={} deferred_event_lanes={} mutable_remaining={} deferred_mutable_lanes={} blob_ranges_fetched={} blob_bytes_fetched={} blob_remaining={} blob_deferred={} bridge_offered={} bridge_applied={} bridge_delivered={} bridge_remaining={} handshake_frames={} handshake_bytes={} protected_frames={} protected_bytes={} carrier_path={} carrier_path_transitions={} carrier_path_transitions_saturated={} path_observation=not-authorization mission_auth=hybrid-pq semantics=source-authenticated-event reconciliation_classes={} controls=source-authenticated-flash content_admission=capability-gated status={}",
                             peer,
                             format_node_id(server_receipt.mission_peer.expect("successful mission contact has peer identity")),
                             server_receipt.rounds,
@@ -12129,6 +12279,10 @@ async fn run_node_actor_inner(
                             server_receipt.blob_bytes_fetched,
                             server_receipt.blob_remaining,
                             server_receipt.blob_deferred,
+                            server_receipt.bridge_offered,
+                            server_receipt.bridge_applied,
+                            server_receipt.bridge_delivered,
+                            server_receipt.bridge_remaining,
                             server_receipt.handshake_frames,
                             server_receipt.handshake_bytes,
                             server_receipt.protected_frames,
@@ -12192,7 +12346,7 @@ async fn run_node_actor_inner(
                         }
                         receipt.contacts += 1;
                         println!(
-                            "CONTACT direction=out carrier_peer={} mission_peer={} locator={} rounds={} control_offered={} control_fetched={} control_retained={} control_duplicates={} control_activated={} control_remaining={} offered={} fetched={} inserted={} duplicates={} remaining={} deferred_event_lanes={} mutable_remaining={} deferred_mutable_lanes={} blob_ranges_fetched={} blob_bytes_fetched={} blob_remaining={} blob_deferred={} handshake_frames={} handshake_bytes={} protected_frames={} protected_bytes={} carrier_path={} carrier_path_transitions={} carrier_path_transitions_saturated={} path_observation=not-authorization mission_auth=hybrid-pq semantics=source-authenticated-event reconciliation_classes={} controls=source-authenticated-flash content_admission=capability-gated status={}",
+                            "CONTACT direction=out carrier_peer={} mission_peer={} locator={} rounds={} control_offered={} control_fetched={} control_retained={} control_duplicates={} control_activated={} control_remaining={} offered={} fetched={} inserted={} duplicates={} remaining={} deferred_event_lanes={} mutable_remaining={} deferred_mutable_lanes={} blob_ranges_fetched={} blob_bytes_fetched={} blob_remaining={} blob_deferred={} bridge_offered={} bridge_applied={} bridge_delivered={} bridge_remaining={} handshake_frames={} handshake_bytes={} protected_frames={} protected_bytes={} carrier_path={} carrier_path_transitions={} carrier_path_transitions_saturated={} path_observation=not-authorization mission_auth=hybrid-pq semantics=source-authenticated-event reconciliation_classes={} controls=source-authenticated-flash content_admission=capability-gated status={}",
                             peer.carrier(),
                             format_node_id(peer_receipt.mission_peer.expect("successful mission contact has peer identity")),
                             peer.locator_name(),
@@ -12215,6 +12369,10 @@ async fn run_node_actor_inner(
                             peer_receipt.blob_bytes_fetched,
                             peer_receipt.blob_remaining,
                             peer_receipt.blob_deferred,
+                            peer_receipt.bridge_offered,
+                            peer_receipt.bridge_applied,
+                            peer_receipt.bridge_delivered,
+                            peer_receipt.bridge_remaining,
                             peer_receipt.handshake_frames,
                             peer_receipt.handshake_bytes,
                             peer_receipt.protected_frames,
@@ -12605,6 +12763,7 @@ async fn sync_once_with_policy(
             emission_snapshot: snapshot,
             custody_clock,
             event_route_cache,
+            event_bridge: None,
             mutable_interests,
             controlled_relay: None,
         },
@@ -12623,6 +12782,7 @@ struct OutboundContact {
     emission_snapshot: EmissionPolicySnapshot,
     custody_clock: NodeCustodyClock,
     event_route_cache: Arc<AuthenticatedEventRouteCache>,
+    event_bridge: Option<SelectedEventBridgeHandle>,
     mutable_interests: MutableSourceInterests,
     controlled_relay: Option<ControlledRelayRouting>,
 }
@@ -12661,6 +12821,7 @@ async fn sync_session(
         emission_snapshot,
         custody_clock,
         event_route_cache,
+        event_bridge,
         mutable_interests,
         controlled_relay,
     } = contact;
@@ -12734,14 +12895,17 @@ async fn sync_session(
             CONTACT_EMISSION_GUARD.scope(
                 guard,
                 sync_authenticated_session(
-                    store,
                     &connection,
-                    credentials,
-                    peer,
-                    #[cfg(feature = "nearby-discovery")]
-                    automatic_admission,
-                    policy_lock,
-                    &mutable_interests,
+                    OutboundAuthenticatedSession {
+                        store,
+                        credentials,
+                        peer,
+                        #[cfg(feature = "nearby-discovery")]
+                        automatic_admission,
+                        policy_lock,
+                        event_bridge,
+                        mutable_interests,
+                    },
                 ),
             ),
         )
@@ -17334,15 +17498,373 @@ async fn sync_mutable_classes(
     Ok(())
 }
 
-async fn sync_authenticated_session(
-    store: Arc<Store>,
+fn bridge_priority_name(priority: Priority) -> &'static str {
+    match priority {
+        Priority::Routine => "routine",
+        Priority::Priority => "priority",
+        Priority::Immediate => "immediate",
+        Priority::Flash => "flash",
+    }
+}
+
+fn bridge_wire_disposition_name(disposition: BridgeRouteDisposition) -> &'static str {
+    match disposition {
+        BridgeRouteDisposition::Duplicate => "duplicate",
+        BridgeRouteDisposition::Promoted => "promoted",
+        BridgeRouteDisposition::StoredInactive => "stored-inactive",
+        BridgeRouteDisposition::NotSelected => "not-selected",
+    }
+}
+
+fn bridge_apply_disposition(
+    disposition: SelectedEventBridgeApplyDisposition,
+) -> BridgeRouteDisposition {
+    match disposition {
+        SelectedEventBridgeApplyDisposition::Active => BridgeRouteDisposition::Promoted,
+        SelectedEventBridgeApplyDisposition::RetainedAlternate
+        | SelectedEventBridgeApplyDisposition::DuplicateInactive => {
+            BridgeRouteDisposition::StoredInactive
+        }
+        SelectedEventBridgeApplyDisposition::DuplicateActive => BridgeRouteDisposition::Duplicate,
+        SelectedEventBridgeApplyDisposition::NotSelected => BridgeRouteDisposition::NotSelected,
+    }
+}
+
+fn emit_bridge_delivery(status: &'static str, delivery: &SelectedEventBridgeDeliveryReceipt) {
+    println!(
+        "BRIDGE_DELIVERY status={} source_id={} route_id={} wrapper_id={} publisher={} hops={} origin_scope={} origin_epoch={} current_scope={} current_epoch={} topic={} priority={} event_sequence={} payload_len={} payload_sha256={} payload_opened=true payload_plaintext_logged=false",
+        status,
+        crate::format_item_id(delivery.source_item_id),
+        format_node_id(delivery.bridge_route_id),
+        format_node_id(delivery.wrapper_envelope_id),
+        format_node_id(delivery.publisher),
+        delivery.hop_count,
+        format_receipt_field(delivery.origin_scope.as_str()),
+        delivery.origin_route_epoch,
+        format_receipt_field(delivery.current_scope.as_str()),
+        delivery.current_route_epoch,
+        format_receipt_field(delivery.topic.as_str()),
+        bridge_priority_name(delivery.priority),
+        delivery.event_sequence,
+        delivery.payload_len,
+        format_node_id(delivery.payload_sha256),
+    );
+}
+
+fn lock_selected_event_bridge(
+    bridge: &SelectedEventBridgeHandle,
+) -> Result<std::sync::MutexGuard<'_, SelectedEventBridgeRuntime>, NodeError> {
+    bridge
+        .lock()
+        .map_err(|_| NodeError::Protocol("selected Event bridge runtime lock was poisoned".into()))
+}
+
+fn bridge_runtime_error(operation: &'static str, error: impl fmt::Display) -> NodeError {
+    NodeError::Protocol(format!("selected Event bridge {operation}: {error}"))
+}
+
+async fn send_selected_event_bridge_routes(
     connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    bridge: &SelectedEventBridgeHandle,
+    receipt: &mut PeerReceipt,
+) -> Result<(), NodeError> {
+    let authenticated_peer = mission.peer().mission_id();
+    let batch = {
+        let peer_route_grant_commitments = mission.peer_route_grant_commitments();
+        let mut runtime = lock_selected_event_bridge(bridge)?;
+        runtime
+            .prepare_outbound_routes(
+                authenticated_peer,
+                peer_route_grant_commitments,
+                MAX_EVENT_BRIDGE_ROUTES_PER_DIRECTION,
+            )
+            .map_err(|error| bridge_runtime_error("outbound preparation", error))?
+    };
+    let remaining = batch
+        .remaining
+        .checked_add(usize::from(batch.scan_truncated))
+        .ok_or_else(|| NodeError::Protocol("selected Event bridge remaining overflow".into()))?;
+    for route in batch.routes {
+        let metadata = route.receipt().clone();
+        let wrapper_id = metadata.wrapper_envelope_id;
+        let response = request_mission_frame(
+            connection,
+            mission,
+            Frame::BridgeRouteOffer {
+                wrapper_id,
+                wrapper: route.exact_wrapper_bytes().to_vec(),
+                source: route.exact_source_bytes().to_vec(),
+            },
+            receipt,
+        )
+        .await?;
+        let Frame::BridgeRouteResult {
+            wrapper_id: received_id,
+            disposition,
+        } = response
+        else {
+            return Err(NodeError::Protocol(
+                "selected Event bridge offer received another response".into(),
+            ));
+        };
+        if received_id != wrapper_id {
+            return Err(NodeError::Protocol(
+                "selected Event bridge result crossed wrapper identities".into(),
+            ));
+        }
+        receipt.bridge_offered = receipt
+            .bridge_offered
+            .checked_add(1)
+            .ok_or_else(|| NodeError::Protocol("selected Event bridge offer overflow".into()))?;
+        println!(
+            "BRIDGE status={} source_id={} route_id={} wrapper_id={} hops={} origin_scope={} origin_epoch={} current_scope={} current_epoch={} disposition={} payload_opened=false payload_plaintext_logged=false",
+            if disposition == BridgeRouteDisposition::NotSelected {
+                "not-selected"
+            } else {
+                "forwarded"
+            },
+            crate::format_item_id(metadata.source_item_id),
+            format_node_id(metadata.bridge_route_id),
+            format_node_id(metadata.wrapper_envelope_id),
+            metadata.hop_count,
+            format_receipt_field(metadata.origin_scope.as_str()),
+            metadata.origin_route_epoch,
+            format_receipt_field(metadata.current_scope.as_str()),
+            metadata.current_route_epoch,
+            bridge_wire_disposition_name(disposition),
+        );
+    }
+    let remaining_wire = u64::try_from(remaining)
+        .map_err(|_| NodeError::Protocol("selected Event bridge remaining exceeds u64".into()))?;
+    let response = request_mission_frame(
+        connection,
+        mission,
+        Frame::BridgeFinish {
+            remaining: remaining_wire,
+        },
+        receipt,
+    )
+    .await?;
+    if response
+        != (Frame::BridgeFinished {
+            remaining: remaining_wire,
+        })
+    {
+        return Err(NodeError::Protocol(
+            "selected Event bridge finish acknowledgement differs".into(),
+        ));
+    }
+    receipt.bridge_remaining = receipt
+        .bridge_remaining
+        .checked_add(remaining)
+        .ok_or_else(|| NodeError::Protocol("selected Event bridge remaining overflow".into()))?;
+    Ok(())
+}
+
+async fn receive_selected_event_bridge_routes(
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    bridge: &SelectedEventBridgeHandle,
+    receipt: &mut PeerReceipt,
+) -> Result<(), NodeError> {
+    let mut received = 0usize;
+    loop {
+        let wire_budget = exchange_wire_budget(receipt)?;
+        let (complete, request_bytes, response_bytes) = respond_mission_frame(
+            connection,
+            mission,
+            wire_budget,
+            |frame, request_wire_len, _mission| match frame {
+                Frame::BridgeRouteOffer {
+                    wrapper_id,
+                    wrapper,
+                    source,
+                } if received < MAX_EVENT_BRIDGE_ROUTES_PER_DIRECTION => {
+                    check_account(receipt, request_wire_len, 256)?;
+                    let computed_id: [u8; 32] = Sha256::digest(&wrapper).into();
+                    if computed_id != wrapper_id {
+                        return Err(NodeError::Protocol(
+                            "selected Event bridge wrapper identity differs".into(),
+                        ));
+                    }
+                    let applied = {
+                        let mut runtime = lock_selected_event_bridge(bridge)?;
+                        runtime
+                            .apply_received_route(&wrapper, &source)
+                            .map_err(|error| bridge_runtime_error("received route apply", error))?
+                    };
+                    if applied.wrapper_envelope_id != wrapper_id {
+                        return Err(NodeError::Protocol(
+                            "selected Event bridge apply crossed wrapper identities".into(),
+                        ));
+                    }
+                    let disposition = bridge_apply_disposition(applied.disposition);
+                    received += 1;
+                    receipt.bridge_applied = receipt.bridge_applied.checked_add(1).ok_or_else(|| {
+                        NodeError::Protocol("selected Event bridge apply overflow".into())
+                    })?;
+                    if let Some(delivery) = &applied.delivery {
+                        receipt.bridge_delivered =
+                            receipt.bridge_delivered.checked_add(1).ok_or_else(|| {
+                                NodeError::Protocol(
+                                    "selected Event bridge delivery overflow".into(),
+                                )
+                            })?;
+                        emit_bridge_delivery("delivered", delivery);
+                    }
+                    Ok((
+                        Frame::BridgeRouteResult {
+                            wrapper_id,
+                            disposition,
+                        },
+                        false,
+                    ))
+                }
+                Frame::BridgeRouteOffer { .. } => Err(NodeError::Protocol(format!(
+                    "selected Event bridge offer count exceeds {MAX_EVENT_BRIDGE_ROUTES_PER_DIRECTION}"
+                ))),
+                Frame::BridgeFinish {
+                    remaining: remaining_wire,
+                } => {
+                    let remaining = usize::try_from(remaining_wire).map_err(|_| {
+                        NodeError::Protocol(
+                            "selected Event bridge peer remaining exceeds usize".into(),
+                        )
+                    })?;
+                    receipt.bridge_remaining = receipt
+                        .bridge_remaining
+                        .checked_add(remaining)
+                        .ok_or_else(|| {
+                            NodeError::Protocol(
+                                "selected Event bridge peer remaining overflow".into(),
+                            )
+                        })?;
+                    Ok((
+                        Frame::BridgeFinished {
+                            remaining: remaining_wire,
+                        },
+                        true,
+                    ))
+                }
+                _ => Err(NodeError::Protocol(
+                    "selected Event bridge receive phase accepts only route offers and finish"
+                        .into(),
+                )),
+            },
+        )
+        .await?;
+        account(receipt, request_bytes, response_bytes)?;
+        if complete {
+            return Ok(());
+        }
+    }
+}
+
+async fn sync_selected_event_bridge(
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    bridge: Option<&SelectedEventBridgeHandle>,
+    receipt: &mut PeerReceipt,
+) -> Result<(), NodeError> {
+    if mission.semantic_version() < MIN_EVENT_BRIDGE_SEMANTIC_VERSION {
+        return Ok(());
+    }
+    let local_enabled = bridge.is_some();
+    let response = request_mission_frame(
+        connection,
+        mission,
+        Frame::BridgeHello {
+            enabled: local_enabled,
+        },
+        receipt,
+    )
+    .await?;
+    let Frame::BridgeHelloAck {
+        enabled: peer_enabled,
+    } = response
+    else {
+        return Err(NodeError::Protocol(
+            "selected Event bridge hello received another response".into(),
+        ));
+    };
+    let Some(bridge) = bridge.filter(|_| peer_enabled) else {
+        return Ok(());
+    };
+    send_selected_event_bridge_routes(connection, mission, bridge, receipt).await?;
+    receive_selected_event_bridge_routes(connection, mission, bridge, receipt).await
+}
+
+async fn serve_selected_event_bridge(
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    bridge: Option<&SelectedEventBridgeHandle>,
+    receipt: &mut PeerReceipt,
+) -> Result<(), NodeError> {
+    if mission.semantic_version() < MIN_EVENT_BRIDGE_SEMANTIC_VERSION {
+        return Ok(());
+    }
+    let local_enabled = bridge.is_some();
+    let mut peer_enabled = None;
+    let wire_budget = exchange_wire_budget(receipt)?;
+    let (complete, request_bytes, response_bytes) = respond_mission_frame(
+        connection,
+        mission,
+        wire_budget,
+        |frame, _request_wire_len, _mission| match frame {
+            Frame::BridgeHello { enabled } => {
+                peer_enabled = Some(enabled);
+                Ok((
+                    Frame::BridgeHelloAck {
+                        enabled: local_enabled,
+                    },
+                    true,
+                ))
+            }
+            _ => Err(NodeError::Protocol(
+                "selected Event bridge phase must begin with hello".into(),
+            )),
+        },
+    )
+    .await?;
+    account(receipt, request_bytes, response_bytes)?;
+    if !complete {
+        return Err(NodeError::Protocol(
+            "selected Event bridge hello did not complete".into(),
+        ));
+    }
+    let Some(bridge) = bridge.filter(|_| peer_enabled == Some(true)) else {
+        return Ok(());
+    };
+    receive_selected_event_bridge_routes(connection, mission, bridge, receipt).await?;
+    send_selected_event_bridge_routes(connection, mission, bridge, receipt).await
+}
+
+struct OutboundAuthenticatedSession {
+    store: Arc<Store>,
     credentials: UnprotectedReferenceMission,
     peer: ContactPeer,
-    #[cfg(feature = "nearby-discovery")] automatic_admission: Option<AutomaticNearbyAdmission>,
+    #[cfg(feature = "nearby-discovery")]
+    automatic_admission: Option<AutomaticNearbyAdmission>,
     policy_lock: Arc<RwLock<()>>,
-    mutable_interests: &MutableSourceInterests,
+    event_bridge: Option<SelectedEventBridgeHandle>,
+    mutable_interests: MutableSourceInterests,
+}
+
+async fn sync_authenticated_session(
+    connection: &aster_iroh::Connection,
+    contact: OutboundAuthenticatedSession,
 ) -> Result<CompletedPeerContact, NodeError> {
+    let OutboundAuthenticatedSession {
+        store,
+        credentials,
+        peer,
+        #[cfg(feature = "nearby-discovery")]
+        automatic_admission,
+        policy_lock,
+        event_bridge,
+        mutable_interests,
+    } = contact;
     let lease_store = store.clone();
     let store = store.as_ref();
     require_contact_frame_initiation()?;
@@ -17401,6 +17923,13 @@ async fn sync_authenticated_session(
         mission.peer().mission_id(),
         receipt.controls_remaining,
     )?;
+    sync_selected_event_bridge(
+        connection,
+        &mut mission,
+        event_bridge.as_ref(),
+        &mut receipt,
+    )
+    .await?;
     let (local_interest, peer_interest) = sync_event_interests(
         store,
         connection,
@@ -17440,7 +17969,7 @@ async fn sync_authenticated_session(
                     &mut mission,
                     &mut event_verifier,
                     &event_guard,
-                    mutable_interests,
+                    &mutable_interests,
                     &mut receipt,
                 )
                 .await?;
@@ -17511,7 +18040,7 @@ async fn sync_authenticated_session(
                     &mut mission,
                     &mut event_verifier,
                     &event_guard,
-                    mutable_interests,
+                    &mutable_interests,
                     &mut receipt,
                 )
                 .await?;
@@ -17553,7 +18082,7 @@ async fn sync_authenticated_session(
         &mut mission,
         &mut event_verifier,
         &event_guard,
-        mutable_interests,
+        &mutable_interests,
         &mut receipt,
     )
     .await?;
@@ -17599,6 +18128,7 @@ async fn serve_connection(
         emission_policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
         custody_clock,
         event_route_cache,
+        event_bridge: None,
         mutable_interests,
     })
     .await
@@ -17615,6 +18145,7 @@ struct InboundContact {
     emission_policy: Arc<LiveEmissionPolicy>,
     custody_clock: NodeCustodyClock,
     event_route_cache: Arc<AuthenticatedEventRouteCache>,
+    event_bridge: Option<SelectedEventBridgeHandle>,
     mutable_interests: MutableSourceInterests,
 }
 
@@ -17622,6 +18153,7 @@ struct InboundPreInventoryAuthorization {
     #[cfg(feature = "nearby-discovery")]
     automatic_admission: Option<AutomaticNearbyAdmission>,
     deferred_custody_maintenance: Option<NodeCustodyClock>,
+    event_bridge: Option<SelectedEventBridgeHandle>,
 }
 
 async fn serve_connection_with_forwarding(
@@ -17638,6 +18170,7 @@ async fn serve_connection_with_forwarding(
         emission_policy,
         custody_clock,
         event_route_cache,
+        event_bridge,
         mutable_interests,
     } = contact;
     let emission_snapshot = emission_policy.snapshot()?;
@@ -17670,6 +18203,7 @@ async fn serve_connection_with_forwarding(
                         #[cfg(feature = "nearby-discovery")]
                         automatic_admission,
                         deferred_custody_maintenance,
+                        event_bridge,
                     },
                     policy_lock,
                     mutable_interests,
@@ -19357,6 +19891,13 @@ async fn serve_session(
         mission.peer().mission_id(),
         receipt.controls_remaining,
     )?;
+    serve_selected_event_bridge(
+        &connection,
+        &mut mission,
+        pre_inventory.event_bridge.as_ref(),
+        &mut receipt,
+    )
+    .await?;
     let (local_interest, peer_interest, remote_emission) = serve_event_interests(
         &store,
         &connection,
@@ -19890,6 +20431,7 @@ const fn contact_status(receipt: &PeerReceipt) -> &'static str {
         && receipt.deferred_event_lanes == 0
         && receipt.mutable_remaining == 0
         && receipt.deferred_mutable_lanes == 0
+        && receipt.bridge_remaining == 0
     {
         "pass"
     } else {
@@ -32040,6 +32582,7 @@ mod tests {
                     emission_policy: server_policy,
                     custody_clock: NodeCustodyClock::injected([0xb1; 16], 0, 0),
                     event_route_cache: server_cache,
+                    event_bridge: None,
                     mutable_interests: server_interests,
                 })
                 .await
@@ -32066,6 +32609,7 @@ mod tests {
                 emission_snapshot: snapshot,
                 custody_clock: NodeCustodyClock::injected([0xb2; 16], 0, 0),
                 event_route_cache: client_cache,
+                event_bridge: None,
                 mutable_interests: client_interests,
                 controlled_relay: None,
             },
@@ -33281,6 +33825,7 @@ mod tests {
                         emission_policy: server_policy,
                         custody_clock: server_clock,
                         event_route_cache: server_event_route_cache,
+                        event_bridge: None,
                         mutable_interests: MutableSourceInterests::default(),
                     }),
                 )
@@ -33311,6 +33856,7 @@ mod tests {
                     emission_snapshot: snapshot,
                     custody_clock: client_clock,
                     event_route_cache: client_event_route_cache,
+                    event_bridge: None,
                     mutable_interests: MutableSourceInterests::default(),
                     controlled_relay: None,
                 },
@@ -33737,6 +34283,7 @@ mod tests {
                 emission_snapshot: snapshot,
                 custody_clock: attempted_clock,
                 event_route_cache,
+                event_bridge: None,
                 mutable_interests: MutableSourceInterests::default(),
                 controlled_relay: None,
             },
@@ -36907,6 +37454,55 @@ mod tests {
             forwarding.nearby_discovery_window(),
             Some(MAX_NEARBY_DISCOVERY_WINDOW)
         );
+        assert!(forwarding.nearby_discovery_ipv4_interfaces().is_empty());
+
+        let multihomed = SelectedForwardingConfig::default()
+            .with_automatic_nearby_discovery_on_ipv4_interfaces(
+                MAX_NEARBY_DISCOVERY_WINDOW,
+                vec![
+                    Ipv4Addr::new(10, 0, 0, 2),
+                    Ipv4Addr::new(10, 0, 0, 1),
+                    Ipv4Addr::new(10, 0, 0, 2),
+                ],
+            )
+            .expect("explicit multi-interface automatic discovery");
+        assert_eq!(
+            multihomed.nearby_discovery_ipv4_interfaces(),
+            [Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2)]
+        );
+        for invalid in [
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::new(224, 0, 0, 1),
+            Ipv4Addr::BROADCAST,
+        ] {
+            assert!(
+                SelectedForwardingConfig::default()
+                    .with_automatic_nearby_discovery_on_ipv4_interfaces(
+                        Duration::from_secs(1),
+                        vec![invalid],
+                    )
+                    .is_err(),
+                "accepted invalid discovery interface {invalid}"
+            );
+        }
+        let too_many_interfaces = (1..=MAX_NEARBY_DISCOVERY_IPV4_INTERFACES + 1)
+            .map(|suffix| {
+                Ipv4Addr::new(
+                    10,
+                    1,
+                    0,
+                    u8::try_from(suffix).expect("test interface range"),
+                )
+            })
+            .collect();
+        assert!(
+            SelectedForwardingConfig::default()
+                .with_automatic_nearby_discovery_on_ipv4_interfaces(
+                    Duration::from_secs(1),
+                    too_many_interfaces,
+                )
+                .is_err()
+        );
 
         let config = nearby_node_config("nearby-auto-rosterless", Vec::new());
         let (allowed, configured) =
@@ -37073,6 +37669,7 @@ mod tests {
             configured_nearby_peers(&config, &forwarding).expect("manual configuration");
 
         assert_eq!(forwarding.nearby_discovery_window(), None);
+        assert!(forwarding.nearby_discovery_ipv4_interfaces().is_empty());
         assert_eq!(allowed, BTreeMap::from([(peer.carrier.id, peer.mission)]));
         assert_eq!(configured, vec![ConfiguredPeer::from(peer)]);
         assert_eq!(

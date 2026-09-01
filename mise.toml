@@ -22,7 +22,9 @@ run = [
   "python3 tools/test_aster_lan_mvp.py",
   "python3 tools/test_aster_lan_mvp_compose.py",
   "python3 tools/test_aster_lan_scale_compose.py",
+  "python3 tools/test_aster_hierarchy_mvp_compose.py",
   "sh -n docker/lan-scale/init-state.sh",
+  "sh -n docker/hierarchy-mvp/demo-node-entrypoint.sh",
   "python3 tools/test-selected-n32-receipt.py",
   "python3 tools/test-selected-iroh-nat-receipt.py",
   "python3 tools/test-selected-live-mutable-receipt.py",
@@ -90,6 +92,10 @@ run = "python3 tools/aster_lan_mvp_compose.py"
 [tasks.lan-scale-compose]
 description = "Measure one generated 8, 16, or 32-node rosterless LAN baseline"
 run = "python3 tools/aster_lan_scale_compose.py"
+
+[tasks.hierarchy-mvp-compose]
+description = "Exercise the five-node rosterless alpha-parent-bravo Event bridge MVP"
+run = "python3 tools/aster_hierarchy_mvp_compose.py"
 
 [tasks.tour]
 description = "Run the fastest two-node causal Ping/Pong capability tour"

@@ -65,7 +65,7 @@ impl SecurityProfile {
         suite_id: 0x0001,
         receipt_label: "hybrid-pq-aster-record-v1",
         application_protection: ApplicationProtection::AsterRecordLayer,
-        maximum_semantic_version: 5,
+        maximum_semantic_version: 6,
     };
 
     pub const CLASSICAL_P256_IROH_QUIC_V1: Self = Self {
@@ -107,6 +107,23 @@ impl SecurityProfile {
 impl Default for SecurityProfile {
     fn default() -> Self {
         Self::HYBRID_PQ_ASTER_RECORD_V1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hybrid_profile_ceiling_matches_the_public_semantic_ceiling() {
+        assert_eq!(
+            SecurityProfile::HYBRID_PQ_ASTER_RECORD_V1.maximum_semantic_version(),
+            crate::HIGHEST_SUPPORTED_SEMANTIC_VERSION
+        );
+        assert_eq!(
+            SecurityProfile::CLASSICAL_P256_IROH_QUIC_V1.maximum_semantic_version(),
+            1
+        );
     }
 }
 

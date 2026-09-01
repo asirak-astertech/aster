@@ -317,7 +317,7 @@ and source hashes are recorded in the
 [prior semantic-v3 custody requirements evidence](implementation/requirements-status.md#prior-semantic-v3-selected-event-custody-automated-evidence).
 
 This is current-code automated evidence, not a retained physical acceptance
-receipt. Finite TTL is Linux/Event/v3-format only, inherited in v3/v4/v5;
+receipt. Finite TTL is Linux/Event/v3-format only, inherited in v3/v4/v5/v6;
 receive-only is not physical RF silence. V1/v2 deterministic whole-contact
 partials, generic cross-class priority eviction, selected State/Record custody
 or future TTL design (the current finite form rejects), long-offline and
@@ -410,10 +410,13 @@ physical result, or additional `observed-bounded` credit. No production
 provider, protected stock CLI/binding, cross-process admin IPC, or coordinated
 provider destruction is added. The post-enqueue cancellation cell is Unix-only.
 
-The semantic-v4 State/Record gate is inherited unchanged by v5 and additive to
-those frozen slices. The handshake default/highest is 5 with
-`[5, 4, 3, 2, 1]`; Event retains v1-v4 compatibility, selected mutable frames
-are absent in v1-v3, and selected Blob frames are absent in v1-v4. Focused validation
+The semantic-v4 State/Record gate is inherited unchanged by v5 and v6 and is
+additive to those frozen slices. The handshake default/highest is 6 with
+`[6, 5, 4, 3, 2, 1]`; semantic v6 preserves the v5 ordinary Event,
+State/Record, and Blob lanes byte-for-byte and adds only the mutually enabled
+Event-bridge mechanics lane. Selected mutable frames are absent in v1-v3,
+selected Blob frames are absent in v1-v4, and selected bridge frames are absent
+in v1-v5. Focused validation
 must cover the complete State/Record class and direction grammar, including all
 20 structured mutable tags in `selected_frame_decode`; exact offer
 `MutableApplyResult`, fetch `MutableFetchResult` plus required exact
