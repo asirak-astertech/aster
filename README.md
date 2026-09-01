@@ -58,6 +58,22 @@ restart persistence, then removes its project-scoped containers, bridge, and
 volumes plus its uniquely named image. This is same-host development feedback,
 not physical-LAN evidence.
 
+After the four-node path passes, measure the current flat discovery ceiling one
+tier at a time with the generated
+[concurrent LAN scale baseline](docs/quickstart/lan-scale.md):
+
+```sh
+mise run lan-scale-compose -- --nodes 8
+mise run lan-scale-compose -- --nodes 16
+mise run lan-scale-compose -- --nodes 32
+```
+
+Each authorized node publishes offline, every authorized node must converge on
+the exact complete Event set, and one different-authority outsider must remain
+empty. The diagnostic reports container and contact-graph measurements but moves
+no retained evidence status. Thirty-two is the intentional flat-LAN boundary
+before composing scopes through filtered hierarchical bridges.
+
 For deterministic acceptance receipts, use the capability tours.
 
 The capability tour starts real processes with independent stores and

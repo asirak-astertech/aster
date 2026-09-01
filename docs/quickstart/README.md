@@ -8,6 +8,9 @@ availability, use the [real-process message playground](message-playground.md).
 For an evaluation-only three-host Event flow with automatic mDNS discovery on
 one trusted LAN—or its fast, one-host Docker Compose rehearsal—use the
 [LAN MVP quickstart](lan-mvp.md).
+To measure 8, 16, or 32 rosterless nodes concurrently on a generated private
+Docker bridge before beginning hierarchy, use the opt-in
+[LAN scale baseline](lan-scale.md).
 This page indexes the offline application and language-binding quickstarts.
 
 For the selected production-lane composition, start with the Rust
@@ -132,6 +135,7 @@ Choose the API closest to your application:
 |---|---|---|
 | Human-driven three-node introduction | `mise run hello` | [Aster Field Notes](hello.md) |
 | One-host automatic-discovery rehearsal | `mise run lan-mvp-compose` | [LAN MVP](lan-mvp.md#fast-one-host-docker-rehearsal) |
+| Concurrent 8/16/32-node LAN diagnostic | `mise run lan-scale-compose -- --nodes N` | [LAN scale baseline](lan-scale.md) |
 | Three-host trusted-LAN Event evaluation | `aster-agent --discover-lan` | [LAN MVP](lan-mvp.md) |
 | Interactive local process demo | `mise run playground -- --nodes N` | [Message playground](message-playground.md) |
 | Rust (selected live Event slice) | `aster_node::start_node` + `SelectedEventHandle` | [Selected Event API](selected-event-api.md) |

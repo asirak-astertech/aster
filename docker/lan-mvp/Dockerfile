@@ -30,6 +30,7 @@ COPY --from=build /work/target/release/aster-agent /usr/local/bin/aster-agent
 COPY tools/aster_lan_mvp.py /usr/local/libexec/aster/aster_lan_mvp.py
 COPY docker/lan-mvp/agent-entrypoint.sh /usr/local/libexec/aster/agent-entrypoint.sh
 COPY docker/lan-mvp/init-state.sh /usr/local/libexec/aster/init-state.sh
+COPY docker/lan-scale/init-state.sh /usr/local/libexec/aster/init-scale-state.sh
 COPY LICENSE /usr/share/licenses/aster/LICENSE
 COPY THIRD_PARTY_NOTICES.md /usr/share/licenses/aster/THIRD_PARTY_NOTICES.md
 RUN chmod 0755 \
@@ -37,7 +38,8 @@ RUN chmod 0755 \
     /usr/local/bin/aster-agent \
     /usr/local/libexec/aster/aster_lan_mvp.py \
     /usr/local/libexec/aster/agent-entrypoint.sh \
-    /usr/local/libexec/aster/init-state.sh
+    /usr/local/libexec/aster/init-state.sh \
+    /usr/local/libexec/aster/init-scale-state.sh
 WORKDIR /opt/aster
 USER 10001:10001
 CMD ["/usr/local/bin/aster-agent", "--help"]
