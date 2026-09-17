@@ -397,6 +397,14 @@ jobs:
     name: bounded fuzz smoke
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      RUSTC_WRAPPER: "sccache"
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_RW_MODE: "READ_WRITE"
+      # Keep sanitizer-instrumented nightly objects separate from stable Rust.
+      SCCACHE_GHA_VERSION: "aster-linux-x86_64-nightly-2026-08-18-fuzz-v1"
+      # Keep statistics available after the bounded campaigns finish.
+      SCCACHE_IDLE_TIMEOUT: "0"
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -404,6 +412,11 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
           submodules: false
+
+      - name: Install pinned Rust compiler cache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: "v0.16.0"
 
       - name: Install pinned fuzz toolchain
         run: |

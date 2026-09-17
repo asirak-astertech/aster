@@ -80,6 +80,12 @@ this low-risk split:
   version, and an explicit manual generation. `sccache` additionally keys each
   compilation result by its compiler inputs. Incremental Rust compilation
   remains disabled.
+- The bounded fuzz lane uses the separate
+  `aster-linux-x86_64-nightly-2026-08-18-fuzz-v1` read-write namespace. This
+  prevents sanitizer-instrumented nightly objects from mixing with the stable
+  Rust cache while allowing repeated pull-request runs to reuse compatible
+  fuzz compilation results. Its cache server remains alive through the
+  campaigns so the action can report final hit and miss statistics.
 - The workflow does not archive the complete Cargo `target` directory. Cache
   eviction, storage limits, hit rates, transfer time, and compilation time
   remain visible in the Actions and `sccache` statistics.
@@ -88,11 +94,10 @@ this low-risk split:
   <https://github.com/mozilla-actions/sccache-action>.
 - Larger private-repository runners may reduce compile and test time, but their
   availability and recurring cost need an explicit operational decision.
-- The bounded fuzz lane spends most of its roughly 13-minute runtime compiling;
-  dependency-policy spends roughly 8--9 minutes installing policy tools; and
+- Dependency-policy spends roughly 8--9 minutes installing policy tools, and
   real-Event delivery spends roughly 8 minutes building its isolated Docker
   image. They are already parallel and are not the current required-check
-  critical path, so build reuse or prebuilt tools/images remain separate work.
+  critical path, so prebuilt tools or images remain separate work.
 - Package-level Cargo sharding and alternate test runners are not adopted. They
   would change scheduling, process-fixture interaction, or evidence shape and
   need dedicated equivalence and resource profiling before use.
