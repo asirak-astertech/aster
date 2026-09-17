@@ -71,10 +71,20 @@ check, or process smoke is omitted.
 The following observations are intentionally deferred rather than folded into
 this low-risk split:
 
-- Actions and compiler caches remain disabled. Cache trust, eviction, keying,
-  restore integrity, and disk-growth behavior need a separate design; local
-  profiling showed build artifacts, rather than partition size, caused prior
-  disk pressure.
+- The Linux `quality` and `Rust quality` lanes use `sccache` v0.16.0 through
+  `sccache-action` v0.0.11. Only a trusted push to `main` may write compiler
+  results. Pull requests, merge queues, and manually dispatched runs use the
+  compiler cache read-only.
+- The cache namespace is separated by operating system, architecture, Rust
+  version, and an explicit manual generation. `sccache` additionally keys each
+  compilation result by its compiler inputs. Incremental Rust compilation
+  remains disabled.
+- The workflow does not archive the complete Cargo `target` directory. Cache
+  eviction, storage limits, hit rates, transfer time, and compilation time
+  remain visible in the Actions and `sccache` statistics.
+- Public sources: `sccache` v0.16.0 / Apache-2.0,
+  <https://github.com/mozilla/sccache>; `sccache-action` v0.0.11 / Apache-2.0,
+  <https://github.com/mozilla-actions/sccache-action>.
 - Larger private-repository runners may reduce compile and test time, but their
   availability and recurring cost need an explicit operational decision.
 - The bounded fuzz lane spends most of its roughly 13-minute runtime compiling;
