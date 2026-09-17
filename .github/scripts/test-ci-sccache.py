@@ -15,10 +15,6 @@ ACTION_SHA = "fc920bf0ec8de6ee65d409111f7ec508035751ba"
 ACTION_VERSION = "v0.0.11"
 SCCACHE_VERSION = "v0.16.0"
 CACHE_GENERATION = "aster-linux-x86_64-rust-1.97.1-v1"
-TRUST_EXPRESSION = (
-    "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' "
-    "&& 'write' || 'read' }}"
-)
 RW_EXPRESSION = (
     "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' "
     "&& 'READ_WRITE' || 'READ_ONLY' }}"
@@ -45,7 +41,10 @@ class CompilerCacheWorkflowTests(unittest.TestCase):
         for name in ("quality", "rust-quality"):
             with self.subTest(job=name):
                 job = workflow_job(workflow, name)
-                self.assertIn(f"cache-mode: {TRUST_EXPRESSION}", job)
+                # GitHub rejected an expression-valued job cache-mode before
+                # starting any job. Keep the platform's trigger-based mode and
+                # enforce the narrower writer policy in sccache itself.
+                self.assertNotIn("cache-mode:", job)
                 self.assertIn('RUSTC_WRAPPER: "sccache"', job)
                 self.assertIn('SCCACHE_GHA_ENABLED: "true"', job)
                 self.assertIn(f"SCCACHE_GHA_RW_MODE: {RW_EXPRESSION}", job)
