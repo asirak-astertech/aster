@@ -31,7 +31,6 @@ jobs:
   quality:
     name: quality
     runs-on: ubuntu-24.04
-    cache-mode: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read' }}
     # Keep headroom for exact-Python setup, support checks, and runner variance.
     # The complete Rust workspace gate runs concurrently in rust-quality.
     timeout-minutes: 45
@@ -248,7 +247,6 @@ jobs:
   rust-quality:
     name: Rust quality
     runs-on: ubuntu-24.04
-    cache-mode: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read' }}
     # This is the former Clippy/workspace-test segment of mise run check.
     # It runs concurrently with the unchanged support checks in quality.
     timeout-minutes: 40
