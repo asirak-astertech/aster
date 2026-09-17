@@ -72,9 +72,10 @@ The following observations are intentionally deferred rather than folded into
 this low-risk split:
 
 - The Linux `quality` and `Rust quality` lanes use `sccache` v0.16.0 through
-  `sccache-action` v0.0.11. Only a trusted push to `main` may write compiler
-  results. Pull requests, merge queues, and manually dispatched runs use the
-  compiler cache read-only.
+  `sccache-action` v0.0.11 in read-write mode. GitHub isolates pull-request
+  writes to the PR merge ref, allowing a cold PR run to populate its cache and
+  a rerun of the same PR to measure warm-cache performance without modifying
+  the default-branch cache.
 - The cache namespace is separated by operating system, architecture, Rust
   version, and an explicit manual generation. `sccache` additionally keys each
   compilation result by its compiler inputs. Incremental Rust compilation

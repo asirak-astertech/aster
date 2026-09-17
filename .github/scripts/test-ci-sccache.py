@@ -15,10 +15,6 @@ ACTION_SHA = "fc920bf0ec8de6ee65d409111f7ec508035751ba"
 ACTION_VERSION = "v0.0.11"
 SCCACHE_VERSION = "v0.16.0"
 CACHE_GENERATION = "aster-linux-x86_64-rust-1.97.1-v1"
-RW_EXPRESSION = (
-    "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' "
-    "&& 'READ_WRITE' || 'READ_ONLY' }}"
-)
 
 
 def workflow_job(workflow: str, name: str) -> str:
@@ -32,7 +28,7 @@ def workflow_job(workflow: str, name: str) -> str:
 
 
 class CompilerCacheWorkflowTests(unittest.TestCase):
-    def test_linux_compile_jobs_share_one_pinned_read_only_pr_cache(self):
+    def test_linux_compile_jobs_share_one_pinned_read_write_cache_namespace(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         action = (
             "uses: mozilla-actions/sccache-action@"
@@ -47,7 +43,7 @@ class CompilerCacheWorkflowTests(unittest.TestCase):
                 self.assertNotIn("cache-mode:", job)
                 self.assertIn('RUSTC_WRAPPER: "sccache"', job)
                 self.assertIn('SCCACHE_GHA_ENABLED: "true"', job)
-                self.assertIn(f"SCCACHE_GHA_RW_MODE: {RW_EXPRESSION}", job)
+                self.assertIn('SCCACHE_GHA_RW_MODE: "READ_WRITE"', job)
                 self.assertIn(f'SCCACHE_GHA_VERSION: "{CACHE_GENERATION}"', job)
                 self.assertEqual(job.count(action), 1)
                 self.assertIn(f'version: "{SCCACHE_VERSION}"', job)
