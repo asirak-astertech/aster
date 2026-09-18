@@ -42,6 +42,8 @@ jobs:
       SCCACHE_GHA_RW_MODE: "READ_WRITE"
       # Change v1 to invalidate the complete compatible compiler cache.
       SCCACHE_GHA_VERSION: "aster-linux-x86_64-rust-1.97.1-v1"
+      # Preserve statistics across the long test-only tail of rust-quality.
+      SCCACHE_IDLE_TIMEOUT: "0"
 
     steps:
       - &checkout-source
