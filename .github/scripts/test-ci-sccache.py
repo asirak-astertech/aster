@@ -36,19 +36,26 @@ class CompilerCacheWorkflowTests(unittest.TestCase):
             "uses: mozilla-actions/sccache-action@"
             f"{ACTION_SHA} # {ACTION_VERSION}"
         )
-        for name in ("quality", "rust-quality"):
-            with self.subTest(job=name):
-                job = workflow_job(workflow, name)
-                # GitHub rejected an expression-valued job cache-mode before
-                # starting any job. Keep the platform's trigger-based mode and
-                # enforce the narrower writer policy in sccache itself.
-                self.assertNotIn("cache-mode:", job)
-                self.assertIn('RUSTC_WRAPPER: "sccache"', job)
-                self.assertIn('SCCACHE_GHA_ENABLED: "true"', job)
-                self.assertIn('SCCACHE_GHA_RW_MODE: "READ_WRITE"', job)
-                self.assertIn(f'SCCACHE_GHA_VERSION: "{CACHE_GENERATION}"', job)
-                self.assertEqual(job.count(action), 1)
-                self.assertIn(f'version: "{SCCACHE_VERSION}"', job)
+        quality = workflow_job(workflow, "quality")
+        rust_quality = workflow_job(workflow, "rust-quality")
+
+        # GitHub rejected an expression-valued job cache-mode before starting
+        # any job. Keep the platform's trigger-based mode and enforce the
+        # narrower writer policy in sccache itself.
+        self.assertNotIn("cache-mode:", quality)
+        self.assertIn("env: &rust-build-profiles", quality)
+        self.assertIn('RUSTC_WRAPPER: "sccache"', quality)
+        self.assertIn('SCCACHE_GHA_ENABLED: "true"', quality)
+        self.assertIn('SCCACHE_GHA_RW_MODE: "READ_WRITE"', quality)
+        self.assertIn(f'SCCACHE_GHA_VERSION: "{CACHE_GENERATION}"', quality)
+        self.assertIn('SCCACHE_IDLE_TIMEOUT: "0"', quality)
+
+        self.assertNotIn("cache-mode:", rust_quality)
+        self.assertIn("env: *rust-build-profiles", rust_quality)
+
+        for job in (quality, rust_quality):
+            self.assertEqual(job.count(action), 1)
+            self.assertIn(f'version: "{SCCACHE_VERSION}"', job)
 
         self.assertEqual(workflow.count(action), 4)
         self.assertNotRegex(workflow, r"mozilla-actions/sccache-action@v")

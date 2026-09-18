@@ -75,7 +75,9 @@ this low-risk split:
   `sccache-action` v0.0.11 in read-write mode. GitHub isolates pull-request
   writes to the PR merge ref, allowing a cold PR run to populate its cache and
   a rerun of the same PR to measure warm-cache performance without modifying
-  the default-branch cache.
+  the default-branch cache. Idle shutdown is disabled for these lanes so the
+  action retains complete statistics through the long test-only tail of
+  `Rust quality`; the runner still terminates the local daemon at job cleanup.
 - The cache namespace is separated by operating system, architecture, Rust
   version, and an explicit manual generation. `sccache` additionally keys each
   compilation result by its compiler inputs. Incremental Rust compilation
