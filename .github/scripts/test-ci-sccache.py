@@ -16,6 +16,7 @@ ACTION_VERSION = "v0.0.11"
 SCCACHE_VERSION = "v0.16.0"
 CACHE_GENERATION = "aster-linux-x86_64-rust-1.97.1-v1"
 FUZZ_CACHE_GENERATION = "aster-linux-x86_64-nightly-2026-08-18-fuzz-v1"
+MACOS_CACHE_GENERATION = "aster-macos-arm64-rust-1.97.1-v1"
 
 
 def workflow_job(workflow: str, name: str) -> str:
@@ -49,8 +50,30 @@ class CompilerCacheWorkflowTests(unittest.TestCase):
                 self.assertEqual(job.count(action), 1)
                 self.assertIn(f'version: "{SCCACHE_VERSION}"', job)
 
-        self.assertEqual(workflow.count(action), 3)
+        self.assertEqual(workflow.count(action), 4)
         self.assertNotRegex(workflow, r"mozilla-actions/sccache-action@v")
+
+    def test_macos_job_aligns_profiles_and_uses_its_own_cache_namespace(self):
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        job = workflow_job(workflow, "macos-tests")
+        action = (
+            "uses: mozilla-actions/sccache-action@"
+            f"{ACTION_SHA} # {ACTION_VERSION}"
+        )
+
+        self.assertIn('CARGO_PROFILE_DEV_DEBUG: "0"', job)
+        self.assertIn('CARGO_PROFILE_TEST_DEBUG: "0"', job)
+        self.assertNotIn("cache-mode:", job)
+        self.assertIn('RUSTC_WRAPPER: "sccache"', job)
+        self.assertIn('SCCACHE_GHA_ENABLED: "true"', job)
+        self.assertIn('SCCACHE_GHA_RW_MODE: "READ_WRITE"', job)
+        self.assertIn(
+            f'SCCACHE_GHA_VERSION: "{MACOS_CACHE_GENERATION}"',
+            job,
+        )
+        self.assertIn('SCCACHE_IDLE_TIMEOUT: "0"', job)
+        self.assertEqual(job.count(action), 1)
+        self.assertIn(f'version: "{SCCACHE_VERSION}"', job)
 
     def test_fuzz_job_uses_its_own_pinned_read_write_cache_namespace(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
@@ -87,6 +110,7 @@ class CompilerCacheWorkflowTests(unittest.TestCase):
             documentation,
         )
         self.assertIn(f"`{FUZZ_CACHE_GENERATION}`", documentation)
+        self.assertIn(f"`{MACOS_CACHE_GENERATION}`", documentation)
 
 
 if __name__ == "__main__":

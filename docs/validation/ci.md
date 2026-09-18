@@ -86,6 +86,11 @@ this low-risk split:
   Rust cache while allowing repeated pull-request runs to reuse compatible
   fuzz compilation results. Its cache server remains alive through the
   campaigns so the action can report final hit and miss statistics.
+- The macOS lane uses the separate
+  `aster-macos-arm64-rust-1.97.1-v1` read-write namespace and disables dev/test
+  debug information for the complete job. The workspace tests and later
+  real-process smoke therefore use compatible debug settings, while Apple ARM
+  compiler objects remain isolated from Linux objects.
 - The workflow does not archive the complete Cargo `target` directory. Cache
   eviction, storage limits, hit rates, transfer time, and compilation time
   remain visible in the Actions and `sccache` statistics.
