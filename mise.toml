@@ -62,7 +62,17 @@ run = [
 [tasks.check-rust]
 description = "Run Clippy and the complete all-feature Rust workspace tests"
 run = [
-  "cargo clippy --locked --workspace --all-targets --all-features -- -D warnings",
+  "mise run check-clippy",
+  "mise run check-workspace-tests",
+]
+
+[tasks.check-clippy]
+description = "Run Clippy for every Rust workspace target and feature"
+run = "cargo clippy --locked --workspace --all-targets --all-features -- -D warnings"
+
+[tasks.check-workspace-tests]
+description = "Run the complete all-feature Rust workspace tests"
+run = [
   "sh tools/with-test-resources.sh cargo nextest run --locked --workspace --all-features --no-fail-fast --test-threads 2",
   "sh tools/with-test-resources.sh cargo test --locked --workspace --all-features --doc",
 ]
