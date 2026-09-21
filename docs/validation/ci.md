@@ -19,7 +19,7 @@ single stable check name **`CI / required`**.
 | Check | Runner | Purpose |
 | --- | --- | --- |
 | `quality` | `ubuntu-24.04` | Runs the exact-source Python process contract, Rust and Go formatting, Apache-2.0-only project-license and package checks, exact 348-row implementation-requirements traceability, the selected-node dependency boundary, vendored netlink source-equivalence and 13-test compatibility gates, the retained-libp2p-oracle boundary, selected live-Event, live-mutable, live-State-subscription, live-Record-subscription, live-Blob, and live-Blob-subscription receipt checker tests, real-process smokes, C ABI build and C/C++ header checks, Rust/Python conformance, Python/Go binding tests, and lab-controller tests. |
-| `Rust quality` | `ubuntu-24.04` | Runs Clippy with warnings denied and the complete locked, all-feature Rust workspace test suite. This is the same `mise run check-rust` segment included by the local aggregate, isolated as a parallel required lane rather than package-sharded. |
+| `Rust quality` | `ubuntu-24.04` | Runs Clippy with warnings denied, the complete locked, all-feature Rust workspace test suite with cargo-nextest, and the workspace doctests with Cargo. This is the same `mise run check-rust` segment included by the local aggregate, isolated as a parallel required lane rather than package-sharded. |
 | `macOS tests` | `macos-14` | Runs all Rust workspace tests on the supported Apple runner with Rust 1.97.1. |
 | `Rust 1.91 MSRV` | `ubuntu-24.04` | Checks every workspace target and feature with the declared minimum supported Rust version. |
 | `dependency policy` | `ubuntu-24.04` | Enforces the retained-libp2p-oracle boundary, applies `deny.toml` to the root and fuzz dependency graphs, and audits both lockfiles against a freshly downloaded RustSec database. |
@@ -33,6 +33,14 @@ current advisory data once, audits the root lockfile during that refresh, and
 reuses the same database without another fetch for the fuzz lockfile. Its
 vulnerability result therefore reflects the RustSec database available when
 the workflow ran, rather than a permanently reproducible snapshot.
+
+The Linux `Rust quality` lane downloads the public cargo-nextest 0.9.145
+`x86_64-unknown-linux-gnu` release from `nextest-rs/nextest` and verifies the
+pinned archive SHA-256 before execution. Nextest runs the same locked workspace
+with all features. Because nextest does not execute Rust doctests, the lane runs
+the complete workspace doctest set separately with Cargo. The `aster-node`
+`mesh_cli` binary is assigned to a single-threaded nextest group so its
+real-process tests cannot overlap each other; all other tests use four workers.
 
 ### CI critical-path profile (2026-09-17)
 
@@ -187,10 +195,11 @@ memory and disk demand without bound. Explicit caller overrides still win. It
 also raises the child process's soft open-file limit to at least 4,096,
 preserves a larger existing limit, and fails clearly if the hard limit cannot
 support it. These execution bounds do not reduce fixture scale or change the
-host's hard limit. For a direct workspace run, use:
+host's hard limit. For the same direct workspace runs, use:
 
 ```sh
-sh tools/with-test-resources.sh cargo test --locked --workspace --all-features
+sh tools/with-test-resources.sh cargo nextest run --locked --workspace --all-features --no-fail-fast --test-threads 4
+sh tools/with-test-resources.sh cargo test --locked --workspace --all-features --doc
 ```
 
 These tests keep exact data and zero-contact-error assertions. Blob waiting

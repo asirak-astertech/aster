@@ -63,7 +63,8 @@ run = [
 description = "Run Clippy and the complete all-feature Rust workspace tests"
 run = [
   "cargo clippy --locked --workspace --all-targets --all-features -- -D warnings",
-  "sh tools/with-test-resources.sh cargo test --locked --workspace --all-features",
+  "sh tools/with-test-resources.sh cargo nextest run --locked --workspace --all-features --no-fail-fast --test-threads 4",
+  "sh tools/with-test-resources.sh cargo test --locked --workspace --all-features --doc",
 ]
 
 [tasks.check-integration]
