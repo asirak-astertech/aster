@@ -198,7 +198,7 @@ support it. These execution bounds do not reduce fixture scale or change the
 host's hard limit. For the same direct workspace runs, use:
 
 ```sh
-sh tools/with-test-resources.sh cargo nextest run --locked --workspace --all-features --no-fail-fast --test-threads 4
+sh tools/with-test-resources.sh cargo nextest run --locked --workspace --all-features --no-fail-fast --test-threads 2
 sh tools/with-test-resources.sh cargo test --locked --workspace --all-features --doc
 ```
 
