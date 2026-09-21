@@ -34,7 +34,8 @@ use aster_redb_store::{
     BlobPublicationIntent, BlobReadPlan, BlobSemanticId, BlobSourceProjection, BlobSourceRetention,
     BlobStoreError, BlobSubscriptionId as StoreBlobSubscriptionId, BlobSubscriptionKey,
     BlobSubscriptionPollSelection, BlobSubscriptionRemoveOutcome, BlobSubscriptionSpec,
-    BlobVariantId, ControlPolicySnapshot, ControlTransferId, MAX_BLOB_OPERATION_KEY_BYTES,
+    BlobTransferStatusSnapshot as StoreBlobTransferStatusSnapshot, BlobVariantId,
+    ControlPolicySnapshot, ControlTransferId, MAX_BLOB_OPERATION_KEY_BYTES,
     MAX_BLOB_POLL_DELIVERIES, MAX_BLOB_SUBSCRIPTION_SCAN, MAX_NETWORK_BLOB_BYTES,
     MAX_NETWORK_BLOB_CHUNKS, Store, StoreError, StoreLimits, StoredBlob,
 };
@@ -474,6 +475,77 @@ pub struct BlobDeliveryStatus {
     pub selector_generation: u64,
 }
 
+/// Durable receive progress for one authenticated pending Blob publication.
+///
+/// Byte counters cover canonical encrypted carrier bytes, not plaintext Blob
+/// bytes. Peer identities, carrier object identities, lineages, and paths are
+/// deliberately absent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingBlobTransferStatus {
+    pub publication: BlobPublicationId,
+    pub id: BlobId,
+    pub topic: Topic,
+    pub scope: Scope,
+    pub plaintext_bytes: u64,
+    pub total_carriers: u64,
+    pub durable_carriers: u64,
+    pub total_carrier_bytes: u64,
+    pub durable_carrier_bytes: u64,
+    pub phase: BlobTransferPhase,
+}
+
+/// Observable durable phase of one still-pending Blob transfer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlobTransferPhase {
+    /// The authenticated source and manifest are durable, but no carrier bytes are.
+    AwaitingCarrier,
+    /// At least one carrier byte is durable, with work still outstanding.
+    Receiving,
+    /// Every carrier is committed; publication promotion has not completed.
+    ReadyToFinalize,
+}
+
+/// Audited local Blob storage and authenticated pending-transfer snapshot.
+///
+/// This is not peer convergence or global delivery status. Retained counters
+/// include policy-inactive rows that still consume local durable capacity;
+/// `pending` contains only currently authorized source projections.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BlobTransferStatus {
+    pub retained_publications: u64,
+    pub retained_pending_transfers: u64,
+    pub network_staging_bytes: u64,
+    pub reserved_file_bytes: u64,
+    pub pending: Vec<PendingBlobTransferStatus>,
+}
+
+fn blob_transfer_phase(
+    total_carriers: u64,
+    durable_carriers: u64,
+    total_carrier_bytes: u64,
+    durable_carrier_bytes: u64,
+) -> Result<BlobTransferPhase, ApplicationError> {
+    let impossible = total_carriers == 0
+        || total_carrier_bytes == 0
+        || durable_carriers > total_carriers
+        || durable_carrier_bytes > total_carrier_bytes
+        || (durable_carriers > 0 && durable_carrier_bytes == 0)
+        || (durable_carriers == total_carriers && durable_carrier_bytes != total_carrier_bytes);
+    if impossible {
+        return Err(ApplicationError::new(
+            ApplicationErrorKind::Integrity,
+            "blob transfer status",
+        ));
+    }
+    Ok(if durable_carriers == total_carriers {
+        BlobTransferPhase::ReadyToFinalize
+    } else if durable_carrier_bytes == 0 {
+        BlobTransferPhase::AwaitingCarrier
+    } else {
+        BlobTransferPhase::Receiving
+    })
+}
+
 /// One durable, operation-key-idempotent Blob publication request.
 ///
 /// `source` is supplied separately to [`SelectedBlobNode::publish`] and must
@@ -843,6 +915,20 @@ impl SelectedBlobHandle {
         .await
     }
 
+    /// Returns audited local Blob storage and pending-transfer progress.
+    ///
+    /// Cancellation has no durable side effect; a completed snapshot that loses
+    /// its receiver is simply discarded.
+    pub async fn transfer_status(&self) -> Result<BlobTransferStatus, ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedBlobCommand::TransferStatus { response },
+            received,
+            "blob transfer status",
+        )
+        .await
+    }
+
     async fn send<T>(
         &self,
         command: SelectedBlobCommand,
@@ -891,6 +977,9 @@ pub(crate) enum SelectedBlobCommand {
     DeliveryStatus {
         response: oneshot::Sender<Result<BlobDeliveryStatus, ApplicationError>>,
     },
+    TransferStatus {
+        response: oneshot::Sender<Result<BlobTransferStatus, ApplicationError>>,
+    },
 }
 
 impl SelectedBlobCommand {
@@ -916,6 +1005,9 @@ impl SelectedBlobCommand {
             }
             Self::DeliveryStatus { response } => {
                 _ = response.send(Err(actor_unavailable("blob delivery status")));
+            }
+            Self::TransferStatus { response } => {
+                _ = response.send(Err(actor_unavailable("blob transfer status")));
             }
         }
     }
@@ -962,6 +1054,12 @@ impl SelectedBlobCommand {
                 _ = response.send(Err(ApplicationError::new(
                     ApplicationErrorKind::ResourceLimit,
                     "blob delivery status",
+                )));
+            }
+            Self::TransferStatus { response } => {
+                _ = response.send(Err(ApplicationError::new(
+                    ApplicationErrorKind::ResourceLimit,
+                    "blob transfer status",
                 )));
             }
         }
@@ -1302,6 +1400,16 @@ impl SelectedBlobNode {
                     admission,
                     "blob delivery status",
                     "live Blob delivery status failed a durable ledger invariant",
+                )
+            }
+            SelectedBlobCommand::TransferStatus { response } => {
+                let result = self.transfer_status();
+                finish_live_blob_ledger_command(
+                    result,
+                    response,
+                    admission,
+                    "blob transfer status",
+                    "live Blob transfer status failed a durable/network invariant",
                 )
             }
         }
@@ -2077,6 +2185,68 @@ impl SelectedBlobNode {
             acknowledged_deliveries: stats.acknowledged_deliveries,
             delivery_cursors: stats.delivery_cursors,
             selector_generation: stats.selector_generation,
+        })
+    }
+
+    /// Returns audited local storage counts and authenticated pending transfer progress.
+    ///
+    /// The snapshot reports durable local work only. It does not claim that any
+    /// peer has, lacks, or will deliver a Blob.
+    pub fn transfer_status(&mut self) -> Result<BlobTransferStatus, ApplicationError> {
+        let policy = self.current_policy("blob transfer status")?;
+        let source_route_cache = Arc::clone(&self.source_route_cache);
+        let _lifecycle = source_route_cache
+            .lock_blob_lifecycle()
+            .map_err(|error| application_error("blob transfer status", error))?;
+        let snapshot = self
+            .store
+            .pending_blob_transfer_progress_with_policy(&policy)
+            .map_err(|error| application_error("blob transfer status", error.into()))?;
+        self.map_transfer_status(snapshot)
+    }
+
+    fn map_transfer_status(
+        &self,
+        snapshot: StoreBlobTransferStatusSnapshot,
+    ) -> Result<BlobTransferStatus, ApplicationError> {
+        let mut pending = Vec::with_capacity(snapshot.pending.len());
+        for progress in snapshot.pending {
+            let current = self
+                .source_route_cache
+                .is_current_blob_source_projection(
+                    &self.verifier,
+                    &progress.source,
+                    BlobSourceRetention::Pending,
+                )
+                .map_err(|error| application_error("blob transfer status", error))?;
+            if !current {
+                continue;
+            }
+            let phase = blob_transfer_phase(
+                progress.total_carriers,
+                progress.durable_carriers,
+                progress.total_carrier_bytes,
+                progress.durable_carrier_bytes,
+            )?;
+            pending.push(PendingBlobTransferStatus {
+                publication: BlobPublicationId::from_store(progress.source.semantic_id),
+                id: BlobId::from_core(progress.source.blob_id),
+                topic: progress.source.topic,
+                scope: progress.source.scope,
+                plaintext_bytes: progress.source.total_len,
+                total_carriers: progress.total_carriers,
+                durable_carriers: progress.durable_carriers,
+                total_carrier_bytes: progress.total_carrier_bytes,
+                durable_carrier_bytes: progress.durable_carrier_bytes,
+                phase,
+            });
+        }
+        Ok(BlobTransferStatus {
+            retained_publications: snapshot.stats.publications,
+            retained_pending_transfers: snapshot.stats.pending_sources,
+            network_staging_bytes: snapshot.stats.network_staging_bytes,
+            reserved_file_bytes: snapshot.stats.reserved_file_bytes,
+            pending,
         })
     }
 
@@ -3541,6 +3711,65 @@ mod tests {
     }
 
     #[test]
+    fn transfer_status_separates_retained_publications_from_pending_network_work() {
+        // Break caught: treating accepted local publications as pending network
+        // transfers gives operators a permanently nonzero transfer backlog.
+        let root = TestRoot::new("transfer-status-local");
+        let mut node = selected_node(&root);
+        assert_eq!(
+            node.transfer_status().expect("empty Blob transfer status"),
+            BlobTransferStatus {
+                retained_publications: 0,
+                retained_pending_transfers: 0,
+                network_staging_bytes: 0,
+                reserved_file_bytes: 0,
+                pending: Vec::new(),
+            }
+        );
+
+        node.publish(
+            request(b"blob/transfer-status/local"),
+            &mut Cursor::new(payload(73)),
+        )
+        .expect("publish transfer-status fixture");
+        let status = node
+            .transfer_status()
+            .expect("published Blob transfer status");
+        assert_eq!(status.retained_publications, 1);
+        assert_eq!(status.retained_pending_transfers, 0);
+        assert_eq!(status.network_staging_bytes, 0);
+        assert!(status.reserved_file_bytes > 0);
+        assert!(status.pending.is_empty());
+    }
+
+    #[test]
+    fn transfer_phase_rejects_impossible_progress_and_classifies_durable_work() {
+        assert_eq!(
+            blob_transfer_phase(2, 0, 100, 0).expect("waiting transfer"),
+            BlobTransferPhase::AwaitingCarrier
+        );
+        assert_eq!(
+            blob_transfer_phase(2, 0, 100, 17).expect("partially received transfer"),
+            BlobTransferPhase::Receiving
+        );
+        assert_eq!(
+            blob_transfer_phase(2, 2, 100, 100).expect("ready transfer"),
+            BlobTransferPhase::ReadyToFinalize
+        );
+        for invalid in [
+            blob_transfer_phase(0, 0, 0, 0),
+            blob_transfer_phase(2, 3, 100, 100),
+            blob_transfer_phase(2, 1, 100, 0),
+            blob_transfer_phase(2, 2, 100, 99),
+            blob_transfer_phase(2, 0, 100, 101),
+        ] {
+            let error = invalid.expect_err("impossible durable progress must fail closed");
+            assert_eq!(error.kind(), ApplicationErrorKind::Integrity);
+            assert_eq!(error.operation(), "blob transfer status");
+        }
+    }
+
+    #[test]
     fn blob_subscription_delivers_exact_publications_with_durable_token_bound_retries() {
         let root = TestRoot::new("subscription-lifecycle");
         let bytes = payload(SELECTED_BLOB_CHUNK_SIZE as usize + 19);
@@ -3825,6 +4054,15 @@ mod tests {
                 selector_generation: 1,
             }
         );
+        let transfer_status = handle
+            .transfer_status()
+            .await
+            .expect("live Blob transfer status");
+        assert_eq!(transfer_status.retained_publications, 1);
+        assert_eq!(transfer_status.retained_pending_transfers, 0);
+        assert_eq!(transfer_status.network_staging_bytes, 0);
+        assert!(transfer_status.reserved_file_bytes > 0);
+        assert!(transfer_status.pending.is_empty());
         assert_eq!(
             handle
                 .unsubscribe(subscription.id)
@@ -4098,6 +4336,15 @@ mod tests {
             .expect_err("closed delivery-status rejects");
         assert_eq!(error.kind(), ApplicationErrorKind::StateUnavailable);
         assert_eq!(error.operation(), "blob delivery status");
+
+        let (response, received) = oneshot::channel();
+        SelectedBlobCommand::TransferStatus { response }.reject_resource_limit();
+        let error = received
+            .blocking_recv()
+            .expect("saturated transfer-status response")
+            .expect_err("saturated transfer-status rejects");
+        assert_eq!(error.kind(), ApplicationErrorKind::ResourceLimit);
+        assert_eq!(error.operation(), "blob transfer status");
     }
 
     #[tokio::test]
