@@ -33,6 +33,7 @@ use crate::lifecycle::{HealthDecision, HealthEndpoint, LifecycleState, ServiceSt
 const HEALTH_HEADER_BYTES: usize = 4 * 1024;
 const HEALTH_TRANSPORT_BUFFER_BYTES: usize = 8 * 1024;
 const HEALTH_HEADER_DEADLINE: Duration = Duration::from_secs(2);
+const HEALTH_RESPONSE_DRAIN_DEADLINE: Duration = Duration::from_secs(1);
 const HEALTH_CONNECTION_LIMIT: usize = 16;
 
 /// A sanitized health-listener error.
@@ -149,7 +150,8 @@ impl BoundHealth {
                             .http1()
                             .timer(TokioTimer::new())
                             .max_buf_size(HEALTH_TRANSPORT_BUFFER_BYTES)
-                            .header_read_timeout(HEALTH_HEADER_DEADLINE);
+                            .header_read_timeout(HEALTH_HEADER_DEADLINE)
+                            .keep_alive(false);
                         builder
                             .http2()
                             .max_header_list_size(HEALTH_HEADER_BYTES as u32);
@@ -162,7 +164,12 @@ impl BoundHealth {
                             _ = &mut connection => {}
                             first = &mut first_header => {
                                 if first.is_ok() {
-                                    let _ = connection.await;
+                                    connection.as_mut().graceful_shutdown();
+                                    let _ = tokio::time::timeout(
+                                        HEALTH_RESPONSE_DRAIN_DEADLINE,
+                                        connection.as_mut(),
+                                    )
+                                    .await;
                                 }
                             }
                         }
@@ -243,7 +250,7 @@ mod tests {
 
     use super::*;
 
-    async fn health(address: SocketAddr, request: &[u8]) -> Vec<u8> {
+    async fn open_health(address: SocketAddr, request: &[u8]) -> (tokio::net::TcpStream, Vec<u8>) {
         let mut stream = tokio::net::TcpStream::connect(address)
             .await
             .expect("connect to health listener");
@@ -269,7 +276,70 @@ mod tests {
         })
         .await
         .expect("health response header deadline");
-        response
+        (stream, response)
+    }
+
+    async fn health(address: SocketAddr, request: &[u8]) -> Vec<u8> {
+        open_health(address, request).await.1
+    }
+
+    async fn open_uncooperative_http2_health(address: SocketAddr) -> tokio::net::TcpStream {
+        const SETTINGS: [u8; 9] = [0, 0, 0, 4, 0, 0, 0, 0, 0];
+        const SETTINGS_ACK: [u8; 9] = [0, 0, 0, 4, 1, 0, 0, 0, 0];
+        const REQUEST_HEADERS: &[u8] = &[
+            0, 0, 21, 1, 5, 0, 0, 0, 1,    // HEADERS, END_STREAM | END_HEADERS, stream 1
+            0x82, // :method: GET
+            0x86, // :scheme: http
+            0x01, 9, b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't', // :authority
+            0x04, 6, b'/', b'l', b'i', b'v', b'e', b'z', // :path
+        ];
+        let mut stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect HTTP/2 health client");
+        stream
+            .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+            .await
+            .expect("write HTTP/2 preface");
+        stream
+            .write_all(&SETTINGS)
+            .await
+            .expect("write HTTP/2 settings");
+        stream
+            .write_all(REQUEST_HEADERS)
+            .await
+            .expect("write HTTP/2 health request");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let mut header = [0_u8; 9];
+                stream
+                    .read_exact(&mut header)
+                    .await
+                    .expect("read HTTP/2 frame header");
+                let length = usize::from(header[0]) << 16
+                    | usize::from(header[1]) << 8
+                    | usize::from(header[2]);
+                let mut payload = vec![0_u8; length];
+                stream
+                    .read_exact(&mut payload)
+                    .await
+                    .expect("read HTTP/2 frame payload");
+                let stream_id =
+                    u32::from_be_bytes([header[5], header[6], header[7], header[8]]) & 0x7fff_ffff;
+                if header[3] == 4 && header[4] & 1 == 0 {
+                    stream
+                        .write_all(&SETTINGS_ACK)
+                        .await
+                        .expect("acknowledge server HTTP/2 settings");
+                }
+                if stream_id == 1 && matches!(header[3], 0 | 1) && header[4] & 1 != 0 {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("HTTP/2 health response deadline");
+        stream
     }
 
     fn assert_empty(response: &[u8], expected_status: u16) {
@@ -344,6 +414,70 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn valid_health_requests_retire_keep_alive_connections_and_release_permits() {
+        let status = ServiceStatus::starting();
+        let listener = BoundHealth::bind("127.0.0.1:0".parse().expect("loopback address"))
+            .await
+            .expect("bind loopback health listener");
+        let address = listener.local_addr().expect("health address");
+        let (stop_send, stop_receive) = watch::channel(false);
+        let task = tokio::spawn(listener.serve(status, stop_receive));
+        let request = b"GET /livez HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n";
+
+        let mut connections = Vec::new();
+        for _ in 0..HEALTH_CONNECTION_LIMIT {
+            let (stream, response) = open_health(address, request).await;
+            assert_empty(&response, 200);
+            connections.push(stream);
+        }
+
+        for stream in &mut connections {
+            let mut byte = [0_u8; 1];
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), stream.read(&mut byte))
+                    .await
+                    .expect("served health connection retires promptly")
+                    .expect("read retired health connection"),
+                0,
+                "served health connection remained open"
+            );
+        }
+        assert_empty(&health(address, request).await, 200);
+
+        stop_send.send(true).expect("request health shutdown");
+        task.await
+            .expect("health task joins")
+            .expect("health task succeeds");
+    }
+
+    #[tokio::test]
+    async fn uncooperative_http2_clients_cannot_retain_all_connection_permits() {
+        let status = ServiceStatus::starting();
+        let listener = BoundHealth::bind("127.0.0.1:0".parse().expect("loopback address"))
+            .await
+            .expect("bind loopback health listener");
+        let address = listener.local_addr().expect("health address");
+        let (stop_send, stop_receive) = watch::channel(false);
+        let task = tokio::spawn(listener.serve(status, stop_receive));
+
+        let mut connections = Vec::new();
+        for _ in 0..HEALTH_CONNECTION_LIMIT {
+            connections.push(open_uncooperative_http2_health(address).await);
+        }
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        assert_empty(
+            &health(address, b"GET /livez HTTP/1.1\r\nHost: localhost\r\n\r\n").await,
+            200,
+        );
+
+        drop(connections);
+        stop_send.send(true).expect("request health shutdown");
+        task.await
+            .expect("health task joins")
+            .expect("health task succeeds");
     }
 
     #[tokio::test]
