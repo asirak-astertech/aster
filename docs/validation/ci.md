@@ -73,13 +73,18 @@ a development-host result, not hosted-CI or throughput evidence.
 command order:
 
 1. `mise run check-foundation`
-2. `mise run check-rust`
-3. `mise run check-integration`
+2. `mise run check-clippy`
+3. `mise run check-workspace-tests`
+4. `mise run check-integration`
+
+The aggregate uses sequential `{ task = "..." }` run entries, supported by
+the pinned [mise 2026.4.28](https://github.com/jdx/mise/blob/v2026.4.28/docs/tasks/running-tasks.md#execution-order),
+instead of shell commands invoking mise. A failed step stops the sequence.
 
 Hosted Linux CI runs `mise run check-clippy` alongside two nextest partitions,
 while `quality` runs the foundation and integration segments. Locally,
-`mise run check-rust` runs `check-clippy` followed by `check-workspace-tests`,
-which executes the complete suite without partitioning and then all doctests.
+`mise run check-workspace-tests` executes the complete suite without
+partitioning and then all doctests.
 The stable `required` job fails unless Clippy, both test partitions, and every
 other validation lane succeed. No test, feature set, receipt assertion, binding check,
 conformance check, or process smoke is omitted. This removes the Clippy wait
