@@ -285,9 +285,13 @@ jobs:
         run: mise run check-clippy
 
   rust-tests:
-    name: Rust tests
+    name: Rust tests (${{ matrix.partition }}/2)
     runs-on: ubuntu-24.04
     timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2]
     env: *rust-build-profiles
     steps:
       - *checkout-source
@@ -315,10 +319,16 @@ jobs:
       - name: Acquire Rust dependencies
         run: cargo fetch --locked
 
-      - name: Run complete workspace tests offline
+      - name: Run workspace test partition offline
         env:
           CARGO_NET_OFFLINE: "true"
-        run: mise run check-workspace-tests
+        run: sh tools/with-test-resources.sh cargo nextest run --locked --workspace --all-features --no-fail-fast --test-threads 2 --partition slice:${{ matrix.partition }}/2
+
+      - name: Run complete workspace doctests offline
+        if: matrix.partition == 1
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: sh tools/with-test-resources.sh cargo test --locked --workspace --all-features --doc
 
   msrv:
     name: Rust 1.91 MSRV

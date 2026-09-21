@@ -20,7 +20,7 @@ single stable check name **`CI / required`**.
 | --- | --- | --- |
 | `quality` | `ubuntu-24.04` | Runs the exact-source Python process contract, Rust and Go formatting, Apache-2.0-only project-license and package checks, exact 348-row implementation-requirements traceability, the selected-node dependency boundary, vendored netlink source-equivalence and 13-test compatibility gates, the retained-libp2p-oracle boundary, selected live-Event, live-mutable, live-State-subscription, live-Record-subscription, live-Blob, and live-Blob-subscription receipt checker tests, real-process smokes, C ABI build and C/C++ header checks, Rust/Python conformance, Python/Go binding tests, and lab-controller tests. |
 | `Rust Clippy` | `ubuntu-24.04` | Runs locked Clippy for every workspace target and feature, with warnings denied. |
-| `Rust tests` | `ubuntu-24.04` | Runs the complete locked, all-feature Rust workspace test suite with nextest and all workspace doctests with Cargo, through the existing resource wrapper. It starts independently of Clippy, with no package sharding or test filtering. |
+| `Rust tests (1/2)` and `Rust tests (2/2)` | `ubuntu-24.04` | Run two disjoint nextest partitions covering the complete locked, all-feature Rust workspace suite. Partition 1 also runs all workspace doctests with Cargo. Both start independently of Clippy and use the existing resource wrapper. |
 | `macOS tests` | `macos-14` | Runs all Rust workspace tests on the supported Apple runner with Rust 1.97.1. |
 | `Rust 1.91 MSRV` | `ubuntu-24.04` | Checks every workspace target and feature with the declared minimum supported Rust version. |
 | `dependency policy` | `ubuntu-24.04` | Enforces the retained-libp2p-oracle boundary, applies `deny.toml` to the root and fuzz dependency graphs, and audits both lockfiles against a freshly downloaded RustSec database. |
@@ -38,10 +38,15 @@ the workflow ran, rather than a permanently reproducible snapshot.
 The Linux `Rust tests` lane downloads the public cargo-nextest 0.9.145
 `x86_64-unknown-linux-gnu` release from `nextest-rs/nextest` and verifies the
 pinned archive SHA-256 before execution. Nextest runs the same locked workspace
-with all features. Because nextest does not execute Rust doctests, the lane runs
-the complete workspace doctest set separately with Cargo. The `aster-node`
+with all features, using `--partition slice:1/2` and `slice:2/2` to distribute
+every test across two runners. See the public nextest 0.9.145
+[partitioning documentation](https://nexte.st/docs/ci-features/partitioning/).
+Because nextest does not execute Rust doctests, partition 1 runs the complete
+workspace doctest set separately with Cargo. The `aster-node`
 `mesh_cli` binary is assigned to a single-threaded nextest group so its
-real-process tests cannot overlap each other; the overall nextest limit remains two workers.
+real-process tests cannot overlap each other on the same runner; the nextest
+limit remains two workers per runner. Matrix fail-fast is disabled so a failed
+partition does not cancel the other partition.
 
 ### CI critical-path profile (2026-09-17)
 
@@ -71,15 +76,16 @@ command order:
 2. `mise run check-rust`
 3. `mise run check-integration`
 
-Hosted Linux CI runs `mise run check-clippy` and
-`mise run check-workspace-tests` in separate, concurrent required lanes while
-`quality` runs the foundation and integration segments. Locally,
-`mise run check-rust` runs those same two tasks in the original order. The
-stable `required` job fails unless both Rust lanes and every other validation
-lane succeed. No test, feature set, receipt assertion, binding check,
+Hosted Linux CI runs `mise run check-clippy` alongside two nextest partitions,
+while `quality` runs the foundation and integration segments. Locally,
+`mise run check-rust` runs `check-clippy` followed by `check-workspace-tests`,
+which executes the complete suite without partitioning and then all doctests.
+The stable `required` job fails unless Clippy, both test partitions, and every
+other validation lane succeed. No test, feature set, receipt assertion, binding check,
 conformance check, or process smoke is omitted. This removes the Clippy wait
-before workspace tests at the cost of another runner's setup and potentially
-duplicated cold-cache compilation; compare cold and warm hosted runs.
+before workspace tests and distributes test execution at the cost of extra
+runner setup and potentially duplicated cold-cache compilation; compare cold
+and warm hosted runs.
 
 ### Compiler cache
 
@@ -141,8 +147,8 @@ SHA-pinned [`actions/cache` v6.1.0](https://github.com/actions/cache/tree/55cc83
 
 Caches are optional acceleration: an absent entry rebuilds the tools. Measure
 a cold and warm hosted run before claiming a speedup. These setup changes
-reduce repeated work in the affected lanes; splitting Clippy from tests targets
-the previous longest lane. Shared checkout, mise, and sccache steps use YAML
+reduce repeated work in the affected lanes; separating Clippy and partitioning
+the tests targets the previous longest lane. Shared checkout, mise, and sccache steps use YAML
 anchors. The validation commands and stable `CI / required` check are retained.
 
 ### Deferred options
@@ -152,9 +158,8 @@ anchors. The validation commands and stable `CI / required` check are retained.
 - Real-Event delivery spends roughly 8 minutes building its isolated Docker
   image. It runs in parallel and is not the current required-check critical
   path, so prebuilt images remain separate work.
-- Package-level sharding and increased test concurrency are not adopted. They
-  would change scheduling and process-fixture interaction and need dedicated
-  equivalence and resource profiling before use.
+- Higher per-runner test concurrency is not adopted. Each of the two partitions
+  keeps the existing worker and process-fixture limits.
 
 ## Manual Linux build
 
