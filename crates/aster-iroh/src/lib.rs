@@ -7,7 +7,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, VecDeque},
     error::Error,
     fmt,
     net::SocketAddr,
@@ -46,6 +46,7 @@ use swarm_discovery::{
     Discoverer as SwarmDiscoverer, DropGuard as SwarmDiscoveryGuard, IpClass as SwarmIpClass,
     Peer as SwarmPeer,
 };
+use tokio::task::{AbortHandle, Id as TaskId, JoinError, JoinSet};
 use tokio::time::timeout;
 
 pub use iroh::{EndpointId, RelayUrl, SecretKey};
@@ -55,6 +56,8 @@ pub use iroh::{EndpointId, RelayUrl, SecretKey};
 /// This version identifies carrier framing only; it does not define an Aster
 /// item encoding or reconciliation profile.
 pub const ALPN: &[u8] = b"aster-carrier/1";
+
+const MAX_PENDING_INBOUND_HANDSHAKES: usize = 16;
 
 /// Private DNS-SD service label used by the explicit nearby evaluation mode.
 ///
@@ -622,6 +625,131 @@ pub struct Endpoint {
     security_profile: CarrierSecurityProfile,
     #[cfg(feature = "nearby-discovery")]
     nearby_discovery_occupied: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
+enum InboundAuthorization {
+    Rostered(Arc<BTreeSet<EndpointId>>),
+    Candidate,
+}
+
+/// Stateful inbound carrier acceptance with bounded concurrent handshakes.
+///
+/// The acceptor keeps dequeuing QUIC attempts while earlier handshakes are in
+/// progress. Address validation happens before a handshake consumes one of the
+/// bounded slots, and the oldest pending handshake is retired when all slots
+/// are occupied so a stalled peer cannot monopolize admission indefinitely.
+pub struct InboundAcceptor {
+    endpoint: Endpoint,
+    authorization: InboundAuthorization,
+    handshakes: JoinSet<Result<Connection, CarrierError>>,
+    handshake_order: VecDeque<AbortHandle>,
+    #[cfg(test)]
+    test_handshake_gates: VecDeque<TestHandshakeGate>,
+}
+
+#[cfg(test)]
+struct TestHandshakeGate {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+impl InboundAcceptor {
+    fn new(endpoint: Endpoint, authorization: InboundAuthorization) -> Self {
+        Self {
+            endpoint,
+            authorization,
+            handshakes: JoinSet::new(),
+            handshake_order: VecDeque::new(),
+            #[cfg(test)]
+            test_handshake_gates: VecDeque::new(),
+        }
+    }
+
+    /// Returns the next carrier-authenticated connection without allowing an
+    /// earlier incomplete handshake to block acceptance of later attempts.
+    pub async fn accept(&mut self) -> Result<Connection, CarrierError> {
+        loop {
+            let endpoint = self.endpoint.clone();
+            let accept_timeout = endpoint.config.connect_timeout;
+            tokio::select! {
+                completed = self.handshakes.join_next_with_id(), if !self.handshakes.is_empty() => {
+                    if let Some(result) = self.handle_completion(
+                        completed.expect("nonempty inbound handshake set has a completion"),
+                    ) {
+                        return result;
+                    }
+                }
+                incoming = timeout(accept_timeout, endpoint.inner.accept()) => {
+                    let incoming = incoming
+                        .map_err(|_| CarrierError::Timeout("accept"))?
+                        .ok_or_else(|| CarrierError::Transport("endpoint stopped accepting".into()))?;
+                    let incoming = if incoming.remote_addr_validated() {
+                        incoming
+                    } else {
+                        match incoming.retry() {
+                            Ok(()) => continue,
+                            Err(error) => error.into_incoming(),
+                        }
+                    };
+
+                    let displaced = if self.handshakes.len() >= MAX_PENDING_INBOUND_HANDSHAKES {
+                        self.handshake_order
+                            .pop_front()
+                            .expect("a full handshake set has an oldest task")
+                            .abort();
+                        let completed = self
+                            .handshakes
+                            .join_next_with_id()
+                            .await
+                            .expect("a full handshake set has a completion after retirement");
+                        self.handle_completion(completed)
+                    } else {
+                        None
+                    };
+                    self.spawn_handshake(incoming);
+                    if let Some(result) = displaced {
+                        return result;
+                    }
+                }
+            }
+        }
+    }
+
+    fn spawn_handshake(&mut self, incoming: iroh::endpoint::Incoming) {
+        let endpoint = self.endpoint.clone();
+        let authorization = self.authorization.clone();
+        #[cfg(test)]
+        let gate = self.test_handshake_gates.pop_front();
+        let handle = self.handshakes.spawn(async move {
+            #[cfg(test)]
+            if let Some(gate) = gate {
+                let _ = gate.entered.send(());
+                let _ = gate.release.await;
+            }
+            endpoint.finish_incoming(incoming, &authorization).await
+        });
+        self.handshake_order.push_back(handle);
+    }
+
+    fn handle_completion(
+        &mut self,
+        completed: Result<(TaskId, Result<Connection, CarrierError>), JoinError>,
+    ) -> Option<Result<Connection, CarrierError>> {
+        let completed_id = match &completed {
+            Ok((id, _)) => *id,
+            Err(error) => error.id(),
+        };
+        self.handshake_order
+            .retain(|handle| handle.id() != completed_id);
+        match completed {
+            Ok((_, result)) => Some(result),
+            Err(error) if error.is_cancelled() => None,
+            Err(_) => Some(Err(CarrierError::Transport(
+                "inbound handshake task stopped unexpectedly".into(),
+            ))),
+        }
+    }
 }
 
 /// Shared synchronous stop authority for one nearby-discovery session.
@@ -1643,6 +1771,17 @@ impl Endpoint {
         self.finish_accepted_connection(inner)
     }
 
+    /// Creates a stateful inbound acceptor for a fixed carrier roster.
+    ///
+    /// Reuse this value for the endpoint's complete accept loop so incomplete
+    /// handshakes remain isolated from later inbound attempts.
+    pub fn inbound_acceptor(&self, allowed: &BTreeSet<EndpointId>) -> InboundAcceptor {
+        InboundAcceptor::new(
+            self.clone(),
+            InboundAuthorization::Rostered(Arc::new(allowed.clone())),
+        )
+    }
+
     /// Accepts one carrier-authenticated candidate without a carrier roster.
     ///
     /// The returned connection proves possession of its Iroh endpoint identity
@@ -1653,6 +1792,31 @@ impl Endpoint {
     /// frames. Use [`Self::accept`] when the carrier roster is already known.
     pub async fn accept_candidate(&self) -> Result<Connection, CarrierError> {
         let inner = self.accept_carrier().await?;
+        self.finish_accepted_connection(inner)
+    }
+
+    /// Creates a stateful acceptor for carrier-authenticated candidates that
+    /// still require the mandatory Aster mission handshake and authorization.
+    pub fn inbound_candidate_acceptor(&self) -> InboundAcceptor {
+        InboundAcceptor::new(self.clone(), InboundAuthorization::Candidate)
+    }
+
+    async fn finish_incoming(
+        &self,
+        incoming: iroh::endpoint::Incoming,
+        authorization: &InboundAuthorization,
+    ) -> Result<Connection, CarrierError> {
+        let inner = timeout(self.config.connect_timeout, incoming)
+            .await
+            .map_err(|_| CarrierError::Timeout("handshake"))?
+            .map_err(|error| CarrierError::Transport(error.to_string()))?;
+        let remote = inner.remote_id();
+        if let InboundAuthorization::Rostered(allowed) = authorization
+            && !allowed.contains(&remote)
+        {
+            inner.close(1u8.into(), b"unauthorized peer");
+            return Err(CarrierError::UnauthorizedPeer(remote));
+        }
         self.finish_accepted_connection(inner)
     }
 
@@ -3471,6 +3635,160 @@ mod tests {
         server_connection.close();
         client_connection.close();
         client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn stalled_inbound_handshake_does_not_block_a_later_valid_connection() {
+        let mut config = EndpointConfig::direct("127.0.0.1:0".parse().expect("address"));
+        config.connect_timeout = Duration::from_secs(2);
+        let server = Endpoint::bind(SecretKey::generate(), config)
+            .await
+            .expect("server");
+        let stalled_client = Endpoint::bind(SecretKey::generate(), config)
+            .await
+            .expect("stalled client");
+        let valid_client = Endpoint::bind(SecretKey::generate(), config)
+            .await
+            .expect("valid client");
+        let allowed = BTreeSet::from([stalled_client.id(), valid_client.id()]);
+        let mut acceptor = server.inbound_acceptor(&allowed);
+        let (stalled_entered_send, stalled_entered_receive) = tokio::sync::oneshot::channel();
+        let (_stalled_release_send, stalled_release_receive) = tokio::sync::oneshot::channel();
+        acceptor.test_handshake_gates.push_back(TestHandshakeGate {
+            entered: stalled_entered_send,
+            release: stalled_release_receive,
+        });
+
+        let server_task = tokio::spawn(async move {
+            timeout(Duration::from_secs(2), acceptor.accept())
+                .await
+                .expect("later connection accepted before stalled handshake deadline")
+                .expect("accept later connection")
+        });
+        let stalled_task = tokio::spawn({
+            let stalled_client = stalled_client.clone();
+            let server = server.clone();
+            async move {
+                stalled_client
+                    .connect(ExpectedPeer {
+                        id: server.id(),
+                        address: loopback(&server),
+                    })
+                    .await
+            }
+        });
+        timeout(Duration::from_secs(2), stalled_entered_receive)
+            .await
+            .expect("stalled handshake admitted")
+            .expect("stalled handshake observation sender");
+
+        let valid_connection = valid_client
+            .connect(ExpectedPeer {
+                id: server.id(),
+                address: loopback(&server),
+            })
+            .await
+            .expect("valid client connects while earlier handshake is stalled");
+        let accepted = server_task.await.expect("server task");
+        assert_eq!(accepted.remote_id(), valid_client.id());
+
+        stalled_task.abort();
+        accepted.close();
+        valid_connection.close();
+        stalled_client.close().await;
+        valid_client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn saturated_stalled_handshakes_retire_the_oldest_and_admit_a_later_peer() {
+        let mut config = EndpointConfig::direct("127.0.0.1:0".parse().expect("address"));
+        config.connect_timeout = Duration::from_secs(10);
+        let server = Endpoint::bind(SecretKey::generate(), config)
+            .await
+            .expect("server");
+        let mut stalled_clients = Vec::new();
+        for _ in 0..MAX_PENDING_INBOUND_HANDSHAKES {
+            stalled_clients.push(
+                Endpoint::bind(SecretKey::generate(), config)
+                    .await
+                    .expect("stalled client"),
+            );
+        }
+        let valid_client = Endpoint::bind(SecretKey::generate(), config)
+            .await
+            .expect("valid client");
+        let mut allowed = stalled_clients
+            .iter()
+            .map(Endpoint::id)
+            .collect::<BTreeSet<_>>();
+        allowed.insert(valid_client.id());
+        let mut acceptor = server.inbound_acceptor(&allowed);
+        let mut entered_receivers = Vec::new();
+        let mut release_senders = Vec::new();
+        for _ in 0..MAX_PENDING_INBOUND_HANDSHAKES {
+            let (entered_send, entered_receive) = tokio::sync::oneshot::channel();
+            let (release_send, release_receive) = tokio::sync::oneshot::channel();
+            acceptor.test_handshake_gates.push_back(TestHandshakeGate {
+                entered: entered_send,
+                release: release_receive,
+            });
+            entered_receivers.push(entered_receive);
+            release_senders.push(release_send);
+        }
+
+        let server_task = tokio::spawn(async move {
+            let accepted = timeout(Duration::from_secs(10), acceptor.accept())
+                .await
+                .expect("later connection accepted before handshake deadline")
+                .expect("accept later connection");
+            (accepted, acceptor)
+        });
+        let mut stalled_tasks = Vec::new();
+        for (client, entered) in stalled_clients.iter().zip(entered_receivers) {
+            stalled_tasks.push(tokio::spawn({
+                let client = client.clone();
+                let server = server.clone();
+                async move {
+                    client
+                        .connect(ExpectedPeer {
+                            id: server.id(),
+                            address: loopback(&server),
+                        })
+                        .await
+                }
+            }));
+            timeout(Duration::from_secs(2), entered)
+                .await
+                .expect("stalled handshake admitted")
+                .expect("stalled handshake observation sender");
+        }
+
+        let valid_connection = valid_client
+            .connect(ExpectedPeer {
+                id: server.id(),
+                address: loopback(&server),
+            })
+            .await
+            .expect("valid client connects after saturation");
+        let (accepted, acceptor) = server_task.await.expect("server task");
+        assert_eq!(accepted.remote_id(), valid_client.id());
+        assert!(
+            release_senders.remove(0).send(()).is_err(),
+            "the oldest stalled handshake was not retired"
+        );
+        drop(acceptor);
+
+        for task in stalled_tasks {
+            task.abort();
+        }
+        accepted.close();
+        valid_connection.close();
+        for client in stalled_clients {
+            client.close().await;
+        }
+        valid_client.close().await;
         server.close().await;
     }
 
