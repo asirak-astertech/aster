@@ -1,7 +1,8 @@
 # CI Python safe-spawn interpreter
 
 The Ubuntu 24.04 `quality` lane builds **CPython 3.13.7** from its exact public
-source archive before installing the remaining mise toolchain. This is CI-only
+source archive on a cache miss, or restores that installation on an exact cache
+hit, before installing the remaining mise toolchain. This is CI-only
 maintenance, not a new product dependency, supported release artifact, or a
 requirements-evidence promotion. Other jobs and the repository's Python version
 pin are unchanged.
@@ -19,8 +20,18 @@ CPython's own configure check detect `posix_spawn_file_actions_addclosefrom_np`.
 No CPython patches, subprocess fallback, moving pyenv/python-build checkout,
 new package manager, pip dependencies, PGO, or LTO are introduced. The build
 uses two make jobs and a 15-minute step deadline within the existing 45-minute
-quality-job budget. It fails rather than reusing a pre-existing installation.
-Required standard-library extension imports are checked after installation.
+quality-job budget. The source-build script still rejects a pre-existing
+installation. The workflow skips that script only on an exact cache hit;
+required standard-library extension imports and close-from support are checked
+before publishing either a new or restored interpreter to PATH.
+
+Only the installed prefix is cached. Its key includes Ubuntu 24.04,
+architecture, and the hashes of the build script and workflow, so changing the
+source pin, checksum, configure flags, or prerequisite recipe forces a rebuild.
+No partial-key restore is used. Native prerequisites are installed and logged
+on both paths, and the direct/nested mise preflight and full process contract
+suite run on both paths. Cache transport uses SHA-pinned `actions/cache` v6.1.0
+(MIT; [public source](https://github.com/actions/cache/tree/55cc8345863c7cc4c66a329aec7e433d2d1c52a9)).
 
 This pins source input, **not bit-for-bit binary reproducibility**: the hosted
 Ubuntu image, compiler, libc, and development headers remain runner-provided
@@ -58,9 +69,10 @@ increase the existing 45-minute job or 15-minute source-build deadlines.
 These are observed package-page revisions, **not exact APT install pins**.
 Like the existing hosted-image compiler/libc inputs, they follow the configured
 Noble archive/security updates. The step logs actual installed package versions
-with `dpkg-query`; those run-specific direct-package versions, not this observation
-table, are the direct-package build receipt, not complete compiler/libc or
-transitive-library provenance. This deliberately avoids freezing obsolete security revisions
+with `dpkg-query`. On a cache miss, those versions are the direct-package build
+receipt; on a cache hit, they describe the current runner's runtime environment,
+not the packages that originally built the restored interpreter. Neither is
+complete compiler/libc or transitive-library provenance. This deliberately avoids freezing obsolete security revisions
 or claiming a reproducible Ubuntu snapshot. CPython's exact source version and
 SHA-256 remain unchanged. Public package pages establish availability, not a
 successful install or build on the next runner. The owner explicitly approved in
