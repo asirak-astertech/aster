@@ -288,10 +288,26 @@ jobs:
       - name: Install Rust quality components
         run: *install-rust-components
 
+      - name: Install pinned cargo-nextest
+        env:
+          CARGO_NEXTEST_SHA256: 32aa82416099eb12fffae9cf1a279ad201fecbd3f74826c613e32e9006b29867
+          CARGO_NEXTEST_URL: https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.145/cargo-nextest-0.9.145-x86_64-unknown-linux-gnu.tar.gz
+        run: |
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            "$CARGO_NEXTEST_URL" \
+            --output "$RUNNER_TEMP/cargo-nextest.tar.gz"
+          printf '%s  %s\n' "$CARGO_NEXTEST_SHA256" \
+            "$RUNNER_TEMP/cargo-nextest.tar.gz" | sha256sum --check --strict
+          mkdir "$RUNNER_TEMP/cargo-nextest-bin"
+          tar --extract --gzip --file "$RUNNER_TEMP/cargo-nextest.tar.gz" \
+            --directory "$RUNNER_TEMP/cargo-nextest-bin" cargo-nextest
+          printf '%s\n' "$RUNNER_TEMP/cargo-nextest-bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/cargo-nextest-bin/cargo-nextest" --version
+
       - name: Acquire Rust dependencies
         run: cargo fetch --locked
 
-      - name: Run Clippy and complete workspace tests offline
+      - name: Run Clippy and complete workspace tests with nextest offline
         env:
           CARGO_NET_OFFLINE: "true"
         run: mise run check-rust
