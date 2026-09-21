@@ -137,6 +137,9 @@ for delivery in page.deliveries {
         .acknowledge(subscription.id, delivery.state.id, delivery.token)
         .await?;
 }
+
+let local = states.delivery_status().await?;
+assert_eq!(local.subscriptions, 1);
 ```
 
 The operation key identifies the selector across process restarts. An exact
@@ -159,6 +162,11 @@ authenticated to compute the projection. If that complete matching set exceeds
 that bound, polling fails without advancing attempts; it never computes a
 current value from a partial snapshot. `has_more` instead means additional
 verified, unacknowledged current heads remain beyond `delivery_limit`.
+
+`delivery_status` is a read-only, structurally audited snapshot of the durable
+local selector and delivery ledger. Its subscription, pending, acknowledged,
+cursor, and selector-generation counts survive restart. They are not sync,
+contact, peer, transfer-progress, or convergence status.
 
 This is a positive-current-version queue, not a materialized projection or
 transition feed. An empty page means only that no positive Current version is

@@ -10872,6 +10872,9 @@ fn execute_selected_state_command(
         } => {
             let _ = response.send(application.unsubscribe(subscription));
         }
+        SelectedStateCommand::DeliveryStatus { response } => {
+            let _ = response.send(application.delivery_status());
+        }
     }
 }
 
@@ -10908,6 +10911,9 @@ fn execute_selected_record_command(
             response,
         } => {
             let _ = response.send(application.unsubscribe(subscription));
+        }
+        SelectedRecordCommand::DeliveryStatus { response } => {
+            let _ = response.send(application.delivery_status());
         }
     }
 }
@@ -30623,6 +30629,15 @@ mod tests {
                 .expect("repeat State acknowledgement through live actor"),
             StateAcknowledgement::AlreadyAcknowledged
         );
+        let state_status = selected_state
+            .delivery_status()
+            .await
+            .expect("State delivery status through live actor");
+        assert_eq!(state_status.subscriptions, 1);
+        assert_eq!(state_status.pending_deliveries, 0);
+        assert_eq!(state_status.acknowledged_deliveries, 1);
+        assert_eq!(state_status.delivery_cursors, 1);
+        assert_eq!(state_status.selector_generation, 1);
 
         let record_query = RecordQuery {
             topic,
@@ -30700,6 +30715,15 @@ mod tests {
                 .expect("repeat Record acknowledgement through live actor"),
             RecordAcknowledgement::AlreadyAcknowledged
         );
+        let record_status = selected_records
+            .delivery_status()
+            .await
+            .expect("Record delivery status through live actor");
+        assert_eq!(record_status.subscriptions, 1);
+        assert_eq!(record_status.pending_deliveries, 0);
+        assert_eq!(record_status.acknowledged_deliveries, 1);
+        assert_eq!(record_status.delivery_cursors, 1);
+        assert_eq!(record_status.selector_generation, 1);
 
         let retained_state = selected_state.clone();
         let retained_records = selected_records.clone();
@@ -30725,6 +30749,15 @@ mod tests {
             ApplicationErrorKind::StateUnavailable
         );
         assert_eq!(state_poll_closed.operation(), "state poll");
+        let state_status_closed = retained_state
+            .delivery_status()
+            .await
+            .expect_err("closed actor rejects retained State delivery status");
+        assert_eq!(
+            state_status_closed.kind(),
+            ApplicationErrorKind::StateUnavailable
+        );
+        assert_eq!(state_status_closed.operation(), "state delivery status");
         let record_closed = retained_records
             .query(record_query.clone())
             .await
@@ -30744,6 +30777,15 @@ mod tests {
             ApplicationErrorKind::StateUnavailable
         );
         assert_eq!(record_poll_closed.operation(), "record poll");
+        let record_status_closed = retained_records
+            .delivery_status()
+            .await
+            .expect_err("closed actor rejects retained Record delivery status");
+        assert_eq!(
+            record_status_closed.kind(),
+            ApplicationErrorKind::StateUnavailable
+        );
+        assert_eq!(record_status_closed.operation(), "record delivery status");
 
         let reopened = start_node(NodeConfig {
             state: state.clone(),
@@ -30769,6 +30811,15 @@ mod tests {
             published_state.id
         );
         let reopened_state_handle = reopened.selected_state();
+        let reopened_state_status = reopened_state_handle
+            .delivery_status()
+            .await
+            .expect("State delivery status survives live restart");
+        assert_eq!(reopened_state_status.subscriptions, 1);
+        assert_eq!(reopened_state_status.pending_deliveries, 0);
+        assert_eq!(reopened_state_status.acknowledged_deliveries, 1);
+        assert_eq!(reopened_state_status.delivery_cursors, 1);
+        assert_eq!(reopened_state_status.selector_generation, 1);
         assert!(
             reopened_state_handle
                 .poll(StatePollRequest {
@@ -30796,6 +30847,15 @@ mod tests {
             StateUnsubscribe::AlreadyAbsent
         );
         let reopened_record_handle = reopened.selected_records();
+        let reopened_record_status = reopened_record_handle
+            .delivery_status()
+            .await
+            .expect("Record delivery status survives live restart");
+        assert_eq!(reopened_record_status.subscriptions, 1);
+        assert_eq!(reopened_record_status.pending_deliveries, 0);
+        assert_eq!(reopened_record_status.acknowledged_deliveries, 1);
+        assert_eq!(reopened_record_status.delivery_cursors, 1);
+        assert_eq!(reopened_record_status.selector_generation, 1);
         assert_eq!(
             reopened_record_handle
                 .query(record_query)

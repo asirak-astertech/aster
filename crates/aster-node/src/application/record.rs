@@ -520,6 +520,19 @@ pub enum RecordUnsubscribe {
     AlreadyAbsent,
 }
 
+/// Structurally audited local Record delivery-ledger status.
+///
+/// This reports only durable application selectors and at-least-once delivery
+/// bookkeeping. It is not network synchronization or convergence status.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RecordDeliveryStatus {
+    pub subscriptions: u64,
+    pub pending_deliveries: u64,
+    pub acknowledged_deliveries: u64,
+    pub delivery_cursors: u64,
+    pub selector_generation: u64,
+}
+
 struct VerifiedRecordSubscriptionProjection {
     projection_id: RecordProjectionId,
     key: RecordProjectionKey,
@@ -682,6 +695,17 @@ impl SelectedRecordHandle {
         .await
     }
 
+    /// Returns audited local Record selector and delivery-ledger counts.
+    pub async fn delivery_status(&self) -> Result<RecordDeliveryStatus, ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedRecordCommand::DeliveryStatus { response },
+            received,
+            "record delivery status",
+        )
+        .await
+    }
+
     async fn send<T>(
         &self,
         command: SelectedRecordCommand,
@@ -730,6 +754,9 @@ pub(crate) enum SelectedRecordCommand {
         subscription: RecordSubscriptionId,
         response: oneshot::Sender<Result<RecordUnsubscribe, ApplicationError>>,
     },
+    DeliveryStatus {
+        response: oneshot::Sender<Result<RecordDeliveryStatus, ApplicationError>>,
+    },
 }
 
 impl SelectedRecordCommand {
@@ -759,6 +786,9 @@ impl SelectedRecordCommand {
             }
             Self::Unsubscribe { response, .. } => {
                 _ = response.send(Err(actor_unavailable("record unsubscribe")));
+            }
+            Self::DeliveryStatus { response } => {
+                _ = response.send(Err(actor_unavailable("record delivery status")));
             }
         }
     }
@@ -1376,6 +1406,22 @@ impl SelectedRecordNode {
             RecordUnsubscribe::Removed
         } else {
             RecordUnsubscribe::AlreadyAbsent
+        })
+    }
+
+    /// Returns audited local Record selector and delivery-ledger counts.
+    pub fn delivery_status(&mut self) -> Result<RecordDeliveryStatus, ApplicationError> {
+        let _policy = self.current_policy("record delivery status")?;
+        let stats = self
+            .store
+            .record_subscription_stats()
+            .map_err(|error| application_error("record delivery status", error.into()))?;
+        Ok(RecordDeliveryStatus {
+            subscriptions: stats.subscriptions,
+            pending_deliveries: stats.pending_deliveries,
+            acknowledged_deliveries: stats.acknowledged_deliveries,
+            delivery_cursors: stats.delivery_cursors,
+            selector_generation: stats.selector_generation,
         })
     }
 
@@ -2179,6 +2225,12 @@ mod tests {
             .expect_err("closed actor unsubscribe");
         assert_eq!(closed.kind(), ApplicationErrorKind::StateUnavailable);
         assert_eq!(closed.operation(), "record unsubscribe");
+        let closed = handle
+            .delivery_status()
+            .await
+            .expect_err("closed actor delivery status");
+        assert_eq!(closed.kind(), ApplicationErrorKind::StateUnavailable);
+        assert_eq!(closed.operation(), "record delivery status");
 
         let (response, received) = oneshot::channel();
         SelectedRecordCommand::Publish {
@@ -2266,6 +2318,17 @@ mod tests {
             .expect_err("rejected unsubscribe command");
         assert_eq!(rejected.kind(), ApplicationErrorKind::StateUnavailable);
         assert_eq!(rejected.operation(), "record unsubscribe");
+
+        let (response, received) = oneshot::channel();
+        let command = SelectedRecordCommand::DeliveryStatus { response };
+        assert!(!command.mutates_selectors());
+        command.reject();
+        let rejected = received
+            .await
+            .expect("actor delivery-status rejection response")
+            .expect_err("rejected delivery-status command");
+        assert_eq!(rejected.kind(), ApplicationErrorKind::StateUnavailable);
+        assert_eq!(rejected.operation(), "record delivery status");
     }
 
     struct TestRoot(PathBuf);
@@ -3473,6 +3536,95 @@ mod tests {
         assert!(projection.concurrent.is_empty());
         assert!(projection.conflict.is_none());
         assert_eq!(projection.superseded.len(), 2);
+    }
+
+    #[test]
+    fn record_delivery_status_tracks_durable_ledger_across_reopen() {
+        let root = TestRoot::new("delivery-status");
+        let subscription_request = RecordSubscriptionRequest {
+            operation_key: b"subscriptions/record/status".to_vec(),
+            topic: record_topic(),
+            scope: record_scope(),
+            include_descendant_scopes: false,
+        };
+
+        let (subscription, projection, token) = {
+            let mut node = selected_node(&root);
+            assert_eq!(
+                node.delivery_status()
+                    .expect("empty Record delivery status"),
+                RecordDeliveryStatus::default()
+            );
+            node.publish(request(b"record/status", b"ready"))
+                .expect("publish Record");
+            let subscription = node
+                .subscribe(subscription_request.clone())
+                .expect("create Record subscription");
+            let replay = node
+                .subscribe(subscription_request)
+                .expect("replay Record subscription");
+            assert_eq!(replay.id, subscription.id);
+            assert!(!replay.inserted);
+            assert_eq!(
+                node.delivery_status().expect("subscribed Record status"),
+                RecordDeliveryStatus {
+                    subscriptions: 1,
+                    pending_deliveries: 0,
+                    acknowledged_deliveries: 0,
+                    delivery_cursors: 0,
+                    selector_generation: 1,
+                }
+            );
+            let page = node
+                .poll(RecordPollRequest {
+                    subscription: subscription.id,
+                    delivery_limit: 1,
+                    scan_limit: MAX_SELECTED_RECORD_SUBSCRIPTION_SCAN,
+                })
+                .expect("poll Record");
+            let delivery = page.deliveries.into_iter().next().expect("delivery");
+            assert_eq!(
+                node.delivery_status().expect("pending Record status"),
+                RecordDeliveryStatus {
+                    subscriptions: 1,
+                    pending_deliveries: 1,
+                    acknowledged_deliveries: 0,
+                    delivery_cursors: 1,
+                    selector_generation: 1,
+                }
+            );
+            (subscription, delivery.projection_id, delivery.token)
+        };
+
+        let mut reopened = selected_node(&root);
+        assert_eq!(
+            reopened.delivery_status().expect("reopened Record status"),
+            RecordDeliveryStatus {
+                subscriptions: 1,
+                pending_deliveries: 1,
+                acknowledged_deliveries: 0,
+                delivery_cursors: 1,
+                selector_generation: 1,
+            }
+        );
+        assert_eq!(
+            reopened
+                .acknowledge(subscription.id, projection, token)
+                .expect("acknowledge Record"),
+            RecordAcknowledgement::Acknowledged
+        );
+        assert_eq!(
+            reopened
+                .delivery_status()
+                .expect("acknowledged Record status"),
+            RecordDeliveryStatus {
+                subscriptions: 1,
+                pending_deliveries: 0,
+                acknowledged_deliveries: 1,
+                delivery_cursors: 1,
+                selector_generation: 1,
+            }
+        );
     }
 
     #[test]
