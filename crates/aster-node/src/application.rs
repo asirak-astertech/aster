@@ -74,20 +74,21 @@ pub(crate) use record::SelectedRecordCommand;
 pub use record::{
     MAX_SELECTED_RECORD_DELIVERIES, MAX_SELECTED_RECORD_SUBSCRIPTION_SCAN,
     RECORD_DELIVERY_TOKEN_BYTES, RecordAcknowledgement, RecordConflict, RecordDelivery,
-    RecordDeliveryConflict, RecordDeliveryPage, RecordDeliveryProjection, RecordDeliveryToken,
-    RecordId, RecordItem, RecordPollRequest, RecordProjection, RecordProjectionId,
-    RecordProjectionKey, RecordPublishRequest, RecordPublishResult, RecordQuery,
-    RecordResolutionGuard, RecordResolveRequest, RecordSubscription, RecordSubscriptionId,
-    RecordSubscriptionRequest, RecordUnsubscribe, RecordVersionDisposition, SelectedRecordHandle,
-    SelectedRecordNode,
+    RecordDeliveryConflict, RecordDeliveryPage, RecordDeliveryProjection, RecordDeliveryStatus,
+    RecordDeliveryToken, RecordId, RecordItem, RecordPollRequest, RecordProjection,
+    RecordProjectionId, RecordProjectionKey, RecordPublishRequest, RecordPublishResult,
+    RecordQuery, RecordResolutionGuard, RecordResolveRequest, RecordSubscription,
+    RecordSubscriptionId, RecordSubscriptionRequest, RecordUnsubscribe, RecordVersionDisposition,
+    SelectedRecordHandle, SelectedRecordNode,
 };
 pub(crate) use state::SelectedStateCommand;
 pub use state::{
     MAX_SELECTED_STATE_DELIVERIES, MAX_SELECTED_STATE_SUBSCRIPTION_SCAN,
     STATE_DELIVERY_TOKEN_BYTES, SelectedStateHandle, SelectedStateNode, StateAcknowledgement,
-    StateDelivery, StateDeliveryPage, StateDeliveryToken, StateId, StateItem, StatePollRequest,
-    StateProjection, StatePublishRequest, StatePublishResult, StateQuery, StateSubscription,
-    StateSubscriptionId, StateSubscriptionRequest, StateUnsubscribe, StateVersionDisposition,
+    StateDelivery, StateDeliveryPage, StateDeliveryStatus, StateDeliveryToken, StateId, StateItem,
+    StatePollRequest, StateProjection, StatePublishRequest, StatePublishResult, StateQuery,
+    StateSubscription, StateSubscriptionId, StateSubscriptionRequest, StateUnsubscribe,
+    StateVersionDisposition,
 };
 
 /// Maximum number of accepted Event rows one query call may scan.

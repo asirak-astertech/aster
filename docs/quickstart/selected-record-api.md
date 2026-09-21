@@ -171,6 +171,9 @@ for delivery in page.deliveries {
         .await?;
 }
 
+let local = records.delivery_status().await?;
+assert_eq!(local.subscriptions, 1);
+
 assert_eq!(
     records.unsubscribe(subscription.id).await?,
     RecordUnsubscribe::Removed,
@@ -214,6 +217,11 @@ empty page means only that no unacknowledged positive active/conflicted
 projection is currently available; it does not prove that a key is absent.
 
 This is a durable projection queue, not a revision stream or transition log.
+
+`delivery_status` is a read-only, structurally audited snapshot of the durable
+local selector and delivery ledger. Its subscription, pending, acknowledged,
+cursor, and selector-generation counts survive restart. They are not sync,
+contact, peer, transfer-progress, or convergence status.
 
 Run the focused whole-projection mechanism regression with:
 

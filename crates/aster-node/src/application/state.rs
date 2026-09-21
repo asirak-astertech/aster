@@ -348,6 +348,19 @@ pub enum StateUnsubscribe {
     AlreadyAbsent,
 }
 
+/// Structurally audited local State delivery-ledger status.
+///
+/// This reports only durable application selectors and at-least-once delivery
+/// bookkeeping. It is not network synchronization or convergence status.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StateDeliveryStatus {
+    pub subscriptions: u64,
+    pub pending_deliveries: u64,
+    pub acknowledged_deliveries: u64,
+    pub delivery_cursors: u64,
+    pub selector_generation: u64,
+}
+
 struct VerifiedStateCandidate {
     id: StateId,
     item: Option<StateItem>,
@@ -504,6 +517,17 @@ impl SelectedStateHandle {
         .await
     }
 
+    /// Returns audited local State selector and delivery-ledger counts.
+    pub async fn delivery_status(&self) -> Result<StateDeliveryStatus, ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedStateCommand::DeliveryStatus { response },
+            received,
+            "state delivery status",
+        )
+        .await
+    }
+
     async fn send<T>(
         &self,
         command: SelectedStateCommand,
@@ -548,6 +572,9 @@ pub(crate) enum SelectedStateCommand {
         subscription: StateSubscriptionId,
         response: oneshot::Sender<Result<StateUnsubscribe, ApplicationError>>,
     },
+    DeliveryStatus {
+        response: oneshot::Sender<Result<StateDeliveryStatus, ApplicationError>>,
+    },
 }
 
 impl SelectedStateCommand {
@@ -574,6 +601,9 @@ impl SelectedStateCommand {
             }
             Self::Unsubscribe { response, .. } => {
                 _ = response.send(Err(actor_unavailable("state unsubscribe")));
+            }
+            Self::DeliveryStatus { response } => {
+                _ = response.send(Err(actor_unavailable("state delivery status")));
             }
         }
     }
@@ -1288,6 +1318,22 @@ impl SelectedStateNode {
         })
     }
 
+    /// Returns audited local State selector and delivery-ledger counts.
+    pub fn delivery_status(&mut self) -> Result<StateDeliveryStatus, ApplicationError> {
+        let _policy = self.current_policy("state delivery status")?;
+        let stats = self
+            .store
+            .state_subscription_stats()
+            .map_err(|error| application_error("state delivery status", error.into()))?;
+        Ok(StateDeliveryStatus {
+            subscriptions: stats.subscriptions,
+            pending_deliveries: stats.pending_deliveries,
+            acknowledged_deliveries: stats.acknowledged_deliveries,
+            delivery_cursors: stats.delivery_cursors,
+            selector_generation: stats.selector_generation,
+        })
+    }
+
     /// Returns the deterministic, freshly verified projection for one exact key.
     pub fn query(&mut self, query: StateQuery) -> Result<StateProjection, ApplicationError> {
         let policy = self.current_policy("state query")?;
@@ -1768,6 +1814,12 @@ mod tests {
             .expect_err("closed actor unsubscribe");
         assert_eq!(closed.kind(), ApplicationErrorKind::StateUnavailable);
         assert_eq!(closed.operation(), "state unsubscribe");
+        let closed = handle
+            .delivery_status()
+            .await
+            .expect_err("closed actor delivery status");
+        assert_eq!(closed.kind(), ApplicationErrorKind::StateUnavailable);
+        assert_eq!(closed.operation(), "state delivery status");
 
         let (response, received) = oneshot::channel();
         SelectedStateCommand::Publish {
@@ -1848,6 +1900,15 @@ mod tests {
             .expect_err("rejected unsubscribe command");
         assert_eq!(rejected.kind(), ApplicationErrorKind::StateUnavailable);
         assert_eq!(rejected.operation(), "state unsubscribe");
+
+        let (response, received) = oneshot::channel();
+        SelectedStateCommand::DeliveryStatus { response }.reject();
+        let rejected = received
+            .await
+            .expect("actor delivery-status rejection response")
+            .expect_err("rejected delivery-status command");
+        assert_eq!(rejected.kind(), ApplicationErrorKind::StateUnavailable);
+        assert_eq!(rejected.operation(), "state delivery status");
     }
 
     struct TestRoot(PathBuf);
@@ -2246,6 +2307,96 @@ mod tests {
         );
         assert_eq!(projection.recoverable.len(), 1);
         assert_eq!(projection.recoverable[0].id, first.id);
+    }
+
+    #[test]
+    fn state_delivery_status_tracks_durable_ledger_across_reopen() {
+        let root = TestRoot::new("delivery-status");
+        let subscription_request = StateSubscriptionRequest {
+            operation_key: b"subscriptions/state/status".to_vec(),
+            topic: Topic::new("ops.state").expect("topic"),
+            scope: Scope::new("mission/apps").expect("scope"),
+            include_descendant_scopes: false,
+        };
+
+        let (subscription, state, token) = {
+            let mut node = selected_node(&root);
+            assert_eq!(
+                node.delivery_status().expect("empty State delivery status"),
+                StateDeliveryStatus::default()
+            );
+            let state = node
+                .publish(request(b"state/status", b"ready"))
+                .expect("publish State");
+            let subscription = node
+                .subscribe(subscription_request.clone())
+                .expect("create State subscription");
+            let replay = node
+                .subscribe(subscription_request)
+                .expect("replay State subscription");
+            assert_eq!(replay.id, subscription.id);
+            assert!(!replay.inserted);
+            assert_eq!(
+                node.delivery_status().expect("subscribed State status"),
+                StateDeliveryStatus {
+                    subscriptions: 1,
+                    pending_deliveries: 0,
+                    acknowledged_deliveries: 0,
+                    delivery_cursors: 0,
+                    selector_generation: 1,
+                }
+            );
+            let page = node
+                .poll(StatePollRequest {
+                    subscription: subscription.id,
+                    delivery_limit: 1,
+                    scan_limit: MAX_SELECTED_STATE_SUBSCRIPTION_SCAN,
+                })
+                .expect("poll State");
+            let delivery = page.deliveries.into_iter().next().expect("delivery");
+            assert_eq!(delivery.state.id, state.id);
+            assert_eq!(
+                node.delivery_status().expect("pending State status"),
+                StateDeliveryStatus {
+                    subscriptions: 1,
+                    pending_deliveries: 1,
+                    acknowledged_deliveries: 0,
+                    delivery_cursors: 1,
+                    selector_generation: 1,
+                }
+            );
+            (subscription, state, delivery.token)
+        };
+
+        let mut reopened = selected_node(&root);
+        assert_eq!(
+            reopened.delivery_status().expect("reopened State status"),
+            StateDeliveryStatus {
+                subscriptions: 1,
+                pending_deliveries: 1,
+                acknowledged_deliveries: 0,
+                delivery_cursors: 1,
+                selector_generation: 1,
+            }
+        );
+        assert_eq!(
+            reopened
+                .acknowledge(subscription.id, state.id, token)
+                .expect("acknowledge State"),
+            StateAcknowledgement::Acknowledged
+        );
+        assert_eq!(
+            reopened
+                .delivery_status()
+                .expect("acknowledged State status"),
+            StateDeliveryStatus {
+                subscriptions: 1,
+                pending_deliveries: 0,
+                acknowledged_deliveries: 1,
+                delivery_cursors: 1,
+                selector_generation: 1,
+            }
+        );
     }
 
     #[test]
