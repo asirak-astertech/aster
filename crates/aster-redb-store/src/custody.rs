@@ -3653,6 +3653,12 @@ fn finalize_retirement_write(
             reason,
         )
         .map_err(event_operation::classify_retirement_invariant)?;
+        crate::numbered_event_operation::retire_numbered_results_write(
+            write,
+            EventTransferId::new(key.transfer_id),
+            reason,
+        )
+        .map_err(event_operation::classify_retirement_invariant)?;
     }
     batch.remove_peer_rows(write, key)?;
     retire_payload_write(write, key, record, batch)?;
