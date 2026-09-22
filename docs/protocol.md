@@ -1558,7 +1558,25 @@ The current handshake negotiates semantic versions `6`, `5`, `4`, `3`, `2`,
 and `1` and the complete suite `0x0001`. Offers are nonempty, nonzero,
 duplicate-free canonical descending lists of at most 16 values. The responder selects the highest common semantic
 version and its locally preferred complete common suite; the initiator requires
-both selections to have been offered and to be locally supported. Semantic `1`
+both selections to have been offered and to be locally supported.
+
+The semantic-version inheritance registry is normative:
+
+| Semantic version | Inherits | Additional mechanics |
+| --- | --- | --- |
+| `1` | — | stable Event and Blob-chunk transfer |
+| `2` | v1 | compact batch and bridge objects |
+| `3` | v2 | session custody record |
+| `4` | v3 | State and Record reconciliation |
+| `5` | v4 | direct Blob transfer |
+| `6` | v5 ordinary lanes byte-for-byte | Event bridge transfer |
+
+An inherited version retains every earlier stable encoding and selected-lane
+rule unless the registry names an additional mechanic. In particular, semantic
+v6 does not revise v1-v5 object bytes or ordinary-lane frame bytes; it only
+allocates the separately gated Event bridge mechanics in §9.3.
+
+Semantic `1`
 permits transfer object kinds `1` (source envelope) and `2` (Blob chunk).
 Semantics `2`, `3`, `4`, `5`, and `6` additionally permit the reserved kinds `3`
 (source-batch proof), `4` (bridge authorization), and `5` (bridge-route

@@ -1080,7 +1080,7 @@ cause a fresh response; deployments MUST rate-limit handshake work.
 After the kind-`2` prefix:
 
 ```text
-selected_semantic_version       u16 = 1, 2, or 3
+selected_semantic_version       u16 = 1, 2, 3, 4, 5, or 6
 selected_suite_id               u16 = 0x0001
 responder_nonce                 32 fresh random bytes
 responder_p256_ephemeral        b16(exactly 33 bytes)
