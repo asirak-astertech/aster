@@ -63,10 +63,10 @@ an image. Every `docker run` includes `--pull=never`, and `build` always uses
   interpreted as "absent".
 - The build preflight requires both deny-all policies, `.dockerignore` and
   `lab/Dockerfile.dockerignore`, to match the reviewed form byte-for-byte. It
-  rejects symbolic links and `.git`, `.agents`, or `.codex` anywhere in admitted
-  `crates/` inputs, records SHA-256 for every admitted file, then copies those
-  exact bytes into a new sealed context inside the evidence directory. Docker
-  never rereads the live workspace for that build.
+  rejects symbolic links, hidden directories, and unreviewed hidden files within
+  admitted `crates/` inputs, records SHA-256 for every admitted file, then copies
+  those exact bytes into a new sealed context inside the evidence directory.
+  Docker never rereads the live workspace for that build.
 
 OrbStack currently reports `DOCKER_INSECURE_NO_IPTABLES_RAW`. Consequently, the
 lab does not use Docker-published ports or treat Docker's bridge firewall as a
