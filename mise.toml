@@ -66,6 +66,7 @@ run = "cargo clippy --locked --workspace --all-targets --all-features -- -D warn
 
 [tasks.check-workspace-tests]
 description = "Run the complete all-feature Rust workspace tests"
+tools = { "cargo:cargo-nextest" = "0.9.145" }
 run = [
   "sh tools/with-test-resources.sh cargo nextest run --locked --workspace --all-features --no-fail-fast --test-threads 2",
   "sh tools/with-test-resources.sh cargo test --locked --workspace --all-features --doc",
