@@ -2,15 +2,17 @@ use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use aster_node::EventEmissionPolicy;
 use aster_node::application::{
-    AuthenticatedPeerStatus, ContactSyncStatus as NodeContactSyncStatus, EventAcknowledgement,
-    EventDelivery as NodeEventDelivery, EventGap as NodeEventGap, EventGapQuery, EventId,
-    EventItem, EventOperationAuditState, EventOperationCapacityWarning, EventPollRequest,
-    EventPublishOptions, EventPublishRequest, EventPublishResult, EventQuery, EventSubscriptionId,
+    AuthenticatedPeerStatus, CommittedEventContent, ContactSyncStatus as NodeContactSyncStatus,
+    EventAcknowledgement, EventClientId, EventDelivery as NodeEventDelivery,
+    EventGap as NodeEventGap, EventGapQuery, EventId, EventItem, EventOperationAbandonment,
+    EventOperationAuditState, EventOperationCapacityWarning, EventOperationSequence,
+    EventPollRequest, EventPublicationSession, EventPublishOptions, EventPublishRequest,
+    EventPublishResult, EventQuery, EventResultAcknowledgement, EventSubscriptionId,
     EventSubscriptionRequest, EventSyncStatus as NodeEventSyncStatus, EventUnsubscribe,
-    PeerAuthorization as NodePeerAuthorization, Priority as NodePriority, Scope,
-    SelectedEventHandle, SelectedEventStatus, Topic,
+    NumberedEventPublishRequest, NumberedEventResult, PeerAuthorization as NodePeerAuthorization,
+    Priority as NodePriority, Scope, SelectedEventHandle, SelectedEventStatus, Topic,
 };
-use aster_redb_store::MAX_EVENT_PENDING_DELIVERIES;
+use aster_redb_store::{CustodyRetirementReason, MAX_EVENT_PENDING_DELIVERIES};
 use connectrpc::{
     ConnectError, ErrorCode, RequestContext, Response, ServiceRequest, ServiceResult, ServiceStream,
 };
@@ -112,6 +114,43 @@ pub(crate) fn rejection_router() -> connectrpc::Router {
         )
         .route_bidi_stream(
             APPLICATION_SERVICE_NAME,
+            "BeginEventPublicationSession",
+            rejection_handler::<
+                api::BeginEventPublicationSessionRequest,
+                api::BeginEventPublicationSessionResponse,
+            >(),
+        )
+        .route_bidi_stream(
+            APPLICATION_SERVICE_NAME,
+            "CompleteEventPublicationRecovery",
+            rejection_handler::<
+                api::CompleteEventPublicationRecoveryRequest,
+                api::CompleteEventPublicationRecoveryResponse,
+            >(),
+        )
+        .route_bidi_stream(
+            APPLICATION_SERVICE_NAME,
+            "PublishNumberedEvent",
+            rejection_handler::<api::PublishNumberedEventRequest, api::PublishNumberedEventResponse>(),
+        )
+        .route_bidi_stream(
+            APPLICATION_SERVICE_NAME,
+            "AbandonEventPublication",
+            rejection_handler::<
+                api::AbandonEventPublicationRequest,
+                api::AbandonEventPublicationResponse,
+            >(),
+        )
+        .route_bidi_stream(
+            APPLICATION_SERVICE_NAME,
+            "AcknowledgeEventPublicationResult",
+            rejection_handler::<
+                api::AcknowledgeEventPublicationResultRequest,
+                api::AcknowledgeEventPublicationResultResponse,
+            >(),
+        )
+        .route_bidi_stream(
+            APPLICATION_SERVICE_NAME,
             "QueryEvents",
             rejection_handler::<api::QueryEventsRequest, api::QueryEventsResponse>(),
         )
@@ -189,6 +228,157 @@ impl api::AsterApplicationService for AsterConnectService {
             .await
             .map_err(connect_application_error)?;
         bounded_response(publish_response(result), PublicOperation::PublishEvent)
+    }
+
+    async fn begin_event_publication_session(
+        &self,
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, api::BeginEventPublicationSessionRequest>,
+    ) -> ServiceResult<api::BeginEventPublicationSessionResponse> {
+        let request = request.to_owned_message();
+        let operation = PublicOperation::BeginEventPublicationSession;
+        let snapshot = self
+            .events
+            .begin_publication_session(
+                parse_client_id(request.client_id, operation)?,
+                request.expected_session,
+                request.claim_nonce,
+            )
+            .await
+            .map_err(connect_application_error)?;
+        bounded_response(
+            api::BeginEventPublicationSessionResponse {
+                session: snapshot.session.get(),
+                allocated_through: snapshot.allocated_through,
+                snapshot_revision: snapshot.snapshot_revision,
+                outstanding: snapshot
+                    .outstanding
+                    .into_iter()
+                    .map(numbered_result_message)
+                    .collect(),
+                ..Default::default()
+            },
+            operation,
+        )
+    }
+
+    async fn complete_event_publication_recovery(
+        &self,
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, api::CompleteEventPublicationRecoveryRequest>,
+    ) -> ServiceResult<api::CompleteEventPublicationRecoveryResponse> {
+        let request = request.to_owned_message();
+        let operation = PublicOperation::CompleteEventPublicationRecovery;
+        self.events
+            .complete_publication_recovery(
+                parse_client_id(request.client_id, operation)?,
+                parse_publication_session(request.session, operation)?,
+                request.snapshot_revision,
+            )
+            .await
+            .map_err(connect_application_error)?;
+        bounded_response(
+            api::CompleteEventPublicationRecoveryResponse::default(),
+            operation,
+        )
+    }
+
+    async fn publish_numbered_event(
+        &self,
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, api::PublishNumberedEventRequest>,
+    ) -> ServiceResult<api::PublishNumberedEventResponse> {
+        let request = request.to_owned_message();
+        let operation = PublicOperation::PublishNumberedEvent;
+        let options = request
+            .ttl_ms
+            .map(EventPublishOptions::finite_ttl_ms)
+            .transpose()
+            .map_err(connect_application_error)?
+            .unwrap_or_else(EventPublishOptions::durable);
+        let outcome = self
+            .events
+            .publish_numbered(
+                NumberedEventPublishRequest {
+                    client_id: parse_client_id(request.client_id, operation)?,
+                    session: parse_publication_session(request.session, operation)?,
+                    sequence: parse_operation_sequence(request.operation_sequence, operation)?,
+                    predecessor: request
+                        .predecessor_id
+                        .map(|value| parse_event_id(&value, operation))
+                        .transpose()?,
+                    topic: parse_topic(request.topic, operation)?,
+                    scope: parse_scope(request.scope, operation)?,
+                    priority: parse_priority(request.priority, operation)?,
+                    logical_key: request.logical_key,
+                    payload: request.payload,
+                    tombstone: request.tombstone,
+                },
+                options,
+            )
+            .await
+            .map_err(connect_application_error)?;
+        bounded_response(
+            api::PublishNumberedEventResponse {
+                result: numbered_result_message(outcome.result).into(),
+                inserted: outcome.inserted,
+                ..Default::default()
+            },
+            operation,
+        )
+    }
+
+    async fn abandon_event_publication(
+        &self,
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, api::AbandonEventPublicationRequest>,
+    ) -> ServiceResult<api::AbandonEventPublicationResponse> {
+        let request = request.to_owned_message();
+        let operation = PublicOperation::AbandonEventPublication;
+        let outcome = self
+            .events
+            .abandon_publication(
+                parse_client_id(request.client_id, operation)?,
+                parse_publication_session(request.session, operation)?,
+                parse_operation_sequence(request.operation_sequence, operation)?,
+            )
+            .await
+            .map_err(connect_application_error)?;
+        bounded_response(
+            api::AbandonEventPublicationResponse {
+                already_abandoned: matches!(outcome, EventOperationAbandonment::AlreadyAbandoned),
+                ..Default::default()
+            },
+            operation,
+        )
+    }
+
+    async fn acknowledge_event_publication_result(
+        &self,
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, api::AcknowledgeEventPublicationResultRequest>,
+    ) -> ServiceResult<api::AcknowledgeEventPublicationResultResponse> {
+        let request = request.to_owned_message();
+        let operation = PublicOperation::AcknowledgeEventPublicationResult;
+        let outcome = self
+            .events
+            .acknowledge_publication_result(
+                parse_client_id(request.client_id, operation)?,
+                parse_publication_session(request.session, operation)?,
+                parse_operation_sequence(request.operation_sequence, operation)?,
+            )
+            .await
+            .map_err(connect_application_error)?;
+        bounded_response(
+            api::AcknowledgeEventPublicationResultResponse {
+                already_acknowledged: matches!(
+                    outcome,
+                    EventResultAcknowledgement::AlreadyAcknowledged
+                ),
+                ..Default::default()
+            },
+            operation,
+        )
     }
 
     async fn query_events(
@@ -575,6 +765,34 @@ fn event_message(event: EventItem) -> api::Event {
     }
 }
 
+fn numbered_result_message(result: NumberedEventResult) -> api::CommittedPublicationResult {
+    let (content, retirement_reason) = match result.content {
+        CommittedEventContent::Available => (api::CommittedContentStatus::Available, None),
+        CommittedEventContent::Retired(reason) => (
+            api::CommittedContentStatus::Retired,
+            Some(match reason {
+                CustodyRetirementReason::Expired => api::RetirementReason::Expired.into(),
+                CustodyRetirementReason::QuotaPressure => {
+                    api::RetirementReason::QuotaPressure.into()
+                }
+            }),
+        ),
+    };
+    api::CommittedPublicationResult {
+        operation_sequence: result.sequence.get(),
+        receipt: api::CommittedEventReceipt {
+            transfer_id: result.receipt.transfer_id.as_bytes().to_vec(),
+            event_id: result.receipt.semantic_id.as_bytes().to_vec(),
+            acceptance_marker: result.receipt.acceptance_marker,
+            ..Default::default()
+        }
+        .into(),
+        content: content.into(),
+        retirement_reason,
+        ..Default::default()
+    }
+}
+
 fn delivery_message(delivery: NodeEventDelivery) -> api::EventDelivery {
     api::EventDelivery {
         event: event_message(delivery.event).into(),
@@ -783,6 +1001,27 @@ fn parse_node_id(value: &[u8], operation: PublicOperation) -> Result<[u8; 32], C
 
 fn parse_event_id(value: &[u8], operation: PublicOperation) -> Result<EventId, ConnectError> {
     parse_node_id(value, operation).map(EventId::from_bytes)
+}
+
+fn parse_client_id(
+    value: Vec<u8>,
+    operation: PublicOperation,
+) -> Result<EventClientId, ConnectError> {
+    EventClientId::new(value).map_err(|_| malformed_input(operation))
+}
+
+fn parse_publication_session(
+    value: u64,
+    operation: PublicOperation,
+) -> Result<EventPublicationSession, ConnectError> {
+    EventPublicationSession::new(value).map_err(|_| malformed_input(operation))
+}
+
+fn parse_operation_sequence(
+    value: u64,
+    operation: PublicOperation,
+) -> Result<EventOperationSequence, ConnectError> {
+    EventOperationSequence::new(value).map_err(|_| malformed_input(operation))
 }
 
 fn parse_subscription_id(
