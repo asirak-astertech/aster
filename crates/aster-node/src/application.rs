@@ -31,10 +31,14 @@ use aster_redb_store::{
     EventSemanticId, EventSubscriptionId as StoreEventSubscriptionId, EventSubscriptionKey,
     EventSubscriptionMode, EventSubscriptionPollSelection, EventSubscriptionRemoveOutcome,
     EventSubscriptionSpec, MAX_EVENT_PAGE, MAX_EVENT_POLL_DELIVERIES, MAX_EVENT_SUBSCRIPTION_SCAN,
-    Store, StoreError, StoreLimits, StoredEvent,
+    Store, StoreError, StoreLimits, StoredEvent, StoredEventTransfer,
 };
 pub use aster_redb_store::{
-    EventOperationAuditState, EventOperationAuditStatus, EventOperationLimits, EventOperationStats,
+    CommittedEventContent, CommittedEventReceipt, EventClientId, EventOperationAbandonment,
+    EventOperationAuditState, EventOperationAuditStatus, EventOperationLimits,
+    EventOperationSequence, EventOperationStats, EventPublicationSession, EventRecoverySnapshot,
+    EventResultAcknowledgement, NumberedEventOperationError, NumberedEventOperationStats,
+    NumberedEventPublishOutcome, NumberedEventResult,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -110,6 +114,11 @@ pub enum ApplicationErrorKind {
     UnauthorizedOrRevoked,
     PolicyUnsettled,
     Conflict,
+    SessionFenced,
+    SequenceGap,
+    SequenceRetired,
+    RecoveryRequired,
+    LegacyState,
     /// The operation remains durably bound after its finite payload was retired.
     ExpiredOrRetired,
     /// The durable Event idempotency map reached its dedicated hard ceiling.
@@ -157,6 +166,11 @@ impl fmt::Display for ApplicationError {
             }
             ApplicationErrorKind::PolicyUnsettled => "mission policy is not settled",
             ApplicationErrorKind::Conflict => "idempotency or causal conflict",
+            ApplicationErrorKind::SessionFenced => "publication session is fenced",
+            ApplicationErrorKind::SequenceGap => "publication sequence has a gap",
+            ApplicationErrorKind::SequenceRetired => "publication sequence is retired",
+            ApplicationErrorKind::RecoveryRequired => "publication recovery is required",
+            ApplicationErrorKind::LegacyState => "legacy publication state requires a fresh store",
             ApplicationErrorKind::ExpiredOrRetired => {
                 "idempotent publication expired or was retired"
             }
@@ -199,7 +213,7 @@ impl EventId {
         Self(*id.as_bytes())
     }
 
-    fn into_store(self) -> EventSemanticId {
+    pub(crate) fn into_store(self) -> EventSemanticId {
         EventSemanticId::new(self.0)
     }
 }
@@ -223,6 +237,21 @@ impl fmt::Display for EventId {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EventPublishRequest {
     pub operation_key: Vec<u8>,
+    pub predecessor: Option<EventId>,
+    pub topic: Topic,
+    pub scope: Scope,
+    pub priority: Priority,
+    pub logical_key: Vec<u8>,
+    pub payload: Vec<u8>,
+    pub tombstone: bool,
+}
+
+/// Numbered Event publication owned by one configured application client.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NumberedEventPublishRequest {
+    pub client_id: EventClientId,
+    pub session: EventPublicationSession,
+    pub sequence: EventOperationSequence,
     pub predecessor: Option<EventId>,
     pub topic: Topic,
     pub scope: Scope,
@@ -718,6 +747,104 @@ impl SelectedEventHandle {
         .await
     }
 
+    pub async fn begin_publication_session(
+        &self,
+        client_id: EventClientId,
+        expected_session: u64,
+        claim_nonce: Vec<u8>,
+    ) -> Result<EventRecoverySnapshot, ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedEventCommand::BeginPublicationSession {
+                client_id,
+                expected_session,
+                claim_nonce,
+                response,
+            },
+            received,
+            "begin_publication_session",
+        )
+        .await
+    }
+
+    pub async fn complete_publication_recovery(
+        &self,
+        client_id: EventClientId,
+        session: EventPublicationSession,
+        snapshot_revision: u64,
+    ) -> Result<(), ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedEventCommand::CompletePublicationRecovery {
+                client_id,
+                session,
+                snapshot_revision,
+                response,
+            },
+            received,
+            "complete_publication_recovery",
+        )
+        .await
+    }
+
+    pub async fn publish_numbered(
+        &self,
+        request: NumberedEventPublishRequest,
+        options: EventPublishOptions,
+    ) -> Result<NumberedEventPublishOutcome, ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedEventCommand::PublishNumbered {
+                request,
+                options,
+                response,
+            },
+            received,
+            "publish_numbered",
+        )
+        .await
+    }
+
+    pub async fn abandon_publication(
+        &self,
+        client_id: EventClientId,
+        session: EventPublicationSession,
+        sequence: EventOperationSequence,
+    ) -> Result<EventOperationAbandonment, ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedEventCommand::AbandonPublication {
+                client_id,
+                session,
+                sequence,
+                response,
+            },
+            received,
+            "abandon_publication",
+        )
+        .await
+    }
+
+    pub async fn acknowledge_publication_result(
+        &self,
+        client_id: EventClientId,
+        session: EventPublicationSession,
+        sequence: EventOperationSequence,
+    ) -> Result<EventResultAcknowledgement, ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedEventCommand::AcknowledgePublicationResult {
+                client_id,
+                session,
+                sequence,
+                response,
+            },
+            received,
+            "acknowledge_publication_result",
+        )
+        .await
+    }
+
     pub async fn query(&self, query: EventQuery) -> Result<EventQueryPage, ApplicationError> {
         let (response, received) = oneshot::channel();
         self.send(
@@ -835,6 +962,35 @@ pub(crate) enum SelectedEventCommand {
         options: EventPublishOptions,
         response: oneshot::Sender<Result<EventPublishResult, ApplicationError>>,
     },
+    BeginPublicationSession {
+        client_id: EventClientId,
+        expected_session: u64,
+        claim_nonce: Vec<u8>,
+        response: oneshot::Sender<Result<EventRecoverySnapshot, ApplicationError>>,
+    },
+    CompletePublicationRecovery {
+        client_id: EventClientId,
+        session: EventPublicationSession,
+        snapshot_revision: u64,
+        response: oneshot::Sender<Result<(), ApplicationError>>,
+    },
+    PublishNumbered {
+        request: NumberedEventPublishRequest,
+        options: EventPublishOptions,
+        response: oneshot::Sender<Result<NumberedEventPublishOutcome, ApplicationError>>,
+    },
+    AbandonPublication {
+        client_id: EventClientId,
+        session: EventPublicationSession,
+        sequence: EventOperationSequence,
+        response: oneshot::Sender<Result<EventOperationAbandonment, ApplicationError>>,
+    },
+    AcknowledgePublicationResult {
+        client_id: EventClientId,
+        session: EventPublicationSession,
+        sequence: EventOperationSequence,
+        response: oneshot::Sender<Result<EventResultAcknowledgement, ApplicationError>>,
+    },
     Query {
         query: EventQuery,
         response: oneshot::Sender<Result<EventQueryPage, ApplicationError>>,
@@ -874,6 +1030,21 @@ impl SelectedEventCommand {
         match self {
             Self::Publish { response, .. } => {
                 _ = response.send(Err(actor_unavailable("publish")));
+            }
+            Self::BeginPublicationSession { response, .. } => {
+                _ = response.send(Err(actor_unavailable("begin_publication_session")));
+            }
+            Self::CompletePublicationRecovery { response, .. } => {
+                _ = response.send(Err(actor_unavailable("complete_publication_recovery")));
+            }
+            Self::PublishNumbered { response, .. } => {
+                _ = response.send(Err(actor_unavailable("publish_numbered")));
+            }
+            Self::AbandonPublication { response, .. } => {
+                _ = response.send(Err(actor_unavailable("abandon_publication")));
+            }
+            Self::AcknowledgePublicationResult { response, .. } => {
+                _ = response.send(Err(actor_unavailable("acknowledge_publication_result")));
             }
             Self::Query { response, .. } => _ = response.send(Err(actor_unavailable("query"))),
             Self::Subscribe { response, .. } => {
@@ -1503,6 +1674,91 @@ impl SelectedEventNode {
         })
     }
 
+    pub fn begin_publication_session(
+        &self,
+        client_id: &EventClientId,
+        expected_session: u64,
+        claim_nonce: &[u8],
+    ) -> Result<EventRecoverySnapshot, ApplicationError> {
+        self.store
+            .begin_event_publication_session(client_id, expected_session, claim_nonce)
+            .map_err(|error| application_error("begin_publication_session", error.into()))
+    }
+
+    pub fn complete_publication_recovery(
+        &self,
+        client_id: &EventClientId,
+        session: EventPublicationSession,
+        snapshot_revision: u64,
+    ) -> Result<(), ApplicationError> {
+        self.store
+            .complete_event_publication_recovery(client_id, session, snapshot_revision)
+            .map_err(|error| application_error("complete_publication_recovery", error.into()))
+    }
+
+    pub fn abandon_publication(
+        &self,
+        client_id: &EventClientId,
+        session: EventPublicationSession,
+        sequence: EventOperationSequence,
+    ) -> Result<EventOperationAbandonment, ApplicationError> {
+        self.store
+            .abandon_event_publication(client_id, session, sequence)
+            .map_err(|error| application_error("abandon_publication", error.into()))
+    }
+
+    pub fn acknowledge_publication_result(
+        &self,
+        client_id: &EventClientId,
+        session: EventPublicationSession,
+        sequence: EventOperationSequence,
+    ) -> Result<EventResultAcknowledgement, ApplicationError> {
+        self.store
+            .acknowledge_event_publication_result(client_id, session, sequence)
+            .map_err(|error| application_error("acknowledge_publication_result", error.into()))
+    }
+
+    pub fn publish_numbered(
+        &mut self,
+        request: NumberedEventPublishRequest,
+        options: EventPublishOptions,
+    ) -> Result<NumberedEventPublishOutcome, ApplicationError> {
+        if options.ttl_ms().is_some()
+            && !request.tombstone
+            && !self.custody_clock.supports_finite_ttl()
+        {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::RequestRejected,
+                "publish_numbered",
+            ));
+        }
+        self.maintain_custody_for("publish_numbered")?;
+        let custody_sample = Some(
+            self.custody_clock
+                .sample()
+                .map_err(|error| application_error("publish_numbered", error))?,
+        );
+        let policy = self.current_policy("publish_numbered")?;
+        let outcome = crate::runtime::publish_selected_numbered_event_once(
+            &self.store,
+            &policy,
+            &mut self.verifier,
+            request,
+            options,
+            custody_sample,
+        )
+        .map_err(|error| application_error("publish_numbered", error))?;
+        if let Some(StoredEventTransfer::Accepted(stored)) = self
+            .store
+            .get_transfer_with_policy(&policy, outcome.result.receipt.transfer_id)
+            .map_err(|error| application_error("publish_numbered", error.into()))?
+        {
+            cache_accepted_stored_event(&self.event_route_cache, &mut self.verifier, &stored)
+                .map_err(|error| application_error("publish_numbered", error))?;
+        }
+        Ok(outcome)
+    }
+
     /// Returns one bounded marker-ordered page of active, content-verified Events.
     pub fn query(&mut self, query: EventQuery) -> Result<EventQueryPage, ApplicationError> {
         self.maintain_custody_for("query")?;
@@ -1920,6 +2176,38 @@ pub(crate) fn runtime_application_error(
 
 fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
     match error {
+        StoreError::NumberedEventOperation(error) => match error {
+            NumberedEventOperationError::InvalidClientId
+            | NumberedEventOperationError::InvalidClaimNonce
+            | NumberedEventOperationError::InvalidSession
+            | NumberedEventOperationError::InvalidSequence
+            | NumberedEventOperationError::ClientNotFound
+            | NumberedEventOperationError::ResultNotFound => ApplicationErrorKind::InvalidRequest,
+            NumberedEventOperationError::SessionFenced => ApplicationErrorKind::SessionFenced,
+            NumberedEventOperationError::IntentConflict => ApplicationErrorKind::Conflict,
+            NumberedEventOperationError::SequenceRetired => ApplicationErrorKind::SequenceRetired,
+            NumberedEventOperationError::RecoveryRequired
+            | NumberedEventOperationError::RecoveryRevisionChanged => {
+                ApplicationErrorKind::RecoveryRequired
+            }
+            NumberedEventOperationError::SequenceGap => ApplicationErrorKind::SequenceGap,
+            NumberedEventOperationError::ClientLimitExceeded
+            | NumberedEventOperationError::OutstandingLimitExceeded
+            | NumberedEventOperationError::GlobalRecordLimitExceeded
+            | NumberedEventOperationError::GlobalByteLimitExceeded
+            | NumberedEventOperationError::RecoverySnapshotTooLarge => {
+                ApplicationErrorKind::OperationCapacity
+            }
+            NumberedEventOperationError::SequenceExhausted
+            | NumberedEventOperationError::SessionExhausted
+            | NumberedEventOperationError::RevisionExhausted
+            | NumberedEventOperationError::Invariant(_) => ApplicationErrorKind::StateUnavailable,
+            NumberedEventOperationError::LegacyStoreRequiresFreshState
+            | NumberedEventOperationError::LegacyOperationDisabled => {
+                ApplicationErrorKind::LegacyState
+            }
+            _ => ApplicationErrorKind::StateUnavailable,
+        },
         StoreError::EventOperationAuditCancelled => ApplicationErrorKind::StateUnavailable,
         StoreError::Blob(error) => blob_store_error_kind(error),
         // The bridge foundation has no selected application surface yet. Any
@@ -2851,6 +3139,277 @@ mod tests {
             payload: payload.to_vec(),
             tombstone: false,
         }
+    }
+
+    fn numbered_request(
+        client_id: &EventClientId,
+        session: EventPublicationSession,
+        sequence: u64,
+        payload: &[u8],
+    ) -> NumberedEventPublishRequest {
+        NumberedEventPublishRequest {
+            client_id: client_id.clone(),
+            session,
+            sequence: EventOperationSequence::new(sequence).expect("sequence"),
+            predecessor: None,
+            topic: Topic::new("ops.alpha").expect("topic"),
+            scope: Scope::new("mission/apps").expect("scope"),
+            priority: Priority::Priority,
+            logical_key: b"numbered-asset".to_vec(),
+            payload: payload.to_vec(),
+            tombstone: false,
+        }
+    }
+
+    #[test]
+    fn numbered_publication_retries_compacts_sparse_results_and_recovers_after_restart() {
+        let root = TestRoot::new("numbered-publication");
+        let client = EventClientId::new(b"numbered-client".to_vec()).expect("client");
+        let first_session;
+        let first_result;
+        {
+            let mut node = selected_node(&root);
+            let recovery = node
+                .begin_publication_session(&client, 0, b"first-process")
+                .expect("claim");
+            first_session = recovery.session;
+            node.complete_publication_recovery(
+                &client,
+                recovery.session,
+                recovery.snapshot_revision,
+            )
+            .expect("complete recovery");
+
+            first_result = node
+                .publish_numbered(
+                    numbered_request(&client, recovery.session, 1, b"first"),
+                    EventPublishOptions::durable(),
+                )
+                .expect("first publication");
+            assert!(first_result.inserted);
+            let exact = node
+                .publish_numbered(
+                    numbered_request(&client, recovery.session, 1, b"first"),
+                    EventPublishOptions::durable(),
+                )
+                .expect("exact retry");
+            assert!(!exact.inserted);
+            assert_eq!(exact.result, first_result.result);
+
+            let conflict = node
+                .publish_numbered(
+                    numbered_request(&client, recovery.session, 1, b"changed"),
+                    EventPublishOptions::durable(),
+                )
+                .expect_err("changed intent");
+            assert_eq!(conflict.kind(), ApplicationErrorKind::Conflict);
+            let gap = node
+                .publish_numbered(
+                    numbered_request(&client, recovery.session, 3, b"gap"),
+                    EventPublishOptions::durable(),
+                )
+                .expect_err("sequence gap");
+            assert_eq!(gap.kind(), ApplicationErrorKind::SequenceGap);
+
+            node.publish_numbered(
+                numbered_request(&client, recovery.session, 2, b"second"),
+                EventPublishOptions::durable(),
+            )
+            .expect("second publication");
+            assert_eq!(
+                node.acknowledge_publication_result(
+                    &client,
+                    recovery.session,
+                    EventOperationSequence::new(2).expect("sequence"),
+                )
+                .expect("compact later result"),
+                EventResultAcknowledgement::Acknowledged
+            );
+        }
+
+        let mut reopened = SelectedEventNode::open_unprotected_reference(
+            root.path(),
+            root.path().join("mission.unprotected-reference.bundle"),
+        )
+        .expect("reopen selected Event node");
+        let recovery = reopened
+            .begin_publication_session(&client, first_session.get(), b"second-process")
+            .expect("take over");
+        assert_eq!(recovery.allocated_through, 2);
+        assert_eq!(recovery.outstanding, vec![first_result.result]);
+        reopened
+            .complete_publication_recovery(&client, recovery.session, recovery.snapshot_revision)
+            .expect("complete restart recovery");
+        reopened
+            .complete_publication_recovery(&client, recovery.session, recovery.snapshot_revision)
+            .expect("repeat lost completion response");
+        let stale = reopened
+            .abandon_publication(
+                &client,
+                first_session,
+                EventOperationSequence::new(3).expect("sequence"),
+            )
+            .expect_err("stale process is fenced");
+        assert_eq!(stale.kind(), ApplicationErrorKind::SessionFenced);
+        reopened
+            .acknowledge_publication_result(
+                &client,
+                recovery.session,
+                EventOperationSequence::new(1).expect("sequence"),
+            )
+            .expect("acknowledge old result");
+        let retired = reopened
+            .publish_numbered(
+                numbered_request(&client, recovery.session, 1, b"first"),
+                EventPublishOptions::durable(),
+            )
+            .expect_err("compacted sequence is permanently retired");
+        assert_eq!(retired.kind(), ApplicationErrorKind::SequenceRetired);
+    }
+
+    #[test]
+    fn numbered_result_preserves_committed_truth_after_ttl_retirement() {
+        let root = TestRoot::new("numbered-ttl-result");
+        let client = EventClientId::new(b"ttl-client".to_vec()).expect("client");
+        let clock_id = [0x7d; 16];
+        let mut node = selected_node(&root);
+        node.custody_clock = NodeCustodyClock::injected(clock_id, 0, 0);
+        let recovery = node
+            .begin_publication_session(&client, 0, b"ttl-session")
+            .expect("claim");
+        node.complete_publication_recovery(&client, recovery.session, recovery.snapshot_revision)
+            .expect("complete recovery");
+        let published = node
+            .publish_numbered(
+                numbered_request(&client, recovery.session, 1, b"brief"),
+                EventPublishOptions::finite_ttl_ms(10).expect("ttl"),
+            )
+            .expect("publish finite Event");
+        assert_eq!(published.result.content, CommittedEventContent::Available);
+
+        node.custody_clock = NodeCustodyClock::injected(clock_id, 10, 0);
+        node.maintain_custody().expect("expire content");
+        let next = node
+            .begin_publication_session(&client, recovery.session.get(), b"after-expiry")
+            .expect("take over after expiry");
+        assert_eq!(next.outstanding.len(), 1);
+        assert_eq!(next.outstanding[0].receipt, published.result.receipt);
+        assert_eq!(
+            next.outstanding[0].content,
+            CommittedEventContent::Retired(aster_redb_store::CustodyRetirementReason::Expired)
+        );
+    }
+
+    #[test]
+    fn numbered_profile_refuses_legacy_ledger_without_modifying_it() {
+        let root = TestRoot::new("numbered-refuses-legacy");
+        let mut node = selected_node(&root);
+        let legacy = node
+            .publish(request(
+                b"legacy-operation",
+                "ops.alpha",
+                b"legacy-asset",
+                b"preserve-me",
+            ))
+            .expect("legacy publication");
+        let client = EventClientId::new(b"new-profile-client".to_vec()).expect("client");
+        let error = node
+            .begin_publication_session(&client, 0, b"cannot-migrate")
+            .expect_err("legacy state requires a fresh boundary");
+        assert_eq!(error.kind(), ApplicationErrorKind::LegacyState);
+        let retained = node.query(EventQuery::default()).expect("legacy query");
+        assert_eq!(retained.items.len(), 1);
+        assert_eq!(retained.items[0].id, legacy.id);
+        assert_eq!(retained.items[0].payload, b"preserve-me");
+
+        let numbered_root = TestRoot::new("legacy-refuses-numbered");
+        let mut numbered_node = selected_node(&numbered_root);
+        let recovery = numbered_node
+            .begin_publication_session(&client, 0, b"numbered-only")
+            .expect("initialize numbered profile");
+        numbered_node
+            .complete_publication_recovery(&client, recovery.session, recovery.snapshot_revision)
+            .expect("complete recovery");
+        let legacy_error = numbered_node
+            .publish(request(
+                b"legacy-after-numbered",
+                "ops.alpha",
+                b"legacy-asset",
+                b"must-not-commit",
+            ))
+            .expect_err("numbered state disables the legacy ledger");
+        assert_eq!(legacy_error.kind(), ApplicationErrorKind::LegacyState);
+        assert!(
+            numbered_node
+                .query(EventQuery::default())
+                .expect("query numbered store")
+                .items
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn numbered_recovery_retry_and_cleanup_remain_available_at_global_saturation() {
+        use aster_redb_store::{BlobDepotLimits, EventOperationLimits, StoreLimits};
+
+        let root = TestRoot::new("numbered-saturation");
+        let mut node = selected_node(&root);
+        node.store = Arc::new(
+            Store::open_with_limits_and_operation_limits_for_mission(
+                root.path().join("numbered-limited.redb"),
+                StoreLimits::default(),
+                BlobDepotLimits::DEFAULT,
+                EventOperationLimits::new(3, 10_000, 1).expect("limits"),
+                node.mission.mission_authority_id(),
+            )
+            .expect("limited store"),
+        );
+        let client = EventClientId::new(b"saturated-client".to_vec()).expect("client");
+        let first = node
+            .begin_publication_session(&client, 0, b"first-session")
+            .expect("claim");
+        node.complete_publication_recovery(&client, first.session, first.snapshot_revision)
+            .expect("complete");
+        let published = node
+            .publish_numbered(
+                numbered_request(&client, first.session, 1, b"fills-limit"),
+                EventPublishOptions::durable(),
+            )
+            .expect("first publication");
+        let full = node
+            .publish_numbered(
+                numbered_request(&client, first.session, 2, b"cannot-grow"),
+                EventPublishOptions::durable(),
+            )
+            .expect_err("global result record limit");
+        assert_eq!(full.kind(), ApplicationErrorKind::OperationCapacity);
+        assert!(
+            !node
+                .publish_numbered(
+                    numbered_request(&client, first.session, 1, b"fills-limit"),
+                    EventPublishOptions::durable(),
+                )
+                .expect("exact retry at saturation")
+                .inserted
+        );
+
+        let takeover = node
+            .begin_publication_session(&client, first.session.get(), b"takeover-at-limit")
+            .expect("takeover at saturation");
+        assert_eq!(takeover.outstanding, vec![published.result]);
+        node.complete_publication_recovery(&client, takeover.session, takeover.snapshot_revision)
+            .expect("recovery at saturation");
+        node.acknowledge_publication_result(
+            &client,
+            takeover.session,
+            EventOperationSequence::new(1).expect("sequence"),
+        )
+        .expect("state-reducing acknowledgement at saturation");
+        node.publish_numbered(
+            numbered_request(&client, takeover.session, 2, b"fits-after-ack"),
+            EventPublishOptions::durable(),
+        )
+        .expect("capacity reused after acknowledgement");
     }
 
     fn subscription_request(operation: &[u8], topic: &str) -> EventSubscriptionRequest {
