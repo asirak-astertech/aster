@@ -161,13 +161,76 @@ approved workload or add retained qualification evidence. The operation ledger
 still has its configured lifetime limit (default 1,000,000 records) and keeps
 compact permanent retry fences. Custody retirement fences and causal history
 have separate retention boundaries; content reuse is not indefinite bounded
-operation. Global deletion propagation and numbered-operation watermark
-compaction remain separate designs.
+operation. Global deletion propagation remains separate. The experimental
+numbered publication profile below supplies bounded local publication-result
+compaction; it does not change mesh-wide Event ordering or deletion
+propagation.
 
 Use an upgraded server with regenerated clients for finite publication. Older
 servers can ignore new Protobuf fields; require the returned `ttl_ms` to match
 the request before treating publication as finite. Old clients that omit TTL
 continue to publish durable Events. Mesh wire and storage formats are unchanged.
+
+## Use crash-safe numbered publication
+
+Increment 1 of the experimental numbered-publication profile replaces caller
+chosen publication keys with `(client_id, operation_sequence)` between an SDK
+and its local agent. Initialize one journal explicitly, keep both its file and
+configured `client_id` stable, open it exclusively, and call `recover()` before
+allocating work. `publish()` flushes the complete intent before transmission
+and flushes the committed result before returning it. `acknowledge()` removes
+the local journal row only after the agent has compacted that individual
+result. A cancelled assigned operation must be passed to `abandon()` before a
+later sequence can be admitted.
+
+The journal is durable protocol state. A missing, corrupt, already-open, or
+wrong-client journal fails closed; `open` never recreates it. Initialization is
+a separate one-time operation:
+
+```no_run
+# #[cfg(feature = "client")]
+# async fn numbered(
+#     client: aster_agent::proto::aster::application::v1alpha1::AsterApplicationServiceClient<connectrpc::client::SharedHttp2Connection>,
+#     path: &std::path::Path,
+# ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+use aster_agent::{proto::aster::application::v1alpha1 as api, sdk::{NumberedEventSdk, PublicationJournal}};
+
+let client_id = b"orders-publisher";
+if !path.exists() {
+    PublicationJournal::initialize(path, client_id)?;
+}
+let sdk = NumberedEventSdk::open(client, path, client_id)?;
+sdk.recover().await?;
+let (sequence, committed) = sdk.publish(api::PublishNumberedEventRequest {
+    topic: "ops.alpha".into(),
+    scope: "mission/apps".into(),
+    priority: api::Priority::Priority.into(),
+    logical_key: b"order-42".to_vec(),
+    payload: b"ready".to_vec(),
+    ..Default::default()
+}).await?;
+// Apply the business effect idempotently before acknowledging the result.
+sdk.acknowledge(sequence).await?;
+# let _ = committed;
+# Ok(())
+# }
+```
+
+The agent retains `allocated_through` plus at most 4,096 sparse outstanding
+results per client. Acknowledgement can compact a later result while an older
+one remains outstanding. If TTL cleanup removes Event content first, recovery
+still returns the immutable commit receipt with `Retired(reason)`. Session
+takeover fences older publication mutations and is idempotent by its persisted
+claim nonce. Recovery completion is repeatable with the same session and
+snapshot revision after a lost response.
+
+This profile requires a fresh store boundary. A store containing the older
+arbitrary-key Event publication ledger is refused without migration or
+deletion, and a numbered store refuses later arbitrary-key publications.
+Increment 1 does not claim session ownership for subscriptions, polling,
+delivery cursors, or delivery acknowledgements; lost-journal reconstruction,
+administrative client retirement, and operator-tunable client limits are also
+later work.
 
 ## Select normal or receive-only operation
 

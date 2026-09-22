@@ -9,7 +9,11 @@ use std::{
     time::Duration,
 };
 
-use aster_agent::{BoundAgent, ClientToken, proto::aster::application::v1alpha1 as api};
+use aster_agent::{
+    BoundAgent, ClientToken,
+    proto::aster::application::v1alpha1 as api,
+    sdk::{NumberedEventSdk, PublicationJournal},
+};
 use aster_node::mission::UnprotectedReferenceMission;
 use aster_node::{MutableSourceInterests, NodeApplication, NodeConfig, start_node};
 use buffa::{Message as _, MessageName as _};
@@ -550,4 +554,97 @@ async fn optional_event_ttl_is_enforced_by_the_live_agent() {
         .unwrap()
         .unwrap();
     node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn numbered_sdk_recovers_its_committed_result_across_restart() {
+    let state = TestState::new();
+    let mission = UnprotectedReferenceMission::from_bytes(
+        include_bytes!("../../../bindings/testdata/non-production-provisioning.bundle").to_vec(),
+    )
+    .expect("mission");
+    let node = start_node(NodeConfig {
+        state: state.0.clone(),
+        bind: "127.0.0.1:0".parse().expect("mesh bind"),
+        mission,
+        peers: Vec::new(),
+        mutable_interests: MutableSourceInterests::default(),
+        sync_interval: Duration::from_millis(50),
+        run_for: None,
+        application: NodeApplication::Relay,
+    })
+    .await
+    .expect("node");
+    let agent = BoundAgent::bind("127.0.0.1:0".parse().expect("agent bind"))
+        .await
+        .expect("agent");
+    let address = agent.local_addr().expect("address");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let server = tokio::spawn(agent.serve(
+        node.selected_events(),
+        ClientToken::from_bytes(TEST_TOKEN.to_vec()).expect("token"),
+        shutdown_rx,
+    ));
+    let config = || {
+        ClientConfig::new(format!("http://{address}").parse().expect("URI")).with_default_header(
+            "authorization",
+            format!("Bearer {}", String::from_utf8_lossy(TEST_TOKEN)),
+        )
+    };
+    let journal_path = state.0.join("publication-journal.redb");
+    let client_id = b"real-numbered-sdk";
+    PublicationJournal::initialize(&journal_path, client_id).expect("initialize journal");
+
+    let sequence;
+    let committed;
+    {
+        let sdk = NumberedEventSdk::open(
+            api::AsterApplicationServiceClient::new(HttpClient::plaintext(), config()),
+            &journal_path,
+            client_id,
+        )
+        .expect("open journal");
+        sdk.recover().await.expect("initial recovery");
+        (sequence, committed) = sdk
+            .publish(api::PublishNumberedEventRequest {
+                topic: "chat.events".to_owned(),
+                scope: "mission/team/alpha".to_owned(),
+                priority: api::Priority::Immediate.into(),
+                logical_key: b"numbered-message".to_vec(),
+                payload: b"survives SDK restart".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .expect("publish");
+        assert_eq!(sequence, 1);
+        assert_eq!(committed.operation_sequence, 1);
+    }
+
+    let restarted = NumberedEventSdk::open(
+        api::AsterApplicationServiceClient::new(HttpClient::plaintext(), config()),
+        &journal_path,
+        client_id,
+    )
+    .expect("reopen journal");
+    restarted.recover().await.expect("restart recovery");
+    assert!(restarted.session().expect("session") > 1);
+    assert_eq!(
+        restarted
+            .publish_journaled(sequence)
+            .await
+            .expect("recovered committed result"),
+        committed
+    );
+    restarted
+        .acknowledge(sequence)
+        .await
+        .expect("acknowledge recovered result");
+
+    shutdown_tx.send(true).expect("shutdown");
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("agent shutdown timeout")
+        .expect("agent task")
+        .expect("agent serve");
+    node.shutdown().await.expect("node shutdown");
 }
