@@ -326,6 +326,7 @@ func TestStatusEvidenceRequiresProfileCapacityContract(t *testing.T) {
 			ProfileBoundary: 1_024, ProfileRemaining: 1_024,
 			OrdinaryRemaining: 990_000, EmergencyRemaining: 10_000,
 			WarningState: applicationv1alpha1.OperationCapacityWarning_OPERATION_CAPACITY_WARNING_OK,
+			LedgerMode:   applicationv1alpha1.PublishOperationLedgerMode_PUBLISH_OPERATION_LEDGER_MODE_LEGACY,
 			Audit:        &applicationv1alpha1.OperationLedgerAuditStatus{State: applicationv1alpha1.OperationLedgerAudit_OPERATION_LEDGER_AUDIT_PENDING},
 		},
 		DeliveryCapacity: &applicationv1alpha1.DeliveryCapacityStatus{
@@ -338,6 +339,9 @@ func TestStatusEvidenceRequiresProfileCapacityContract(t *testing.T) {
 	}
 	if receipt["configured_emission_mode"] != "normal" || receipt["effective_emission_mode"] != "receive_only" {
 		t.Fatalf("emission modes not retained in receipt: %#v", receipt)
+	}
+	if receipt["operation_ledger_mode"] != "legacy" {
+		t.Fatalf("operation ledger mode missing from receipt: %#v", receipt)
 	}
 	if receipt["operation_ordinary_remaining"] != uint64(990_000) || receipt["operation_audit_state"] != "pending" {
 		t.Fatalf("ledger health missing from receipt: %#v", receipt)
@@ -447,6 +451,25 @@ func TestOperationHealthRequiresCoherentRateEstimate(t *testing.T) {
 				t.Fatalf("estimate accepted=%v; want %v", err == nil, test.valid)
 			}
 		})
+	}
+}
+
+func TestOperationHealthAcceptsCoherentNumberedCapacity(t *testing.T) {
+	operations := &applicationv1alpha1.PublishOperationCapacityStatus{
+		Rows: 2, Bytes: 300,
+		OrdinaryRemaining: 683_925, EmergencyRemaining: 0,
+		WarningState:               applicationv1alpha1.OperationCapacityWarning_OPERATION_CAPACITY_WARNING_OK,
+		LedgerMode:                 applicationv1alpha1.PublishOperationLedgerMode_PUBLISH_OPERATION_LEDGER_MODE_NUMBERED,
+		NumberedClients:            1,
+		NumberedOutstandingResults: 1,
+		NumberedReverseRows:        1,
+		Audit: &applicationv1alpha1.OperationLedgerAuditStatus{
+			State: applicationv1alpha1.OperationLedgerAudit_OPERATION_LEDGER_AUDIT_PENDING,
+		},
+	}
+
+	if _, _, err := operationHealth(operations); err != nil {
+		t.Fatalf("coherent numbered capacity rejected: %v", err)
 	}
 }
 

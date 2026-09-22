@@ -611,11 +611,21 @@ pub enum EventOperationCapacityWarning {
     Exhausted,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EventOperationLedgerMode {
+    Legacy,
+    Numbered,
+}
+
 /// Candidate ledger headroom, independent of the approved evaluation profile.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EventOperationCapacity {
     pub stats: EventOperationStats,
+    pub numbered_stats: NumberedEventOperationStats,
+    pub mode: EventOperationLedgerMode,
     pub limits: EventOperationLimits,
+    pub rows: u64,
+    pub logical_bytes: u64,
     pub ordinary_remaining: u64,
     pub emergency_remaining: u64,
     pub warning: EventOperationCapacityWarning,
@@ -623,26 +633,55 @@ pub struct EventOperationCapacity {
 
 impl EventOperationCapacity {
     pub fn new(stats: EventOperationStats, limits: EventOperationLimits) -> Self {
-        const ACTIVE_BYTES: u64 = 162;
+        Self::for_ledgers(stats, NumberedEventOperationStats::default(), limits)
+    }
+
+    pub fn for_ledgers(
+        stats: EventOperationStats,
+        numbered_stats: NumberedEventOperationStats,
+        limits: EventOperationLimits,
+    ) -> Self {
+        const LEGACY_ACTIVE_BYTES: u64 = 162;
+        const NUMBERED_RESULT_BYTES: u64 = 292;
         // EventOperationLimits construction checked both reserve arithmetic
         // and subtraction. Retained usage may exceed a lower reopened limit.
+        let mode = if numbered_stats != NumberedEventOperationStats::default() {
+            EventOperationLedgerMode::Numbered
+        } else {
+            EventOperationLedgerMode::Legacy
+        };
+        let rows = match mode {
+            EventOperationLedgerMode::Legacy => stats.records_total,
+            EventOperationLedgerMode::Numbered => numbered_stats
+                .clients
+                .saturating_add(numbered_stats.outstanding_results),
+        };
+        let logical_bytes = match mode {
+            EventOperationLedgerMode::Legacy => stats.logical_bytes,
+            EventOperationLedgerMode::Numbered => numbered_stats.logical_bytes,
+        };
         let ordinary_records = limits.ordinary_record_limit();
         let ordinary_bytes = limits.max_logical_bytes() - limits.emergency_byte_reserve();
-        let ordinary_remaining = ordinary_records
-            .saturating_sub(stats.records_total)
-            .min(ordinary_bytes.saturating_sub(stats.logical_bytes) / ACTIVE_BYTES);
-        let total_remaining = limits
-            .max_records()
-            .saturating_sub(stats.records_total)
-            .min(
-                limits
-                    .max_logical_bytes()
-                    .saturating_sub(stats.logical_bytes)
-                    / ACTIVE_BYTES,
-            );
+        let ordinary_remaining = ordinary_records.saturating_sub(rows).min(
+            ordinary_bytes.saturating_sub(logical_bytes)
+                / match mode {
+                    EventOperationLedgerMode::Legacy => LEGACY_ACTIVE_BYTES,
+                    EventOperationLedgerMode::Numbered => NUMBERED_RESULT_BYTES,
+                },
+        );
+        let emergency_remaining = match mode {
+            EventOperationLedgerMode::Legacy => {
+                let total_remaining = limits.max_records().saturating_sub(rows).min(
+                    limits.max_logical_bytes().saturating_sub(logical_bytes) / LEGACY_ACTIVE_BYTES,
+                );
+                total_remaining.saturating_sub(ordinary_remaining)
+            }
+            // Numbered admission currently cannot consume the tombstone reserve.
+            EventOperationLedgerMode::Numbered => 0,
+        };
         let at_percent = |percent: u128| {
-            u128::from(stats.records_total) * 100 >= u128::from(ordinary_records) * percent
-                || u128::from(stats.logical_bytes) * 100 >= u128::from(ordinary_bytes) * percent
+            u128::from(rows) * 100 >= u128::from(ordinary_records) * percent
+                || u128::from(logical_bytes) * 100 >= u128::from(ordinary_bytes) * percent
         };
         let warning = if ordinary_remaining == 0 {
             EventOperationCapacityWarning::Exhausted
@@ -655,9 +694,13 @@ impl EventOperationCapacity {
         };
         Self {
             stats,
+            numbered_stats,
+            mode,
             limits,
+            rows,
+            logical_bytes,
             ordinary_remaining,
-            emergency_remaining: total_remaining.saturating_sub(ordinary_remaining),
+            emergency_remaining,
             warning,
         }
     }
@@ -669,7 +712,7 @@ impl EventOperationCapacity {
 /// synchronization, emission, and audit observations remain actor-current.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SelectedEventStatus {
-    /// One background audit; traversal counts include ledger and reverse rows.
+    /// Legacy-ledger background audit; it does not claim numbered-ledger coverage.
     pub event_operation_audit: EventOperationAuditStatus,
     pub sync: EventSyncStatus,
     pub authenticated_contacts: u64,
@@ -679,7 +722,7 @@ pub struct SelectedEventStatus {
     pub store_usage: AggregateStoreUsage,
     pub store_limits: StoreLimits,
     pub event_operation_capacity: EventOperationCapacity,
-    /// New permanent records committed in the preceding monotonic 60 seconds / 60.
+    /// New durable ledger rows committed in the preceding monotonic 60 seconds / 60.
     pub event_operation_rolling_accept_rate: f64,
     /// Ceiling of remaining / rate, saturated to u64; zero without observations.
     pub event_operation_estimated_seconds_to_exhaustion: u64,

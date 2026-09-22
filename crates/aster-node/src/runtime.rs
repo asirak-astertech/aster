@@ -2698,6 +2698,7 @@ impl EventOperationAcceptRate {
 struct SelectedEventStoreMetrics {
     usage: aster_redb_store::AggregateStoreUsage,
     events: aster_redb_store::EventStoreStats,
+    numbered_operations: aster_redb_store::NumberedEventOperationStats,
     pending_deliveries: u64,
 }
 
@@ -2706,6 +2707,7 @@ impl SelectedEventStoreMetrics {
         Ok(Self {
             usage: store.aggregate_usage()?,
             events: store.event_stats()?,
+            numbered_operations: store.numbered_event_operation_stats()?,
             pending_deliveries: store.event_subscription_stats()?.pending_deliveries,
         })
     }
@@ -2827,14 +2829,23 @@ impl SelectedEventStatusTracker {
     }
 
     fn observe_operation_commit<T>(&mut self, store: &Store, commit: impl FnOnce() -> T) -> T {
-        // Only the selected actor publishes local operation keys. Retirement
-        // preserves the permanent count. Read failures/ambiguous deltas cannot
-        // alter the caller's result, especially after a successful commit.
-        let before = store.event_operation_stats().ok();
+        // Only the selected actor publishes local operations. Legacy retirement
+        // preserves its permanent count; numbered acknowledgement is not observed
+        // here and therefore cannot add a negative delta. Read failures or
+        // ambiguous deltas cannot alter the caller's result after a commit.
+        let rows = || {
+            let legacy = store.event_operation_stats().ok()?;
+            let numbered = store.numbered_event_operation_stats().ok()?;
+            legacy
+                .records_total
+                .checked_add(numbered.clients)?
+                .checked_add(numbered.outstanding_results)
+        };
+        let before = rows();
         let result = commit();
-        let after = store.event_operation_stats().ok();
+        let after = rows();
         if let (Some(before), Some(after)) = (before, after)
-            && let Some(count) = after.records_total.checked_sub(before.records_total)
+            && let Some(count) = after.checked_sub(before)
         {
             self.operation_rate
                 .record(tokio::time::Instant::now(), count);
@@ -2883,8 +2894,11 @@ impl SelectedEventStatusTracker {
         let store_usage = metrics.usage;
         let store_limits = store.limits();
         let event_stats = metrics.events;
-        let event_operation_capacity =
-            EventOperationCapacity::new(event_stats.operation_stats, store.operation_limits());
+        let event_operation_capacity = EventOperationCapacity::for_ledgers(
+            event_stats.operation_stats,
+            metrics.numbered_operations,
+            store.operation_limits(),
+        );
         let (event_operation_rolling_accept_rate, event_operation_estimated_seconds_to_exhaustion) =
             self.operation_rate.snapshot(
                 tokio::time::Instant::now(),
@@ -10943,8 +10957,9 @@ fn execute_selected_event_command(
             claim_nonce,
             response,
         } => {
-            let result =
-                application.begin_publication_session(&client_id, expected_session, &claim_nonce);
+            let result = status.observe_operation_commit(store, || {
+                application.begin_publication_session(&client_id, expected_session, &claim_nonce)
+            });
             let _ = response.send(result);
         }
         SelectedEventCommand::CompletePublicationRecovery {
@@ -10962,7 +10977,8 @@ fn execute_selected_event_command(
             options,
             response,
         } => {
-            let result = application.publish_numbered(request, options);
+            let result = status
+                .observe_operation_commit(store, || application.publish_numbered(request, options));
             let _ = response.send(result);
         }
         SelectedEventCommand::AbandonPublication {
