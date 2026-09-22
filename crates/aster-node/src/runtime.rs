@@ -71,11 +71,12 @@ use aster_redb_store::{
     MAX_BLOB_NETWORK_STAGING_ROWS, MAX_CUSTODY_PAGE, MAX_CUSTODY_RETIREMENTS, MAX_EVENT_PAGE,
     MAX_MUTABLE_TRANSFER_CURSOR_PEERS, MAX_NETWORK_BLOB_BYTES, MAX_NETWORK_BLOB_CHUNKS,
     MAX_ROUTE_CACHE_ITEMS, MutableTransferCursorClass, MutableTransferCursorMode,
-    RecordSenderProjection, RecordTransferId, RejectedControl, RouteCacheOutcome,
-    ScopeRekeyPublicationIntent, StateSenderProjection, StateTransferId, Store,
-    StoreBackingIdentity, StoreError, StoreInspection, StoreLimits, StoreZeroizationState,
-    StoredControl, StoredControlEffect, StoredEvent, StoredEventTransfer, StoredRecord,
-    StoredState, TransferLease, ZeroizationArtifact, ZeroizationIntent, ZeroizationStore,
+    NumberedEventOperationRequest, NumberedEventPublishOutcome, RecordSenderProjection,
+    RecordTransferId, RejectedControl, RouteCacheOutcome, ScopeRekeyPublicationIntent,
+    StateSenderProjection, StateTransferId, Store, StoreBackingIdentity, StoreError,
+    StoreInspection, StoreLimits, StoreZeroizationState, StoredControl, StoredControlEffect,
+    StoredEvent, StoredEventTransfer, StoredRecord, StoredState, TransferLease,
+    ZeroizationArtifact, ZeroizationIntent, ZeroizationStore,
 };
 use sha2::{Digest as _, Sha256};
 #[cfg(unix)]
@@ -102,11 +103,12 @@ use crate::mission::{initiate_discovered_over_iroh_metered, respond_discovered_o
 use crate::{
     NodeIdentity,
     application::{
-        AuthenticatedPeerStatus, ContactSyncStatus, EventOperationCapacity, EventSyncStatus,
-        PeerAuthorization, SelectedApplicationCommand, SelectedBlobCommand, SelectedBlobHandle,
-        SelectedBlobNode, SelectedEventCommand, SelectedEventHandle, SelectedEventNode,
-        SelectedEventStatus, SelectedRecordCommand, SelectedRecordHandle, SelectedRecordNode,
-        SelectedStateCommand, SelectedStateHandle, SelectedStateNode, runtime_application_error,
+        AuthenticatedPeerStatus, ContactSyncStatus, EventOperationCapacity, EventPublishOptions,
+        EventSyncStatus, NumberedEventPublishRequest, PeerAuthorization,
+        SelectedApplicationCommand, SelectedBlobCommand, SelectedBlobHandle, SelectedBlobNode,
+        SelectedEventCommand, SelectedEventHandle, SelectedEventNode, SelectedEventStatus,
+        SelectedRecordCommand, SelectedRecordHandle, SelectedRecordNode, SelectedStateCommand,
+        SelectedStateHandle, SelectedStateNode, runtime_application_error,
     },
     bridge_runtime::{
         SelectedEventBridgeApplyDisposition, SelectedEventBridgeConfig,
@@ -4343,6 +4345,145 @@ pub(crate) fn publish_selected_event_once(
             Err(StoreError::EventOperationConflict | StoreError::OperationPredecessorMismatch) => {
                 return Err(NodeError::Protocol(EVENT_OPERATION_CONFLICT.into()));
             }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(NodeError::Protocol(format!(
+        "Event publication reservation changed {MAX_EVENT_PUBLISH_RETRIES} times"
+    )))
+}
+
+pub(crate) fn publish_selected_numbered_event_once(
+    store: &Store,
+    policy: &ControlPolicySnapshot,
+    sealer: &mut ReferenceEnvelopeSealer,
+    request: NumberedEventPublishRequest,
+    options: EventPublishOptions,
+    custody_sample: Option<CustodySample>,
+) -> Result<NumberedEventPublishOutcome, NodeError> {
+    let NumberedEventPublishRequest {
+        client_id,
+        session,
+        sequence,
+        predecessor,
+        topic,
+        scope,
+        priority,
+        logical_key,
+        payload,
+        tombstone,
+    } = request;
+    let ttl_ms = options.ttl_ms();
+    if ttl_ms == Some(0) {
+        return Err(NodeError::Configuration(
+            "finite Event TTL must be greater than zero milliseconds".into(),
+        ));
+    }
+    if ttl_ms.is_some() && custody_sample.is_none() {
+        return Err(NodeError::Configuration(
+            "finite Event publication requires a continuous custody sample".into(),
+        ));
+    }
+    if tombstone && ttl_ms.is_some() {
+        return Err(NodeError::Configuration(
+            "Event tombstones are durable and cannot carry finite TTL".into(),
+        ));
+    }
+    if tombstone && !payload.is_empty() {
+        return Err(NodeError::Configuration(
+            "Event tombstones must carry an empty payload".into(),
+        ));
+    }
+    let predecessor = predecessor.map(crate::application::EventId::into_store);
+    let intent = EventPublicationIntent::new(
+        EventPublicationSpec::new(
+            sealer.identity(),
+            topic.clone(),
+            scope.clone(),
+            priority,
+            logical_key.clone(),
+            tombstone,
+            ttl_ms,
+        )?,
+        &payload,
+    )?;
+    let operation_request = NumberedEventOperationRequest::new(
+        &client_id,
+        session,
+        sequence,
+        predecessor,
+        &intent,
+        &payload,
+    )?;
+    let key_epoch = store
+        .active_scope_epoch(&scope)?
+        .map_or(1, |(epoch, _)| epoch);
+    for _ in 0..MAX_EVENT_PUBLISH_RETRIES {
+        let custody_revision = custody_sample
+            .map(|_| store.custody_policy_revision())
+            .transpose()?;
+        let reservation = match predecessor {
+            Some(predecessor) => store.reserve_reaction_event_with_policy(
+                policy,
+                sealer.identity(),
+                &topic,
+                &scope,
+                predecessor,
+            )?,
+            None => store.reserve_event_with_policy(policy, sealer.identity(), &topic, &scope)?,
+        };
+        let header = reservation.header(
+            priority,
+            logical_key.clone(),
+            ttl_ms,
+            u64::try_from(payload.len())
+                .map_err(|_| NodeError::Protocol("Event payload length overflows u64".into()))?,
+            tombstone,
+            key_epoch,
+        )?;
+        let sealed = sealer.seal_event(&header, &payload)?;
+        let route_verified = sealer.verify_event(&sealed.bytes)?;
+        let verified = match sealer.verify_event_content(route_verified, &sealed.bytes)? {
+            EventContentVerification::ContentVerified {
+                event,
+                payload: opened,
+            } if opened == payload => event,
+            EventContentVerification::ContentVerified { .. } => {
+                return Err(NodeError::Protocol(
+                    "locally sealed Event reopened with different content".into(),
+                ));
+            }
+            EventContentVerification::RouteOnly(_) => {
+                return Err(NodeError::Protocol(
+                    "local Event publisher lacks content authorization".into(),
+                ));
+            }
+        };
+        let committed = match (custody_sample, custody_revision) {
+            (Some(sample), Some(revision)) => store
+                .commit_reserved_numbered_event_with_custody_policy(
+                    policy,
+                    LocalCustodyCheckpoint::new(revision, sample),
+                    &operation_request,
+                    &reservation,
+                    &verified,
+                    &sealed.bytes,
+                ),
+            (None, None) => store.commit_reserved_numbered_event_with_policy(
+                policy,
+                &operation_request,
+                &reservation,
+                &verified,
+                &sealed.bytes,
+            ),
+            _ => Err(StoreError::SemanticInvariant(
+                "custody sample and policy revision were not captured together",
+            )),
+        };
+        match committed {
+            Ok(outcome) => return Ok(outcome),
+            Err(StoreError::ReservationChanged) => continue,
+            Err(StoreError::Custody(CustodyStoreError::PolicyChanged)) => continue,
             Err(error) => return Err(error.into()),
         }
     }
@@ -10794,6 +10935,52 @@ fn execute_selected_event_command(
                     application.publish_with_options(request, options)
                 })
             };
+            let _ = response.send(result);
+        }
+        SelectedEventCommand::BeginPublicationSession {
+            client_id,
+            expected_session,
+            claim_nonce,
+            response,
+        } => {
+            let result =
+                application.begin_publication_session(&client_id, expected_session, &claim_nonce);
+            let _ = response.send(result);
+        }
+        SelectedEventCommand::CompletePublicationRecovery {
+            client_id,
+            session,
+            snapshot_revision,
+            response,
+        } => {
+            let result =
+                application.complete_publication_recovery(&client_id, session, snapshot_revision);
+            let _ = response.send(result);
+        }
+        SelectedEventCommand::PublishNumbered {
+            request,
+            options,
+            response,
+        } => {
+            let result = application.publish_numbered(request, options);
+            let _ = response.send(result);
+        }
+        SelectedEventCommand::AbandonPublication {
+            client_id,
+            session,
+            sequence,
+            response,
+        } => {
+            let result = application.abandon_publication(&client_id, session, sequence);
+            let _ = response.send(result);
+        }
+        SelectedEventCommand::AcknowledgePublicationResult {
+            client_id,
+            session,
+            sequence,
+            response,
+        } => {
+            let result = application.acknowledge_publication_result(&client_id, session, sequence);
             let _ = response.send(result);
         }
         SelectedEventCommand::Query { query, response } => {
