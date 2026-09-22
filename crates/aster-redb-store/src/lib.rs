@@ -34,6 +34,7 @@ mod bridge_event;
 mod custody;
 #[allow(dead_code)] // Ledger codec/delta pieces become authoritative in Tasks 3-5.
 mod event_operation;
+mod numbered_event_operation;
 mod record_subscription;
 mod state_subscription;
 
@@ -45,6 +46,7 @@ pub use event_operation::{
     EventOperationAuditProgress, EventOperationAuditState, EventOperationAuditStatus,
     EventOperationKey, EventOperationLimits, EventOperationStats, MAX_EVENT_OPERATION_ALIASES,
 };
+pub use numbered_event_operation::*;
 pub use record_subscription::*;
 pub use state_subscription::*;
 
@@ -1182,6 +1184,39 @@ pub struct EventOperationRequest<'a> {
     intent: &'a EventPublicationIntent,
     payload: &'a [u8],
     predecessor: Option<EventSemanticId>,
+}
+
+/// Exact borrowed inputs for one atomic numbered Event commit.
+pub struct NumberedEventOperationRequest<'a> {
+    client: &'a EventClientId,
+    session: EventPublicationSession,
+    sequence: EventOperationSequence,
+    predecessor: Option<EventSemanticId>,
+    intent: &'a EventPublicationIntent,
+    payload: &'a [u8],
+}
+
+impl<'a> NumberedEventOperationRequest<'a> {
+    pub fn new(
+        client: &'a EventClientId,
+        session: EventPublicationSession,
+        sequence: EventOperationSequence,
+        predecessor: Option<EventSemanticId>,
+        intent: &'a EventPublicationIntent,
+        payload: &'a [u8],
+    ) -> Result<Self, StoreError> {
+        if !intent.matches_payload(payload) {
+            return Err(NumberedEventOperationError::IntentConflict.into());
+        }
+        Ok(Self {
+            client,
+            session,
+            sequence,
+            predecessor,
+            intent,
+            payload,
+        })
+    }
 }
 
 /// Exact policy generation and monotonic checkpoint for one local finite Event.
@@ -3373,6 +3408,8 @@ pub enum StoreError {
         incoming: u64,
         limit: u64,
     },
+    /// Numbered publication client/session/recovery state rejected the operation.
+    NumberedEventOperation(NumberedEventOperationError),
     /// A core State capability did not match its exact sealed bytes or payload.
     StateVerification(String),
     /// Source-authenticated State metadata was internally inconsistent.
@@ -3854,6 +3891,7 @@ impl fmt::Display for StoreError {
                 formatter,
                 "retaining {incoming} Event operation bytes at {current} would exceed dedicated limit {limit}"
             ),
+            Self::NumberedEventOperation(error) => write!(formatter, "{error}"),
             Self::StateVerification(error) => {
                 write!(formatter, "source State verification failed: {error}")
             }
@@ -4400,6 +4438,7 @@ impl Error for StoreError {
             Self::Blob(error) => Some(error),
             Self::Bridge(error) => Some(error),
             Self::Custody(error) => Some(error),
+            Self::NumberedEventOperation(error) => Some(error),
             Self::EventOperationRetirementInvariant(error) => Some(error.as_ref()),
             Self::StorePath(error) => Some(error),
             _ => None,
@@ -4422,6 +4461,12 @@ impl From<BridgeStoreError> for StoreError {
 impl From<CustodyStoreError> for StoreError {
     fn from(error: CustodyStoreError) -> Self {
         Self::Custody(error)
+    }
+}
+
+impl From<NumberedEventOperationError> for StoreError {
+    fn from(error: NumberedEventOperationError) -> Self {
+        Self::NumberedEventOperation(error)
     }
 }
 
@@ -4658,6 +4703,21 @@ struct PendingOperation<'a> {
 }
 
 #[derive(Clone, Copy)]
+enum PendingEventOperation<'a> {
+    Legacy(PendingOperation<'a>),
+    Numbered(numbered_event_operation::PendingNumberedEventOperation<'a>),
+}
+
+impl PendingEventOperation<'_> {
+    const fn predecessor(self) -> Option<EventSemanticId> {
+        match self {
+            Self::Legacy(operation) => operation.predecessor,
+            Self::Numbered(operation) => operation.predecessor,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 struct PendingEventCustody {
     expected_policy: CustodyPolicyRevision,
     authenticated_age_ms: u64,
@@ -4666,7 +4726,13 @@ struct PendingEventCustody {
 
 enum EventCommitResult {
     Retained(EventCommit),
-    RetiredOperation { reason: CustodyRetirementReason },
+    RetiredOperation {
+        reason: CustodyRetirementReason,
+    },
+    Numbered {
+        result: NumberedEventResult,
+        inserted: bool,
+    },
 }
 
 impl EventCommitResult {
@@ -4674,8 +4740,18 @@ impl EventCommitResult {
         match self {
             Self::Retained(committed) => Ok(committed.apply),
             Self::RetiredOperation { .. } => Err(CustodyStoreError::AlreadyRetired.into()),
+            Self::Numbered { .. } => Err(StoreError::SemanticInvariant(
+                "numbered Event result reached a non-numbered commit caller",
+            )),
         }
     }
+}
+
+/// Result of one atomic numbered Event publication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NumberedEventPublishOutcome {
+    pub result: NumberedEventResult,
+    pub inserted: bool,
 }
 
 struct EventCommit {
@@ -4691,6 +4767,11 @@ fn event_once_outcome(result: EventCommitResult) -> Result<EventOnceOutcome, Sto
         EventCommitResult::Retained(committed) => committed,
         EventCommitResult::RetiredOperation { reason } => {
             return Ok(EventOnceOutcome::RetiredOperation { reason });
+        }
+        EventCommitResult::Numbered { .. } => {
+            return Err(StoreError::SemanticInvariant(
+                "numbered Event result reached the legacy result converter",
+            ));
         }
     };
     let transfer_id = committed.transfer_id;
@@ -4721,6 +4802,19 @@ fn event_once_outcome(result: EventCommitResult) -> Result<EventOnceOutcome, Sto
             semantic_id,
             acceptance_marker,
         })
+    }
+}
+
+fn numbered_event_outcome(
+    result: EventCommitResult,
+) -> Result<NumberedEventPublishOutcome, StoreError> {
+    match result {
+        EventCommitResult::Numbered { result, inserted } => {
+            Ok(NumberedEventPublishOutcome { result, inserted })
+        }
+        _ => Err(StoreError::SemanticInvariant(
+            "legacy Event result reached the numbered result converter",
+        )),
     }
 }
 
@@ -5635,6 +5729,8 @@ impl Store {
             migration.apply(&write)?;
         }
         let operation_stats = event_operation::audit_event_operation_accounting_write(&write)?;
+        let numbered_operation_stats =
+            numbered_event_operation::audit_numbered_tables_write(&write)?;
         let blob_depot_owner_token = blob::depot::depot_owner_token_write(&write)?;
         blob::depot::bind_depot_owner_write(
             &write,
@@ -5659,6 +5755,8 @@ impl Store {
                 || write.open_table(ROUTE_CACHE)?.len()? != 0
                 || write.open_table(CONTROL_RECORDS)?.len()? != 0
                 || operation_stats.records_total != 0
+                || numbered_operation_stats.clients != 0
+                || numbered_operation_stats.outstanding_results != 0
                 || bridge_event_stats.aggregate_items()? != 0
                 || mutable_transfer_cursors.rows != 0)
         {
@@ -9021,7 +9119,7 @@ impl Store {
         let committed = self.commit_prepared_event(
             &prepared,
             Some(reservation),
-            Some(operation),
+            Some(PendingEventOperation::Legacy(operation)),
             EventAdmissionGuard::Control(&reservation.control_policy),
             None,
         )?;
@@ -9046,7 +9144,7 @@ impl Store {
         let committed = self.commit_prepared_event(
             &prepared,
             Some(reservation),
-            Some(operation),
+            Some(PendingEventOperation::Legacy(operation)),
             EventAdmissionGuard::Control(policy),
             None,
         )?;
@@ -9075,7 +9173,7 @@ impl Store {
         let committed = self.commit_prepared_event(
             &prepared,
             Some(reservation),
-            Some(operation),
+            Some(PendingEventOperation::Legacy(operation)),
             EventAdmissionGuard::Control(policy),
             Some(PendingEventCustody {
                 expected_policy: custody.policy_revision,
@@ -9084,6 +9182,60 @@ impl Store {
             }),
         )?;
         event_once_outcome(committed)
+    }
+
+    /// Atomically commits one numbered local Event and its recoverable result.
+    pub fn commit_reserved_numbered_event_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        request: &NumberedEventOperationRequest<'_>,
+        reservation: &EventReservation,
+        event: &ContentVerifiedEventEnvelope,
+        sealed: &[u8],
+    ) -> Result<NumberedEventPublishOutcome, StoreError> {
+        self.require_live()?;
+        if policy != &reservation.control_policy {
+            return Err(StoreError::ControlPolicyChanged);
+        }
+        let prepared = PreparedEvent::from_verified(event, sealed, EventOrigin::Local)?;
+        let operation = prepare_numbered_event_operation(request, event, &prepared.header)?;
+        numbered_event_outcome(self.commit_prepared_event(
+            &prepared,
+            Some(reservation),
+            Some(PendingEventOperation::Numbered(operation)),
+            EventAdmissionGuard::Control(policy),
+            None,
+        )?)
+    }
+
+    /// Atomically commits one finite numbered Event, its age checkpoint, and result.
+    pub fn commit_reserved_numbered_event_with_custody_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        custody: LocalCustodyCheckpoint,
+        request: &NumberedEventOperationRequest<'_>,
+        reservation: &EventReservation,
+        event: &ContentVerifiedEventEnvelope,
+        sealed: &[u8],
+    ) -> Result<NumberedEventPublishOutcome, StoreError> {
+        self.require_live()?;
+        if policy != &reservation.control_policy {
+            return Err(StoreError::ControlPolicyChanged);
+        }
+        let prepared =
+            PreparedEvent::from_verified_with_custody(event, sealed, EventOrigin::Local)?;
+        let operation = prepare_numbered_event_operation(request, event, &prepared.header)?;
+        numbered_event_outcome(self.commit_prepared_event(
+            &prepared,
+            Some(reservation),
+            Some(PendingEventOperation::Numbered(operation)),
+            EventAdmissionGuard::Control(policy),
+            Some(PendingEventCustody {
+                expected_policy: custody.policy_revision,
+                authenticated_age_ms: 0,
+                sample: Some(custody.sample),
+            }),
+        )?)
     }
 
     /// Compares a request with its mission-bound commitment before resolving
@@ -9725,7 +9877,7 @@ impl Store {
         &self,
         prepared: &PreparedEvent,
         reservation: Option<&EventReservation>,
-        operation: Option<PendingOperation<'_>>,
+        operation: Option<PendingEventOperation<'_>>,
         guard: EventAdmissionGuard<'_>,
         pending_custody: Option<PendingEventCustody>,
     ) -> Result<EventCommitResult, StoreError> {
@@ -9784,65 +9936,85 @@ impl Store {
         // Compare the durable intent before loading any retained Event bytes.
         // The operation result wins before optimistic reservation checks.
         if let Some(operation) = operation {
-            let fingerprint = event_operation::event_operation_fingerprint(
-                &prepared.mission_authority,
-                operation.key,
-            );
-            let existing = write
-                .open_table(event_operation::EVENT_OPERATION_LEDGER_V3)?
-                .get(fingerprint.as_slice())?
-                .map(|value| event_operation::decode_event_operation_ledger_record(value.value()))
-                .transpose()?;
-            if let Some(existing) = existing {
-                let (intent_digest, transfer_id) = match existing {
-                    event_operation::EventOperationLedgerRecord::Active {
-                        intent_digest,
-                        transfer_id,
-                    } => (intent_digest, transfer_id),
-                    event_operation::EventOperationLedgerRecord::Retired {
-                        intent_digest,
-                        reason,
-                    } => {
+            match operation {
+                PendingEventOperation::Numbered(operation) => {
+                    if let numbered_event_operation::NumberedOperationResolution::Existing(result) =
+                        numbered_event_operation::resolve_numbered_operation_write(
+                            &write, operation,
+                        )?
+                    {
+                        return Ok(EventCommitResult::Numbered {
+                            result,
+                            inserted: false,
+                        });
+                    }
+                }
+                PendingEventOperation::Legacy(operation) => {
+                    numbered_event_operation::legacy_operation_allowed_write(&write)?;
+                    let fingerprint = event_operation::event_operation_fingerprint(
+                        &prepared.mission_authority,
+                        operation.key,
+                    );
+                    let existing = write
+                        .open_table(event_operation::EVENT_OPERATION_LEDGER_V3)?
+                        .get(fingerprint.as_slice())?
+                        .map(|value| {
+                            event_operation::decode_event_operation_ledger_record(value.value())
+                        })
+                        .transpose()?;
+                    if let Some(existing) = existing {
+                        let (intent_digest, transfer_id) = match existing {
+                            event_operation::EventOperationLedgerRecord::Active {
+                                intent_digest,
+                                transfer_id,
+                            } => (intent_digest, transfer_id),
+                            event_operation::EventOperationLedgerRecord::Retired {
+                                intent_digest,
+                                reason,
+                            } => {
+                                if intent_digest != operation.intent_digest {
+                                    return Err(StoreError::EventOperationConflict);
+                                }
+                                return Ok(EventCommitResult::RetiredOperation { reason });
+                            }
+                        };
                         if intent_digest != operation.intent_digest {
                             return Err(StoreError::EventOperationConflict);
                         }
-                        return Ok(EventCommitResult::RetiredOperation { reason });
+                        if !custody::sender_row_live_write(
+                            &write,
+                            CustodyObjectKey::event(transfer_id),
+                        )? && custody::retired_event_receipt_write(&write, transfer_id)?
+                            .is_none()
+                        {
+                            return Err(CustodyStoreError::AlreadyRetired.into());
+                        }
+                        if let Some(stored) = load_event_from_write(&write, transfer_id)? {
+                            return Ok(EventCommitResult::Retained(EventCommit {
+                                transfer_id,
+                                semantic_id: stored.semantic_id,
+                                apply: ApplyOutcome::Duplicate {
+                                    acceptance_marker: stored.acceptance_marker,
+                                },
+                                operation_existing: true,
+                                retirement: None,
+                            }));
+                        }
+                        let (semantic_id, acceptance_marker, reason) =
+                            custody::retired_event_receipt_write(&write, transfer_id)?.ok_or(
+                                StoreError::SemanticInvariant(
+                                    "Event operation points to missing live and retired authority",
+                                ),
+                            )?;
+                        return Ok(EventCommitResult::Retained(EventCommit {
+                            transfer_id,
+                            semantic_id,
+                            apply: ApplyOutcome::Duplicate { acceptance_marker },
+                            operation_existing: true,
+                            retirement: Some(reason),
+                        }));
                     }
-                };
-                if intent_digest != operation.intent_digest {
-                    return Err(StoreError::EventOperationConflict);
                 }
-                if !custody::sender_row_live_write(&write, CustodyObjectKey::event(transfer_id))?
-                    && custody::retired_event_receipt_write(&write, transfer_id)?.is_none()
-                {
-                    // Lease drain retains bytes but never restores application
-                    // authority. Keep the active ledger until custody compacts it.
-                    return Err(CustodyStoreError::AlreadyRetired.into());
-                }
-                if let Some(stored) = load_event_from_write(&write, transfer_id)? {
-                    return Ok(EventCommitResult::Retained(EventCommit {
-                        transfer_id,
-                        semantic_id: stored.semantic_id,
-                        apply: ApplyOutcome::Duplicate {
-                            acceptance_marker: stored.acceptance_marker,
-                        },
-                        operation_existing: true,
-                        retirement: None,
-                    }));
-                }
-                let (semantic_id, acceptance_marker, reason) =
-                    custody::retired_event_receipt_write(&write, transfer_id)?.ok_or(
-                        StoreError::SemanticInvariant(
-                            "Event operation points to missing live and retired authority",
-                        ),
-                    )?;
-                return Ok(EventCommitResult::Retained(EventCommit {
-                    transfer_id,
-                    semantic_id,
-                    apply: ApplyOutcome::Duplicate { acceptance_marker },
-                    operation_existing: true,
-                    retirement: Some(reason),
-                }));
             }
         }
 
@@ -9850,7 +10022,7 @@ impl Store {
             validate_reservation(reservation, prepared)?;
         }
 
-        if let Some(predecessor) = operation.and_then(|operation| operation.predecessor) {
+        if let Some(predecessor) = operation.and_then(PendingEventOperation::predecessor) {
             let predecessor_transfer = {
                 let semantic_items = write.open_table(SEMANTIC_ITEMS)?;
                 semantic_items
@@ -9951,16 +10123,27 @@ impl Store {
                     ));
                 }
                 if let Some(operation) = operation {
-                    event_operation::admit_retired_event_operation_write(
+                    let numbered = admit_pending_event_operation_write(
                         &write,
                         &prepared.mission_authority,
-                        operation.key,
-                        operation.intent_digest,
-                        reason,
+                        operation,
+                        CommittedEventReceipt {
+                            transfer_id: accepted,
+                            semantic_id,
+                            acceptance_marker,
+                        },
+                        CommittedEventContent::Retired(reason),
                         self.operation_limits,
+                        prepared.header.tombstone,
                     )?;
                     write.commit()?;
-                    return Ok(EventCommitResult::RetiredOperation { reason });
+                    return Ok(match numbered {
+                        Some(result) => EventCommitResult::Numbered {
+                            result,
+                            inserted: false,
+                        },
+                        None => EventCommitResult::RetiredOperation { reason },
+                    });
                 }
                 write.commit()?;
                 return Ok(EventCommitResult::Retained(EventCommit {
@@ -10010,15 +10193,26 @@ impl Store {
                 &prepared.sealed,
             )?;
             if let Some(operation) = operation {
-                event_operation::admit_active_event_operation_write(
+                let numbered = admit_pending_event_operation_write(
                     &write,
                     &prepared.mission_authority,
-                    operation.key,
-                    operation.intent_digest,
-                    prepared.transfer_id,
+                    operation,
+                    CommittedEventReceipt {
+                        transfer_id: prepared.transfer_id,
+                        semantic_id: prepared.semantic_id,
+                        acceptance_marker: stored.acceptance_marker,
+                    },
+                    CommittedEventContent::Available,
                     self.operation_limits,
                     prepared.header.tombstone,
                 )?;
+                if let Some(result) = numbered {
+                    write.commit()?;
+                    return Ok(EventCommitResult::Numbered {
+                        result,
+                        inserted: false,
+                    });
+                }
             }
             write.commit()?;
             return Ok(EventCommitResult::Retained(EventCommit {
@@ -10254,15 +10448,26 @@ impl Store {
         )?;
 
         if let Some(operation) = operation {
-            event_operation::admit_active_event_operation_write(
+            let numbered = admit_pending_event_operation_write(
                 &write,
                 &prepared.mission_authority,
-                operation.key,
-                operation.intent_digest,
-                prepared.transfer_id,
+                operation,
+                CommittedEventReceipt {
+                    transfer_id: prepared.transfer_id,
+                    semantic_id: prepared.semantic_id,
+                    acceptance_marker: marker,
+                },
+                CommittedEventContent::Available,
                 self.operation_limits,
                 prepared.header.tombstone,
             )?;
+            if let Some(result) = numbered {
+                write.commit()?;
+                return Ok(EventCommitResult::Numbered {
+                    result,
+                    inserted: true,
+                });
+            }
         }
         write.commit()?;
 
@@ -19224,6 +19429,70 @@ fn prepare_event_operation<'a>(
         predecessor: request.predecessor,
         intent_digest: event_operation_intent_digest(request.intent, request.predecessor)?,
     })
+}
+
+fn prepare_numbered_event_operation<'a>(
+    request: &'a NumberedEventOperationRequest<'a>,
+    event: &ContentVerifiedEventEnvelope,
+    header: &EnvelopeHeader,
+) -> Result<numbered_event_operation::PendingNumberedEventOperation<'a>, StoreError> {
+    event
+        .verify_exact_payload(request.payload)
+        .map_err(|_| NumberedEventOperationError::IntentConflict)?;
+    validate_event_publication_intent(request.intent, request.payload, header)
+        .map_err(|_| NumberedEventOperationError::IntentConflict)?;
+    Ok(numbered_event_operation::PendingNumberedEventOperation {
+        client: request.client,
+        session: request.session,
+        sequence: request.sequence,
+        predecessor: request.predecessor,
+        intent_digest: event_operation_intent_digest(request.intent, request.predecessor)?,
+    })
+}
+
+fn admit_pending_event_operation_write(
+    write: &redb::WriteTransaction,
+    mission_authority: &NodeId,
+    operation: PendingEventOperation<'_>,
+    receipt: CommittedEventReceipt,
+    content: CommittedEventContent,
+    limits: EventOperationLimits,
+    tombstone: bool,
+) -> Result<Option<NumberedEventResult>, StoreError> {
+    match operation {
+        PendingEventOperation::Legacy(operation) => {
+            match content {
+                CommittedEventContent::Available => {
+                    event_operation::admit_active_event_operation_write(
+                        write,
+                        mission_authority,
+                        operation.key,
+                        operation.intent_digest,
+                        receipt.transfer_id,
+                        limits,
+                        tombstone,
+                    )?;
+                }
+                CommittedEventContent::Retired(reason) => {
+                    event_operation::admit_retired_event_operation_write(
+                        write,
+                        mission_authority,
+                        operation.key,
+                        operation.intent_digest,
+                        reason,
+                        limits,
+                    )?;
+                }
+            }
+            Ok(None)
+        }
+        PendingEventOperation::Numbered(operation) => {
+            numbered_event_operation::admit_numbered_result_write(
+                write, operation, receipt, content, limits,
+            )
+            .map(Some)
+        }
+    }
 }
 
 fn encode_operation_record(record: OperationRecord) -> Vec<u8> {
