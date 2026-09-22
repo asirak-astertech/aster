@@ -17,6 +17,8 @@ pub mod health;
 pub mod lifecycle;
 #[cfg(feature = "server")]
 pub mod runtime;
+#[cfg(feature = "client")]
+pub mod sdk;
 #[cfg(feature = "server")]
 pub mod server;
 #[cfg(feature = "server")]

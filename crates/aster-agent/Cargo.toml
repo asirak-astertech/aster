@@ -29,10 +29,12 @@ buffa.workspace = true
 bytes.workspace = true
 connectrpc = { workspace = true, features = ["json"] }
 futures.workspace = true
+getrandom.workspace = true
 http.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
+redb.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 subtle.workspace = true
