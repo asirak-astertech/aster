@@ -5,12 +5,13 @@ use aster_node::application::{
     AuthenticatedPeerStatus, CommittedEventContent, ContactSyncStatus as NodeContactSyncStatus,
     EventAcknowledgement, EventClientId, EventDelivery as NodeEventDelivery,
     EventGap as NodeEventGap, EventGapQuery, EventId, EventItem, EventOperationAbandonment,
-    EventOperationAuditState, EventOperationCapacityWarning, EventOperationSequence,
-    EventPollRequest, EventPublicationSession, EventPublishOptions, EventPublishRequest,
-    EventPublishResult, EventQuery, EventResultAcknowledgement, EventSubscriptionId,
-    EventSubscriptionRequest, EventSyncStatus as NodeEventSyncStatus, EventUnsubscribe,
-    NumberedEventPublishRequest, NumberedEventResult, PeerAuthorization as NodePeerAuthorization,
-    Priority as NodePriority, Scope, SelectedEventHandle, SelectedEventStatus, Topic,
+    EventOperationAuditState, EventOperationCapacityWarning, EventOperationLedgerMode,
+    EventOperationSequence, EventPollRequest, EventPublicationSession, EventPublishOptions,
+    EventPublishRequest, EventPublishResult, EventQuery, EventResultAcknowledgement,
+    EventSubscriptionId, EventSubscriptionRequest, EventSyncStatus as NodeEventSyncStatus,
+    EventUnsubscribe, NumberedEventPublishRequest, NumberedEventResult,
+    PeerAuthorization as NodePeerAuthorization, Priority as NodePriority, Scope,
+    SelectedEventHandle, SelectedEventStatus, Topic,
 };
 use aster_redb_store::{CustodyRetirementReason, MAX_EVENT_PENDING_DELIVERIES};
 use connectrpc::{
@@ -827,8 +828,7 @@ fn status_response(
     status: SelectedEventStatus,
 ) -> api::GetStatusResponse {
     let operations = status.event_operation_capacity;
-    let profile_remaining =
-        PROFILE_EVENT_OPERATION_BOUNDARY.saturating_sub(operations.stats.records_total);
+    let profile_remaining = PROFILE_EVENT_OPERATION_BOUNDARY.saturating_sub(operations.rows);
     api::GetStatusResponse {
         identity: identity.to_vec(),
         mission_authority: mission_authority.to_vec(),
@@ -847,14 +847,14 @@ fn status_response(
         }
         .into(),
         publish_operation_capacity: api::PublishOperationCapacityStatus {
-            rows: operations.stats.records_total,
-            bytes: operations.stats.logical_bytes,
+            rows: operations.rows,
+            bytes: operations.logical_bytes,
             row_hard_limit: operations.limits.max_records(),
             byte_hard_limit: operations.limits.max_logical_bytes(),
             profile_boundary: PROFILE_EVENT_OPERATION_BOUNDARY,
             profile_remaining,
-            profile_warning: operations.stats.records_total >= PROFILE_EVENT_OPERATION_WARNING,
-            profile_exhausted: operations.stats.records_total >= PROFILE_EVENT_OPERATION_BOUNDARY,
+            profile_warning: operations.rows >= PROFILE_EVENT_OPERATION_WARNING,
+            profile_exhausted: operations.rows >= PROFILE_EVENT_OPERATION_BOUNDARY,
             active_rows: operations.stats.records_active,
             retired_rows: operations.stats.records_retired,
             reverse_rows: operations.stats.reverse_rows,
@@ -884,6 +884,14 @@ fn status_response(
                 ..Default::default()
             }
             .into(),
+            ledger_mode: match operations.mode {
+                EventOperationLedgerMode::Legacy => api::PublishOperationLedgerMode::Legacy,
+                EventOperationLedgerMode::Numbered => api::PublishOperationLedgerMode::Numbered,
+            }
+            .into(),
+            numbered_clients: operations.numbered_stats.clients,
+            numbered_outstanding_results: operations.numbered_stats.outstanding_results,
+            numbered_reverse_rows: operations.numbered_stats.reverse_edges,
             ..Default::default()
         }
         .into(),
@@ -1390,6 +1398,7 @@ mod tests {
                 ordinary_remaining: 990_000,
                 emergency_remaining: 10_000,
                 warning_state: api::OperationCapacityWarning::Ok.into(),
+                ledger_mode: api::PublishOperationLedgerMode::Legacy.into(),
                 audit: api::OperationLedgerAuditStatus {
                     state: api::OperationLedgerAudit::Pending.into(),
                     ..Default::default()
@@ -1515,6 +1524,10 @@ mod tests {
                 (1_900 - rows, 100)
             );
             assert_eq!(operations.warning_state, api::OperationCapacityWarning::Ok);
+            assert_eq!(
+                operations.ledger_mode,
+                api::PublishOperationLedgerMode::Legacy
+            );
             assert_eq!(
                 (
                     operations.rolling_accept_rate,

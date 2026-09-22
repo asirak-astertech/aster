@@ -548,6 +548,14 @@ fn status_evidence(response: &api::GetStatusResponse) -> Result<serde_json::Valu
         .publish_operation_capacity
         .as_option()
         .ok_or(FixtureError::Local)?;
+    let operation_ledger_mode = if operations.ledger_mode == api::PublishOperationLedgerMode::Legacy
+    {
+        "legacy"
+    } else if operations.ledger_mode == api::PublishOperationLedgerMode::Numbered {
+        "numbered"
+    } else {
+        return Err(FixtureError::Local);
+    };
     let deliveries = response
         .delivery_capacity
         .as_option()
@@ -590,9 +598,13 @@ fn status_evidence(response: &api::GetStatusResponse) -> Result<serde_json::Valu
         "operation_profile_remaining": operations.profile_remaining,
         "operation_profile_warning": operations.profile_warning,
         "operation_profile_exhausted": operations.profile_exhausted,
+        "operation_ledger_mode": operation_ledger_mode,
         "operation_active_rows": operations.active_rows,
         "operation_retired_rows": operations.retired_rows,
         "operation_reverse_rows": operations.reverse_rows,
+        "operation_numbered_clients": operations.numbered_clients,
+        "operation_numbered_outstanding_results": operations.numbered_outstanding_results,
+        "operation_numbered_reverse_rows": operations.numbered_reverse_rows,
         "operation_ordinary_remaining": operations.ordinary_remaining,
         "operation_emergency_remaining": operations.emergency_remaining,
         "operation_rolling_accept_rate": operations.rolling_accept_rate,
@@ -610,24 +622,58 @@ fn operation_health(
     operations: &api::PublishOperationCapacityStatus,
 ) -> Result<(&'static str, &'static str), FixtureError> {
     use aster_node::application::{EventOperationCapacity, EventOperationCapacityWarning};
-    use aster_redb_store::{EventOperationLimits, EventOperationStats};
-    if operations.active_rows.checked_add(operations.retired_rows) != Some(operations.rows)
-        || operations.reverse_rows != operations.active_rows
-        || u128::from(operations.bytes)
-            != u128::from(operations.active_rows) * 162 + u128::from(operations.retired_rows) * 67
+    use aster_redb_store::{
+        EventOperationLimits, EventOperationStats, NumberedEventOperationStats,
+    };
+    let capacity = if operations.ledger_mode == api::PublishOperationLedgerMode::Unspecified
+        || operations.ledger_mode == api::PublishOperationLedgerMode::Legacy
     {
+        if operations.active_rows.checked_add(operations.retired_rows) != Some(operations.rows)
+            || operations.reverse_rows != operations.active_rows
+            || u128::from(operations.bytes)
+                != u128::from(operations.active_rows) * 162
+                    + u128::from(operations.retired_rows) * 67
+            || operations.numbered_clients != 0
+            || operations.numbered_outstanding_results != 0
+            || operations.numbered_reverse_rows != 0
+        {
+            return Err(FixtureError::Local);
+        }
+        EventOperationCapacity::new(
+            EventOperationStats {
+                records_total: operations.rows,
+                records_active: operations.active_rows,
+                records_retired: operations.retired_rows,
+                reverse_rows: operations.reverse_rows,
+                logical_bytes: operations.bytes,
+            },
+            EventOperationLimits::DEFAULT,
+        )
+    } else if operations.ledger_mode == api::PublishOperationLedgerMode::Numbered {
+        if operations.active_rows != 0
+            || operations.retired_rows != 0
+            || operations.reverse_rows != 0
+            || operations
+                .numbered_clients
+                .checked_add(operations.numbered_outstanding_results)
+                != Some(operations.rows)
+            || operations.numbered_reverse_rows != operations.numbered_outstanding_results
+        {
+            return Err(FixtureError::Local);
+        }
+        EventOperationCapacity::for_ledgers(
+            EventOperationStats::default(),
+            NumberedEventOperationStats {
+                clients: operations.numbered_clients,
+                outstanding_results: operations.numbered_outstanding_results,
+                reverse_edges: operations.numbered_reverse_rows,
+                logical_bytes: operations.bytes,
+            },
+            EventOperationLimits::DEFAULT,
+        )
+    } else {
         return Err(FixtureError::Local);
-    }
-    let capacity = EventOperationCapacity::new(
-        EventOperationStats {
-            records_total: operations.rows,
-            records_active: operations.active_rows,
-            records_retired: operations.retired_rows,
-            reverse_rows: operations.reverse_rows,
-            logical_bytes: operations.bytes,
-        },
-        EventOperationLimits::DEFAULT,
-    );
+    };
     let (expected_warning, warning) = match capacity.warning {
         EventOperationCapacityWarning::Ok => (api::OperationCapacityWarning::Ok, "ok"),
         EventOperationCapacityWarning::Warning => {
@@ -1129,6 +1175,7 @@ mod tests {
                 ordinary_remaining: 990_000,
                 emergency_remaining: 10_000,
                 warning_state: api::OperationCapacityWarning::Ok.into(),
+                ledger_mode: api::PublishOperationLedgerMode::Legacy.into(),
                 audit: api::OperationLedgerAuditStatus {
                     state: api::OperationLedgerAudit::Pending.into(),
                     ..Default::default()
@@ -1149,6 +1196,7 @@ mod tests {
         let evidence = status_evidence(&valid).expect("valid profile status");
         assert_eq!(evidence["configured_emission_mode"], "normal");
         assert_eq!(evidence["effective_emission_mode"], "receive_only");
+        assert_eq!(evidence["operation_ledger_mode"], "legacy");
         assert_eq!(evidence["operation_ordinary_remaining"], 990_000);
         assert_eq!(evidence["operation_audit_state"], "pending");
 
@@ -1243,6 +1291,29 @@ mod tests {
             };
             assert_eq!(operation_health(&operations).is_ok(), valid, "{name}");
         }
+    }
+
+    #[test]
+    fn operation_health_accepts_coherent_numbered_capacity() {
+        let operations = api::PublishOperationCapacityStatus {
+            rows: 2,
+            bytes: 300,
+            ordinary_remaining: 683_925,
+            emergency_remaining: 0,
+            warning_state: api::OperationCapacityWarning::Ok.into(),
+            ledger_mode: api::PublishOperationLedgerMode::Numbered.into(),
+            numbered_clients: 1,
+            numbered_outstanding_results: 1,
+            numbered_reverse_rows: 1,
+            audit: api::OperationLedgerAuditStatus {
+                state: api::OperationLedgerAudit::Pending.into(),
+                ..Default::default()
+            }
+            .into(),
+            ..Default::default()
+        };
+
+        assert!(operation_health(&operations).is_ok());
     }
 
     #[test]

@@ -199,7 +199,11 @@ async fn customer_operation_limits_process_preserves_over_limit_reopen() {
         (6, 1_296, 4, 5, 1_296), // record quota, then retained count above the new maximum
         (10, 648, 2, 10, 486),   // byte quota, then retained bytes above the new maximum
     ] {
-        let fixture = CustomerFixture::new();
+        // This test exercises quota preservation, not the minimum shutdown
+        // deadline. Leave enough grace for a loaded CI runner to flush the
+        // reopened over-limit ledger without turning a clean stop into a
+        // timing-dependent forced stop.
+        let fixture = CustomerFixture::with_shutdown_grace(5_000);
         fixture.set_operation_limits(records, bytes, 2);
         let running = RunningFixture::start(&fixture).await;
         let mut originals = Vec::new();

@@ -183,51 +183,59 @@ continues to require capacity for its complete image and fails atomically if
 the selected limits cannot hold it.
 
 Authenticated `GetStatus.publish_operation_capacity` now exposes two capacity
-views. `rows` and `bytes` are the actual permanent ledger record count and
-logical bytes; `row_hard_limit` and `byte_hard_limit` are the configured
-candidate limits. The approved evaluation workload boundary remains 1,024
+views. `ledger_mode` identifies the active mutually exclusive `LEGACY` or
+`NUMBERED` ledger. `rows` and `bytes` are that ledger's actual durable record
+count and logical bytes; `row_hard_limit` and `byte_hard_limit` are the
+configured candidate limits. The approved evaluation workload boundary remains 1,024
 operations pending evidence and role review: `profile_boundary = 1024`,
 `profile_remaining = max(1024 - rows, 0)`, `profile_warning` starts at 512, and
 `profile_exhausted` starts at 1,024. An exhausted approved profile can therefore
 coexist with candidate implementation headroom. These observations do not
 approve a higher evaluation workload or grant requirements evidence credit.
 
-The additive fields `active_rows`, `retired_rows`, and `reverse_rows` distinguish
-live operation references from permanent compact fences. `ordinary_remaining`
-is the smaller of ordinary record headroom and ordinary byte headroom divided
-by 162, rounded down. `emergency_remaining` is total record/byte headroom minus
-ordinary headroom. Every headroom subtraction saturates at zero, including
-after reopening with lower limits. `warning_state` is `OK` below 70%, `WARNING`
-at 70%, `CRITICAL` at 90%, and `EXHAUSTED` when no ordinary active record fits.
-Occupancy uses the larger fraction of ordinary record and byte limits.
+In legacy mode, `active_rows`, `retired_rows`, and `reverse_rows` distinguish
+live operation references from permanent compact fences. In numbered mode they
+are zero, while `numbered_clients`, `numbered_outstanding_results`, and
+`numbered_reverse_rows` report the exact sparse-result breakdown.
+`ordinary_remaining` is the smaller of ordinary record and byte headroom,
+using 162 bytes per prospective legacy active record or a conservative 292
+bytes per prospective numbered result. `emergency_remaining` is zero for
+numbered mode until numbered tombstones can use the reserve. Every subtraction
+saturates at zero. `warning_state` is `OK` below 70%, `WARNING` at 70%,
+`CRITICAL` at 90%, and `EXHAUSTED` when no ordinary record fits. Occupancy uses
+the larger fraction of ordinary record and byte limits.
 
-`rolling_accept_rate` counts newly committed permanent operation records over
-the preceding monotonic 60 seconds, divided by 60. A newly bound alias or
-direct compact retired fence counts; an exact retry, conflict, or failed
-admission adds nothing. Restart begins an empty observation window, so the
-first minute can understate the ongoing rate. Samples exactly 60 seconds old
-expire. `estimated_seconds_to_exhaustion` is ordinary headroom divided by that
-rate, rounded up to whole seconds and saturated at `u64::MAX`; zero means no
-observed rate (or zero headroom). The observations are not durable authority.
-Until Event retention is configurable, rate and estimate are planning
-information and do not change the occupancy warning.
+`rolling_accept_rate` counts newly committed ledger rows over the preceding
+monotonic 60 seconds, divided by 60. A newly bound legacy alias, direct compact
+retired fence, numbered client, or numbered outstanding result counts; exact
+retries, session takeovers, acknowledgements, conflicts, and failed admissions
+add nothing. Restart begins an empty observation window, so the first minute
+can understate the ongoing rate. Samples exactly 60 seconds old expire.
+`estimated_seconds_to_exhaustion` is ordinary headroom divided by that rate,
+rounded up to whole seconds and saturated at `u64::MAX`; zero means no observed
+rate (or zero headroom). The observations are not durable authority.
 
-The nested `audit` has `state`, `scanned`, and `total`. `PENDING` means the
-background pass has not started; `RUNNING` reports traversal of one fixed
-snapshot; `COMPLETE` means traversal and final accounting checks passed;
-`FAILED` closes new Event publication. Counts include ledger and reverse rows;
-records committed after the snapshot belong to the next pass. After failure,
-reported store and operation usage/headroom are last-known figures and must
-not be treated as trusted current capacity. Completion is structural integrity
-evidence, not qualification of the configured capacity.
+For the legacy ledger, nested `audit` has `state`, `scanned`, and `total`.
+`PENDING` means the background pass has not started; `RUNNING` reports traversal
+of one fixed snapshot; `COMPLETE` means traversal and final accounting checks
+passed; `FAILED` closes new Event publication. Counts include ledger and reverse
+rows; records committed after the snapshot belong to the next pass. In numbered
+mode this field still describes only the legacy background audit and does not
+claim numbered-ledger audit coverage. After failure, reported store and
+operation usage/headroom are last-known figures and must not be treated as
+trusted current capacity. Completion is structural integrity evidence, not
+qualification of the configured capacity.
 
-Operation keys are permanent for the mission even after payload retirement.
-For capacity remediation, close the mission and start a new mission namespace,
-or select a larger prequalified limit before mission start. Never manually
-delete ledger or reverse-index rows, reuse a retired key, or rely on automatic
-rollover or limit increases. Crate-level constructors that do not select
-operation limits retain `EventOperationLimits::DEFAULT`; strict agent config
-v1 always requires all three explicit values.
+In legacy mode, operation keys are permanent for the mission even after payload
+retirement. In numbered mode, client records remain durable and sequence
+numbers are never reused, while acknowledgement reclaims the result and its
+reverse row. For capacity remediation, close the mission and start a new
+mission namespace, or select a larger prequalified limit before mission start.
+Never manually delete ledger or reverse-index rows, reuse a legacy key or
+numbered sequence, or rely on automatic rollover or limit increases.
+Crate-level constructors that do not select operation limits retain
+`EventOperationLimits::DEFAULT`; strict agent config v1 always requires all
+three explicit values.
 
 The profile workload boundary for unacknowledged Event deliveries is 256,
 while the implementation hard ceiling remains 262,144. `GetStatus` reports

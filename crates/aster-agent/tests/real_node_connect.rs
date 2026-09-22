@@ -362,6 +362,8 @@ fn connect_client_uses_the_real_live_event_authority() {
 
 #[tokio::test]
 async fn optional_event_ttl_is_enforced_by_the_live_agent() {
+    const TEST_TTL_MS: u64 = 10_000;
+
     let state = TestState::new();
     let mission = UnprotectedReferenceMission::from_bytes(
         include_bytes!("../../../bindings/testdata/non-production-provisioning.bundle").to_vec(),
@@ -414,7 +416,7 @@ async fn optional_event_ttl_is_enforced_by_the_live_agent() {
             .code,
         ErrorCode::InvalidArgument
     );
-    request.ttl_ms = Some(2_000);
+    request.ttl_ms = Some(TEST_TTL_MS);
     request.tombstone = true;
     assert_eq!(
         client
@@ -460,7 +462,7 @@ async fn optional_event_ttl_is_enforced_by_the_live_agent() {
         assert_eq!(retry.id, published.id);
         assert!(!retry.inserted);
         let mut changed = request.clone();
-        changed.ttl_ms = Some(3_000);
+        changed.ttl_ms = Some(TEST_TTL_MS + 1_000);
         assert_eq!(
             client.publish_event(changed).await.unwrap_err().code,
             ErrorCode::Aborted
@@ -493,7 +495,9 @@ async fn optional_event_ttl_is_enforced_by_the_live_agent() {
             .await
             .unwrap()
             .into_owned();
-        tokio::time::sleep(Duration::from_millis(2_050)).await;
+        // Keep a generous pre-expiry window for loaded CI runners while still
+        // crossing the real live-agent wall-clock boundary in this test.
+        tokio::time::sleep(Duration::from_millis(TEST_TTL_MS + 50)).await;
         assert!(
             client
                 .query_events(query)
@@ -597,6 +601,7 @@ async fn numbered_sdk_recovers_its_committed_result_across_restart() {
 
     let sequence;
     let committed;
+    let occupied_bytes;
     {
         let sdk = NumberedEventSdk::open(
             api::AsterApplicationServiceClient::new(HttpClient::plaintext(), config()),
@@ -618,6 +623,30 @@ async fn numbered_sdk_recovers_its_committed_result_across_restart() {
             .expect("publish");
         assert_eq!(sequence, 1);
         assert_eq!(committed.operation_sequence, 1);
+
+        let status = api::AsterApplicationServiceClient::new(HttpClient::plaintext(), config())
+            .get_status(api::GetStatusRequest::default())
+            .await
+            .expect("numbered status")
+            .into_owned();
+        let operations = status
+            .publish_operation_capacity
+            .as_option()
+            .expect("publication capacity");
+        assert_eq!(operations.rows, 2, "one client and one outstanding result");
+        assert!(operations.bytes > 0);
+        occupied_bytes = operations.bytes;
+        assert_eq!(operations.ordinary_remaining, 683_925);
+        assert_eq!(operations.emergency_remaining, 0);
+        assert_eq!(operations.profile_remaining, 1_022);
+        assert_eq!(
+            operations.ledger_mode,
+            api::PublishOperationLedgerMode::Numbered
+        );
+        assert_eq!(operations.numbered_clients, 1);
+        assert_eq!(operations.numbered_outstanding_results, 1);
+        assert_eq!(operations.numbered_reverse_rows, 1);
+        assert!(operations.rolling_accept_rate > 0.0);
     }
 
     let restarted = NumberedEventSdk::open(
@@ -639,6 +668,34 @@ async fn numbered_sdk_recovers_its_committed_result_across_restart() {
         .acknowledge(sequence)
         .await
         .expect("acknowledge recovered result");
+
+    let status = api::AsterApplicationServiceClient::new(HttpClient::plaintext(), config())
+        .get_status(api::GetStatusRequest::default())
+        .await
+        .expect("compacted numbered status")
+        .into_owned();
+    let operations = status
+        .publish_operation_capacity
+        .as_option()
+        .expect("publication capacity");
+    assert_eq!(
+        operations.rows, 1,
+        "the durable client remains after result acknowledgement"
+    );
+    assert!(
+        operations.bytes < occupied_bytes,
+        "acknowledgement must reclaim the result and reverse-edge bytes"
+    );
+    assert_eq!(operations.ordinary_remaining, 683_926);
+    assert_eq!(operations.emergency_remaining, 0);
+    assert_eq!(operations.profile_remaining, 1_023);
+    assert_eq!(
+        operations.ledger_mode,
+        api::PublishOperationLedgerMode::Numbered
+    );
+    assert_eq!(operations.numbered_clients, 1);
+    assert_eq!(operations.numbered_outstanding_results, 0);
+    assert_eq!(operations.numbered_reverse_rows, 0);
 
     shutdown_tx.send(true).expect("shutdown");
     tokio::time::timeout(Duration::from_secs(5), server)

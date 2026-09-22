@@ -81,42 +81,56 @@ carrier connectivity, a recent contact, an empty queue, or convergence.
 Offline-first publication is ready behavior.
 
 `GetStatus` also returns configured and effective emission mode, aggregate
-logical store use/limits, permanent publish-operation usage, and pending
+logical store use/limits, durable publish-operation usage, and pending
 delivery pressure. The approved profile remains unchanged: operation
 `profile_warning` begins at 512 records and `profile_exhausted` at 1,024;
 `profile_boundary` is 1,024 and `profile_remaining` saturates at zero. Pending
 delivery workload saturates at 256. A higher configured limit does not approve
 a larger evaluation workload.
 
-In `publish_operation_capacity`, `rows`/`bytes` report actual permanent ledger
-use and `row_hard_limit`/`byte_hard_limit` report configured candidate limits.
-The additive `active_rows`, `retired_rows`, and `reverse_rows` expose compact
-retirement, while `ordinary_remaining` and `emergency_remaining` account for
-both record and byte headroom, preserving 162 bytes for each reserved active
-operation. The candidate `warning_state` becomes `WARNING` at 70% and
-`CRITICAL` at 90% of the larger ordinary record/byte occupancy, then `EXHAUSTED`
-when no ordinary record fits. Candidate headroom can remain positive after
-the approved profile is exhausted.
+In `publish_operation_capacity`, `ledger_mode` identifies the active mutually
+exclusive `LEGACY` or `NUMBERED` ledger. `rows`/`bytes` report that ledger's
+actual use and `row_hard_limit`/`byte_hard_limit` report configured candidate
+limits. In legacy mode, `active_rows`, `retired_rows`, and `reverse_rows`
+expose compact retirement. In numbered mode those legacy counters are zero;
+`numbered_clients`, `numbered_outstanding_results`, and
+`numbered_reverse_rows` provide the exact breakdown, and acknowledging a result
+reduces `rows` and `bytes` while leaving its client record durable.
 
-`rolling_accept_rate` is newly committed permanent records in the last
-monotonic 60 seconds divided by 60. New aliases and direct retired fences
-count; exact retries, conflicts, and failed admission do not. The window starts
-empty on restart and expires samples at exactly 60 seconds. The estimate in
+`ordinary_remaining` and `warning_state` use the active ledger's record and
+byte accounting. Numbered headroom conservatively reserves 292 logical bytes
+for a future result. `emergency_remaining` is zero in numbered mode until
+numbered tombstone admission can consume the emergency reserve. The candidate
+`warning_state` becomes `WARNING` at 70% and `CRITICAL` at 90% of the larger
+ordinary record/byte occupancy, then `EXHAUSTED` when no ordinary record fits.
+Candidate headroom can remain positive after the approved profile is exhausted.
+
+`rolling_accept_rate` is newly committed ledger rows in the last monotonic 60
+seconds divided by 60. New legacy aliases and direct retired fences count; in
+numbered mode, new client and outstanding-result rows count. Exact retries,
+session takeovers, acknowledgements, conflicts, and failed admission do not.
+The window starts empty on restart and expires samples at exactly 60 seconds.
+The estimate in
 `estimated_seconds_to_exhaustion` rounds ordinary headroom/rate up to whole
 seconds, saturates at `u64::MAX`, and is zero without an observed rate or
 headroom. It is planning information; warning state remains occupancy-only
 and does not assume that content expiry frees permanent operation records.
 
-The nested `audit` reports `PENDING`, `RUNNING`, `COMPLETE`, or `FAILED`, with
-`scanned`/`total` counting ledger and reverse rows in one fixed snapshot.
-Completion includes accounting checks; later commits belong to the next pass.
-Failure closes new Event publication and leaves usage/headroom at the last
-successfully read figures, which must not be trusted as current capacity.
+For the legacy ledger, nested `audit` reports `PENDING`, `RUNNING`, `COMPLETE`,
+or `FAILED`, with `scanned`/`total` counting ledger and reverse rows in one fixed
+snapshot. Completion includes accounting checks; later commits belong to the
+next pass. Failure closes new legacy Event publication and leaves
+usage/headroom at the last successfully read figures, which must not be trusted
+as current capacity. In numbered mode this field still describes only the
+legacy background audit and does not claim numbered-ledger audit coverage.
 
-Every operation key remains bound to its mission and intent after payload
-retirement. Plan a new mission namespace or a larger prequalified limit before
-mission start when capacity is insufficient. Never manually delete ledger
-rows or reuse retired keys. See the [capacity reference](../reference/aster-agent-config-v1.md#storage-reserve-calculation)
+In legacy mode, every operation key remains bound to its mission and intent
+after payload retirement. In numbered mode, client records remain durable and
+sequence numbers are never reused, while acknowledgement reclaims the result
+and reverse row. Plan a new mission namespace or a larger prequalified limit
+before mission start when durable capacity is insufficient. Never manually
+delete ledger rows or reuse legacy keys or numbered sequences. See the
+[capacity reference](../reference/aster-agent-config-v1.md#storage-reserve-calculation)
 for configuration details; no larger-capacity qualification is claimed here.
 
 Only `GET` with no body is accepted. Unknown paths return `404`, other methods
