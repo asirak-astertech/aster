@@ -1299,7 +1299,7 @@ mod tests {
             rows: 2,
             bytes: 300,
             ordinary_remaining: 683_925,
-            emergency_remaining: 0,
+            emergency_remaining: 5_548,
             warning_state: api::OperationCapacityWarning::Ok.into(),
             ledger_mode: api::PublishOperationLedgerMode::Numbered.into(),
             numbered_clients: 1,
