@@ -2184,7 +2184,7 @@ fn application_error(operation: &'static str, error: NodeError) -> ApplicationEr
         NodeError::Configuration(_) => ApplicationErrorKind::InvalidRequest,
         NodeError::MissionProvisioning(_) => ApplicationErrorKind::Provisioning,
         NodeError::Revoked(_) => ApplicationErrorKind::UnauthorizedOrRevoked,
-        NodeError::SourceEnvelope(_) if operation == "publish" => {
+        NodeError::SourceEnvelope(_) if matches!(operation, "publish" | "publish_numbered") => {
             ApplicationErrorKind::RequestRejected
         }
         NodeError::SourceEnvelope(_) => ApplicationErrorKind::Integrity,
@@ -3202,6 +3202,26 @@ mod tests {
             payload: payload.to_vec(),
             tombstone: false,
         }
+    }
+
+    #[test]
+    fn numbered_publication_rejects_unprovisioned_topic_after_recovery() {
+        let root = TestRoot::new("numbered-unprovisioned-topic");
+        let client = EventClientId::new(b"numbered-rejected-client".to_vec()).expect("client");
+        let mut node = selected_node(&root);
+        let recovery = node
+            .begin_publication_session(&client, 0, b"rejected-topic-session")
+            .expect("claim");
+        node.complete_publication_recovery(&client, recovery.session, recovery.snapshot_revision)
+            .expect("complete recovery");
+
+        let mut request = numbered_request(&client, recovery.session, 1, b"rejected");
+        request.topic = Topic::new("ops.unprovisioned").expect("topic");
+        let error = node
+            .publish_numbered(request, EventPublishOptions::durable())
+            .expect_err("unprovisioned topic must fail");
+        assert_eq!(error.kind(), ApplicationErrorKind::RequestRejected);
+        assert_eq!(error.operation(), "publish_numbered");
     }
 
     #[test]
