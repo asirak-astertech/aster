@@ -4,6 +4,7 @@
 //! initialized once and is then opened exclusively. Opening never creates or
 //! repairs a missing or corrupt journal.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -54,6 +55,56 @@ impl From<connectrpc::ConnectError> for NumberedEventSdkError {
     }
 }
 
+/// A publication failure that says whether durable sequence assignment happened.
+#[derive(Debug)]
+pub enum PublicationError {
+    /// The journal could not assign a sequence; there is no operation to resume.
+    BeforeAssignment(NumberedEventSdkError),
+    /// The intent is journaled at sequence; recover or resume that operation.
+    Assigned {
+        sequence: u64,
+        source: NumberedEventSdkError,
+    },
+}
+
+impl PublicationError {
+    /// Returns the durable sequence when an intent was assigned.
+    pub fn assigned_sequence(&self) -> Option<u64> {
+        match self {
+            Self::BeforeAssignment(_) => None,
+            Self::Assigned { sequence, .. } => Some(*sequence),
+        }
+    }
+
+    /// Returns the underlying journal, protocol, or transport error.
+    pub fn sdk_error(&self) -> &NumberedEventSdkError {
+        match self {
+            Self::BeforeAssignment(error) | Self::Assigned { source: error, .. } => error,
+        }
+    }
+}
+
+impl fmt::Display for PublicationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BeforeAssignment(error) => {
+                write!(formatter, "publication was not assigned: {error}")
+            }
+            Self::Assigned { sequence, source } => {
+                write!(
+                    formatter,
+                    "publication sequence {sequence} was assigned: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for PublicationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.sdk_error())
+    }
+}
 type Result<T> = std::result::Result<T, NumberedEventSdkError>;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -79,6 +130,36 @@ struct JournalEntry {
     intent: api::PublishNumberedEventRequest,
     result: Option<api::CommittedPublicationResult>,
     abandoned: bool,
+}
+/// State discovered while reconciling a durable publication journal.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RecoveredState {
+    /// The intent is journaled above the server frontier; publish or abandon it.
+    Pending,
+    /// The server retains a committed result; apply it idempotently, then acknowledge.
+    Committed(api::CommittedPublicationResult),
+    /// The server has permanently consumed the sequence; no action is required.
+    Retired,
+}
+
+/// One locally journaled operation found during recovery.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecoveredOperation {
+    /// The positive operation sequence assigned by the journal.
+    pub sequence: u64,
+    /// The one action state proved by the recovered server snapshot.
+    pub state: RecoveredState,
+}
+
+/// Ordered recovery result returned only after durable reconciliation and completion.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecoveryReport {
+    /// The fenced publication session completed by this recovery.
+    pub session: u64,
+    /// The server's durable allocated sequence frontier.
+    pub allocated_through: u64,
+    /// Locally journaled operations in ascending sequence order.
+    pub operations: Vec<RecoveredOperation>,
 }
 
 /// Exclusive, transactional publication state for one stable client ID.
@@ -323,6 +404,10 @@ where
     /// Claims or idempotently resumes this process session and persists the
     /// complete recovery snapshot before returning.
     pub async fn begin_recovery(&self) -> Result<()> {
+        self.begin_recovery_report().await.map(|_| ())
+    }
+
+    async fn begin_recovery_report(&self) -> Result<RecoveryReport> {
         let mut state = self.journal.read_state()?;
         let claim = if let Some(claim) = state.pending_claim.clone() {
             claim
@@ -352,11 +437,52 @@ where
             })
             .await?
             .into_owned();
-        if response.session == 0 || response.allocated_through < state.allocated_through {
+        if response.session == 0
+            || response.allocated_through < state.allocated_through
+            || response.snapshot_revision == 0
+        {
             return Err(NumberedEventSdkError::Protocol(
-                "recovery snapshot regressed a durable frontier".to_owned(),
+                "recovery snapshot has an invalid session, frontier, or revision".to_owned(),
             ));
         }
+        // Validate the complete snapshot against durable rows before opening a
+        // write transaction. A rejected response changes only the prior claim.
+        let mut outstanding = BTreeMap::new();
+        for result in &response.outstanding {
+            let sequence = result.operation_sequence;
+            if sequence == 0
+                || sequence > response.allocated_through
+                || outstanding.insert(sequence, result).is_some()
+            {
+                return Err(NumberedEventSdkError::Protocol(format!(
+                    "recovery snapshot has an invalid or duplicate sequence {sequence}"
+                )));
+            }
+            validate_committed_result(result)?;
+            let entry = self.journal.entry(sequence)?.ok_or_else(|| {
+                NumberedEventSdkError::Protocol(format!(
+                    "agent returned unknown journal sequence {sequence}"
+                ))
+            })?;
+            if entry.abandoned {
+                return Err(NumberedEventSdkError::Protocol(format!(
+                    "agent resurrected abandoned sequence {sequence}"
+                )));
+            }
+            if let Some(previous) = &entry.result {
+                validate_committed_result(previous)?;
+                let same = previous == result;
+                let retirement = previous.content == api::CommittedContentStatus::Available
+                    && result.content == api::CommittedContentStatus::Retired
+                    && previous.receipt == result.receipt;
+                if !same && !retirement {
+                    return Err(NumberedEventSdkError::Protocol(format!(
+                        "agent replaced committed result for sequence {sequence}"
+                    )));
+                }
+            }
+        }
+        let mut operations = Vec::new();
         self.journal.write(|journal_state, entries| {
             if journal_state.pending_claim.as_ref().is_none_or(|pending| {
                 pending.expected_session != claim.expected_session || pending.nonce != claim.nonce
@@ -389,43 +515,28 @@ where
                     })?;
             }
             let mut retired = Vec::new();
-            let iter = entries
-                .range(1..=response.allocated_through)
-                .map_err(|error| {
-                    journal_error(self.journal.path(), "scan recovered entries", error)
-                })?;
+            let iter = entries.iter().map_err(|error| {
+                journal_error(self.journal.path(), "scan recovered entries", error)
+            })?;
             for row in iter {
-                let (key, value) = row.map_err(|error| {
+                let (key, _value) = row.map_err(|error| {
                     journal_error(self.journal.path(), "read recovered entry", error)
                 })?;
-                let entry: JournalEntry = decode_json(value.value(), "entry")?;
-                if entry.result.is_none()
-                    && !response
-                        .outstanding
-                        .iter()
-                        .any(|result| result.operation_sequence == key.value())
-                {
-                    retired.push(key.value());
-                }
+                let sequence = key.value();
+                let state = if let Some(result) = outstanding.get(&sequence) {
+                    RecoveredState::Committed((*result).clone())
+                } else if sequence <= response.allocated_through {
+                    retired.push(sequence);
+                    RecoveredState::Retired
+                } else {
+                    RecoveredState::Pending
+                };
+                operations.push(RecoveredOperation { sequence, state });
             }
             for sequence in retired {
-                let value = entries
-                    .get(sequence)
-                    .map_err(|error| {
-                        journal_error(self.journal.path(), "get retired entry", error)
-                    })?
-                    .ok_or_else(|| {
-                        NumberedEventSdkError::Journal("entry disappeared".to_owned())
-                    })?;
-                let mut entry: JournalEntry = decode_json(value.value(), "entry")?;
-                drop(value);
-                entry.abandoned = true;
-                let encoded = encode_json(&entry)?;
-                entries
-                    .insert(sequence, encoded.as_slice())
-                    .map_err(|error| {
-                        journal_error(self.journal.path(), "mark retired entry", error)
-                    })?;
+                entries.remove(sequence).map_err(|error| {
+                    journal_error(self.journal.path(), "remove consumed entry", error)
+                })?;
             }
             journal_state.session = response.session;
             journal_state.allocated_through = response.allocated_through;
@@ -447,7 +558,11 @@ where
                 "recovered session was not persisted".to_owned(),
             ));
         }
-        Ok(())
+        Ok(RecoveryReport {
+            session: response.session,
+            allocated_through: response.allocated_through,
+            operations,
+        })
     }
 
     /// Completes the saved snapshot. Repeating this after a lost response is
@@ -480,9 +595,12 @@ where
         })
     }
 
-    pub async fn recover(&self) -> Result<()> {
-        self.begin_recovery().await?;
-        self.complete_recovery().await
+    /// Reconciles the journal and returns ordered work only after completion
+    /// succeeds and is durably marked complete.
+    pub async fn recover(&self) -> Result<RecoveryReport> {
+        let report = self.begin_recovery_report().await?;
+        self.complete_recovery().await?;
+        Ok(report)
     }
 
     /// Durably assigns the next positive sequence before any request can be sent.
@@ -585,9 +703,14 @@ where
     pub async fn publish(
         &self,
         intent: api::PublishNumberedEventRequest,
-    ) -> Result<(u64, api::CommittedPublicationResult)> {
-        let sequence = self.journal_publication(intent)?;
-        let result = self.publish_journaled(sequence).await?;
+    ) -> std::result::Result<(u64, api::CommittedPublicationResult), PublicationError> {
+        let sequence = self
+            .journal_publication(intent)
+            .map_err(PublicationError::BeforeAssignment)?;
+        let result = self
+            .publish_journaled(sequence)
+            .await
+            .map_err(|source| PublicationError::Assigned { sequence, source })?;
         Ok((sequence, result))
     }
 
@@ -595,11 +718,27 @@ where
     pub async fn abandon(&self, sequence: u64) -> Result<()> {
         let state = self.journal.read_state()?;
         require_recovered(&state)?;
-        let entry = self.journal.entry(sequence)?.ok_or_else(|| {
-            NumberedEventSdkError::Journal(format!("sequence {sequence} is not journaled"))
-        })?;
+        let entry = match self.journal.entry(sequence)? {
+            Some(entry) => entry,
+            None if sequence > 0 && sequence <= state.allocated_through => return Ok(()),
+            None => {
+                return Err(NumberedEventSdkError::Journal(format!(
+                    "sequence {sequence} is not journaled"
+                )));
+            }
+        };
         if entry.abandoned {
-            return Ok(());
+            if sequence > state.allocated_through {
+                return Err(NumberedEventSdkError::Protocol(
+                    "abandoned sequence is above the durable frontier".to_owned(),
+                ));
+            }
+            return self.journal.write(|_, entries| {
+                entries.remove(sequence).map_err(|error| {
+                    journal_error(self.journal.path(), "remove old abandoned entry", error)
+                })?;
+                Ok(())
+            });
         }
         if entry.result.is_some() || sequence != state.allocated_through + 1 {
             return Err(NumberedEventSdkError::Protocol(
@@ -621,19 +760,17 @@ where
                     "abandonment frontier changed while an RPC was in flight".to_owned(),
                 ));
             }
-            let value = entries
-                .get(sequence)
-                .map_err(|error| journal_error(self.journal.path(), "get abandonment", error))?
-                .ok_or_else(|| {
-                    NumberedEventSdkError::Journal("publication disappeared".to_owned())
-                })?;
-            let mut saved: JournalEntry = decode_json(value.value(), "entry")?;
-            drop(value);
-            saved.abandoned = true;
-            let encoded = encode_json(&saved)?;
-            entries
-                .insert(sequence, encoded.as_slice())
-                .map_err(|error| journal_error(self.journal.path(), "store abandonment", error))?;
+            if entries
+                .remove(sequence)
+                .map_err(|error| {
+                    journal_error(self.journal.path(), "remove abandoned entry", error)
+                })?
+                .is_none()
+            {
+                return Err(NumberedEventSdkError::Journal(
+                    "publication disappeared".to_owned(),
+                ));
+            }
             current.allocated_through = sequence;
             Ok(())
         })
@@ -643,9 +780,15 @@ where
     pub async fn acknowledge(&self, sequence: u64) -> Result<()> {
         let state = self.journal.read_state()?;
         require_recovered(&state)?;
-        let entry = self.journal.entry(sequence)?.ok_or_else(|| {
-            NumberedEventSdkError::Journal(format!("sequence {sequence} is not journaled"))
-        })?;
+        let entry = match self.journal.entry(sequence)? {
+            Some(entry) => entry,
+            None if sequence > 0 && sequence <= state.allocated_through => return Ok(()),
+            None => {
+                return Err(NumberedEventSdkError::Journal(format!(
+                    "sequence {sequence} is not journaled"
+                )));
+            }
+        };
         if entry.result.is_none() || entry.abandoned {
             return Err(NumberedEventSdkError::Protocol(
                 "only a durably saved committed result may be acknowledged".to_owned(),
@@ -672,6 +815,39 @@ where
             Ok(())
         })
     }
+}
+
+fn validate_committed_result(result: &api::CommittedPublicationResult) -> Result<()> {
+    let sequence = result.operation_sequence;
+    let receipt = result.receipt.as_option().ok_or_else(|| {
+        NumberedEventSdkError::Protocol(format!("sequence {sequence} omitted its receipt"))
+    })?;
+    if sequence == 0
+        || receipt.transfer_id.len() != 32
+        || receipt.event_id.len() != 32
+        || receipt.acceptance_marker == 0
+    {
+        return Err(NumberedEventSdkError::Protocol(format!(
+            "sequence {sequence} has an invalid receipt"
+        )));
+    }
+    let content_valid = match result.content.as_known() {
+        Some(api::CommittedContentStatus::Available) => result.retirement_reason.is_none(),
+        Some(api::CommittedContentStatus::Retired) => matches!(
+            result
+                .retirement_reason
+                .as_ref()
+                .and_then(|reason| reason.as_known()),
+            Some(api::RetirementReason::Expired | api::RetirementReason::QuotaPressure)
+        ),
+        _ => false,
+    };
+    if !content_valid {
+        return Err(NumberedEventSdkError::Protocol(format!(
+            "sequence {sequence} has an invalid content status or retirement reason"
+        )));
+    }
+    Ok(())
 }
 
 fn require_recovered(state: &JournalState) -> Result<()> {
@@ -718,7 +894,677 @@ fn _response_shape<T>(response: UnaryResponse<T>) -> UnaryResponse<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+    use connectrpc::client::{ClientBody, ClientConfig};
+    use futures::future::BoxFuture;
+    use http::{Request, Response};
+    use http_body_util::Full;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
 
+    #[derive(Clone)]
+    struct ScriptedTransport(Arc<Mutex<VecDeque<Step>>>);
+
+    struct Step {
+        procedure: &'static str,
+        body: Option<Vec<u8>>,
+    }
+
+    impl ClientTransport for ScriptedTransport {
+        type ResponseBody = Full<Bytes>;
+        type Error = std::io::Error;
+
+        fn send(
+            &self,
+            request: Request<ClientBody>,
+        ) -> BoxFuture<'static, std::result::Result<Response<Self::ResponseBody>, Self::Error>>
+        {
+            let step = self
+                .0
+                .lock()
+                .expect("script lock")
+                .pop_front()
+                .expect("script step");
+            assert!(
+                request.uri().path().ends_with(step.procedure),
+                "wrong RPC: {}",
+                request.uri()
+            );
+            Box::pin(async move {
+                let body = step
+                    .body
+                    .ok_or_else(|| std::io::Error::other("scripted lost response"))?;
+                Ok(Response::builder()
+                    .status(200)
+                    .header("content-type", "application/proto")
+                    .body(Full::new(Bytes::from(body)))
+                    .expect("scripted response"))
+            })
+        }
+    }
+
+    fn step<M: buffa::Message>(procedure: &'static str, response: M) -> Step {
+        Step {
+            procedure,
+            body: Some(response.encode_to_vec()),
+        }
+    }
+
+    fn lost(procedure: &'static str) -> Step {
+        Step {
+            procedure,
+            body: None,
+        }
+    }
+
+    fn scripted(
+        steps: Vec<Step>,
+    ) -> (
+        ScriptedTransport,
+        api::AsterApplicationServiceClient<ScriptedTransport>,
+    ) {
+        let transport = ScriptedTransport(Arc::new(Mutex::new(steps.into())));
+        let client = api::AsterApplicationServiceClient::new(
+            transport.clone(),
+            ClientConfig::new("http://localhost".parse().expect("URI")),
+        );
+        (transport, client)
+    }
+
+    fn begin(
+        session: u64,
+        frontier: u64,
+        outstanding: Vec<api::CommittedPublicationResult>,
+    ) -> Step {
+        step(
+            "/BeginEventPublicationSession",
+            api::BeginEventPublicationSessionResponse {
+                session,
+                allocated_through: frontier,
+                snapshot_revision: 1,
+                outstanding,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn complete() -> Step {
+        step(
+            "/CompleteEventPublicationRecovery",
+            api::CompleteEventPublicationRecoveryResponse::default(),
+        )
+    }
+
+    fn result(sequence: u64) -> api::CommittedPublicationResult {
+        api::CommittedPublicationResult {
+            operation_sequence: sequence,
+            receipt: api::CommittedEventReceipt {
+                transfer_id: vec![1; 32],
+                event_id: vec![2; 32],
+                acceptance_marker: 7,
+                ..Default::default()
+            }
+            .into(),
+            content: api::CommittedContentStatus::Available.into(),
+            ..Default::default()
+        }
+    }
+
+    fn intent() -> api::PublishNumberedEventRequest {
+        api::PublishNumberedEventRequest {
+            payload: b"secret payload".to_vec(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_error_exposes_assigned_sequence_after_rpc_loss() {
+        let path = journal_path("publish-loss");
+        let _ = std::fs::remove_file(&path);
+        PublicationJournal::initialize(&path, b"client").expect("initialize");
+        let (_transport, client) = scripted(vec![
+            begin(1, 0, vec![]),
+            complete(),
+            lost("/PublishNumberedEvent"),
+        ]);
+        let sdk = NumberedEventSdk::open(client, &path, b"client").expect("open");
+        sdk.recover().await.expect("recover");
+        let error = sdk.publish(intent()).await.expect_err("lost response");
+        assert_eq!(error.assigned_sequence(), Some(1));
+        drop(sdk);
+        std::fs::remove_file(path).expect("remove journal");
+    }
+    #[tokio::test]
+    async fn restart_report_lists_pending_committed_and_consumed_in_sequence_order() {
+        let path = journal_path("mixed-recovery");
+        let _ = std::fs::remove_file(&path);
+        PublicationJournal::initialize(&path, b"client").expect("initialize");
+        let (_transport, client) = scripted(vec![
+            begin(1, 0, vec![]),
+            complete(),
+            step(
+                "/PublishNumberedEvent",
+                api::PublishNumberedEventResponse {
+                    result: result(1).into(),
+                    ..Default::default()
+                },
+            ),
+            lost("/AbandonEventPublication"),
+        ]);
+        let sdk = NumberedEventSdk::open(client, &path, b"client").expect("open");
+        sdk.recover().await.expect("recover");
+        let first = sdk.journal_publication(intent()).expect("first intent");
+        assert_eq!(first, 1);
+        sdk.publish_journaled(first).await.expect("commit first");
+        let consumed = sdk.journal_publication(intent()).expect("second intent");
+        assert_eq!(consumed, 2);
+        sdk.abandon(consumed)
+            .await
+            .expect_err("lost abandonment response");
+        let pending = sdk.journal_publication(intent()).expect("third intent");
+        assert_eq!(pending, 3);
+        drop(sdk);
+
+        let (_transport, client) = scripted(vec![begin(2, 2, vec![result(1)]), complete()]);
+        let sdk = NumberedEventSdk::open(client, &path, b"client").expect("restart");
+        let report = sdk.recover().await.expect("restart recovery");
+        assert_eq!(report.session, 2);
+        assert_eq!(report.allocated_through, 2);
+        assert_eq!(report.operations.len(), 3);
+        assert_eq!(report.operations[0].sequence, 1);
+        assert!(
+            matches!(&report.operations[0].state, RecoveredState::Committed(recovered) if recovered == &result(1))
+        );
+        assert_eq!(report.operations[1].sequence, 2);
+        assert!(matches!(
+            report.operations[1].state,
+            RecoveredState::Retired
+        ));
+        assert_eq!(report.operations[2].sequence, 3);
+        assert!(matches!(
+            report.operations[2].state,
+            RecoveredState::Pending
+        ));
+        assert!(sdk.journal.entry(2).expect("row lookup").is_none());
+        assert!(sdk.journal.entry(1).expect("row lookup").is_some());
+        assert!(sdk.journal.entry(3).expect("row lookup").is_some());
+        drop(sdk);
+        std::fs::remove_file(path).expect("remove journal");
+    }
+    #[tokio::test]
+    async fn recovery_rejects_changed_receipt_without_touching_journal() {
+        let path = journal_path("receipt-replacement");
+        let _ = std::fs::remove_file(&path);
+        PublicationJournal::initialize(&path, b"client").expect("initialize");
+        let journal = PublicationJournal::open(&path, b"client").expect("open");
+        journal
+            .write(|state, entries| {
+                state.session = 1;
+                state.allocated_through = 1;
+                state.snapshot_revision = 1;
+                state.next_sequence = Some(2);
+                let mut publication = intent();
+                publication.client_id = b"client".to_vec();
+                publication.operation_sequence = 1;
+                publication.session = 1;
+                let encoded = encode_json(&JournalEntry {
+                    intent: publication,
+                    result: Some(result(1)),
+                    abandoned: false,
+                })?;
+                entries
+                    .insert(1, encoded.as_slice())
+                    .map_err(|error| journal_error(journal.path(), "seed result", error))?;
+                Ok(())
+            })
+            .expect("seed journal");
+        drop(journal);
+        let mut changed = result(1);
+        let mut receipt = changed.receipt.as_option().cloned().expect("receipt");
+        receipt.transfer_id = vec![9; 32];
+        changed.receipt = receipt.into();
+        let (_transport, client) = scripted(vec![begin(2, 1, vec![changed])]);
+        let sdk = NumberedEventSdk::open(client, &path, b"client").expect("restart");
+        sdk.journal
+            .update_state(|state| {
+                state.pending_claim = Some(PendingClaim {
+                    expected_session: 1,
+                    nonce: vec![8; CLAIM_NONCE_BYTES],
+                });
+                Ok(())
+            })
+            .expect("seed claim");
+        let before_state =
+            encode_json(&sdk.journal.read_state().expect("state")).expect("encode state");
+        let before_entry =
+            encode_json(&sdk.journal.entry(1).expect("entry").expect("row")).expect("encode row");
+        assert!(matches!(
+            sdk.begin_recovery().await,
+            Err(NumberedEventSdkError::Protocol(_))
+        ));
+        assert_eq!(
+            encode_json(&sdk.journal.read_state().expect("state")).expect("encode state"),
+            before_state
+        );
+        assert_eq!(
+            encode_json(&sdk.journal.entry(1).expect("entry").expect("row")).expect("encode row"),
+            before_entry
+        );
+        drop(sdk);
+        std::fs::remove_file(path).expect("remove journal");
+    }
+    #[tokio::test]
+    async fn malformed_snapshots_leave_claim_and_rows_unchanged() {
+        fn base() -> api::BeginEventPublicationSessionResponse {
+            api::BeginEventPublicationSessionResponse {
+                session: 2,
+                allocated_through: 1,
+                snapshot_revision: 1,
+                outstanding: vec![result(1)],
+                ..Default::default()
+            }
+        }
+        fn bad(
+            change: impl FnOnce(&mut api::BeginEventPublicationSessionResponse),
+        ) -> api::BeginEventPublicationSessionResponse {
+            let mut snapshot = base();
+            change(&mut snapshot);
+            snapshot
+        }
+        fn receipt_bad(
+            change: impl FnOnce(&mut api::CommittedEventReceipt),
+        ) -> api::BeginEventPublicationSessionResponse {
+            bad(|snapshot| {
+                let mut receipt = snapshot.outstanding[0]
+                    .receipt
+                    .as_option()
+                    .cloned()
+                    .expect("receipt");
+                change(&mut receipt);
+                snapshot.outstanding[0].receipt = receipt.into();
+            })
+        }
+        let retired = {
+            let mut value = result(1);
+            value.content = api::CommittedContentStatus::Retired.into();
+            value.retirement_reason = Some(api::RetirementReason::Expired.into());
+            value
+        };
+        let mut cases = vec![
+            ("zero-session", bad(|s| s.session = 0), result(1), false),
+            (
+                "regressed-frontier",
+                bad(|s| s.allocated_through = 0),
+                result(1),
+                false,
+            ),
+            (
+                "zero-revision",
+                bad(|s| s.snapshot_revision = 0),
+                result(1),
+                false,
+            ),
+            (
+                "zero-sequence",
+                bad(|s| s.outstanding[0].operation_sequence = 0),
+                result(1),
+                false,
+            ),
+            (
+                "duplicate-sequence",
+                bad(|s| s.outstanding.push(result(1))),
+                result(1),
+                false,
+            ),
+            (
+                "above-frontier",
+                bad(|s| s.outstanding[0].operation_sequence = 2),
+                result(1),
+                false,
+            ),
+            (
+                "unknown-sequence",
+                bad(|s| {
+                    s.allocated_through = 3;
+                    s.outstanding[0].operation_sequence = 3;
+                }),
+                result(1),
+                false,
+            ),
+            (
+                "missing-receipt",
+                bad(|s| s.outstanding[0].receipt = Default::default()),
+                result(1),
+                false,
+            ),
+            (
+                "short-transfer-id",
+                receipt_bad(|r| r.transfer_id.pop().map(drop).unwrap_or(())),
+                result(1),
+                false,
+            ),
+            (
+                "short-event-id",
+                receipt_bad(|r| r.event_id.pop().map(drop).unwrap_or(())),
+                result(1),
+                false,
+            ),
+            (
+                "zero-marker",
+                receipt_bad(|r| r.acceptance_marker = 0),
+                result(1),
+                false,
+            ),
+            (
+                "unspecified-content",
+                bad(|s| s.outstanding[0].content = api::CommittedContentStatus::Unspecified.into()),
+                result(1),
+                false,
+            ),
+            (
+                "unknown-content",
+                bad(|s| s.outstanding[0].content = 99.into()),
+                result(1),
+                false,
+            ),
+            (
+                "available-with-reason",
+                bad(|s| {
+                    s.outstanding[0].retirement_reason = Some(api::RetirementReason::Expired.into())
+                }),
+                result(1),
+                false,
+            ),
+            (
+                "retired-without-reason",
+                bad(|s| s.outstanding[0].content = api::CommittedContentStatus::Retired.into()),
+                result(1),
+                false,
+            ),
+            (
+                "retired-unspecified-reason",
+                bad(|s| {
+                    s.outstanding[0].content = api::CommittedContentStatus::Retired.into();
+                    s.outstanding[0].retirement_reason =
+                        Some(api::RetirementReason::Unspecified.into());
+                }),
+                result(1),
+                false,
+            ),
+            (
+                "retired-unknown-reason",
+                bad(|s| {
+                    s.outstanding[0].content = api::CommittedContentStatus::Retired.into();
+                    s.outstanding[0].retirement_reason = Some(99.into());
+                }),
+                result(1),
+                false,
+            ),
+            (
+                "changed-transfer-id",
+                receipt_bad(|r| r.transfer_id = vec![9; 32]),
+                result(1),
+                false,
+            ),
+            (
+                "changed-event-id",
+                receipt_bad(|r| r.event_id = vec![9; 32]),
+                result(1),
+                false,
+            ),
+            (
+                "changed-marker",
+                receipt_bad(|r| r.acceptance_marker = 9),
+                result(1),
+                false,
+            ),
+            ("retired-to-available", base(), retired.clone(), false),
+            (
+                "changed-retired-reason",
+                bad(|s| {
+                    s.outstanding[0].content = api::CommittedContentStatus::Retired.into();
+                    s.outstanding[0].retirement_reason =
+                        Some(api::RetirementReason::QuotaPressure.into());
+                }),
+                retired,
+                false,
+            ),
+        ];
+        cases.push((
+            "abandoned-resurrection",
+            bad(|s| {
+                s.allocated_through = 2;
+                s.outstanding.push(result(2));
+            }),
+            result(1),
+            true,
+        ));
+
+        for (name, snapshot, stored, abandoned) in cases {
+            let path = journal_path(name);
+            let _ = std::fs::remove_file(&path);
+            PublicationJournal::initialize(&path, b"client").expect("initialize");
+            let journal = PublicationJournal::open(&path, b"client").expect("open");
+            journal
+                .write(|state, entries| {
+                    state.session = 1;
+                    state.allocated_through = 1;
+                    state.snapshot_revision = 1;
+                    state.next_sequence = Some(3);
+                    for (sequence, saved_result, is_abandoned) in
+                        [(1, Some(stored.clone()), false), (2, None, abandoned)]
+                    {
+                        let mut publication = intent();
+                        publication.client_id = b"client".to_vec();
+                        publication.operation_sequence = sequence;
+                        publication.session = 1;
+                        let encoded = encode_json(&JournalEntry {
+                            intent: publication,
+                            result: saved_result,
+                            abandoned: is_abandoned,
+                        })?;
+                        entries
+                            .insert(sequence, encoded.as_slice())
+                            .map_err(|error| journal_error(journal.path(), "seed entry", error))?;
+                    }
+                    Ok(())
+                })
+                .expect("seed journal");
+            drop(journal);
+            let (_transport, client) =
+                scripted(vec![step("/BeginEventPublicationSession", snapshot)]);
+            let sdk = NumberedEventSdk::open(client, &path, b"client").expect("restart");
+            sdk.journal
+                .update_state(|state| {
+                    state.pending_claim = Some(PendingClaim {
+                        expected_session: 1,
+                        nonce: vec![8; CLAIM_NONCE_BYTES],
+                    });
+                    Ok(())
+                })
+                .expect("seed claim");
+            let before_state =
+                encode_json(&sdk.journal.read_state().expect("state")).expect("encode state");
+            let before_first = encode_json(&sdk.journal.entry(1).expect("entry").expect("row"))
+                .expect("encode row");
+            let before_second = encode_json(&sdk.journal.entry(2).expect("entry").expect("row"))
+                .expect("encode row");
+            assert!(
+                matches!(
+                    sdk.begin_recovery().await,
+                    Err(NumberedEventSdkError::Protocol(_))
+                ),
+                "{name}"
+            );
+            assert_eq!(
+                encode_json(&sdk.journal.read_state().expect("state")).expect("encode state"),
+                before_state,
+                "{name}: state"
+            );
+            assert_eq!(
+                encode_json(&sdk.journal.entry(1).expect("entry").expect("row"))
+                    .expect("encode row"),
+                before_first,
+                "{name}: first row"
+            );
+            assert_eq!(
+                encode_json(&sdk.journal.entry(2).expect("entry").expect("row"))
+                    .expect("encode row"),
+                before_second,
+                "{name}: second row"
+            );
+            drop(sdk);
+            std::fs::remove_file(path).expect("remove journal");
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_abandon_deletes_payload_and_repeat_is_bounded() {
+        let path = journal_path("abandon-cleanup");
+        let _ = std::fs::remove_file(&path);
+        PublicationJournal::initialize(&path, b"client").expect("initialize");
+        let (_transport, client) = scripted(vec![
+            begin(1, 0, vec![]),
+            complete(),
+            step(
+                "/AbandonEventPublication",
+                api::AbandonEventPublicationResponse::default(),
+            ),
+        ]);
+        let sdk = NumberedEventSdk::open(client, &path, b"client").expect("open");
+        sdk.recover().await.expect("recover");
+        let sequence = sdk.journal_publication(intent()).expect("journal");
+        sdk.abandon(sequence).await.expect("abandon");
+        assert!(sdk.journal.entry(sequence).expect("row lookup").is_none());
+        sdk.abandon(sequence).await.expect("repeat abandon");
+        assert!(
+            sdk.abandon(sequence + 1).await.is_err(),
+            "absent above frontier"
+        );
+        drop(sdk);
+        std::fs::remove_file(path).expect("remove journal");
+    }
+
+    #[tokio::test]
+    async fn lost_acknowledgement_response_is_cleaned_by_recovery() {
+        let path = journal_path("ack-loss");
+        let _ = std::fs::remove_file(&path);
+        PublicationJournal::initialize(&path, b"client").expect("initialize");
+        let (_transport, client) = scripted(vec![
+            begin(1, 0, vec![]),
+            complete(),
+            step(
+                "/PublishNumberedEvent",
+                api::PublishNumberedEventResponse {
+                    result: result(1).into(),
+                    ..Default::default()
+                },
+            ),
+            lost("/AcknowledgeEventPublicationResult"),
+        ]);
+        let sdk = NumberedEventSdk::open(client, &path, b"client").expect("open");
+        sdk.recover().await.expect("recover");
+        let (sequence, _) = sdk.publish(intent()).await.expect("publish");
+        sdk.acknowledge(sequence)
+            .await
+            .expect_err("lost acknowledgement response");
+        assert!(sdk.journal.entry(sequence).expect("row lookup").is_some());
+        drop(sdk);
+        let (_transport, client) = scripted(vec![begin(2, 1, vec![]), complete()]);
+        let sdk = NumberedEventSdk::open(client, &path, b"client").expect("restart");
+        let report = sdk.recover().await.expect("recover consumed result");
+        assert!(matches!(
+            report.operations[0].state,
+            RecoveredState::Retired
+        ));
+        assert!(sdk.journal.entry(sequence).expect("row lookup").is_none());
+        sdk.acknowledge(sequence)
+            .await
+            .expect("repeat acknowledgement");
+        drop(sdk);
+        std::fs::remove_file(path).expect("remove journal");
+    }
+    #[tokio::test]
+    async fn publish_before_assignment_has_no_sequence() {
+        let path = journal_path("preassignment");
+        let _ = std::fs::remove_file(&path);
+        PublicationJournal::initialize(&path, b"client").expect("initialize");
+        let (_transport, client) = scripted(vec![]);
+        let sdk = NumberedEventSdk::open(client, &path, b"client").expect("open");
+        let error = sdk.publish(intent()).await.expect_err("recovery required");
+        assert!(matches!(error, PublicationError::BeforeAssignment(_)));
+        assert_eq!(error.assigned_sequence(), None);
+        assert!(sdk.journal.entry(1).expect("row lookup").is_none());
+        drop(sdk);
+        std::fs::remove_file(path).expect("remove journal");
+    }
+
+    #[tokio::test]
+    async fn identical_replay_and_monotonic_content_retirement_succeed() {
+        let path = journal_path("content-transition");
+        let _ = std::fs::remove_file(&path);
+        PublicationJournal::initialize(&path, b"client").expect("initialize");
+        let (_transport, client) = scripted(vec![
+            begin(1, 0, vec![]),
+            complete(),
+            step(
+                "/PublishNumberedEvent",
+                api::PublishNumberedEventResponse {
+                    result: result(1).into(),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let sdk = NumberedEventSdk::open(client, &path, b"client").expect("open");
+        sdk.recover().await.expect("recover");
+        sdk.publish(intent()).await.expect("publish");
+        drop(sdk);
+
+        let (_transport, client) = scripted(vec![begin(2, 1, vec![result(1)]), complete()]);
+        let sdk = NumberedEventSdk::open(client, &path, b"client").expect("restart");
+        let report = sdk.recover().await.expect("identical replay");
+        assert!(
+            matches!(&report.operations[0].state, RecoveredState::Committed(replayed) if replayed == &result(1))
+        );
+        drop(sdk);
+
+        let mut retired = result(1);
+        retired.content = api::CommittedContentStatus::Retired.into();
+        retired.retirement_reason = Some(api::RetirementReason::Expired.into());
+        let (_transport, client) = scripted(vec![begin(3, 1, vec![retired.clone()]), complete()]);
+        let sdk = NumberedEventSdk::open(client, &path, b"client").expect("restart");
+        let report = sdk.recover().await.expect("monotonic retirement");
+        assert!(
+            matches!(&report.operations[0].state, RecoveredState::Committed(replayed) if replayed == &retired)
+        );
+        assert_eq!(
+            sdk.journal
+                .entry(1)
+                .expect("row lookup")
+                .expect("row")
+                .result,
+            Some(retired)
+        );
+        drop(sdk);
+        std::fs::remove_file(path).expect("remove journal");
+    }
+
+    #[tokio::test]
+    async fn completion_failure_withholds_report_and_recovery_gate() {
+        let path = journal_path("completion-loss");
+        let _ = std::fs::remove_file(&path);
+        PublicationJournal::initialize(&path, b"client").expect("initialize");
+        let (_transport, client) = scripted(vec![
+            begin(1, 0, vec![]),
+            lost("/CompleteEventPublicationRecovery"),
+        ]);
+        let sdk = NumberedEventSdk::open(client, &path, b"client").expect("open");
+        assert!(sdk.recover().await.is_err());
+        assert!(!sdk.journal.read_state().expect("state").recovery_complete);
+        assert!(sdk.journal_publication(intent()).is_err());
+        drop(sdk);
+        std::fs::remove_file(path).expect("remove journal");
+    }
     fn journal_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "aster-numbered-journal-{name}-{}-{:?}.redb",

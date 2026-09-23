@@ -99,8 +99,8 @@ reduces `rows` and `bytes` while leaving its client record durable.
 
 `ordinary_remaining` and `warning_state` use the active ledger's record and
 byte accounting. Numbered headroom conservatively reserves 292 logical bytes
-for a future result. `emergency_remaining` is zero in numbered mode until
-numbered tombstone admission can consume the emergency reserve. The candidate
+for a future result. `emergency_remaining` reports numbered tombstone result
+headroom within the hard limits beyond ordinary admission. The candidate
 `warning_state` becomes `WARNING` at 70% and `CRITICAL` at 90% of the larger
 ordinary record/byte occupancy, then `EXHAUSTED` when no ordinary record fits.
 Candidate headroom can remain positive after the approved profile is exhausted.
@@ -191,11 +191,17 @@ Increment 1 of the experimental numbered-publication profile replaces caller
 chosen publication keys with `(client_id, operation_sequence)` between an SDK
 and its local agent. Initialize one journal explicitly, keep both its file and
 configured `client_id` stable, open it exclusively, and call `recover()` before
-allocating work. `publish()` flushes the complete intent before transmission
-and flushes the committed result before returning it. `acknowledge()` removes
-the local journal row only after the agent has compacted that individual
-result. A cancelled assigned operation must be passed to `abandon()` before a
-later sequence can be admitted.
+allocating work. Its sequence-ordered report lists `Pending` intents to send
+with `publish_journaled()` or cancel with `abandon()`, `Committed(result)`
+receipts to apply idempotently then `acknowledge()`, and transient `Retired`
+sequences that need no action. The report is returned only after the complete
+recovery RPC succeeds. `publish()` flushes the complete intent before
+transmission and the committed result before returning it. On failure,
+`assigned_sequence()` distinguishes a pre-assignment journal error from an
+assigned intent whose RPC outcome needs recovery. A cancelled assigned
+operation must be passed to `abandon()` before a later sequence can be admitted.
+Successful abandon and acknowledgement, and validated recovery of consumed
+sequences, delete their full local rows and payloads.
 
 The journal is durable protocol state. A missing, corrupt, already-open, or
 wrong-client journal fails closed; `open` never recreates it. Initialization is
@@ -207,22 +213,41 @@ a separate one-time operation:
 #     client: aster_agent::proto::aster::application::v1alpha1::AsterApplicationServiceClient<connectrpc::client::SharedHttp2Connection>,
 #     path: &std::path::Path,
 # ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-use aster_agent::{proto::aster::application::v1alpha1 as api, sdk::{NumberedEventSdk, PublicationJournal}};
+use aster_agent::{proto::aster::application::v1alpha1 as api, sdk::{NumberedEventSdk, PublicationJournal, RecoveredState}};
 
 let client_id = b"orders-publisher";
 if !path.exists() {
     PublicationJournal::initialize(path, client_id)?;
 }
 let sdk = NumberedEventSdk::open(client, path, client_id)?;
-sdk.recover().await?;
-let (sequence, committed) = sdk.publish(api::PublishNumberedEventRequest {
+let report = sdk.recover().await?;
+for operation in report.operations {
+    let committed = match operation.state {
+        RecoveredState::Pending => Some(sdk.publish_journaled(operation.sequence).await?),
+        RecoveredState::Committed(result) => Some(result),
+        RecoveredState::Retired => None,
+    };
+    if let Some(committed) = committed {
+        // Apply the business effect idempotently before acknowledgement.
+        let _ = committed;
+        sdk.acknowledge(operation.sequence).await?;
+    }
+}
+let (sequence, committed) = match sdk.publish(api::PublishNumberedEventRequest {
     topic: "ops.alpha".into(),
     scope: "mission/apps".into(),
     priority: api::Priority::Priority.into(),
     logical_key: b"order-42".to_vec(),
     payload: b"ready".to_vec(),
     ..Default::default()
-}).await?;
+}).await {
+    Ok(published) => published,
+    Err(error) => {
+        // Preserve this sequence and recover after reconnect if it exists.
+        let _assigned_sequence_to_reconcile = error.assigned_sequence();
+        return Err(error.into());
+    }
+};
 // Apply the business effect idempotently before acknowledging the result.
 sdk.acknowledge(sequence).await?;
 # let _ = committed;

@@ -12,7 +12,7 @@ use std::{
 use aster_agent::{
     BoundAgent, ClientToken,
     proto::aster::application::v1alpha1 as api,
-    sdk::{NumberedEventSdk, PublicationJournal},
+    sdk::{NumberedEventSdk, PublicationJournal, RecoveredState},
 };
 use aster_node::mission::UnprotectedReferenceMission;
 use aster_node::{MutableSourceInterests, NodeApplication, NodeConfig, start_node};
@@ -609,7 +609,8 @@ async fn numbered_sdk_recovers_its_committed_result_across_restart() {
             client_id,
         )
         .expect("open journal");
-        sdk.recover().await.expect("initial recovery");
+        let report = sdk.recover().await.expect("initial recovery");
+        assert!(report.operations.is_empty());
         (sequence, committed) = sdk
             .publish(api::PublishNumberedEventRequest {
                 topic: "chat.events".to_owned(),
@@ -637,7 +638,7 @@ async fn numbered_sdk_recovers_its_committed_result_across_restart() {
         assert!(operations.bytes > 0);
         occupied_bytes = operations.bytes;
         assert_eq!(operations.ordinary_remaining, 683_925);
-        assert_eq!(operations.emergency_remaining, 0);
+        assert!(operations.emergency_remaining > 0);
         assert_eq!(operations.profile_remaining, 1_022);
         assert_eq!(
             operations.ledger_mode,
@@ -655,7 +656,11 @@ async fn numbered_sdk_recovers_its_committed_result_across_restart() {
         client_id,
     )
     .expect("reopen journal");
-    restarted.recover().await.expect("restart recovery");
+    let report = restarted.recover().await.expect("restart recovery");
+    assert_eq!(report.operations.len(), 1);
+    assert_eq!(report.operations[0].sequence, sequence);
+    assert!(matches!(&report.operations[0].state,
+        RecoveredState::Committed(result) if result == &committed));
     assert!(restarted.session().expect("session") > 1);
     assert_eq!(
         restarted
@@ -687,7 +692,7 @@ async fn numbered_sdk_recovers_its_committed_result_across_restart() {
         "acknowledgement must reclaim the result and reverse-edge bytes"
     );
     assert_eq!(operations.ordinary_remaining, 683_926);
-    assert_eq!(operations.emergency_remaining, 0);
+    assert!(operations.emergency_remaining > 0);
     assert_eq!(operations.profile_remaining, 1_023);
     assert_eq!(
         operations.ledger_mode,
