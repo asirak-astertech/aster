@@ -675,6 +675,12 @@ pub(crate) fn audit_numbered_tables_write(
             .into());
         }
     }
+    if clients.len()? > MAX_NUMBERED_EVENT_CLIENTS {
+        return Err(NumberedEventOperationError::Invariant(
+            "numbered Event client table exceeds its client limit",
+        )
+        .into());
+    }
     let mut stats = NumberedEventOperationStats::default();
     let mut client_frontiers = BTreeMap::<EventClientId, (u64, u64)>::new();
     for row in clients.iter()? {
@@ -808,8 +814,15 @@ fn require_numbered_mode_write(
     allow_initialize: bool,
 ) -> Result<(), StoreError> {
     let mode = write.open_table(METADATA)?.get(MODE)?.map(|v| v.value());
-    if mode == Some(1) {
-        return Ok(());
+    match mode {
+        Some(1) => return Ok(()),
+        Some(_) => {
+            return Err(NumberedEventOperationError::Invariant(
+                "numbered Event operation mode is unknown",
+            )
+            .into());
+        }
+        None => {}
     }
     if !allow_initialize {
         return Err(NumberedEventOperationError::ClientNotFound.into());
@@ -1350,6 +1363,72 @@ mod tests {
         assert_eq!(
             numbered_error(error),
             Some(&NumberedEventOperationError::Invariant(message))
+        );
+    }
+
+    #[test]
+    fn live_claim_rejects_unknown_mode_without_repairing_marker() {
+        let file = CorruptionFile::new("live-unknown-mode");
+        let store = file.open();
+        let write = store.database.begin_write().expect("write");
+        write
+            .open_table(METADATA)
+            .expect("metadata")
+            .insert(MODE, 2)
+            .expect("unknown mode");
+        write.commit().expect("commit");
+
+        let client = EventClientId::new(b"live-corrupt-client".to_vec()).expect("client");
+        assert_invariant(
+            &store
+                .begin_event_publication_session(&client, 0, b"claim")
+                .expect_err("unknown mode must fail"),
+            "numbered Event operation mode is unknown",
+        );
+        let read = store.database.begin_read().expect("read");
+        assert_eq!(
+            read.open_table(METADATA)
+                .expect("metadata")
+                .get(MODE)
+                .expect("mode read")
+                .map(|value| value.value()),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn reopen_rejects_numbered_client_table_above_fixed_limit() {
+        let file = CorruptionFile::new("client-overflow");
+        let store = file.open();
+        fixture_client(&store);
+        let write = store.database.begin_write().expect("write");
+        let mut stats = read_stats_write(&write).expect("stats");
+        let record = ClientRecord {
+            session: 1,
+            allocated_through: 0,
+            snapshot_revision: 1,
+            completed_session: 0,
+            completed_revision: 0,
+            last_claim_expected: 0,
+            last_claim_digest: [0x78; 32],
+        };
+        for index in 0..MAX_NUMBERED_EVENT_CLIENTS {
+            let client = EventClientId::new(format!("overflow-client-{index}").into_bytes())
+                .expect("client");
+            write
+                .open_table(CLIENTS)
+                .expect("clients")
+                .insert(client.as_bytes(), encode_client(record).as_slice())
+                .expect("insert client");
+            stats.clients += 1;
+            stats.logical_bytes += (client.as_bytes().len() + 81) as u64;
+        }
+        write_stats(&write, stats).expect("exact accounting");
+        write.commit().expect("commit");
+        drop(store);
+        assert_invariant(
+            &file.reopen_error(),
+            "numbered Event client table exceeds its client limit",
         );
     }
 
