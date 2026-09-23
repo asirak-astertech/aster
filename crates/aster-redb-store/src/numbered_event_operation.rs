@@ -321,6 +321,7 @@ impl Store {
                 &mut stats,
                 self.operation_limits,
                 client.as_bytes().len() + encoded.len(),
+                false,
             )?;
             stats.clients += 1;
             write_stats(&write, stats)?;
@@ -489,6 +490,7 @@ pub(crate) fn admit_numbered_result_write(
     receipt: CommittedEventReceipt,
     content: CommittedEventContent,
     limits: EventOperationLimits,
+    tombstone: bool,
 ) -> Result<NumberedEventResult, StoreError> {
     let mut client_record = load_client_write(write, operation.client)?;
     require_mutating_session(client_record, operation.session)?;
@@ -516,6 +518,7 @@ pub(crate) fn admit_numbered_result_write(
         &mut stats,
         limits,
         key.len() + encoded.len() + reverse.len(),
+        tombstone,
     )?;
     let mut prospective = outstanding;
     prospective.push(result);
@@ -1167,23 +1170,36 @@ fn charge_new_record(
     stats: &mut NumberedEventOperationStats,
     limits: EventOperationLimits,
     incoming_bytes: usize,
+    emergency: bool,
 ) -> Result<(), StoreError> {
-    let records = stats
+    let next_records = stats
         .clients
         .checked_add(stats.outstanding_results)
+        .and_then(|records| records.checked_add(1))
         .ok_or(NumberedEventOperationError::GlobalRecordLimitExceeded)?;
-    if records >= limits.ordinary_record_limit() {
+    let record_limit = if emergency {
+        limits.max_records()
+    } else {
+        limits.ordinary_record_limit()
+    };
+    if next_records > record_limit {
         return Err(NumberedEventOperationError::GlobalRecordLimitExceeded.into());
     }
-    let incoming = incoming_bytes as u64;
-    let ordinary_byte_limit = limits
-        .max_logical_bytes()
-        .checked_sub(limits.emergency_byte_reserve())
+    let incoming = u64::try_from(incoming_bytes)
+        .map_err(|_| NumberedEventOperationError::GlobalByteLimitExceeded)?;
+    let byte_limit = if emergency {
+        limits.max_logical_bytes()
+    } else {
+        limits.max_logical_bytes() - limits.emergency_byte_reserve()
+    };
+    let next_bytes = stats
+        .logical_bytes
+        .checked_add(incoming)
         .ok_or(NumberedEventOperationError::GlobalByteLimitExceeded)?;
-    if stats.logical_bytes.saturating_add(incoming) > ordinary_byte_limit {
+    if next_bytes > byte_limit {
         return Err(NumberedEventOperationError::GlobalByteLimitExceeded.into());
     }
-    stats.logical_bytes += incoming;
+    stats.logical_bytes = next_bytes;
     Ok(())
 }
 
@@ -1319,6 +1335,186 @@ mod tests {
             .begin_event_publication_session(&client, 0, b"fixture-claim")
             .expect("claim");
         client
+    }
+
+    fn capacity_client(store: &Store) -> EventClientId {
+        let client = EventClientId::new(b"x".to_vec()).unwrap();
+        let claim = store
+            .begin_event_publication_session(&client, 0, b"capacity")
+            .unwrap();
+        store
+            .complete_event_publication_recovery(&client, claim.session, claim.snapshot_revision)
+            .unwrap();
+        client
+    }
+
+    fn capacity_operation(
+        client: &EventClientId,
+        sequence: u64,
+    ) -> PendingNumberedEventOperation<'_> {
+        PendingNumberedEventOperation {
+            client,
+            session: EventPublicationSession::new(1).unwrap(),
+            sequence: EventOperationSequence::new(sequence).unwrap(),
+            predecessor: None,
+            intent_digest: [sequence as u8; 32],
+        }
+    }
+
+    fn capacity_admit(
+        store: &Store,
+        client: &EventClientId,
+        sequence: u64,
+        tombstone: bool,
+        limits: EventOperationLimits,
+    ) -> Result<NumberedEventResult, StoreError> {
+        let write = store.database.begin_write()?;
+        let result = crate::admit_pending_event_operation_write(
+            &write,
+            &[0x71; 32],
+            crate::PendingEventOperation::Numbered(capacity_operation(client, sequence)),
+            CommittedEventReceipt {
+                transfer_id: EventTransferId::new([sequence as u8; 32]),
+                semantic_id: EventSemanticId::new([sequence as u8 + 10; 32]),
+                acceptance_marker: sequence,
+            },
+            CommittedEventContent::Available,
+            limits,
+            tombstone,
+        )?
+        .expect("numbered result");
+        write.commit()?;
+        Ok(result)
+    }
+
+    #[test]
+    fn numbered_tombstones_use_record_reserve_without_exceeding_hard_limit() {
+        capacity_case(
+            "record-capacity",
+            EventOperationLimits::new(3, 1_000, 1).unwrap(),
+            NumberedEventOperationError::GlobalRecordLimitExceeded,
+        );
+    }
+
+    #[test]
+    fn numbered_tombstones_use_byte_reserve_without_exceeding_hard_limit() {
+        // Client is 82 bytes; each one-byte-client result is 166 bytes.
+        // Ordinary ceiling is 414 - 162 = 252, and hard ceiling is 414.
+        capacity_case(
+            "byte-capacity",
+            EventOperationLimits::new(10, 414, 1).unwrap(),
+            NumberedEventOperationError::GlobalByteLimitExceeded,
+        );
+    }
+
+    fn capacity_case(
+        name: &str,
+        limits: EventOperationLimits,
+        expected: NumberedEventOperationError,
+    ) {
+        let file = CorruptionFile::new(name);
+        let store = Store::open_with_limits_and_operation_limits_for_mission(
+            &file.0,
+            crate::StoreLimits::default(),
+            crate::BlobDepotLimits::default(),
+            limits,
+            CORRUPTION_MISSION,
+        )
+        .unwrap();
+        let client = capacity_client(&store);
+        capacity_admit(&store, &client, 1, false, limits).expect("ordinary result");
+        let before = store.numbered_event_operation_stats().unwrap();
+        assert_eq!(before.logical_bytes, 248, "{name}");
+        assert_eq!(
+            numbered_error(&capacity_admit(&store, &client, 2, false, limits).unwrap_err()),
+            Some(&expected),
+            "{name}"
+        );
+        assert_eq!(
+            store.numbered_event_operation_stats().unwrap(),
+            before,
+            "{name}"
+        );
+        let admitted =
+            capacity_admit(&store, &client, 2, true, limits).expect("tombstone must use reserve");
+        let full = store.numbered_event_operation_stats().unwrap();
+        assert_eq!(full.logical_bytes, 414, "{name}");
+        let write = store.database.begin_write().unwrap();
+        assert_eq!(
+            resolve_numbered_operation_write(&write, capacity_operation(&client, 2)).unwrap(),
+            NumberedOperationResolution::Existing(admitted),
+            "{name}"
+        );
+        drop(write);
+        assert_eq!(
+            store.numbered_event_operation_stats().unwrap(),
+            full,
+            "{name}"
+        );
+        assert_eq!(
+            numbered_error(&capacity_admit(&store, &client, 3, true, limits).unwrap_err()),
+            Some(&expected),
+            "{name}"
+        );
+        assert_eq!(
+            store.numbered_event_operation_stats().unwrap(),
+            full,
+            "{name}"
+        );
+        let write = store.database.begin_write().unwrap();
+        assert_eq!(
+            load_client_write(&write, &client)
+                .unwrap()
+                .allocated_through,
+            2,
+            "{name}"
+        );
+        assert!(
+            load_result_write(&write, &client, EventOperationSequence::new(3).unwrap())
+                .unwrap()
+                .is_none(),
+            "{name}"
+        );
+    }
+
+    #[test]
+    fn numbered_client_creation_stays_at_ordinary_record_limit() {
+        let file = CorruptionFile::new("client-ordinary-capacity");
+        let store = Store::open_with_limits_and_operation_limits_for_mission(
+            &file.0,
+            crate::StoreLimits::default(),
+            crate::BlobDepotLimits::default(),
+            EventOperationLimits::new(2, 1_000, 1).unwrap(),
+            CORRUPTION_MISSION,
+        )
+        .unwrap();
+        let first = EventClientId::new(b"a".to_vec()).unwrap();
+        let second = EventClientId::new(b"b".to_vec()).unwrap();
+        store
+            .begin_event_publication_session(&first, 0, b"first")
+            .unwrap();
+        let before = store.numbered_event_operation_stats().unwrap();
+        assert_eq!(before.clients, 1);
+        assert_eq!(
+            numbered_error(
+                &store
+                    .begin_event_publication_session(&second, 0, b"second")
+                    .unwrap_err()
+            ),
+            Some(&NumberedEventOperationError::GlobalRecordLimitExceeded)
+        );
+        assert_eq!(store.numbered_event_operation_stats().unwrap(), before);
+        assert!(
+            store
+                .database
+                .begin_read()
+                .unwrap()
+                .open_table(CLIENTS)
+                .unwrap()
+                .get(second.as_bytes())
+                .unwrap()
+                .is_none()
+        );
     }
 
     fn fixture_results(

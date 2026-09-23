@@ -676,8 +676,13 @@ impl EventOperationCapacity {
                 );
                 total_remaining.saturating_sub(ordinary_remaining)
             }
-            // Numbered admission currently cannot consume the tombstone reserve.
-            EventOperationLedgerMode::Numbered => 0,
+            EventOperationLedgerMode::Numbered => {
+                let total_remaining = limits.max_records().saturating_sub(rows).min(
+                    limits.max_logical_bytes().saturating_sub(logical_bytes)
+                        / NUMBERED_RESULT_BYTES,
+                );
+                total_remaining.saturating_sub(ordinary_remaining)
+            }
         };
         let at_percent = |percent: u128| {
             u128::from(rows) * 100 >= u128::from(ordinary_records) * percent

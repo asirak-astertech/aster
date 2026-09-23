@@ -479,7 +479,6 @@ func saturatingSub(limit, used uint64) uint64 {
 func operationHealth(operations *applicationv1alpha1.PublishOperationCapacityStatus) (string, string, error) {
 	invalid := errors.New("invalid status response")
 	bytesPerRow := uint64(162)
-	numbered := operations.LedgerMode == applicationv1alpha1.PublishOperationLedgerMode_PUBLISH_OPERATION_LEDGER_MODE_NUMBERED
 	switch operations.LedgerMode {
 	case applicationv1alpha1.PublishOperationLedgerMode_PUBLISH_OPERATION_LEDGER_MODE_UNSPECIFIED,
 		applicationv1alpha1.PublishOperationLedgerMode_PUBLISH_OPERATION_LEDGER_MODE_LEGACY:
@@ -504,11 +503,8 @@ func operationHealth(operations *applicationv1alpha1.PublishOperationCapacitySta
 	ordinaryRecords := uint64(operationHardRows - operationReserveRows)
 	ordinaryBytes := uint64(operationHardBytes - operationReserveRows*162)
 	ordinary := min(saturatingSub(ordinaryRecords, operations.Rows), saturatingSub(ordinaryBytes, operations.Bytes)/bytesPerRow)
-	emergency := uint64(0)
-	if !numbered {
-		total := min(saturatingSub(operationHardRows, operations.Rows), saturatingSub(operationHardBytes, operations.Bytes)/bytesPerRow)
-		emergency = saturatingSub(total, ordinary)
-	}
+	total := min(saturatingSub(operationHardRows, operations.Rows), saturatingSub(operationHardBytes, operations.Bytes)/bytesPerRow)
+	emergency := saturatingSub(total, ordinary)
 	if operations.OrdinaryRemaining != ordinary || operations.EmergencyRemaining != emergency {
 		return "", "", invalid
 	}

@@ -2,6 +2,24 @@ use super::*;
 use aster_redb_store::{EventOperationLimits, EventOperationStats};
 
 #[test]
+fn numbered_capacity_reports_conservative_emergency_byte_headroom() {
+    let limits = EventOperationLimits::new(110, 2_000, 10).unwrap();
+    let stats = NumberedEventOperationStats {
+        clients: 1,
+        outstanding_results: 1,
+        reverse_edges: 1,
+        logical_bytes: 300,
+    };
+    let capacity =
+        EventOperationCapacity::for_ledgers(EventOperationStats::default(), stats, limits);
+    assert_eq!(capacity.mode, EventOperationLedgerMode::Numbered);
+    assert_eq!(capacity.ordinary_remaining, 0);
+    // Total bytes permit five conservative 292-byte results, fewer than ten reserved records.
+    assert_eq!(capacity.emergency_remaining, 5);
+    assert_eq!(capacity.warning, EventOperationCapacityWarning::Exhausted);
+}
+
+#[test]
 fn operation_capacity_uses_record_and_byte_headroom_and_exact_thresholds() {
     use EventOperationCapacityWarning::{Critical, Exhausted, Ok, Warning};
     // Hand-derived headroom includes 162 bytes per active record, 67 per retired

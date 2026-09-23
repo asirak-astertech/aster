@@ -19488,7 +19488,7 @@ fn admit_pending_event_operation_write(
         }
         PendingEventOperation::Numbered(operation) => {
             numbered_event_operation::admit_numbered_result_write(
-                write, operation, receipt, content, limits,
+                write, operation, receipt, content, limits, tombstone,
             )
             .map(Some)
         }
