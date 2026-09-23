@@ -3736,6 +3736,14 @@ fn mark_retiring_write_indexed(
         write
             .open_table(CUSTODY_ITEMS)?
             .insert(key.encoded().as_slice(), encoded.as_slice())?;
+        if key.class == CustodyObjectClass::Event {
+            crate::numbered_event_operation::retire_numbered_results_write(
+                write,
+                EventTransferId::new(key.transfer_id),
+                deferred_retirement_reason(&record),
+            )
+            .map_err(event_operation::classify_retirement_invariant)?;
+        }
         batch.remove_retry_rows(write, key)?;
         advance_revision(write, true)?;
     }
