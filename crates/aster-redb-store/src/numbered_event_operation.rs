@@ -7,6 +7,12 @@ use std::{
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle};
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
+thread_local! {
+    static RESULT_ROWS_VISITED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static REVERSE_ROWS_VISITED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 use crate::{
     CustodyRetirementReason, EventOperationLimits, EventSemanticId, EventTransferId, METADATA,
     Store, StoreError,
@@ -559,21 +565,38 @@ pub(crate) fn retire_numbered_results_write(
     reason: CustodyRetirementReason,
 ) -> Result<(), StoreError> {
     let prefix = transfer_id.as_bytes();
+    let mut successor = *prefix;
+    let upper = if let Some(index) = successor.iter().rposition(|byte| *byte != u8::MAX) {
+        successor[index] += 1;
+        successor[index + 1..].fill(0);
+        std::ops::Bound::Excluded(successor.as_slice())
+    } else {
+        std::ops::Bound::Unbounded
+    };
     let mut matches = Vec::new();
-    for row in write.open_table(RESULT_BY_EVENT)?.iter()? {
+    for row in write
+        .open_table(RESULT_BY_EVENT)?
+        .range::<&[u8]>((std::ops::Bound::Included(prefix.as_slice()), upper))?
+    {
         let (key, value) = row?;
+        #[cfg(test)]
+        REVERSE_ROWS_VISITED.with(|count| count.set(count.get() + 1));
         if !value.value().is_empty() {
             return Err(NumberedEventOperationError::Invariant(
                 "numbered Event reverse value is not empty",
             )
             .into());
         }
-        if key.value().starts_with(prefix) {
-            matches.push(key.value().to_vec());
+        let (client, sequence) = decode_reverse_key(key.value())?;
+        if key.value().get(..32) != Some(prefix.as_slice()) {
+            return Err(NumberedEventOperationError::Invariant(
+                "numbered Event reverse edge targets another Event",
+            )
+            .into());
         }
+        matches.push((client, sequence));
     }
-    for reverse in matches {
-        let (client, sequence) = decode_reverse_key(&reverse)?;
+    for (client, sequence) in matches {
         let key = result_key(&client, sequence);
         let results = write.open_table(RESULTS)?;
         let encoded =
@@ -922,14 +945,24 @@ fn results_for_client_write(
     client: &EventClientId,
 ) -> Result<Vec<NumberedEventResult>, StoreError> {
     let mut values = Vec::new();
-    for row in write.open_table(RESULTS)?.iter()? {
+    let lower = result_key(client, EventOperationSequence(1));
+    let upper = result_key(client, EventOperationSequence(u64::MAX));
+    for row in write
+        .open_table(RESULTS)?
+        .range(lower.as_slice()..=upper.as_slice())?
+    {
         let (key, value) = row?;
+        #[cfg(test)]
+        RESULT_ROWS_VISITED.with(|count| count.set(count.get() + 1));
         let (stored_client, sequence) = decode_result_key(key.value())?;
-        if &stored_client == client {
-            values.push(decode_result(sequence, value.value())?);
+        if &stored_client != client {
+            return Err(NumberedEventOperationError::Invariant(
+                "numbered Event result range contains another client",
+            )
+            .into());
         }
+        values.push(decode_result(sequence, value.value())?);
     }
-    values.sort_by_key(|result| result.sequence);
     if values.len() as u64 > MAX_OUTSTANDING_EVENT_RESULTS_PER_CLIENT {
         return Err(NumberedEventOperationError::Invariant(
             "client exceeds its outstanding numbered Event result limit",
@@ -1331,6 +1364,187 @@ mod tests {
             stats.logical_bytes += (key.len() + value.len() + reverse.len()) as u64;
         }
         write_stats(write, stats).expect("exact fixture accounting");
+    }
+
+    fn insert_lookup_result(
+        write: &redb::WriteTransaction,
+        client: &EventClientId,
+        sequence: u64,
+        transfer_id: EventTransferId,
+    ) {
+        let sequence = EventOperationSequence::new(sequence).expect("sequence");
+        let result = NumberedEventResult {
+            sequence,
+            receipt: CommittedEventReceipt {
+                transfer_id,
+                semantic_id: EventSemanticId::new([0x93; 32]),
+                acceptance_marker: sequence.get(),
+            },
+            content: CommittedEventContent::Available,
+        };
+        write
+            .open_table(RESULTS)
+            .expect("results")
+            .insert(
+                result_key(client, sequence).as_slice(),
+                encode_result(result, [0x94; 32]).as_slice(),
+            )
+            .expect("insert result");
+        write
+            .open_table(RESULT_BY_EVENT)
+            .expect("reverse")
+            .insert(
+                reverse_key(transfer_id, client, sequence).as_slice(),
+                &[][..],
+            )
+            .expect("insert reverse");
+    }
+
+    #[test]
+    fn client_recovery_visits_only_exact_client_results_in_sequence_order() {
+        let file = CorruptionFile::new("client-lookup-range");
+        let store = file.open();
+        let write = store.database.begin_write().expect("write");
+        let clients = [b"a".as_slice(), b"b", b"ba", b"bb", b"c"]
+            .map(|name| EventClientId::new(name.to_vec()).expect("client"));
+        for (index, client) in clients.iter().enumerate() {
+            insert_lookup_result(&write, client, 1, EventTransferId::new([index as u8; 32]));
+        }
+        insert_lookup_result(&write, &clients[1], 2, EventTransferId::new([0x82; 32]));
+
+        RESULT_ROWS_VISITED.with(|count| count.set(0));
+        let recovered = results_for_client_write(&write, &clients[1]).expect("recovery");
+        assert_eq!(
+            recovered
+                .iter()
+                .map(|result| result.sequence.get())
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(
+            recovered[0].receipt.transfer_id,
+            EventTransferId::new([1; 32])
+        );
+        assert_eq!(
+            recovered[1].receipt.transfer_id,
+            EventTransferId::new([0x82; 32])
+        );
+        assert_eq!(RESULT_ROWS_VISITED.with(|count| count.get()), 2);
+    }
+
+    #[test]
+    fn retirement_visits_only_exact_transfer_prefix_including_maximum_id() {
+        for (name, target, other) in [
+            ("middle", [0x80u8; 32], [0x81; 32]),
+            ("maximum", [0xffu8; 32], [0xfe; 32]),
+        ] {
+            let file = CorruptionFile::new(name);
+            let store = file.open();
+            let client = fixture_client(&store);
+            let write = store.database.begin_write().expect("write");
+            let mut adjacent = target;
+            adjacent[31] = target[31].wrapping_sub(1);
+            for (sequence, transfer) in [other, adjacent, target, target, other]
+                .into_iter()
+                .enumerate()
+            {
+                insert_lookup_result(
+                    &write,
+                    &client,
+                    sequence as u64 + 1,
+                    EventTransferId::new(transfer),
+                );
+            }
+
+            REVERSE_ROWS_VISITED.with(|count| count.set(0));
+            retire_numbered_results_write(
+                &write,
+                EventTransferId::new(target),
+                CustodyRetirementReason::Expired,
+            )
+            .expect("retire exact transfer");
+            assert_eq!(REVERSE_ROWS_VISITED.with(|count| count.get()), 2, "{name}");
+            for sequence in 1..=5 {
+                let result = load_result_write(
+                    &write,
+                    &client,
+                    EventOperationSequence::new(sequence).expect("sequence"),
+                )
+                .expect("read result")
+                .expect("result present");
+                let expected = if sequence == 3 || sequence == 4 {
+                    CommittedEventContent::Retired(CustodyRetirementReason::Expired)
+                } else {
+                    CommittedEventContent::Available
+                };
+                assert_eq!(result.content, expected, "{name} sequence {sequence}");
+            }
+            REVERSE_ROWS_VISITED.with(|count| count.set(0));
+            retire_numbered_results_write(
+                &write,
+                EventTransferId::new(target),
+                CustodyRetirementReason::Expired,
+            )
+            .expect("idempotent retirement");
+            assert_eq!(
+                REVERSE_ROWS_VISITED.with(|count| count.get()),
+                2,
+                "{name} retry"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_lookups_still_reject_malformed_rows_within_the_prefix() {
+        let file = CorruptionFile::new("malformed-lookup-range");
+        let store = file.open();
+        let client = fixture_client(&store);
+        let write = store.database.begin_write().expect("write");
+        let sequence = EventOperationSequence::new(1).expect("sequence");
+        write
+            .open_table(RESULTS)
+            .expect("results")
+            .insert(result_key(&client, sequence).as_slice(), &[0u8][..])
+            .expect("insert malformed result");
+        assert_invariant(
+            &results_for_client_write(&write, &client).expect_err("malformed result value"),
+            "numbered Event result length is invalid",
+        );
+        write
+            .open_table(RESULTS)
+            .expect("results")
+            .remove(result_key(&client, sequence).as_slice())
+            .expect("remove malformed result");
+        let mut malformed_key = result_key(&client, sequence);
+        malformed_key.push(0);
+        write
+            .open_table(RESULTS)
+            .expect("results")
+            .insert(malformed_key.as_slice(), &[0u8][..])
+            .expect("insert malformed key");
+        assert_invariant(
+            &results_for_client_write(&write, &client).expect_err("malformed result key"),
+            "numbered Event result key length is invalid",
+        );
+        write
+            .open_table(RESULTS)
+            .expect("results")
+            .remove(malformed_key.as_slice())
+            .expect("remove malformed key");
+
+        let transfer = EventTransferId::new([0xa5; 32]);
+        let mut malformed_reverse = transfer.as_bytes().to_vec();
+        malformed_reverse.push(0);
+        write
+            .open_table(RESULT_BY_EVENT)
+            .expect("reverse")
+            .insert(malformed_reverse.as_slice(), &[][..])
+            .expect("insert malformed reverse");
+        assert_invariant(
+            &retire_numbered_results_write(&write, transfer, CustodyRetirementReason::Expired)
+                .expect_err("malformed reverse key"),
+            "numbered Event result key length is invalid",
+        );
     }
 
     fn fixture_legacy_row(write: &redb::WriteTransaction) {
