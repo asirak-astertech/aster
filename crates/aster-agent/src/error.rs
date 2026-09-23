@@ -427,6 +427,30 @@ mod tests {
     }
 
     #[test]
+    fn numbered_publication_rejection_has_public_permission_mapping() {
+        let mapping =
+            application_error_mapping(ApplicationErrorKind::RequestRejected, "publish_numbered");
+        assert_eq!(mapping.code, ErrorCode::PermissionDenied);
+        assert_eq!(mapping.reason, api::PublicErrorReason::FailedPrecondition);
+        assert_eq!(mapping.operation, PublicOperation::PublishNumberedEvent);
+        let error = public_error(
+            mapping.code,
+            mapping.reason,
+            mapping.operation,
+            mapping.retryable,
+            mapping.retry_delay,
+        );
+        assert_eq!(error.code, ErrorCode::PermissionDenied);
+        assert_detail(
+            error,
+            api::PublicErrorReason::FailedPrecondition,
+            "publish_numbered_event",
+            false,
+            None,
+        );
+    }
+
+    #[test]
     fn application_operation_names_are_translated_through_a_closed_allowlist() {
         let cases = [
             ("status", PublicOperation::GetStatus, "get_status"),
