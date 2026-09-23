@@ -457,7 +457,7 @@ func TestOperationHealthRequiresCoherentRateEstimate(t *testing.T) {
 func TestOperationHealthAcceptsCoherentNumberedCapacity(t *testing.T) {
 	operations := &applicationv1alpha1.PublishOperationCapacityStatus{
 		Rows: 2, Bytes: 300,
-		OrdinaryRemaining: 683_925, EmergencyRemaining: 0,
+		OrdinaryRemaining: 683_925, EmergencyRemaining: 5_548,
 		WarningState:               applicationv1alpha1.OperationCapacityWarning_OPERATION_CAPACITY_WARNING_OK,
 		LedgerMode:                 applicationv1alpha1.PublishOperationLedgerMode_PUBLISH_OPERATION_LEDGER_MODE_NUMBERED,
 		NumberedClients:            1,
@@ -470,6 +470,10 @@ func TestOperationHealthAcceptsCoherentNumberedCapacity(t *testing.T) {
 
 	if _, _, err := operationHealth(operations); err != nil {
 		t.Fatalf("coherent numbered capacity rejected: %v", err)
+	}
+	operations.EmergencyRemaining = 0
+	if _, _, err := operationHealth(operations); err == nil {
+		t.Fatal("missing numbered emergency headroom accepted")
 	}
 }
 
