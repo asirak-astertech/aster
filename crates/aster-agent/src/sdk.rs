@@ -437,9 +437,10 @@ where
             })
             .await?
             .into_owned();
-        if response.session == 0
+        if claim.expected_session.checked_add(1) != Some(response.session)
             || response.allocated_through < state.allocated_through
             || response.snapshot_revision == 0
+            || response.snapshot_revision < state.snapshot_revision
         {
             return Err(NumberedEventSdkError::Protocol(
                 "recovery snapshot has an invalid session, frontier, or revision".to_owned(),
@@ -1565,6 +1566,97 @@ mod tests {
         drop(sdk);
         std::fs::remove_file(path).expect("remove journal");
     }
+
+    #[tokio::test]
+    async fn regressed_revision_or_wrong_claim_session_preserves_durable_rows() {
+        fn saved_bytes(journal: &PublicationJournal) -> (Vec<u8>, Vec<u8>) {
+            let read = journal.database.begin_read().expect("read journal");
+            let meta = read.open_table(JOURNAL_META).expect("metadata table");
+            let state = meta
+                .get(STATE_KEY)
+                .expect("state read")
+                .expect("state")
+                .value()
+                .to_vec();
+            let entries = read.open_table(JOURNAL_ENTRIES).expect("entries table");
+            let row = entries
+                .get(1)
+                .expect("entry read")
+                .expect("entry")
+                .value()
+                .to_vec();
+            (state, row)
+        }
+
+        for (name, response_session, response_revision) in [
+            ("regressed-positive-revision", 2, 2),
+            ("nonadvancing-session", 1, 3),
+            ("leaped-session", 3, 3),
+        ] {
+            let path = journal_path(name);
+            let _ = std::fs::remove_file(&path);
+            PublicationJournal::initialize(&path, b"client").expect("initialize");
+            let journal = PublicationJournal::open(&path, b"client").expect("open");
+            journal
+                .write(|state, entries| {
+                    state.session = 1;
+                    state.allocated_through = 1;
+                    state.snapshot_revision = 3;
+                    state.next_sequence = Some(2);
+                    let mut publication = intent();
+                    publication.client_id = b"client".to_vec();
+                    publication.operation_sequence = 1;
+                    publication.session = 1;
+                    let encoded = encode_json(&JournalEntry {
+                        intent: publication,
+                        result: Some(result(1)),
+                        abandoned: false,
+                    })?;
+                    entries
+                        .insert(1, encoded.as_slice())
+                        .map_err(|error| journal_error(journal.path(), "seed result", error))?;
+                    Ok(())
+                })
+                .expect("seed journal");
+            drop(journal);
+
+            let response = api::BeginEventPublicationSessionResponse {
+                session: response_session,
+                allocated_through: 1,
+                snapshot_revision: response_revision,
+                outstanding: vec![],
+                ..Default::default()
+            };
+            let (_transport, client) =
+                scripted(vec![step("/BeginEventPublicationSession", response)]);
+            let sdk = NumberedEventSdk::open(client, &path, b"client").expect("restart");
+            sdk.journal
+                .update_state(|state| {
+                    state.pending_claim = Some(PendingClaim {
+                        expected_session: 1,
+                        nonce: vec![8; CLAIM_NONCE_BYTES],
+                    });
+                    Ok(())
+                })
+                .expect("seed durable claim");
+            let before = saved_bytes(&sdk.journal);
+            assert!(
+                matches!(
+                    sdk.begin_recovery().await,
+                    Err(NumberedEventSdkError::Protocol(_))
+                ),
+                "{name}"
+            );
+            assert_eq!(
+                saved_bytes(&sdk.journal),
+                before,
+                "{name}: durable state or row changed"
+            );
+            drop(sdk);
+            std::fs::remove_file(path).expect("remove journal");
+        }
+    }
+
     fn journal_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "aster-numbered-journal-{name}-{}-{:?}.redb",
