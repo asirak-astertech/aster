@@ -441,6 +441,8 @@ where
             || response.allocated_through < state.allocated_through
             || response.snapshot_revision == 0
             || response.snapshot_revision < state.snapshot_revision
+            || (response.snapshot_revision == state.snapshot_revision
+                && response.allocated_through != state.allocated_through)
         {
             return Err(NumberedEventSdkError::Protocol(
                 "recovery snapshot has an invalid session, frontier, or revision".to_owned(),
@@ -479,6 +481,41 @@ where
                 if !same && !retirement {
                     return Err(NumberedEventSdkError::Protocol(format!(
                         "agent replaced committed result for sequence {sequence}"
+                    )));
+                }
+            }
+        }
+        if response.snapshot_revision == state.snapshot_revision {
+            // An unchanged server revision proves an unchanged server image.
+            // Old abandoned rows are local cleanup residue, not server results.
+            let read = self.journal.database.begin_read().map_err(|error| {
+                journal_error(self.journal.path(), "read equal-revision entries", error)
+            })?;
+            let entries = read.open_table(JOURNAL_ENTRIES).map_err(|error| {
+                journal_error(self.journal.path(), "open equal-revision entries", error)
+            })?;
+            let iter = entries.iter().map_err(|error| {
+                journal_error(self.journal.path(), "scan equal-revision entries", error)
+            })?;
+            for row in iter {
+                let (key, value) = row.map_err(|error| {
+                    journal_error(self.journal.path(), "read equal-revision entry", error)
+                })?;
+                let sequence = key.value();
+                if sequence > state.allocated_through {
+                    break;
+                }
+                let entry: JournalEntry = decode_json(value.value(), "entry")?;
+                if entry.abandoned && !outstanding.contains_key(&sequence) {
+                    continue;
+                }
+                if !entry.result.as_ref().is_some_and(|saved| {
+                    outstanding
+                        .get(&sequence)
+                        .is_some_and(|current| *current == saved)
+                }) {
+                    return Err(NumberedEventSdkError::Protocol(format!(
+                        "equal-revision recovery changed sequence {sequence}"
                     )));
                 }
             }
@@ -977,12 +1014,21 @@ mod tests {
         frontier: u64,
         outstanding: Vec<api::CommittedPublicationResult>,
     ) -> Step {
+        begin_revision(session, frontier, 1, outstanding)
+    }
+
+    fn begin_revision(
+        session: u64,
+        frontier: u64,
+        revision: u64,
+        outstanding: Vec<api::CommittedPublicationResult>,
+    ) -> Step {
         step(
             "/BeginEventPublicationSession",
             api::BeginEventPublicationSessionResponse {
                 session,
                 allocated_through: frontier,
-                snapshot_revision: 1,
+                snapshot_revision: revision,
                 outstanding,
                 ..Default::default()
             },
@@ -1016,6 +1062,55 @@ mod tests {
             payload: b"secret payload".to_vec(),
             ..Default::default()
         }
+    }
+
+    fn raw_journal_snapshot(journal: &PublicationJournal, sequence: u64) -> (Vec<u8>, Vec<u8>) {
+        let read = journal.database.begin_read().expect("read journal");
+        let meta = read.open_table(JOURNAL_META).expect("metadata table");
+        let state = meta
+            .get(STATE_KEY)
+            .expect("state read")
+            .expect("state")
+            .value()
+            .to_vec();
+        let entries = read.open_table(JOURNAL_ENTRIES).expect("entries table");
+        let row = entries
+            .get(sequence)
+            .expect("row read")
+            .expect("row")
+            .value()
+            .to_vec();
+        (state, row)
+    }
+
+    fn seed_equal_revision_journal(
+        path: &Path,
+        saved: Option<api::CommittedPublicationResult>,
+        abandoned: bool,
+    ) {
+        PublicationJournal::initialize(path, b"client").expect("initialize");
+        let journal = PublicationJournal::open(path, b"client").expect("open");
+        journal
+            .write(|state, entries| {
+                state.session = 1;
+                state.allocated_through = 1;
+                state.snapshot_revision = 3;
+                state.next_sequence = Some(2);
+                let mut publication = intent();
+                publication.client_id = b"client".to_vec();
+                publication.operation_sequence = 1;
+                publication.session = 1;
+                let encoded = encode_json(&JournalEntry {
+                    intent: publication,
+                    result: saved,
+                    abandoned,
+                })?;
+                entries
+                    .insert(1, encoded.as_slice())
+                    .map_err(|error| journal_error(journal.path(), "seed row", error))?;
+                Ok(())
+            })
+            .expect("seed journal");
     }
 
     #[tokio::test]
@@ -1066,7 +1161,8 @@ mod tests {
         assert_eq!(pending, 3);
         drop(sdk);
 
-        let (_transport, client) = scripted(vec![begin(2, 2, vec![result(1)]), complete()]);
+        let (_transport, client) =
+            scripted(vec![begin_revision(2, 2, 3, vec![result(1)]), complete()]);
         let sdk = NumberedEventSdk::open(client, &path, b"client").expect("restart");
         let report = sdk.recover().await.expect("restart recovery");
         assert_eq!(report.session, 2);
@@ -1471,7 +1567,7 @@ mod tests {
             .expect_err("lost acknowledgement response");
         assert!(sdk.journal.entry(sequence).expect("row lookup").is_some());
         drop(sdk);
-        let (_transport, client) = scripted(vec![begin(2, 1, vec![]), complete()]);
+        let (_transport, client) = scripted(vec![begin_revision(2, 1, 3, vec![]), complete()]);
         let sdk = NumberedEventSdk::open(client, &path, b"client").expect("restart");
         let report = sdk.recover().await.expect("recover consumed result");
         assert!(matches!(
@@ -1521,7 +1617,8 @@ mod tests {
         sdk.publish(intent()).await.expect("publish");
         drop(sdk);
 
-        let (_transport, client) = scripted(vec![begin(2, 1, vec![result(1)]), complete()]);
+        let (_transport, client) =
+            scripted(vec![begin_revision(2, 1, 2, vec![result(1)]), complete()]);
         let sdk = NumberedEventSdk::open(client, &path, b"client").expect("restart");
         let report = sdk.recover().await.expect("identical replay");
         assert!(
@@ -1532,7 +1629,10 @@ mod tests {
         let mut retired = result(1);
         retired.content = api::CommittedContentStatus::Retired.into();
         retired.retirement_reason = Some(api::RetirementReason::Expired.into());
-        let (_transport, client) = scripted(vec![begin(3, 1, vec![retired.clone()]), complete()]);
+        let (_transport, client) = scripted(vec![
+            begin_revision(3, 1, 3, vec![retired.clone()]),
+            complete(),
+        ]);
         let sdk = NumberedEventSdk::open(client, &path, b"client").expect("restart");
         let report = sdk.recover().await.expect("monotonic retirement");
         assert!(
@@ -1655,6 +1755,91 @@ mod tests {
             drop(sdk);
             std::fs::remove_file(path).expect("remove journal");
         }
+    }
+
+    #[tokio::test]
+    async fn equal_revision_cannot_change_the_durable_server_image() {
+        let available = result(1);
+        let mut retired = available.clone();
+        retired.content = api::CommittedContentStatus::Retired.into();
+        retired.retirement_reason = Some(api::RetirementReason::Expired.into());
+        for (name, frontier, outstanding, saved) in [
+            (
+                "equal-frontier-advance",
+                2,
+                vec![available.clone()],
+                Some(available.clone()),
+            ),
+            ("equal-result-omission", 1, vec![], Some(available.clone())),
+            (
+                "equal-content-retirement",
+                1,
+                vec![retired],
+                Some(available.clone()),
+            ),
+            ("equal-result-addition", 1, vec![available.clone()], None),
+        ] {
+            let path = journal_path(name);
+            let _ = std::fs::remove_file(&path);
+            seed_equal_revision_journal(&path, saved, false);
+            let (_transport, client) = scripted(vec![begin_revision(2, frontier, 3, outstanding)]);
+            let sdk = NumberedEventSdk::open(client, &path, b"client").expect("restart");
+            sdk.journal
+                .update_state(|state| {
+                    state.pending_claim = Some(PendingClaim {
+                        expected_session: 1,
+                        nonce: vec![8; CLAIM_NONCE_BYTES],
+                    });
+                    Ok(())
+                })
+                .expect("seed durable claim");
+            let before = raw_journal_snapshot(&sdk.journal, 1);
+            assert!(
+                matches!(
+                    sdk.begin_recovery().await,
+                    Err(NumberedEventSdkError::Protocol(_))
+                ),
+                "{name}"
+            );
+            assert_eq!(
+                raw_journal_snapshot(&sdk.journal, 1),
+                before,
+                "{name}: journal bytes changed"
+            );
+            drop(sdk);
+            std::fs::remove_file(path).expect("remove journal");
+        }
+    }
+
+    #[tokio::test]
+    async fn equal_revision_replays_identical_result_and_cleans_legacy_abandoned_row() {
+        let path = journal_path("equal-identical");
+        let _ = std::fs::remove_file(&path);
+        seed_equal_revision_journal(&path, Some(result(1)), false);
+        let (_transport, client) =
+            scripted(vec![begin_revision(2, 1, 3, vec![result(1)]), complete()]);
+        let sdk = NumberedEventSdk::open(client, &path, b"client").expect("restart");
+        let report = sdk.recover().await.expect("unchanged snapshot");
+        assert!(
+            matches!(&report.operations[0].state, RecoveredState::Committed(replayed) if replayed == &result(1))
+        );
+        assert!(sdk.journal.entry(1).expect("row lookup").is_some());
+        drop(sdk);
+        std::fs::remove_file(path).expect("remove journal");
+
+        let path = journal_path("equal-legacy-abandoned");
+        let _ = std::fs::remove_file(&path);
+        seed_equal_revision_journal(&path, None, true);
+        let (_transport, client) = scripted(vec![begin_revision(2, 1, 3, vec![]), complete()]);
+        let sdk = NumberedEventSdk::open(client, &path, b"client").expect("restart");
+        let report = sdk.recover().await.expect("unchanged server image");
+        assert!(matches!(
+            report.operations[0].state,
+            RecoveredState::Retired
+        ));
+        assert!(sdk.journal.entry(1).expect("row lookup").is_none());
+        drop(sdk);
+        std::fs::remove_file(path).expect("remove journal");
     }
 
     fn journal_path(name: &str) -> PathBuf {
