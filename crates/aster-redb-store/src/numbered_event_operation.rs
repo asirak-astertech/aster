@@ -1,4 +1,8 @@
-use std::{collections::BTreeSet, error::Error, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
+};
 
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle};
 use sha2::{Digest, Sha256};
@@ -607,14 +611,18 @@ pub(crate) fn retire_numbered_results_write(
 pub(crate) fn legacy_operation_allowed_write(
     write: &redb::WriteTransaction,
 ) -> Result<(), StoreError> {
-    if write
+    match write
         .open_table(METADATA)?
         .get(MODE)?
-        .is_some_and(|value| value.value() == 1)
+        .map(|value| value.value())
     {
-        return Err(NumberedEventOperationError::LegacyOperationDisabled.into());
+        None => Ok(()),
+        Some(1) => Err(NumberedEventOperationError::LegacyOperationDisabled.into()),
+        Some(_) => Err(NumberedEventOperationError::Invariant(
+            "numbered Event operation mode is unknown",
+        )
+        .into()),
     }
-    Ok(())
 }
 
 pub(crate) fn audit_numbered_tables_write(
@@ -642,17 +650,66 @@ pub(crate) fn audit_numbered_tables_write(
     let clients = write.open_table(CLIENTS)?;
     let results = write.open_table(RESULTS)?;
     let reverse = write.open_table(RESULT_BY_EVENT)?;
+    let numbered_rows = clients.len()? != 0 || results.len()? != 0 || reverse.len()? != 0;
+    let legacy_rows = write.open_table(EVENT_OPERATION_LEDGER_V3)?.len()? != 0
+        || write.open_table(ACTIVE_OPERATION_BY_EVENT_V1)?.len()? != 0;
+    let mode = write
+        .open_table(METADATA)?
+        .get(MODE)?
+        .map(|value| value.value());
+    if legacy_rows && (numbered_rows || mode == Some(1)) {
+        return Err(NumberedEventOperationError::LegacyStoreRequiresFreshState.into());
+    }
+    match mode {
+        None if numbered_rows => {
+            return Err(NumberedEventOperationError::Invariant(
+                "numbered Event rows lack numbered mode",
+            )
+            .into());
+        }
+        None | Some(1) => {}
+        Some(_) => {
+            return Err(NumberedEventOperationError::Invariant(
+                "numbered Event operation mode is unknown",
+            )
+            .into());
+        }
+    }
     let mut stats = NumberedEventOperationStats::default();
+    let mut client_frontiers = BTreeMap::<EventClientId, (u64, u64)>::new();
     for row in clients.iter()? {
         let (key, value) = row?;
-        EventClientId::new(key.value().to_vec())?;
-        let _ = decode_client(value.value())?;
-        stats.clients += 1;
-        stats.logical_bytes += (key.value().len() + value.value().len()) as u64;
+        let client = EventClientId::new(key.value().to_vec())?;
+        let record = decode_client(value.value())?;
+        client_frontiers.insert(client, (record.allocated_through, 0));
+        checked_accounting_add(&mut stats.clients, 1)?;
+        checked_accounting_add_lengths(
+            &mut stats.logical_bytes,
+            &[key.value().len(), value.value().len()],
+        )?;
     }
     for row in results.iter()? {
         let (key, value) = row?;
         let (client, sequence) = decode_result_key(key.value())?;
+        let (frontier, count) =
+            client_frontiers
+                .get_mut(&client)
+                .ok_or(NumberedEventOperationError::Invariant(
+                    "numbered Event result has no client",
+                ))?;
+        if sequence.get() > *frontier {
+            return Err(NumberedEventOperationError::Invariant(
+                "numbered Event result exceeds client frontier",
+            )
+            .into());
+        }
+        checked_accounting_add(count, 1)?;
+        if *count > MAX_OUTSTANDING_EVENT_RESULTS_PER_CLIENT {
+            return Err(NumberedEventOperationError::Invariant(
+                "client exceeds its outstanding numbered Event result limit",
+            )
+            .into());
+        }
         let (result, _) = decode_result_with_digest(sequence, value.value())?;
         let reverse_key = reverse_key(result.receipt.transfer_id, &client, sequence);
         if reverse.get(reverse_key.as_slice())?.is_none() {
@@ -661,8 +718,11 @@ pub(crate) fn audit_numbered_tables_write(
             )
             .into());
         }
-        stats.outstanding_results += 1;
-        stats.logical_bytes += (key.value().len() + value.value().len()) as u64;
+        checked_accounting_add(&mut stats.outstanding_results, 1)?;
+        checked_accounting_add_lengths(
+            &mut stats.logical_bytes,
+            &[key.value().len(), value.value().len()],
+        )?;
     }
     for row in reverse.iter()? {
         let (key, value) = row?;
@@ -673,37 +733,74 @@ pub(crate) fn audit_numbered_tables_write(
             .into());
         }
         let (client, sequence) = decode_reverse_key(key.value())?;
-        if results
-            .get(result_key(&client, sequence).as_slice())?
-            .is_none()
-        {
+        let result_key = result_key(&client, sequence);
+        let result_value =
+            results
+                .get(result_key.as_slice())?
+                .ok_or(NumberedEventOperationError::Invariant(
+                    "numbered Event reverse edge is orphaned",
+                ))?;
+        let result = decode_result(sequence, result_value.value())?;
+        if &key.value()[..32] != result.receipt.transfer_id.as_bytes() {
             return Err(NumberedEventOperationError::Invariant(
-                "numbered Event reverse edge is orphaned",
+                "numbered Event reverse edge targets another Event",
             )
             .into());
         }
-        stats.reverse_edges += 1;
-        stats.logical_bytes += key.value().len() as u64;
+        checked_accounting_add(&mut stats.reverse_edges, 1)?;
+        checked_accounting_add_lengths(&mut stats.logical_bytes, &[key.value().len()])?;
     }
-    let stored = read_stats_write(write)?;
-    if stored == NumberedEventOperationStats::default() {
-        write_stats(write, stats)?;
-    } else if stored != stats {
-        return Err(NumberedEventOperationError::Invariant(
-            "numbered Event operation accounting differs from table truth",
-        )
-        .into());
-    }
-    if write
-        .open_table(METADATA)?
-        .get(MODE)?
-        .is_some_and(|value| value.value() == 1)
-        && (write.open_table(EVENT_OPERATION_LEDGER_V3)?.len()? != 0
-            || write.open_table(ACTIVE_OPERATION_BY_EVENT_V1)?.len()? != 0)
-    {
-        return Err(NumberedEventOperationError::LegacyStoreRequiresFreshState.into());
+    let metadata = write.open_table(METADATA)?;
+    let stored = (
+        metadata.get(CLIENT_COUNT)?.map(|value| value.value()),
+        metadata.get(RESULT_COUNT)?.map(|value| value.value()),
+        metadata.get(REVERSE_COUNT)?.map(|value| value.value()),
+        metadata.get(LOGICAL_BYTES)?.map(|value| value.value()),
+    );
+    drop(metadata);
+    match stored {
+        (None, None, None, None) => write_stats(write, stats)?,
+        (Some(clients), Some(results), Some(reverse), Some(bytes)) => {
+            let persisted = NumberedEventOperationStats {
+                clients,
+                outstanding_results: results,
+                reverse_edges: reverse,
+                logical_bytes: bytes,
+            };
+            if persisted != stats {
+                return Err(NumberedEventOperationError::Invariant(
+                    "numbered Event operation accounting differs from table truth",
+                )
+                .into());
+            }
+        }
+        _ => {
+            return Err(NumberedEventOperationError::Invariant(
+                "numbered Event operation accounting group is incomplete",
+            )
+            .into());
+        }
     }
     Ok(stats)
+}
+
+fn checked_accounting_add(total: &mut u64, amount: u64) -> Result<(), StoreError> {
+    *total = total
+        .checked_add(amount)
+        .ok_or(NumberedEventOperationError::Invariant(
+            "numbered Event operation accounting overflowed",
+        ))?;
+    Ok(())
+}
+
+fn checked_accounting_add_lengths(total: &mut u64, lengths: &[usize]) -> Result<(), StoreError> {
+    for &length in lengths {
+        let amount = u64::try_from(length).map_err(|_| {
+            NumberedEventOperationError::Invariant("numbered Event operation accounting overflowed")
+        })?;
+        checked_accounting_add(total, amount)?;
+    }
+    Ok(())
 }
 
 fn require_numbered_mode_write(
@@ -1137,6 +1234,341 @@ pub fn recovery_snapshot_proto_len(snapshot: &EventRecoverySnapshot) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_CORRUPTION_PATH: AtomicU64 = AtomicU64::new(0);
+    const CORRUPTION_MISSION: [u8; 32] = [0x71; 32];
+
+    struct CorruptionFile(std::path::PathBuf);
+
+    impl CorruptionFile {
+        fn new(name: &str) -> Self {
+            let id = NEXT_CORRUPTION_PATH.fetch_add(1, Ordering::Relaxed);
+            Self(std::env::temp_dir().join(format!(
+                "aster-numbered-corruption-{name}-{}-{id}.redb",
+                std::process::id()
+            )))
+        }
+
+        fn open(&self) -> Store {
+            Store::open_for_mission(&self.0, CORRUPTION_MISSION).expect("fixture store")
+        }
+
+        fn reopen_error(&self) -> StoreError {
+            Store::open_for_mission(&self.0, CORRUPTION_MISSION)
+                .err()
+                .expect("corrupt store must not open")
+        }
+    }
+
+    impl Drop for CorruptionFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn fixture_client(store: &Store) -> EventClientId {
+        let client = EventClientId::new(b"corrupt-client".to_vec()).expect("client");
+        store
+            .begin_event_publication_session(&client, 0, b"fixture-claim")
+            .expect("claim");
+        client
+    }
+
+    fn fixture_results(
+        write: &redb::WriteTransaction,
+        client: &EventClientId,
+        count: u64,
+        frontier: u64,
+    ) {
+        let mut record = load_client_write(write, client).expect("client record");
+        record.allocated_through = frontier;
+        write
+            .open_table(CLIENTS)
+            .expect("clients")
+            .insert(client.as_bytes(), encode_client(record).as_slice())
+            .expect("update client");
+        let mut stats = read_stats_write(write).expect("stats");
+        for sequence in 1..=count {
+            let sequence = EventOperationSequence::new(sequence).expect("sequence");
+            let result = NumberedEventResult {
+                sequence,
+                receipt: CommittedEventReceipt {
+                    transfer_id: EventTransferId::new([0x72; 32]),
+                    semantic_id: EventSemanticId::new([0x73; 32]),
+                    acceptance_marker: 1,
+                },
+                content: CommittedEventContent::Available,
+            };
+            let key = result_key(client, sequence);
+            let value = encode_result(result, [0x74; 32]);
+            let reverse = reverse_key(result.receipt.transfer_id, client, sequence);
+            write
+                .open_table(RESULTS)
+                .expect("results")
+                .insert(key.as_slice(), value.as_slice())
+                .expect("insert result");
+            write
+                .open_table(RESULT_BY_EVENT)
+                .expect("reverse")
+                .insert(reverse.as_slice(), &[][..])
+                .expect("insert reverse");
+            stats.outstanding_results += 1;
+            stats.reverse_edges += 1;
+            stats.logical_bytes += (key.len() + value.len() + reverse.len()) as u64;
+        }
+        write_stats(write, stats).expect("exact fixture accounting");
+    }
+
+    fn fixture_legacy_row(write: &redb::WriteTransaction) {
+        use crate::event_operation::{
+            EVENT_OPERATION_LEDGER_V3, EventOperationLedgerRecord, EventOperationStats,
+            encode_event_operation_ledger_record, write_event_operation_stats,
+        };
+        let encoded = encode_event_operation_ledger_record(EventOperationLedgerRecord::Retired {
+            intent_digest: [0x75; 32],
+            reason: CustodyRetirementReason::Expired,
+        });
+        write
+            .open_table(EVENT_OPERATION_LEDGER_V3)
+            .expect("legacy ledger")
+            .insert([0x76; 32].as_slice(), encoded.as_slice())
+            .expect("legacy row");
+        write_event_operation_stats(
+            &mut write.open_table(METADATA).expect("metadata"),
+            EventOperationStats {
+                records_total: 1,
+                records_retired: 1,
+                logical_bytes: 67,
+                ..EventOperationStats::default()
+            },
+        )
+        .expect("legacy accounting");
+    }
+
+    fn assert_invariant(error: &StoreError, message: &'static str) {
+        assert_eq!(
+            numbered_error(error),
+            Some(&NumberedEventOperationError::Invariant(message))
+        );
+    }
+
+    #[test]
+    fn reopen_rejects_explicit_zero_accounting_over_numbered_rows() {
+        let file = CorruptionFile::new("zero-accounting");
+        let store = file.open();
+        fixture_client(&store);
+        let write = store.database.begin_write().expect("write");
+        write_stats(&write, NumberedEventOperationStats::default()).expect("zero accounting");
+        write.commit().expect("commit");
+        drop(store);
+        assert_invariant(
+            &file.reopen_error(),
+            "numbered Event operation accounting differs from table truth",
+        );
+    }
+
+    #[test]
+    fn reopen_rejects_partial_numbered_accounting_group() {
+        let file = CorruptionFile::new("partial-accounting");
+        let store = file.open();
+        fixture_client(&store);
+        let write = store.database.begin_write().expect("write");
+        write
+            .open_table(METADATA)
+            .expect("metadata")
+            .remove(REVERSE_COUNT)
+            .expect("remove counter");
+        write.commit().expect("commit");
+        drop(store);
+        assert_invariant(
+            &file.reopen_error(),
+            "numbered Event operation accounting group is incomplete",
+        );
+    }
+
+    #[test]
+    fn reopen_rejects_numbered_rows_without_mode() {
+        let file = CorruptionFile::new("missing-mode");
+        let store = file.open();
+        fixture_client(&store);
+        let write = store.database.begin_write().expect("write");
+        write
+            .open_table(METADATA)
+            .expect("metadata")
+            .remove(MODE)
+            .expect("remove mode");
+        write.commit().expect("commit");
+        drop(store);
+        assert_invariant(
+            &file.reopen_error(),
+            "numbered Event rows lack numbered mode",
+        );
+    }
+
+    #[test]
+    fn reopen_and_legacy_write_reject_unknown_mode() {
+        let file = CorruptionFile::new("unknown-mode");
+        let store = file.open();
+        let write = store.database.begin_write().expect("write");
+        write
+            .open_table(METADATA)
+            .expect("metadata")
+            .insert(MODE, 2)
+            .expect("unknown mode");
+        assert_invariant(
+            &legacy_operation_allowed_write(&write).expect_err("legacy write must reject"),
+            "numbered Event operation mode is unknown",
+        );
+        write.commit().expect("commit");
+        drop(store);
+        assert_invariant(
+            &file.reopen_error(),
+            "numbered Event operation mode is unknown",
+        );
+    }
+
+    #[test]
+    fn reopen_rejects_mixed_ledgers_for_every_mode_marker() {
+        for marker in [None, Some(1), Some(2)] {
+            let file = CorruptionFile::new("mixed-ledgers");
+            let store = file.open();
+            fixture_client(&store);
+            let write = store.database.begin_write().expect("write");
+            fixture_legacy_row(&write);
+            {
+                let mut metadata = write.open_table(METADATA).expect("metadata");
+                match marker {
+                    Some(value) => {
+                        metadata.insert(MODE, value).expect("mode");
+                    }
+                    None => {
+                        metadata.remove(MODE).expect("remove mode");
+                    }
+                }
+            }
+            write.commit().expect("commit");
+            drop(store);
+            assert_eq!(
+                numbered_error(&file.reopen_error()),
+                Some(&NumberedEventOperationError::LegacyStoreRequiresFreshState),
+                "marker {marker:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reopen_rejects_result_without_client_owner() {
+        let file = CorruptionFile::new("missing-owner");
+        let store = file.open();
+        let client = fixture_client(&store);
+        let write = store.database.begin_write().expect("write");
+        fixture_results(&write, &client, 1, 1);
+        write
+            .open_table(CLIENTS)
+            .expect("clients")
+            .remove(client.as_bytes())
+            .expect("remove");
+        let mut stats = read_stats_write(&write).expect("stats");
+        stats.clients = 0;
+        stats.logical_bytes -= client.as_bytes().len() as u64 + 81;
+        write_stats(&write, stats).expect("accounting");
+        write.commit().expect("commit");
+        drop(store);
+        assert_invariant(&file.reopen_error(), "numbered Event result has no client");
+    }
+
+    #[test]
+    fn reopen_rejects_result_beyond_client_frontier() {
+        let file = CorruptionFile::new("beyond-frontier");
+        let store = file.open();
+        let client = fixture_client(&store);
+        let write = store.database.begin_write().expect("write");
+        fixture_results(&write, &client, 1, 0);
+        write.commit().expect("commit");
+        drop(store);
+        assert_invariant(
+            &file.reopen_error(),
+            "numbered Event result exceeds client frontier",
+        );
+    }
+
+    #[test]
+    fn reopen_rejects_client_result_overflow() {
+        let file = CorruptionFile::new("result-overflow");
+        let store = file.open();
+        let client = fixture_client(&store);
+        let write = store.database.begin_write().expect("write");
+        fixture_results(
+            &write,
+            &client,
+            MAX_OUTSTANDING_EVENT_RESULTS_PER_CLIENT + 1,
+            MAX_OUTSTANDING_EVENT_RESULTS_PER_CLIENT + 1,
+        );
+        write.commit().expect("commit");
+        drop(store);
+        assert_invariant(
+            &file.reopen_error(),
+            "client exceeds its outstanding numbered Event result limit",
+        );
+    }
+
+    #[test]
+    fn reopen_rejects_result_with_wrong_reverse_prefix_only() {
+        let file = CorruptionFile::new("wrong-reverse-only");
+        let store = file.open();
+        let client = fixture_client(&store);
+        let write = store.database.begin_write().expect("write");
+        fixture_results(&write, &client, 1, 1);
+        let sequence = EventOperationSequence::new(1).expect("sequence");
+        let correct = reverse_key(EventTransferId::new([0x72; 32]), &client, sequence);
+        let wrong = reverse_key(EventTransferId::new([0x77; 32]), &client, sequence);
+        write
+            .open_table(RESULT_BY_EVENT)
+            .expect("reverse")
+            .remove(correct.as_slice())
+            .expect("remove");
+        write
+            .open_table(RESULT_BY_EVENT)
+            .expect("reverse")
+            .insert(wrong.as_slice(), &[][..])
+            .expect("insert");
+        write.commit().expect("commit");
+        drop(store);
+        assert_invariant(
+            &file.reopen_error(),
+            "numbered Event result is missing its reverse edge",
+        );
+    }
+
+    #[test]
+    fn reopen_rejects_reverse_prefix_different_from_receipt() {
+        let file = CorruptionFile::new("wrong-reverse-extra");
+        let store = file.open();
+        let client = fixture_client(&store);
+        let write = store.database.begin_write().expect("write");
+        fixture_results(&write, &client, 1, 1);
+        let wrong = reverse_key(
+            EventTransferId::new([0x77; 32]),
+            &client,
+            EventOperationSequence::new(1).expect("sequence"),
+        );
+        write
+            .open_table(RESULT_BY_EVENT)
+            .expect("reverse")
+            .insert(wrong.as_slice(), &[][..])
+            .expect("insert");
+        let mut stats = read_stats_write(&write).expect("stats");
+        stats.reverse_edges += 1;
+        stats.logical_bytes += wrong.len() as u64;
+        write_stats(&write, stats).expect("accounting");
+        write.commit().expect("commit");
+        drop(store);
+        assert_invariant(
+            &file.reopen_error(),
+            "numbered Event reverse edge targets another Event",
+        );
+    }
 
     fn store_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
