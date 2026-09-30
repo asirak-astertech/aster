@@ -65,28 +65,30 @@ pub use blob::{
     BlobDeliveryStatus, BlobDeliveryToken, BlobDepotLimits, BlobId, BlobPollRequest,
     BlobPublicationId, BlobPublishRequest, BlobPublishResult, BlobReadPage, BlobReadPageRequest,
     BlobReadRequest, BlobReadResult, BlobSubscription, BlobSubscriptionId, BlobSubscriptionRequest,
-    BlobUnsubscribe, MAX_SELECTED_BLOB_DELIVERIES, MAX_SELECTED_BLOB_PAGE_BYTES,
-    MAX_SELECTED_BLOB_SUBSCRIPTION_SCAN, MAX_SELECTED_LIVE_BLOB_BYTES,
-    MAX_SELECTED_LIVE_BLOB_CHUNKS, SelectedBlobHandle, SelectedBlobNode, SelectedBlobOptions,
+    BlobTransferPhase, BlobTransferStatus, BlobUnsubscribe, MAX_SELECTED_BLOB_DELIVERIES,
+    MAX_SELECTED_BLOB_PAGE_BYTES, MAX_SELECTED_BLOB_SUBSCRIPTION_SCAN,
+    MAX_SELECTED_LIVE_BLOB_BYTES, MAX_SELECTED_LIVE_BLOB_CHUNKS, PendingBlobTransferStatus,
+    SelectedBlobHandle, SelectedBlobNode, SelectedBlobOptions,
 };
 pub(crate) use record::SelectedRecordCommand;
 pub use record::{
     MAX_SELECTED_RECORD_DELIVERIES, MAX_SELECTED_RECORD_SUBSCRIPTION_SCAN,
     RECORD_DELIVERY_TOKEN_BYTES, RecordAcknowledgement, RecordConflict, RecordDelivery,
-    RecordDeliveryConflict, RecordDeliveryPage, RecordDeliveryProjection, RecordDeliveryToken,
-    RecordId, RecordItem, RecordPollRequest, RecordProjection, RecordProjectionId,
-    RecordProjectionKey, RecordPublishRequest, RecordPublishResult, RecordQuery,
-    RecordResolutionGuard, RecordResolveRequest, RecordSubscription, RecordSubscriptionId,
-    RecordSubscriptionRequest, RecordUnsubscribe, RecordVersionDisposition, SelectedRecordHandle,
-    SelectedRecordNode,
+    RecordDeliveryConflict, RecordDeliveryPage, RecordDeliveryProjection, RecordDeliveryStatus,
+    RecordDeliveryToken, RecordId, RecordItem, RecordPollRequest, RecordProjection,
+    RecordProjectionId, RecordProjectionKey, RecordPublishRequest, RecordPublishResult,
+    RecordQuery, RecordResolutionGuard, RecordResolveRequest, RecordSubscription,
+    RecordSubscriptionId, RecordSubscriptionRequest, RecordUnsubscribe, RecordVersionDisposition,
+    SelectedRecordHandle, SelectedRecordNode,
 };
 pub(crate) use state::SelectedStateCommand;
 pub use state::{
     MAX_SELECTED_STATE_DELIVERIES, MAX_SELECTED_STATE_SUBSCRIPTION_SCAN,
     STATE_DELIVERY_TOKEN_BYTES, SelectedStateHandle, SelectedStateNode, StateAcknowledgement,
-    StateDelivery, StateDeliveryPage, StateDeliveryToken, StateId, StateItem, StatePollRequest,
-    StateProjection, StatePublishRequest, StatePublishResult, StateQuery, StateSubscription,
-    StateSubscriptionId, StateSubscriptionRequest, StateUnsubscribe, StateVersionDisposition,
+    StateDelivery, StateDeliveryPage, StateDeliveryStatus, StateDeliveryToken, StateId, StateItem,
+    StatePollRequest, StateProjection, StatePublishRequest, StatePublishResult, StateQuery,
+    StateSubscription, StateSubscriptionId, StateSubscriptionRequest, StateUnsubscribe,
+    StateVersionDisposition,
 };
 
 /// Maximum number of accepted Event rows one query call may scan.

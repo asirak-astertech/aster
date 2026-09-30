@@ -3014,6 +3014,31 @@ fn load_chunk_read(
         .transpose()
 }
 
+pub(super) fn pending_chunk_is_committed_read(
+    read: &redb::ReadTransaction,
+    variant: BlobVariantId,
+    index: u64,
+) -> Result<bool, StoreError> {
+    let import = load_import_read(read, variant)?
+        .ok_or_else(|| blob_error(BlobStoreError::PendingSourceConflict))?;
+    let state = load_chunk_read(read, variant, index)?
+        .ok_or_else(|| blob_error(BlobStoreError::PendingSourceConflict))?;
+    validate_chunk_state_lengths(&import, index, state)?;
+    let expected = state
+        .expected
+        .ok_or_else(|| blob_error(BlobStoreError::PendingSourceConflict))?;
+    if state
+        .committed
+        .is_some_and(|committed| committed != expected)
+        || (state.committed == Some(expected)
+            && state.committed_file_bytes != chunk_file_len(expected)?)
+        || (state.committed.is_none() && state.committed_file_bytes != 0)
+    {
+        return Err(blob_error(BlobStoreError::PendingSourceConflict));
+    }
+    Ok(state.committed == Some(expected))
+}
+
 #[cfg(test)]
 pub(super) fn remove_completion_chunk_state_for_test(
     write: &redb::WriteTransaction,

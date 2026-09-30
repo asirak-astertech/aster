@@ -610,6 +610,28 @@ pub struct PendingBlobSource {
     pub carriers: Vec<PendingBlobCarrier>,
 }
 
+/// Durable peer-neutral progress for one authenticated pending Blob source.
+///
+/// This store-layer value retains the existing authenticated source projection
+/// so its caller can validate it against process-live capabilities. The selected
+/// application projection must redact its route/physical lineages and publisher.
+/// Byte counters describe canonical encrypted carriers, not plaintext bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingBlobTransferProgress {
+    pub source: BlobSourceProjection,
+    pub total_carriers: u64,
+    pub durable_carriers: u64,
+    pub total_carrier_bytes: u64,
+    pub durable_carrier_bytes: u64,
+}
+
+/// One internally consistent audited Blob storage and pending-transfer snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlobTransferStatusSnapshot {
+    pub stats: BlobStoreStats,
+    pub pending: Vec<PendingBlobTransferProgress>,
+}
+
 /// Outcome of atomically staging one exact source and complete manifest plan.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BlobSourceStageOutcome {
@@ -2012,6 +2034,99 @@ impl Store {
         let mut output = Vec::new();
         self.visit_pending_blob_sources(Some(policy), |source| output.push(source.clone()))?;
         Ok(output)
+    }
+
+    /// Returns one policy-filtered snapshot of durable pending transfer progress.
+    ///
+    /// A committed carrier contributes its complete canonical length after its
+    /// prefix row has been retired. An uncommitted carrier contributes only its
+    /// durable contiguous prefix. The result is ordered by internal transfer
+    /// identity without exposing peer-specific fetch cursors.
+    pub fn pending_blob_transfer_progress_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+    ) -> Result<BlobTransferStatusSnapshot, StoreError> {
+        self.require_live()?;
+        let authority = self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        require_control_policy_read(&read, authority, policy)?;
+        let stats = inspect_blob_tables_read(&read)?.stats;
+        depot::audit_depot_read(
+            &read,
+            &self.path,
+            self.backing_identity,
+            self.blob_depot_owner_token,
+            stats,
+        )?;
+        let pending = read.open_table(BLOB_PENDING_SOURCES)?;
+        let prefixes = read.open_table(BLOB_CARRIER_PREFIXES)?;
+        let mut progress = Vec::with_capacity(
+            usize::try_from(pending.len()?).map_err(|_| StoreError::ItemCountAccountingOverflow)?,
+        );
+        for row in pending.iter()? {
+            let (_, value) = row?;
+            let pending = decode_pending_blob_source(value.value())?;
+            if !blob_header_is_current_read(&read, &pending.metadata.header)? {
+                continue;
+            }
+            let sealed_len = u64::try_from(pending.sealed.len())
+                .map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
+            let shape = durable_blob_source_shape_read(&read, &pending.metadata, false)?;
+            let source = blob_source_projection(&pending.metadata, sealed_len, shape)?;
+            let mut durable_carriers = 0u64;
+            let mut total_carrier_bytes = 0u64;
+            let mut durable_carrier_bytes = 0u64;
+            for carrier in &pending.carriers {
+                total_carrier_bytes = total_carrier_bytes
+                    .checked_add(carrier.total_len)
+                    .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+                if depot::pending_chunk_is_committed_read(
+                    &read,
+                    pending.metadata.variant_id,
+                    carrier.index,
+                )? {
+                    durable_carriers = durable_carriers
+                        .checked_add(1)
+                        .ok_or(StoreError::ItemCountAccountingOverflow)?;
+                    durable_carrier_bytes = durable_carrier_bytes
+                        .checked_add(carrier.total_len)
+                        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+                    continue;
+                }
+                let key = blob_carrier_prefix_key(pending.metadata.transfer_id, carrier.object);
+                let prefix_len = prefixes
+                    .get(key.as_slice())?
+                    .map(|value| decode_blob_carrier_prefix(value.value()))
+                    .transpose()?
+                    .map(|record| {
+                        if record.source != pending.metadata.transfer_id
+                            || record.total_len != carrier.total_len
+                        {
+                            return Err(blob_error(BlobStoreError::CarrierPrefixConflict));
+                        }
+                        u64::try_from(record.prefix.len())
+                            .map_err(|_| StoreError::PayloadByteAccountingOverflow)
+                    })
+                    .transpose()?
+                    .unwrap_or(0);
+                durable_carrier_bytes = durable_carrier_bytes
+                    .checked_add(prefix_len)
+                    .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+            }
+            progress.push(PendingBlobTransferProgress {
+                source,
+                total_carriers: u64::try_from(pending.carriers.len())
+                    .map_err(|_| StoreError::ItemCountAccountingOverflow)?,
+                durable_carriers,
+                total_carrier_bytes,
+                durable_carrier_bytes,
+            });
+        }
+        progress.sort_unstable_by_key(|item| item.source.transfer_id);
+        Ok(BlobTransferStatusSnapshot {
+            stats,
+            pending: progress,
+        })
     }
 
     /// Selects at most one current pending source after `after`, wrapping once.
@@ -6975,6 +7090,112 @@ mod tests {
             target.blob_stats().expect("pending-work final stats"),
             before_stats,
             "pending work queries are durable-state neutral"
+        );
+    }
+
+    #[test]
+    fn pending_transfer_progress_counts_durable_prefixes_and_committed_carriers_across_reopen() {
+        // Break caught: a status implementation that counts only prefix rows
+        // reports progress falling back to zero after a complete carrier moves
+        // into the durable depot.
+        let source_root = BlobTestRoot::new("transfer-progress-source");
+        let target_root = BlobTestRoot::new("transfer-progress-target");
+        let mut services = blob_services(0xb1);
+        let source = Store::open_for_mission(&source_root.database, services.authority)
+            .expect("transfer-progress source store");
+        let target = Store::open_for_mission(&target_root.database, services.authority)
+            .expect("transfer-progress target store");
+        let policy = target
+            .control_policy_snapshot()
+            .expect("transfer-progress policy");
+        let plaintext = vec![0x63; SELECTED_BLOB_CHUNK_SIZE as usize + 7];
+        let prepared = prepared_blob(&plaintext);
+        let proof = prepare_blob_proof(&source, &mut services, &prepared, &plaintext, 1);
+        let plan = proof
+            .blob
+            .transfer_plan(&proof.manifest_bytes)
+            .expect("transfer-progress plan");
+        let transfer = BlobTransferId::new(proof.blob.envelope_id());
+        target
+            .stage_verified_blob_source_with_policy(&policy, &proof.blob, &proof.sealed, &plan)
+            .expect("stage transfer-progress source");
+
+        let waiting = target
+            .pending_blob_transfer_progress_with_policy(&policy)
+            .expect("waiting transfer progress");
+        assert_eq!(waiting.pending.len(), 1);
+        assert_eq!(waiting.pending[0].source.transfer_id, transfer);
+        assert_eq!(waiting.pending[0].total_carriers, 2);
+        assert_eq!(waiting.pending[0].durable_carriers, 0);
+        assert_eq!(waiting.pending[0].durable_carrier_bytes, 0);
+        assert!(waiting.pending[0].total_carrier_bytes > 0);
+
+        let mut source_depot = source.blob_depot().expect("source transfer depot");
+        CoreBlobStore::begin_blob_with_lineage(
+            &mut source_depot,
+            plan.manifest(),
+            plan.physical_lineage(),
+        )
+        .expect("activate source transfer plan");
+        let carrier = plan
+            .build_carrier(&mut source_depot, 0)
+            .expect("build first transfer carrier");
+        let object = BlobCarrierObjectId::new(carrier.object_id().wire_bytes())
+            .expect("typed first carrier");
+        let total_len = u64::try_from(carrier.bytes().len()).expect("first carrier length");
+        let first_range_len = carrier.bytes().len().min(MAX_BLOB_NETWORK_RANGE_BYTES);
+        target
+            .append_blob_carrier_prefix_with_policy(
+                &policy,
+                transfer,
+                object,
+                total_len,
+                0,
+                &carrier.bytes()[..first_range_len],
+            )
+            .expect("append first transfer range");
+
+        let partial = target
+            .pending_blob_transfer_progress_with_policy(&policy)
+            .expect("partial transfer progress");
+        assert_eq!(partial.pending[0].durable_carriers, 0);
+        assert_eq!(
+            partial.pending[0].durable_carrier_bytes,
+            u64::try_from(first_range_len).expect("first range length")
+        );
+
+        for (range_index, range) in carrier
+            .bytes()
+            .chunks(MAX_BLOB_NETWORK_RANGE_BYTES)
+            .enumerate()
+            .skip(1)
+        {
+            let offset =
+                u64::try_from(range_index * MAX_BLOB_NETWORK_RANGE_BYTES).expect("carrier offset");
+            target
+                .append_blob_carrier_prefix_with_policy(
+                    &policy, transfer, object, total_len, offset, range,
+                )
+                .expect("append remaining transfer range");
+        }
+        target
+            .commit_complete_blob_carrier_with_policy(&policy, transfer, object, &plan)
+            .expect("commit first transfer carrier");
+
+        let committed = target
+            .pending_blob_transfer_progress_with_policy(&policy)
+            .expect("committed transfer progress");
+        assert_eq!(committed.pending[0].durable_carriers, 1);
+        assert_eq!(committed.pending[0].durable_carrier_bytes, total_len);
+        drop(target);
+
+        let reopened = Store::open_for_mission(&target_root.database, services.authority)
+            .expect("reopen transfer-progress target");
+        assert_eq!(
+            reopened
+                .pending_blob_transfer_progress_with_policy(&policy)
+                .expect("reopened transfer progress"),
+            committed
         );
     }
 
