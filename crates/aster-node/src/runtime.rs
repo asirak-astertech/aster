@@ -12060,9 +12060,10 @@ async fn run_node_actor_inner(
     let mut initial_application_receipt_emitted = false;
     let mut fatal_error = None;
     let mut live_zeroization = None;
-    // Keep one accept future alive independently from the scheduler select.
-    // Reconstructing `Endpoint::accept` on every 100 ms tick can cancel a
-    // handshake indefinitely on an accept-only node.
+    // Keep one stateful acceptor alive independently from the scheduler
+    // select. It continues dequeuing bounded inbound handshake attempts while
+    // earlier handshakes are incomplete, and avoids scheduler-tick
+    // cancellation on accept-only nodes.
     let (accepted_sender, mut accepted_receiver) = mpsc::channel(1);
     #[cfg(feature = "nearby-discovery")]
     let accept_enabled = !allowed.is_empty() || automatic_nearby;
@@ -12076,15 +12077,16 @@ async fn run_node_actor_inner(
         #[cfg(feature = "nearby-discovery")]
         let automatic = automatic_nearby;
         Some(tokio::spawn(inherit_node_output(async move {
+            #[cfg(feature = "nearby-discovery")]
+            let mut acceptor = if automatic {
+                endpoint.inbound_candidate_acceptor()
+            } else {
+                endpoint.inbound_acceptor(&allowed)
+            };
+            #[cfg(not(feature = "nearby-discovery"))]
+            let mut acceptor = endpoint.inbound_acceptor(&allowed);
             loop {
-                #[cfg(feature = "nearby-discovery")]
-                let accepted = if automatic {
-                    endpoint.accept_candidate().await
-                } else {
-                    endpoint.accept(&allowed).await
-                };
-                #[cfg(not(feature = "nearby-discovery"))]
-                let accepted = endpoint.accept(&allowed).await;
+                let accepted = acceptor.accept().await;
                 match accepted {
                     Ok(connection) => {
                         if accepted_sender.send(Ok(connection)).await.is_err() {
