@@ -36,7 +36,7 @@ remain unanswered.
 
 | Topic | Confirmed feedback |
 | --- | --- |
-| Data workloads | Telemetry, sensor data, and AI detections are relevant workloads. |
+| Data workloads | Telemetry, sensor data, and automated detections are relevant workloads. |
 | Growth and synchronization cost | As accumulated CRDT data grows, synchronization takes progressively longer. Memory consumption and network traffic also increase. The concern is operational cost; the client did not request rejection of CRDTs. |
 | Near-term offline retention | A strong initial result would preserve 24 hours of selected mission-critical data on an offline node and make that content available for transmission when connectivity returns. |
 | Longer-term aspiration | Seven days of mission-critical data retention on an offline node is an ideal future goal, not an immediate expectation. |
@@ -60,7 +60,7 @@ remain unanswered.
 - How mission-critical data is selected.
 - Maximum acceptable delivery time after reconnection.
 - Typical and worst-case bandwidth, loss, latency, and contact duration.
-- Whether AI detections include imagery or other large binary content.
+- Whether automated detections include imagery or other large binary content.
 - Whether the higher-capacity participant remains in one scope or crosses an
   administrative boundary.
 - Decision timing and client-assigned priorities.

@@ -81,42 +81,56 @@ carrier connectivity, a recent contact, an empty queue, or convergence.
 Offline-first publication is ready behavior.
 
 `GetStatus` also returns configured and effective emission mode, aggregate
-logical store use/limits, permanent publish-operation usage, and pending
+logical store use/limits, durable publish-operation usage, and pending
 delivery pressure. The approved profile remains unchanged: operation
 `profile_warning` begins at 512 records and `profile_exhausted` at 1,024;
 `profile_boundary` is 1,024 and `profile_remaining` saturates at zero. Pending
 delivery workload saturates at 256. A higher configured limit does not approve
 a larger evaluation workload.
 
-In `publish_operation_capacity`, `rows`/`bytes` report actual permanent ledger
-use and `row_hard_limit`/`byte_hard_limit` report configured candidate limits.
-The additive `active_rows`, `retired_rows`, and `reverse_rows` expose compact
-retirement, while `ordinary_remaining` and `emergency_remaining` account for
-both record and byte headroom, preserving 162 bytes for each reserved active
-operation. The candidate `warning_state` becomes `WARNING` at 70% and
-`CRITICAL` at 90% of the larger ordinary record/byte occupancy, then `EXHAUSTED`
-when no ordinary record fits. Candidate headroom can remain positive after
-the approved profile is exhausted.
+In `publish_operation_capacity`, `ledger_mode` identifies the active mutually
+exclusive `LEGACY` or `NUMBERED` ledger. `rows`/`bytes` report that ledger's
+actual use and `row_hard_limit`/`byte_hard_limit` report configured candidate
+limits. In legacy mode, `active_rows`, `retired_rows`, and `reverse_rows`
+expose compact retirement. In numbered mode those legacy counters are zero;
+`numbered_clients`, `numbered_outstanding_results`, and
+`numbered_reverse_rows` provide the exact breakdown, and acknowledging a result
+reduces `rows` and `bytes` while leaving its client record durable.
 
-`rolling_accept_rate` is newly committed permanent records in the last
-monotonic 60 seconds divided by 60. New aliases and direct retired fences
-count; exact retries, conflicts, and failed admission do not. The window starts
-empty on restart and expires samples at exactly 60 seconds. The estimate in
+`ordinary_remaining` and `warning_state` use the active ledger's record and
+byte accounting. Numbered headroom conservatively reserves 292 logical bytes
+for a future result. `emergency_remaining` reports numbered tombstone result
+headroom within the hard limits beyond ordinary admission. The candidate
+`warning_state` becomes `WARNING` at 70% and `CRITICAL` at 90% of the larger
+ordinary record/byte occupancy, then `EXHAUSTED` when no ordinary record fits.
+Candidate headroom can remain positive after the approved profile is exhausted.
+
+`rolling_accept_rate` is newly committed ledger rows in the last monotonic 60
+seconds divided by 60. New legacy aliases and direct retired fences count; in
+numbered mode, new client and outstanding-result rows count. Exact retries,
+session takeovers, acknowledgements, conflicts, and failed admission do not.
+The window starts empty on restart and expires samples at exactly 60 seconds.
+The estimate in
 `estimated_seconds_to_exhaustion` rounds ordinary headroom/rate up to whole
 seconds, saturates at `u64::MAX`, and is zero without an observed rate or
 headroom. It is planning information; warning state remains occupancy-only
 and does not assume that content expiry frees permanent operation records.
 
-The nested `audit` reports `PENDING`, `RUNNING`, `COMPLETE`, or `FAILED`, with
-`scanned`/`total` counting ledger and reverse rows in one fixed snapshot.
-Completion includes accounting checks; later commits belong to the next pass.
-Failure closes new Event publication and leaves usage/headroom at the last
-successfully read figures, which must not be trusted as current capacity.
+For the legacy ledger, nested `audit` reports `PENDING`, `RUNNING`, `COMPLETE`,
+or `FAILED`, with `scanned`/`total` counting ledger and reverse rows in one fixed
+snapshot. Completion includes accounting checks; later commits belong to the
+next pass. Failure closes new legacy Event publication and leaves
+usage/headroom at the last successfully read figures, which must not be trusted
+as current capacity. In numbered mode this field still describes only the
+legacy background audit and does not claim numbered-ledger audit coverage.
 
-Every operation key remains bound to its mission and intent after payload
-retirement. Plan a new mission namespace or a larger prequalified limit before
-mission start when capacity is insufficient. Never manually delete ledger
-rows or reuse retired keys. See the [capacity reference](../reference/aster-agent-config-v1.md#storage-reserve-calculation)
+In legacy mode, every operation key remains bound to its mission and intent
+after payload retirement. In numbered mode, client records remain durable and
+sequence numbers are never reused, while acknowledgement reclaims the result
+and reverse row. Plan a new mission namespace or a larger prequalified limit
+before mission start when durable capacity is insufficient. Never manually
+delete ledger rows or reuse legacy keys or numbered sequences. See the
+[capacity reference](../reference/aster-agent-config-v1.md#storage-reserve-calculation)
 for configuration details; no larger-capacity qualification is claimed here.
 
 Only `GET` with no body is accepted. Unknown paths return `404`, other methods
@@ -161,13 +175,101 @@ approved workload or add retained qualification evidence. The operation ledger
 still has its configured lifetime limit (default 1,000,000 records) and keeps
 compact permanent retry fences. Custody retirement fences and causal history
 have separate retention boundaries; content reuse is not indefinite bounded
-operation. Global deletion propagation and numbered-operation watermark
-compaction remain separate designs.
+operation. Global deletion propagation remains separate. The experimental
+numbered publication profile below supplies bounded local publication-result
+compaction; it does not change mesh-wide Event ordering or deletion
+propagation.
 
 Use an upgraded server with regenerated clients for finite publication. Older
 servers can ignore new Protobuf fields; require the returned `ttl_ms` to match
 the request before treating publication as finite. Old clients that omit TTL
 continue to publish durable Events. Mesh wire and storage formats are unchanged.
+
+## Use crash-safe numbered publication
+
+Increment 1 of the experimental numbered-publication profile replaces caller
+chosen publication keys with `(client_id, operation_sequence)` between an SDK
+and its local agent. Initialize one journal explicitly, keep both its file and
+configured `client_id` stable, open it exclusively, and call `recover()` before
+allocating work. Its sequence-ordered report lists `Pending` intents to send
+with `publish_journaled()` or cancel with `abandon()`, `Committed(result)`
+receipts to apply idempotently then `acknowledge()`, and transient `Retired`
+sequences that need no action. The report is returned only after the complete
+recovery RPC succeeds. `publish()` flushes the complete intent before
+transmission and the committed result before returning it. On failure,
+`assigned_sequence()` distinguishes a pre-assignment journal error from an
+assigned intent whose RPC outcome needs recovery. A cancelled assigned
+operation must be passed to `abandon()` before a later sequence can be admitted.
+Successful abandon and acknowledgement, and validated recovery of consumed
+sequences, delete their full local rows and payloads.
+
+The journal is durable protocol state. A missing, corrupt, already-open, or
+wrong-client journal fails closed; `open` never recreates it. Initialization is
+a separate one-time operation:
+
+```no_run
+# #[cfg(feature = "client")]
+# async fn numbered(
+#     client: aster_agent::proto::aster::application::v1alpha1::AsterApplicationServiceClient<connectrpc::client::SharedHttp2Connection>,
+#     path: &std::path::Path,
+# ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+use aster_agent::{proto::aster::application::v1alpha1 as api, sdk::{NumberedEventSdk, PublicationJournal, RecoveredState}};
+
+let client_id = b"orders-publisher";
+if !path.exists() {
+    PublicationJournal::initialize(path, client_id)?;
+}
+let sdk = NumberedEventSdk::open(client, path, client_id)?;
+let report = sdk.recover().await?;
+for operation in report.operations {
+    let committed = match operation.state {
+        RecoveredState::Pending => Some(sdk.publish_journaled(operation.sequence).await?),
+        RecoveredState::Committed(result) => Some(result),
+        RecoveredState::Retired => None,
+    };
+    if let Some(committed) = committed {
+        // Apply the business effect idempotently before acknowledgement.
+        let _ = committed;
+        sdk.acknowledge(operation.sequence).await?;
+    }
+}
+let (sequence, committed) = match sdk.publish(api::PublishNumberedEventRequest {
+    topic: "ops.alpha".into(),
+    scope: "mission/apps".into(),
+    priority: api::Priority::Priority.into(),
+    logical_key: b"order-42".to_vec(),
+    payload: b"ready".to_vec(),
+    ..Default::default()
+}).await {
+    Ok(published) => published,
+    Err(error) => {
+        // Preserve this sequence and recover after reconnect if it exists.
+        let _assigned_sequence_to_reconcile = error.assigned_sequence();
+        return Err(error.into());
+    }
+};
+// Apply the business effect idempotently before acknowledging the result.
+sdk.acknowledge(sequence).await?;
+# let _ = committed;
+# Ok(())
+# }
+```
+
+The agent retains `allocated_through` plus at most 4,096 sparse outstanding
+results per client. Acknowledgement can compact a later result while an older
+one remains outstanding. If TTL cleanup removes Event content first, recovery
+still returns the immutable commit receipt with `Retired(reason)`. Session
+takeover fences older publication mutations and is idempotent by its persisted
+claim nonce. Recovery completion is repeatable with the same session and
+snapshot revision after a lost response.
+
+This profile requires a fresh store boundary. A store containing the older
+arbitrary-key Event publication ledger is refused without migration or
+deletion, and a numbered store refuses later arbitrary-key publications.
+Increment 1 does not claim session ownership for subscriptions, polling,
+delivery cursors, or delivery acknowledgements; lost-journal reconstruction,
+administrative client retirement, and operator-tunable client limits are also
+later work.
 
 ## Select normal or receive-only operation
 

@@ -13,6 +13,11 @@ pub enum PublicOperation {
     Unspecified,
     GetStatus,
     PublishEvent,
+    BeginEventPublicationSession,
+    CompleteEventPublicationRecovery,
+    PublishNumberedEvent,
+    AbandonEventPublication,
+    AcknowledgeEventPublicationResult,
     QueryEvents,
     CreateEventSubscription,
     PollEvents,
@@ -29,6 +34,11 @@ impl PublicOperation {
             Self::Unspecified => "unspecified",
             Self::GetStatus => "get_status",
             Self::PublishEvent => "publish_event",
+            Self::BeginEventPublicationSession => "begin_event_publication_session",
+            Self::CompleteEventPublicationRecovery => "complete_event_publication_recovery",
+            Self::PublishNumberedEvent => "publish_numbered_event",
+            Self::AbandonEventPublication => "abandon_event_publication",
+            Self::AcknowledgeEventPublicationResult => "acknowledge_event_publication_result",
             Self::QueryEvents => "query_events",
             Self::CreateEventSubscription => "create_event_subscription",
             Self::PollEvents => "poll_events",
@@ -43,6 +53,11 @@ impl PublicOperation {
         match operation.as_bytes() {
             b"status" => Some(Self::GetStatus),
             b"publish" => Some(Self::PublishEvent),
+            b"begin_publication_session" => Some(Self::BeginEventPublicationSession),
+            b"complete_publication_recovery" => Some(Self::CompleteEventPublicationRecovery),
+            b"publish_numbered" => Some(Self::PublishNumberedEvent),
+            b"abandon_publication" => Some(Self::AbandonEventPublication),
+            b"acknowledge_publication_result" => Some(Self::AcknowledgeEventPublicationResult),
             b"query" => Some(Self::QueryEvents),
             b"subscribe" => Some(Self::CreateEventSubscription),
             b"poll" => Some(Self::PollEvents),
@@ -65,6 +80,13 @@ impl api::PublicErrorReason {
             Self::Deadline => "operation deadline exceeded",
             Self::ResourceExhaustion => "resource limit reached",
             Self::OperationCapacityExhausted => "durable operation capacity exhausted",
+            Self::SessionFenced => "publication session is fenced",
+            Self::SequenceGap => "publication sequence has a gap",
+            Self::SequenceRetired => "publication sequence is retired",
+            Self::RecoveryRequired => "publication recovery is required",
+            Self::LegacyStateRequiresFreshStore => {
+                "legacy publication state requires a fresh store"
+            }
             Self::Draining => "service is draining",
             Self::StateUnavailable => "service state is unavailable",
             Self::AuthenticationFailed => "authentication failed",
@@ -86,6 +108,11 @@ pub(crate) fn is_public_error_message(message: &str) -> bool {
         R::Deadline,
         R::ResourceExhaustion,
         R::OperationCapacityExhausted,
+        R::SessionFenced,
+        R::SequenceGap,
+        R::SequenceRetired,
+        R::RecoveryRequired,
+        R::LegacyStateRequiresFreshStore,
         R::Draining,
         R::StateUnavailable,
         R::AuthenticationFailed,
@@ -156,6 +183,31 @@ fn application_error_mapping(kind: ApplicationErrorKind, operation: &str) -> Pub
         ApplicationErrorKind::Conflict => (
             ErrorCode::Aborted,
             api::PublicErrorReason::OperationKeyConflict,
+            false,
+        ),
+        ApplicationErrorKind::SessionFenced => (
+            ErrorCode::Aborted,
+            api::PublicErrorReason::SessionFenced,
+            false,
+        ),
+        ApplicationErrorKind::SequenceGap => (
+            ErrorCode::FailedPrecondition,
+            api::PublicErrorReason::SequenceGap,
+            false,
+        ),
+        ApplicationErrorKind::SequenceRetired => (
+            ErrorCode::NotFound,
+            api::PublicErrorReason::SequenceRetired,
+            false,
+        ),
+        ApplicationErrorKind::RecoveryRequired => (
+            ErrorCode::FailedPrecondition,
+            api::PublicErrorReason::RecoveryRequired,
+            false,
+        ),
+        ApplicationErrorKind::LegacyState => (
+            ErrorCode::FailedPrecondition,
+            api::PublicErrorReason::LegacyStateRequiresFreshStore,
             false,
         ),
         ApplicationErrorKind::ExpiredOrRetired => (
@@ -372,6 +424,30 @@ mod tests {
             assert_eq!(mapping.retryable, retryable, "{kind:?}");
             assert_eq!(mapping.retry_delay, None, "{kind:?}");
         }
+    }
+
+    #[test]
+    fn numbered_publication_rejection_has_public_permission_mapping() {
+        let mapping =
+            application_error_mapping(ApplicationErrorKind::RequestRejected, "publish_numbered");
+        assert_eq!(mapping.code, ErrorCode::PermissionDenied);
+        assert_eq!(mapping.reason, api::PublicErrorReason::FailedPrecondition);
+        assert_eq!(mapping.operation, PublicOperation::PublishNumberedEvent);
+        let error = public_error(
+            mapping.code,
+            mapping.reason,
+            mapping.operation,
+            mapping.retryable,
+            mapping.retry_delay,
+        );
+        assert_eq!(error.code, ErrorCode::PermissionDenied);
+        assert_detail(
+            error,
+            api::PublicErrorReason::FailedPrecondition,
+            "publish_numbered_event",
+            false,
+            None,
+        );
     }
 
     #[test]

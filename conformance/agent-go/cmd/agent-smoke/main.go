@@ -402,6 +402,15 @@ func statusEvidence(message *applicationv1alpha1.GetStatusResponse) (result, err
 	if store == nil || operations == nil || deliveries == nil {
 		return nil, errors.New("invalid status response")
 	}
+	var operationLedgerMode string
+	switch operations.LedgerMode {
+	case applicationv1alpha1.PublishOperationLedgerMode_PUBLISH_OPERATION_LEDGER_MODE_LEGACY:
+		operationLedgerMode = "legacy"
+	case applicationv1alpha1.PublishOperationLedgerMode_PUBLISH_OPERATION_LEDGER_MODE_NUMBERED:
+		operationLedgerMode = "numbered"
+	default:
+		return nil, errors.New("invalid status response")
+	}
 	if store.ItemLimit != profileStoreItems || store.PayloadByteLimit != profileStoreBytes ||
 		store.Items > store.ItemLimit || store.PayloadBytes > store.PayloadByteLimit {
 		return nil, errors.New("invalid status response")
@@ -438,9 +447,13 @@ func statusEvidence(message *applicationv1alpha1.GetStatusResponse) (result, err
 		"operation_profile_remaining":               operations.ProfileRemaining,
 		"operation_profile_warning":                 operations.ProfileWarning,
 		"operation_profile_exhausted":               operations.ProfileExhausted,
+		"operation_ledger_mode":                     operationLedgerMode,
 		"operation_active_rows":                     operations.ActiveRows,
 		"operation_retired_rows":                    operations.RetiredRows,
 		"operation_reverse_rows":                    operations.ReverseRows,
+		"operation_numbered_clients":                operations.NumberedClients,
+		"operation_numbered_outstanding_results":    operations.NumberedOutstandingResults,
+		"operation_numbered_reverse_rows":           operations.NumberedReverseRows,
 		"operation_ordinary_remaining":              operations.OrdinaryRemaining,
 		"operation_emergency_remaining":             operations.EmergencyRemaining,
 		"operation_rolling_accept_rate":             operations.RollingAcceptRate,
@@ -465,17 +478,34 @@ func saturatingSub(limit, used uint64) uint64 {
 // remain the independent 1,024-row view checked above.
 func operationHealth(operations *applicationv1alpha1.PublishOperationCapacityStatus) (string, string, error) {
 	invalid := errors.New("invalid status response")
-	if operations.ActiveRows > operations.Rows || operations.RetiredRows != operations.Rows-operations.ActiveRows ||
-		operations.ReverseRows != operations.ActiveRows || operations.ActiveRows > math.MaxUint64/162 ||
-		operations.RetiredRows > (math.MaxUint64-operations.ActiveRows*162)/67 ||
-		operations.Bytes != operations.ActiveRows*162+operations.RetiredRows*67 {
+	bytesPerRow := uint64(162)
+	switch operations.LedgerMode {
+	case applicationv1alpha1.PublishOperationLedgerMode_PUBLISH_OPERATION_LEDGER_MODE_UNSPECIFIED,
+		applicationv1alpha1.PublishOperationLedgerMode_PUBLISH_OPERATION_LEDGER_MODE_LEGACY:
+		if operations.ActiveRows > operations.Rows || operations.RetiredRows != operations.Rows-operations.ActiveRows ||
+			operations.ReverseRows != operations.ActiveRows || operations.ActiveRows > math.MaxUint64/162 ||
+			operations.RetiredRows > (math.MaxUint64-operations.ActiveRows*162)/67 ||
+			operations.Bytes != operations.ActiveRows*162+operations.RetiredRows*67 ||
+			operations.NumberedClients != 0 || operations.NumberedOutstandingResults != 0 || operations.NumberedReverseRows != 0 {
+			return "", "", invalid
+		}
+	case applicationv1alpha1.PublishOperationLedgerMode_PUBLISH_OPERATION_LEDGER_MODE_NUMBERED:
+		bytesPerRow = 292
+		if operations.ActiveRows != 0 || operations.RetiredRows != 0 || operations.ReverseRows != 0 ||
+			operations.NumberedClients > math.MaxUint64-operations.NumberedOutstandingResults ||
+			operations.NumberedClients+operations.NumberedOutstandingResults != operations.Rows ||
+			operations.NumberedReverseRows != operations.NumberedOutstandingResults {
+			return "", "", invalid
+		}
+	default:
 		return "", "", invalid
 	}
 	ordinaryRecords := uint64(operationHardRows - operationReserveRows)
 	ordinaryBytes := uint64(operationHardBytes - operationReserveRows*162)
-	ordinary := min(saturatingSub(ordinaryRecords, operations.Rows), saturatingSub(ordinaryBytes, operations.Bytes)/162)
-	total := min(saturatingSub(operationHardRows, operations.Rows), saturatingSub(operationHardBytes, operations.Bytes)/162)
-	if operations.OrdinaryRemaining != ordinary || operations.EmergencyRemaining != saturatingSub(total, ordinary) {
+	ordinary := min(saturatingSub(ordinaryRecords, operations.Rows), saturatingSub(ordinaryBytes, operations.Bytes)/bytesPerRow)
+	total := min(saturatingSub(operationHardRows, operations.Rows), saturatingSub(operationHardBytes, operations.Bytes)/bytesPerRow)
+	emergency := saturatingSub(total, ordinary)
+	if operations.OrdinaryRemaining != ordinary || operations.EmergencyRemaining != emergency {
 		return "", "", invalid
 	}
 	warning := applicationv1alpha1.OperationCapacityWarning_OPERATION_CAPACITY_WARNING_OK

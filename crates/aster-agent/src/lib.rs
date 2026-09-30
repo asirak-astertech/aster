@@ -17,6 +17,8 @@ pub mod health;
 pub mod lifecycle;
 #[cfg(feature = "server")]
 pub mod runtime;
+#[cfg(feature = "client")]
+pub mod sdk;
 #[cfg(feature = "server")]
 pub mod server;
 #[cfg(feature = "server")]
@@ -119,6 +121,7 @@ impl BoundAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use buffa::Message as _;
 
     #[test]
     fn plaintext_listener_rejects_non_loopback_before_binding() {
@@ -143,6 +146,55 @@ mod tests {
         assert!(ClientToken::from_bytes(vec![b'a'; 31]).is_err());
         assert!(ClientToken::from_bytes(vec![b'a'; 257]).is_err());
         assert!(ClientToken::from_bytes(vec![b' '; 32]).is_err());
+    }
+
+    #[test]
+    fn numbered_recovery_size_calculation_matches_final_protobuf_wire_shape() {
+        use aster_redb_store::{
+            CommittedEventContent, CommittedEventReceipt, CustodyRetirementReason,
+            EventOperationSequence, EventPublicationSession, EventRecoverySnapshot,
+            EventSemanticId, EventTransferId, NumberedEventResult, recovery_snapshot_proto_len,
+        };
+
+        let store_result = NumberedEventResult {
+            sequence: EventOperationSequence::new(u64::MAX).expect("sequence"),
+            receipt: CommittedEventReceipt {
+                transfer_id: EventTransferId::new([0xff; 32]),
+                semantic_id: EventSemanticId::new([0xfe; 32]),
+                acceptance_marker: u64::MAX,
+            },
+            content: CommittedEventContent::Retired(CustodyRetirementReason::Expired),
+        };
+        let snapshot = EventRecoverySnapshot {
+            session: EventPublicationSession::new(u64::MAX).expect("session"),
+            allocated_through: u64::MAX,
+            snapshot_revision: u64::MAX,
+            outstanding: vec![store_result; 4_096],
+        };
+        let wire_result = api::CommittedPublicationResult {
+            operation_sequence: u64::MAX,
+            receipt: buffa::MessageField::some(api::CommittedEventReceipt {
+                transfer_id: vec![0xff; 32],
+                event_id: vec![0xfe; 32],
+                acceptance_marker: u64::MAX,
+                ..Default::default()
+            }),
+            content: api::CommittedContentStatus::Retired.into(),
+            retirement_reason: Some(api::RetirementReason::Expired.into()),
+            ..Default::default()
+        };
+        let response = api::BeginEventPublicationSessionResponse {
+            session: u64::MAX,
+            allocated_through: u64::MAX,
+            snapshot_revision: u64::MAX,
+            outstanding: vec![wire_result; 4_096],
+            ..Default::default()
+        };
+        assert_eq!(
+            recovery_snapshot_proto_len(&snapshot),
+            response.encoded_len() as usize
+        );
+        assert!(response.encoded_len() <= MAX_AGENT_RESPONSE_PROTO_BYTES);
     }
 
     #[cfg(unix)]
