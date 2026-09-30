@@ -19,7 +19,8 @@ single stable check name **`CI / required`**.
 | Check | Runner | Purpose |
 | --- | --- | --- |
 | `quality` | `ubuntu-24.04` | Runs the exact-source Python process contract, Rust and Go formatting, Apache-2.0-only project-license and package checks, exact 348-row implementation-requirements traceability, the selected-node dependency boundary, vendored netlink source-equivalence and 13-test compatibility gates, the retained-libp2p-oracle boundary, selected live-Event, live-mutable, live-State-subscription, live-Record-subscription, live-Blob, and live-Blob-subscription receipt checker tests, real-process smokes, C ABI build and C/C++ header checks, Rust/Python conformance, Python/Go binding tests, and lab-controller tests. |
-| `Rust quality` | `ubuntu-24.04` | Runs Clippy with warnings denied and the complete locked, all-feature Rust workspace test suite. This is the same `mise run check-rust` segment included by the local aggregate, isolated as a parallel required lane rather than package-sharded. |
+| `Rust Clippy` | `ubuntu-24.04` | Runs locked Clippy for every workspace target and feature, with warnings denied. |
+| `Rust tests (1/2)` and `Rust tests (2/2)` | `ubuntu-24.04` | Run two disjoint nextest partitions covering the complete locked, all-feature Rust workspace suite. Partition 1 also runs all workspace doctests with Cargo. Both start independently of Clippy and use the existing resource wrapper. |
 | `macOS tests` | `macos-14` | Runs all Rust workspace tests on the supported Apple runner with Rust 1.97.1. |
 | `Rust 1.91 MSRV` | `ubuntu-24.04` | Checks every workspace target and feature with the declared minimum supported Rust version. |
 | `dependency policy` | `ubuntu-24.04` | Enforces the retained-libp2p-oracle boundary, applies `deny.toml` to the root and fuzz dependency graphs, and audits both lockfiles against a freshly downloaded RustSec database. |
@@ -33,6 +34,19 @@ current advisory data once, audits the root lockfile during that refresh, and
 reuses the same database without another fetch for the fuzz lockfile. Its
 vulnerability result therefore reflects the RustSec database available when
 the workflow ran, rather than a permanently reproducible snapshot.
+
+The Linux `Rust tests` lane downloads the public cargo-nextest 0.9.145
+`x86_64-unknown-linux-gnu` release from `nextest-rs/nextest` and verifies the
+pinned archive SHA-256 before execution. Nextest runs the same locked workspace
+with all features, using `--partition slice:1/2` and `slice:2/2` to distribute
+every test across two runners. See the public nextest 0.9.145
+[partitioning documentation](https://nexte.st/docs/ci-features/partitioning/).
+Because nextest does not execute Rust doctests, partition 1 runs the complete
+workspace doctest set separately with Cargo. The `aster-node`
+`mesh_cli` binary is assigned to a single-threaded nextest group so its
+real-process tests cannot overlap each other on the same runner; the nextest
+limit remains two workers per runner. Matrix fail-fast is disabled so a failed
+partition does not cancel the other partition.
 
 ### CI critical-path profile (2026-09-17)
 
@@ -59,32 +73,98 @@ a development-host result, not hosted-CI or throughput evidence.
 command order:
 
 1. `mise run check-foundation`
-2. `mise run check-rust`
-3. `mise run check-integration`
+2. `mise run check-clippy`
+3. `mise run check-workspace-tests`
+4. `mise run check-integration`
 
-Hosted Linux CI runs the Rust segment in the separate required `Rust quality`
-lane while `quality` runs the foundation and integration segments. The stable
-`required` job fails unless both lanes and every pre-existing validation lane
-succeed. No test, feature set, receipt assertion, binding check, conformance
-check, or process smoke is omitted.
+The aggregate uses sequential `{ task = "..." }` run entries, supported by
+the pinned [mise 2026.4.28](https://github.com/jdx/mise/blob/v2026.4.28/docs/tasks/running-tasks.md#execution-order),
+instead of shell commands invoking mise. A failed step stops the sequence.
 
-The following observations are intentionally deferred rather than folded into
-this low-risk split:
+Hosted Linux CI runs `mise run check-clippy` alongside two nextest partitions,
+while `quality` runs the foundation and integration segments. Locally,
+`mise run check-workspace-tests` executes the complete suite without
+partitioning and then all doctests.
+The stable `required` job fails unless Clippy, both test partitions, and every
+other validation lane succeed. No test, feature set, receipt assertion, binding check,
+conformance check, or process smoke is omitted. This removes the Clippy wait
+before workspace tests and distributes test execution at the cost of extra
+runner setup and potentially duplicated cold-cache compilation; compare cold
+and warm hosted runs.
 
-- Actions and compiler caches remain disabled. Cache trust, eviction, keying,
-  restore integrity, and disk-growth behavior need a separate design; local
-  profiling showed build artifacts, rather than partition size, caused prior
-  disk pressure.
+### Compiler cache
+
+- The Linux `quality`, `Rust Clippy`, and `Rust tests` lanes use `sccache` v0.16.0 through
+  `sccache-action` v0.0.11 in read-write mode. GitHub isolates pull-request
+  writes to the PR merge ref, allowing a cold PR run to populate its cache and
+  a rerun of the same PR to measure warm-cache performance without modifying
+  the default-branch cache. Idle shutdown is disabled for these lanes so the
+  action retains complete statistics through the long test-only tail of
+  `Rust tests`; the runner still terminates the local daemon at job cleanup.
+- The cache namespace is separated by operating system, architecture, Rust
+  version, and an explicit manual generation. `sccache` additionally keys each
+  compilation result by its compiler inputs. Incremental Rust compilation
+  remains disabled.
+- The bounded fuzz lane uses the separate
+  `aster-linux-x86_64-nightly-2026-08-18-fuzz-v1` read-write namespace. This
+  prevents sanitizer-instrumented nightly objects from mixing with the stable
+  Rust cache while allowing repeated pull-request runs to reuse compatible
+  fuzz compilation results. Its cache server remains alive through the
+  campaigns so the action can report final hit and miss statistics.
+- The macOS lane uses the separate
+  `aster-macos-arm64-rust-1.97.1-v1` read-write namespace and disables dev/test
+  debug information for the complete job. The workspace tests and later
+  real-process smoke therefore use compatible debug settings, while Apple ARM
+  compiler objects remain isolated from Linux objects.
+- The workflow does not archive the complete Cargo `target` directory. Cache
+  eviction, storage limits, hit rates, transfer time, and compilation time
+  remain visible in the Actions and `sccache` statistics.
+- Public sources: `sccache` v0.16.0 / Apache-2.0,
+  <https://github.com/mozilla/sccache>; `sccache-action` v0.0.11 / Apache-2.0,
+  <https://github.com/mozilla-actions/sccache-action>.
+### Repeated setup
+
+Run [35365004599](https://github.com/edgesoftops/astertech/actions/runs/35365004599)
+at `4c79230540a955e36f9e5cf680c7e4136726f469` provides the setup baseline:
+`quality` took approximately 9m42s, including 3m25s building CPython; dependency
+policy took 8m35s, including 8m03s installing `cargo-deny` and `cargo-audit`.
+The longest lane was `Rust quality` at 23m11s despite 953 compiler-cache hits
+and zero misses. These are observations from that run, not expected savings
+or measurements of the setup caches below.
+
+The workflow reuses two small, separate sets of installed tools through
+SHA-pinned [`actions/cache` v6.1.0](https://github.com/actions/cache/tree/55cc8345863c7cc4c66a329aec7e433d2d1c52a9)
+(MIT, CI-only):
+
+- **CI Python:** cache only the installed CPython prefix, keyed by Ubuntu
+  24.04, architecture, and a hash of the source-build script and CI workflow.
+  There is no fallback key. A recipe change or cache miss runs the original
+  checksum-verified source build. Native prerequisites are still installed
+  and logged on every run. A hit must pass the same extension-import and
+  close-from checks before PATH selection, then the existing direct/nested
+  mise preflight and process contract tests. See [CI Python](ci-python.md).
+- **Policy tools:** cache only `cargo-deny` and `cargo-audit`, keyed by Ubuntu
+  24.04, architecture, Rust version, and both tool versions. A miss runs the
+  existing locked Cargo installs; both versions are checked before use on
+  every run. Advisory data and audit results are not cached: the database
+  refresh, root/fuzz audits, and dependency-policy checks still run each time.
+  Increment the key's `v1` suffix to force a rebuild with unchanged pins.
+
+Caches are optional acceleration: an absent entry rebuilds the tools. Measure
+a cold and warm hosted run before claiming a speedup. These setup changes
+reduce repeated work in the affected lanes; separating Clippy and partitioning
+the tests targets the previous longest lane. Shared checkout, mise, and sccache steps use YAML
+anchors. The validation commands and stable `CI / required` check are retained.
+
+### Deferred options
+
 - Larger private-repository runners may reduce compile and test time, but their
   availability and recurring cost need an explicit operational decision.
-- The bounded fuzz lane spends most of its roughly 13-minute runtime compiling;
-  dependency-policy spends roughly 8--9 minutes installing policy tools; and
-  real-Event delivery spends roughly 8 minutes building its isolated Docker
-  image. They are already parallel and are not the current required-check
-  critical path, so build reuse or prebuilt tools/images remain separate work.
-- Package-level Cargo sharding and alternate test runners are not adopted. They
-  would change scheduling, process-fixture interaction, or evidence shape and
-  need dedicated equivalence and resource profiling before use.
+- Real-Event delivery spends roughly 8 minutes building its isolated Docker
+  image. It runs in parallel and is not the current required-check critical
+  path, so prebuilt images remain separate work.
+- Higher per-runner test concurrency is not adopted. Each of the two partitions
+  keeps the existing worker and process-fixture limits.
 
 ## Manual Linux build
 
@@ -164,10 +244,11 @@ memory and disk demand without bound. Explicit caller overrides still win. It
 also raises the child process's soft open-file limit to at least 4,096,
 preserves a larger existing limit, and fails clearly if the hard limit cannot
 support it. These execution bounds do not reduce fixture scale or change the
-host's hard limit. For a direct workspace run, use:
+host's hard limit. For the same direct workspace runs, use:
 
 ```sh
-sh tools/with-test-resources.sh cargo test --locked --workspace --all-features
+sh tools/with-test-resources.sh cargo nextest run --locked --workspace --all-features --no-fail-fast --test-threads 2
+sh tools/with-test-resources.sh cargo test --locked --workspace --all-features --doc
 ```
 
 These tests keep exact data and zero-contact-error assertions. Blob waiting
@@ -202,7 +283,7 @@ invokes the payload writer and that a subsequent authorized exchange completes.
 The receiver checks bytes incrementally. An observation timeout is a failure,
 not evidence that no payload was sent.
 
-The Linux `Rust quality` lane uses the CPU-aware test-thread cap from
+The Linux `Rust tests` lane uses the CPU-aware test-thread cap from
 `tools/with-test-resources.sh`. Narrow isolation in individual process fixtures
 remains. Investigate errors before weakening zero-error assertions or
 increasing carrier deadlines.
