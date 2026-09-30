@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `asterctl` CLI utility.
+- Local delivery and transfer status for State, Record, and Blob operations.
 
 ### Changed
 
