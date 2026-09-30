@@ -97,7 +97,7 @@ second-contact cost, retained bytes, database growth, remaining capacity,
 convergence time, transmitted bytes, inventory work, peak RSS, and CPU.
 
 The low-rate fixture is a bounded evaluation, not a representative telemetry,
-sensor, or AI-detection claim.
+sensor, or automated-detection claim.
 
 References:
 
@@ -192,7 +192,7 @@ qualification claims are made.
 
 - Target operating systems, hardware tiers, and available storage.
 - Event rates and payload-size distributions by workload.
-- Whether AI detections include imagery or other Blob content.
+- Whether automated detections include imagery or other Blob content.
 - The policy used to identify mission-critical data.
 - Maximum acceptable delivery time after reconnection.
 - Typical and worst-case bandwidth, loss, latency, and contact duration.

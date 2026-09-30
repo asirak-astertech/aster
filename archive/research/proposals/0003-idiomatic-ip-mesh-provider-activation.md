@@ -8,7 +8,8 @@
   [0003 — Idiomatic IP mesh provider comparison](0003-idiomatic-ip-mesh-provider-comparison.md)
 - Observed worktree base:
   `56ea19d89e537a351ceded446c2d38f5313d118b`
-- Observed branch: `codex/mesh-host-libp2p-spike`
+- Observed branch suffix: `mesh-host-libp2p-spike` (workspace-specific prefix
+  omitted)
 - Observed worktree state: dirty experiment worktree; not a reproducible
   candidate receipt
 - Workspace package MSRV: Rust `1.90`

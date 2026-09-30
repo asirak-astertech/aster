@@ -1418,7 +1418,15 @@ def collect_build_inputs() -> list[BuildInput]:
     ]
     if not from_sources or any(source != "${LAB_BASE_IMAGE}" for source in from_sources):
         raise LabError("Dockerfile contains a base outside the single pinned build argument")
-    prohibited = {".git", ".agents", ".codex"}
+    # Hidden directories are always rejected below. These reviewed vendored
+    # metadata files are the only hidden regular files admitted from source
+    # trees.
+    allowed_hidden_files = {
+        ".cargo_vcs_info.json",
+        ".gitignore",
+        ".licenserc.yaml",
+        ".rustfmt.toml",
+    }
     admitted_files = [
         root_ignore,
         WORKSPACE / "Cargo.toml",
@@ -1437,15 +1445,19 @@ def collect_build_inputs() -> list[BuildInput]:
             names.sort()
             files.sort()
             directory_path = Path(directory)
+            relative_directory = directory_path.relative_to(tree)
             if directory_path.is_symlink() or any(
-                part in prohibited for part in directory_path.parts
+                part.startswith(".") for part in relative_directory.parts
             ):
                 raise LabError(
                     f"prohibited or symbolic build input directory: {directory_path}"
                 )
             for name in [*names, *files]:
                 path = directory_path / name
-                if name in prohibited or path.is_symlink():
+                if (
+                    (name.startswith(".") and name not in allowed_hidden_files)
+                    or path.is_symlink()
+                ):
                     raise LabError(f"prohibited or symbolic build input: {path}")
             admitted_files.extend(directory_path / name for name in files)
     inputs = []

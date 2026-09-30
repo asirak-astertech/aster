@@ -58,6 +58,27 @@ async fn grpc_status(
 }
 ```
 
+### Crash-safe numbered publication
+
+With the `client` feature, [`sdk::PublicationJournal`] and
+[`sdk::NumberedEventSdk`] implement the experimental numbered-publication
+profile. Journal creation is explicit. Opening a missing, corrupt,
+already-open, or differently configured journal fails closed. Call `recover`
+once per SDK process incarnation before assigning work; transport reconnects
+on the same SDK do not roll the publication session.
+
+The SDK writes each complete intent with immediate durability before sending
+it and writes each returned or recovered result before exposing it. `recover()`
+returns a sequence-ordered `RecoveryReport` only after the server completes
+recovery. `Pending` operations can be sent with `publish_journaled` or cancelled
+with `abandon`; `Committed(result)` operations need idempotent application
+followed by `acknowledge`; `Retired` operations need no action. Consumed rows
+and their payloads are removed from the journal. A `publish()` error exposes
+`assigned_sequence()` when the intent was durably journaled, so callers can
+retain that sequence for recovery after an uncertain RPC outcome. See the
+[agent quickstart](../../docs/quickstart/connect-agent.md#use-crash-safe-numbered-publication)
+for an end-to-end example and the exact Increment 1 boundary.
+
 ### Serving a live node for development or migration
 
 `BoundAgent` is a development/migration compatibility entry point, not the

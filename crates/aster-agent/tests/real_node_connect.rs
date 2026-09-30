@@ -9,7 +9,11 @@ use std::{
     time::Duration,
 };
 
-use aster_agent::{BoundAgent, ClientToken, proto::aster::application::v1alpha1 as api};
+use aster_agent::{
+    BoundAgent, ClientToken,
+    proto::aster::application::v1alpha1 as api,
+    sdk::{NumberedEventSdk, PublicationJournal, RecoveredState},
+};
 use aster_node::mission::UnprotectedReferenceMission;
 use aster_node::{MutableSourceInterests, NodeApplication, NodeConfig, start_node};
 use buffa::{Message as _, MessageName as _};
@@ -358,6 +362,8 @@ fn connect_client_uses_the_real_live_event_authority() {
 
 #[tokio::test]
 async fn optional_event_ttl_is_enforced_by_the_live_agent() {
+    const TEST_TTL_MS: u64 = 10_000;
+
     let state = TestState::new();
     let mission = UnprotectedReferenceMission::from_bytes(
         include_bytes!("../../../bindings/testdata/non-production-provisioning.bundle").to_vec(),
@@ -410,7 +416,7 @@ async fn optional_event_ttl_is_enforced_by_the_live_agent() {
             .code,
         ErrorCode::InvalidArgument
     );
-    request.ttl_ms = Some(2_000);
+    request.ttl_ms = Some(TEST_TTL_MS);
     request.tombstone = true;
     assert_eq!(
         client
@@ -456,7 +462,7 @@ async fn optional_event_ttl_is_enforced_by_the_live_agent() {
         assert_eq!(retry.id, published.id);
         assert!(!retry.inserted);
         let mut changed = request.clone();
-        changed.ttl_ms = Some(3_000);
+        changed.ttl_ms = Some(TEST_TTL_MS + 1_000);
         assert_eq!(
             client.publish_event(changed).await.unwrap_err().code,
             ErrorCode::Aborted
@@ -489,7 +495,9 @@ async fn optional_event_ttl_is_enforced_by_the_live_agent() {
             .await
             .unwrap()
             .into_owned();
-        tokio::time::sleep(Duration::from_millis(2_050)).await;
+        // Keep a generous pre-expiry window for loaded CI runners while still
+        // crossing the real live-agent wall-clock boundary in this test.
+        tokio::time::sleep(Duration::from_millis(TEST_TTL_MS + 50)).await;
         assert!(
             client
                 .query_events(query)
@@ -550,4 +558,155 @@ async fn optional_event_ttl_is_enforced_by_the_live_agent() {
         .unwrap()
         .unwrap();
     node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn numbered_sdk_recovers_its_committed_result_across_restart() {
+    let state = TestState::new();
+    let mission = UnprotectedReferenceMission::from_bytes(
+        include_bytes!("../../../bindings/testdata/non-production-provisioning.bundle").to_vec(),
+    )
+    .expect("mission");
+    let node = start_node(NodeConfig {
+        state: state.0.clone(),
+        bind: "127.0.0.1:0".parse().expect("mesh bind"),
+        mission,
+        peers: Vec::new(),
+        mutable_interests: MutableSourceInterests::default(),
+        sync_interval: Duration::from_millis(50),
+        run_for: None,
+        application: NodeApplication::Relay,
+    })
+    .await
+    .expect("node");
+    let agent = BoundAgent::bind("127.0.0.1:0".parse().expect("agent bind"))
+        .await
+        .expect("agent");
+    let address = agent.local_addr().expect("address");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let server = tokio::spawn(agent.serve(
+        node.selected_events(),
+        ClientToken::from_bytes(TEST_TOKEN.to_vec()).expect("token"),
+        shutdown_rx,
+    ));
+    let config = || {
+        ClientConfig::new(format!("http://{address}").parse().expect("URI")).with_default_header(
+            "authorization",
+            format!("Bearer {}", String::from_utf8_lossy(TEST_TOKEN)),
+        )
+    };
+    let journal_path = state.0.join("publication-journal.redb");
+    let client_id = b"real-numbered-sdk";
+    PublicationJournal::initialize(&journal_path, client_id).expect("initialize journal");
+
+    let sequence;
+    let committed;
+    let occupied_bytes;
+    {
+        let sdk = NumberedEventSdk::open(
+            api::AsterApplicationServiceClient::new(HttpClient::plaintext(), config()),
+            &journal_path,
+            client_id,
+        )
+        .expect("open journal");
+        let report = sdk.recover().await.expect("initial recovery");
+        assert!(report.operations.is_empty());
+        (sequence, committed) = sdk
+            .publish(api::PublishNumberedEventRequest {
+                topic: "chat.events".to_owned(),
+                scope: "mission/team/alpha".to_owned(),
+                priority: api::Priority::Immediate.into(),
+                logical_key: b"numbered-message".to_vec(),
+                payload: b"survives SDK restart".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .expect("publish");
+        assert_eq!(sequence, 1);
+        assert_eq!(committed.operation_sequence, 1);
+
+        let status = api::AsterApplicationServiceClient::new(HttpClient::plaintext(), config())
+            .get_status(api::GetStatusRequest::default())
+            .await
+            .expect("numbered status")
+            .into_owned();
+        let operations = status
+            .publish_operation_capacity
+            .as_option()
+            .expect("publication capacity");
+        assert_eq!(operations.rows, 2, "one client and one outstanding result");
+        assert!(operations.bytes > 0);
+        occupied_bytes = operations.bytes;
+        assert_eq!(operations.ordinary_remaining, 683_925);
+        assert!(operations.emergency_remaining > 0);
+        assert_eq!(operations.profile_remaining, 1_022);
+        assert_eq!(
+            operations.ledger_mode,
+            api::PublishOperationLedgerMode::Numbered
+        );
+        assert_eq!(operations.numbered_clients, 1);
+        assert_eq!(operations.numbered_outstanding_results, 1);
+        assert_eq!(operations.numbered_reverse_rows, 1);
+        assert!(operations.rolling_accept_rate > 0.0);
+    }
+
+    let restarted = NumberedEventSdk::open(
+        api::AsterApplicationServiceClient::new(HttpClient::plaintext(), config()),
+        &journal_path,
+        client_id,
+    )
+    .expect("reopen journal");
+    let report = restarted.recover().await.expect("restart recovery");
+    assert_eq!(report.operations.len(), 1);
+    assert_eq!(report.operations[0].sequence, sequence);
+    assert!(matches!(&report.operations[0].state,
+        RecoveredState::Committed(result) if result == &committed));
+    assert!(restarted.session().expect("session") > 1);
+    assert_eq!(
+        restarted
+            .publish_journaled(sequence)
+            .await
+            .expect("recovered committed result"),
+        committed
+    );
+    restarted
+        .acknowledge(sequence)
+        .await
+        .expect("acknowledge recovered result");
+
+    let status = api::AsterApplicationServiceClient::new(HttpClient::plaintext(), config())
+        .get_status(api::GetStatusRequest::default())
+        .await
+        .expect("compacted numbered status")
+        .into_owned();
+    let operations = status
+        .publish_operation_capacity
+        .as_option()
+        .expect("publication capacity");
+    assert_eq!(
+        operations.rows, 1,
+        "the durable client remains after result acknowledgement"
+    );
+    assert!(
+        operations.bytes < occupied_bytes,
+        "acknowledgement must reclaim the result and reverse-edge bytes"
+    );
+    assert_eq!(operations.ordinary_remaining, 683_926);
+    assert!(operations.emergency_remaining > 0);
+    assert_eq!(operations.profile_remaining, 1_023);
+    assert_eq!(
+        operations.ledger_mode,
+        api::PublishOperationLedgerMode::Numbered
+    );
+    assert_eq!(operations.numbered_clients, 1);
+    assert_eq!(operations.numbered_outstanding_results, 0);
+    assert_eq!(operations.numbered_reverse_rows, 0);
+
+    shutdown_tx.send(true).expect("shutdown");
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("agent shutdown timeout")
+        .expect("agent task")
+        .expect("agent serve");
+    node.shutdown().await.expect("node shutdown");
 }
