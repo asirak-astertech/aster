@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `asterctl` CLI utility.
 - Local delivery and transfer status for State, Record, and Blob operations.
+- Numbered Event publication with durable operation tracking and crash-safe recovery.
 
 ### Changed
 
