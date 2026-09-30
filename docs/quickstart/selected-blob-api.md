@@ -13,7 +13,8 @@ drop; each delivery is metadata only and carries no Blob plaintext.
 The live surface deliberately keeps application delivery separate from network
 replication. A Blob subscription is durable local intent, not a route/content
 grant or a dynamic network interest. The surface has no Blob peer or convergence
-status; `delivery_status` reports only local selector and delivery-ledger counts.
+status; `delivery_status` reports local selector/delivery-ledger counts, while
+`transfer_status` reports audited local durable storage and receive progress.
 The exclusive `SelectedBlobNode` remains available when no runtime owns the same
 store and provides the same delivery lifecycle plus synchronous seekable-source
 publication and streaming `read_into`. Separately, semantic v5 reconciles
@@ -142,6 +143,19 @@ for delivery in page.deliveries {
 
 let local = blobs.delivery_status().await?;
 assert_eq!(local.subscriptions, 1);
+
+let transfers = blobs.transfer_status().await?;
+for pending in transfers.pending {
+    println!(
+        "blob={} durable_carriers={}/{} durable_bytes={}/{} phase={:?}",
+        pending.id,
+        pending.durable_carriers,
+        pending.total_carriers,
+        pending.durable_carrier_bytes,
+        pending.total_carrier_bytes,
+        pending.phase,
+    );
+}
 blobs.unsubscribe(subscription.id).await?;
 ```
 
@@ -182,6 +196,16 @@ make application side effects transactional with acknowledgement.
 
 `delivery_status` is a structurally audited local ledger snapshot, not sync,
 contact, peer, transfer-progress, or convergence status.
+
+`transfer_status` is also read-only and is available on both
+`SelectedBlobHandle` and `SelectedBlobNode`. Its retained counters include all
+local rows that still consume durable capacity; its `pending` list includes
+only currently authorized source projections. `AwaitingCarrier`, `Receiving`,
+and `ReadyToFinalize` are derived from durable carrier prefixes and committed
+chunks. Byte counts describe encrypted carrier representations, not plaintext.
+The snapshot deliberately omits peer identities, carrier object identities,
+routes, lineages, paths, and keys, and makes no peer or global convergence
+claim.
 
 ## Run the example
 
