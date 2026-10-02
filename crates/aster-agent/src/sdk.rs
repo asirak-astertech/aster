@@ -376,6 +376,15 @@ fn open_journal_file(path: &Path, create: bool) -> Result<std::fs::File> {
     let file = options
         .open(path)
         .map_err(|error| journal_error(path, "open journal", error))?;
+    #[cfg(unix)]
+    if create {
+        use std::os::unix::fs::PermissionsExt as _;
+        // Creation mode is filtered by umask. Restore owner read/write on the
+        // same descriptor before initializing the journal, without granting
+        // group/other access or changing permissions on existing journals.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| journal_error(path, "set journal permissions", error))?;
+    }
     let metadata = file
         .metadata()
         .map_err(|error| journal_error(path, "inspect journal", error))?;
@@ -1908,29 +1917,33 @@ mod tests {
     }
     #[test]
     #[cfg(unix)]
-    fn journal_creation_is_owner_only_even_with_permissive_umask() {
+    fn journal_creation_is_private_and_reopenable_regardless_of_umask() {
         use std::os::unix::fs::PermissionsExt as _;
         const CHILD: &str = "ASTER_TEST_JOURNAL_UMASK_CHILD";
-        if std::env::var_os(CHILD).is_none() {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "sdk::tests::journal_creation_is_owner_only_even_with_permissive_umask",
-                    "--test-threads=1",
-                ])
-                .env(CHILD, "1")
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+        let Some(mask) = std::env::var_os(CHILD) else {
+            for mask in [0o000, 0o777] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "sdk::tests::journal_creation_is_private_and_reopenable_regardless_of_umask",
+                        "--test-threads=1",
+                    ])
+                    .env(CHILD, mask.to_string())
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "umask {mask:03o}: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
             return;
-        }
-        // Only this regression runs in the child; do not change the parallel
+        };
+        // Only this regression runs in each child; do not change the parallel
         // parent harness's process-wide umask.
-        rustix::process::umask(rustix::fs::Mode::empty());
+        let mask = mask.to_str().unwrap().parse().unwrap();
+        rustix::process::umask(rustix::fs::Mode::from_bits_truncate(mask));
         let path = journal_path("private-mode");
         PublicationJournal::initialize(&path, b"client").unwrap();
         assert_eq!(
