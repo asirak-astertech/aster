@@ -34,10 +34,10 @@ pub(crate) use reference::{
     VerifiedBridgeSourceRoute, VerifiedBridgeWrapper,
 };
 pub use reference::{
-    ProvisioningAccess, ProvisioningBundle, ReferenceAuthenticatedSession, ReferenceEnvelopeSealer,
-    ReferenceProvisioner, ReferenceSessionAwaitingFinished, ReferenceSessionInitiator,
-    ReferenceSessionResponder, ReferenceSessionResponderPending, ScopeRekeyPlan,
-    ScopeRekeyRecipient,
+    ProvisioningAccess, ProvisioningBundle, REFERENCE_SESSION_FRAME_OVERHEAD_BYTES,
+    ReferenceAuthenticatedSession, ReferenceEnvelopeSealer, ReferenceProvisioner,
+    ReferenceSessionAwaitingFinished, ReferenceSessionInitiator, ReferenceSessionResponder,
+    ReferenceSessionResponderPending, ScopeRekeyPlan, ScopeRekeyRecipient,
 };
 #[cfg(feature = "sqlite-store")]
 pub use reference::{ReferenceNode, open_reference_node};
@@ -84,6 +84,7 @@ pub(crate) const SEMANTIC_PROTOCOL_V3: u16 = 3;
 pub(crate) const SEMANTIC_PROTOCOL_V4: u16 = 4;
 pub(crate) const SEMANTIC_PROTOCOL_V5: u16 = 5;
 pub(crate) const SEMANTIC_PROTOCOL_V6: u16 = 6;
+pub(crate) const SEMANTIC_PROTOCOL_V7: u16 = 7;
 pub(crate) const HYBRID_SUITE_ID: u16 = 0x0001;
 
 const NONCE_LEN: usize = 12;
@@ -91,6 +92,7 @@ const HASH_LEN: usize = 32;
 const MAX_OFFERED_VERSIONS: usize = 16;
 const MAX_OFFERED_SUITES: usize = 16;
 pub(crate) const SUPPORTED_SEMANTIC_PROTOCOL_VERSIONS: &[u16] = &[
+    SEMANTIC_PROTOCOL_V7,
     SEMANTIC_PROTOCOL_V6,
     SEMANTIC_PROTOCOL_V5,
     SEMANTIC_PROTOCOL_V4,
@@ -2459,7 +2461,7 @@ mod tests {
         assert!(matches!(
             InitiatorHandshake::start(
                 &mut initiator_provider,
-                vec![SEMANTIC_PROTOCOL_V6 + 1],
+                vec![SEMANTIC_PROTOCOL_V7 + 1],
                 vec![HYBRID_SUITE_ID]
             ),
             Err(CryptoError::UnsupportedProtocolVersion)
@@ -2491,7 +2493,7 @@ mod tests {
         assert_eq!(prepared.public_hello.selected_suite, HYBRID_SUITE_ID);
 
         let mut unsupported_version = hello.clone();
-        unsupported_version.supported_versions = vec![SEMANTIC_PROTOCOL_V6 + 1];
+        unsupported_version.supported_versions = vec![SEMANTIC_PROTOCOL_V7 + 1];
         assert!(matches!(
             ResponderHandshakePrepared::respond(&mut responder_provider, &unsupported_version),
             Err(CryptoError::UnsupportedProtocolVersion)
@@ -2516,6 +2518,31 @@ mod tests {
             ResponderHandshakePrepared::respond(&mut responder_provider, &unsupported_suite),
             Err(CryptoError::UnsupportedSuite)
         ));
+    }
+
+    #[test]
+    fn semantic_v7_selects_v7_and_falls_back_to_a_v6_only_peer() {
+        assert_eq!(
+            select_highest_common_version(
+                SUPPORTED_SEMANTIC_PROTOCOL_VERSIONS,
+                SUPPORTED_SEMANTIC_PROTOCOL_VERSIONS,
+            ),
+            Ok(SEMANTIC_PROTOCOL_V7)
+        );
+        assert_eq!(
+            select_highest_common_version(
+                SUPPORTED_SEMANTIC_PROTOCOL_VERSIONS,
+                &[
+                    SEMANTIC_PROTOCOL_V6,
+                    SEMANTIC_PROTOCOL_V5,
+                    SEMANTIC_PROTOCOL_V4,
+                    SEMANTIC_PROTOCOL_V3,
+                    SEMANTIC_PROTOCOL_V2,
+                    SEMANTIC_PROTOCOL_V1,
+                ],
+            ),
+            Ok(SEMANTIC_PROTOCOL_V6)
+        );
     }
 
     #[test]
@@ -2598,6 +2625,7 @@ mod tests {
             assert_eq!(
                 stripped_hello.supported_versions,
                 vec![
+                    SEMANTIC_PROTOCOL_V7,
                     SEMANTIC_PROTOCOL_V6,
                     SEMANTIC_PROTOCOL_V5,
                     SEMANTIC_PROTOCOL_V4,

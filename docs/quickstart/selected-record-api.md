@@ -14,9 +14,10 @@ or merge execution during ingest.
 `RunningNode::selected_records()` returns `SelectedRecordHandle`. Its clones
 send commands through the actor's one bounded Event/State/Record lane; they do
 not open another store or policy authority. `SelectedRecordNode` remains the
-stopped facade and owns the mission-bound writer exclusively. Record reconciles
-over a semantic-v4/v5 mission-authenticated, class- and direction-specific
-Negentropy lane under exact receiver interests. Ingest never executes registered
+stopped facade and owns the mission-bound writer exclusively. Record reconciles over a mission-authenticated, class- and direction-specific
+Negentropy lane under exact receiver interests. Semantic v7 negotiates this
+unchanged lane through mandatory `LegacyV6`; `EventPagesV1` is Event-only, so
+selecting v7 never removes or weakens Record. Ingest never executes registered
 merge code, so concurrent heads remain durable and explicit.
 
 Durable whole-key Record delivery is available through the selected Rust

@@ -30,7 +30,7 @@ Event/control evaluation slice, not a complete MVP/product profile:
 
 | Profile | Implemented boundary | Runtime status |
 |---|---|---|
-| `0x0001` `hybrid-pq-aster-record-v1` | Hybrid source/control objects, four-flight mission session, and `ASTRFR01` application records through semantic v6 | Stock selected node/runtime |
+| `0x0001` `hybrid-pq-aster-record-v1` | Hybrid source/control objects, four-flight mission session, and `ASTRFR01` application records through semantic v7 | Stock selected node/runtime |
 | `0x0002` `classical-p256-iroh-quic-v1` | Provisioned singleton policy, P-256 semantic-v1 Event/control objects, Iroh TLS-exporter-bound mission session, and raw QUIC application exchanges | Additive library/two-node mission path; not selected by stock `run_node` or CLI |
 
 Profile `0x0002` has no ML-DSA or ML-KEM operation in its runtime path and adds
@@ -132,7 +132,7 @@ below is instead a mission node with route-only Event custody, and route-only
 Blob relay/custody is not implemented.
 
 Aster application relays are not content readers by default. The implemented
-semantic-version-2/3/v4/v5/v6 bridge similarly limits a bridge to rule-specific endpoint routing grants and
+semantic-version-2/3/v4/v5/v6/v7 bridge similarly limits a bridge to rule-specific endpoint routing grants and
 an authority-signed directed-edge authorization. It rewraps the exact immutable
 format-2 source carrier without content access, preserves the source signature
 and origin scope, and exposes a distinct authenticated current scope. A target
@@ -281,18 +281,25 @@ are recorded separately in the
 - Canonical ordered semantic-version and complete-suite offers, with selection
   bound into the transcript, KDF, key confirmations, and hybrid authentication;
   there is no algorithm-by-algorithm mixing. The stable framing/profile remains
-  `1`, the default semantic offer is `[6, 5, 4, 3, 2, 1]`, and profile 1 has one registered
-  complete suite.
+  `1`, the default semantic offer is `[7, 6, 5, 4, 3, 2, 1]`, and profile 1
+  has one registered complete suite.
+- Semantic-v7 profile, plan, header, page, and terminal records bind semantic
+  version, the canonical transfer-profile digest, lane, selected profile, and
+  direction in record AAD. Substitution or cross-direction replay therefore
+  fails before mechanics parsing. Receipt-free Event pages create no per-Event
+  peer receipt or custody-settlement state; a successful local write remains
+  only a send attempt, and later authenticated reconciliation determines the
+  remaining difference.
 - Both classical and PQ signatures verify; failure is indistinguishable on wire.
-- A compact semantic-version-2/3/v4/v5/v6 batch item is never authenticated by its P-256
+- A compact semantic-version-2/3/v4/v5/v6/v7 batch item is never authenticated by its P-256
   suffix alone: the exact proof credential, authority hybrid signature, source
   hybrid root signature, ciphertext commitment, Merkle path, and item signature
   must all verify. Missing proof means bounded pending state, never delivery.
-- Selected Event/RouteEvent semantic-v3-format custody claims, used by v3, v4, v5, and v6 sessions, use a distinct
+- Selected Event/RouteEvent semantic-v3-format custody claims, used by v3, v4, v5, v6, and v7 sessions, use a distinct
   session-record AAD, bind the exact transfer/source fields, exchange, nonzero
   policy revision, session ID, and checked cumulative age, and are
   replay-checked before store admission.
-- Protected v3-format Event interests used in v3/v4/v5/v6 bind an opaque receiver
+- Protected v3-format Event interests used in v3/v4/v5/v6/v7 `LegacyV6` bind an opaque receiver
   selector generation.
   Receipts suppress only that generation; `Satisfied` hides Carry versus
   successful Consume, while `ContentAcceptancePending` reveals only that the
@@ -300,7 +307,7 @@ are recorded separately in the
   not a Byzantine peer-state high-water: an authenticated peer can still lie
   about its own retention or restore its own older state.
 - Durable partial-transfer progress preserves its first-admission semantic
-  version. Unknown provenance fails closed, and v2/v3/v4/v5/v6-only objects cannot be
+  version. Unknown provenance fails closed, and v2/v3/v4/v5/v6/v7-only objects cannot be
   resumed or served through a selected-v1 session after restart.
 - Hybrid ephemeral establishment, transcript binding, explicit key confirmation,
   direction/purpose labels, and no 0-RTT data.
@@ -421,7 +428,7 @@ delegated signers.
 
 Both ordinary and bridge stores persist the authenticated signer. Ordinary
 controls share one chain head keyed by stable `authority_id`; bridge
-authorizations use their own semantic-v2/v3/v4/v5/v6 chain, also keyed by that stable root
+authorizations use their own semantic-v2/v3/v4/v5/v6/v7 chain, also keyed by that stable root
 identifier. Neither creates a per-signer history. A signer revoked in the
 contiguous applied prefix cannot contribute another link. If activation reaches
 a staged link signed by an identity revoked earlier in that prefix, the
@@ -522,7 +529,7 @@ claimed or implemented.
 State and Record reconciliation is enabled only after the hybrid mission
 session selects semantic version 4, 5, or 6. The v1-v3 Event compatibility paths do not
 accept, act on, or expose mutable interests, inventory, IDs, objects, results,
-or finish counts. Within v4/v5/v6, State and Record and both receiver directions are distinct
+or finish counts. Within v4/v5/v6/v7, State and Record and both receiver directions are distinct
 authenticated lanes. Cross-class/direction substitution, result/ack mismatch,
 and finish-remainder mismatch fail the contact.
 
@@ -556,7 +563,7 @@ contain metadata growth and prevent a fixed lexicographic prefix from starving
 later IDs across repeated partial contacts; they are not evidence of physical
 resource sufficiency or adversarial-link liveness.
 
-Normal and `AtLeast` run the v4/v5/v6 State/Record lanes because `AtLeast` is an Event-only
+Normal and `AtLeast` run the v4/v5/v6/v7 State/Record lanes because `AtLeast` is an Event-only
 threshold. `ReceiveOnly` initiates no contact and discloses no mutable interest,
 inventory, ID, or object. Event last-contact status is deliberately separate
 and is not evidence that State/Record converged. Selected State/Record finite

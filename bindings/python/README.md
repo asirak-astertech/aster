@@ -13,9 +13,13 @@ library.
 `PROTOCOL_VERSION` is retained as the legacy name for replication-wire version
 `1`; new code should use `REPLICATION_WIRE_VERSION`. The separate
 `DEFAULT_SEMANTIC_VERSION` and `HIGHEST_SUPPORTED_SEMANTIC_VERSION` values are
-both `6` in this build; authenticated sessions retain semantic versions 5, 4, 3,
+both `7` in this build; authenticated sessions retain semantic versions 6, 5, 4, 3,
 2, and 1 for compatibility. These process-wide constants do not report a
 particular session's negotiated result.
+
+Semantic-v7 transfer-profile selection and Event page controls are
+runtime-internal. This application binding exposes neither; State, Record, Blob,
+and EventBridge remain available through the negotiated `LegacyV6` profile.
 
 `Node` currently accepts the canonical unprotected inner provisioning bytes for
 compatibility and tests; no protected-provider binding is shipped. Raw open is

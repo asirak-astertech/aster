@@ -609,6 +609,7 @@ pub struct CustodySenderProjection {
     ttl_ms: Option<u64>,
     tombstone: bool,
     accounted_bytes: u64,
+    acceptance_order: u64,
     status: CustodyAgeStatus,
 }
 
@@ -651,6 +652,10 @@ impl CustodySenderProjection {
 
     pub const fn accounted_bytes(&self) -> u64 {
         self.accounted_bytes
+    }
+
+    pub const fn acceptance_order(&self) -> u64 {
+        self.acceptance_order
     }
 
     pub const fn status(&self) -> CustodyAgeStatus {
@@ -2340,6 +2345,7 @@ pub(crate) fn sender_event_projection_read(
                 ttl_ms: record.ttl_ms,
                 tombstone: record.tombstone,
                 accounted_bytes: record.accounted_bytes,
+                acceptance_order: record.acceptance_order,
                 status,
             });
         }
@@ -2403,6 +2409,7 @@ pub(crate) fn retained_event_projection_read(
             ttl_ms: record.ttl_ms,
             tombstone: record.tombstone,
             accounted_bytes: record.accounted_bytes,
+            acceptance_order: record.acceptance_order,
             status,
         });
     }
@@ -5430,6 +5437,67 @@ impl Store {
             age_ms: age_ms.max(durable_lease.age_ms),
             sample,
         })
+    }
+
+    /// Returns last-moment finite-age authority for a receipt-free page send.
+    ///
+    /// Unlike [`Store::begin_custody_send`], this operation creates no peer
+    /// receipt, transfer lease, retry, or suppression state. It still performs
+    /// the exact policy, continuity, retirement, and expiry checks in one
+    /// writer transaction so page transport cannot bypass local lifecycle
+    /// authority.
+    pub fn authorize_receipt_free_custody_send(
+        &self,
+        key: CustodyObjectKey,
+        sample: Option<CustodySample>,
+        expected_policy: CustodyPolicyRevision,
+    ) -> Result<CustodySendAuthorization, StoreError> {
+        self.require_live()?;
+        let authority = self.require_bound_mission()?;
+        let write = self.database.begin_write()?;
+        enforce_live_write(&write)?;
+        require_custody_mission_write(&write, authority)?;
+        if policy_revision_write(&write)? != expected_policy {
+            write.commit()?;
+            return Err(CustodyStoreError::PolicyChanged.into());
+        }
+        let continuity = sample
+            .map(|sample| observe_continuity_write(&write, sample))
+            .transpose()?;
+        let sample = continuity.map(|record| record.sample).or(sample);
+        if policy_revision_write(&write)? != expected_policy {
+            write.commit()?;
+            return Err(CustodyStoreError::PolicyChanged.into());
+        }
+        let record = write
+            .open_table(CUSTODY_ITEMS)?
+            .get(key.encoded().as_slice())?
+            .map(|value| decode_item(value.value()))
+            .transpose()?
+            .ok_or(CustodyStoreError::ItemNotFound)?;
+        if record.retiring {
+            return Err(CustodyStoreError::Retiring.into());
+        }
+        let (status, lost) = evaluate_item(&record, continuity, sample);
+        if lost {
+            mark_continuity_lost_write(&write, key, record)?;
+            write.commit()?;
+            return Err(CustodyStoreError::ContinuityLost.into());
+        }
+        let age_ms = match status {
+            CustodyAgeStatus::Durable => record.cumulative_age_ms,
+            CustodyAgeStatus::Forwardable { age_ms, .. } => age_ms,
+            CustodyAgeStatus::Expired { age_ms } => {
+                mark_retiring_write(&write, key, record, age_ms)?;
+                write.commit()?;
+                return Err(CustodyStoreError::Expired.into());
+            }
+            CustodyAgeStatus::WithheldUnknownAge => {
+                return Err(CustodyStoreError::ContinuityLost.into());
+            }
+        };
+        write.commit()?;
+        Ok(CustodySendAuthorization { age_ms, sample })
     }
 
     /// Releases one lease while retaining its bounded retry record.

@@ -621,7 +621,7 @@ and source hashes are recorded in the
 [prior semantic-v3 custody requirements evidence](requirements-status.md#prior-semantic-v3-selected-event-custody-automated-evidence).
 
 This is current-code automated evidence, not a retained physical acceptance
-receipt. Finite TTL is Linux/Event/v3-format only, inherited in v3/v4/v5/v6;
+receipt. Finite TTL is Linux/Event/v3-format only, inherited in v3/v4/v5/v6/v7;
 receive-only is not physical RF silence. V1/v2 deterministic whole-contact
 partials, generic cross-class priority eviction, selected State/Record custody
 or future TTL design (the current finite form rejects), long-offline and
@@ -714,9 +714,29 @@ physical result, or additional `observed-bounded` credit. No production
 provider, protected stock CLI/binding, cross-process admin IPC, or coordinated
 provider destruction is added. The post-enqueue cancellation cell is Unix-only.
 
-The semantic-v4 State/Record gate is inherited unchanged by v5 and v6 and is
-additive to those frozen slices. The handshake default/highest is 6 with
-`[6, 5, 4, 3, 2, 1]`; semantic v6 preserves the v5 ordinary Event,
+## Semantic-v7 Event page current-code gate
+
+`V-EVENT-PAGES-V7` is an additive current-code gate. It checks semantic
+`[7,6,5,4,3,2,1]` selection and v7/v6 fallback, canonical per-lane profile
+negotiation, contextual record AAD, bounded ordered uni turns, receipt-free
+durable, finite-TTL, mixed, route-only, and blind ReceiveOnly Event convergence,
+finite custody-age admission without per-peer receipt/lease/retry state,
+v7/v6 compatibility fallback, interruption with prefix preservation and
+remainder-only reconnect, strict
+priority/equal-tier rotation, and later-lane reserves. Receiver rejection limits
+come only from exact serialization and protected-carrier bounds. Sender page
+targets and peer-cursor allocation remain implementation details pending the
+paired physical-device calibration; this gate supplies no retained performance,
+physical, mixed-implementation, or production evidence. The checked-in
+`conformance/vectors/event-pages-v7.tsv` corpus contains 18 canonical ACCEPT
+rows and 6 representative malformed REJECT rows; the `aster-node` vector tests
+regenerate it from the reference codecs and route every REJECT row through its
+corresponding decoder.
+
+The semantic-v4 State/Record gate is inherited unchanged by v5, v6, and v7 and
+is additive to those frozen slices. The frozen v6 gate used default/highest 6
+with `[6, 5, 4, 3, 2, 1]`; the current v7 gate uses default/highest 7 with
+`[7, 6, 5, 4, 3, 2, 1]`. Semantic v6 preserves the v5 ordinary Event,
 State/Record, and Blob lanes byte-for-byte and adds only the mutually enabled
 Event-bridge mechanics lane. Selected mutable frames are absent in v1-v3,
 selected Blob frames are absent in v1-v4, and selected bridge frames are absent

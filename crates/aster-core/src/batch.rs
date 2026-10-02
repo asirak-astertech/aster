@@ -1329,6 +1329,7 @@ pub mod conformance {
                     | crate::wire::SEMANTIC_PROTOCOL_V4
                     | crate::wire::SEMANTIC_PROTOCOL_V5
                     | crate::wire::SEMANTIC_PROTOCOL_V6
+                    | crate::wire::SEMANTIC_PROTOCOL_V7
             ) {
                 return Err(format!(
                     "semantic-v{selected_semantic_version} receiver rejects ASTRENV3"
@@ -1374,6 +1375,11 @@ pub mod conformance {
             != header
         {
             return Err("semantic-v6 ASTRENV3 decoder changed the header".to_owned());
+        }
+        if Envelope3Header::decode_for_semantic_version(&bytes, crate::wire::SEMANTIC_PROTOCOL_V7)?
+            != header
+        {
+            return Err("semantic-v7 ASTRENV3 decoder changed the header".to_owned());
         }
         if Envelope3Header::decode_for_semantic_version(&bytes, 1).is_ok() {
             return Err("semantic-v1 decoder accepted raw ASTRENV3 bytes".to_owned());

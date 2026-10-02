@@ -19,8 +19,10 @@ The exclusive `SelectedBlobNode` remains available when no runtime owns the same
 store and provides the same delivery lifecycle plus synchronous seekable-source
 publication and streaming `read_into`. Separately, semantic v5 reconciles
 already-durable Blob sources and direct carrier ranges between current
-content-capable peers, and semantic v6 inherits that Blob lane unchanged. The
-default offer is `[6, 5, 4, 3, 2, 1]`; v1-v4 emit zero Blob frames, and stable
+content-capable peers. Semantic v6 inherits that Blob lane unchanged, and
+semantic v7 negotiates it through mandatory `LegacyV6`; `EventPagesV1` is
+Event-only. The default offer is `[7, 6, 5, 4, 3, 2, 1]`; v1-v4 emit zero Blob
+frames, and stable
 wire/ABI, source, manifest, and `ASTRBT01` formats remain version 1.
 
 ## Use the live actor API
