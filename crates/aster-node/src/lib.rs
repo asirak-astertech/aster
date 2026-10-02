@@ -33,6 +33,7 @@
 pub mod application;
 pub mod bridge_runtime;
 pub mod control_admin;
+mod event_pages;
 mod frame;
 mod identity;
 pub mod mission;
@@ -163,6 +164,106 @@ fn format_hex_32(bytes: &[u8; 32]) -> String {
         let _ = write!(&mut output, "{byte:02x}");
     }
     output
+}
+
+/// Builds one canonical semantic-v7 mechanics frame for structured fuzz coverage.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_structured_v7_mechanics_frame(
+    tag: u8,
+    selector: u8,
+    payload: &[u8],
+) -> Option<Vec<u8>> {
+    use crate::event_pages::{
+        ChangePageEntry, ChangePageV7, ChangeTurnFinishedV1, ChangeTurnHeaderV1, EventTurnPlanV1,
+        LegacyDifference, TransferProfileId, TransferProfileOfferV1, empty_set_commitment,
+        event_difference_set_commitment, schedule_digest,
+    };
+    use crate::frame::{EventDirection, Frame};
+    use aster_redb_store::EventTransferId;
+
+    let direction = if selector & 1 == 0 {
+        EventDirection::ToSessionInitiator
+    } else {
+        EventDirection::ToSessionResponder
+    };
+    let mut id_bytes = [0u8; 32];
+    let copied = payload.len().min(id_bytes.len());
+    id_bytes[..copied].copy_from_slice(&payload[..copied]);
+    let scheduled_id = EventTransferId::new(id_bytes);
+    let scheduled = vec![scheduled_id];
+    let set_commitment =
+        event_difference_set_commitment(&scheduled).expect("one structured Event ID is canonical");
+    let schedule = schedule_digest(&scheduled);
+    let transfer_profile_digest = [0x21; 32];
+    let frame = match tag {
+        0xd1 => Frame::TransferProfileOffer(TransferProfileOfferV1::current()),
+        0xd2 => Frame::EventTurnPlan(match 1 + (selector % 4) {
+            1 => EventTurnPlanV1::PageActive {
+                direction,
+                transfer_profile_digest,
+                difference_count: 1,
+                set_commitment,
+                scheduled_count: 1,
+                unscheduled_count: 0,
+            },
+            2 => EventTurnPlanV1::LegacyActive {
+                direction,
+                transfer_profile_digest,
+                difference: LegacyDifference::Exact {
+                    difference_count: 1,
+                    set_commitment,
+                },
+            },
+            3 => EventTurnPlanV1::Empty {
+                direction,
+                transfer_profile_digest,
+                selected_profile: TransferProfileId::EventPagesV1,
+                set_commitment: empty_set_commitment(),
+            },
+            4 => EventTurnPlanV1::Suppressed {
+                direction,
+                transfer_profile_digest,
+            },
+            _ => unreachable!("variant is reduced modulo four"),
+        }),
+        0xd3 => Frame::ChangeTurnHeader(ChangeTurnHeaderV1 {
+            direction,
+            transfer_profile_digest,
+            set_commitment,
+            scheduled: scheduled.clone(),
+            schedule_digest: schedule,
+        }),
+        0xd4 => Frame::ChangePage(ChangePageV7 {
+            direction,
+            transfer_profile_digest,
+            schedule_digest: schedule,
+            page_number: 0,
+            entries: vec![ChangePageEntry {
+                id: scheduled_id,
+                custody: None,
+                source_event: payload
+                    .get(32..)
+                    .filter(|source| !source.is_empty())
+                    .unwrap_or(&[0])
+                    .to_vec(),
+            }],
+            remaining: 0,
+        }),
+        0xd5 => Frame::ChangeTurnFinished(ChangeTurnFinishedV1 {
+            direction,
+            transfer_profile_digest,
+            set_commitment,
+            schedule_digest: schedule,
+            final_page_count: 1,
+        }),
+        _ => return None,
+    };
+    Some(
+        frame
+            .encode_for_semantic_version(event_pages::SEMANTIC_PROTOCOL_V7)
+            .expect("structured semantic-v7 frame must encode"),
+    )
 }
 
 /// Exercises the selected-stack mechanics-frame decoder for hostile-input fuzzing.

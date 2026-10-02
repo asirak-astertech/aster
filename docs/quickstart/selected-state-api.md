@@ -10,9 +10,10 @@ envelopes, cryptographic keys, sealed bytes, or reducer internals.
 `RunningNode::selected_state()` returns `SelectedStateHandle`. Its clones send
 commands through the actor's one bounded Event/State/Record lane; they do not
 open another store or policy authority. `SelectedStateNode` remains the stopped
-facade and owns the mission-bound writer exclusively. State reconciles over a
-semantic-v4/v5 mission-authenticated, class- and direction-specific Negentropy
-lane when the receiver configures an exact topic/scope interest.
+facade and owns the mission-bound writer exclusively. State reconciles over a mission-authenticated, class- and direction-specific
+Negentropy lane when the receiver configures an exact topic/scope interest.
+Semantic v7 negotiates this unchanged lane through mandatory `LegacyV6`;
+`EventPagesV1` is Event-only, so selecting v7 never removes or weakens State.
 
 Durable positive-current-version application delivery is available through the
 selected Rust surface. It is not a synthetic-withdrawal or materialized-view

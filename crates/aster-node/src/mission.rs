@@ -2323,6 +2323,65 @@ impl MissionSession {
         self.inner.open_frame(frame).map_err(Into::into)
     }
 
+    /// Protects one semantic-v7 record with exact negotiated profile, lane,
+    /// and direction context as authenticated associated data.
+    pub(crate) fn seal_v7_application_frame(
+        &mut self,
+        transfer_profile_digest: [u8; 32],
+        lane: crate::event_pages::LaneId,
+        profile: crate::event_pages::TransferProfileId,
+        direction: crate::frame::EventDirection,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, MissionSessionError> {
+        let context =
+            self.v7_application_record_context(transfer_profile_digest, lane, profile, direction)?;
+        self.inner
+            .seal_frame_with_context(plaintext, &context)
+            .map_err(Into::into)
+    }
+
+    /// Opens one semantic-v7 record only under the exact negotiated profile,
+    /// lane, and direction context supplied by the local state machine.
+    pub(crate) fn open_v7_application_frame(
+        &mut self,
+        transfer_profile_digest: [u8; 32],
+        lane: crate::event_pages::LaneId,
+        profile: crate::event_pages::TransferProfileId,
+        direction: crate::frame::EventDirection,
+        frame: &[u8],
+    ) -> Result<Vec<u8>, MissionSessionError> {
+        let context =
+            self.v7_application_record_context(transfer_profile_digest, lane, profile, direction)?;
+        self.inner
+            .open_frame_with_context(frame, &context)
+            .map_err(Into::into)
+    }
+
+    fn v7_application_record_context(
+        &self,
+        transfer_profile_digest: [u8; 32],
+        lane: crate::event_pages::LaneId,
+        profile: crate::event_pages::TransferProfileId,
+        direction: crate::frame::EventDirection,
+    ) -> Result<Vec<u8>, MissionSessionError> {
+        if self.semantic_version() != crate::event_pages::SEMANTIC_PROTOCOL_V7 {
+            return Err(MissionSessionError::Authentication(EnvelopeError(
+                "semantic-v7 record context is unavailable for this session".into(),
+            )));
+        }
+        let mut context = Vec::with_capacity(24 + 2 + 32 + 2 + 2 + 1);
+        context.extend_from_slice(b"ASTER/v7-lane-record/v1\0");
+        context.extend_from_slice(&self.semantic_version().to_be_bytes());
+        context.extend_from_slice(&transfer_profile_digest);
+        context.extend_from_slice(&(lane as u16).to_be_bytes());
+        context.extend_from_slice(&(profile as u16).to_be_bytes());
+        context.push(match direction {
+            crate::frame::EventDirection::ToSessionInitiator => 1,
+            crate::frame::EventDirection::ToSessionResponder => 2,
+        });
+        Ok(context)
+    }
+
     /// Protects one exact semantic-v3 custody claim in its dedicated record domain.
     pub fn seal_custody_wrapper(
         &mut self,
@@ -3141,6 +3200,88 @@ mod tests {
         server_task.await.expect("server task");
         client.close().await;
         server.close().await;
+    }
+
+    #[test]
+    fn semantic_v7_application_records_bind_profile_lane_and_direction() {
+        let mut provisioner = ReferenceProvisioner::from_seed([0x40; 32]).expect("provisioner");
+        let initiator = issue(&mut provisioner, 1);
+        let responder = issue(&mut provisioner, 2);
+        let (mut initiator_session, mut responder_session) =
+            establish(&initiator, &responder).expect("establish session");
+        let offer = crate::event_pages::TransferProfileOfferV1::current();
+        let negotiated = crate::event_pages::negotiate_transfer_profiles(&offer, &offer)
+            .expect("negotiate profiles");
+        let digest = crate::event_pages::transfer_profile_digest(&offer, &offer, &negotiated);
+
+        let protected = initiator_session
+            .seal_v7_application_frame(
+                digest,
+                crate::event_pages::LaneId::Event,
+                crate::event_pages::TransferProfileId::EventPagesV1,
+                EventDirection::ToSessionResponder,
+                b"page",
+            )
+            .expect("seal contextual v7 frame");
+
+        let mut wrong_digest = digest;
+        wrong_digest[0] ^= 1;
+        assert!(
+            responder_session
+                .open_v7_application_frame(
+                    wrong_digest,
+                    crate::event_pages::LaneId::Event,
+                    crate::event_pages::TransferProfileId::EventPagesV1,
+                    EventDirection::ToSessionResponder,
+                    &protected,
+                )
+                .is_err()
+        );
+        assert!(
+            responder_session
+                .open_v7_application_frame(
+                    digest,
+                    crate::event_pages::LaneId::State,
+                    crate::event_pages::TransferProfileId::EventPagesV1,
+                    EventDirection::ToSessionResponder,
+                    &protected,
+                )
+                .is_err()
+        );
+        assert!(
+            responder_session
+                .open_v7_application_frame(
+                    digest,
+                    crate::event_pages::LaneId::Event,
+                    crate::event_pages::TransferProfileId::LegacyV6,
+                    EventDirection::ToSessionResponder,
+                    &protected,
+                )
+                .is_err()
+        );
+        assert!(
+            responder_session
+                .open_v7_application_frame(
+                    digest,
+                    crate::event_pages::LaneId::Event,
+                    crate::event_pages::TransferProfileId::EventPagesV1,
+                    EventDirection::ToSessionInitiator,
+                    &protected,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            responder_session
+                .open_v7_application_frame(
+                    digest,
+                    crate::event_pages::LaneId::Event,
+                    crate::event_pages::TransferProfileId::EventPagesV1,
+                    EventDirection::ToSessionResponder,
+                    &protected,
+                )
+                .expect("open exact contextual v7 frame"),
+            b"page"
+        );
     }
 
     #[test]

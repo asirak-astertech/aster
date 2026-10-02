@@ -9,6 +9,16 @@ and `AtLeast` contacts; `AtLeast` is an Event threshold only. `ReceiveOnly`
 initiates or discloses none of those lanes. See the selected State, Record, and
 Blob API guides for their application surfaces and limits.
 
+Semantic v7 does not weaken this custody contract. When both peers negotiate
+`EventPagesV1`, durable Events, tombstones, and finite-TTL non-tombstones use
+receipt-free Event pages. Every finite entry carries session-authenticated
+cumulative custody age and is checked for continuity, policy, and expiry before
+send and during atomic receiver admission; it creates no peer lease, apply
+result, suppression, or retry settlement. A v1-v6 peer retains the complete
+`LegacyV6` custody path. ReceiveOnly discloses no local Event difference, but it
+can accept bounded blind pages whose entries independently satisfy its interest,
+route grant, local policy, and custody checks.
+
 This is an additive configuration surface. Existing callers of `start_node`
 retain durable Event publication, default store limits, and normal emission.
 Use `start_node_with_forwarding` when an operator must set the Step 3 policy.

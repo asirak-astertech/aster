@@ -118,13 +118,30 @@ provisioning remain open work.
 
 | Surface | Implemented | Still open |
 |---|---|---|
-| **Event** | Source-authenticated reconciliation over direct Iroh or one operator-pinned controlled Iroh connectivity relay; live Rust and local ConnectRPC APIs with optional Linux Event TTL and local expiry cleanup; durable consume/carry selectors and at-least-once delivery; experimental crash-safe numbered publication with sparse result compaction | Coherent numbered ownership for subscriptions/delivery, lost-journal recovery and client retirement, atomic subscription update, production automatic/hosted discovery, public relay selection, and broader physical-network acceptance |
+| **Event** | Source-authenticated reconciliation over direct Iroh or one operator-pinned controlled Iroh connectivity relay; semantic-v7 receipt-free ordered pages with full-page receiver validation, receiver-local batched commits for consecutive content-capable durable/finite/mixed entries, and receipt-free route-only and blind ReceiveOnly Event traffic; semantic-v6 compatibility fallback; live Rust and local ConnectRPC APIs; durable consume/carry selectors and at-least-once application delivery; experimental crash-safe numbered publication with sparse result compaction | Physical performance/resource validation of v7 pages and receiver batching, coherent numbered ownership for subscriptions/delivery, lost-journal recovery and client retirement, atomic subscription update, production automatic/hosted discovery, public relay selection, and broader physical-network acceptance |
 | **State** | Live or stopped publication/query, causal latest-value projection, direct-Iroh reconciliation under explicit interests, durable positive-current-version delivery, and local delivery-ledger status | Peer/contact/convergence status, synthetic withdrawals, dynamic network interests, selected-node bindings, finite TTL, relay support, expiry, and garbage collection |
 | **Record** | Live or stopped conflict-preserving publication/query, exact-sibling guarded resolution, direct-Iroh reconciliation, durable whole-key active-head delivery, and local delivery-ledger status | Peer/contact/convergence status, selected-node bindings, automatic merge execution, finite TTL, relay support, expiry, and garbage collection |
 | **Blob** | Live or stopped immutable publication, bounded authenticated reads, durable metadata-only delivery, local durable transfer progress, and semantic-v5 direct source/range transfer with resumable staging | Peer/convergence status, route-only relay/custody, arbitrary-peer recovery, finite TTL, retention, and garbage collection |
 | **Static Event hierarchy** | Profile-`0x0001` authenticated directed edges, topic/priority narrowing, route-only nested wrappers, durable candidates, and semantic-v6 runtime integration | Supported bridge administration, live join/leave, complete quotas, dynamic policy, revocation/rekey lifecycle, and cross-class bridge custody |
 | **Security profiles** | Stock hybrid-PQ profile `0x0001`; additive P-256 Event/control profile `0x0002` with an exporter-bound two-node Iroh path | Stock runtime/CLI selection for `0x0002`, general negotiation, complete classical data/lifecycle coverage, and rollback policy |
 | **Operations** | Manually admitted direct addresses, one operator-pinned controlled relay, default-off time-windowed mDNS with bounded Aster admission, reference provisioning, and same-UID Unix software zeroization | Protected operational provisioning, hostile-LAN discovery, public/default relay selection, BTLE integration, and physical sanitization |
+
+Semantic v7 changes the network mechanics for Event synchronization,
+not publication semantics: a successful publish remains a local durable commit
+and never waits for a peer. State, Record, Blob, and EventBridge negotiate their
+existing mechanics through mandatory `LegacyV6`; selecting v7 does not remove
+or weaken those lanes. Exact differences and bounded blind ReceiveOnly traffic
+use pages; finite-TTL entries carry authenticated cumulative age without
+creating peer receipt, lease, suppression, or retry state. Page attempts and
+contact completion are not remote delivery evidence. The sender uses distinct
+provisional packing targets for durable/tombstone and finite-TTL pages; those
+targets and the peer-cursor allocation are implementation details, not receiver
+limits or interoperability requirements. The sender authenticates the bounded
+page first, then creates the finite entries' custody evidence in one local
+batch immediately before page protection and one carrier-adjacent batch check.
+The packing targets remain subject to retained physical measurement; they are
+not claimed as safety thresholds. Receiver transaction grouping is likewise a
+local implementation detail: it adds no wire-visible batch size or receipt.
 
 ## Product readiness
 

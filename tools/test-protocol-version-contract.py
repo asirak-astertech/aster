@@ -21,10 +21,10 @@ SPEC.loader.exec_module(CHECKER)
 def core_contract() -> str:
     constants = "\n".join(
         f"pub(crate) const SEMANTIC_PROTOCOL_V{version}: u16 = {version};"
-        for version in range(1, 7)
+        for version in range(1, 8)
     )
     offered = ",\n    ".join(
-        f"SEMANTIC_PROTOCOL_V{version}" for version in range(6, 0, -1)
+        f"SEMANTIC_PROTOCOL_V{version}" for version in range(7, 0, -1)
     )
     return f"""{constants}
 pub(crate) const SUPPORTED_SEMANTIC_PROTOCOL_VERSIONS: &[u16] = &[
@@ -34,11 +34,11 @@ pub(crate) const SUPPORTED_SEMANTIC_PROTOCOL_VERSIONS: &[u16] = &[
 
 
 def protocol_contract() -> str:
-    return """The default and highest-supported semantic-version surfaces report `6`.
-The default semantic offer is `[6, 5, 4, 3, 2, 1]`.
-The default descending offer is `[6, 5, 4, 3, 2, 1]`.
-The default initiator offers semantic versions `[6, 5, 4, 3, 2, 1]`.
-The current handshake negotiates semantic versions `6`, `5`, `4`, `3`, `2`, and `1` and the complete suite `0x0001`.
+    return """The default and highest-supported semantic-version surfaces report `7`.
+The default semantic offer is `[7, 6, 5, 4, 3, 2, 1]`.
+The default descending offer is `[7, 6, 5, 4, 3, 2, 1]`.
+The default initiator offers semantic versions `[7, 6, 5, 4, 3, 2, 1]`.
+The current handshake negotiates semantic versions `7`, `6`, `5`, `4`, `3`, `2`, and `1` and the complete suite `0x0001`.
 
 | Semantic version | Inherits | Additional mechanics |
 | --- | --- | --- |
@@ -48,13 +48,14 @@ The current handshake negotiates semantic versions `6`, `5`, `4`, `3`, `2`, and 
 | `4` | v3 | State and Record reconciliation |
 | `5` | v4 | direct Blob transfer |
 | `6` | v5 ordinary lanes byte-for-byte | Event bridge transfer |
+| `7` | v6 byte-for-byte | per-lane transfer profiles and receipt-free Event pages |
 """
 
 
 def envelope_contract() -> str:
-    return """- Negotiated semantic versions: default/highest `6`, compatibility `5`, `4`, `3`, `2`, and `1`
-The default semantic-version list is `[6, 5, 4, 3, 2, 1]`.
-selected_semantic_version       u16 = 1, 2, 3, 4, 5, or 6
+    return """- Negotiated semantic versions: default/highest `7`, compatibility `6`, `5`, `4`, `3`, `2`, and `1`
+The default semantic-version list is `[7, 6, 5, 4, 3, 2, 1]`.
+selected_semantic_version       u16 = 1, 2, 3, 4, 5, 6, or 7
 """
 
 
@@ -65,6 +66,7 @@ semantic-v3-object-kind = semantic-v2-object-kind
 semantic-v4-object-kind = semantic-v3-object-kind
 semantic-v5-object-kind = semantic-v4-object-kind
 semantic-v6-object-kind = semantic-v5-object-kind
+semantic-v7-object-kind = semantic-v6-object-kind
 """
 
 
@@ -84,11 +86,11 @@ class ProtocolVersionContractTests(unittest.TestCase):
             cddl if cddl is not None else cddl_contract(),
         )
 
-    def test_v1_through_v6_contract_passes(self) -> None:
+    def test_v1_through_v7_contract_passes(self) -> None:
         self.validate()
 
     def test_each_missing_implementation_version_fails(self) -> None:
-        for version in range(1, 7):
+        for version in range(1, 8):
             with self.subTest(version=version):
                 damaged = core_contract().replace(
                     f"pub(crate) const SEMANTIC_PROTOCOL_V{version}: u16 = {version};\n",
@@ -101,14 +103,14 @@ class ProtocolVersionContractTests(unittest.TestCase):
 
     def test_noncanonical_default_offer_fails(self) -> None:
         damaged = core_contract().replace(
-            "SEMANTIC_PROTOCOL_V6,\n    SEMANTIC_PROTOCOL_V5",
-            "SEMANTIC_PROTOCOL_V5,\n    SEMANTIC_PROTOCOL_V6",
+            "SEMANTIC_PROTOCOL_V7,\n    SEMANTIC_PROTOCOL_V6",
+            "SEMANTIC_PROTOCOL_V6,\n    SEMANTIC_PROTOCOL_V7",
         )
         with self.assertRaisesRegex(CHECKER.ContractViolation, "default offer"):
             self.validate(core=damaged)
 
     def test_each_missing_protocol_registry_row_fails(self) -> None:
-        for version in range(1, 7):
+        for version in range(1, 8):
             with self.subTest(version=version):
                 rows = protocol_contract().splitlines()
                 damaged = "\n".join(
@@ -121,14 +123,14 @@ class ProtocolVersionContractTests(unittest.TestCase):
 
     def test_each_protocol_default_offer_declaration_is_checked(self) -> None:
         declarations = (
-            "default semantic offer is `[6, 5, 4, 3, 2, 1]`",
-            "default descending offer is `[6, 5, 4, 3, 2, 1]`",
-            "default initiator offers semantic versions `[6, 5, 4, 3, 2, 1]`",
+            "default semantic offer is `[7, 6, 5, 4, 3, 2, 1]`",
+            "default descending offer is `[7, 6, 5, 4, 3, 2, 1]`",
+            "default initiator offers semantic versions `[7, 6, 5, 4, 3, 2, 1]`",
         )
         for declaration in declarations:
             with self.subTest(declaration=declaration):
                 damaged = protocol_contract().replace(
-                    declaration, declaration.replace("6, ", ""), 1
+                    declaration, declaration.replace("7, ", ""), 1
                 )
                 with self.assertRaisesRegex(
                     CHECKER.ContractViolation, "protocol default offer"
@@ -137,8 +139,8 @@ class ProtocolVersionContractTests(unittest.TestCase):
 
     def test_protocol_negotiated_version_declaration_is_checked(self) -> None:
         damaged = protocol_contract().replace(
+            "`7`, `6`, `5`, `4`, `3`, `2`, and `1`",
             "`6`, `5`, `4`, `3`, `2`, and `1`",
-            "`5`, `4`, `3`, `2`, and `1`",
         )
         with self.assertRaisesRegex(
             CHECKER.ContractViolation, "protocol negotiated versions"
@@ -147,8 +149,8 @@ class ProtocolVersionContractTests(unittest.TestCase):
 
     def test_protocol_highest_supported_surface_is_checked(self) -> None:
         damaged = protocol_contract().replace(
+            "highest-supported semantic-version surfaces report `7`",
             "highest-supported semantic-version surfaces report `6`",
-            "highest-supported semantic-version surfaces report `5`",
         )
         with self.assertRaisesRegex(
             CHECKER.ContractViolation, "protocol highest-supported version"
@@ -162,22 +164,27 @@ class ProtocolVersionContractTests(unittest.TestCase):
         with self.assertRaisesRegex(CHECKER.ContractViolation, "v6 inheritance"):
             self.validate(protocol=damaged)
 
+    def test_v7_must_inherit_v6_byte_for_byte(self) -> None:
+        damaged = protocol_contract().replace("v6 byte-for-byte", "v6")
+        with self.assertRaisesRegex(CHECKER.ContractViolation, "v7 inheritance"):
+            self.validate(protocol=damaged)
+
     def test_truncated_envelope_selection_registry_fails(self) -> None:
-        damaged = envelope_contract().replace(", 4, 5, or 6", "")
+        damaged = envelope_contract().replace(", 5, 6, or 7", "")
         with self.assertRaisesRegex(CHECKER.ContractViolation, "envelope selection"):
             self.validate(envelope=damaged)
 
     def test_truncated_envelope_default_offer_fails(self) -> None:
         damaged = envelope_contract().replace(
-            "[6, 5, 4, 3, 2, 1]", "[5, 4, 3, 2, 1]"
+            "[7, 6, 5, 4, 3, 2, 1]", "[6, 5, 4, 3, 2, 1]"
         )
         with self.assertRaisesRegex(CHECKER.ContractViolation, "envelope default offer"):
             self.validate(envelope=damaged)
 
     def test_envelope_version_summary_is_checked(self) -> None:
         damaged = envelope_contract().replace(
+            "default/highest `7`, compatibility `6`, `5`, `4`, `3`, `2`, and `1`",
             "default/highest `6`, compatibility `5`, `4`, `3`, `2`, and `1`",
-            "default/highest `5`, compatibility `4`, `3`, `2`, and `1`",
         )
         with self.assertRaisesRegex(
             CHECKER.ContractViolation, "envelope version summary"
@@ -185,7 +192,7 @@ class ProtocolVersionContractTests(unittest.TestCase):
             self.validate(envelope=damaged)
 
     def test_each_missing_cddl_alias_fails(self) -> None:
-        for version in range(1, 7):
+        for version in range(1, 8):
             with self.subTest(version=version):
                 rows = cddl_contract().splitlines()
                 damaged = "\n".join(
@@ -204,6 +211,14 @@ class ProtocolVersionContractTests(unittest.TestCase):
             "semantic-v6-object-kind = semantic-v4-object-kind",
         )
         with self.assertRaisesRegex(CHECKER.ContractViolation, "CDDL v6 inheritance"):
+            self.validate(cddl=damaged)
+
+    def test_cddl_v7_must_inherit_v6_object_kinds(self) -> None:
+        damaged = cddl_contract().replace(
+            "semantic-v7-object-kind = semantic-v6-object-kind",
+            "semantic-v7-object-kind = semantic-v5-object-kind",
+        )
+        with self.assertRaisesRegex(CHECKER.ContractViolation, "CDDL v7 inheritance"):
             self.validate(cddl=damaged)
 
 

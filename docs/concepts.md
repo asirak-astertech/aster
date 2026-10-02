@@ -88,6 +88,18 @@ A successful publish result means the item and its local causal metadata are
 durably committed. It does not mean another node received the item. This lets
 the same application work online, through relays, or while disconnected.
 
+A useful model is "database inside out": all four data classes are authenticated
+change streams whose local queries and subscriptions are materialized
+projections. Network synchronization reconciles durable differences
+asynchronously; it is not part of the publish call. Semantic v7 applies this
+model directly to Event synchronization by sending committed, bounded pages
+without asking for or storing a per-Event network receipt. Finite entries retain
+authenticated cumulative age, and a ReceiveOnly receiver accepts a bounded
+blind page schedule without disclosing inventory. A later contact recomputes
+any remaining exact difference or advances blind attempt rotation. Application subscription
+acknowledgement remains separate and still records only local application
+processing.
+
 Publisher counters must never roll backward. A node that loses its complete
 store and anti-rollback state must be reprovisioned with a new identity.
 

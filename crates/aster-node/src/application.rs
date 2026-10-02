@@ -2305,6 +2305,7 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         | StoreError::InvalidSemanticState(_)
         | StoreError::InvalidSemanticRecord(_)
         | StoreError::MutableTransferCursorPeerLimitExceeded { .. }
+        | StoreError::EventPageAttemptCursorPeerLimitExceeded { .. }
         | StoreError::AuthenticatedCustodyAgeRequired => ApplicationErrorKind::InvalidRequest,
         StoreError::EventPublisherRevoked(_)
         | StoreError::StatePublisherRevoked(_)
@@ -2404,6 +2405,7 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         | StoreError::RouteCacheByteLimitExceeded { .. }
         | StoreError::RouteCacheSemanticRepresentationLimit { .. }
         | StoreError::MutableTransferCursorLimitExceeded { .. }
+        | StoreError::EventPageAttemptCursorLimitExceeded { .. }
         | StoreError::ControlItemLimitExceeded { .. }
         | StoreError::ControlByteLimitExceeded { .. }
         | StoreError::ControlSequenceExhausted => ApplicationErrorKind::ResourceLimit,
@@ -2443,6 +2445,7 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         | StoreError::ControlPublicationIntentConflict { .. }
         | StoreError::TransferNamespaceCollision { .. }
         | StoreError::MutableTransferCursorInvariant(_)
+        | StoreError::EventPageAttemptCursorInvariant(_)
         | StoreError::SecurityProfilePolicyInvariant(_)
         | StoreError::ZeroizationInvariant(_)
         | StoreError::InvalidZeroizationDescriptor { .. }

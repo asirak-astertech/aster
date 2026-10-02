@@ -7,8 +7,12 @@ use aster_redb_store::{
 };
 
 use crate::NodeError;
+use crate::event_pages::{
+    ChangePageV7, ChangeTurnFinishedV1, ChangeTurnHeaderV1, EventTurnPlanV1, TransferProfileOfferV1,
+};
 
 const MAGIC: &[u8; 4] = b"ASM\x01";
+pub(crate) const MECHANICS_FRAME_PREFIX_BYTES: usize = MAGIC.len() + 1;
 const EVENT_INTEREST: u8 = 0x09;
 const EVENT_INTEREST_REPLY: u8 = 0x0a;
 const EVENT_INTEREST_REPLY_V3: u8 = 0x0b;
@@ -82,6 +86,11 @@ const BRIDGE_ROUTE_OFFER: u8 = 0xc3;
 const BRIDGE_ROUTE_RESULT: u8 = 0xc4;
 const BRIDGE_FINISH: u8 = 0xc5;
 const BRIDGE_FINISHED: u8 = 0xc6;
+const TRANSFER_PROFILE_OFFER_V1: u8 = 0xd1;
+const EVENT_TURN_PLAN_V1: u8 = 0xd2;
+const CHANGE_TURN_HEADER_V1: u8 = 0xd3;
+const CHANGE_PAGE_V7: u8 = 0xd4;
+const CHANGE_TURN_FINISHED_V1: u8 = 0xd5;
 pub(crate) const MAX_OBJECT_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_BLOB_RANGE_BYTES: usize = 16 * 1024;
 pub(crate) const BLOB_CONTENT_PROOF_BYTES: usize = 32;
@@ -862,6 +871,11 @@ pub(crate) enum Frame {
     BridgeFinished {
         remaining: u64,
     },
+    TransferProfileOffer(TransferProfileOfferV1),
+    EventTurnPlan(EventTurnPlanV1),
+    ChangeTurnHeader(ChangeTurnHeaderV1),
+    ChangePage(ChangePageV7),
+    ChangeTurnFinished(ChangeTurnFinishedV1),
 }
 
 impl Frame {
@@ -1438,8 +1452,74 @@ impl Frame {
             Self::BridgeFinished { remaining } => {
                 encode_bridge_remaining(&mut output, BRIDGE_FINISHED, *remaining)?;
             }
+            Self::TransferProfileOffer(offer) => {
+                output.push(TRANSFER_PROFILE_OFFER_V1);
+                output.extend_from_slice(&offer.encode().map_err(event_pages_protocol_error)?);
+            }
+            Self::EventTurnPlan(plan) => {
+                output.push(EVENT_TURN_PLAN_V1);
+                output.extend_from_slice(&plan.encode().map_err(event_pages_protocol_error)?);
+            }
+            Self::ChangeTurnHeader(header) => {
+                output.push(CHANGE_TURN_HEADER_V1);
+                output.extend_from_slice(&header.encode().map_err(event_pages_protocol_error)?);
+            }
+            Self::ChangePage(page) => {
+                output.push(CHANGE_PAGE_V7);
+                output.extend_from_slice(&page.encode().map_err(event_pages_protocol_error)?);
+            }
+            Self::ChangeTurnFinished(finished) => {
+                output.push(CHANGE_TURN_FINISHED_V1);
+                output.extend_from_slice(
+                    &finished
+                        .encode()
+                        .map_err(|error| NodeError::Protocol(error.to_string()))?,
+                );
+            }
         }
         Ok(output)
+    }
+
+    pub(crate) fn encode_for_semantic_version(
+        &self,
+        semantic_version: u16,
+    ) -> Result<Vec<u8>, NodeError> {
+        validate_semantic_version(semantic_version)?;
+        if semantic_version < crate::event_pages::SEMANTIC_PROTOCOL_V7 && self.is_v7_only() {
+            return Err(NodeError::Protocol(
+                "semantic v1-v6 session cannot emit a v7-only mechanics frame".into(),
+            ));
+        }
+        self.encode()
+    }
+
+    pub(crate) fn decode_for_semantic_version(
+        input: &[u8],
+        semantic_version: u16,
+    ) -> Result<Self, NodeError> {
+        validate_semantic_version(semantic_version)?;
+        if input.len() < 5 || &input[..4] != MAGIC {
+            return Err(NodeError::Protocol(
+                "invalid mechanics frame version".into(),
+            ));
+        }
+        if semantic_version < crate::event_pages::SEMANTIC_PROTOCOL_V7 && is_v7_only_tag(input[4]) {
+            return Err(NodeError::Protocol(
+                "semantic v1-v6 session rejected a v7-only mechanics frame".into(),
+            ));
+        }
+        Self::decode(input)
+    }
+
+    const fn is_v7_only(&self) -> bool {
+        matches!(
+            self,
+            Self::TransferProfileOffer(_)
+                | Self::EventTurnPlan(_)
+                | Self::ChangeTurnHeader(_)
+                | Self::ChangePage(_)
+                | Self::ChangeTurnFinished(_)
+        )
     }
 
     pub(crate) fn decode(input: &[u8]) -> Result<Self, NodeError> {
@@ -2001,6 +2081,21 @@ impl Frame {
                     Ok(Self::BridgeFinished { remaining })
                 }
             }
+            TRANSFER_PROFILE_OFFER_V1 => Ok(Self::TransferProfileOffer(
+                TransferProfileOfferV1::decode(body).map_err(event_pages_protocol_error)?,
+            )),
+            EVENT_TURN_PLAN_V1 => Ok(Self::EventTurnPlan(
+                EventTurnPlanV1::decode(body).map_err(event_pages_protocol_error)?,
+            )),
+            CHANGE_TURN_HEADER_V1 => Ok(Self::ChangeTurnHeader(
+                ChangeTurnHeaderV1::decode(body).map_err(event_pages_protocol_error)?,
+            )),
+            CHANGE_PAGE_V7 => Ok(Self::ChangePage(
+                ChangePageV7::decode(body).map_err(event_pages_protocol_error)?,
+            )),
+            CHANGE_TURN_FINISHED_V1 => Ok(Self::ChangeTurnFinished(
+                ChangeTurnFinishedV1::decode(body).map_err(event_pages_protocol_error)?,
+            )),
             _ => Err(NodeError::Protocol(
                 "unknown or malformed mechanics frame".into(),
             )),
@@ -2016,6 +2111,30 @@ fn decode_bridge_enabled(body: &[u8]) -> Result<bool, NodeError> {
             "bridge enabled flag is not one canonical boolean".into(),
         )),
     }
+}
+
+fn event_pages_protocol_error(error: crate::event_pages::EventPagesError) -> NodeError {
+    NodeError::Protocol(error.to_string())
+}
+
+const fn is_v7_only_tag(tag: u8) -> bool {
+    matches!(
+        tag,
+        TRANSFER_PROFILE_OFFER_V1
+            | EVENT_TURN_PLAN_V1
+            | CHANGE_TURN_HEADER_V1
+            | CHANGE_PAGE_V7
+            | CHANGE_TURN_FINISHED_V1
+    )
+}
+
+fn validate_semantic_version(semantic_version: u16) -> Result<(), NodeError> {
+    if !(1..=crate::event_pages::SEMANTIC_PROTOCOL_V7).contains(&semantic_version) {
+        return Err(NodeError::Protocol(format!(
+            "unsupported semantic protocol version {semantic_version}"
+        )));
+    }
+    Ok(())
 }
 
 fn encode_bridge_remaining(output: &mut Vec<u8>, tag: u8, remaining: u64) -> Result<(), NodeError> {
@@ -4185,5 +4304,86 @@ mod tests {
         oversized_remaining[5..13]
             .copy_from_slice(&(MAX_CARDINALITY_LIMIT as u64 + 1).to_be_bytes());
         assert!(Frame::decode(&oversized_remaining).is_err());
+    }
+
+    #[test]
+    fn semantic_version_gate_rejects_every_v7_only_frame_for_v1_through_v6() {
+        use crate::event_pages::{
+            ChangePageEntry, ChangePageV7, ChangeTurnFinishedV1, ChangeTurnHeaderV1,
+            EventTurnPlanV1, TransferProfileOfferV1, empty_set_commitment, schedule_digest,
+        };
+
+        let direction = EventDirection::ToSessionResponder;
+        let scheduled = vec![EventTransferId::new([1; 32])];
+        let digest = [2; 32];
+        let schedule = schedule_digest(&scheduled);
+        let frames = [
+            Frame::TransferProfileOffer(TransferProfileOfferV1::current()),
+            Frame::EventTurnPlan(EventTurnPlanV1::Empty {
+                direction,
+                transfer_profile_digest: digest,
+                selected_profile: crate::event_pages::TransferProfileId::EventPagesV1,
+                set_commitment: empty_set_commitment(),
+            }),
+            Frame::ChangeTurnHeader(ChangeTurnHeaderV1 {
+                direction,
+                transfer_profile_digest: digest,
+                set_commitment: [3; 32],
+                scheduled: scheduled.clone(),
+                schedule_digest: schedule,
+            }),
+            Frame::ChangePage(ChangePageV7 {
+                direction,
+                transfer_profile_digest: digest,
+                schedule_digest: schedule,
+                page_number: 0,
+                entries: vec![ChangePageEntry {
+                    id: scheduled[0],
+                    custody: None,
+                    source_event: vec![4],
+                }],
+                remaining: 0,
+            }),
+            Frame::ChangeTurnFinished(ChangeTurnFinishedV1 {
+                direction,
+                transfer_profile_digest: digest,
+                set_commitment: [3; 32],
+                schedule_digest: schedule,
+                final_page_count: 1,
+            }),
+        ];
+
+        for frame in frames {
+            let encoded = frame
+                .encode_for_semantic_version(7)
+                .expect("v7 frame encodes for v7");
+            assert_eq!(
+                Frame::decode_for_semantic_version(&encoded, 7).expect("v7 frame decodes for v7"),
+                frame
+            );
+            for legacy_version in 1..=6 {
+                assert!(frame.encode_for_semantic_version(legacy_version).is_err());
+                assert!(Frame::decode_for_semantic_version(&encoded, legacy_version).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn semantic_v7_keeps_legacy_frame_bytes_and_acceptance_unchanged() {
+        let frame = Frame::Finish {
+            direction: EventDirection::ToSessionInitiator,
+        };
+        let raw = frame.encode().unwrap();
+        for semantic_version in 1..=7 {
+            assert_eq!(
+                frame.encode_for_semantic_version(semantic_version).unwrap(),
+                raw
+            );
+            assert_eq!(
+                Frame::decode_for_semantic_version(&raw, semantic_version).unwrap(),
+                frame
+            );
+        }
+        assert!(Frame::decode_for_semantic_version(&raw, 8).is_err());
     }
 }

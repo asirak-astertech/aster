@@ -466,12 +466,20 @@ reconciliation, authentication, or scheduling authority. Use the
 ## Semantic protocol versions you may see
 
 Aster separates stable bytes from negotiated behavior. The current selected
-implementation offers semantic versions `[6, 5, 4, 3, 2, 1]` in that descending
-order:
+implementation offers semantic versions `[7, 6, 5, 4, 3, 2, 1]` in that
+descending order:
 
 - **Replication wire/profile version 1** identifies the current encoding and
   fixed security-object family.
-- **Semantic version 6** is offered first. It inherits ordinary Event,
+- **Semantic version 7** is offered first. After the four-flight mission
+  handshake, peers negotiate transfer profiles per lane. Event directions use
+  receipt-free ordered pages for exact durable, finite-TTL, tombstone,
+  route-only, mixed, and bounded blind ReceiveOnly traffic when both peers
+  advertise `EventPagesV1`; only older/non-page peers use the complete
+  semantic-v6 Event mechanics. State, Record, Blob, and EventBridge always use
+  mandatory `LegacyV6` in this increment. Page send is an attempt, not proof of
+  remote delivery.
+- **Semantic version 6** remains a compatibility option. It inherits ordinary Event,
   compact-batch, custody, State/Record, and Blob behavior from version 5 and
   adds only the opt-in selected Event-bridge mechanics lane. Semantic versions
   1 through 5 emit zero Event-bridge frames.
