@@ -20,5 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Created Unix publication journals with owner-only permissions and rejected insecure existing journal files.
+
+- Restricted `asterctl` plaintext RPC to loopback addresses before credential or payload loading.
+
 - Hardened inbound handshakes and health admission against resource exhaustion.
 
