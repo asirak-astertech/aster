@@ -40,6 +40,7 @@ mkdir -p "$wire_corpus" "$fragment_corpus" "$envelope_corpus" \
 cp -R "$project_dir/fuzz/corpus/wire_decode/." "$wire_corpus/"
 cp -R "$project_dir/fuzz/corpus/fragment_decode/." "$fragment_corpus/"
 cp -R "$project_dir/fuzz/corpus/envelope_inspect/." "$envelope_corpus/"
+cp -R "$project_dir/fuzz/corpus/selected_frame_decode/." "$selected_frame_corpus/"
 cp -R "$project_dir/fuzz/corpus/classical_profile_decode/." "$classical_profile_corpus/"
 cp -R "$project_dir/fuzz/corpus/systemd_credential_decode/." "$systemd_credential_corpus/"
 

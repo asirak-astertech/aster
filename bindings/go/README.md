@@ -24,9 +24,13 @@ only after the application has committed its own result.
 `1`; new code should use `ReplicationWireVersion()`. The default and highest
 implemented semantic version are reported separately by
 `DefaultSemanticVersion()` and `HighestSupportedSemanticVersion()` and are both
-`6` in this build; authenticated sessions retain semantic versions 5, 4, 3, 2,
+`7` in this build; authenticated sessions retain semantic versions 6, 5, 4, 3, 2,
 and 1 for compatibility. These process-wide values do not report a particular
 session's negotiated result.
+
+Semantic-v7 transfer-profile selection and Event page controls are
+runtime-internal. This application binding exposes neither; State, Record, Blob,
+and EventBridge remain available through the negotiated `LegacyV6` profile.
 
 Queried and subscribed `Item` values expose `OriginScope` and `CurrentScope`.
 `Scope` remains an exact compatibility alias of `CurrentScope`.

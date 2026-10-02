@@ -4156,8 +4156,8 @@ mod tests {
         let hybrid_total: usize = hybrid_lengths.iter().sum();
         assert_eq!(classical_lengths, [259, 712, 499, 78]);
         assert_eq!(classical_total, 1_548);
-        assert_eq!(hybrid_lengths, [1_319, 11_337, 10_142, 78]);
-        assert_eq!(hybrid_total, 22_876);
+        assert_eq!(hybrid_lengths, [1_321, 11_337, 10_142, 78]);
+        assert_eq!(hybrid_total, 22_878);
         assert!(
             classical_total < hybrid_total,
             "classical flights {classical_lengths:?} total {classical_total} bytes; legacy hybrid flights {hybrid_lengths:?} total {hybrid_total} bytes"

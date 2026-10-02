@@ -10,6 +10,7 @@ cargo-fuzz = true
 
 [dependencies]
 aster-core = { path = "../crates/aster-core", features = ["adapter-sdk"] }
+aster-iroh = { path = "../crates/aster-iroh", features = ["fuzzing"] }
 aster-negentropy = { path = "../crates/aster-negentropy" }
 aster-node = { path = "../crates/aster-node", features = ["fuzzing"] }
 aster-profile = { path = "../crates/aster-profile" }

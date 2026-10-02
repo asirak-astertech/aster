@@ -118,6 +118,7 @@ pub(crate) const SEMANTIC_PROTOCOL_V3: u16 = 3;
 pub(crate) const SEMANTIC_PROTOCOL_V4: u16 = 4;
 pub(crate) const SEMANTIC_PROTOCOL_V5: u16 = 5;
 pub(crate) const SEMANTIC_PROTOCOL_V6: u16 = 6;
+pub(crate) const SEMANTIC_PROTOCOL_V7: u16 = 7;
 
 /// Typed identity in the reconciliation and ranged-transfer namespace.
 ///
@@ -1387,7 +1388,8 @@ pub(crate) fn validate_interest_work(
 pub(crate) fn validate_semantic_version(semantic_version: u16) -> Result<(), WireError> {
     match semantic_version {
         SEMANTIC_PROTOCOL_V1 | SEMANTIC_PROTOCOL_V2 | SEMANTIC_PROTOCOL_V3
-        | SEMANTIC_PROTOCOL_V4 | SEMANTIC_PROTOCOL_V5 | SEMANTIC_PROTOCOL_V6 => Ok(()),
+        | SEMANTIC_PROTOCOL_V4 | SEMANTIC_PROTOCOL_V5 | SEMANTIC_PROTOCOL_V6
+        | SEMANTIC_PROTOCOL_V7 => Ok(()),
         _ => Err(WireError::UnsupportedSemanticVersion(semantic_version)),
     }
 }
@@ -1909,12 +1911,17 @@ mod tests {
                         .unwrap(),
                     message
                 );
+                assert_eq!(
+                    decode_message_for_semantic_version(&encoded, SEMANTIC_PROTOCOL_V7, limits(),)
+                        .unwrap(),
+                    message
+                );
             }
         }
     }
 
     #[test]
-    fn source_and_blob_messages_are_byte_identical_on_v1_through_v6() {
+    fn source_and_blob_messages_are_byte_identical_on_v1_through_v7() {
         for id in [
             ObjectId::for_envelope(EnvelopeId::from_bytes([0x41; 32])),
             ObjectId::for_blob_chunk_digest([0x42; 32]),
@@ -1936,11 +1943,15 @@ mod tests {
                 let v6 =
                     encode_message_for_semantic_version(&message, SEMANTIC_PROTOCOL_V6, limits())
                         .unwrap();
+                let v7 =
+                    encode_message_for_semantic_version(&message, SEMANTIC_PROTOCOL_V7, limits())
+                        .unwrap();
                 assert_eq!(v2, v1);
                 assert_eq!(v3, v1);
                 assert_eq!(v4, v1);
                 assert_eq!(v5, v1);
                 assert_eq!(v6, v1);
+                assert_eq!(v7, v1);
                 assert_eq!(decode_message(&v1, limits()).unwrap(), message);
                 assert_eq!(
                     decode_message_for_semantic_version(&v2, SEMANTIC_PROTOCOL_V2, limits())
@@ -1964,6 +1975,11 @@ mod tests {
                 );
                 assert_eq!(
                     decode_message_for_semantic_version(&v6, SEMANTIC_PROTOCOL_V6, limits())
+                        .unwrap(),
+                    message
+                );
+                assert_eq!(
+                    decode_message_for_semantic_version(&v7, SEMANTIC_PROTOCOL_V7, limits())
                         .unwrap(),
                     message
                 );

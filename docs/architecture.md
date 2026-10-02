@@ -109,6 +109,22 @@ or key-bearing state is released, so retained clones return sanitized
 `StateUnavailable`. A stopped facade can acquire the writer only after the live
 actor has exited and must close before a new actor starts.
 
+For a semantic-v7 contact, the first protected exchange negotiates a transfer
+profile independently for Event, State, Record, Blob, and EventBridge. Every
+lane must offer `LegacyV6`; only Event may additionally select
+`EventPagesV1`. Exact Event differences and bounded blind traffic into a
+ReceiveOnly peer can then move in one ordered bounded unidirectional turn.
+Finite entries carry session-authenticated cumulative age, while durable and
+tombstone entries carry no age wrapper. The receiver commits each complete page
+before continuing, and neither endpoint creates a per-Event apply result,
+custody receipt, suppression hint, lease, or retry settlement for that paged
+transfer. An interruption leaves the committed prefix durable; the next contact
+reconciles the remaining exact difference or advances blind attempt rotation.
+The sender's persisted per-peer,
+per-priority cursor rotates attempts only within the same priority tier and is
+never delivery evidence. Its allocation and the sender page-packing target are
+local implementation details, not wire limits.
+
 Each mission-authenticated contact runs class-separated State and Record
 Negentropy/fetch lanes after its control and Event lanes. A receiver supplies
 canonical topic/scope interests independently for each class; empty means

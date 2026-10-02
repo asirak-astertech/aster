@@ -9,6 +9,7 @@ publish = false
 
 [features]
 default = []
+fuzzing = []
 nearby-discovery = ["dep:iroh-mdns-address-lookup", "dep:swarm-discovery"]
 test-utils = ["dep:iroh-relay"]
 

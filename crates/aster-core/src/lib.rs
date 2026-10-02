@@ -161,10 +161,11 @@ pub use crypto::{
     ClassicalSessionAwaitingFinished, ClassicalSessionInitiator, ClassicalSessionResponder,
     ClassicalSessionResponderPending, HYBRID_SECURITY_PROFILE_ID, ProfileEnvelopeSealer,
     ProfileProvisioningBundle, ProvisioningAccess, ProvisioningBundle,
-    ReferenceAuthenticatedSession, ReferenceEnvelopeSealer, ReferenceNode, ReferenceProvisioner,
-    ReferenceSessionAwaitingFinished, ReferenceSessionInitiator, ReferenceSessionResponder,
-    ReferenceSessionResponderPending, ScopeRekeyPlan, ScopeRekeyRecipient, SecurityProfile,
-    SecurityProfileId, VerifiedSecurityProfile, open_reference_node,
+    REFERENCE_SESSION_FRAME_OVERHEAD_BYTES, ReferenceAuthenticatedSession, ReferenceEnvelopeSealer,
+    ReferenceNode, ReferenceProvisioner, ReferenceSessionAwaitingFinished,
+    ReferenceSessionInitiator, ReferenceSessionResponder, ReferenceSessionResponderPending,
+    ScopeRekeyPlan, ScopeRekeyRecipient, SecurityProfile, SecurityProfileId,
+    VerifiedSecurityProfile, open_reference_node,
 };
 #[cfg(all(feature = "reference-session", not(feature = "adapter-sdk")))]
 pub use crypto::{
@@ -174,10 +175,10 @@ pub use crypto::{
     ClassicalSessionAwaitingFinished, ClassicalSessionInitiator, ClassicalSessionResponder,
     ClassicalSessionResponderPending, HYBRID_SECURITY_PROFILE_ID, ProfileEnvelopeSealer,
     ProfileProvisioningBundle, ProvisioningAccess, ProvisioningBundle,
-    ReferenceAuthenticatedSession, ReferenceEnvelopeSealer, ReferenceProvisioner,
-    ReferenceSessionAwaitingFinished, ReferenceSessionInitiator, ReferenceSessionResponder,
-    ReferenceSessionResponderPending, ScopeRekeyRecipient, SecurityProfile, SecurityProfileId,
-    VerifiedSecurityProfile,
+    REFERENCE_SESSION_FRAME_OVERHEAD_BYTES, ReferenceAuthenticatedSession, ReferenceEnvelopeSealer,
+    ReferenceProvisioner, ReferenceSessionAwaitingFinished, ReferenceSessionInitiator,
+    ReferenceSessionResponder, ReferenceSessionResponderPending, ScopeRekeyRecipient,
+    SecurityProfile, SecurityProfileId, VerifiedSecurityProfile,
 };
 #[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
 pub use custody::{
@@ -247,10 +248,10 @@ pub const REPLICATION_WIRE_VERSION: u16 = 1;
 pub const PROTOCOL_VERSION: u16 = REPLICATION_WIRE_VERSION;
 
 /// Semantic replication version offered first by a default initiator.
-pub const DEFAULT_SEMANTIC_VERSION: u16 = 6;
+pub const DEFAULT_SEMANTIC_VERSION: u16 = 7;
 
 /// Highest semantic replication version implemented by this build.
-pub const HIGHEST_SUPPORTED_SEMANTIC_VERSION: u16 = 6;
+pub const HIGHEST_SUPPORTED_SEMANTIC_VERSION: u16 = 7;
 
 #[cfg(feature = "sqlite-store")]
 const _: () = assert!(batch::DATA_CLASS_EVENT == model::DataClass::Event as u8);
@@ -265,8 +266,9 @@ mod version_surface_tests {
         #[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
         assert_eq!(
             crypto::SUPPORTED_SEMANTIC_PROTOCOL_VERSIONS,
-            &[DEFAULT_SEMANTIC_VERSION, 5, 4, 3, 2, 1]
+            &[7, 6, 5, 4, 3, 2, 1]
         );
+        assert_eq!(DEFAULT_SEMANTIC_VERSION, 7);
         assert_eq!(HIGHEST_SUPPORTED_SEMANTIC_VERSION, DEFAULT_SEMANTIC_VERSION);
         #[cfg(feature = "sqlite-store")]
         assert_eq!(batch::DATA_CLASS_EVENT, DataClass::Event as u8);

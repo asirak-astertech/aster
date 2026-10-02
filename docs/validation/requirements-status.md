@@ -199,14 +199,14 @@ indexes plus one authenticated publisher-dot and causal-frontier authority
 across Event, State, Record, and Blob. Canonical strict kind-2 Blob carrier IDs
 enter only the v5 carrier-range grammar.
 
-The selected handshake default/highest semantic version is 6 with offer
-`[6, 5, 4, 3, 2, 1]`. Event remains compatible across all six values;
-State/Record mechanics run in v4-v6, and Blob mechanics run in v5/v6. The
-static selected Event bridge lane is v6-only. V6 ordinary lane encodings are
-byte-identical to v5, and a peer without v6 negotiates the prior behavior.
-V1-v4 emit zero Blob frames. Stable
-wire/profile, ABI, handshake framing, and source-object formats remain version
-1. Current-code v4-v6 automation does not alter any retained v1-v3 receipt.
+The selected handshake default/highest semantic version is 7 with offer
+`[7, 6, 5, 4, 3, 2, 1]`. Event remains compatible across all seven values;
+State/Record mechanics run in v4-v7, Blob mechanics run in v5-v7, and the
+static selected Event bridge lane runs in v6-v7. V7 preserves the v6 legacy
+lanes and adds negotiated receipt-free Event pages; a peer without v7 negotiates
+the prior behavior. V1-v4 emit zero Blob frames. Stable wire/profile, ABI,
+handshake framing, and source-object formats remain version 1. Current-code
+v4-v7 automation does not alter any retained v1-v3 receipt.
 
 The selected node's normal dependency graph contains neither SQLite nor
 `rusqlite`. The old caller-ID opaque `put` path remains isolated for compatibility
@@ -1035,10 +1035,11 @@ independent interoperability, or release credit is claimed.
 
 ### Semantic-v5 selected Blob network slice
 
-The current selected offer is `[6, 5, 4, 3, 2, 1]`. The semantic-v5 slice
+The current selected offer is `[7, 6, 5, 4, 3, 2, 1]`. The semantic-v5 slice
 inherits Event v1-v4 and State/Record v4 behavior and adds Blob class `3`
 source lanes plus one carrier range lane. Semantic v6 inherits those ordinary
-lanes unchanged and adds only the opt-in Event-bridge mechanics lane. V1-v4
+lanes unchanged and adds only the opt-in Event-bridge mechanics lane; semantic
+v7 preserves those paths and adds negotiated receipt-free Event pages. V1-v4
 emit and accept zero Blob frames. Stable wire/ABI version 1, session framing,
 `ASTRENV2`/`ASTRENV3`, manifests, `ASTRBT01`, typed ObjectIDs, and cryptographic
 suite remain unchanged.
@@ -3202,9 +3203,10 @@ build, C11 and C++17 syntax plus linked-runtime smoke tests, Python 12/12, and
 the complete Go suite. At that pre-v4 source freeze, ABI and wire versions were
 1 and the default/highest semantic version was 3, with semantic versions 2 and
 1 retained for negotiated compatibility. Current code instead offers
-`[6, 5, 4, 3, 2, 1]`; v4 through v6 inherit the same Event custody mechanics
-without changing this receipt, and v6 separately adds the opt-in Event-bridge
-lane.
+`[7, 6, 5, 4, 3, 2, 1]`; v4 through v7 inherit the same Event custody mechanics
+without changing this receipt, v6 adds the opt-in Event-bridge lane, and v7
+adds negotiated receipt-free Event pages without changing this historical
+receipt.
 
 This evidence moves exactly `DM-11-15`, `DM-11-17`, `DM-5.4-05`,
 `DM-5.4-09`, `DM-5.4-10`, `DM-5.4-12` through `DM-5.4-19`, `DM-5.4-21`,

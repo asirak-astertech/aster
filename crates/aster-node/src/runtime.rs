@@ -30,7 +30,7 @@ use std::sync::LazyLock;
 
 use aster_iroh::{
     CarrierError, Endpoint, EndpointConfig, EndpointId, ExpectedPeer, PeerRoute, PinnedRelay,
-    SelectedPath,
+    ReceiveUniTurn, SelectedPath, SendUniTurn,
 };
 #[cfg(feature = "nearby-discovery")]
 use aster_iroh::{
@@ -43,11 +43,12 @@ use aster_mesh::{
     CustodySample, CustodyTransferClaims, CustodyTransferId, EventContentVerification,
     EventRouteLineage, MAX_CUSTODY_WRAPPER_BYTES, MIN_CUSTODY_SEMANTIC_VERSION, NodeId, Priority,
     ProvisioningAccess, ProvisioningLoadId, ProvisioningProtectionError, ProvisioningSecretLoader,
-    ProvisioningSecretRef, ProvisioningUnprotector, RecordContentVerification,
-    ReferenceEnvelopeSealer, ReferenceProvisioner, RouteVerifiedEventEnvelope,
-    RouteVerifiedRecordEnvelope, RouteVerifiedStateEnvelope, Scope, ScopeRekeyRecipient,
-    SourceRouteLineage, StateContentVerification, Topic, VerifiedBlobContentCompletion,
-    VerifiedBlobTransferPlan, VerifiedControlEnvelope, VerifiedControlKind, engine::EnvelopeError,
+    ProvisioningSecretRef, ProvisioningUnprotector, REFERENCE_SESSION_FRAME_OVERHEAD_BYTES,
+    RecordContentVerification, ReferenceEnvelopeSealer, ReferenceProvisioner,
+    RouteVerifiedEventEnvelope, RouteVerifiedRecordEnvelope, RouteVerifiedStateEnvelope, Scope,
+    ScopeRekeyRecipient, SourceRouteLineage, StateContentVerification, Topic,
+    VerifiedBlobContentCompletion, VerifiedBlobTransferPlan, VerifiedControlEnvelope,
+    VerifiedControlKind, VerifiedCustodyClaims, engine::EnvelopeError,
 };
 use aster_negentropy::{
     DEFAULT_FRAME_SIZE_LIMIT, Difference, Initiator, InitiatorStep, MAX_CARDINALITY_LIMIT,
@@ -65,18 +66,19 @@ use aster_redb_store::{
     CustodySenderProjection, CustodyStoreError, CustodyUsage, EventOnceOutcome,
     EventOperationAuditProgress, EventOperationAuditState, EventOperationAuditStatus,
     EventOperationKey, EventOperationLimits, EventOperationRequest, EventOperationResolution,
-    EventPublicationIntent, EventPublicationSpec, EventReplicationPolicySnapshot, EventSemanticId,
-    EventSubscriptionKey, EventSubscriptionMode, EventSubscriptionSpec, EventTransferId,
-    LocalCustodyCheckpoint, MAX_BLOB_NETWORK_RANGE_BYTES, MAX_BLOB_NETWORK_SOURCE_BYTES,
-    MAX_BLOB_NETWORK_STAGING_ROWS, MAX_CUSTODY_PAGE, MAX_CUSTODY_RETIREMENTS, MAX_EVENT_PAGE,
-    MAX_MUTABLE_TRANSFER_CURSOR_PEERS, MAX_NETWORK_BLOB_BYTES, MAX_NETWORK_BLOB_CHUNKS,
-    MAX_ROUTE_CACHE_ITEMS, MutableTransferCursorClass, MutableTransferCursorMode,
-    NumberedEventOperationRequest, NumberedEventPublishOutcome, RecordSenderProjection,
-    RecordTransferId, RejectedControl, ReservedEventOnceCommit, RouteCacheOutcome,
-    ScopeRekeyPublicationIntent, StateSenderProjection, StateTransferId, Store,
-    StoreBackingIdentity, StoreError, StoreInspection, StoreLimits, StoreZeroizationState,
-    StoredControl, StoredControlEffect, StoredEvent, StoredEventTransfer, StoredRecord,
-    StoredState, TransferLease, ZeroizationArtifact, ZeroizationIntent, ZeroizationStore,
+    EventPageAttemptCursor, EventPageAttemptCursorUpdate, EventPublicationIntent,
+    EventPublicationSpec, EventReplicationPolicySnapshot, EventSemanticId, EventSubscriptionKey,
+    EventSubscriptionMode, EventSubscriptionSpec, EventTransferId, LocalCustodyCheckpoint,
+    MAX_BLOB_NETWORK_RANGE_BYTES, MAX_BLOB_NETWORK_SOURCE_BYTES, MAX_BLOB_NETWORK_STAGING_ROWS,
+    MAX_CUSTODY_PAGE, MAX_CUSTODY_RETIREMENTS, MAX_EVENT_PAGE, MAX_MUTABLE_TRANSFER_CURSOR_PEERS,
+    MAX_NETWORK_BLOB_BYTES, MAX_NETWORK_BLOB_CHUNKS, MAX_ROUTE_CACHE_ITEMS,
+    MutableTransferCursorClass, MutableTransferCursorMode, NumberedEventOperationRequest,
+    NumberedEventPublishOutcome, RecordSenderProjection, RecordTransferId, RejectedControl,
+    ReservedEventOnceCommit, RouteCacheOutcome, ScopeRekeyPublicationIntent, StateSenderProjection,
+    StateTransferId, Store, StoreBackingIdentity, StoreError, StoreInspection, StoreLimits,
+    StoreZeroizationState, StoredControl, StoredControlEffect, StoredEvent, StoredEventTransfer,
+    StoredRecord, StoredState, TransferLease, ZeroizationArtifact, ZeroizationIntent,
+    ZeroizationStore,
 };
 use sha2::{Digest as _, Sha256};
 #[cfg(unix)]
@@ -98,6 +100,8 @@ mod blob_progress_test;
 #[path = "runtime/convergence_test.rs"]
 mod convergence_test;
 
+#[cfg(test)]
+use crate::event_pages::{TransferProfileId, empty_set_commitment};
 #[cfg(feature = "nearby-discovery")]
 use crate::mission::{initiate_discovered_over_iroh_metered, respond_discovered_over_iroh_metered};
 use crate::{
@@ -116,6 +120,17 @@ use crate::{
         SelectedEventBridgeDeliveryReceipt, SelectedEventBridgeRuntime,
     },
     control_admin::{SelectedControlCommand, SelectedControlHandle, admin_error},
+    event_pages::{
+        AuthenticatedEventMetadata, BuiltLocalEventSendPlan, CHANGE_PAGE_ENTRY_FIXED_BYTES,
+        CHANGE_PAGE_FIXED_BYTES, ChangePageCustody, ChangePageEntry, ChangePageV7,
+        ChangeTurnFinishedV1, ChangeTurnHeaderV1, EventPageScheduleLimits,
+        EventPageSchedulePosition, EventTurnPlanV1, LaneId, LocalEventSendDifference,
+        MAX_CHANGE_PAGE_CODEC_BYTES, MAX_EVENT_TURN_PLAN_CODEC_BYTES, NegotiatedTransferProfiles,
+        SEMANTIC_PROTOCOL_V7, TransferProfileOfferV1, blind_set_commitment,
+        build_local_event_send_plan_with_limits, negotiate_transfer_profiles, schedule_digest,
+        transfer_profile_digest, validate_remote_event_page_budget,
+        validate_remote_event_send_plan,
+    },
     format_node_id, format_path_field, format_receipt_field,
     frame::{
         BlobInterest, BlobInterestSelector, BlobObjectId, BlobRangeApplyDisposition,
@@ -300,7 +315,7 @@ const MAX_CONTACT_BYTES: usize = 64 * 1024 * 1024;
 const OFFER_V3_PLAINTEXT_OVERHEAD_BYTES: usize =
     4 + 1 + 1 + 32 + 8 + 4 + MAX_CUSTODY_WRAPPER_BYTES + 4;
 // Reference session record: magic/version/suite/sequence/nonce/length/GCM tag.
-const APPLICATION_PROTECTION_OVERHEAD_BYTES: usize = 8 + 2 + 2 + 8 + 12 + 4 + 16;
+const APPLICATION_PROTECTION_OVERHEAD_BYTES: usize = REFERENCE_SESSION_FRAME_OVERHEAD_BYTES;
 const APPLY_RESULT_V3_PLAINTEXT_BYTES: usize = 4 + 1 + 1 + 32 + 8 + 1 + 1;
 const DIRECTION_ONLY_PLAINTEXT_BYTES: usize = 4 + 1 + 1;
 const FINISH_V3_PLAINTEXT_BYTES: usize = DIRECTION_ONLY_PLAINTEXT_BYTES + 8;
@@ -318,6 +333,38 @@ const MIN_MUTABLE_SEMANTIC_VERSION: u16 = 4;
 const MIN_BLOB_NETWORK_SEMANTIC_VERSION: u16 = 5;
 const MIN_EVENT_BRIDGE_SEMANTIC_VERSION: u16 = 6;
 const MAX_EVENT_BRIDGE_ROUTES_PER_DIRECTION: usize = 8;
+// Semantic v7 runs EventBridge after Event. Its selected runtime reserve proves
+// one opaque route in each direction plus both finishes; unsent routes remain
+// durable for later contacts. This is a local scheduler choice, not a wire
+// rejection limit, so receivers retain the inherited v6 bound above.
+const V7_EVENT_BRIDGE_ROUTES_PER_DIRECTION: usize = 1;
+
+const fn event_bridge_route_send_limit(semantic_version: u16) -> usize {
+    if semantic_version >= SEMANTIC_PROTOCOL_V7 {
+        V7_EVENT_BRIDGE_ROUTES_PER_DIRECTION
+    } else {
+        MAX_EVENT_BRIDGE_ROUTES_PER_DIRECTION
+    }
+}
+
+const EVENT_BRIDGE_HELLO_PLAINTEXT_BYTES: usize = 4 + 1 + 1;
+const EVENT_BRIDGE_ROUTE_OFFER_MAX_BYTES: usize =
+    4 + 1 + 32 + 4 + aster_mesh::MAX_SELECTED_BRIDGE_WRAPPER_BYTES + 4 + MAX_OBJECT_BYTES;
+const EVENT_BRIDGE_ROUTE_RESULT_BYTES: usize = 4 + 1 + 32 + 1;
+const EVENT_BRIDGE_FINISH_PLAINTEXT_BYTES: usize = 4 + 1 + 8;
+const EVENT_BRIDGE_HELLO_EXCHANGE_BYTES: usize =
+    2 * (EVENT_BRIDGE_HELLO_PLAINTEXT_BYTES + APPLICATION_PROTECTION_OVERHEAD_BYTES);
+const EVENT_BRIDGE_PROGRESS_EXCHANGE_BYTES: usize = EVENT_BRIDGE_ROUTE_OFFER_MAX_BYTES
+    + EVENT_BRIDGE_ROUTE_RESULT_BYTES
+    + 2 * APPLICATION_PROTECTION_OVERHEAD_BYTES;
+const EVENT_BRIDGE_FINISH_EXCHANGE_BYTES: usize =
+    2 * (EVENT_BRIDGE_FINISH_PLAINTEXT_BYTES + APPLICATION_PROTECTION_OVERHEAD_BYTES);
+const EVENT_BRIDGE_CONTACT_RESERVE_EXCHANGES: usize = 5;
+const EVENT_BRIDGE_CONTACT_RESERVE_FRAMES: usize =
+    EVENT_BRIDGE_CONTACT_RESERVE_EXCHANGES * EXCHANGE_FRAMES;
+const EVENT_BRIDGE_CONTACT_RESERVE_BYTES: usize = EVENT_BRIDGE_HELLO_EXCHANGE_BYTES
+    + 2 * (EVENT_BRIDGE_PROGRESS_EXCHANGE_BYTES + EVENT_BRIDGE_FINISH_EXCHANGE_BYTES);
+const EVENT_BRIDGE_CONTACT_RESERVE_ITEMS: usize = 2;
 type SelectedEventBridgeHandle = Arc<StdMutex<SelectedEventBridgeRuntime>>;
 const MUTABLE_RECONCILIATION_FRAME_BYTES: usize = 16 * 1024;
 const MUTABLE_RECONCILIATION_ROUNDS: u32 = 64;
@@ -566,24 +613,34 @@ const fn contact_reconciliation_classes(semantic_version: u16) -> &'static str {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PostEventReserve {
-    exchanges: usize,
-    bytes: usize,
+/// Caller-computed capacity held for later lanes in this contact.
+///
+/// These values are selected-runtime composition bounds. They are absent from
+/// semantic-v7 codecs and are not peer-visible rejection limits.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ContactReserve {
     items: usize,
+    protected_frames: usize,
+    protected_bytes: usize,
 }
 
-fn post_event_reserve(semantic_version: u16) -> Option<PostEventReserve> {
+fn post_event_reserve(semantic_version: u16) -> Option<ContactReserve> {
     match semantic_version {
-        MIN_BLOB_NETWORK_SEMANTIC_VERSION.. => Some(PostEventReserve {
-            exchanges: MUTABLE_V5_CONTACT_RESERVE_EXCHANGES,
-            bytes: MUTABLE_V5_CONTACT_RESERVE_BYTES,
-            items: 6 * MUTABLE_LANE_GUARANTEED_ITEMS + 1,
+        SEMANTIC_PROTOCOL_V7.. => Some(ContactReserve {
+            items: 6 * MUTABLE_LANE_GUARANTEED_ITEMS + 1 + EVENT_BRIDGE_CONTACT_RESERVE_ITEMS,
+            protected_frames: MUTABLE_V5_CONTACT_RESERVE_EXCHANGES * EXCHANGE_FRAMES
+                + EVENT_BRIDGE_CONTACT_RESERVE_FRAMES,
+            protected_bytes: MUTABLE_V5_CONTACT_RESERVE_BYTES + EVENT_BRIDGE_CONTACT_RESERVE_BYTES,
         }),
-        MIN_MUTABLE_SEMANTIC_VERSION.. => Some(PostEventReserve {
-            exchanges: MUTABLE_CONTACT_RESERVE_EXCHANGES,
-            bytes: MUTABLE_CONTACT_RESERVE_BYTES,
+        MIN_BLOB_NETWORK_SEMANTIC_VERSION.. => Some(ContactReserve {
+            items: 6 * MUTABLE_LANE_GUARANTEED_ITEMS + 1,
+            protected_frames: MUTABLE_V5_CONTACT_RESERVE_EXCHANGES * EXCHANGE_FRAMES,
+            protected_bytes: MUTABLE_V5_CONTACT_RESERVE_BYTES,
+        }),
+        MIN_MUTABLE_SEMANTIC_VERSION.. => Some(ContactReserve {
             items: 4 * MUTABLE_LANE_GUARANTEED_ITEMS,
+            protected_frames: MUTABLE_CONTACT_RESERVE_EXCHANGES * EXCHANGE_FRAMES,
+            protected_bytes: MUTABLE_CONTACT_RESERVE_BYTES,
         }),
         _ => None,
     }
@@ -2413,6 +2470,8 @@ tokio::task_local! {
 tokio::task_local! {
     static TEST_RECONCILIATION_EXCHANGES_BEFORE_DEFER: std::cell::Cell<Option<usize>>;
     static TEST_CUSTODY_PREOPEN_RACES: std::cell::RefCell<Vec<TestCustodyPreopenRace>>;
+    static TEST_TRANSFER_PROFILE_OFFER: std::cell::RefCell<Option<TransferProfileOfferV1>>;
+    static TEST_PREACCOUNTED_CONTACT_ITEMS: std::cell::Cell<usize>;
 }
 
 #[cfg(test)]
@@ -2437,6 +2496,26 @@ enum TestCustodyPreopenRace {
         transfer_id: EventTransferId,
         count: Arc<AtomicU64>,
     },
+    FinalPolicyChangeBeforeEventPage(usize),
+    PageControlChangeBeforeEventPage {
+        remaining: usize,
+        authority: NodeId,
+        transfer_id: ControlTransferId,
+        exact: Vec<u8>,
+    },
+    PageSelectorChangeBeforeEventPage {
+        remaining: usize,
+        topic: Topic,
+        scope: Scope,
+        key: Vec<u8>,
+    },
+    EventPageSourcePreparationDelayMs(u64),
+    EventPageFinalPostBatchDelayMs(u64),
+    EventPageTargetEntries(usize),
+    FailEventPageReceiveAfterPages(usize),
+    FailEventPageStoreBeforePages(usize),
+    FailEventPageValidationAfterEntries(usize),
+    ExhaustEventCapacityBeforePages(usize),
 }
 
 #[cfg(test)]
@@ -2734,6 +2813,10 @@ impl LiveEmissionPolicy {
 pub struct PeerReceipt {
     /// Authenticated negotiated semantic protocol version.
     pub semantic_version: u16,
+    /// Canonical semantic-v7 profile transcript digest, absent on v1-v6 contacts.
+    pub transfer_profile_digest: Option<[u8; 32]>,
+    /// Selected numeric transfer-profile IDs by Event/State/Record/Blob/EventBridge lane.
+    pub negotiated_transfer_profiles: Option<[u16; 5]>,
     /// Authenticated remote endpoint.
     pub peer: Option<EndpointId>,
     /// Independently hybrid-authenticated Aster identity.
@@ -2800,6 +2883,30 @@ pub struct PeerReceipt {
     pub protected_frames: usize,
     /// Successfully sealed and opened application wire bytes.
     pub protected_bytes: usize,
+    /// Receipt-free Event uni turns emitted by this node.
+    pub event_uni_turns_sent: usize,
+    /// Receipt-free Event uni turns consumed by this node.
+    pub event_uni_turns_received: usize,
+    /// Receipt-free Event pages emitted by this node.
+    pub event_pages_sent: usize,
+    /// Receipt-free Event pages consumed by this node.
+    pub event_pages_received: usize,
+    /// Source Event entries emitted in receipt-free pages.
+    pub event_page_entries_sent: usize,
+    /// Source Event entries consumed from receipt-free pages.
+    pub event_page_entries_received: usize,
+    /// Source Event bytes emitted in receipt-free pages.
+    pub event_page_bytes_sent: usize,
+    /// Source Event bytes consumed from receipt-free pages.
+    pub event_page_bytes_received: usize,
+    /// Newly inserted Events from receipt-free pages.
+    pub event_page_inserts: usize,
+    /// Idempotent duplicate Events from receipt-free pages.
+    pub event_page_duplicates: usize,
+    /// Durable Event IDs committed by a page plan but deferred to another contact.
+    pub event_page_unscheduled: usize,
+    /// Receiptful legacy/finite-TTL Event offers emitted by this node.
+    pub receiptful_event_offers: usize,
     /// Opaque bridge routes offered by this node during the protected v6 lane.
     pub bridge_offered: usize,
     /// Opaque bridge routes freshly authenticated by this node.
@@ -2884,6 +2991,30 @@ pub struct NodeReceipt {
     pub data_duplicates: u64,
     /// Event-lane data work reported outstanding across successful contacts.
     pub data_remaining: u64,
+    /// Receipt-free Event uni turns emitted across successful contacts.
+    pub event_uni_turns_sent: u64,
+    /// Receipt-free Event uni turns consumed across successful contacts.
+    pub event_uni_turns_received: u64,
+    /// Receipt-free Event pages emitted across successful contacts.
+    pub event_pages_sent: u64,
+    /// Receipt-free Event pages consumed across successful contacts.
+    pub event_pages_received: u64,
+    /// Source Event entries emitted in receipt-free pages.
+    pub event_page_entries_sent: u64,
+    /// Source Event entries consumed from receipt-free pages.
+    pub event_page_entries_received: u64,
+    /// Source Event bytes emitted in receipt-free pages.
+    pub event_page_bytes_sent: u64,
+    /// Source Event bytes consumed from receipt-free pages.
+    pub event_page_bytes_received: u64,
+    /// Newly inserted Events from receipt-free pages.
+    pub event_page_inserts: u64,
+    /// Idempotent duplicate Events from receipt-free pages.
+    pub event_page_duplicates: u64,
+    /// Durable Events deferred by receipt-free plans.
+    pub event_page_unscheduled: u64,
+    /// Receiptful legacy or finite-TTL Event offers emitted.
+    pub receiptful_event_offers: u64,
     /// Mutable-class object and Blob carrier work reported outstanding across successful contacts.
     pub mutable_remaining: u64,
     /// Mutable-class lanes cleanly deferred across successful contacts.
@@ -2952,6 +3083,18 @@ fn account_path_receipt(total: &mut NodeReceipt, contact: &PeerReceipt) -> Resul
     Ok(())
 }
 
+fn checked_aggregate_data_counter(
+    current: u64,
+    contact: usize,
+    label: &'static str,
+) -> Result<u64, NodeError> {
+    let contact = u64::try_from(contact)
+        .map_err(|_| NodeError::Protocol(format!("contact {label} count exceeds u64")))?;
+    current
+        .checked_add(contact)
+        .ok_or_else(|| NodeError::Protocol(format!("aggregate {label} count overflow")))
+}
+
 fn account_data_receipt(total: &mut NodeReceipt, contact: &PeerReceipt) -> Result<(), NodeError> {
     let data_offered =
         total
@@ -3002,12 +3145,84 @@ fn account_data_receipt(total: &mut NodeReceipt, contact: &PeerReceipt) -> Resul
         .ok_or_else(|| {
             NodeError::Protocol("aggregate deferred mutable lane count overflow".into())
         })?;
+    let event_uni_turns_sent = checked_aggregate_data_counter(
+        total.event_uni_turns_sent,
+        contact.event_uni_turns_sent,
+        "Event uni turns sent",
+    )?;
+    let event_uni_turns_received = checked_aggregate_data_counter(
+        total.event_uni_turns_received,
+        contact.event_uni_turns_received,
+        "Event uni turns received",
+    )?;
+    let event_pages_sent = checked_aggregate_data_counter(
+        total.event_pages_sent,
+        contact.event_pages_sent,
+        "Event pages sent",
+    )?;
+    let event_pages_received = checked_aggregate_data_counter(
+        total.event_pages_received,
+        contact.event_pages_received,
+        "Event pages received",
+    )?;
+    let event_page_entries_sent = checked_aggregate_data_counter(
+        total.event_page_entries_sent,
+        contact.event_page_entries_sent,
+        "Event page entries sent",
+    )?;
+    let event_page_entries_received = checked_aggregate_data_counter(
+        total.event_page_entries_received,
+        contact.event_page_entries_received,
+        "Event page entries received",
+    )?;
+    let event_page_bytes_sent = checked_aggregate_data_counter(
+        total.event_page_bytes_sent,
+        contact.event_page_bytes_sent,
+        "Event page bytes sent",
+    )?;
+    let event_page_bytes_received = checked_aggregate_data_counter(
+        total.event_page_bytes_received,
+        contact.event_page_bytes_received,
+        "Event page bytes received",
+    )?;
+    let event_page_inserts = checked_aggregate_data_counter(
+        total.event_page_inserts,
+        contact.event_page_inserts,
+        "Event page inserts",
+    )?;
+    let event_page_duplicates = checked_aggregate_data_counter(
+        total.event_page_duplicates,
+        contact.event_page_duplicates,
+        "Event page duplicates",
+    )?;
+    let event_page_unscheduled = checked_aggregate_data_counter(
+        total.event_page_unscheduled,
+        contact.event_page_unscheduled,
+        "Event page unscheduled",
+    )?;
+    let receiptful_event_offers = checked_aggregate_data_counter(
+        total.receiptful_event_offers,
+        contact.receiptful_event_offers,
+        "receiptful Event offers",
+    )?;
 
     total.data_offered = data_offered;
     total.data_fetched = data_fetched;
     total.data_inserted = data_inserted;
     total.data_duplicates = data_duplicates;
     total.data_remaining = data_remaining;
+    total.event_uni_turns_sent = event_uni_turns_sent;
+    total.event_uni_turns_received = event_uni_turns_received;
+    total.event_pages_sent = event_pages_sent;
+    total.event_pages_received = event_pages_received;
+    total.event_page_entries_sent = event_page_entries_sent;
+    total.event_page_entries_received = event_page_entries_received;
+    total.event_page_bytes_sent = event_page_bytes_sent;
+    total.event_page_bytes_received = event_page_bytes_received;
+    total.event_page_inserts = event_page_inserts;
+    total.event_page_duplicates = event_page_duplicates;
+    total.event_page_unscheduled = event_page_unscheduled;
+    total.receiptful_event_offers = receiptful_event_offers;
     total.mutable_remaining = mutable_remaining;
     total.deferred_mutable_lanes = deferred_mutable_lanes;
     Ok(())
@@ -8181,6 +8396,280 @@ struct PreparedOutboundCustody {
     lease: CustodyLeaseGuard,
 }
 
+struct PreparedPageCustody {
+    object: CustodyObjectKey,
+    policy_revision: CustodyPolicyRevision,
+    authenticated_age_ms: u64,
+}
+
+struct LoadedEventPageEntry {
+    metadata: AuthenticatedEventMetadata,
+    verified: RouteVerifiedEventEnvelope,
+    state: EventTransferState,
+    source_event: Vec<u8>,
+}
+
+struct PreparedEventPage {
+    entries: Vec<ChangePageEntry>,
+    metadata: Vec<AuthenticatedEventMetadata>,
+    custody: Vec<PreparedPageCustody>,
+}
+
+fn require_event_page_final_send(
+    store: &Store,
+    custody: &[PreparedPageCustody],
+) -> Result<(), NodeError> {
+    require_contact_policy_current()?;
+    let Some(first) = custody.first() else {
+        return Ok(());
+    };
+    if custody
+        .iter()
+        .any(|prepared| prepared.policy_revision != first.policy_revision)
+    {
+        return Err(NodeError::Protocol(
+            "Event-page custody entries disagree on their policy revision".into(),
+        ));
+    }
+    let sample = contact_custody_sample()?.ok_or_else(|| {
+        NodeError::Protocol("final Event-page custody send lacks a local clock sample".into())
+    })?;
+    let objects = custody
+        .iter()
+        .map(|prepared| prepared.object)
+        .collect::<Vec<_>>();
+    let authorizations = store.authorize_receipt_free_custody_sends(
+        &objects,
+        Some(sample),
+        first.policy_revision,
+    )?;
+    if authorizations.len() != custody.len() {
+        return Err(NodeError::Protocol(
+            "custody store changed Event-page authorization cardinality".into(),
+        ));
+    }
+    #[cfg(test)]
+    apply_test_event_page_final_post_batch_delay()?;
+    let final_sample = contact_custody_sample()?.ok_or_else(|| {
+        NodeError::Protocol(
+            "final Event-page custody send lacks a carrier-adjacent clock sample".into(),
+        )
+    })?;
+    for index in 0..custody.len() {
+        let authorization = authorizations.get(index).ok_or_else(|| {
+            NodeError::Protocol("custody store truncated Event-page authorization results".into())
+        })?;
+        let prepared = custody.get(index).ok_or_else(|| {
+            NodeError::Protocol("Event-page custody authorization index is invalid".into())
+        })?;
+        let authorization_sample = authorization.sample.ok_or_else(|| {
+            NodeError::Protocol(
+                "custody store omitted the normalized Event-page send checkpoint".into(),
+            )
+        })?;
+        if final_sample.clock_id != authorization_sample.clock_id {
+            return Err(NodeError::Protocol(
+                "custody clock continuity changed during the final Event-page send check".into(),
+            ));
+        }
+        let post_check_delta_ms = final_sample
+            .tick_ms
+            .checked_sub(authorization_sample.tick_ms)
+            .ok_or_else(|| {
+                NodeError::Protocol(
+                    "custody clock regressed during the final Event-page send check".into(),
+                )
+            })?;
+        let observed_age_ms = authorization
+            .age_ms
+            .checked_add(post_check_delta_ms)
+            .ok_or_else(|| {
+                NodeError::Protocol(
+                    "custody age overflowed during the final Event-page send check".into(),
+                )
+            })?;
+        require_finalization_within_charge(observed_age_ms, prepared.authenticated_age_ms)?;
+    }
+    require_contact_policy_current()?;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "authenticated source, page batch authority, and wrapper inputs stay explicit"
+)]
+fn prepare_event_page_custody(
+    mission: &mut MissionSession,
+    exchanges: &mut CustodyExchangeSequence,
+    transfer_id: EventTransferId,
+    state: EventTransferState,
+    verified: &RouteVerifiedEventEnvelope,
+    exact_len: usize,
+    emission: EmissionPolicySnapshot,
+    policy_revision: CustodyPolicyRevision,
+    authorization: CustodySendAuthorization,
+) -> Result<(ChangePageCustody, PreparedPageCustody), NodeError> {
+    let ttl_ms = verified
+        .ttl_ms()
+        .filter(|_| !verified.tombstone())
+        .ok_or_else(|| NodeError::Protocol("Event-page custody entry is not finite".into()))?;
+    let object = state.custody_key(transfer_id);
+    let normalized_sample = authorization.sample.ok_or_else(|| {
+        NodeError::Protocol(
+            "custody store omitted the normalized Event-page send checkpoint".into(),
+        )
+    })?;
+    let exact_len = u64::try_from(exact_len)
+        .map_err(|_| NodeError::Protocol("Event transfer length exceeds u64".into()))?;
+    let transfer = CustodyTransferClaims::new(
+        CustodyTransferId::from_exact_hash(*transfer_id.as_bytes()),
+        exact_len,
+        verified.ttl_ms(),
+        verified.priority(),
+    )
+    .map_err(custody_claim_error)?;
+    let authenticated_age_ms =
+        charged_custody_finalization_age(authorization.age_ms, exact_len, Some(ttl_ms))?;
+    let hop_delta_ms = authenticated_age_ms
+        .checked_sub(authorization.age_ms)
+        .ok_or_else(|| NodeError::Protocol("Event-page custody age regressed".into()))?;
+    let hop = CustodyHop::new(authorization.age_ms, normalized_sample, hop_delta_ms)
+        .map_err(custody_claim_error)?;
+    let exchange_id = exchanges.take()?;
+    let claims = CustodyClaims::new(transfer, exchange_id, emission.revision, hop)
+        .map_err(custody_claim_error)?;
+    let wrapper = mission.seal_custody_wrapper(&claims)?;
+    Ok((
+        ChangePageCustody {
+            exchange_id,
+            wrapper,
+        },
+        PreparedPageCustody {
+            object,
+            policy_revision,
+            authenticated_age_ms,
+        },
+    ))
+}
+
+fn prepare_loaded_event_page_entries(
+    store: &Store,
+    mission: &mut MissionSession,
+    exchanges: &mut CustodyExchangeSequence,
+    loaded: Vec<LoadedEventPageEntry>,
+) -> Result<PreparedEventPage, NodeError> {
+    let finite_keys = loaded
+        .iter()
+        .filter(|loaded| loaded.verified.ttl_ms().is_some() && !loaded.verified.tombstone())
+        .map(|loaded| loaded.state.custody_key(loaded.metadata.id))
+        .collect::<Vec<_>>();
+    let preparation = if finite_keys.is_empty() {
+        None
+    } else {
+        if !contact_supports_finite_ttl() {
+            return Err(NodeError::Protocol(
+                "finite-TTL Event paging requires a suspend-inclusive custody clock".into(),
+            ));
+        }
+        let emission = contact_policy_or_normal()?;
+        for loaded in &loaded {
+            if loaded.verified.ttl_ms().is_some()
+                && !loaded.verified.tombstone()
+                && !emission.policy.permits_event(loaded.verified.priority())
+            {
+                return Err(NodeError::EmissionPolicyChanged);
+            }
+        }
+        let policy_revision = store.custody_policy_revision()?;
+        let sample = contact_custody_sample()?.ok_or_else(|| {
+            NodeError::Protocol("authenticated Event-page custody send lacks a clock sample".into())
+        })?;
+        let authorizations = store
+            .authorize_receipt_free_custody_sends(&finite_keys, Some(sample), policy_revision)
+            .map_err(NodeError::from)
+            .map_err(map_preopen_custody_expiry)?;
+        if authorizations.len() != finite_keys.len() {
+            return Err(NodeError::Protocol(
+                "custody store changed Event-page preparation cardinality".into(),
+            ));
+        }
+        Some((emission, policy_revision, authorizations.into_iter()))
+    };
+    let mut preparation = preparation;
+    let mut entries = Vec::with_capacity(loaded.len());
+    let mut metadata = Vec::with_capacity(loaded.len());
+    let mut custody = Vec::with_capacity(loaded.len());
+    for loaded in loaded {
+        let prepared = if loaded.verified.ttl_ms().is_some() && !loaded.verified.tombstone() {
+            let (emission, policy_revision, authorizations) =
+                preparation.as_mut().ok_or_else(|| {
+                    NodeError::Protocol("finite Event page lacks batch custody authority".into())
+                })?;
+            let authorization = authorizations.next().ok_or_else(|| {
+                NodeError::Protocol("custody store truncated Event-page preparation results".into())
+            })?;
+            Some(prepare_event_page_custody(
+                mission,
+                exchanges,
+                loaded.metadata.id,
+                loaded.state,
+                &loaded.verified,
+                loaded.source_event.len(),
+                *emission,
+                *policy_revision,
+                authorization,
+            )?)
+        } else {
+            None
+        };
+        entries.push(ChangePageEntry {
+            id: loaded.metadata.id,
+            custody: prepared.as_ref().map(|(wire, _)| wire.clone()),
+            source_event: loaded.source_event,
+        });
+        metadata.push(loaded.metadata);
+        if let Some((_, prepared)) = prepared {
+            custody.push(prepared);
+        }
+    }
+    if preparation
+        .as_mut()
+        .is_some_and(|(_, _, authorizations)| authorizations.next().is_some())
+    {
+        return Err(NodeError::Protocol(
+            "custody store returned surplus Event-page preparation results".into(),
+        ));
+    }
+    Ok(PreparedEventPage {
+        entries,
+        metadata,
+        custody,
+    })
+}
+
+fn require_event_page_entries_fit(
+    entries: &[ChangePageEntry],
+    max_page_codec_bytes: usize,
+) -> Result<(), NodeError> {
+    let encoded_bytes = entries
+        .iter()
+        .try_fold(CHANGE_PAGE_FIXED_BYTES, |total, entry| {
+            total
+                .checked_add(
+                    entry
+                        .encoded_len()
+                        .map_err(|error| NodeError::Protocol(error.to_string()))?,
+                )
+                .ok_or_else(|| NodeError::Protocol("Event page length overflow".into()))
+        })?;
+    if encoded_bytes > max_page_codec_bytes {
+        return Err(NodeError::Protocol(
+            "scheduled Event does not fit its authenticated page budget".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl PreparedOutboundCustody {
     fn build_offer(
         &self,
@@ -8403,14 +8892,11 @@ fn v3_custody_schedule_budget(
     let remaining_frames = MAX_CONTACT_FRAMES
         .checked_sub(used_frames)
         .ok_or_else(|| NodeError::Protocol("contact frame budget is exhausted".into()))?;
-    let reserved_exchanges = 1usize
-        .checked_add(usize::from(reserve_future_defer))
-        .and_then(|exchanges| {
-            exchanges.checked_add(post_event.map_or(0, |reserve| reserve.exchanges))
-        })
-        .ok_or_else(|| NodeError::Protocol("contact frame reserve overflow".into()))?;
     let reserved_frames = EXCHANGE_FRAMES
-        .checked_mul(reserved_exchanges)
+        .checked_mul(1usize + usize::from(reserve_future_defer))
+        .and_then(|frames| {
+            frames.checked_add(post_event.map_or(0, |reserve| reserve.protected_frames))
+        })
         .ok_or_else(|| NodeError::Protocol("contact frame reserve overflow".into()))?;
     let offer_frames = remaining_frames
         .checked_sub(reserved_frames)
@@ -8432,7 +8918,9 @@ fn v3_custody_schedule_budget(
         } else {
             0
         })
-        .and_then(|bytes| bytes.checked_add(post_event.map_or(0, |reserve| reserve.bytes)))
+        .and_then(|bytes| {
+            bytes.checked_add(post_event.map_or(0, |reserve| reserve.protected_bytes))
+        })
         .ok_or_else(|| NodeError::Protocol("contact byte reserve overflow".into()))?;
     let offer_wire_bytes = remaining_bytes.checked_sub(reserved_bytes).ok_or_else(|| {
         NodeError::Protocol("contact lacks the reserved Event continuation exchanges".into())
@@ -9361,11 +9849,25 @@ fn cache_contact_verified_event(
         .map_or(Ok(()), |result| result)
 }
 
+#[derive(Clone, Debug)]
+struct AuthenticatedSenderRouteCandidate {
+    claim: AuthenticatedEventRouteClaim,
+    acceptance_order: u64,
+}
+
+impl std::ops::Deref for AuthenticatedSenderRouteCandidate {
+    type Target = AuthenticatedEventRouteClaim;
+
+    fn deref(&self) -> &Self::Target {
+        &self.claim
+    }
+}
+
 fn cached_sender_route_claims(
     store: &Store,
     policy: &ControlPolicySnapshot,
     verifier: &mut ReferenceEnvelopeSealer,
-) -> Result<Vec<AuthenticatedEventRouteClaim>, NodeError> {
+) -> Result<Vec<AuthenticatedSenderRouteCandidate>, NodeError> {
     let cache = match CONTACT_EVENT_ROUTE_CACHE.try_with(Arc::clone) {
         Ok(cache) => {
             cache.require_binding(verifier)?;
@@ -9459,7 +9961,10 @@ fn cached_sender_route_claims(
         ) {
             continue;
         }
-        claims.push(claim);
+        claims.push(AuthenticatedSenderRouteCandidate {
+            claim,
+            acceptance_order: projection.acceptance_order(),
+        });
     }
     Ok(claims)
 }
@@ -9663,6 +10168,417 @@ fn verify_received_event_content(
         return Ok(EventContentVerification::RouteOnly(route_verified));
     }
     Ok(verifier.verify_event_content(route_verified, sealed)?)
+}
+
+enum PreparedReceivedEvent {
+    Content {
+        event: ContentVerifiedEventEnvelope,
+        claim: AuthenticatedEventRouteClaim,
+        custody: Option<VerifiedCustodyClaims>,
+    },
+    RouteOnly {
+        event: RouteVerifiedEventEnvelope,
+        claim: AuthenticatedEventRouteClaim,
+        custody: Option<VerifiedCustodyClaims>,
+    },
+}
+
+struct PreparedReceivedPageEntry<'a> {
+    event: PreparedReceivedEvent,
+    sealed: &'a [u8],
+}
+
+struct ReceivedPageCustody<'a> {
+    mission: &'a mut MissionSession,
+    expected_sender_policy_revision: u64,
+    evidence: Option<&'a ChangePageCustody>,
+}
+
+fn prepare_received_page_transfer(
+    store: &Store,
+    verifier: &mut ReferenceEnvelopeSealer,
+    authority: EventReceiveAuthority<'_>,
+    transfer_id: EventTransferId,
+    sealed: &[u8],
+    custody: ReceivedPageCustody<'_>,
+) -> Result<PreparedReceivedEvent, NodeError> {
+    let route_verified = verifier.verify_event(sealed)?;
+    if EventTransferId::new(route_verified.envelope_id()) != transfer_id {
+        return Err(NodeError::Protocol(
+            "received Event bytes do not match their exact transfer identity".into(),
+        ));
+    }
+    let finite = route_verified.ttl_ms().is_some() && !route_verified.tombstone();
+    let verified_custody = match (finite, custody.evidence) {
+        (true, Some(evidence)) => {
+            if !contact_supports_finite_ttl() {
+                return Err(NodeError::Protocol(
+                    "finite-TTL Event paging requires a suspend-inclusive custody clock".into(),
+                ));
+            }
+            let exact_len = u64::try_from(sealed.len())
+                .map_err(|_| NodeError::Protocol("received Event length exceeds u64".into()))?;
+            let transfer = CustodyTransferClaims::new(
+                CustodyTransferId::from_exact_hash(*transfer_id.as_bytes()),
+                exact_len,
+                route_verified.ttl_ms(),
+                route_verified.priority(),
+            )
+            .map_err(custody_claim_error)?;
+            let expected = CustodyExpectation::new(transfer, evidence.exchange_id);
+            let verified = custody
+                .mission
+                .open_custody_wrapper(&evidence.wrapper, expected)?;
+            if verified.policy_revision() != custody.expected_sender_policy_revision {
+                return Err(NodeError::Protocol(
+                    "Event-page custody policy revision differs from the authenticated sender snapshot"
+                        .into(),
+                ));
+            }
+            if let Some(ttl_ms) = route_verified.ttl_ms()
+                && verified.forwarding_age_ms() >= ttl_ms
+            {
+                return Err(NodeError::Protocol(
+                    "received Event is expired at its authenticated cumulative age".into(),
+                ));
+            }
+            Some(verified)
+        }
+        (true, None) => {
+            return Err(NodeError::Protocol(
+                "finite-TTL Event page entry lacks authenticated custody age".into(),
+            ));
+        }
+        (false, Some(_)) => {
+            return Err(NodeError::Protocol(
+                "durable Event page entry carries surplus custody age evidence".into(),
+            ));
+        }
+        (false, None) => None,
+    };
+    ensure_event_epoch_active(store, &route_verified)?;
+    if !authority
+        .receiver_interest
+        .matches(route_verified.topic(), route_verified.scope())
+    {
+        return Err(NodeError::Protocol(
+            "received Event is outside the durable receive interest captured for this contact"
+                .into(),
+        ));
+    }
+    if !verifier.peer_can_route(
+        authority.peer,
+        authority.peer_route_commitments,
+        route_verified.scope(),
+        route_verified.key_epoch(),
+    ) {
+        return Err(NodeError::Protocol(
+            "authenticated peer lacks the Event route grant for this scope and epoch".into(),
+        ));
+    }
+    let Some(mode) = authority
+        .local_replication_policy
+        .effective_mode(route_verified.topic(), route_verified.scope())
+    else {
+        return Err(NodeError::Protocol(
+            "received Event is outside the durable local receive-mode snapshot".into(),
+        ));
+    };
+    if mode == EventSubscriptionMode::Carry {
+        let claim = AuthenticatedEventRouteClaim::from_verified(
+            &route_verified,
+            EventTransferState::RouteCached,
+            sealed.len(),
+        )?;
+        return Ok(PreparedReceivedEvent::RouteOnly {
+            event: route_verified,
+            claim,
+            custody: verified_custody,
+        });
+    }
+    let accepted_claim = AuthenticatedEventRouteClaim::from_verified(
+        &route_verified,
+        EventTransferState::Accepted,
+        sealed.len(),
+    )?;
+    match verify_received_event_content(verifier, route_verified, sealed, transfer_id)? {
+        EventContentVerification::ContentVerified { event, .. } => {
+            Ok(PreparedReceivedEvent::Content {
+                event,
+                claim: accepted_claim,
+                custody: verified_custody,
+            })
+        }
+        EventContentVerification::RouteOnly(event) => {
+            let claim = AuthenticatedEventRouteClaim::from_verified(
+                &event,
+                EventTransferState::RouteCached,
+                sealed.len(),
+            )?;
+            Ok(PreparedReceivedEvent::RouteOnly {
+                event,
+                claim,
+                custody: verified_custody,
+            })
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PageCustodyApplyContext {
+    policy_revision: CustodyPolicyRevision,
+    receiver_sample: CustodySample,
+}
+
+fn apply_prepared_received_event(
+    store: &Store,
+    verifier: &mut ReferenceEnvelopeSealer,
+    replication_policy: &EventReplicationPolicySnapshot,
+    custody_context: Option<PageCustodyApplyContext>,
+    prepared: &PreparedReceivedEvent,
+    sealed: &[u8],
+) -> Result<ReceivedEventApply, NodeError> {
+    match prepared {
+        PreparedReceivedEvent::Content {
+            event,
+            claim,
+            custody,
+        } => {
+            let outcome = if let Some(custody) = custody.as_ref() {
+                let context = custody_context.ok_or_else(|| {
+                    NodeError::Protocol("Event-page custody apply context is missing".into())
+                })?;
+                store.apply_verified_event_with_custody_policy(
+                    replication_policy,
+                    context.policy_revision,
+                    custody,
+                    context.receiver_sample,
+                    event,
+                    sealed,
+                )?
+            } else {
+                store.apply_verified_event_with_replication_policy(
+                    replication_policy,
+                    event,
+                    sealed,
+                )?
+            };
+            cache_contact_verified_event(verifier, claim.clone())?;
+            Ok(ReceivedEventApply::accepted(outcome.inserted()))
+        }
+        PreparedReceivedEvent::RouteOnly {
+            event,
+            claim,
+            custody,
+        } => {
+            let outcome = if let Some(custody) = custody.as_ref() {
+                let context = custody_context.ok_or_else(|| {
+                    NodeError::Protocol("Event-page custody apply context is missing".into())
+                })?;
+                store.cache_route_verified_event_with_custody_policy(
+                    replication_policy,
+                    context.policy_revision,
+                    custody,
+                    context.receiver_sample,
+                    event,
+                    sealed,
+                )?
+            } else {
+                store.cache_route_verified_event_with_replication_policy(
+                    replication_policy,
+                    event,
+                    sealed,
+                )?
+            };
+            let applied = ReceivedEventApply::from_route_cache(outcome);
+            if applied.inserted {
+                cache_contact_verified_event(verifier, claim.clone())?;
+            }
+            Ok(applied)
+        }
+    }
+}
+
+fn event_batch_hit_capacity(error: &StoreError) -> bool {
+    matches!(
+        error,
+        StoreError::ItemLimitExceeded { .. }
+            | StoreError::PayloadByteLimitExceeded { .. }
+            | StoreError::Custody(
+                CustodyStoreError::ItemQuotaExceeded { .. }
+                    | CustodyStoreError::ByteQuotaExceeded { .. }
+            )
+    )
+}
+
+fn event_batch_item_local_rejection(error: &StoreError) -> bool {
+    matches!(
+        error,
+        StoreError::IdentityConflict { .. }
+            | StoreError::SemanticRepresentationConflict { .. }
+            | StoreError::CausalEquivocation { .. }
+            | StoreError::EventEquivocation { .. }
+            | StoreError::SemanticNamespaceCollision { .. }
+            | StoreError::TransferNamespaceCollision { .. }
+    )
+}
+
+fn event_batch_split_recoverable(error: &NodeError) -> bool {
+    matches!(
+        error,
+        NodeError::Store(error)
+            if event_batch_hit_capacity(error) || event_batch_item_local_rejection(error)
+    )
+}
+
+fn merge_event_batch_split_results(
+    first: Result<Vec<ReceivedEventApply>, NodeError>,
+    second: Result<Vec<ReceivedEventApply>, NodeError>,
+) -> Result<Vec<ReceivedEventApply>, NodeError> {
+    match (first, second) {
+        (Ok(mut first), Ok(second)) => {
+            first.extend(second);
+            Ok(first)
+        }
+        (Err(error), Ok(_)) | (Ok(_), Err(error)) => Err(error),
+        (Err(first), Err(second)) => {
+            if event_batch_split_recoverable(&first) && !event_batch_split_recoverable(&second) {
+                Err(second)
+            } else {
+                Err(first)
+            }
+        }
+    }
+}
+
+fn evaluate_event_batch_split<F>(
+    first: Result<Vec<ReceivedEventApply>, NodeError>,
+    second: F,
+) -> Result<Vec<ReceivedEventApply>, NodeError>
+where
+    F: FnOnce() -> Result<Vec<ReceivedEventApply>, NodeError>,
+{
+    if let Err(error) = &first
+        && !event_batch_split_recoverable(error)
+    {
+        return first;
+    }
+    merge_event_batch_split_results(first, second())
+}
+
+fn apply_prepared_content_run(
+    store: &Store,
+    verifier: &mut ReferenceEnvelopeSealer,
+    replication_policy: &EventReplicationPolicySnapshot,
+    custody_context: Option<PageCustodyApplyContext>,
+    entries: &[PreparedReceivedPageEntry<'_>],
+) -> Result<Vec<ReceivedEventApply>, NodeError> {
+    let batch = entries
+        .iter()
+        .map(|entry| match &entry.event {
+            PreparedReceivedEvent::Content { event, custody, .. } => {
+                Ok((event, entry.sealed, custody.as_ref()))
+            }
+            PreparedReceivedEvent::RouteOnly { .. } => Err(NodeError::Protocol(
+                "internal Event content batch contains a route-only entry".into(),
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let has_custody = batch.iter().any(|(_, _, custody)| custody.is_some());
+    let result = if has_custody {
+        let context = custody_context.ok_or_else(|| {
+            NodeError::Protocol("Event-page custody batch context is missing".into())
+        })?;
+        store.apply_verified_event_batch_with_optional_custody_policy(
+            replication_policy,
+            context.policy_revision,
+            context.receiver_sample,
+            &batch,
+        )
+    } else {
+        let durable = batch
+            .iter()
+            .map(|(event, sealed, _)| (*event, *sealed))
+            .collect::<Vec<_>>();
+        store.apply_verified_event_batch_with_replication_policy(replication_policy, &durable)
+    };
+    match result {
+        Ok(outcomes) => entries
+            .iter()
+            .zip(outcomes)
+            .map(|(entry, outcome)| {
+                let PreparedReceivedEvent::Content { claim, .. } = &entry.event else {
+                    unreachable!("content batch was checked above")
+                };
+                cache_contact_verified_event(verifier, claim.clone())?;
+                Ok(ReceivedEventApply::accepted(outcome.inserted()))
+            })
+            .collect(),
+        Err(error)
+            if entries.len() > 1
+                && (event_batch_hit_capacity(&error)
+                    || event_batch_item_local_rejection(&error)) =>
+        {
+            let middle = entries.len() / 2;
+            let first = apply_prepared_content_run(
+                store,
+                verifier,
+                replication_policy,
+                custody_context,
+                &entries[..middle],
+            );
+            evaluate_event_batch_split(first, || {
+                apply_prepared_content_run(
+                    store,
+                    verifier,
+                    replication_policy,
+                    custody_context,
+                    &entries[middle..],
+                )
+            })
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn apply_prepared_event_page(
+    store: &Store,
+    verifier: &mut ReferenceEnvelopeSealer,
+    replication_policy: &EventReplicationPolicySnapshot,
+    custody_context: Option<PageCustodyApplyContext>,
+    entries: &[PreparedReceivedPageEntry<'_>],
+) -> Result<Vec<ReceivedEventApply>, NodeError> {
+    let mut applied = Vec::with_capacity(entries.len());
+    let mut cursor = 0usize;
+    while cursor < entries.len() {
+        if matches!(entries[cursor].event, PreparedReceivedEvent::Content { .. }) {
+            let mut end = cursor + 1;
+            while end < entries.len()
+                && matches!(entries[end].event, PreparedReceivedEvent::Content { .. })
+            {
+                end += 1;
+            }
+            applied.extend(apply_prepared_content_run(
+                store,
+                verifier,
+                replication_policy,
+                custody_context,
+                &entries[cursor..end],
+            )?);
+            cursor = end;
+        } else {
+            applied.push(apply_prepared_received_event(
+                store,
+                verifier,
+                replication_policy,
+                custody_context,
+                &entries[cursor].event,
+                entries[cursor].sealed,
+            )?);
+            cursor += 1;
+        }
+    }
+    Ok(applied)
 }
 
 fn accept_received_transfer(
@@ -11053,6 +11969,23 @@ fn format_digest(bytes: &[u8; 32]) -> String {
         let _ = write!(&mut output, "{byte:02x}");
     }
     output
+}
+
+fn format_transfer_profile_digest(digest: Option<[u8; 32]>) -> String {
+    digest
+        .map(|digest| format_digest(&digest))
+        .unwrap_or_else(|| "none".into())
+}
+
+fn format_transfer_profiles(profiles: Option<[u16; 5]>) -> String {
+    profiles
+        .map(|profiles| {
+            format!(
+                "{},{},{},{},{}",
+                profiles[0], profiles[1], profiles[2], profiles[3], profiles[4]
+            )
+        })
+        .unwrap_or_else(|| "none".into())
 }
 
 #[cfg(unix)]
@@ -13206,6 +14139,7 @@ async fn run_node_actor_inner(
     } = open_startup_event_verifier_and_cache(&store, &config.mission)?;
     let configured_cursor_peers = peer_missions.values().copied().collect::<Vec<_>>();
     store.reconcile_mutable_transfer_cursor_peers(&configured_cursor_peers)?;
+    store.reconcile_event_page_attempt_cursor_peers(&configured_cursor_peers)?;
     store.reconcile_blob_carrier_fetch_cursor_peers(&configured_cursor_peers)?;
     let application_control_head = store.control_head()?;
     ensure_principal_active(&store, application_sealer.identity())?;
@@ -14530,7 +15464,7 @@ async fn run_node_actor_inner(
                         }
                         receipt.contacts += 1;
                         node_stdout!(
-                            "CONTACT direction=in carrier_peer={} mission_peer={} rounds={} control_offered={} control_fetched={} control_retained={} control_duplicates={} control_activated={} control_remaining={} offered={} fetched={} inserted={} duplicates={} remaining={} deferred_event_lanes={} mutable_remaining={} deferred_mutable_lanes={} blob_ranges_fetched={} blob_bytes_fetched={} blob_remaining={} blob_deferred={} bridge_offered={} bridge_applied={} bridge_delivered={} bridge_remaining={} handshake_frames={} handshake_bytes={} protected_frames={} protected_bytes={} carrier_path={} carrier_path_transitions={} carrier_path_transitions_saturated={} path_observation=not-authorization mission_auth=hybrid-pq semantics=source-authenticated-event reconciliation_classes={} controls=source-authenticated-flash content_admission=capability-gated status={}",
+                            "CONTACT direction=in carrier_peer={} mission_peer={} rounds={} control_offered={} control_fetched={} control_retained={} control_duplicates={} control_activated={} control_remaining={} offered={} fetched={} inserted={} duplicates={} remaining={} deferred_event_lanes={} mutable_remaining={} deferred_mutable_lanes={} blob_ranges_fetched={} blob_bytes_fetched={} blob_remaining={} blob_deferred={} bridge_offered={} bridge_applied={} bridge_delivered={} bridge_remaining={} handshake_frames={} handshake_bytes={} protected_frames={} protected_bytes={} event_uni_turns_sent={} event_uni_turns_received={} event_pages_sent={} event_pages_received={} event_page_entries_sent={} event_page_entries_received={} event_page_bytes_sent={} event_page_bytes_received={} event_page_inserts={} event_page_duplicates={} event_page_unscheduled={} receiptful_event_offers={} transfer_profiles={} transfer_profile_digest={} carrier_path={} carrier_path_transitions={} carrier_path_transitions_saturated={} path_observation=not-authorization mission_auth=hybrid-pq semantics=source-authenticated-event reconciliation_classes={} controls=source-authenticated-flash content_admission=capability-gated status={}",
                             peer,
                             format_node_id(server_receipt.mission_peer.expect("successful mission contact has peer identity")),
                             server_receipt.rounds,
@@ -14560,6 +15494,20 @@ async fn run_node_actor_inner(
                             server_receipt.handshake_bytes,
                             server_receipt.protected_frames,
                             server_receipt.protected_bytes,
+                            server_receipt.event_uni_turns_sent,
+                            server_receipt.event_uni_turns_received,
+                            server_receipt.event_pages_sent,
+                            server_receipt.event_pages_received,
+                            server_receipt.event_page_entries_sent,
+                            server_receipt.event_page_entries_received,
+                            server_receipt.event_page_bytes_sent,
+                            server_receipt.event_page_bytes_received,
+                            server_receipt.event_page_inserts,
+                            server_receipt.event_page_duplicates,
+                            server_receipt.event_page_unscheduled,
+                            server_receipt.receiptful_event_offers,
+                            format_transfer_profiles(server_receipt.negotiated_transfer_profiles),
+                            format_transfer_profile_digest(server_receipt.transfer_profile_digest),
                             carrier_path_name(server_receipt.carrier_path),
                             server_receipt.carrier_path_transitions,
                             server_receipt.carrier_path_transitions_saturated,
@@ -14690,7 +15638,7 @@ async fn run_node_actor_inner(
                         }
                         receipt.contacts += 1;
                         node_stdout!(
-                            "CONTACT direction=out carrier_peer={} mission_peer={} locator={} rounds={} control_offered={} control_fetched={} control_retained={} control_duplicates={} control_activated={} control_remaining={} offered={} fetched={} inserted={} duplicates={} remaining={} deferred_event_lanes={} mutable_remaining={} deferred_mutable_lanes={} blob_ranges_fetched={} blob_bytes_fetched={} blob_remaining={} blob_deferred={} bridge_offered={} bridge_applied={} bridge_delivered={} bridge_remaining={} handshake_frames={} handshake_bytes={} protected_frames={} protected_bytes={} carrier_path={} carrier_path_transitions={} carrier_path_transitions_saturated={} path_observation=not-authorization mission_auth=hybrid-pq semantics=source-authenticated-event reconciliation_classes={} controls=source-authenticated-flash content_admission=capability-gated status={}",
+                            "CONTACT direction=out carrier_peer={} mission_peer={} locator={} rounds={} control_offered={} control_fetched={} control_retained={} control_duplicates={} control_activated={} control_remaining={} offered={} fetched={} inserted={} duplicates={} remaining={} deferred_event_lanes={} mutable_remaining={} deferred_mutable_lanes={} blob_ranges_fetched={} blob_bytes_fetched={} blob_remaining={} blob_deferred={} bridge_offered={} bridge_applied={} bridge_delivered={} bridge_remaining={} handshake_frames={} handshake_bytes={} protected_frames={} protected_bytes={} event_uni_turns_sent={} event_uni_turns_received={} event_pages_sent={} event_pages_received={} event_page_entries_sent={} event_page_entries_received={} event_page_bytes_sent={} event_page_bytes_received={} event_page_inserts={} event_page_duplicates={} event_page_unscheduled={} receiptful_event_offers={} transfer_profiles={} transfer_profile_digest={} carrier_path={} carrier_path_transitions={} carrier_path_transitions_saturated={} path_observation=not-authorization mission_auth=hybrid-pq semantics=source-authenticated-event reconciliation_classes={} controls=source-authenticated-flash content_admission=capability-gated status={}",
                             peer.carrier(),
                             format_node_id(peer_receipt.mission_peer.expect("successful mission contact has peer identity")),
                             peer.locator_name(),
@@ -14721,6 +15669,20 @@ async fn run_node_actor_inner(
                             peer_receipt.handshake_bytes,
                             peer_receipt.protected_frames,
                             peer_receipt.protected_bytes,
+                            peer_receipt.event_uni_turns_sent,
+                            peer_receipt.event_uni_turns_received,
+                            peer_receipt.event_pages_sent,
+                            peer_receipt.event_pages_received,
+                            peer_receipt.event_page_entries_sent,
+                            peer_receipt.event_page_entries_received,
+                            peer_receipt.event_page_bytes_sent,
+                            peer_receipt.event_page_bytes_received,
+                            peer_receipt.event_page_inserts,
+                            peer_receipt.event_page_duplicates,
+                            peer_receipt.event_page_unscheduled,
+                            peer_receipt.receiptful_event_offers,
+                            format_transfer_profiles(peer_receipt.negotiated_transfer_profiles),
+                            format_transfer_profile_digest(peer_receipt.transfer_profile_digest),
                             carrier_path_name(peer_receipt.carrier_path),
                             peer_receipt.carrier_path_transitions,
                             peer_receipt.carrier_path_transitions_saturated,
@@ -15558,7 +16520,14 @@ async fn sync_event_interests(
     event_guard: &EventLaneGuard,
     expected_remote_emission: EmissionPolicySnapshot,
     receipt: &mut PeerReceipt,
-) -> Result<(EventInterestSnapshot, EventInterestSnapshot), NodeError> {
+) -> Result<
+    (
+        EventInterestSnapshot,
+        EventInterestSnapshot,
+        EmissionPolicySnapshot,
+    ),
+    NodeError,
+> {
     event_guard.check(store)?;
     let local_interest = EventInterestSnapshot::protected(
         event_guard.interest()?,
@@ -15598,7 +16567,7 @@ async fn sync_event_interests(
         }
     };
     event_guard.check(store)?;
-    Ok((local_interest, peer_interest))
+    Ok((local_interest, peer_interest, local_emission))
 }
 
 #[derive(Debug)]
@@ -15687,11 +16656,8 @@ fn reconciliation_exchange_preserves_defer(
         .handshake_frames
         .checked_add(receipt.protected_frames)
         .ok_or_else(|| NodeError::Protocol("contact frame count overflow".into()))?;
-    let required_exchanges = 2usize
-        .checked_add(post_event.map_or(0, |reserve| reserve.exchanges))
-        .ok_or_else(|| NodeError::Protocol("Event reconciliation frame reserve overflow".into()))?;
-    let required_frames = EXCHANGE_FRAMES
-        .checked_mul(required_exchanges)
+    let required_frames = (2usize * EXCHANGE_FRAMES)
+        .checked_add(post_event.map_or(0, |reserve| reserve.protected_frames))
         .ok_or_else(|| NodeError::Protocol("Event reconciliation frame reserve overflow".into()))?;
     let frames_fit = used_frames
         .checked_add(required_frames)
@@ -15706,7 +16672,9 @@ fn reconciliation_exchange_preserves_defer(
         .and_then(|bytes| bytes.checked_add(maximum_response_plaintext_bytes))
         .and_then(|bytes| bytes.checked_add(APPLICATION_PROTECTION_OVERHEAD_BYTES))
         .and_then(|bytes| bytes.checked_add(EVENT_LANE_DEFER_EXCHANGE_BYTES))
-        .and_then(|bytes| bytes.checked_add(post_event.map_or(0, |reserve| reserve.bytes)))
+        .and_then(|bytes| {
+            bytes.checked_add(post_event.map_or(0, |reserve| reserve.protected_bytes))
+        })
         .ok_or_else(|| NodeError::Protocol("Event reconciliation byte reserve overflow".into()))?;
     let bytes_fit = used_bytes
         .checked_add(exchange_bytes)
@@ -15948,6 +16916,220 @@ async fn sync_event_reconciliation_lane(
     }
 }
 
+struct RuntimeLocalEventSendPlan {
+    built: BuiltLocalEventSendPlan,
+    cursor_updates: Vec<EventPageAttemptCursorUpdate>,
+    schedule_limits: EventPageScheduleLimits,
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the explicit authorization generations and budgets are independently validated inputs"
+)]
+fn build_runtime_local_event_send_plan(
+    store: &Store,
+    event_guard: &EventLaneGuard,
+    event_verifier: &mut ReferenceEnvelopeSealer,
+    profiles: &V7TransferProfiles,
+    direction: EventDirection,
+    difference: LocalEventSendDifference<'_>,
+    outbound_suppressed: bool,
+    schedule_limits: EventPageScheduleLimits,
+    peer: NodeId,
+    peer_route_commitments: &[[u8; 32]],
+    receiver_interest: &EventInterest,
+    selector_generation: u64,
+    emission: EmissionPolicySnapshot,
+) -> Result<RuntimeLocalEventSendPlan, NodeError> {
+    let claims = cached_sender_route_claims(store, event_guard.policy(), event_verifier)?;
+    let claims: BTreeMap<_, _> = claims
+        .into_iter()
+        .map(|claim| (claim.transfer_id, claim))
+        .collect();
+    let selected = match difference {
+        LocalEventSendDifference::Blind => claims
+            .values()
+            .filter(|claim| {
+                emission.policy.permits_event(claim.priority)
+                    && receiver_interest.matches(&claim.topic, &claim.scope)
+                    && event_verifier.peer_can_route(
+                        peer,
+                        peer_route_commitments,
+                        &claim.scope,
+                        claim.key_epoch,
+                    )
+            })
+            .map(|claim| claim.transfer_id)
+            .collect::<Vec<_>>(),
+        LocalEventSendDifference::Exact(ids) => ids.to_vec(),
+    };
+    let metadata = selected
+        .iter()
+        .filter_map(|id| {
+            let claim = claims.get(id)?;
+            Some(AuthenticatedEventMetadata {
+                id: *id,
+                acceptance_order: claim.acceptance_order,
+                priority: claim.priority,
+                ttl_ms: claim.ttl_ms,
+                tombstone: claim.tombstone,
+                source_bytes: claim.exact_len,
+            })
+        })
+        .collect::<Vec<_>>();
+    let priorities = [
+        Priority::Routine,
+        Priority::Priority,
+        Priority::Immediate,
+        Priority::Flash,
+    ];
+    let stored = priorities
+        .map(|priority| store.event_page_attempt_cursor(peer, priority))
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut valid_last = [None; 4];
+    for (index, cursor) in stored.iter().copied().enumerate() {
+        valid_last[index] = cursor
+            .filter(|cursor| {
+                cursor.selector_generation() == selector_generation
+                    && cursor.emission_generation() == emission.revision
+            })
+            .map(|cursor| EventPageSchedulePosition {
+                acceptance_order: cursor.acceptance_order(),
+                id: EventTransferId::new(cursor.last_attempted()),
+            });
+    }
+    let built = build_local_event_send_plan_with_limits(
+        direction,
+        profiles.digest,
+        &profiles.negotiated,
+        difference,
+        &metadata,
+        outbound_suppressed,
+        schedule_limits,
+        valid_last,
+    )
+    .map_err(|error| NodeError::Protocol(error.to_string()))?;
+    let cursor_updates = priorities
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, priority)| {
+            built.last_attempted_by_priority[index].map(|last| {
+                let attempt_sequence = stored[index].map_or(Ok(1), |cursor| {
+                    cursor.attempt_sequence().checked_add(1).ok_or_else(|| {
+                        NodeError::Protocol("Event-page attempt sequence overflow".into())
+                    })
+                })?;
+                Ok(EventPageAttemptCursorUpdate::new(
+                    priority,
+                    stored[index],
+                    EventPageAttemptCursor::new(
+                        *last.id.as_bytes(),
+                        last.acceptance_order,
+                        attempt_sequence,
+                        selector_generation,
+                        emission.revision,
+                    ),
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, NodeError>>()?;
+    Ok(RuntimeLocalEventSendPlan {
+        built,
+        cursor_updates,
+        schedule_limits,
+    })
+}
+
+fn split_directional_capacity(
+    total: usize,
+    to_responder_requested: usize,
+    to_initiator_requested: usize,
+) -> (usize, usize) {
+    let to_responder = to_responder_requested.min(total / 2);
+    let to_initiator = to_initiator_requested.min(total - to_responder);
+    let to_responder = to_responder_requested.min(total - to_initiator);
+    (to_responder, to_initiator)
+}
+
+fn split_active_resource(
+    total: usize,
+    to_responder_count: usize,
+    to_initiator_count: usize,
+) -> (usize, usize) {
+    match (to_responder_count != 0, to_initiator_count != 0) {
+        (true, true) => (total / 2, total - total / 2),
+        (true, false) => (total, 0),
+        (false, true) => (0, total),
+        (false, false) => (0, 0),
+    }
+}
+
+fn event_page_sender_target_entries() -> usize {
+    #[cfg(test)]
+    if let Ok(Some(target)) = TEST_CUSTODY_PREOPEN_RACES.try_with(|races| {
+        races.borrow().iter().find_map(|race| match race {
+            TestCustodyPreopenRace::EventPageTargetEntries(target) => Some(*target),
+            _ => None,
+        })
+    }) {
+        return target.clamp(1, EVENT_PAGE_SENDER_TARGET_ENTRIES);
+    }
+    EVENT_PAGE_SENDER_TARGET_ENTRIES
+}
+
+fn directional_event_schedule_limits(
+    receipt: &PeerReceipt,
+    to_responder_count: usize,
+    to_initiator_count: usize,
+    max_protected_frame_bytes: usize,
+) -> Result<(EventPageScheduleLimits, EventPageScheduleLimits), NodeError> {
+    let total_items = event_transfer_capacity(receipt, Some(SEMANTIC_PROTOCOL_V7))?;
+    let (to_responder_items, to_initiator_items) =
+        split_directional_capacity(total_items, to_responder_count, to_initiator_count);
+    let reserve = event_turn_reserve();
+    let used_frames = receipt
+        .handshake_frames
+        .checked_add(receipt.protected_frames)
+        .ok_or_else(|| NodeError::Protocol("contact frame count overflow".into()))?;
+    let total_frames = MAX_CONTACT_FRAMES
+        .checked_sub(used_frames)
+        .and_then(|frames| frames.checked_sub(reserve.protected_frames))
+        .and_then(|frames| frames.checked_sub(2))
+        .ok_or_else(|| {
+            NodeError::Protocol("contact lacks the Event plan/later-lane frame reserve".into())
+        })?;
+    let (to_responder_frames, to_initiator_frames) =
+        split_active_resource(total_frames, to_responder_count, to_initiator_count);
+    let used_bytes = receipt
+        .handshake_bytes
+        .checked_add(receipt.protected_bytes)
+        .ok_or_else(|| NodeError::Protocol("contact byte count overflow".into()))?;
+    let plan_bytes = EVENT_TURN_PLAN_MAX_PROTECTED_BYTES
+        .checked_mul(2)
+        .ok_or_else(|| NodeError::Protocol("Event plan byte reserve overflow".into()))?;
+    let total_turn_bytes = MAX_CONTACT_BYTES
+        .checked_sub(used_bytes)
+        .and_then(|bytes| bytes.checked_sub(reserve.protected_bytes))
+        .and_then(|bytes| bytes.checked_sub(plan_bytes))
+        .ok_or_else(|| {
+            NodeError::Protocol("contact lacks the Event plan/later-lane byte reserve".into())
+        })?;
+    let (to_responder_bytes, to_initiator_bytes) =
+        split_active_resource(total_turn_bytes, to_responder_count, to_initiator_count);
+    let limits = |item_capacity, frame_capacity, turn_bytes| EventPageScheduleLimits {
+        item_capacity,
+        frame_capacity,
+        turn_bytes,
+        max_protected_frame_bytes,
+        page_target_entries: event_page_sender_target_entries(),
+    };
+    Ok((
+        limits(to_responder_items, to_responder_frames, to_responder_bytes),
+        limits(to_initiator_items, to_initiator_frames, to_initiator_bytes),
+    ))
+}
+
 fn event_transfer_capacity(
     receipt: &PeerReceipt,
     post_event_semantic: Option<u16>,
@@ -16118,10 +17300,20 @@ fn take_test_custody_preopen_race(transfer_id: EventTransferId) -> Option<TestCu
                 | TestCustodyPreopenRace::RetryLimitExceeded(target)
                 | TestCustodyPreopenRace::RetryNotDue(target) => *target == transfer_id,
                 TestCustodyPreopenRace::ForceRouteOnly(_) => false,
-                TestCustodyPreopenRace::FinalPolicyChange => false,
-                TestCustodyPreopenRace::FinalCustodyPolicyChange => false,
-                TestCustodyPreopenRace::CountAuthorizations { .. } => false,
-                TestCustodyPreopenRace::HoldWriterAfterLease { .. } => false,
+                TestCustodyPreopenRace::FinalPolicyChange
+                | TestCustodyPreopenRace::FinalCustodyPolicyChange
+                | TestCustodyPreopenRace::CountAuthorizations { .. }
+                | TestCustodyPreopenRace::HoldWriterAfterLease { .. }
+                | TestCustodyPreopenRace::FinalPolicyChangeBeforeEventPage(_)
+                | TestCustodyPreopenRace::PageControlChangeBeforeEventPage { .. }
+                | TestCustodyPreopenRace::PageSelectorChangeBeforeEventPage { .. }
+                | TestCustodyPreopenRace::EventPageSourcePreparationDelayMs(_)
+                | TestCustodyPreopenRace::EventPageFinalPostBatchDelayMs(_)
+                | TestCustodyPreopenRace::EventPageTargetEntries(_)
+                | TestCustodyPreopenRace::FailEventPageReceiveAfterPages(_)
+                | TestCustodyPreopenRace::FailEventPageStoreBeforePages(_)
+                | TestCustodyPreopenRace::FailEventPageValidationAfterEntries(_)
+                | TestCustodyPreopenRace::ExhaustEventCapacityBeforePages(_) => false,
             })?;
             Some(races.remove(index))
         })
@@ -16153,7 +17345,17 @@ fn apply_test_expiry_before_scheduled_load(transfer_id: EventTransferId) -> Resu
                 TestCustodyPreopenRace::FinalPolicyChange
                 | TestCustodyPreopenRace::FinalCustodyPolicyChange
                 | TestCustodyPreopenRace::HoldWriterAfterLease { .. }
-                | TestCustodyPreopenRace::CountAuthorizations { .. } => None,
+                | TestCustodyPreopenRace::CountAuthorizations { .. }
+                | TestCustodyPreopenRace::FinalPolicyChangeBeforeEventPage(_)
+                | TestCustodyPreopenRace::PageControlChangeBeforeEventPage { .. }
+                | TestCustodyPreopenRace::PageSelectorChangeBeforeEventPage { .. }
+                | TestCustodyPreopenRace::EventPageSourcePreparationDelayMs(_)
+                | TestCustodyPreopenRace::EventPageFinalPostBatchDelayMs(_)
+                | TestCustodyPreopenRace::EventPageTargetEntries(_)
+                | TestCustodyPreopenRace::FailEventPageReceiveAfterPages(_)
+                | TestCustodyPreopenRace::FailEventPageStoreBeforePages(_)
+                | TestCustodyPreopenRace::FailEventPageValidationAfterEntries(_)
+                | TestCustodyPreopenRace::ExhaustEventCapacityBeforePages(_) => None,
             }
         })
         .ok()
@@ -16212,6 +17414,309 @@ fn apply_test_custody_policy_change_during_final_send(store: &Store) -> Result<(
         )
         .map_err(StoreError::from)?;
         store.set_custody_quota(quota)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn apply_test_event_page_source_preparation_delay() -> Result<(), NodeError> {
+    let delay_ms = TEST_CUSTODY_PREOPEN_RACES
+        .try_with(|races| {
+            races.borrow().iter().find_map(|race| match race {
+                TestCustodyPreopenRace::EventPageSourcePreparationDelayMs(delay_ms) => {
+                    Some(*delay_ms)
+                }
+                _ => None,
+            })
+        })
+        .ok()
+        .flatten();
+    let Some(delay_ms) = delay_ms else {
+        return Ok(());
+    };
+    CONTACT_EMISSION_GUARD
+        .try_with(|guard| {
+            let current = guard.custody_clock.sample()?;
+            let delayed = current
+                .tick_ms
+                .checked_add(delay_ms)
+                .ok_or_else(|| NodeError::Protocol("custody test delay overflowed".into()))?;
+            guard.custody_clock.set_injected_tick(delayed)
+        })
+        .map_err(|_| NodeError::Protocol("custody test hook lacks a contact clock".into()))??;
+    Ok(())
+}
+
+#[cfg(test)]
+fn apply_test_event_page_final_post_batch_delay() -> Result<(), NodeError> {
+    let delay_ms = TEST_CUSTODY_PREOPEN_RACES
+        .try_with(|races| {
+            races.borrow().iter().find_map(|race| match race {
+                TestCustodyPreopenRace::EventPageFinalPostBatchDelayMs(delay_ms) => Some(*delay_ms),
+                _ => None,
+            })
+        })
+        .ok()
+        .flatten();
+    let Some(delay_ms) = delay_ms else {
+        return Ok(());
+    };
+    CONTACT_EMISSION_GUARD
+        .try_with(|guard| {
+            let current = guard.custody_clock.sample()?;
+            let delayed = current
+                .tick_ms
+                .checked_add(delay_ms)
+                .ok_or_else(|| NodeError::Protocol("custody test delay overflowed".into()))?;
+            guard.custody_clock.set_injected_tick(delayed)
+        })
+        .map_err(|_| NodeError::Protocol("custody test hook lacks a contact clock".into()))??;
+    Ok(())
+}
+
+#[cfg(test)]
+fn apply_test_policy_change_before_event_page() -> Result<(), NodeError> {
+    let change = TEST_CUSTODY_PREOPEN_RACES
+        .try_with(|races| {
+            let mut races = races.borrow_mut();
+            let index = races.iter().position(|race| {
+                matches!(
+                    race,
+                    TestCustodyPreopenRace::FinalPolicyChangeBeforeEventPage(_)
+                )
+            })?;
+            let TestCustodyPreopenRace::FinalPolicyChangeBeforeEventPage(remaining) =
+                &mut races[index]
+            else {
+                unreachable!("matched page policy-change hook")
+            };
+            if *remaining <= 1 {
+                races.remove(index);
+                Some(true)
+            } else {
+                *remaining -= 1;
+                Some(false)
+            }
+        })
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+    if change {
+        CONTACT_EMISSION_GUARD
+            .try_with(|guard| guard.live.update(EventEmissionPolicy::ReceiveOnly))
+            .map_err(|_| {
+                NodeError::Protocol("page policy hook lacks a contact emission guard".into())
+            })??;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn apply_test_page_boundary_state_change(
+    store: &Store,
+    event_verifier: &mut ReferenceEnvelopeSealer,
+) -> Result<(), NodeError> {
+    let action = TEST_CUSTODY_PREOPEN_RACES
+        .try_with(|races| {
+            let mut races = races.borrow_mut();
+            let index = races.iter().position(|race| {
+                matches!(
+                    race,
+                    TestCustodyPreopenRace::PageControlChangeBeforeEventPage { .. }
+                        | TestCustodyPreopenRace::PageSelectorChangeBeforeEventPage { .. }
+                )
+            })?;
+            let remaining = match &mut races[index] {
+                TestCustodyPreopenRace::PageControlChangeBeforeEventPage { remaining, .. }
+                | TestCustodyPreopenRace::PageSelectorChangeBeforeEventPage { remaining, .. } => {
+                    remaining
+                }
+                _ => unreachable!("matched page state-change hook"),
+            };
+            if *remaining <= 1 {
+                Some(races.remove(index))
+            } else {
+                *remaining -= 1;
+                None
+            }
+        })
+        .ok()
+        .flatten();
+    match action {
+        Some(TestCustodyPreopenRace::PageControlChangeBeforeEventPage {
+            authority,
+            transfer_id,
+            exact,
+            ..
+        }) => {
+            accept_received_control(store, event_verifier, authority, transfer_id, &exact)?;
+        }
+        Some(TestCustodyPreopenRace::PageSelectorChangeBeforeEventPage {
+            topic,
+            scope,
+            key,
+            ..
+        }) => {
+            let policy = store.control_policy_snapshot()?;
+            store.create_event_subscription_with_policy(
+                &policy,
+                &EventSubscriptionKey::new(key).map_err(NodeError::Store)?,
+                EventSubscriptionSpec {
+                    mode: EventSubscriptionMode::Carry,
+                    topic,
+                    scope,
+                    include_descendant_scopes: false,
+                },
+            )?;
+        }
+        Some(_) | None => {}
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn apply_test_event_page_storage_failure_before_receive() -> Result<(), NodeError> {
+    let fail = TEST_CUSTODY_PREOPEN_RACES
+        .try_with(|races| {
+            let mut races = races.borrow_mut();
+            let index = races.iter().position(|race| {
+                matches!(
+                    race,
+                    TestCustodyPreopenRace::FailEventPageStoreBeforePages(_)
+                )
+            })?;
+            let TestCustodyPreopenRace::FailEventPageStoreBeforePages(remaining) =
+                &mut races[index]
+            else {
+                unreachable!("matched Event-page storage hook")
+            };
+            if *remaining <= 1 {
+                races.remove(index);
+                Some(true)
+            } else {
+                *remaining -= 1;
+                Some(false)
+            }
+        })
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+    if fail {
+        return Err(NodeError::Store(StoreError::ItemLimitExceeded {
+            current: 1,
+            limit: 1,
+        }));
+    }
+    Ok(())
+}
+#[cfg(test)]
+fn apply_test_event_page_validation_failure() -> Result<(), NodeError> {
+    let fail = TEST_CUSTODY_PREOPEN_RACES
+        .try_with(|races| {
+            let mut races = races.borrow_mut();
+            let index = races.iter().position(|race| {
+                matches!(
+                    race,
+                    TestCustodyPreopenRace::FailEventPageValidationAfterEntries(_)
+                )
+            })?;
+            let TestCustodyPreopenRace::FailEventPageValidationAfterEntries(remaining) =
+                &mut races[index]
+            else {
+                unreachable!("matched Event-page validation hook")
+            };
+            if *remaining <= 1 {
+                races.remove(index);
+                Some(true)
+            } else {
+                *remaining -= 1;
+                Some(false)
+            }
+        })
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+    if fail {
+        return Err(NodeError::Protocol(
+            "injected Event page validation failure".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn apply_test_event_page_capacity_exhaustion_before_receive(
+    receipt: &mut PeerReceipt,
+) -> Result<(), NodeError> {
+    let exhaust = TEST_CUSTODY_PREOPEN_RACES
+        .try_with(|races| {
+            let mut races = races.borrow_mut();
+            let index = races.iter().position(|race| {
+                matches!(
+                    race,
+                    TestCustodyPreopenRace::ExhaustEventCapacityBeforePages(_)
+                )
+            })?;
+            let TestCustodyPreopenRace::ExhaustEventCapacityBeforePages(remaining) =
+                &mut races[index]
+            else {
+                unreachable!("matched Event-page capacity hook")
+            };
+            if *remaining <= 1 {
+                races.remove(index);
+                Some(true)
+            } else {
+                *remaining -= 1;
+                Some(false)
+            }
+        })
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+    if exhaust {
+        let event_item_bound = MAX_CONTACT_ITEMS
+            .checked_sub(event_turn_reserve().items)
+            .ok_or_else(|| NodeError::Protocol("Event reserve exceeds contact bound".into()))?;
+        receipt.fetched = event_item_bound
+            .checked_sub(receipt.offered)
+            .ok_or_else(|| {
+                NodeError::Protocol("test Event capacity hook exceeds its item bound".into())
+            })?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn apply_test_event_page_failure_after_receive() -> Result<(), NodeError> {
+    let fail = TEST_CUSTODY_PREOPEN_RACES
+        .try_with(|races| {
+            let mut races = races.borrow_mut();
+            let index = races.iter().position(|race| {
+                matches!(
+                    race,
+                    TestCustodyPreopenRace::FailEventPageReceiveAfterPages(_)
+                )
+            })?;
+            let TestCustodyPreopenRace::FailEventPageReceiveAfterPages(remaining) =
+                &mut races[index]
+            else {
+                unreachable!("matched Event-page interruption hook")
+            };
+            if *remaining <= 1 {
+                races.remove(index);
+                Some(true)
+            } else {
+                *remaining -= 1;
+                Some(false)
+            }
+        })
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+    if fail {
+        return Err(NodeError::Protocol(
+            "injected receiver interruption after durable Event page apply".into(),
+        ));
     }
     Ok(())
 }
@@ -16350,11 +17855,27 @@ async fn send_v3_offer(
         Some(TestCustodyPreopenRace::HoldWriterAfterLease { .. }) => {
             unreachable!("writer holds are applied after lease acquisition")
         }
+        Some(TestCustodyPreopenRace::FinalPolicyChangeBeforeEventPage(_)) => {
+            unreachable!("page policy change is applied at the page-adjacent check")
+        }
         Some(TestCustodyPreopenRace::ForceRouteOnly(_)) => {
             unreachable!("route-only receive hook is not a sender pre-open race")
         }
         Some(TestCustodyPreopenRace::CountAuthorizations { .. }) => {
             unreachable!("authorization counters are not pre-open races")
+        }
+        Some(
+            TestCustodyPreopenRace::PageControlChangeBeforeEventPage { .. }
+            | TestCustodyPreopenRace::PageSelectorChangeBeforeEventPage { .. }
+            | TestCustodyPreopenRace::EventPageSourcePreparationDelayMs(_)
+            | TestCustodyPreopenRace::EventPageFinalPostBatchDelayMs(_)
+            | TestCustodyPreopenRace::EventPageTargetEntries(_)
+            | TestCustodyPreopenRace::FailEventPageReceiveAfterPages(_)
+            | TestCustodyPreopenRace::FailEventPageValidationAfterEntries(_)
+            | TestCustodyPreopenRace::FailEventPageStoreBeforePages(_)
+            | TestCustodyPreopenRace::ExhaustEventCapacityBeforePages(_),
+        ) => {
+            unreachable!("Event-page hook is not a custody race")
         }
         None => None,
     };
@@ -16408,6 +17929,932 @@ async fn send_v3_offer(
     Ok(V3OfferOutcome::Applied(inserted))
 }
 
+// Provisional implementation-local packing target. It is neither advertised
+// nor receiver-enforced and must be tuned only from retained device evidence.
+const EVENT_PAGE_SENDER_TARGET_ENTRIES: usize = 256;
+// Finite-TTL entries carry per-object custody evidence prepared and rechecked
+// in page-scoped local batches. This provisional sender packing target is not a
+// measured safety threshold, negotiated value, or receiver-enforced limit.
+const FINITE_EVENT_PAGE_SENDER_TARGET_ENTRIES: usize = 16;
+const EVENT_TURN_PLAN_MAX_PROTECTED_BYTES: usize = crate::frame::MECHANICS_FRAME_PREFIX_BYTES
+    + MAX_EVENT_TURN_PLAN_CODEC_BYTES
+    + REFERENCE_SESSION_FRAME_OVERHEAD_BYTES;
+
+fn record_receiptful_event_offer(receipt: &mut PeerReceipt) -> Result<(), NodeError> {
+    receipt.receiptful_event_offers = receipt
+        .receiptful_event_offers
+        .checked_add(1)
+        .ok_or_else(|| NodeError::Protocol("receiptful Event offer count overflow".into()))?;
+    receipt.offered = receipt
+        .offered
+        .checked_add(1)
+        .ok_or_else(|| NodeError::Protocol("offered Event count overflow".into()))?;
+    Ok(())
+}
+
+fn event_turn_reserve() -> ContactReserve {
+    post_event_reserve(SEMANTIC_PROTOCOL_V7).unwrap_or_default()
+}
+
+fn event_turn_wire_budget(
+    receipt: &PeerReceipt,
+    reserve: ContactReserve,
+) -> Result<usize, NodeError> {
+    let used = receipt
+        .handshake_bytes
+        .checked_add(receipt.protected_bytes)
+        .ok_or_else(|| NodeError::Protocol("contact byte count overflow".into()))?;
+    MAX_CONTACT_BYTES
+        .checked_sub(used)
+        .and_then(|bytes| bytes.checked_sub(reserve.protected_bytes))
+        .filter(|bytes| *bytes > 0)
+        .ok_or_else(|| {
+            NodeError::Protocol("contact lacks bytes after the later-lane reserve".into())
+        })
+}
+
+fn event_turn_receive_wire_budget(
+    receipt: &PeerReceipt,
+    reserve: ContactReserve,
+    limits: EventPageScheduleLimits,
+) -> Result<usize, NodeError> {
+    let directional = event_turn_wire_budget(receipt, reserve)?.min(limits.turn_bytes);
+    if directional == 0 {
+        return Err(NodeError::Protocol(
+            "Event direction has no receive byte budget".into(),
+        ));
+    }
+    Ok(directional)
+}
+
+fn account_event_turn_received_frame(
+    frames_read: &mut usize,
+    limits: EventPageScheduleLimits,
+) -> Result<(), NodeError> {
+    if *frames_read >= limits.frame_capacity {
+        return Err(NodeError::Protocol(
+            "Event turn exceeds its direction-local frame budget".into(),
+        ));
+    }
+    *frames_read = frames_read
+        .checked_add(1)
+        .ok_or_else(|| NodeError::Protocol("Event turn frame count overflow".into()))?;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "carrier-adjacent authorization, budget, and final-write callback inputs stay explicit"
+)]
+async fn write_v7_event_turn_frame_checked<F>(
+    turn: &mut SendUniTurn,
+    store: &Store,
+    mission: &mut MissionSession,
+    event_guard: &EventLaneGuard,
+    profiles: &V7TransferProfiles,
+    direction: EventDirection,
+    frame: Frame,
+    reserve: ContactReserve,
+    receipt: &mut PeerReceipt,
+    before_write: F,
+) -> Result<(), NodeError>
+where
+    F: FnOnce() -> Result<(), NodeError>,
+{
+    event_guard.check(store)?;
+    require_contact_frame_initiation()?;
+    let profile = profiles
+        .negotiated
+        .profile(LaneId::Event)
+        .ok_or_else(|| NodeError::Protocol("Event lane has no negotiated profile".into()))?;
+    let plaintext = frame.encode_for_semantic_version(mission.semantic_version())?;
+    let expected_wire_bytes = plaintext
+        .len()
+        .checked_add(REFERENCE_SESSION_FRAME_OVERHEAD_BYTES)
+        .ok_or_else(|| NodeError::Protocol("protected Event frame length overflow".into()))?;
+    check_protected_frame_with_reserve(receipt, expected_wire_bytes, reserve)?;
+    let protected = mission.seal_v7_application_frame(
+        profiles.digest,
+        LaneId::Event,
+        profile,
+        direction,
+        &plaintext,
+    )?;
+    if protected.len() != expected_wire_bytes {
+        return Err(NodeError::Protocol(
+            "reference-session Event protection overhead changed".into(),
+        ));
+    }
+    turn.write_frame_checked(&protected, || {
+        #[cfg(test)]
+        apply_test_policy_change_during_final_send()?;
+        event_guard.check(store)?;
+        require_contact_frame_initiation()?;
+        check_protected_frame_with_reserve(receipt, protected.len(), reserve)?;
+        before_write()
+    })
+    .await?;
+    account_outbound_protected_frame(receipt, protected.len())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "carrier-adjacent authorization and budget inputs stay explicit"
+)]
+async fn write_v7_event_turn_frame(
+    turn: &mut SendUniTurn,
+    store: &Store,
+    mission: &mut MissionSession,
+    event_guard: &EventLaneGuard,
+    profiles: &V7TransferProfiles,
+    direction: EventDirection,
+    frame: Frame,
+    reserve: ContactReserve,
+    receipt: &mut PeerReceipt,
+) -> Result<(), NodeError> {
+    write_v7_event_turn_frame_checked(
+        turn,
+        store,
+        mission,
+        event_guard,
+        profiles,
+        direction,
+        frame,
+        reserve,
+        receipt,
+        || Ok(()),
+    )
+    .await
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "carrier-adjacent authorization and budget inputs stay explicit"
+)]
+async fn read_v7_event_turn_frame(
+    turn: &mut ReceiveUniTurn,
+    store: &Store,
+    mission: &mut MissionSession,
+    event_guard: &EventLaneGuard,
+    profiles: &V7TransferProfiles,
+    direction: EventDirection,
+    reserve: ContactReserve,
+    limits: EventPageScheduleLimits,
+    frames_read: &mut usize,
+    receipt: &mut PeerReceipt,
+) -> Result<Frame, NodeError> {
+    let protected = turn.read_frame().await?.ok_or_else(|| {
+        NodeError::Protocol("Event page turn ended before its terminal frame".into())
+    })?;
+    if protected.len() > limits.max_protected_frame_bytes {
+        return Err(NodeError::Protocol(
+            "Event frame exceeds its direction-local carrier bound".into(),
+        ));
+    }
+    account_event_turn_received_frame(frames_read, limits)?;
+    check_protected_frame_with_reserve(receipt, protected.len(), reserve)?;
+    event_guard.check(store)?;
+    require_contact_policy_current()?;
+    let profile = profiles
+        .negotiated
+        .profile(LaneId::Event)
+        .ok_or_else(|| NodeError::Protocol("Event lane has no negotiated profile".into()))?;
+    let plaintext = mission.open_v7_application_frame(
+        profiles.digest,
+        LaneId::Event,
+        profile,
+        direction,
+        &protected,
+    )?;
+    let frame = Frame::decode_for_semantic_version(&plaintext, mission.semantic_version())?;
+    account_inbound_protected_frame(receipt, protected.len())?;
+    Ok(frame)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "page progress, authorization, budget, and final-write callback inputs stay explicit"
+)]
+async fn write_change_page<F>(
+    turn: &mut SendUniTurn,
+    store: &Store,
+    mission: &mut MissionSession,
+    event_guard: &EventLaneGuard,
+    profiles: &V7TransferProfiles,
+    direction: EventDirection,
+    schedule_digest: [u8; 32],
+    page_number: usize,
+    entries: Vec<ChangePageEntry>,
+    consumed: usize,
+    scheduled_count: usize,
+    reserve: ContactReserve,
+    receipt: &mut PeerReceipt,
+    before_write: F,
+) -> Result<(), NodeError>
+where
+    F: FnOnce() -> Result<(), NodeError>,
+{
+    let remaining = scheduled_count
+        .checked_sub(consumed)
+        .ok_or_else(|| NodeError::Protocol("Event page progress exceeds its schedule".into()))?;
+    let entry_count = entries.len();
+    let source_bytes = entries.iter().try_fold(0usize, |total, entry| {
+        total
+            .checked_add(entry.source_event.len())
+            .ok_or_else(|| NodeError::Protocol("Event page source byte count overflow".into()))
+    })?;
+    write_v7_event_turn_frame_checked(
+        turn,
+        store,
+        mission,
+        event_guard,
+        profiles,
+        direction,
+        Frame::ChangePage(ChangePageV7 {
+            direction,
+            transfer_profile_digest: profiles.digest,
+            schedule_digest,
+            page_number: u32::try_from(page_number)
+                .map_err(|_| NodeError::Protocol("Event page count exceeds u32".into()))?,
+            entries,
+            remaining: u32::try_from(remaining)
+                .map_err(|_| NodeError::Protocol("remaining Event count exceeds u32".into()))?,
+        }),
+        reserve,
+        receipt,
+        before_write,
+    )
+    .await?;
+    receipt.event_pages_sent = receipt
+        .event_pages_sent
+        .checked_add(1)
+        .ok_or_else(|| NodeError::Protocol("Event page send count overflow".into()))?;
+    receipt.event_page_entries_sent = receipt
+        .event_page_entries_sent
+        .checked_add(entry_count)
+        .ok_or_else(|| NodeError::Protocol("Event page entry send count overflow".into()))?;
+    receipt.event_page_bytes_sent = receipt
+        .event_page_bytes_sent
+        .checked_add(source_bytes)
+        .ok_or_else(|| NodeError::Protocol("Event page source byte send count overflow".into()))?;
+    Ok(())
+}
+
+fn revalidate_event_page_schedule(
+    store: &Store,
+    event_verifier: &mut ReferenceEnvelopeSealer,
+    lane: DirectedEventLane<'_>,
+    scheduled: &[AuthenticatedEventMetadata],
+    authenticated_peer: NodeId,
+    peer_route_commitments: &[[u8; 32]],
+) -> Result<(), NodeError> {
+    lane.guard.check(store)?;
+    let emission = contact_policy_or_normal()?;
+    let candidates = cached_sender_route_claims(store, lane.guard.policy(), event_verifier)?
+        .into_iter()
+        .map(|candidate| (candidate.transfer_id, candidate))
+        .collect::<BTreeMap<_, _>>();
+    for metadata in scheduled {
+        let candidate = candidates.get(&metadata.id).ok_or_else(|| {
+            NodeError::Protocol(
+                "scheduled Event disappeared before page-header authorization".into(),
+            )
+        })?;
+        if candidate.acceptance_order != metadata.acceptance_order
+            || candidate.priority != metadata.priority
+            || candidate.ttl_ms != metadata.ttl_ms
+            || candidate.tombstone != metadata.tombstone
+            || candidate.exact_len != metadata.source_bytes
+        {
+            return Err(NodeError::Protocol(
+                "scheduled Event metadata changed before page-header authorization".into(),
+            ));
+        }
+        if !emission.policy.permits_event(candidate.priority) {
+            return Err(NodeError::EmissionPolicyChanged);
+        }
+        if !lane
+            .receiver_interest
+            .matches(&candidate.topic, &candidate.scope)
+            || !event_verifier.peer_can_route(
+                authenticated_peer,
+                peer_route_commitments,
+                &candidate.scope,
+                candidate.key_epoch,
+            )
+        {
+            return Err(NodeError::Protocol(
+                "scheduled Event lost receiver-relative route authorization before header".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "directional authorization, carrier, plan, and accounting inputs stay explicit"
+)]
+async fn send_event_page_turn(
+    store: &Store,
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    event_verifier: &mut ReferenceEnvelopeSealer,
+    lane: DirectedEventLane<'_>,
+    profiles: &V7TransferProfiles,
+    local_plan: &RuntimeLocalEventSendPlan,
+    exchanges: &mut CustodyExchangeSequence,
+    receipt: &mut PeerReceipt,
+) -> Result<(), NodeError> {
+    let built = &local_plan.built;
+    let (direction, transfer_profile_digest, set_commitment, scheduled_count) = match &built.plan {
+        EventTurnPlanV1::PageActive {
+            direction,
+            transfer_profile_digest,
+            set_commitment,
+            scheduled_count,
+            ..
+        } => (
+            *direction,
+            *transfer_profile_digest,
+            *set_commitment,
+            *scheduled_count,
+        ),
+        EventTurnPlanV1::PageBlindActive {
+            direction,
+            transfer_profile_digest,
+            scheduled_count,
+            ..
+        } => (
+            *direction,
+            *transfer_profile_digest,
+            blind_set_commitment(),
+            *scheduled_count,
+        ),
+        _ => {
+            return Err(NodeError::Protocol(
+                "receipt-free Event sender requires an active page plan".into(),
+            ));
+        }
+    };
+    if direction != lane.direction || transfer_profile_digest != profiles.digest {
+        return Err(NodeError::Protocol(
+            "local Event page plan differs from its authenticated direction".into(),
+        ));
+    }
+    let scheduled_count = usize::try_from(scheduled_count)
+        .map_err(|_| NodeError::Protocol("scheduled Event count exceeds usize".into()))?;
+    if built.scheduled.len() != scheduled_count
+        || built.scheduled_metadata.len() != scheduled_count
+        || scheduled_count == 0
+    {
+        return Err(NodeError::Protocol(
+            "local Event page schedule differs from its committed count".into(),
+        ));
+    }
+    let reserve = event_turn_reserve();
+    let deadline = tokio::time::Instant::now() + CONTACT_DEADLINE;
+    let mut turn = connection
+        .open_send_uni(deadline, event_turn_wire_budget(receipt, reserve)?)
+        .await?;
+    let digest = schedule_digest(&built.scheduled);
+    let authenticated_peer = mission.peer().mission_id();
+    let peer_route_commitments = mission.peer_route_grant_commitments().to_vec();
+    write_v7_event_turn_frame_checked(
+        &mut turn,
+        store,
+        mission,
+        lane.guard,
+        profiles,
+        direction,
+        Frame::ChangeTurnHeader(ChangeTurnHeaderV1 {
+            direction,
+            transfer_profile_digest: profiles.digest,
+            set_commitment,
+            scheduled: built.scheduled.clone(),
+            schedule_digest: digest,
+        }),
+        reserve,
+        receipt,
+        || {
+            revalidate_event_page_schedule(
+                store,
+                event_verifier,
+                lane,
+                &built.scheduled_metadata,
+                authenticated_peer,
+                &peer_route_commitments,
+            )?;
+            if !store.compare_and_advance_event_page_attempt_cursors(
+                authenticated_peer,
+                &local_plan.cursor_updates,
+            )? {
+                return Err(NodeError::Protocol(
+                    "Event-page attempt cursor changed before header emission".into(),
+                ));
+            }
+            Ok(())
+        },
+    )
+    .await?;
+
+    let max_page_codec_bytes = local_plan
+        .schedule_limits
+        .max_protected_frame_bytes
+        .checked_sub(crate::frame::MECHANICS_FRAME_PREFIX_BYTES)
+        .and_then(|bytes| bytes.checked_sub(REFERENCE_SESSION_FRAME_OVERHEAD_BYTES))
+        .map(|bytes| bytes.min(MAX_CHANGE_PAGE_CODEC_BYTES))
+        .ok_or_else(|| NodeError::Protocol("carrier frame bound cannot hold Event pages".into()))?;
+    let page_target_entries = local_plan.schedule_limits.page_target_entries;
+    let mut loaded_entries = Vec::new();
+    let mut page_contains_finite = false;
+    let mut encoded_bytes = CHANGE_PAGE_FIXED_BYTES;
+    let mut consumed = 0usize;
+    let mut page_number = 0usize;
+    for metadata in &built.scheduled_metadata {
+        let source_bytes = usize::try_from(metadata.source_bytes)
+            .map_err(|_| NodeError::Protocol("Event source length exceeds usize".into()))?;
+        let finite = metadata.ttl_ms.is_some() && !metadata.tombstone;
+        let custody_reserve = if finite {
+            10usize
+                .checked_add(MAX_CUSTODY_WRAPPER_BYTES)
+                .ok_or_else(|| NodeError::Protocol("custody wrapper size overflow".into()))?
+        } else {
+            0
+        };
+        let planned_entry_bytes = CHANGE_PAGE_ENTRY_FIXED_BYTES
+            .checked_add(source_bytes)
+            .and_then(|bytes| bytes.checked_add(custody_reserve))
+            .ok_or_else(|| NodeError::Protocol("Event page entry length overflow".into()))?;
+        let effective_page_target_entries = if finite || page_contains_finite {
+            page_target_entries.min(FINITE_EVENT_PAGE_SENDER_TARGET_ENTRIES)
+        } else {
+            page_target_entries
+        };
+        if !loaded_entries.is_empty()
+            && (loaded_entries.len() >= effective_page_target_entries
+                || encoded_bytes
+                    .checked_add(planned_entry_bytes)
+                    .is_none_or(|bytes| bytes > max_page_codec_bytes))
+        {
+            let prepared = prepare_loaded_event_page_entries(
+                store,
+                mission,
+                exchanges,
+                std::mem::take(&mut loaded_entries),
+            )?;
+            let PreparedEventPage {
+                entries: page_entries,
+                metadata: checked_metadata,
+                custody: checked_custody,
+            } = prepared;
+            require_event_page_entries_fit(&page_entries, max_page_codec_bytes)?;
+            write_change_page(
+                &mut turn,
+                store,
+                mission,
+                lane.guard,
+                profiles,
+                direction,
+                digest,
+                page_number,
+                page_entries,
+                consumed,
+                scheduled_count,
+                reserve,
+                receipt,
+                || {
+                    #[cfg(test)]
+                    {
+                        apply_test_page_boundary_state_change(store, event_verifier)?;
+                        apply_test_policy_change_before_event_page()?;
+                    }
+                    revalidate_event_page_schedule(
+                        store,
+                        event_verifier,
+                        lane,
+                        &checked_metadata,
+                        authenticated_peer,
+                        &peer_route_commitments,
+                    )?;
+                    require_event_page_final_send(store, &checked_custody)
+                },
+            )
+            .await?;
+            page_number += 1;
+            encoded_bytes = CHANGE_PAGE_FIXED_BYTES;
+            page_contains_finite = false;
+        }
+        lane.guard.check(store)?;
+        let (verified, bytes, state) = load_verified_transfer_for_peer_with_claims(
+            store,
+            lane.guard.policy(),
+            event_verifier,
+            metadata.id,
+            authenticated_peer,
+            &peer_route_commitments,
+            lane.receiver_interest,
+        )?;
+        if bytes.len() != source_bytes
+            || verified.ttl_ms() != metadata.ttl_ms
+            || verified.tombstone() != metadata.tombstone
+            || EventTransferId::new(verified.envelope_id()) != metadata.id
+        {
+            return Err(NodeError::Protocol(
+                "scheduled Event no longer satisfies its authenticated page plan".into(),
+            ));
+        }
+        #[cfg(test)]
+        apply_test_event_page_source_preparation_delay()?;
+        if encoded_bytes
+            .checked_add(planned_entry_bytes)
+            .is_none_or(|bytes| bytes > max_page_codec_bytes)
+        {
+            return Err(NodeError::Protocol(
+                "scheduled Event does not fit its authenticated page budget".into(),
+            ));
+        }
+        encoded_bytes = encoded_bytes
+            .checked_add(planned_entry_bytes)
+            .ok_or_else(|| NodeError::Protocol("Event page length overflow".into()))?;
+        loaded_entries.push(LoadedEventPageEntry {
+            metadata: *metadata,
+            verified,
+            state,
+            source_event: bytes,
+        });
+        page_contains_finite |= finite;
+        consumed += 1;
+    }
+    if !loaded_entries.is_empty() {
+        let PreparedEventPage {
+            entries,
+            metadata: page_metadata,
+            custody: page_custody,
+        } = prepare_loaded_event_page_entries(store, mission, exchanges, loaded_entries)?;
+        require_event_page_entries_fit(&entries, max_page_codec_bytes)?;
+        write_change_page(
+            &mut turn,
+            store,
+            mission,
+            lane.guard,
+            profiles,
+            direction,
+            digest,
+            page_number,
+            entries,
+            consumed,
+            scheduled_count,
+            reserve,
+            receipt,
+            || {
+                #[cfg(test)]
+                {
+                    apply_test_page_boundary_state_change(store, event_verifier)?;
+                    apply_test_policy_change_before_event_page()?;
+                }
+                revalidate_event_page_schedule(
+                    store,
+                    event_verifier,
+                    lane,
+                    &page_metadata,
+                    authenticated_peer,
+                    &peer_route_commitments,
+                )?;
+                require_event_page_final_send(store, &page_custody)
+            },
+        )
+        .await?;
+        page_number += 1;
+    }
+    write_v7_event_turn_frame(
+        &mut turn,
+        store,
+        mission,
+        lane.guard,
+        profiles,
+        direction,
+        Frame::ChangeTurnFinished(ChangeTurnFinishedV1 {
+            direction,
+            transfer_profile_digest: profiles.digest,
+            set_commitment,
+            schedule_digest: digest,
+            final_page_count: u32::try_from(page_number)
+                .map_err(|_| NodeError::Protocol("Event page count exceeds u32".into()))?,
+        }),
+        reserve,
+        receipt,
+    )
+    .await?;
+    turn.finish().await?;
+    receipt.event_uni_turns_sent = receipt
+        .event_uni_turns_sent
+        .checked_add(1)
+        .ok_or_else(|| NodeError::Protocol("Event uni-turn send count overflow".into()))?;
+    receipt.offered = receipt
+        .offered
+        .checked_add(scheduled_count)
+        .ok_or_else(|| NodeError::Protocol("offered Event count overflow".into()))?;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "directional authorization, carrier, plan, and accounting inputs stay explicit"
+)]
+async fn receive_event_page_turn(
+    store: &Store,
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    event_verifier: &mut ReferenceEnvelopeSealer,
+    lane: DirectedEventLane<'_>,
+    profiles: &V7TransferProfiles,
+    remote_plan: &EventTurnPlanV1,
+    limits: EventPageScheduleLimits,
+    authenticated_missing: &[EventTransferId],
+    expected_sender_policy_revision: u64,
+    receipt: &mut PeerReceipt,
+) -> Result<(), NodeError> {
+    let (direction, transfer_profile_digest, set_commitment, scheduled_count, blind) =
+        match remote_plan {
+            EventTurnPlanV1::PageActive {
+                direction,
+                transfer_profile_digest,
+                set_commitment,
+                scheduled_count,
+                ..
+            } => (
+                *direction,
+                *transfer_profile_digest,
+                *set_commitment,
+                *scheduled_count,
+                false,
+            ),
+            EventTurnPlanV1::PageBlindActive {
+                direction,
+                transfer_profile_digest,
+                scheduled_count,
+                ..
+            } => (
+                *direction,
+                *transfer_profile_digest,
+                blind_set_commitment(),
+                *scheduled_count,
+                true,
+            ),
+            _ => {
+                return Err(NodeError::Protocol(
+                    "receipt-free Event receiver requires an active page plan".into(),
+                ));
+            }
+        };
+    if direction != lane.direction || transfer_profile_digest != profiles.digest {
+        return Err(NodeError::Protocol(
+            "remote Event page plan differs from its authenticated direction".into(),
+        ));
+    }
+    let scheduled_count = usize::try_from(scheduled_count)
+        .map_err(|_| NodeError::Protocol("scheduled Event count exceeds usize".into()))?;
+    let reserve = event_turn_reserve();
+    let deadline = tokio::time::Instant::now() + CONTACT_DEADLINE;
+    let mut turn = connection
+        .accept_uni(
+            deadline,
+            event_turn_receive_wire_budget(receipt, reserve, limits)?,
+        )
+        .await?;
+    let mut frames_read = 0usize;
+    let header = read_v7_event_turn_frame(
+        &mut turn,
+        store,
+        mission,
+        lane.guard,
+        profiles,
+        lane.direction,
+        reserve,
+        limits,
+        &mut frames_read,
+        receipt,
+    )
+    .await?;
+    let Frame::ChangeTurnHeader(header) = header else {
+        return Err(NodeError::Protocol(
+            "Event page turn did not begin with its committed header".into(),
+        ));
+    };
+    if header.direction != lane.direction
+        || header.transfer_profile_digest != profiles.digest
+        || header.set_commitment != set_commitment
+        || header.scheduled.len() != scheduled_count
+    {
+        return Err(NodeError::Protocol(
+            "Event page header differs from its validated turn plan".into(),
+        ));
+    }
+    let allowed: BTreeSet<_> = authenticated_missing.iter().copied().collect();
+    if !blind && header.scheduled.iter().any(|id| !allowed.contains(id)) {
+        return Err(NodeError::Protocol(
+            "Event page schedule contains an ID outside the authenticated difference".into(),
+        ));
+    }
+    let expected_schedule_digest = schedule_digest(&header.scheduled);
+    if header.schedule_digest != expected_schedule_digest {
+        return Err(NodeError::Protocol(
+            "Event page schedule digest differs".into(),
+        ));
+    }
+
+    let authenticated_peer = mission.peer().mission_id();
+    let peer_route_commitments = mission.peer_route_grant_commitments().to_vec();
+    let mut consumed = 0usize;
+    let mut page_count = 0usize;
+    loop {
+        let frame = read_v7_event_turn_frame(
+            &mut turn,
+            store,
+            mission,
+            lane.guard,
+            profiles,
+            lane.direction,
+            reserve,
+            limits,
+            &mut frames_read,
+            receipt,
+        )
+        .await?;
+        match frame {
+            Frame::ChangePage(page) => {
+                if page.direction != lane.direction
+                    || page.transfer_profile_digest != profiles.digest
+                    || page.schedule_digest != expected_schedule_digest
+                    || usize::try_from(page.page_number).ok() != Some(page_count)
+                {
+                    return Err(NodeError::Protocol(
+                        "Event page crossed its committed turn context".into(),
+                    ));
+                }
+                let next_consumed = consumed
+                    .checked_add(page.entries.len())
+                    .ok_or_else(|| NodeError::Protocol("Event page progress overflow".into()))?;
+                if next_consumed > header.scheduled.len()
+                    || usize::try_from(page.remaining).ok()
+                        != Some(header.scheduled.len() - next_consumed)
+                {
+                    return Err(NodeError::Protocol(
+                        "Event page remaining count differs from its schedule".into(),
+                    ));
+                }
+                #[cfg(test)]
+                {
+                    apply_test_event_page_storage_failure_before_receive()?;
+                    apply_test_event_page_capacity_exhaustion_before_receive(receipt)?;
+                }
+                let custody_context = if page.entries.iter().any(|entry| entry.custody.is_some()) {
+                    require_contact_policy_current()?;
+                    Some(PageCustodyApplyContext {
+                        policy_revision: store.custody_policy_revision()?,
+                        receiver_sample: contact_custody_sample()?.ok_or_else(|| {
+                            NodeError::Protocol(
+                                "Event-page custody admission lacks a receiver clock sample".into(),
+                            )
+                        })?,
+                    })
+                } else {
+                    None
+                };
+                let mut prepared = Vec::with_capacity(page.entries.len());
+                let mut capacity_receipt = receipt.clone();
+                for (entry, expected_id) in page
+                    .entries
+                    .iter()
+                    .zip(&header.scheduled[consumed..next_consumed])
+                {
+                    #[cfg(test)]
+                    apply_test_event_page_validation_failure()?;
+                    if entry.id != *expected_id {
+                        return Err(NodeError::Protocol(
+                            "Event page entry order differs from its committed schedule".into(),
+                        ));
+                    }
+                    lane.guard.check(store)?;
+                    authorize_event_page_entry(&capacity_receipt)?;
+                    capacity_receipt.fetched =
+                        capacity_receipt.fetched.checked_add(1).ok_or_else(|| {
+                            NodeError::Protocol("fetched Event count overflow".into())
+                        })?;
+                    let event = prepare_received_page_transfer(
+                        store,
+                        event_verifier,
+                        EventReceiveAuthority {
+                            peer: authenticated_peer,
+                            peer_route_commitments: &peer_route_commitments,
+                            receiver_interest: lane.receiver_interest,
+                            local_replication_policy: lane.guard.replication_policy(),
+                        },
+                        entry.id,
+                        &entry.source_event,
+                        ReceivedPageCustody {
+                            mission,
+                            expected_sender_policy_revision,
+                            evidence: entry.custody.as_ref(),
+                        },
+                    )?;
+                    prepared.push(PreparedReceivedPageEntry {
+                        event,
+                        sealed: &entry.source_event,
+                    });
+                }
+                let applied = apply_prepared_event_page(
+                    store,
+                    event_verifier,
+                    lane.guard.replication_policy(),
+                    custody_context,
+                    &prepared,
+                )?;
+                for applied in applied {
+                    receipt.fetched = receipt.fetched.checked_add(1).ok_or_else(|| {
+                        NodeError::Protocol("fetched Event count overflow".into())
+                    })?;
+                    if applied.inserted {
+                        receipt.inserted = receipt.inserted.checked_add(1).ok_or_else(|| {
+                            NodeError::Protocol("inserted Event count overflow".into())
+                        })?;
+                        receipt.event_page_inserts =
+                            receipt.event_page_inserts.checked_add(1).ok_or_else(|| {
+                                NodeError::Protocol("Event page insert count overflow".into())
+                            })?;
+                    } else {
+                        receipt.duplicates =
+                            receipt.duplicates.checked_add(1).ok_or_else(|| {
+                                NodeError::Protocol("duplicate Event count overflow".into())
+                            })?;
+                        receipt.event_page_duplicates = receipt
+                            .event_page_duplicates
+                            .checked_add(1)
+                            .ok_or_else(|| {
+                                NodeError::Protocol("Event page duplicate count overflow".into())
+                            })?;
+                    }
+                }
+                let page_source_bytes = page.entries.iter().try_fold(0usize, |total, entry| {
+                    total.checked_add(entry.source_event.len()).ok_or_else(|| {
+                        NodeError::Protocol("Event page receive byte count overflow".into())
+                    })
+                })?;
+                receipt.event_pages_received =
+                    receipt.event_pages_received.checked_add(1).ok_or_else(|| {
+                        NodeError::Protocol("Event page receive count overflow".into())
+                    })?;
+                receipt.event_page_entries_received = receipt
+                    .event_page_entries_received
+                    .checked_add(page.entries.len())
+                    .ok_or_else(|| {
+                        NodeError::Protocol("Event page entry receive count overflow".into())
+                    })?;
+                receipt.event_page_bytes_received = receipt
+                    .event_page_bytes_received
+                    .checked_add(page_source_bytes)
+                    .ok_or_else(|| {
+                        NodeError::Protocol("Event page source byte receive count overflow".into())
+                    })?;
+                #[cfg(test)]
+                apply_test_event_page_failure_after_receive()?;
+                consumed = next_consumed;
+                page_count += 1;
+            }
+            Frame::ChangeTurnFinished(finished) => {
+                if finished.direction != lane.direction
+                    || finished.transfer_profile_digest != profiles.digest
+                    || finished.set_commitment != set_commitment
+                    || finished.schedule_digest != expected_schedule_digest
+                    || usize::try_from(finished.final_page_count).ok() != Some(page_count)
+                    || consumed != header.scheduled.len()
+                {
+                    return Err(NodeError::Protocol(
+                        "Event page terminal differs from committed progress".into(),
+                    ));
+                }
+                break;
+            }
+            _ => {
+                return Err(NodeError::Protocol(
+                    "unexpected frame in receipt-free Event page turn".into(),
+                ));
+            }
+        }
+    }
+    if turn.read_frame().await?.is_some() {
+        return Err(NodeError::Protocol(
+            "Event page turn contains frames after its terminal".into(),
+        ));
+    }
+    receipt.event_uni_turns_received = receipt
+        .event_uni_turns_received
+        .checked_add(1)
+        .ok_or_else(|| NodeError::Protocol("Event uni-turn receive count overflow".into()))?;
+    Ok(())
+}
+
 struct EventTransferLaneContext<'io, 'lane> {
     store: &'io Store,
     lease_store: Arc<Store>,
@@ -16420,9 +18867,328 @@ struct EventTransferLaneContext<'io, 'lane> {
     receipt: &'io mut PeerReceipt,
 }
 
+async fn sync_event_transfer_lane_planned(
+    context: EventTransferLaneContext<'_, '_>,
+    difference: &EventDifference,
+    profiles: Option<&V7TransferProfiles>,
+    local_plan: Option<&RuntimeLocalEventSendPlan>,
+    remote_plan: Option<&EventTurnPlanV1>,
+    remote_page_limits: Option<EventPageScheduleLimits>,
+) -> Result<(), NodeError> {
+    let Some(profiles) = profiles else {
+        return sync_event_transfer_lane(context, difference).await;
+    };
+    match context.lane.direction {
+        EventDirection::ToSessionResponder => {
+            let local_plan = local_plan.ok_or_else(|| {
+                NodeError::Protocol("initiator sender lacks its local Event turn plan".into())
+            })?;
+            match local_plan.built.plan {
+                EventTurnPlanV1::PageActive { .. } | EventTurnPlanV1::PageBlindActive { .. }
+                    if !event_page_plan_requires_stream(&local_plan.built.plan) =>
+                {
+                    context.connection.skip_uni_turn()?;
+                    Ok(())
+                }
+                EventTurnPlanV1::PageActive { .. } | EventTurnPlanV1::PageBlindActive { .. } => {
+                    send_event_page_turn(
+                        context.store,
+                        context.connection,
+                        context.mission,
+                        context.event_verifier,
+                        context.lane,
+                        profiles,
+                        local_plan,
+                        context.exchanges,
+                        context.receipt,
+                    )
+                    .await
+                }
+                EventTurnPlanV1::LegacyActive { .. } => {
+                    context.connection.skip_uni_turn()?;
+                    sync_event_transfer_lane_bounded(
+                        context,
+                        difference,
+                        local_plan.schedule_limits,
+                    )
+                    .await
+                }
+                EventTurnPlanV1::Empty { .. } | EventTurnPlanV1::Suppressed { .. } => {
+                    context.connection.skip_uni_turn()?;
+                    Ok(())
+                }
+            }
+        }
+        EventDirection::ToSessionInitiator => {
+            let plan = remote_plan.ok_or_else(|| {
+                NodeError::Protocol("initiator receiver lacks the remote Event turn plan".into())
+            })?;
+            match plan {
+                EventTurnPlanV1::PageActive { .. } | EventTurnPlanV1::PageBlindActive { .. }
+                    if !event_page_plan_requires_stream(plan) =>
+                {
+                    context.connection.skip_uni_turn()?;
+                    Ok(())
+                }
+                EventTurnPlanV1::PageActive { .. } | EventTurnPlanV1::PageBlindActive { .. } => {
+                    let limits = remote_page_limits.ok_or_else(|| {
+                        NodeError::Protocol(
+                            "Event receiver lacks direction-local page limits".into(),
+                        )
+                    })?;
+                    receive_event_page_turn(
+                        context.store,
+                        context.connection,
+                        context.mission,
+                        context.event_verifier,
+                        context.lane,
+                        profiles,
+                        plan,
+                        limits,
+                        &difference.remote_only,
+                        context.remote_emission.revision,
+                        context.receipt,
+                    )
+                    .await
+                }
+                EventTurnPlanV1::LegacyActive { .. } => {
+                    let limits = remote_page_limits.ok_or_else(|| {
+                        NodeError::Protocol(
+                            "legacy Event receiver lacks direction-local limits".into(),
+                        )
+                    })?;
+                    context.connection.skip_uni_turn()?;
+                    sync_event_transfer_lane_bounded(context, difference, limits).await
+                }
+                EventTurnPlanV1::Empty { .. } | EventTurnPlanV1::Suppressed { .. } => {
+                    context.connection.skip_uni_turn()?;
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+async fn serve_event_transfer_lane_planned(
+    context: EventTransferLaneContext<'_, '_>,
+    difference: &EventDifference,
+    profiles: Option<&V7TransferProfiles>,
+    local_plan: Option<&RuntimeLocalEventSendPlan>,
+    remote_plan: Option<&EventTurnPlanV1>,
+    remote_page_limits: Option<EventPageScheduleLimits>,
+) -> Result<(), NodeError> {
+    let Some(profiles) = profiles else {
+        return serve_event_transfer_lane(context, difference).await;
+    };
+    match context.lane.direction {
+        EventDirection::ToSessionResponder => {
+            let plan = remote_plan.ok_or_else(|| {
+                NodeError::Protocol("responder receiver lacks the remote Event turn plan".into())
+            })?;
+            match plan {
+                EventTurnPlanV1::PageActive { .. } | EventTurnPlanV1::PageBlindActive { .. }
+                    if !event_page_plan_requires_stream(plan) =>
+                {
+                    context.connection.skip_uni_turn()?;
+                    Ok(())
+                }
+                EventTurnPlanV1::PageActive { .. } | EventTurnPlanV1::PageBlindActive { .. } => {
+                    let limits = remote_page_limits.ok_or_else(|| {
+                        NodeError::Protocol(
+                            "Event receiver lacks direction-local page limits".into(),
+                        )
+                    })?;
+                    receive_event_page_turn(
+                        context.store,
+                        context.connection,
+                        context.mission,
+                        context.event_verifier,
+                        context.lane,
+                        profiles,
+                        plan,
+                        limits,
+                        &difference.remote_only,
+                        context.remote_emission.revision,
+                        context.receipt,
+                    )
+                    .await
+                }
+                EventTurnPlanV1::LegacyActive { .. } => {
+                    let limits = remote_page_limits.ok_or_else(|| {
+                        NodeError::Protocol(
+                            "legacy Event receiver lacks direction-local limits".into(),
+                        )
+                    })?;
+                    context.connection.skip_uni_turn()?;
+                    serve_event_transfer_lane_bounded(context, difference, limits).await
+                }
+                EventTurnPlanV1::Empty { .. } | EventTurnPlanV1::Suppressed { .. } => {
+                    context.connection.skip_uni_turn()?;
+                    Ok(())
+                }
+            }
+        }
+        EventDirection::ToSessionInitiator => {
+            let local_plan = local_plan.ok_or_else(|| {
+                NodeError::Protocol("responder sender lacks its local Event turn plan".into())
+            })?;
+            match local_plan.built.plan {
+                EventTurnPlanV1::PageActive { .. } | EventTurnPlanV1::PageBlindActive { .. }
+                    if !event_page_plan_requires_stream(&local_plan.built.plan) =>
+                {
+                    context.connection.skip_uni_turn()?;
+                    Ok(())
+                }
+                EventTurnPlanV1::PageActive { .. } | EventTurnPlanV1::PageBlindActive { .. } => {
+                    send_event_page_turn(
+                        context.store,
+                        context.connection,
+                        context.mission,
+                        context.event_verifier,
+                        context.lane,
+                        profiles,
+                        local_plan,
+                        context.exchanges,
+                        context.receipt,
+                    )
+                    .await
+                }
+                EventTurnPlanV1::LegacyActive { .. } => {
+                    context.connection.skip_uni_turn()?;
+                    serve_event_transfer_lane_bounded(
+                        context,
+                        difference,
+                        local_plan.schedule_limits,
+                    )
+                    .await
+                }
+                EventTurnPlanV1::Empty { .. } | EventTurnPlanV1::Suppressed { .. } => {
+                    context.connection.skip_uni_turn()?;
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EventDirectionContactAdjustment {
+    handshake_frames: usize,
+    handshake_bytes: usize,
+}
+
+fn apply_event_direction_contact_limit(
+    receipt: &mut PeerReceipt,
+    limits: EventPageScheduleLimits,
+) -> Result<EventDirectionContactAdjustment, NodeError> {
+    let reserve = event_turn_reserve();
+    let used_frames = receipt
+        .handshake_frames
+        .checked_add(receipt.protected_frames)
+        .ok_or_else(|| NodeError::Protocol("contact frame count overflow".into()))?;
+    let remaining_frames = MAX_CONTACT_FRAMES
+        .checked_sub(used_frames)
+        .ok_or_else(|| NodeError::Protocol("contact frame budget is exhausted".into()))?;
+    let allowed_frames = limits
+        .frame_capacity
+        .checked_add(reserve.protected_frames)
+        .ok_or_else(|| NodeError::Protocol("directional Event frame allowance overflow".into()))?;
+    let hidden_frames = remaining_frames.saturating_sub(allowed_frames);
+
+    let used_bytes = receipt
+        .handshake_bytes
+        .checked_add(receipt.protected_bytes)
+        .ok_or_else(|| NodeError::Protocol("contact byte count overflow".into()))?;
+    let remaining_bytes = MAX_CONTACT_BYTES
+        .checked_sub(used_bytes)
+        .ok_or_else(|| NodeError::Protocol("contact byte budget is exhausted".into()))?;
+    let allowed_bytes = limits
+        .turn_bytes
+        .checked_add(reserve.protected_bytes)
+        .ok_or_else(|| NodeError::Protocol("directional Event byte allowance overflow".into()))?;
+    let hidden_bytes = remaining_bytes.saturating_sub(allowed_bytes);
+
+    receipt.handshake_frames = receipt
+        .handshake_frames
+        .checked_add(hidden_frames)
+        .ok_or_else(|| NodeError::Protocol("directional Event frame adjustment overflow".into()))?;
+    receipt.handshake_bytes = receipt
+        .handshake_bytes
+        .checked_add(hidden_bytes)
+        .ok_or_else(|| NodeError::Protocol("directional Event byte adjustment overflow".into()))?;
+    Ok(EventDirectionContactAdjustment {
+        handshake_frames: hidden_frames,
+        handshake_bytes: hidden_bytes,
+    })
+}
+
+fn remove_event_direction_contact_limit(
+    receipt: &mut PeerReceipt,
+    adjustment: EventDirectionContactAdjustment,
+) -> Result<(), NodeError> {
+    receipt.handshake_frames = receipt
+        .handshake_frames
+        .checked_sub(adjustment.handshake_frames)
+        .ok_or_else(|| {
+            NodeError::Protocol("directional Event frame adjustment underflow".into())
+        })?;
+    receipt.handshake_bytes = receipt
+        .handshake_bytes
+        .checked_sub(adjustment.handshake_bytes)
+        .ok_or_else(|| NodeError::Protocol("directional Event byte adjustment underflow".into()))?;
+    Ok(())
+}
+
+async fn sync_event_transfer_lane_bounded(
+    context: EventTransferLaneContext<'_, '_>,
+    difference: &EventDifference,
+    limits: EventPageScheduleLimits,
+) -> Result<(), NodeError> {
+    let EventTransferLaneContext {
+        store,
+        lease_store,
+        connection,
+        mission,
+        event_verifier,
+        lane,
+        remote_emission,
+        exchanges,
+        receipt,
+    } = context;
+    let mut bounded_receipt = receipt.clone();
+    let adjustment = apply_event_direction_contact_limit(&mut bounded_receipt, limits)?;
+    let result = sync_event_transfer_lane_inner(
+        EventTransferLaneContext {
+            store,
+            lease_store,
+            connection,
+            mission,
+            event_verifier,
+            lane,
+            remote_emission,
+            exchanges,
+            receipt: &mut bounded_receipt,
+        },
+        difference,
+        Some(limits.item_capacity),
+    )
+    .await;
+    remove_event_direction_contact_limit(&mut bounded_receipt, adjustment)?;
+    *receipt = bounded_receipt;
+    result
+}
+
 async fn sync_event_transfer_lane(
     context: EventTransferLaneContext<'_, '_>,
     difference: &EventDifference,
+) -> Result<(), NodeError> {
+    sync_event_transfer_lane_inner(context, difference, None).await
+}
+
+async fn sync_event_transfer_lane_inner(
+    context: EventTransferLaneContext<'_, '_>,
+    difference: &EventDifference,
+    item_capacity: Option<usize>,
 ) -> Result<(), NodeError> {
     let EventTransferLaneContext {
         store,
@@ -16448,6 +19214,7 @@ async fn sync_event_transfer_lane(
         && !matches!(remote_emission.policy, EventEmissionPolicy::ReceiveOnly))
     .then_some(mission.semantic_version());
     let capacity = event_transfer_capacity(receipt, post_event_semantic)?;
+    let capacity = item_capacity.map_or(capacity, |limit| capacity.min(limit));
     let lane_remaining_before = receipt.remaining;
     match direction {
         EventDirection::ToSessionResponder => {
@@ -16568,7 +19335,7 @@ async fn sync_event_transfer_lane(
                     .await?;
                     require_legacy_apply_result(response, direction, id)?
                 };
-                receipt.offered += 1;
+                record_receiptful_event_offer(receipt)?;
                 if !inserted {
                     receipt.duplicates += 1;
                 }
@@ -20063,6 +22830,7 @@ async fn send_selected_event_bridge_routes(
     receipt: &mut PeerReceipt,
 ) -> Result<(), NodeError> {
     let authenticated_peer = mission.peer().mission_id();
+    let route_limit = event_bridge_route_send_limit(mission.semantic_version());
     let batch = {
         let peer_route_grant_commitments = mission.peer_route_grant_commitments();
         let mut runtime = lock_selected_event_bridge(bridge)?;
@@ -20070,7 +22838,7 @@ async fn send_selected_event_bridge_routes(
             .prepare_outbound_routes(
                 authenticated_peer,
                 peer_route_grant_commitments,
-                MAX_EVENT_BRIDGE_ROUTES_PER_DIRECTION,
+                route_limit,
             )
             .map_err(|error| bridge_runtime_error("outbound preparation", error))?
     };
@@ -20333,6 +23101,285 @@ async fn serve_selected_event_bridge(
     send_selected_event_bridge_routes(connection, mission, bridge, receipt).await
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct V7TransferProfiles {
+    negotiated: NegotiatedTransferProfiles,
+    digest: [u8; 32],
+}
+
+fn record_v7_transfer_profiles(receipt: &mut PeerReceipt, profiles: &V7TransferProfiles) {
+    receipt.transfer_profile_digest = Some(profiles.digest);
+    receipt.negotiated_transfer_profiles = Some([
+        profiles
+            .negotiated
+            .profile(LaneId::Event)
+            .expect("validated Event profile") as u16,
+        profiles
+            .negotiated
+            .profile(LaneId::State)
+            .expect("validated State profile") as u16,
+        profiles
+            .negotiated
+            .profile(LaneId::Record)
+            .expect("validated Record profile") as u16,
+        profiles
+            .negotiated
+            .profile(LaneId::Blob)
+            .expect("validated Blob profile") as u16,
+        profiles
+            .negotiated
+            .profile(LaneId::EventBridge)
+            .expect("validated EventBridge profile") as u16,
+    ]);
+}
+
+fn event_page_plan_requires_stream(plan: &EventTurnPlanV1) -> bool {
+    matches!(
+        plan,
+        EventTurnPlanV1::PageActive {
+            scheduled_count, ..
+        } | EventTurnPlanV1::PageBlindActive {
+            scheduled_count, ..
+        } if *scheduled_count != 0
+    )
+}
+
+fn record_local_event_plan(
+    receipt: &mut PeerReceipt,
+    plan: &EventTurnPlanV1,
+) -> Result<(), NodeError> {
+    if let EventTurnPlanV1::PageActive {
+        unscheduled_count, ..
+    }
+    | EventTurnPlanV1::PageBlindActive {
+        unscheduled_count, ..
+    } = plan
+    {
+        receipt.event_page_unscheduled = receipt
+            .event_page_unscheduled
+            .checked_add(usize::try_from(*unscheduled_count).map_err(|_| {
+                NodeError::Protocol("unscheduled Event page count exceeds usize".into())
+            })?)
+            .ok_or_else(|| NodeError::Protocol("unscheduled Event page count overflow".into()))?;
+    }
+    Ok(())
+}
+
+fn local_transfer_profile_offer() -> TransferProfileOfferV1 {
+    #[cfg(test)]
+    if let Ok(Some(offer)) = TEST_TRANSFER_PROFILE_OFFER.try_with(|offer| offer.borrow().clone()) {
+        return offer;
+    }
+    TransferProfileOfferV1::current()
+}
+
+async fn sync_transfer_profiles(
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    receipt: &mut PeerReceipt,
+) -> Result<Option<V7TransferProfiles>, NodeError> {
+    if mission.semantic_version() < SEMANTIC_PROTOCOL_V7 {
+        return Ok(None);
+    }
+    if mission.semantic_version() != SEMANTIC_PROTOCOL_V7 {
+        return Err(NodeError::Protocol(
+            "unsupported semantic version for transfer-profile exchange".into(),
+        ));
+    }
+    let initiator = local_transfer_profile_offer();
+    let response = request_mission_frame(
+        connection,
+        mission,
+        Frame::TransferProfileOffer(initiator.clone()),
+        receipt,
+    )
+    .await?;
+    let Frame::TransferProfileOffer(responder) = response else {
+        return Err(NodeError::Protocol(
+            "semantic-v7 contact did not begin with the responder transfer-profile offer".into(),
+        ));
+    };
+    let negotiated = negotiate_transfer_profiles(&initiator, &responder)
+        .map_err(|error| NodeError::Protocol(error.to_string()))?;
+    let digest = transfer_profile_digest(&initiator, &responder, &negotiated);
+    let profiles = V7TransferProfiles { negotiated, digest };
+    record_v7_transfer_profiles(receipt, &profiles);
+    Ok(Some(profiles))
+}
+
+async fn serve_transfer_profiles(
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    receipt: &mut PeerReceipt,
+) -> Result<Option<V7TransferProfiles>, NodeError> {
+    if mission.semantic_version() < SEMANTIC_PROTOCOL_V7 {
+        return Ok(None);
+    }
+    if mission.semantic_version() != SEMANTIC_PROTOCOL_V7 {
+        return Err(NodeError::Protocol(
+            "unsupported semantic version for transfer-profile exchange".into(),
+        ));
+    }
+    let responder = TransferProfileOfferV1::current();
+    let mut initiator = None;
+    let wire_budget = exchange_wire_budget(receipt)?;
+    let (complete, request_bytes, response_bytes) = respond_mission_frame(
+        connection,
+        mission,
+        wire_budget,
+        |frame, _request_wire_len, _mission| match frame {
+            Frame::TransferProfileOffer(offer) => {
+                initiator = Some(offer);
+                Ok((Frame::TransferProfileOffer(responder.clone()), true))
+            }
+            _ => Err(NodeError::Protocol(
+                "semantic-v7 contact must begin with the initiator transfer-profile offer".into(),
+            )),
+        },
+    )
+    .await?;
+    account(receipt, request_bytes, response_bytes)?;
+    if !complete {
+        return Err(NodeError::Protocol(
+            "semantic-v7 transfer-profile exchange did not complete".into(),
+        ));
+    }
+    let initiator = initiator.ok_or_else(|| {
+        NodeError::Protocol("initiator transfer-profile offer disappeared".into())
+    })?;
+    let negotiated = negotiate_transfer_profiles(&initiator, &responder)
+        .map_err(|error| NodeError::Protocol(error.to_string()))?;
+    let digest = transfer_profile_digest(&initiator, &responder, &negotiated);
+    let profiles = V7TransferProfiles { negotiated, digest };
+    record_v7_transfer_profiles(receipt, &profiles);
+    Ok(Some(profiles))
+}
+
+async fn sync_event_turn_plans(
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    profiles: &V7TransferProfiles,
+    local_plan: EventTurnPlanV1,
+    receipt: &mut PeerReceipt,
+) -> Result<EventTurnPlanV1, NodeError> {
+    require_contact_frame_initiation()?;
+    let profile = profiles
+        .negotiated
+        .profile(LaneId::Event)
+        .ok_or_else(|| NodeError::Protocol("Event lane has no negotiated profile".into()))?;
+    let plaintext =
+        Frame::EventTurnPlan(local_plan).encode_for_semantic_version(mission.semantic_version())?;
+    let protected_request = mission.seal_v7_application_frame(
+        profiles.digest,
+        LaneId::Event,
+        profile,
+        EventDirection::ToSessionResponder,
+        &plaintext,
+    )?;
+    let wire_budget = exchange_wire_budget(receipt)?;
+    let (protected_response, _checked) = connection
+        .request_with_total_limit_checked(&protected_request, wire_budget, || {
+            require_contact_frame_initiation()
+        })
+        .await?;
+    let plaintext = mission.open_v7_application_frame(
+        profiles.digest,
+        LaneId::Event,
+        profile,
+        EventDirection::ToSessionInitiator,
+        &protected_response,
+    )?;
+    let response = Frame::decode_for_semantic_version(&plaintext, mission.semantic_version())?;
+    account(receipt, protected_request.len(), protected_response.len())?;
+    match response {
+        Frame::EventTurnPlan(plan) => Ok(plan),
+        _ => Err(NodeError::Protocol(
+            "semantic-v7 Event plan response contained another frame".into(),
+        )),
+    }
+}
+
+async fn serve_event_turn_plans(
+    connection: &aster_iroh::Connection,
+    mission: &mut MissionSession,
+    profiles: &V7TransferProfiles,
+    local_plan: EventTurnPlanV1,
+    receipt: &mut PeerReceipt,
+) -> Result<EventTurnPlanV1, NodeError> {
+    let profile = profiles
+        .negotiated
+        .profile(LaneId::Event)
+        .ok_or_else(|| NodeError::Protocol("Event lane has no negotiated profile".into()))?;
+    let wire_budget = exchange_wire_budget(receipt)?;
+    let mut application_error = None;
+    let mut request_len = None;
+    let mut response_len = None;
+    let mut remote_plan = None;
+    let carrier_result = connection
+        .respond_once_with_total_limit(wire_budget, |protected_request| {
+            require_contact_policy_current()
+                .map_err(|_| CarrierError::Transport("live emission policy changed".into()))?;
+            request_len = Some(protected_request.len());
+            let handled = (|| -> Result<Vec<u8>, NodeError> {
+                let plaintext = mission.open_v7_application_frame(
+                    profiles.digest,
+                    LaneId::Event,
+                    profile,
+                    EventDirection::ToSessionResponder,
+                    protected_request,
+                )?;
+                let request =
+                    Frame::decode_for_semantic_version(&plaintext, mission.semantic_version())?;
+                let Frame::EventTurnPlan(plan) = request else {
+                    return Err(NodeError::Protocol(
+                        "semantic-v7 Event plan request contained another frame".into(),
+                    ));
+                };
+                remote_plan = Some(plan);
+                let response_frame = Frame::EventTurnPlan(local_plan.clone());
+                require_contact_frame_response(&response_frame)?;
+                let plaintext =
+                    response_frame.encode_for_semantic_version(mission.semantic_version())?;
+                let protected_response = mission.seal_v7_application_frame(
+                    profiles.digest,
+                    LaneId::Event,
+                    profile,
+                    EventDirection::ToSessionInitiator,
+                    &plaintext,
+                )?;
+                require_contact_policy_current()?;
+                response_len = Some(protected_response.len());
+                Ok(protected_response)
+            })();
+            match handled {
+                Ok(response) => Ok((response, true)),
+                Err(error) => {
+                    application_error = Some(error);
+                    Err(CarrierError::Transport(
+                        "semantic-v7 Event plan exchange rejected".into(),
+                    ))
+                }
+            }
+        })
+        .await;
+    if let Some(error) = application_error {
+        return Err(error);
+    }
+    if !carrier_result? {
+        return Err(NodeError::Protocol(
+            "semantic-v7 Event plan exchange did not complete".into(),
+        ));
+    }
+    let request_len = request_len.ok_or_else(|| {
+        NodeError::Protocol("Event plan exchange omitted request accounting".into())
+    })?;
+    let response_len = response_len.ok_or_else(|| {
+        NodeError::Protocol("Event plan exchange omitted response accounting".into())
+    })?;
+    account(receipt, request_len, response_len)?;
+    remote_plan.ok_or_else(|| NodeError::Protocol("remote Event turn plan disappeared".into()))
+}
+
 struct OutboundAuthenticatedSession {
     store: Arc<Store>,
     credentials: UnprotectedReferenceMission,
@@ -20380,6 +23427,9 @@ async fn sync_authenticated_session(
         None => unreachable!("discovered peers require the nearby-discovery feature"),
     };
     let mut receipt = authenticated_receipt(connection, &mission, handshake)?;
+    #[cfg(test)]
+    apply_test_preaccounted_contact_items(&mut receipt)?;
+    let transfer_profiles = sync_transfer_profiles(connection, &mut mission, &mut receipt).await?;
 
     // Replay and reconcile mission controls under the exclusive policy lease.
     // The verifier must not predate this lease: another contact may have
@@ -20416,14 +23466,16 @@ async fn sync_authenticated_session(
         mission.peer().mission_id(),
         receipt.controls_remaining,
     )?;
-    sync_selected_event_bridge(
-        connection,
-        &mut mission,
-        event_bridge.as_ref(),
-        &mut receipt,
-    )
-    .await?;
-    let (local_interest, peer_interest) = sync_event_interests(
+    if mission.semantic_version() < SEMANTIC_PROTOCOL_V7 {
+        sync_selected_event_bridge(
+            connection,
+            &mut mission,
+            event_bridge.as_ref(),
+            &mut receipt,
+        )
+        .await?;
+    }
+    let (local_interest, peer_interest, local_emission) = sync_event_interests(
         store,
         connection,
         &mut mission,
@@ -20467,73 +23519,11 @@ async fn sync_authenticated_session(
                 )
                 .await?;
             }
-            event_guard.check(store)?;
-            let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
-            let completed = complete_peer_contact(connection, receipt, event_policy);
-            connection.finish_as_initiator().await?;
-            return Ok(completed);
-        }
-    };
-    settle_authenticated_event_common_set(
-        store,
-        &event_guard,
-        mission.peer().mission_id(),
-        mission.semantic_version() >= MIN_CUSTODY_SEMANTIC_VERSION,
-        remote_emission,
-        to_responder_lane.receiver_selector_revision,
-        &to_responder,
-    )?;
-    sync_event_transfer_lane(
-        EventTransferLaneContext {
-            store,
-            lease_store: lease_store.clone(),
-            connection,
-            mission: &mut mission,
-            event_verifier: &mut event_verifier,
-            lane: to_responder_lane,
-            remote_emission,
-            exchanges: &mut custody_exchanges,
-            receipt: &mut receipt,
-        },
-        &to_responder.difference,
-    )
-    .await?;
-
-    if matches!(remote_emission.policy, EventEmissionPolicy::ReceiveOnly) {
-        event_guard.check(store)?;
-        let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
-        let completed = complete_peer_contact(connection, receipt, event_policy);
-        connection.finish_as_initiator().await?;
-        return Ok(completed);
-    }
-
-    let to_initiator_lane = DirectedEventLane {
-        guard: &event_guard,
-        receiver_interest: &local_interest.interest,
-        receiver_selector_revision: local_interest.selector_revision,
-        direction: EventDirection::ToSessionInitiator,
-    };
-    let to_initiator = match sync_event_reconciliation_lane(
-        store,
-        connection,
-        &mut mission,
-        &mut event_verifier,
-        to_initiator_lane,
-        remote_emission,
-        &mut receipt,
-    )
-    .await?
-    {
-        EventReconciliationOutcome::Complete(reconciliation) => reconciliation,
-        EventReconciliationOutcome::Deferred => {
-            if !matches!(remote_emission.policy, EventEmissionPolicy::ReceiveOnly) {
-                sync_mutable_classes(
-                    store,
+            if transfer_profiles.is_some() {
+                sync_selected_event_bridge(
                     connection,
                     &mut mission,
-                    &mut event_verifier,
-                    &event_guard,
-                    &mutable_interests,
+                    event_bridge.as_ref(),
                     &mut receipt,
                 )
                 .await?;
@@ -20551,10 +23541,267 @@ async fn sync_authenticated_session(
         mission.peer().mission_id(),
         mission.semantic_version() >= MIN_CUSTODY_SEMANTIC_VERSION,
         remote_emission,
-        to_initiator_lane.receiver_selector_revision,
-        &to_initiator,
+        to_responder_lane.receiver_selector_revision,
+        &to_responder,
     )?;
-    sync_event_transfer_lane(
+    if transfer_profiles.is_none() {
+        sync_event_transfer_lane(
+            EventTransferLaneContext {
+                store,
+                lease_store: lease_store.clone(),
+                connection,
+                mission: &mut mission,
+                event_verifier: &mut event_verifier,
+                lane: to_responder_lane,
+                remote_emission,
+                exchanges: &mut custody_exchanges,
+                receipt: &mut receipt,
+            },
+            &to_responder.difference,
+        )
+        .await?;
+
+        if matches!(remote_emission.policy, EventEmissionPolicy::ReceiveOnly) {
+            event_guard.check(store)?;
+            let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
+            let completed = complete_peer_contact(connection, receipt, event_policy);
+            connection.finish_as_initiator().await?;
+            return Ok(completed);
+        }
+
+        let to_initiator_lane = DirectedEventLane {
+            guard: &event_guard,
+            receiver_interest: &local_interest.interest,
+            receiver_selector_revision: local_interest.selector_revision,
+            direction: EventDirection::ToSessionInitiator,
+        };
+        let to_initiator = match sync_event_reconciliation_lane(
+            store,
+            connection,
+            &mut mission,
+            &mut event_verifier,
+            to_initiator_lane,
+            remote_emission,
+            &mut receipt,
+        )
+        .await?
+        {
+            EventReconciliationOutcome::Complete(reconciliation) => reconciliation,
+            EventReconciliationOutcome::Deferred => {
+                if !matches!(remote_emission.policy, EventEmissionPolicy::ReceiveOnly) {
+                    sync_mutable_classes(
+                        store,
+                        connection,
+                        &mut mission,
+                        &mut event_verifier,
+                        &event_guard,
+                        &mutable_interests,
+                        &mut receipt,
+                    )
+                    .await?;
+                }
+                event_guard.check(store)?;
+                let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
+                let completed = complete_peer_contact(connection, receipt, event_policy);
+                connection.finish_as_initiator().await?;
+                return Ok(completed);
+            }
+        };
+        settle_authenticated_event_common_set(
+            store,
+            &event_guard,
+            mission.peer().mission_id(),
+            mission.semantic_version() >= MIN_CUSTODY_SEMANTIC_VERSION,
+            remote_emission,
+            to_initiator_lane.receiver_selector_revision,
+            &to_initiator,
+        )?;
+        sync_event_transfer_lane(
+            EventTransferLaneContext {
+                store,
+                lease_store,
+                connection,
+                mission: &mut mission,
+                event_verifier: &mut event_verifier,
+                lane: to_initiator_lane,
+                remote_emission,
+                exchanges: &mut custody_exchanges,
+                receipt: &mut receipt,
+            },
+            &to_initiator.difference,
+        )
+        .await?;
+        sync_mutable_classes(
+            store,
+            connection,
+            &mut mission,
+            &mut event_verifier,
+            &event_guard,
+            &mutable_interests,
+            &mut receipt,
+        )
+        .await?;
+        event_guard.check(store)?;
+        let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
+        let completed = complete_peer_contact(connection, receipt, event_policy);
+        connection.finish_as_initiator().await?;
+        return Ok(completed);
+    }
+
+    let profiles = transfer_profiles
+        .as_ref()
+        .expect("semantic-v7 profiles checked above");
+    let to_initiator_lane = DirectedEventLane {
+        guard: &event_guard,
+        receiver_interest: &local_interest.interest,
+        receiver_selector_revision: local_interest.selector_revision,
+        direction: EventDirection::ToSessionInitiator,
+    };
+    let to_initiator = if matches!(remote_emission.policy, EventEmissionPolicy::ReceiveOnly) {
+        None
+    } else {
+        let reconciliation = match sync_event_reconciliation_lane(
+            store,
+            connection,
+            &mut mission,
+            &mut event_verifier,
+            to_initiator_lane,
+            remote_emission,
+            &mut receipt,
+        )
+        .await?
+        {
+            EventReconciliationOutcome::Complete(reconciliation) => reconciliation,
+            EventReconciliationOutcome::Deferred => {
+                sync_mutable_classes(
+                    store,
+                    connection,
+                    &mut mission,
+                    &mut event_verifier,
+                    &event_guard,
+                    &mutable_interests,
+                    &mut receipt,
+                )
+                .await?;
+                sync_selected_event_bridge(
+                    connection,
+                    &mut mission,
+                    event_bridge.as_ref(),
+                    &mut receipt,
+                )
+                .await?;
+                event_guard.check(store)?;
+                let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
+                let completed = complete_peer_contact(connection, receipt, event_policy);
+                connection.finish_as_initiator().await?;
+                return Ok(completed);
+            }
+        };
+        settle_authenticated_event_common_set(
+            store,
+            &event_guard,
+            mission.peer().mission_id(),
+            true,
+            remote_emission,
+            to_initiator_lane.receiver_selector_revision,
+            &reconciliation,
+        )?;
+        Some(reconciliation)
+    };
+
+    let to_responder_count = if matches!(remote_emission.policy, EventEmissionPolicy::ReceiveOnly) {
+        // Blind custody fallback has no authenticated cardinality. Allocate it
+        // against the existing contact item ceiling so it remains active and
+        // bounded without publishing a new protocol limit.
+        MAX_CONTACT_ITEMS
+    } else {
+        to_responder.difference.local_only.len()
+    };
+    let to_initiator_count = to_initiator.as_ref().map_or(0, |reconciliation| {
+        reconciliation.difference.remote_only.len()
+    });
+    let (to_responder_limits, to_initiator_limits) = directional_event_schedule_limits(
+        &receipt,
+        to_responder_count,
+        to_initiator_count,
+        connection.max_uni_frame_bytes(),
+    )?;
+    let local_difference = if matches!(remote_emission.policy, EventEmissionPolicy::ReceiveOnly) {
+        LocalEventSendDifference::Blind
+    } else {
+        LocalEventSendDifference::Exact(&to_responder.difference.local_only)
+    };
+    let local_plan = build_runtime_local_event_send_plan(
+        store,
+        &event_guard,
+        &mut event_verifier,
+        profiles,
+        EventDirection::ToSessionResponder,
+        local_difference,
+        false,
+        to_responder_limits,
+        mission.peer().mission_id(),
+        mission.peer_route_grant_commitments(),
+        to_responder_lane.receiver_interest,
+        to_responder_lane.receiver_selector_revision.value(),
+        local_emission,
+    )?;
+    record_local_event_plan(&mut receipt, &local_plan.built.plan)?;
+    let remote_plan = sync_event_turn_plans(
+        connection,
+        &mut mission,
+        profiles,
+        local_plan.built.plan.clone(),
+        &mut receipt,
+    )
+    .await?;
+    let remote_missing = to_initiator
+        .as_ref()
+        .map_or(LocalEventSendDifference::Blind, |reconciliation| {
+            LocalEventSendDifference::Exact(&reconciliation.difference.remote_only)
+        });
+    validate_remote_event_send_plan(
+        &remote_plan,
+        EventDirection::ToSessionInitiator,
+        profiles.digest,
+        &profiles.negotiated,
+        remote_missing,
+        matches!(remote_emission.policy, EventEmissionPolicy::ReceiveOnly),
+    )
+    .map_err(|error| NodeError::Protocol(error.to_string()))?;
+    validate_remote_event_page_budget(&remote_plan, to_initiator_limits)
+        .map_err(|error| NodeError::Protocol(error.to_string()))?;
+
+    sync_event_transfer_lane_planned(
+        EventTransferLaneContext {
+            store,
+            lease_store: lease_store.clone(),
+            connection,
+            mission: &mut mission,
+            event_verifier: &mut event_verifier,
+            lane: to_responder_lane,
+            remote_emission,
+            exchanges: &mut custody_exchanges,
+            receipt: &mut receipt,
+        },
+        &to_responder.difference,
+        Some(profiles),
+        Some(&local_plan),
+        None,
+        None,
+    )
+    .await?;
+
+    let empty_to_initiator = EventDifference {
+        local_only: Vec::new(),
+        remote_only: Vec::new(),
+    };
+    let to_initiator_difference = to_initiator
+        .as_ref()
+        .map_or(&empty_to_initiator, |reconciliation| {
+            &reconciliation.difference
+        });
+    sync_event_transfer_lane_planned(
         EventTransferLaneContext {
             store,
             lease_store,
@@ -20566,16 +23813,30 @@ async fn sync_authenticated_session(
             exchanges: &mut custody_exchanges,
             receipt: &mut receipt,
         },
-        &to_initiator.difference,
+        to_initiator_difference,
+        Some(profiles),
+        None,
+        Some(&remote_plan),
+        Some(to_initiator_limits),
     )
     .await?;
-    sync_mutable_classes(
-        store,
+
+    if !matches!(remote_emission.policy, EventEmissionPolicy::ReceiveOnly) {
+        sync_mutable_classes(
+            store,
+            connection,
+            &mut mission,
+            &mut event_verifier,
+            &event_guard,
+            &mutable_interests,
+            &mut receipt,
+        )
+        .await?;
+    }
+    sync_selected_event_bridge(
         connection,
         &mut mission,
-        &mut event_verifier,
-        &event_guard,
-        &mutable_interests,
+        event_bridge.as_ref(),
         &mut receipt,
     )
     .await?;
@@ -21257,9 +24518,56 @@ async fn serve_event_reconciliation_lane(
     ))
 }
 
+async fn serve_event_transfer_lane_bounded(
+    context: EventTransferLaneContext<'_, '_>,
+    difference: &EventDifference,
+    limits: EventPageScheduleLimits,
+) -> Result<(), NodeError> {
+    let EventTransferLaneContext {
+        store,
+        lease_store,
+        connection,
+        mission,
+        event_verifier,
+        lane,
+        remote_emission,
+        exchanges,
+        receipt,
+    } = context;
+    let mut bounded_receipt = receipt.clone();
+    let adjustment = apply_event_direction_contact_limit(&mut bounded_receipt, limits)?;
+    let result = serve_event_transfer_lane_inner(
+        EventTransferLaneContext {
+            store,
+            lease_store,
+            connection,
+            mission,
+            event_verifier,
+            lane,
+            remote_emission,
+            exchanges,
+            receipt: &mut bounded_receipt,
+        },
+        difference,
+        Some(limits.item_capacity),
+    )
+    .await;
+    remove_event_direction_contact_limit(&mut bounded_receipt, adjustment)?;
+    *receipt = bounded_receipt;
+    result
+}
+
 async fn serve_event_transfer_lane(
     context: EventTransferLaneContext<'_, '_>,
     difference: &EventDifference,
+) -> Result<(), NodeError> {
+    serve_event_transfer_lane_inner(context, difference, None).await
+}
+
+async fn serve_event_transfer_lane_inner(
+    context: EventTransferLaneContext<'_, '_>,
+    difference: &EventDifference,
+    item_capacity: Option<usize>,
 ) -> Result<(), NodeError> {
     let EventTransferLaneContext {
         store,
@@ -21284,6 +24592,7 @@ async fn serve_event_transfer_lane(
         && !matches!(emission.policy, EventEmissionPolicy::ReceiveOnly))
     .then_some(mission.semantic_version());
     let capacity = event_transfer_capacity(receipt, post_event_semantic)?;
+    let capacity = item_capacity.map_or(capacity, |limit| capacity.min(limit));
     if matches!(emission.policy, EventEmissionPolicy::ReceiveOnly) {
         if direction != EventDirection::ToSessionResponder {
             return Err(NodeError::Protocol(
@@ -21471,7 +24780,7 @@ async fn serve_event_transfer_lane(
                 add_unscheduled_events(receipt, 1)?;
                 continue;
             };
-            receipt.offered += 1;
+            record_receiptful_event_offer(receipt)?;
             if !inserted {
                 receipt.duplicates += 1;
             }
@@ -21622,7 +24931,7 @@ async fn serve_event_transfer_lane(
                             "finite-TTL Event cannot be sent on semantic protocol v1/v2".into(),
                         ));
                     }
-                    receipt.offered += 1;
+                    record_receiptful_event_offer(receipt)?;
                     Ok((
                         Frame::Object {
                             direction,
@@ -22334,6 +25643,10 @@ async fn serve_session(
         None => unreachable!("discovered peers require the nearby-discovery feature"),
     };
     let mut receipt = authenticated_receipt(&connection, &mission, handshake)?;
+    #[cfg(test)]
+    apply_test_preaccounted_contact_items(&mut receipt)?;
+    let transfer_profiles =
+        serve_transfer_profiles(&connection, &mut mission, &mut receipt).await?;
     let local_emission = contact_policy_or_normal()?;
     if matches!(local_emission.policy, EventEmissionPolicy::ReceiveOnly)
         && mission.semantic_version() < MIN_CUSTODY_SEMANTIC_VERSION
@@ -22374,13 +25687,15 @@ async fn serve_session(
         mission.peer().mission_id(),
         receipt.controls_remaining,
     )?;
-    serve_selected_event_bridge(
-        &connection,
-        &mut mission,
-        pre_inventory.event_bridge.as_ref(),
-        &mut receipt,
-    )
-    .await?;
+    if mission.semantic_version() < SEMANTIC_PROTOCOL_V7 {
+        serve_selected_event_bridge(
+            &connection,
+            &mut mission,
+            pre_inventory.event_bridge.as_ref(),
+            &mut receipt,
+        )
+        .await?;
+    }
     let (local_interest, peer_interest, remote_emission) = serve_event_interests(
         &store,
         &connection,
@@ -22421,72 +25736,11 @@ async fn serve_session(
                 )
                 .await?;
             }
-            event_guard.check(&store)?;
-            let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
-            let completed = complete_peer_contact(&connection, receipt, event_policy);
-            connection.finish_as_responder().await?;
-            return Ok(completed);
-        }
-    };
-    settle_authenticated_event_common_set(
-        &store,
-        &event_guard,
-        mission.peer().mission_id(),
-        mission.semantic_version() >= MIN_CUSTODY_SEMANTIC_VERSION,
-        remote_emission,
-        to_responder_lane.receiver_selector_revision,
-        &to_responder,
-    )?;
-    serve_event_transfer_lane(
-        EventTransferLaneContext {
-            store: &store,
-            lease_store: lease_store.clone(),
-            connection: &connection,
-            mission: &mut mission,
-            event_verifier: &mut event_verifier,
-            lane: to_responder_lane,
-            remote_emission,
-            exchanges: &mut custody_exchanges,
-            receipt: &mut receipt,
-        },
-        &to_responder.difference,
-    )
-    .await?;
-
-    if matches!(local_emission.policy, EventEmissionPolicy::ReceiveOnly) {
-        event_guard.check(&store)?;
-        let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
-        let completed = complete_peer_contact(&connection, receipt, event_policy);
-        connection.finish_as_responder().await?;
-        return Ok(completed);
-    }
-
-    let to_initiator_lane = DirectedEventLane {
-        guard: &event_guard,
-        receiver_interest: &peer_interest.interest,
-        receiver_selector_revision: peer_interest.selector_revision,
-        direction: EventDirection::ToSessionInitiator,
-    };
-    let to_initiator = match serve_event_reconciliation_lane(
-        &store,
-        &connection,
-        &mut mission,
-        &mut event_verifier,
-        to_initiator_lane,
-        &mut receipt,
-    )
-    .await?
-    {
-        EventReconciliationOutcome::Complete(reconciliation) => reconciliation,
-        EventReconciliationOutcome::Deferred => {
-            if !matches!(local_emission.policy, EventEmissionPolicy::ReceiveOnly) {
-                serve_mutable_classes(
-                    &store,
+            if transfer_profiles.is_some() {
+                serve_selected_event_bridge(
                     &connection,
                     &mut mission,
-                    &mut event_verifier,
-                    &event_guard,
-                    &mutable_interests,
+                    pre_inventory.event_bridge.as_ref(),
                     &mut receipt,
                 )
                 .await?;
@@ -22504,10 +25758,265 @@ async fn serve_session(
         mission.peer().mission_id(),
         mission.semantic_version() >= MIN_CUSTODY_SEMANTIC_VERSION,
         remote_emission,
-        to_initiator_lane.receiver_selector_revision,
-        &to_initiator,
+        to_responder_lane.receiver_selector_revision,
+        &to_responder,
     )?;
-    serve_event_transfer_lane(
+    if transfer_profiles.is_none() {
+        serve_event_transfer_lane(
+            EventTransferLaneContext {
+                store: &store,
+                lease_store: lease_store.clone(),
+                connection: &connection,
+                mission: &mut mission,
+                event_verifier: &mut event_verifier,
+                lane: to_responder_lane,
+                remote_emission,
+                exchanges: &mut custody_exchanges,
+                receipt: &mut receipt,
+            },
+            &to_responder.difference,
+        )
+        .await?;
+
+        if matches!(local_emission.policy, EventEmissionPolicy::ReceiveOnly) {
+            event_guard.check(&store)?;
+            let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
+            let completed = complete_peer_contact(&connection, receipt, event_policy);
+            connection.finish_as_responder().await?;
+            return Ok(completed);
+        }
+
+        let to_initiator_lane = DirectedEventLane {
+            guard: &event_guard,
+            receiver_interest: &peer_interest.interest,
+            receiver_selector_revision: peer_interest.selector_revision,
+            direction: EventDirection::ToSessionInitiator,
+        };
+        let to_initiator = match serve_event_reconciliation_lane(
+            &store,
+            &connection,
+            &mut mission,
+            &mut event_verifier,
+            to_initiator_lane,
+            &mut receipt,
+        )
+        .await?
+        {
+            EventReconciliationOutcome::Complete(reconciliation) => reconciliation,
+            EventReconciliationOutcome::Deferred => {
+                if !matches!(local_emission.policy, EventEmissionPolicy::ReceiveOnly) {
+                    serve_mutable_classes(
+                        &store,
+                        &connection,
+                        &mut mission,
+                        &mut event_verifier,
+                        &event_guard,
+                        &mutable_interests,
+                        &mut receipt,
+                    )
+                    .await?;
+                }
+                event_guard.check(&store)?;
+                let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
+                let completed = complete_peer_contact(&connection, receipt, event_policy);
+                connection.finish_as_responder().await?;
+                return Ok(completed);
+            }
+        };
+        settle_authenticated_event_common_set(
+            &store,
+            &event_guard,
+            mission.peer().mission_id(),
+            mission.semantic_version() >= MIN_CUSTODY_SEMANTIC_VERSION,
+            remote_emission,
+            to_initiator_lane.receiver_selector_revision,
+            &to_initiator,
+        )?;
+        serve_event_transfer_lane(
+            EventTransferLaneContext {
+                store: &store,
+                lease_store,
+                connection: &connection,
+                mission: &mut mission,
+                event_verifier: &mut event_verifier,
+                lane: to_initiator_lane,
+                remote_emission,
+                exchanges: &mut custody_exchanges,
+                receipt: &mut receipt,
+            },
+            &to_initiator.difference,
+        )
+        .await?;
+        serve_mutable_classes(
+            &store,
+            &connection,
+            &mut mission,
+            &mut event_verifier,
+            &event_guard,
+            &mutable_interests,
+            &mut receipt,
+        )
+        .await?;
+        event_guard.check(&store)?;
+        let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
+        let completed = complete_peer_contact(&connection, receipt, event_policy);
+        connection.finish_as_responder().await?;
+        return Ok(completed);
+    }
+
+    let profiles = transfer_profiles
+        .as_ref()
+        .expect("semantic-v7 profiles checked above");
+    let to_initiator_lane = DirectedEventLane {
+        guard: &event_guard,
+        receiver_interest: &peer_interest.interest,
+        receiver_selector_revision: peer_interest.selector_revision,
+        direction: EventDirection::ToSessionInitiator,
+    };
+    let to_initiator = if matches!(local_emission.policy, EventEmissionPolicy::ReceiveOnly) {
+        None
+    } else {
+        let reconciliation = match serve_event_reconciliation_lane(
+            &store,
+            &connection,
+            &mut mission,
+            &mut event_verifier,
+            to_initiator_lane,
+            &mut receipt,
+        )
+        .await?
+        {
+            EventReconciliationOutcome::Complete(reconciliation) => reconciliation,
+            EventReconciliationOutcome::Deferred => {
+                serve_mutable_classes(
+                    &store,
+                    &connection,
+                    &mut mission,
+                    &mut event_verifier,
+                    &event_guard,
+                    &mutable_interests,
+                    &mut receipt,
+                )
+                .await?;
+                serve_selected_event_bridge(
+                    &connection,
+                    &mut mission,
+                    pre_inventory.event_bridge.as_ref(),
+                    &mut receipt,
+                )
+                .await?;
+                event_guard.check(&store)?;
+                let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
+                let completed = complete_peer_contact(&connection, receipt, event_policy);
+                connection.finish_as_responder().await?;
+                return Ok(completed);
+            }
+        };
+        settle_authenticated_event_common_set(
+            &store,
+            &event_guard,
+            mission.peer().mission_id(),
+            true,
+            remote_emission,
+            to_initiator_lane.receiver_selector_revision,
+            &reconciliation,
+        )?;
+        Some(reconciliation)
+    };
+
+    let to_responder_count = if matches!(local_emission.policy, EventEmissionPolicy::ReceiveOnly) {
+        // Blind custody fallback has no authenticated cardinality. Allocate it
+        // against the existing contact item ceiling so it remains active and
+        // bounded without publishing a new protocol limit.
+        MAX_CONTACT_ITEMS
+    } else {
+        to_responder.difference.remote_only.len()
+    };
+    let to_initiator_count = to_initiator.as_ref().map_or(0, |reconciliation| {
+        reconciliation.difference.local_only.len()
+    });
+    let (to_responder_limits, to_initiator_limits) = directional_event_schedule_limits(
+        &receipt,
+        to_responder_count,
+        to_initiator_count,
+        connection.max_uni_frame_bytes(),
+    )?;
+    let local_difference = to_initiator
+        .as_ref()
+        .map_or(LocalEventSendDifference::Blind, |reconciliation| {
+            LocalEventSendDifference::Exact(&reconciliation.difference.local_only)
+        });
+    let local_plan = build_runtime_local_event_send_plan(
+        &store,
+        &event_guard,
+        &mut event_verifier,
+        profiles,
+        EventDirection::ToSessionInitiator,
+        local_difference,
+        matches!(local_emission.policy, EventEmissionPolicy::ReceiveOnly),
+        to_initiator_limits,
+        mission.peer().mission_id(),
+        mission.peer_route_grant_commitments(),
+        to_initiator_lane.receiver_interest,
+        to_initiator_lane.receiver_selector_revision.value(),
+        local_emission,
+    )?;
+    record_local_event_plan(&mut receipt, &local_plan.built.plan)?;
+    let remote_plan = serve_event_turn_plans(
+        &connection,
+        &mut mission,
+        profiles,
+        local_plan.built.plan.clone(),
+        &mut receipt,
+    )
+    .await?;
+    let remote_missing = if matches!(local_emission.policy, EventEmissionPolicy::ReceiveOnly) {
+        LocalEventSendDifference::Blind
+    } else {
+        LocalEventSendDifference::Exact(&to_responder.difference.remote_only)
+    };
+    validate_remote_event_send_plan(
+        &remote_plan,
+        EventDirection::ToSessionResponder,
+        profiles.digest,
+        &profiles.negotiated,
+        remote_missing,
+        false,
+    )
+    .map_err(|error| NodeError::Protocol(error.to_string()))?;
+    validate_remote_event_page_budget(&remote_plan, to_responder_limits)
+        .map_err(|error| NodeError::Protocol(error.to_string()))?;
+
+    serve_event_transfer_lane_planned(
+        EventTransferLaneContext {
+            store: &store,
+            lease_store: lease_store.clone(),
+            connection: &connection,
+            mission: &mut mission,
+            event_verifier: &mut event_verifier,
+            lane: to_responder_lane,
+            remote_emission,
+            exchanges: &mut custody_exchanges,
+            receipt: &mut receipt,
+        },
+        &to_responder.difference,
+        Some(profiles),
+        None,
+        Some(&remote_plan),
+        Some(to_responder_limits),
+    )
+    .await?;
+
+    let empty_to_initiator = EventDifference {
+        local_only: Vec::new(),
+        remote_only: Vec::new(),
+    };
+    let to_initiator_difference = to_initiator
+        .as_ref()
+        .map_or(&empty_to_initiator, |reconciliation| {
+            &reconciliation.difference
+        });
+    serve_event_transfer_lane_planned(
         EventTransferLaneContext {
             store: &store,
             lease_store,
@@ -22519,16 +26028,30 @@ async fn serve_session(
             exchanges: &mut custody_exchanges,
             receipt: &mut receipt,
         },
-        &to_initiator.difference,
+        to_initiator_difference,
+        Some(profiles),
+        Some(&local_plan),
+        None,
+        None,
     )
     .await?;
-    serve_mutable_classes(
-        &store,
+
+    if !matches!(local_emission.policy, EventEmissionPolicy::ReceiveOnly) {
+        serve_mutable_classes(
+            &store,
+            &connection,
+            &mut mission,
+            &mut event_verifier,
+            &event_guard,
+            &mutable_interests,
+            &mut receipt,
+        )
+        .await?;
+    }
+    serve_selected_event_bridge(
         &connection,
         &mut mission,
-        &mut event_verifier,
-        &event_guard,
-        &mutable_interests,
+        pre_inventory.event_bridge.as_ref(),
         &mut receipt,
     )
     .await?;
@@ -22705,6 +26228,16 @@ fn authorize_transfer_item(
     Ok(())
 }
 
+fn authorize_event_page_entry(receipt: &PeerReceipt) -> Result<(), NodeError> {
+    authorize_transfer_item(true, receipt, "Event page")?;
+    if event_transfer_capacity(receipt, Some(SEMANTIC_PROTOCOL_V7))? == 0 {
+        return Err(NodeError::Protocol(
+            "Event page entry would consume the later-lane item reserve".into(),
+        ));
+    }
+    Ok(())
+}
+
 async fn request_mission_frame(
     connection: &aster_iroh::Connection,
     mission: &mut MissionSession,
@@ -22753,7 +26286,7 @@ where
     require_contact_frame_initiation()?;
     let wire_budget = exchange_wire_budget(receipt)?;
     let (request, built) = build_immediately_before_send(mission)?;
-    let plaintext = request.encode()?;
+    let plaintext = request.encode_for_semantic_version(mission.semantic_version())?;
     let protected_request = mission.seal_application_frame(&plaintext)?;
     // The carrier invokes this check after QUIC stream acquisition and
     // immediately before invoking its first write. No bidirectional-stream
@@ -22765,7 +26298,7 @@ where
         })
         .await?;
     let response = mission.open_application_frame(&protected_response)?;
-    let response = Frame::decode(&response)?;
+    let response = Frame::decode_for_semantic_version(&response, mission.semantic_version())?;
     account(receipt, protected_request.len(), protected_response.len())?;
     Ok((response, (built, final_checked)))
 }
@@ -22790,11 +26323,12 @@ where
             request_len = Some(protected_request.len());
             let handled = (|| -> Result<Vec<u8>, NodeError> {
                 let plaintext = mission.open_application_frame(protected_request)?;
-                let frame = Frame::decode(&plaintext)?;
+                let frame =
+                    Frame::decode_for_semantic_version(&plaintext, mission.semantic_version())?;
                 let (response, session_complete) =
                     handler(frame, protected_request.len(), mission)?;
                 require_contact_frame_response(&response)?;
-                let response = response.encode()?;
+                let response = response.encode_for_semantic_version(mission.semantic_version())?;
                 let protected_response = mission.seal_application_frame(&response)?;
                 // Keep the final revision check adjacent to handing bytes back
                 // to the carrier response path.
@@ -22833,6 +26367,24 @@ where
         NodeError::Protocol("mission response completed without a protected request".into())
     })?;
     Ok((carrier_complete, request_len, response_len))
+}
+
+#[cfg(test)]
+fn apply_test_preaccounted_contact_items(receipt: &mut PeerReceipt) -> Result<(), NodeError> {
+    let items = TEST_PREACCOUNTED_CONTACT_ITEMS
+        .try_with(std::cell::Cell::get)
+        .unwrap_or(0);
+    if items == 0 {
+        return Ok(());
+    }
+    if receipt.offered != 0 || receipt.fetched != 0 || items > MAX_CONTACT_ITEMS {
+        return Err(NodeError::Protocol(
+            "test contact item pre-accounting is outside the empty contact bound".into(),
+        ));
+    }
+    receipt.offered = items / 2;
+    receipt.fetched = items - receipt.offered;
+    Ok(())
 }
 
 fn authenticated_receipt(
@@ -22929,14 +26481,58 @@ fn account(receipt: &mut PeerReceipt, request: usize, response: usize) -> Result
     Ok(())
 }
 
+fn account_outbound_protected_frame(
+    receipt: &mut PeerReceipt,
+    wire_bytes: usize,
+) -> Result<(), NodeError> {
+    let (frames, bytes) = check_one_protected_frame(
+        receipt,
+        receipt.protected_frames,
+        receipt.protected_bytes,
+        wire_bytes,
+    )?;
+    receipt.protected_frames = frames;
+    receipt.protected_bytes = bytes;
+    Ok(())
+}
+
+fn account_inbound_protected_frame(
+    receipt: &mut PeerReceipt,
+    wire_bytes: usize,
+) -> Result<(), NodeError> {
+    let (frames, bytes) = check_one_protected_frame(
+        receipt,
+        receipt.protected_frames,
+        receipt.protected_bytes,
+        wire_bytes,
+    )?;
+    receipt.protected_frames = frames;
+    receipt.protected_bytes = bytes;
+    Ok(())
+}
+
 fn check_account(
     receipt: &PeerReceipt,
     request: usize,
     response: usize,
 ) -> Result<(usize, usize), NodeError> {
-    let frames = receipt
-        .protected_frames
-        .checked_add(2)
+    let (frames, bytes) = check_one_protected_frame(
+        receipt,
+        receipt.protected_frames,
+        receipt.protected_bytes,
+        request,
+    )?;
+    check_one_protected_frame(receipt, frames, bytes, response)
+}
+
+fn check_one_protected_frame(
+    receipt: &PeerReceipt,
+    protected_frames: usize,
+    protected_bytes: usize,
+    wire_bytes: usize,
+) -> Result<(usize, usize), NodeError> {
+    let frames = protected_frames
+        .checked_add(1)
         .ok_or_else(|| NodeError::Protocol("contact frame count overflow".into()))?;
     let mission_frames = receipt
         .handshake_frames
@@ -22947,10 +26543,8 @@ fn check_account(
             "contact frame count {mission_frames} exceeds {MAX_CONTACT_FRAMES}"
         )));
     }
-    let bytes = receipt
-        .protected_bytes
-        .checked_add(request)
-        .and_then(|bytes| bytes.checked_add(response))
+    let bytes = protected_bytes
+        .checked_add(wire_bytes)
         .ok_or_else(|| NodeError::Protocol("contact byte count overflow".into()))?;
     let mission_bytes = receipt
         .handshake_bytes
@@ -22962,6 +26556,35 @@ fn check_account(
         )));
     }
     Ok((frames, bytes))
+}
+
+fn check_protected_frame_with_reserve(
+    receipt: &PeerReceipt,
+    wire_bytes: usize,
+    reserve: ContactReserve,
+) -> Result<(), NodeError> {
+    let (frames, bytes) = check_one_protected_frame(
+        receipt,
+        receipt.protected_frames,
+        receipt.protected_bytes,
+        wire_bytes,
+    )?;
+    let final_frames = receipt
+        .handshake_frames
+        .checked_add(frames)
+        .and_then(|count| count.checked_add(reserve.protected_frames))
+        .ok_or_else(|| NodeError::Protocol("reserved contact frame count overflow".into()))?;
+    let final_bytes = receipt
+        .handshake_bytes
+        .checked_add(bytes)
+        .and_then(|count| count.checked_add(reserve.protected_bytes))
+        .ok_or_else(|| NodeError::Protocol("reserved contact byte count overflow".into()))?;
+    if final_frames > MAX_CONTACT_FRAMES || final_bytes > MAX_CONTACT_BYTES {
+        return Err(NodeError::Protocol(
+            "protected Event frame would consume the later-lane contact reserve".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Runs the default real N-process Ping/Pong, temporal-forwarding, and restart demonstration.
@@ -24417,7 +28040,12 @@ mod tests {
 
     use super::*;
     use crate::application::{RecordProjection, StateProjection};
+    use crate::bridge_runtime::SelectedEventBridgeEdge;
     use crate::mission::initiate_over_iroh;
+    use aster_mesh::{
+        BridgeAuthorizationLink, SelectedBridgeAuthorizationPolicy, SelectedBridgeNarrowingPolicy,
+        SelectedEventBridgeAdapter,
+    };
     use redb::{ReadableDatabase as _, ReadableTable as _};
 
     #[derive(Default)]
@@ -24679,6 +28307,12 @@ mod tests {
             inserted: 2,
             duplicates: 1,
             remaining: 4,
+            event_uni_turns_sent: 1,
+            event_pages_sent: 2,
+            event_page_entries_sent: 3,
+            event_page_bytes_sent: 4,
+            event_page_unscheduled: 5,
+            receiptful_event_offers: 6,
             mutable_remaining: 5,
             deferred_mutable_lanes: 1,
             ..PeerReceipt::default()
@@ -24689,6 +28323,12 @@ mod tests {
             inserted: 6,
             duplicates: 5,
             remaining: 13,
+            event_uni_turns_sent: 7,
+            event_pages_sent: 11,
+            event_page_entries_sent: 13,
+            event_page_bytes_sent: 17,
+            event_page_unscheduled: 19,
+            receiptful_event_offers: 23,
             mutable_remaining: 17,
             deferred_mutable_lanes: 2,
             ..PeerReceipt::default()
@@ -24702,6 +28342,12 @@ mod tests {
         assert_eq!(total.data_inserted, 8);
         assert_eq!(total.data_duplicates, 6);
         assert_eq!(total.data_remaining, 17);
+        assert_eq!(total.event_uni_turns_sent, 8);
+        assert_eq!(total.event_pages_sent, 13);
+        assert_eq!(total.event_page_entries_sent, 16);
+        assert_eq!(total.event_page_bytes_sent, 21);
+        assert_eq!(total.event_page_unscheduled, 24);
+        assert_eq!(total.receiptful_event_offers, 29);
         assert_eq!(total.mutable_remaining, 22);
         assert_eq!(total.deferred_mutable_lanes, 3);
     }
@@ -24726,6 +28372,30 @@ mod tests {
             error,
             NodeError::Protocol(message)
                 if message == "aggregate data fetched count overflow"
+        ));
+        assert_eq!(total, before);
+    }
+
+    #[test]
+    fn node_receipt_page_accounting_fails_atomically_on_overflow() {
+        let mut total = NodeReceipt {
+            data_offered: 41,
+            event_page_entries_sent: u64::MAX,
+            ..NodeReceipt::default()
+        };
+        let before = total.clone();
+        let contact = PeerReceipt {
+            offered: 1,
+            event_page_entries_sent: 1,
+            ..PeerReceipt::default()
+        };
+
+        let error = account_data_receipt(&mut total, &contact).expect_err("overflow must fail");
+
+        assert!(matches!(
+            error,
+            NodeError::Protocol(message)
+                if message == "aggregate Event page entries sent count overflow"
         ));
         assert_eq!(total, before);
     }
@@ -25133,10 +28803,28 @@ mod tests {
         );
         assert_eq!(
             post_event_reserve(5),
-            Some(PostEventReserve {
-                exchanges: MUTABLE_V5_CONTACT_RESERVE_EXCHANGES,
-                bytes: MUTABLE_V5_CONTACT_RESERVE_BYTES,
+            Some(ContactReserve {
                 items: 7,
+                protected_frames: MUTABLE_V5_CONTACT_RESERVE_EXCHANGES * EXCHANGE_FRAMES,
+                protected_bytes: MUTABLE_V5_CONTACT_RESERVE_BYTES,
+            })
+        );
+        assert_eq!(
+            post_event_reserve(6),
+            Some(ContactReserve {
+                items: 7,
+                protected_frames: MUTABLE_V5_CONTACT_RESERVE_EXCHANGES * EXCHANGE_FRAMES,
+                protected_bytes: MUTABLE_V5_CONTACT_RESERVE_BYTES,
+            })
+        );
+        assert_eq!(
+            post_event_reserve(SEMANTIC_PROTOCOL_V7),
+            Some(ContactReserve {
+                items: 9,
+                protected_frames: MUTABLE_V5_CONTACT_RESERVE_EXCHANGES * EXCHANGE_FRAMES
+                    + EVENT_BRIDGE_CONTACT_RESERVE_FRAMES,
+                protected_bytes: MUTABLE_V5_CONTACT_RESERVE_BYTES
+                    + EVENT_BRIDGE_CONTACT_RESERVE_BYTES,
             })
         );
         assert_eq!(MAX_CONFIGURED_PEERS, 256);
@@ -25175,9 +28863,24 @@ mod tests {
             event_transfer_capacity(&PeerReceipt::default(), Some(4)).expect("v4 Event capacity");
         let v5_event_capacity =
             event_transfer_capacity(&PeerReceipt::default(), Some(5)).expect("v5 Event capacity");
+        let v6_event_capacity =
+            event_transfer_capacity(&PeerReceipt::default(), Some(6)).expect("v6 Event capacity");
+        let v7_event_capacity =
+            event_transfer_capacity(&PeerReceipt::default(), Some(SEMANTIC_PROTOCOL_V7))
+                .expect("v7 Event capacity");
         assert_eq!(v3_full_event_capacity, MAX_CONTACT_ITEMS);
         assert_eq!(v4_event_capacity, MAX_CONTACT_ITEMS - 4);
         assert_eq!(v5_event_capacity, MAX_CONTACT_ITEMS - 7);
+        assert_eq!(v6_event_capacity, v5_event_capacity);
+        assert_eq!(v7_event_capacity, MAX_CONTACT_ITEMS - 9);
+        assert_eq!(
+            event_bridge_route_send_limit(MIN_EVENT_BRIDGE_SEMANTIC_VERSION),
+            MAX_EVENT_BRIDGE_ROUTES_PER_DIRECTION
+        );
+        assert_eq!(
+            event_bridge_route_send_limit(SEMANTIC_PROTOCOL_V7),
+            V7_EVENT_BRIDGE_ROUTES_PER_DIRECTION
+        );
     }
 
     #[test]
@@ -25654,6 +29357,162 @@ mod tests {
             fair.offered += 1;
         }
         assert_eq!(fair.offered, MAX_CONTACT_ITEMS);
+    }
+
+    #[test]
+    fn received_event_page_entry_preserves_later_lane_item_reserve() {
+        let reserve = event_turn_reserve();
+        let mut receipt = PeerReceipt {
+            fetched: MAX_CONTACT_ITEMS - reserve.items - 1,
+            ..PeerReceipt::default()
+        };
+        authorize_event_page_entry(&receipt).expect("last Event item before reserve");
+        receipt.fetched += 1;
+        assert!(authorize_event_page_entry(&receipt).is_err());
+    }
+
+    #[test]
+    fn zero_scheduled_page_plan_opens_no_uni_stream() {
+        let zero = EventTurnPlanV1::PageActive {
+            direction: EventDirection::ToSessionResponder,
+            transfer_profile_digest: [1; 32],
+            difference_count: 2,
+            set_commitment: [2; 32],
+            scheduled_count: 0,
+            unscheduled_count: 2,
+        };
+        let one = EventTurnPlanV1::PageActive {
+            direction: EventDirection::ToSessionResponder,
+            transfer_profile_digest: [1; 32],
+            difference_count: 2,
+            set_commitment: [2; 32],
+            scheduled_count: 1,
+            unscheduled_count: 1,
+        };
+        assert!(!event_page_plan_requires_stream(&zero));
+        assert!(event_page_plan_requires_stream(&one));
+    }
+
+    #[test]
+    fn v7_directional_event_limits_reserve_plan_exchange_and_later_lanes() {
+        let receipt = PeerReceipt::default();
+        let reserve = event_turn_reserve();
+        let (to_responder, to_initiator) = directional_event_schedule_limits(
+            &receipt,
+            MAX_CONTACT_ITEMS,
+            MAX_CONTACT_ITEMS,
+            1_024,
+        )
+        .expect("directional Event limits");
+
+        assert_eq!(
+            to_responder.item_capacity + to_initiator.item_capacity,
+            event_transfer_capacity(&receipt, Some(SEMANTIC_PROTOCOL_V7))
+                .expect("Event item capacity")
+        );
+        assert_eq!(
+            to_responder.frame_capacity
+                + to_initiator.frame_capacity
+                + reserve.protected_frames
+                + 2,
+            MAX_CONTACT_FRAMES
+        );
+        assert_eq!(
+            to_responder.turn_bytes
+                + to_initiator.turn_bytes
+                + reserve.protected_bytes
+                + 2 * EVENT_TURN_PLAN_MAX_PROTECTED_BYTES,
+            MAX_CONTACT_BYTES
+        );
+        assert_eq!(to_responder.max_protected_frame_bytes, 1_024);
+        assert_eq!(to_initiator.max_protected_frame_bytes, 1_024);
+
+        let (only_responder, inactive) = directional_event_schedule_limits(&receipt, 7, 0, 512)
+            .expect("one active Event direction");
+        assert_eq!(only_responder.item_capacity, 7);
+        assert_eq!(inactive.item_capacity, 0);
+        assert_eq!(inactive.frame_capacity, 0);
+        assert_eq!(inactive.turn_bytes, 0);
+    }
+
+    #[test]
+    fn v7_receiver_caps_actual_turn_bytes_and_pathological_page_splitting_per_direction() {
+        let receipt = PeerReceipt::default();
+        let reserve = event_turn_reserve();
+        let (to_responder, to_initiator) = directional_event_schedule_limits(
+            &receipt,
+            MAX_CONTACT_ITEMS,
+            MAX_CONTACT_ITEMS,
+            1_024,
+        )
+        .expect("directional Event limits");
+        let global = event_turn_wire_budget(&receipt, reserve).expect("global Event budget");
+
+        assert!(global > to_responder.turn_bytes);
+        assert_eq!(
+            event_turn_receive_wire_budget(&receipt, reserve, to_responder)
+                .expect("direction-local receive budget"),
+            to_responder.turn_bytes
+        );
+        assert_eq!(
+            to_initiator.turn_bytes,
+            directional_event_schedule_limits(
+                &receipt,
+                MAX_CONTACT_ITEMS,
+                MAX_CONTACT_ITEMS,
+                1_024,
+            )
+            .expect("stable reverse Event limits")
+            .1
+            .turn_bytes
+        );
+
+        let narrow = EventPageScheduleLimits {
+            item_capacity: 1,
+            frame_capacity: 3,
+            turn_bytes: 1_024,
+            max_protected_frame_bytes: 512,
+            page_target_entries: 1,
+        };
+        let mut frames_read = 0;
+        account_event_turn_received_frame(&mut frames_read, narrow).expect("header");
+        account_event_turn_received_frame(&mut frames_read, narrow).expect("one page");
+        account_event_turn_received_frame(&mut frames_read, narrow).expect("terminal");
+        assert!(account_event_turn_received_frame(&mut frames_read, narrow).is_err());
+        assert_eq!(frames_read, narrow.frame_capacity);
+    }
+
+    #[test]
+    fn v7_legacy_direction_limit_hides_other_direction_and_restores_receipt() {
+        let planning_receipt = PeerReceipt::default();
+        let reserve = event_turn_reserve();
+        let (to_responder, _) = directional_event_schedule_limits(
+            &planning_receipt,
+            MAX_CONTACT_ITEMS,
+            MAX_CONTACT_ITEMS,
+            1_024,
+        )
+        .expect("directional Event limits");
+        let mut receipt = PeerReceipt {
+            protected_frames: 2,
+            protected_bytes: 2 * EVENT_TURN_PLAN_MAX_PROTECTED_BYTES,
+            ..PeerReceipt::default()
+        };
+        let original = receipt.clone();
+
+        let adjustment = apply_event_direction_contact_limit(&mut receipt, to_responder)
+            .expect("apply direction-local legacy limit");
+        assert_eq!(
+            MAX_CONTACT_FRAMES - receipt.handshake_frames - receipt.protected_frames,
+            to_responder.frame_capacity + reserve.protected_frames
+        );
+        assert_eq!(
+            MAX_CONTACT_BYTES - receipt.handshake_bytes - receipt.protected_bytes,
+            to_responder.turn_bytes + reserve.protected_bytes
+        );
+        remove_event_direction_contact_limit(&mut receipt, adjustment)
+            .expect("remove direction-local legacy limit");
+        assert_eq!(receipt, original);
     }
 
     #[test]
@@ -27916,6 +31775,119 @@ mod tests {
         fs::remove_dir_all(state).expect("cleanup actor state");
     }
 
+    #[tokio::test]
+    async fn v7_profile_offer_is_first_protected_exchange_after_four_flight_handshake() {
+        let mut issued = issue_missions(2);
+        let client_mission = issued.remove(0);
+        let server_mission = issued.remove(0);
+        let server = Endpoint::bind(
+            aster_iroh::SecretKey::generate(),
+            EndpointConfig::direct("127.0.0.1:0".parse().expect("server address")),
+        )
+        .await
+        .expect("server endpoint");
+        let client = Endpoint::bind(
+            aster_iroh::SecretKey::generate(),
+            EndpointConfig::direct("127.0.0.1:0".parse().expect("client address")),
+        )
+        .await
+        .expect("client endpoint");
+        let client_id = client.id();
+        let expected_client = MissionPeerBinding::new(client_id, client_mission.identity);
+        let expected_server = MissionPeerBinding::new(server.id(), server_mission.identity);
+
+        let server_task = tokio::spawn({
+            let server = server.clone();
+            let credentials = server_mission.credentials.clone();
+            async move {
+                let connection = server
+                    .accept(&BTreeSet::from([client_id]))
+                    .await
+                    .expect("accept carrier");
+                let (mut mission, handshake) = respond_over_iroh_metered(
+                    &connection,
+                    credentials.fresh_bundle().expect("server bundle"),
+                    expected_client,
+                )
+                .await
+                .expect("server handshake");
+                let mut receipt = authenticated_receipt(&connection, &mission, handshake)
+                    .expect("server receipt");
+                let profiles = serve_transfer_profiles(&connection, &mut mission, &mut receipt)
+                    .await
+                    .expect("serve profiles")
+                    .expect("semantic v7 profiles");
+                let response_plan = EventTurnPlanV1::Empty {
+                    direction: EventDirection::ToSessionInitiator,
+                    transfer_profile_digest: profiles.digest,
+                    selected_profile: TransferProfileId::EventPagesV1,
+                    set_commitment: empty_set_commitment(),
+                };
+                let request_plan = serve_event_turn_plans(
+                    &connection,
+                    &mut mission,
+                    &profiles,
+                    response_plan.clone(),
+                    &mut receipt,
+                )
+                .await
+                .expect("serve plans");
+                (profiles, receipt, request_plan, response_plan)
+            }
+        });
+
+        let connection = client
+            .connect(ExpectedPeer {
+                id: server.id(),
+                address: loopback(&server),
+            })
+            .await
+            .expect("connect carrier");
+        let (mut mission, handshake) = initiate_over_iroh_metered(
+            &connection,
+            client_mission
+                .credentials
+                .fresh_bundle()
+                .expect("client bundle"),
+            expected_server,
+        )
+        .await
+        .expect("client handshake");
+        let mut receipt =
+            authenticated_receipt(&connection, &mission, handshake).expect("client receipt");
+        assert_eq!(receipt.protected_frames, 0);
+        let client_profiles = sync_transfer_profiles(&connection, &mut mission, &mut receipt)
+            .await
+            .expect("sync profiles")
+            .expect("semantic v7 profiles");
+        let request_plan = EventTurnPlanV1::Empty {
+            direction: EventDirection::ToSessionResponder,
+            transfer_profile_digest: client_profiles.digest,
+            selected_profile: TransferProfileId::EventPagesV1,
+            set_commitment: empty_set_commitment(),
+        };
+        let response_plan = sync_event_turn_plans(
+            &connection,
+            &mut mission,
+            &client_profiles,
+            request_plan.clone(),
+            &mut receipt,
+        )
+        .await
+        .expect("sync plans");
+        let (server_profiles, server_receipt, server_request_plan, server_response_plan) =
+            server_task.await.expect("server task");
+
+        assert_eq!(client_profiles, server_profiles);
+        assert_eq!(server_request_plan, request_plan);
+        assert_eq!(response_plan, server_response_plan);
+        assert_eq!(receipt.protected_frames, 4);
+        assert_eq!(server_receipt.protected_frames, 4);
+        assert_eq!(mission.semantic_version(), SEMANTIC_PROTOCOL_V7);
+        client.close().await;
+        server.close().await;
+    }
+
     #[test]
     fn blob_interest_uses_static_epoch_one_exact_proof_and_receive_only_discloses_none() {
         let mut issued = issue_missions(1);
@@ -29304,6 +33276,9 @@ mod tests {
             mission_peer: Some(mission.peer().mission_id()),
             ..PeerReceipt::default()
         };
+        let transfer_profiles = sync_transfer_profiles(connection, mission, &mut receipt)
+            .await
+            .expect("transfer-profile exchange");
         let control_inventory = InventorySnapshot::default();
         let semantic_v3 = mission.semantic_version() >= MIN_CUSTODY_SEMANTIC_VERSION;
         let mut remote_emission = None;
@@ -29389,7 +33364,9 @@ mod tests {
             Frame::ControlFinished
         );
 
-        if mission.semantic_version() >= MIN_EVENT_BRIDGE_SEMANTIC_VERSION {
+        if (MIN_EVENT_BRIDGE_SEMANTIC_VERSION..SEMANTIC_PROTOCOL_V7)
+            .contains(&mission.semantic_version())
+        {
             assert_eq!(
                 request_mission_frame(
                     connection,
@@ -29512,6 +33489,41 @@ mod tests {
             if complete {
                 break;
             }
+        }
+        if let Some(profiles) = transfer_profiles {
+            reconcile_equal_event_lane(
+                connection,
+                mission,
+                inventory,
+                EventDirection::ToSessionInitiator,
+                &mut receipt,
+            )
+            .await;
+            let local_plan = EventTurnPlanV1::Empty {
+                direction: EventDirection::ToSessionResponder,
+                transfer_profile_digest: profiles.digest,
+                selected_profile: TransferProfileId::EventPagesV1,
+                set_commitment: empty_set_commitment(),
+            };
+            let remote_plan =
+                sync_event_turn_plans(connection, mission, &profiles, local_plan, &mut receipt)
+                    .await
+                    .expect("empty v7 Event plan exchange");
+            assert_eq!(
+                remote_plan,
+                EventTurnPlanV1::Empty {
+                    direction: EventDirection::ToSessionInitiator,
+                    transfer_profile_digest: profiles.digest,
+                    selected_profile: TransferProfileId::EventPagesV1,
+                    set_commitment: empty_set_commitment(),
+                }
+            );
+            connection
+                .skip_uni_turn()
+                .expect("skip empty outbound v7 turn");
+            connection
+                .skip_uni_turn()
+                .expect("skip empty inbound v7 turn");
         }
         receipt
     }
@@ -29784,7 +33796,10 @@ mod tests {
                 .contains("outside this authenticated contact's negotiated difference")
                 || server_error
                     .to_string()
-                    .contains("transfer crossed Event lanes"),
+                    .contains("transfer crossed Event lanes")
+                || server_error
+                    .to_string()
+                    .contains("mutable reconciliation preceded its class interest exchange"),
             "unexpected server rejection: {server_error}"
         );
         let stats = server_store.stats().expect("server stats");
@@ -36999,13 +41014,51 @@ mod tests {
         scope: &Scope,
         logical_key: &[u8],
     ) -> EventTransferId {
+        publish_test_epoch_one_event_with_priority(
+            store,
+            sealer,
+            topic,
+            scope,
+            logical_key,
+            Priority::Routine,
+        )
+    }
+
+    fn publish_test_epoch_one_event_with_priority(
+        store: &Store,
+        sealer: &mut ReferenceEnvelopeSealer,
+        topic: &Topic,
+        scope: &Scope,
+        logical_key: &[u8],
+        priority: Priority,
+    ) -> EventTransferId {
+        publish_test_epoch_one_event_with_payload(
+            store,
+            sealer,
+            topic,
+            scope,
+            logical_key,
+            logical_key,
+            priority,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_test_epoch_one_event_with_payload(
+        store: &Store,
+        sealer: &mut ReferenceEnvelopeSealer,
+        topic: &Topic,
+        scope: &Scope,
+        logical_key: &[u8],
+        payload: &[u8],
+        priority: Priority,
+    ) -> EventTransferId {
         let reservation = store
             .reserve_event(sealer.identity(), topic, scope)
             .expect("reserve epoch-one test Event");
-        let payload = logical_key;
         let header = reservation
             .header(
-                Priority::Routine,
+                priority,
                 logical_key.to_vec(),
                 None,
                 payload.len() as u64,
@@ -37029,6 +41082,40 @@ mod tests {
             .commit_reserved_event(&reservation, &event, &sealed.bytes)
             .expect("commit epoch-one test Event");
         EventTransferId::new(event.envelope_id())
+    }
+
+    fn prepare_test_received_page<'a>(
+        verifier: &mut ReferenceEnvelopeSealer,
+        events: &'a [StoredEvent],
+    ) -> Vec<PreparedReceivedPageEntry<'a>> {
+        events
+            .iter()
+            .map(|stored| {
+                let route = verifier
+                    .verify_event(&stored.sealed)
+                    .expect("verify test page route");
+                let claim = AuthenticatedEventRouteClaim::from_verified(
+                    &route,
+                    EventTransferState::Accepted,
+                    stored.sealed.len(),
+                )
+                .expect("build test page claim");
+                let EventContentVerification::ContentVerified { event, .. } = verifier
+                    .verify_event_content(route, &stored.sealed)
+                    .expect("verify test page content")
+                else {
+                    panic!("test page receiver lost its content grant")
+                };
+                PreparedReceivedPageEntry {
+                    event: PreparedReceivedEvent::Content {
+                        event,
+                        claim,
+                        custody: None,
+                    },
+                    sealed: &stored.sealed,
+                }
+            })
+            .collect()
     }
 
     struct TestCustodyPublication<'a> {
@@ -38665,6 +42752,11 @@ mod tests {
             client_mission,
             client_interests,
             Arc::clone(&client_cache),
+            None,
+            None,
+            None,
+            None,
+            0,
         )
         .await;
         (client_receipt, server_receipt, server_cache, client_cache)
@@ -38680,6 +42772,11 @@ mod tests {
         client_mission: UnprotectedReferenceMission,
         client_interests: MutableSourceInterests,
         client_cache: Arc<AuthenticatedEventRouteCache>,
+        server_bridge: Option<SelectedEventBridgeHandle>,
+        client_bridge: Option<SelectedEventBridgeHandle>,
+        server_reconciliation_exchanges_before_defer: Option<usize>,
+        client_reconciliation_exchanges_before_defer: Option<usize>,
+        preaccounted_contact_items: usize,
     ) -> (PeerReceipt, PeerReceipt) {
         let server = Endpoint::bind(
             aster_iroh::SecretKey::generate(),
@@ -38705,51 +42802,67 @@ mod tests {
                     .accept(&allowed)
                     .await
                     .expect("accept Blob carrier");
-                serve_connection_with_forwarding(InboundContact {
-                    store: server_store,
-                    connection,
-                    mission: server_mission,
-                    expected_peer: Some(peer),
-                    #[cfg(feature = "nearby-discovery")]
-                    automatic_admission: None,
-                    policy_lock: Arc::new(RwLock::new(())),
-                    emission_policy: server_policy,
-                    custody_clock: NodeCustodyClock::injected([0xb1; 16], 0, 0),
-                    event_route_cache: server_cache,
-                    event_bridge: None,
-                    mutable_interests: server_interests,
-                })
-                .await
+                TEST_PREACCOUNTED_CONTACT_ITEMS
+                    .scope(
+                        std::cell::Cell::new(preaccounted_contact_items),
+                        with_test_contact_hooks(
+                            server_reconciliation_exchanges_before_defer,
+                            Vec::new(),
+                            serve_connection_with_forwarding(InboundContact {
+                                store: server_store,
+                                connection,
+                                mission: server_mission,
+                                expected_peer: Some(peer),
+                                #[cfg(feature = "nearby-discovery")]
+                                automatic_admission: None,
+                                policy_lock: Arc::new(RwLock::new(())),
+                                emission_policy: server_policy,
+                                custody_clock: NodeCustodyClock::injected([0xb1; 16], 0, 0),
+                                event_route_cache: server_cache,
+                                event_bridge: server_bridge,
+                                mutable_interests: server_interests,
+                            }),
+                        ),
+                    )
+                    .await
             }
         });
         let snapshot = client_policy.snapshot().expect("client policy snapshot");
-        let client_receipt = sync_once_with_forwarding(
-            &client,
-            OutboundContact {
-                store: client_store,
-                mission: client_mission,
-                peer: MissionExpectedPeer {
-                    carrier: ExpectedPeer {
-                        id: server.id(),
-                        address: loopback(&server),
-                    },
-                    mission: server_mission_id,
-                }
-                .into(),
-                #[cfg(feature = "nearby-discovery")]
-                automatic_admission: None,
-                policy_lock: Arc::new(RwLock::new(())),
-                emission_policy: client_policy,
-                emission_snapshot: snapshot,
-                custody_clock: NodeCustodyClock::injected([0xb2; 16], 0, 0),
-                event_route_cache: client_cache,
-                event_bridge: None,
-                mutable_interests: client_interests,
-                controlled_relay: None,
-            },
-        )
-        .await
-        .expect("Blob client contact");
+        let client_receipt = TEST_PREACCOUNTED_CONTACT_ITEMS
+            .scope(
+                std::cell::Cell::new(preaccounted_contact_items),
+                with_test_contact_hooks(
+                    client_reconciliation_exchanges_before_defer,
+                    Vec::new(),
+                    sync_once_with_forwarding(
+                        &client,
+                        OutboundContact {
+                            store: client_store,
+                            mission: client_mission,
+                            peer: MissionExpectedPeer {
+                                carrier: ExpectedPeer {
+                                    id: server.id(),
+                                    address: loopback(&server),
+                                },
+                                mission: server_mission_id,
+                            }
+                            .into(),
+                            #[cfg(feature = "nearby-discovery")]
+                            automatic_admission: None,
+                            policy_lock: Arc::new(RwLock::new(())),
+                            emission_policy: client_policy,
+                            emission_snapshot: snapshot,
+                            custody_clock: NodeCustodyClock::injected([0xb2; 16], 0, 0),
+                            event_route_cache: client_cache,
+                            event_bridge: client_bridge,
+                            mutable_interests: client_interests,
+                            controlled_relay: None,
+                        },
+                    ),
+                ),
+            )
+            .await
+            .expect("Blob client contact");
         let server_receipt = server_task
             .await
             .expect("Blob server task")
@@ -38757,6 +42870,299 @@ mod tests {
         client.close().await;
         server.close().await;
         (client_receipt.receipt, server_receipt.receipt)
+    }
+
+    #[tokio::test]
+    async fn v7_saturated_events_preserve_all_later_lanes_and_bridge_deferral_progress() {
+        let source_scope = Scope::new("test/v7-saturated/source").expect("source scope");
+        let target_scope = Scope::new("test/v7-saturated/target").expect("target scope");
+        let topic = Topic::new("telemetry").expect("telemetry topic");
+        let source_route =
+            ProvisioningAccess::relay(source_scope.clone(), vec![1]).expect("source route access");
+        let target_route =
+            ProvisioningAccess::relay(target_scope.clone(), vec![2]).expect("target route access");
+        let source_member =
+            ProvisioningAccess::member(source_scope.clone(), vec![1], vec![topic.clone()])
+                .expect("source member access");
+        let target_member =
+            ProvisioningAccess::member(target_scope.clone(), vec![2], vec![topic.clone()])
+                .expect("target member access");
+        let receiver_source_member =
+            ProvisioningAccess::member(source_scope.clone(), vec![1], vec![topic.clone()])
+                .expect("receiver source member access");
+        let mut provisioner =
+            ReferenceProvisioner::from_seed([0xe8; 32]).expect("bridge provisioner");
+        let mut authority = provisioner
+            .issue_control_authority(1, &[source_route.clone(), target_route.clone()])
+            .and_then(ReferenceEnvelopeSealer::open)
+            .expect("bridge authority");
+        let source_mission = UnprotectedReferenceMission::from_bytes(
+            provisioner
+                .issue_node(2, &[source_member, target_route])
+                .and_then(|bundle| bundle.to_bytes())
+                .expect("source bridge bundle"),
+        )
+        .expect("source bridge mission");
+        let receiver_mission = UnprotectedReferenceMission::from_bytes(
+            provisioner
+                .issue_node(3, &[target_member, receiver_source_member])
+                .and_then(|bundle| bundle.to_bytes())
+                .expect("receiver bundle"),
+        )
+        .expect("receiver mission");
+        let source_provider = open_test_sealer(&source_mission);
+        let enrollment = SelectedEventBridgeAdapter::create_enrollment(
+            &source_provider,
+            &source_scope,
+            1,
+            &target_scope,
+            2,
+        )
+        .expect("bridge enrollment");
+        let enrollment = SelectedEventBridgeAdapter::verify_enrollment(&authority, &enrollment)
+            .expect("verified bridge enrollment");
+        let authorization_policy = SelectedBridgeAuthorizationPolicy::new(
+            vec![topic.clone()],
+            vec![Priority::Immediate],
+            1,
+        )
+        .expect("bridge authorization policy");
+        let authorization = SelectedEventBridgeAdapter::issue_authorization(
+            &mut authority,
+            &enrollment,
+            BridgeAuthorizationLink::new(1, None, 1).expect("bridge link"),
+            &authorization_policy,
+        )
+        .expect("bridge authorization");
+        let authorization_id = authorization.envelope_id();
+        let authorization_chain = vec![authorization.exact_bytes().to_vec()];
+        let source_config = SelectedEventBridgeConfig::new(
+            authorization_chain.clone(),
+            vec![SelectedEventBridgeEdge::new(
+                authorization_id,
+                SelectedBridgeNarrowingPolicy::new(vec![topic.clone()], vec![Priority::Immediate])
+                    .expect("bridge narrowing"),
+            )],
+            false,
+        )
+        .expect("source bridge config");
+        let receiver_config = SelectedEventBridgeConfig::new(authorization_chain, Vec::new(), true)
+            .expect("receiver bridge config");
+
+        let source_state = root("v7-saturated-all-lanes-source");
+        let receiver_state = root("v7-saturated-all-lanes-receiver");
+        fs::create_dir_all(&source_state).expect("source state");
+        fs::create_dir_all(&receiver_state).expect("receiver state");
+        let mission_authority = source_mission.mission_authority_id();
+        assert_eq!(receiver_mission.mission_authority_id(), mission_authority);
+        let source_store = Arc::new(
+            Store::open_for_mission(source_state.join(STORE_FILE), mission_authority)
+                .expect("source store"),
+        );
+        let receiver_store = Arc::new(
+            Store::open_for_mission(receiver_state.join(STORE_FILE), mission_authority)
+                .expect("receiver store"),
+        );
+        let (source_bridge_runtime, source_initialization) =
+            SelectedEventBridgeRuntime::initialize(
+                source_store.clone(),
+                &source_mission,
+                source_config,
+            )
+            .expect("initialize source bridge");
+        assert_eq!(source_initialization.carry_subscriptions_inserted, 1);
+        let (receiver_bridge_runtime, receiver_initialization) =
+            SelectedEventBridgeRuntime::initialize(
+                receiver_store.clone(),
+                &receiver_mission,
+                receiver_config,
+            )
+            .expect("initialize receiver bridge");
+        assert_eq!(receiver_initialization.carry_subscriptions_inserted, 0);
+        let source_bridge = Arc::new(StdMutex::new(source_bridge_runtime));
+        let receiver_bridge = Arc::new(StdMutex::new(receiver_bridge_runtime));
+        seed_test_event_subscription(
+            &receiver_store,
+            EventSubscriptionMode::Consume,
+            &topic,
+            &source_scope,
+            b"v7-saturated-consume",
+        );
+
+        let mut source_sealer = open_test_sealer(&source_mission);
+        let large_payload = vec![0xa7; 64 * 1024];
+        let mut bridge_sources = Vec::new();
+        for index in 0..3 {
+            let logical_key = format!("bridge/large/{index}");
+            let transfer_id = publish_test_epoch_one_event_with_payload(
+                &source_store,
+                &mut source_sealer,
+                &topic,
+                &source_scope,
+                logical_key.as_bytes(),
+                &large_payload,
+                Priority::Immediate,
+            );
+            let stored = source_store
+                .get_event(transfer_id)
+                .expect("load bridge source")
+                .expect("bridge source exists");
+            source_bridge
+                .lock()
+                .expect("source bridge lock")
+                .materialize_first_hop(&stored.sealed, authorization_id, 0, false)
+                .expect("materialize durable bridge route");
+            bridge_sources.push(transfer_id);
+        }
+        assert_eq!(
+            source_store
+                .selected_bridge_stats()
+                .expect("source bridge stats")
+                .event_routes,
+            3
+        );
+
+        const EVENT_PAGE_TEST_CAPACITY: usize = 32;
+        let full_event_capacity =
+            event_transfer_capacity(&PeerReceipt::default(), Some(SEMANTIC_PROTOCOL_V7))
+                .expect("v7 Event capacity");
+        let preaccounted_contact_items = full_event_capacity
+            .checked_sub(EVENT_PAGE_TEST_CAPACITY)
+            .expect("test Event capacity fits the production bound");
+        for index in 0..EVENT_PAGE_TEST_CAPACITY {
+            let logical_key = format!("telemetry/{index:04}");
+            publish_test_epoch_one_event(
+                &source_store,
+                &mut source_sealer,
+                &topic,
+                &source_scope,
+                logical_key.as_bytes(),
+            );
+        }
+        let state_id = publish_test_state(
+            &source_store,
+            &mut source_sealer,
+            &topic,
+            &source_scope,
+            b"telemetry/state",
+            b"state-value",
+        );
+        let record_id = publish_test_record(
+            &source_store,
+            &mut source_sealer,
+            &topic,
+            &source_scope,
+            b"telemetry/record",
+            b"record-value",
+        );
+        let blob_id = publish_test_blob(
+            &source_store,
+            &mut source_sealer,
+            &topic,
+            &source_scope,
+            1,
+            &[0x5b; 4 * 1024],
+        );
+        let interests = || {
+            let selector =
+                || SourceInterestSelector::new(topic.clone(), source_scope.clone(), false);
+            MutableSourceInterests::new(vec![selector()], vec![selector()])
+                .with_blob(vec![selector()])
+        };
+        let source_cache = test_event_route_cache(&source_store, &source_mission);
+        let receiver_cache = test_event_route_cache(&receiver_store, &receiver_mission);
+        let (receiver_receipt, source_receipt) = blob_contact_test_pair_with_caches(
+            source_store.clone(),
+            source_mission.clone(),
+            interests(),
+            Arc::clone(&source_cache),
+            receiver_store.clone(),
+            receiver_mission.clone(),
+            interests(),
+            Arc::clone(&receiver_cache),
+            Some(source_bridge.clone()),
+            Some(receiver_bridge.clone()),
+            None,
+            None,
+            preaccounted_contact_items,
+        )
+        .await;
+
+        assert_eq!(source_receipt.semantic_version, SEMANTIC_PROTOCOL_V7);
+        assert!(
+            source_receipt.event_page_entries_sent > 0,
+            "source receipt: {source_receipt:?}; receiver receipt: {receiver_receipt:?}"
+        );
+        assert!(source_receipt.event_page_unscheduled > 0);
+        assert_eq!(source_receipt.receiptful_event_offers, 0);
+        assert_eq!(
+            source_receipt.event_page_entries_sent,
+            receiver_receipt.event_page_entries_received
+        );
+        assert_eq!(source_receipt.bridge_offered, 1);
+        assert!(source_receipt.bridge_remaining > 0);
+        assert_eq!(receiver_receipt.bridge_applied, 1);
+        assert_eq!(receiver_receipt.bridge_delivered, 1);
+        assert!(receiver_receipt.blob_ranges_fetched > 0);
+        assert!(receiver_receipt.blob_bytes_fetched > 0);
+        assert!(
+            receiver_store
+                .get_event(bridge_sources[0])
+                .expect("receiver Event lookup")
+                .is_some()
+        );
+        assert!(
+            receiver_store
+                .get_state(state_id)
+                .expect("receiver State lookup")
+                .is_some()
+        );
+        assert!(
+            receiver_store
+                .get_record(record_id)
+                .expect("receiver Record lookup")
+                .is_some()
+        );
+        assert!(
+            receiver_store
+                .get_blob(blob_id)
+                .expect("receiver Blob lookup")
+                .is_some()
+        );
+        assert_eq!(
+            receiver_store
+                .blob_stats()
+                .expect("receiver Blob stats")
+                .publications,
+            1
+        );
+
+        let (deferred_receiver, deferred_source) = blob_contact_test_pair_with_caches(
+            source_store.clone(),
+            source_mission.clone(),
+            interests(),
+            source_cache,
+            receiver_store.clone(),
+            receiver_mission.clone(),
+            interests(),
+            receiver_cache,
+            Some(source_bridge),
+            Some(receiver_bridge),
+            None,
+            Some(0),
+            0,
+        )
+        .await;
+        assert_eq!(deferred_source.deferred_event_lanes, 1);
+        assert_eq!(deferred_receiver.deferred_event_lanes, 1);
+        assert_eq!(deferred_source.bridge_offered, 1);
+        assert_eq!(deferred_receiver.bridge_applied, 1);
+        assert_eq!(deferred_receiver.bridge_delivered, 1);
+
+        drop(source_store);
+        drop(receiver_store);
+        fs::remove_dir_all(source_state).expect("source cleanup");
+        fs::remove_dir_all(receiver_state).expect("receiver cleanup");
     }
 
     #[tokio::test]
@@ -39073,6 +43479,11 @@ mod tests {
                 receiver.credentials.clone(),
                 interests(),
                 Arc::clone(&receiver_cache),
+                None,
+                None,
+                None,
+                None,
+                0,
             )
             .await;
             deferrals = deferrals.saturating_add(receipt.blob_deferred);
@@ -39125,6 +43536,11 @@ mod tests {
             receiver.credentials.clone(),
             interests(),
             Arc::clone(&restarted_cache),
+            None,
+            None,
+            None,
+            None,
+            0,
         )
         .await;
         assert_eq!(resumed.blob_deferred, 0);
@@ -39870,6 +44286,18 @@ mod tests {
         cache
     }
 
+    async fn with_test_transfer_profile_offer<F>(
+        offer: TransferProfileOfferV1,
+        future: F,
+    ) -> F::Output
+    where
+        F: std::future::Future,
+    {
+        TEST_TRANSFER_PROFILE_OFFER
+            .scope(std::cell::RefCell::new(Some(offer)), future)
+            .await
+    }
+
     async fn with_test_contact_hooks<F>(
         exchanges_before_defer: Option<usize>,
         preopen_custody_races: Vec<TestCustodyPreopenRace>,
@@ -40071,7 +44499,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn receive_only_v3_accepts_finite_priority_push_without_disclosing_local_objects() {
+    async fn receive_only_v7_accepts_blind_pages_without_disclosing_local_objects() {
         let carry_scope = Scope::new("test/selected-control/carry").expect("Carry scope");
         let services =
             control_test_services_with_additional_scope([0xa7; 32], Some(carry_scope.clone()));
@@ -40212,12 +44640,12 @@ mod tests {
                 topic: &topic,
                 scope: &carry_scope,
                 priority: Priority::Flash,
-                ttl_ms: None,
+                ttl_ms: Some(10_000),
                 sample: CustodySample {
                     clock_id: client_clock_id,
                     tick_ms: 0,
                 },
-                payload: b"blind-carry-satisfied",
+                payload: b"blind-finite-carry",
                 tombstone: false,
             },
         );
@@ -40250,6 +44678,16 @@ mod tests {
         assert_eq!(server_receipt.inserted, 3);
         assert_eq!(server_receipt.offered, 0);
         assert_eq!(server_receipt.controls_offered, 0);
+        assert_eq!(client_receipt.event_uni_turns_sent, 1);
+        assert_eq!(client_receipt.event_pages_sent, 1);
+        assert_eq!(client_receipt.event_page_entries_sent, 3);
+        assert_eq!(client_receipt.receiptful_event_offers, 0);
+        assert_eq!(server_receipt.event_uni_turns_received, 1);
+        assert_eq!(server_receipt.event_pages_received, 1);
+        assert_eq!(server_receipt.event_page_entries_received, 3);
+        assert_eq!(server_receipt.event_page_inserts, 3);
+        assert_eq!(server_receipt.event_page_duplicates, 0);
+        assert_eq!(server_receipt.receiptful_event_offers, 0);
         assert_eq!(
             server_store
                 .control_stats()
@@ -40320,17 +44758,25 @@ mod tests {
         )
         .await;
         assert_eq!(
-            repeat_client.offered, 0,
-            "blind scheduling must honor receipts"
+            repeat_client.offered, 3,
+            "receipt-free blind scheduling must not retain peer receipt state"
         );
-        assert_eq!(repeat_server.fetched, 0);
+        assert_eq!(repeat_client.event_pages_sent, 1);
+        assert_eq!(repeat_client.event_page_entries_sent, 3);
+        assert_eq!(repeat_client.receiptful_event_offers, 0);
+        assert_eq!(repeat_server.fetched, 3);
         assert_eq!(repeat_server.inserted, 0);
+        assert_eq!(repeat_server.event_pages_received, 1);
+        assert_eq!(repeat_server.event_page_inserts, 0);
+        assert_eq!(repeat_server.event_page_duplicates, 3);
+        assert_eq!(repeat_server.receiptful_event_offers, 0);
 
         // The selector contents stay mode-hidden when Carry becomes Consume,
         // but the protected opaque revision changes. Reopen both stores to
-        // prove the durable blind receipt is scoped to that exact revision:
-        // the old route-only transfer is offered once for promotion, then the
-        // replacement revision is suppressed normally.
+        // prove the blind route-only transfer can be promoted after the
+        // protected selector revision changes. Receipt-free V7 intentionally
+        // keeps no sender-side peer receipt, so later contacts remain
+        // idempotent duplicate deliveries.
         drop(server_store);
         drop(client_store);
         let server_store = Arc::new(
@@ -40411,8 +44857,12 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(promoted_repeat_client.offered, 0);
-        assert_eq!(promoted_repeat_server.fetched, 0);
+        assert_eq!(promoted_repeat_client.offered, 1);
+        assert_eq!(promoted_repeat_client.event_pages_sent, 1);
+        assert_eq!(promoted_repeat_client.receiptful_event_offers, 0);
+        assert_eq!(promoted_repeat_server.fetched, 1);
+        assert_eq!(promoted_repeat_server.inserted, 0);
+        assert_eq!(promoted_repeat_server.event_page_duplicates, 1);
 
         let endpoint = Endpoint::bind(
             aster_iroh::SecretKey::generate(),
@@ -40454,10 +44904,140 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v3_final_send_overrun_leaks_no_offer_to_the_peer() {
+    async fn receive_only_v7_blind_pages_cover_both_identity_orders_without_settlement_state() {
+        let mut selected: [Option<ControlTestServices>; 2] = [None, None];
+        for seed in 1u8..=u8::MAX {
+            let services = control_test_services([seed; 32]);
+            let order = usize::from(services.member.identity() > services.other.identity());
+            if selected[order].is_none() {
+                selected[order] = Some(services);
+            }
+            if selected.iter().all(Option::is_some) {
+                break;
+            }
+        }
+        let selected = selected.map(|services| services.expect("both mission identity orders"));
+
+        for (order, services) in selected.into_iter().enumerate() {
+            assert_eq!(
+                usize::from(services.member.identity() > services.other.identity()),
+                order
+            );
+            let server_state = root(&format!("receive-only-v7-order-{order}-server"));
+            let client_state = root(&format!("receive-only-v7-order-{order}-client"));
+            fs::create_dir_all(&server_state).expect("server state");
+            fs::create_dir_all(&client_state).expect("client state");
+            let authority = services.member.mission_authority_id();
+            let server_store = Arc::new(
+                Store::open_for_mission(server_state.join(STORE_FILE), authority)
+                    .expect("server store"),
+            );
+            let client_path = client_state.join(STORE_FILE);
+            let client_store =
+                Arc::new(Store::open_for_mission(&client_path, authority).expect("client store"));
+            seed_test_event_subscription(
+                &server_store,
+                EventSubscriptionMode::Consume,
+                &services.topic,
+                &services.scope,
+                format!("receive-only-order-{order}").as_bytes(),
+            );
+            let mut server_sealer = open_test_sealer(&services.member);
+            let local_only = publish_test_epoch_one_event(
+                &server_store,
+                &mut server_sealer,
+                &services.topic,
+                &services.scope,
+                format!("server-local-{order}").as_bytes(),
+            );
+            let client_clock_id = [0xc0 + order as u8; 16];
+            let mut client_sealer = open_test_sealer(&services.other);
+            let inbound = publish_test_custody_event(
+                &client_store,
+                &mut client_sealer,
+                TestCustodyPublication {
+                    operation: format!("receive-only/order/{order}").as_bytes(),
+                    topic: &services.topic,
+                    scope: &services.scope,
+                    priority: Priority::Immediate,
+                    ttl_ms: Some(600_000),
+                    sample: CustodySample {
+                        clock_id: client_clock_id,
+                        tick_ms: 0,
+                    },
+                    payload: format!("blind-order-{order}").as_bytes(),
+                    tombstone: false,
+                },
+            );
+            let server_policy = Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::ReceiveOnly));
+            let client_policy = Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal));
+
+            for (contact, expected_inserts) in [(0, 1), (1, 0)] {
+                let (client_receipt, server_receipt) = contact_test_pair_with_forwarding(
+                    TestForwardingNode {
+                        store: server_store.clone(),
+                        mission: services.member.clone(),
+                        policy: server_policy.clone(),
+                        clock: NodeCustodyClock::injected([0xd0 + order as u8; 16], contact, 0),
+                        reconciliation_exchanges_before_defer: None,
+                        preopen_custody_races: Vec::new(),
+                    },
+                    TestForwardingNode {
+                        store: client_store.clone(),
+                        mission: services.other.clone(),
+                        policy: client_policy.clone(),
+                        clock: NodeCustodyClock::injected(client_clock_id, contact, 0),
+                        reconciliation_exchanges_before_defer: None,
+                        preopen_custody_races: Vec::new(),
+                    },
+                )
+                .await;
+                assert_eq!(client_receipt.event_pages_sent, 1, "order {order}");
+                assert_eq!(client_receipt.event_page_entries_sent, 1, "order {order}");
+                assert_eq!(client_receipt.receiptful_event_offers, 0, "order {order}");
+                assert_eq!(server_receipt.event_pages_received, 1, "order {order}");
+                assert_eq!(
+                    server_receipt.event_page_inserts, expected_inserts,
+                    "order {order}"
+                );
+                assert_eq!(
+                    server_receipt.event_page_duplicates,
+                    1 - expected_inserts,
+                    "order {order}"
+                );
+                assert_eq!(server_receipt.offered, 0, "order {order}");
+            }
+            assert!(
+                server_store
+                    .get_event(inbound.transfer_id)
+                    .expect("blind inbound lookup")
+                    .is_some()
+            );
+            assert!(
+                client_store
+                    .get_event(local_only)
+                    .expect("local disclosure lookup")
+                    .is_none()
+            );
+
+            drop(client_store);
+            let sender_custody = Store::inspect_existing(&client_path)
+                .expect("blind sender custody inspection")
+                .custody_stats;
+            assert_eq!(sender_custody.transfer_leases, 0, "order {order}");
+            assert_eq!(sender_custody.peer_receipts, 0, "order {order}");
+            assert_eq!(sender_custody.retries, 0, "order {order}");
+            drop(server_store);
+            fs::remove_dir_all(server_state).expect("server cleanup");
+            fs::remove_dir_all(client_state).expect("client cleanup");
+        }
+    }
+
+    #[tokio::test]
+    async fn v7_event_page_final_send_overrun_leaks_no_entry_to_the_peer() {
         let services = control_test_services([0x6f; 32]);
-        let server_state = root("v3-final-send-overrun-server");
-        let client_state = root("v3-final-send-overrun-client");
+        let server_state = root("v7-final-send-overrun-server");
+        let client_state = root("v7-final-send-overrun-client");
         fs::create_dir_all(&server_state).expect("server state");
         fs::create_dir_all(&client_state).expect("client state");
         let server_store = Arc::new(
@@ -40467,12 +45047,10 @@ mod tests {
             )
             .expect("server store"),
         );
+        let client_path = client_state.join(STORE_FILE);
         let client_store = Arc::new(
-            Store::open_for_mission(
-                client_state.join(STORE_FILE),
-                services.other.mission_authority_id(),
-            )
-            .expect("client store"),
+            Store::open_for_mission(&client_path, services.other.mission_authority_id())
+                .expect("client store"),
         );
         seed_test_event_subscription(
             &server_store,
@@ -40541,16 +45119,24 @@ mod tests {
         if let Ok(completed) = server {
             assert_eq!(completed.receipt.inserted, 0);
             assert_eq!(completed.receipt.fetched, 0);
+            assert_eq!(completed.receipt.event_page_entries_received, 0);
+            assert_eq!(completed.receipt.receiptful_event_offers, 0);
         }
         assert!(
             server_store
                 .get_event(source.transfer_id)
                 .expect("peer Event lookup")
                 .is_none(),
-            "carrier callback rejection must occur before any OfferV3 byte reaches the peer"
+            "carrier-adjacent rejection must occur before any page entry reaches the peer"
         );
         drop(server_store);
         drop(client_store);
+        let custody = Store::inspect_existing(&client_path)
+            .expect("overrun source custody inspection")
+            .custody_stats;
+        assert_eq!(custody.transfer_leases, 0);
+        assert_eq!(custody.peer_receipts, 0);
+        assert_eq!(custody.retries, 0);
         fs::remove_dir_all(server_state).expect("server cleanup");
         fs::remove_dir_all(client_state).expect("client cleanup");
     }
@@ -40763,6 +45349,129 @@ mod tests {
         drop(client_store);
         fs::remove_dir_all(server_state).expect("server cleanup");
         fs::remove_dir_all(client_state).expect("client cleanup");
+    }
+
+    #[tokio::test]
+    async fn v7_event_page_rejects_true_post_batch_overrun_for_every_custody_entry() {
+        let services = control_test_services([0x6e; 32]);
+        let receiver_state = root("v7-page-final-sample-receiver");
+        let source_state = root("v7-page-final-sample-source");
+        fs::create_dir_all(&receiver_state).expect("receiver state");
+        fs::create_dir_all(&source_state).expect("source state");
+        let receiver_store = Arc::new(
+            Store::open_for_mission(
+                receiver_state.join(STORE_FILE),
+                services.member.mission_authority_id(),
+            )
+            .expect("receiver store"),
+        );
+        let source_path = source_state.join(STORE_FILE);
+        let source_store = Arc::new(
+            Store::open_for_mission(&source_path, services.other.mission_authority_id())
+                .expect("source store"),
+        );
+        seed_test_event_subscription(
+            &receiver_store,
+            EventSubscriptionMode::Consume,
+            &services.topic,
+            &services.scope,
+            b"page-final-sample-consume",
+        );
+        let clock_id = [0x6d; 16];
+        let mut source_sealer = open_test_sealer(&services.other);
+        let short = publish_test_custody_event(
+            &source_store,
+            &mut source_sealer,
+            TestCustodyPublication {
+                operation: b"page-final-sample/short",
+                topic: &services.topic,
+                scope: &services.scope,
+                priority: Priority::Immediate,
+                ttl_ms: Some(10_000_000),
+                sample: CustodySample {
+                    clock_id,
+                    tick_ms: 0,
+                },
+                payload: b"short",
+                tombstone: false,
+            },
+        );
+        let large_payload = vec![0x5a; 4 * 1_024];
+        let large = publish_test_custody_event(
+            &source_store,
+            &mut source_sealer,
+            TestCustodyPublication {
+                operation: b"page-final-sample/large",
+                topic: &services.topic,
+                scope: &services.scope,
+                priority: Priority::Immediate,
+                ttl_ms: Some(10_000_000),
+                sample: CustodySample {
+                    clock_id,
+                    tick_ms: 0,
+                },
+                payload: &large_payload,
+                tombstone: false,
+            },
+        );
+        let short_charge =
+            custody_finalization_charge_ms(short.sealed.len() as u64).expect("short charge");
+        let delay_ms = short_charge + 1;
+        assert!(
+            custody_finalization_charge_ms(large.sealed.len() as u64).expect("large charge")
+                > delay_ms
+        );
+
+        let (source, receiver) = contact_test_pair_with_forwarding_results(
+            TestForwardingNode {
+                store: receiver_store.clone(),
+                mission: services.member.clone(),
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::ReceiveOnly)),
+                clock: NodeCustodyClock::injected([0x6c; 16], 0, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            },
+            TestForwardingNode {
+                store: source_store.clone(),
+                mission: services.other.clone(),
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                clock: NodeCustodyClock::injected(clock_id, 0, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: vec![
+                    TestCustodyPreopenRace::EventPageFinalPostBatchDelayMs(delay_ms),
+                ],
+            },
+        )
+        .await;
+        let source_error = source.expect_err("page-wide final sample must reject the early entry");
+        assert!(
+            matches!(source_error, NodeError::Protocol(message) if message.contains(
+                "finalization exceeded its authenticated age charge"
+            ))
+        );
+        if let Ok(completed) = receiver {
+            assert_eq!(completed.receipt.inserted, 0);
+            assert_eq!(completed.receipt.event_page_entries_received, 0);
+        }
+        for transfer_id in [short.transfer_id, large.transfer_id] {
+            assert!(
+                receiver_store
+                    .get_event(transfer_id)
+                    .expect("receiver Event lookup")
+                    .is_none(),
+                "the rejected page must not leak any entry"
+            );
+        }
+        drop(receiver_store);
+        drop(source_store);
+        let custody = Store::inspect_existing(&source_path)
+            .expect("source custody inspection")
+            .custody_stats;
+        assert_eq!(custody.transfer_leases, 0);
+        assert_eq!(custody.peer_receipts, 0);
+        assert_eq!(custody.retries, 0);
+        fs::remove_dir_all(receiver_state).expect("receiver cleanup");
+        fs::remove_dir_all(source_state).expect("source cleanup");
     }
 
     #[tokio::test]
@@ -41070,32 +45779,35 @@ mod tests {
             },
         );
 
-        let (client, server) = contact_test_pair_with_forwarding_results(
-            TestForwardingNode {
-                store: server_store.clone(),
-                mission: services.member.clone(),
-                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::ReceiveOnly)),
-                clock: NodeCustodyClock::injected([0x77; 16], 0, 0),
-                reconciliation_exchanges_before_defer: None,
-                preopen_custody_races: Vec::new(),
-            },
-            TestForwardingNode {
-                store: client_store.clone(),
-                mission: services.other.clone(),
-                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
-                clock: NodeCustodyClock::injected(clock_id, 0, 0),
-                reconciliation_exchanges_before_defer: None,
-                preopen_custody_races: vec![
-                    TestCustodyPreopenRace::Expire {
-                        transfer_id: expired.transfer_id,
-                        tick_ms: 100,
-                    },
-                    TestCustodyPreopenRace::ItemChanged(changed.transfer_id),
-                    TestCustodyPreopenRace::LeaseLimitExceeded(lease_limited.transfer_id),
-                    TestCustodyPreopenRace::RetryLimitExceeded(retry_limited.transfer_id),
-                    TestCustodyPreopenRace::RetryNotDue(retry.transfer_id),
-                ],
-            },
+        let (client, server) = with_test_transfer_profile_offer(
+            TransferProfileOfferV1::legacy_only(),
+            contact_test_pair_with_forwarding_results(
+                TestForwardingNode {
+                    store: server_store.clone(),
+                    mission: services.member.clone(),
+                    policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::ReceiveOnly)),
+                    clock: NodeCustodyClock::injected([0x77; 16], 0, 0),
+                    reconciliation_exchanges_before_defer: None,
+                    preopen_custody_races: Vec::new(),
+                },
+                TestForwardingNode {
+                    store: client_store.clone(),
+                    mission: services.other.clone(),
+                    policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                    clock: NodeCustodyClock::injected(clock_id, 0, 0),
+                    reconciliation_exchanges_before_defer: None,
+                    preopen_custody_races: vec![
+                        TestCustodyPreopenRace::Expire {
+                            transfer_id: expired.transfer_id,
+                            tick_ms: 100,
+                        },
+                        TestCustodyPreopenRace::ItemChanged(changed.transfer_id),
+                        TestCustodyPreopenRace::LeaseLimitExceeded(lease_limited.transfer_id),
+                        TestCustodyPreopenRace::RetryLimitExceeded(retry_limited.transfer_id),
+                        TestCustodyPreopenRace::RetryNotDue(retry.transfer_id),
+                    ],
+                },
+            ),
         )
         .await;
         let (client, server) = match (client, server) {
@@ -41140,6 +45852,234 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v7_pages_transfer_pure_finite_then_mixed_events_without_receipt_state() {
+        let services = control_test_services([0xf1; 32]);
+        let source_state = root("v7-finite-mixed-source");
+        let receiver_state = root("v7-finite-mixed-receiver");
+        fs::create_dir_all(&source_state).expect("source state");
+        fs::create_dir_all(&receiver_state).expect("receiver state");
+        let authority = services.member.mission_authority_id();
+        let source_store = Arc::new(
+            Store::open_for_mission(source_state.join(STORE_FILE), authority)
+                .expect("source store"),
+        );
+        let receiver_store = Arc::new(
+            Store::open_for_mission(receiver_state.join(STORE_FILE), authority)
+                .expect("receiver store"),
+        );
+        seed_test_event_subscription(
+            &receiver_store,
+            EventSubscriptionMode::Consume,
+            &services.topic,
+            &services.scope,
+            b"v7-finite-mixed-consume",
+        );
+        let source_clock_id = [0xa1; 16];
+        let mut source_sealer = open_test_sealer(&services.member);
+        let finite_only = publish_test_custody_event(
+            &source_store,
+            &mut source_sealer,
+            TestCustodyPublication {
+                operation: b"v7/finite-only",
+                topic: &services.topic,
+                scope: &services.scope,
+                priority: Priority::Routine,
+                ttl_ms: Some(600_000),
+                sample: CustodySample {
+                    clock_id: source_clock_id,
+                    tick_ms: 0,
+                },
+                payload: b"finite-only",
+                tombstone: false,
+            },
+        );
+
+        let (finite_receiver, finite_source) = contact_test_pair(
+            source_store.clone(),
+            services.member.clone(),
+            receiver_store.clone(),
+            services.other.clone(),
+        )
+        .await;
+        assert_eq!(finite_source.semantic_version, SEMANTIC_PROTOCOL_V7);
+        assert_eq!(finite_source.offered, 1);
+        assert_eq!(finite_source.event_pages_sent, 1);
+        assert_eq!(finite_source.event_page_entries_sent, 1);
+        assert_eq!(finite_source.receiptful_event_offers, 0);
+        assert_eq!(finite_receiver.fetched, 1);
+        assert_eq!(finite_receiver.inserted, 1);
+        assert_eq!(finite_receiver.event_pages_received, 1);
+        assert_eq!(finite_receiver.event_page_inserts, 1);
+        assert_eq!(finite_receiver.receiptful_event_offers, 0);
+        assert!(
+            receiver_store
+                .get_event(finite_only.transfer_id)
+                .expect("finite-only receiver lookup")
+                .is_some()
+        );
+        let durable = publish_test_epoch_one_event(
+            &source_store,
+            &mut source_sealer,
+            &services.topic,
+            &services.scope,
+            b"v7-mixed-durable",
+        );
+        let finite = publish_test_custody_event(
+            &source_store,
+            &mut source_sealer,
+            TestCustodyPublication {
+                operation: b"v7/mixed-finite",
+                topic: &services.topic,
+                scope: &services.scope,
+                priority: Priority::Routine,
+                ttl_ms: Some(600_000),
+                sample: CustodySample {
+                    clock_id: source_clock_id,
+                    tick_ms: 0,
+                },
+                payload: b"mixed-finite",
+                tombstone: false,
+            },
+        );
+
+        let (mixed_receiver, mixed_source) = contact_test_pair(
+            source_store.clone(),
+            services.member.clone(),
+            receiver_store.clone(),
+            services.other.clone(),
+        )
+        .await;
+        assert_eq!(mixed_source.offered, 2);
+        assert_eq!(mixed_source.event_pages_sent, 1);
+        assert_eq!(mixed_source.event_page_entries_sent, 2);
+        assert_eq!(mixed_source.receiptful_event_offers, 0);
+        assert_eq!(mixed_receiver.fetched, 2);
+        assert_eq!(mixed_receiver.inserted, 2);
+        assert_eq!(mixed_receiver.event_pages_received, 1);
+        assert_eq!(mixed_receiver.event_page_entries_received, 2);
+        assert_eq!(mixed_receiver.event_page_inserts, 2);
+        assert_eq!(mixed_receiver.receiptful_event_offers, 0);
+        for id in [durable, finite.transfer_id] {
+            assert!(
+                receiver_store
+                    .get_event(id)
+                    .expect("mixed receiver lookup")
+                    .is_some()
+            );
+        }
+        assert_eq!(
+            receiver_store.event_count().expect("receiver Event count"),
+            3
+        );
+        drop(source_store);
+        let source_custody = Store::inspect_existing(source_state.join(STORE_FILE))
+            .expect("mixed source inspection")
+            .custody_stats;
+        assert_eq!(source_custody.transfer_leases, 0);
+        assert_eq!(source_custody.peer_receipts, 0);
+        assert_eq!(source_custody.retries, 0);
+        drop(receiver_store);
+        fs::remove_dir_all(source_state).expect("source cleanup");
+        fs::remove_dir_all(receiver_state).expect("receiver cleanup");
+    }
+
+    #[tokio::test]
+    async fn v7_pages_authenticate_finite_sources_before_custody_finalization_window() {
+        const EVENT_COUNT: usize = 100;
+
+        let services = control_test_services([0xf2; 32]);
+        let source_state = root("v7-finite-page-scale-source");
+        let receiver_state = root("v7-finite-page-scale-receiver");
+        fs::create_dir_all(&source_state).expect("source state");
+        fs::create_dir_all(&receiver_state).expect("receiver state");
+        let authority = services.member.mission_authority_id();
+        let source_store = Arc::new(
+            Store::open_for_mission(source_state.join(STORE_FILE), authority)
+                .expect("source store"),
+        );
+        let receiver_store = Arc::new(
+            Store::open_for_mission(receiver_state.join(STORE_FILE), authority)
+                .expect("receiver store"),
+        );
+        seed_test_event_subscription(
+            &receiver_store,
+            EventSubscriptionMode::Consume,
+            &services.topic,
+            &services.scope,
+            b"v7-finite-page-scale-consume",
+        );
+        let source_clock_id = [0xa1; 16];
+        let mut source_sealer = open_test_sealer(&services.member);
+        for index in 0..EVENT_COUNT {
+            let operation = format!("v7/finite-page-scale/{index}");
+            publish_test_custody_event(
+                &source_store,
+                &mut source_sealer,
+                TestCustodyPublication {
+                    operation: operation.as_bytes(),
+                    topic: &services.topic,
+                    scope: &services.scope,
+                    priority: Priority::Routine,
+                    ttl_ms: Some(600_000),
+                    sample: CustodySample {
+                        clock_id: source_clock_id,
+                        tick_ms: 0,
+                    },
+                    payload: operation.as_bytes(),
+                    tombstone: false,
+                },
+            );
+        }
+
+        let (receiver, source) = contact_test_pair_with_forwarding(
+            TestForwardingNode {
+                store: source_store.clone(),
+                mission: services.member.clone(),
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                clock: NodeCustodyClock::injected(source_clock_id, 0, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: vec![
+                    TestCustodyPreopenRace::EventPageSourcePreparationDelayMs(8),
+                ],
+            },
+            TestForwardingNode {
+                store: receiver_store.clone(),
+                mission: services.other.clone(),
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                clock: NodeCustodyClock::injected([0xa2; 16], 0, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            },
+        )
+        .await;
+        assert_eq!(source.semantic_version, SEMANTIC_PROTOCOL_V7);
+        assert_eq!(source.offered, EVENT_COUNT);
+        assert_eq!(
+            source.event_pages_sent,
+            EVENT_COUNT.div_ceil(FINITE_EVENT_PAGE_SENDER_TARGET_ENTRIES)
+        );
+        assert_eq!(source.event_page_entries_sent, EVENT_COUNT);
+        assert_eq!(source.receiptful_event_offers, 0);
+        assert_eq!(receiver.fetched, EVENT_COUNT);
+        assert_eq!(receiver.inserted, EVENT_COUNT);
+        assert_eq!(
+            receiver.event_pages_received,
+            EVENT_COUNT.div_ceil(FINITE_EVENT_PAGE_SENDER_TARGET_ENTRIES)
+        );
+        assert_eq!(receiver.event_page_entries_received, EVENT_COUNT);
+        assert_eq!(receiver.receiptful_event_offers, 0);
+        assert_eq!(
+            receiver_store.event_count().expect("receiver Event count"),
+            EVENT_COUNT as u64
+        );
+
+        drop(source_store);
+        drop(receiver_store);
+        fs::remove_dir_all(source_state).expect("source cleanup");
+        fs::remove_dir_all(receiver_state).expect("receiver cleanup");
+    }
+
+    #[tokio::test]
     async fn protected_interest_selects_only_beta_and_empty_means_receive_none() {
         let scope = Scope::new("test/interest-filter").expect("interest scope");
         let alpha = Topic::new("alpha").expect("alpha topic");
@@ -41170,6 +46110,12 @@ mod tests {
                 .expect("empty receiver bundle"),
         )
         .expect("empty receiver mission");
+        let beta_peer = beta_mission.identity();
+        let empty_peer = empty_mission.identity();
+        let default_emission_generation = LiveEmissionPolicy::new(EventEmissionPolicy::Normal)
+            .snapshot()
+            .expect("default emission snapshot")
+            .revision;
 
         let server_state = root("interest-filter-server");
         let beta_state = root("interest-filter-beta");
@@ -41218,7 +46164,21 @@ mod tests {
             &mut server_sealer,
             &beta,
             &scope,
-            b"beta-event",
+            b"beta-event-1",
+        );
+        let beta_id_2 = publish_test_epoch_one_event(
+            &server_store,
+            &mut server_sealer,
+            &beta,
+            &scope,
+            b"beta-event-2",
+        );
+        let beta_id_3 = publish_test_epoch_one_event(
+            &server_store,
+            &mut server_sealer,
+            &beta,
+            &scope,
+            b"beta-event-3",
         );
         let server_policy = server_store
             .event_replication_policy_snapshot()
@@ -41233,7 +46193,11 @@ mod tests {
                 true,
             )
             .expect("beta-filtered inventory"),
-            InventorySnapshot::new(vec![beta_id.reconciliation_item_id()]),
+            InventorySnapshot::new(
+                [beta_id, beta_id_2, beta_id_3]
+                    .into_iter()
+                    .map(|id| id.reconciliation_item_id()),
+            ),
         );
         assert!(
             transfer_inventory_for_receiver(
@@ -41255,15 +46219,63 @@ mod tests {
             beta_mission,
         )
         .await;
-        assert_eq!(beta_receipt.fetched, 1);
-        assert_eq!(beta_receipt.inserted, 1);
-        assert_eq!(beta_server_receipt.offered, 1);
-        assert!(
-            beta_store
-                .get_event(beta_id)
-                .expect("beta lookup")
-                .is_some()
+        assert_eq!(beta_receipt.fetched, 3);
+        assert_eq!(beta_receipt.inserted, 3);
+        assert_eq!(beta_server_receipt.offered, 3);
+        assert_eq!(beta_server_receipt.event_uni_turns_sent, 1);
+        assert_eq!(beta_server_receipt.event_pages_sent, 1);
+        assert_eq!(beta_server_receipt.event_page_entries_sent, 3);
+        assert_eq!(beta_server_receipt.receiptful_event_offers, 0);
+        assert_eq!(beta_receipt.event_uni_turns_received, 1);
+        assert_eq!(beta_receipt.event_pages_received, 1);
+        assert_eq!(beta_receipt.event_page_entries_received, 3);
+        assert_eq!(beta_receipt.event_page_inserts, 3);
+        assert_eq!(beta_receipt.event_page_duplicates, 0);
+        assert_eq!(beta_receipt.receiptful_event_offers, 0);
+        assert_eq!(
+            beta_server_receipt.event_page_bytes_sent,
+            beta_receipt.event_page_bytes_received
         );
+        assert!(beta_receipt.event_page_bytes_received > 0);
+        let expected_last = beta_id_3;
+        let attempt = server_store
+            .event_page_attempt_cursor(beta_peer, Priority::Routine)
+            .expect("sender Event attempt cursor")
+            .expect("sender cursor advanced before header");
+        assert_eq!(attempt.last_attempted(), *expected_last.as_bytes());
+        assert_eq!(
+            attempt.selector_generation(),
+            beta_store
+                .event_replication_policy_snapshot()
+                .expect("beta selector generation")
+                .selector_revision()
+        );
+        assert_eq!(attempt.emission_generation(), default_emission_generation);
+        let selected_profiles = Some([
+            TransferProfileId::EventPagesV1 as u16,
+            TransferProfileId::LegacyV6 as u16,
+            TransferProfileId::LegacyV6 as u16,
+            TransferProfileId::LegacyV6 as u16,
+            TransferProfileId::LegacyV6 as u16,
+        ]);
+        assert_eq!(
+            beta_server_receipt.negotiated_transfer_profiles,
+            selected_profiles
+        );
+        assert_eq!(beta_receipt.negotiated_transfer_profiles, selected_profiles);
+        assert_eq!(
+            beta_server_receipt.transfer_profile_digest,
+            beta_receipt.transfer_profile_digest
+        );
+        assert!(beta_receipt.transfer_profile_digest.is_some());
+        for beta_id in [beta_id, beta_id_2, beta_id_3] {
+            assert!(
+                beta_store
+                    .get_event(beta_id)
+                    .expect("beta lookup")
+                    .is_some()
+            );
+        }
         assert!(
             beta_store
                 .get_event(alpha_id)
@@ -41271,7 +46283,7 @@ mod tests {
                 .is_none(),
             "authorized but unsubscribed alpha crossed the beta receive lane"
         );
-        assert_eq!(beta_store.event_count().expect("beta Event count"), 1);
+        assert_eq!(beta_store.event_count().expect("beta Event count"), 3);
 
         let (empty_receipt, empty_server_receipt) = contact_test_pair(
             server_store.clone(),
@@ -41283,6 +46295,19 @@ mod tests {
         assert_eq!(empty_receipt.fetched, 0);
         assert_eq!(empty_receipt.inserted, 0);
         assert_eq!(empty_server_receipt.offered, 0);
+        assert_eq!(empty_server_receipt.event_uni_turns_sent, 0);
+        assert_eq!(empty_server_receipt.event_pages_sent, 0);
+        assert_eq!(empty_receipt.event_uni_turns_received, 0);
+        assert_eq!(empty_receipt.event_pages_received, 0);
+        assert_eq!(empty_server_receipt.receiptful_event_offers, 0);
+        assert_eq!(empty_receipt.receiptful_event_offers, 0);
+        assert_eq!(
+            server_store
+                .event_page_attempt_cursor(empty_peer, Priority::Routine)
+                .expect("empty peer attempt cursor"),
+            None,
+            "an empty schedule must not create attempt state"
+        );
         assert_eq!(empty_store.event_count().expect("empty Event count"), 0);
         assert_eq!(
             empty_store
@@ -41297,6 +46322,1378 @@ mod tests {
         drop(empty_store);
         for state in [server_state, beta_state, empty_state] {
             fs::remove_dir_all(state).expect("cleanup interest test state");
+        }
+    }
+
+    async fn assert_event_page_boundary_sender_race<F>(
+        label: &str,
+        services: &ControlTestServices,
+        race: TestCustodyPreopenRace,
+        expected_source_error: F,
+        reconnects_exact_remainder: bool,
+    ) where
+        F: Fn(&NodeError) -> bool,
+    {
+        let source_state = root(&format!("{label}-source"));
+        let receiver_state = root(&format!("{label}-receiver"));
+        fs::create_dir_all(&source_state).expect("source state");
+        fs::create_dir_all(&receiver_state).expect("receiver state");
+        let authority = services.member.mission_authority_id();
+        let source_store = Arc::new(
+            Store::open_for_mission(source_state.join(STORE_FILE), authority)
+                .expect("source store"),
+        );
+        let receiver_store = Arc::new(
+            Store::open_for_mission(receiver_state.join(STORE_FILE), authority)
+                .expect("receiver store"),
+        );
+        seed_test_event_subscription(
+            &receiver_store,
+            EventSubscriptionMode::Consume,
+            &services.topic,
+            &services.scope,
+            format!("{label}-consume").as_bytes(),
+        );
+        let mut source_sealer = open_test_sealer(&services.member);
+        let mut ids = Vec::new();
+        for index in 0..3 {
+            ids.push(publish_test_epoch_one_event(
+                &source_store,
+                &mut source_sealer,
+                &services.topic,
+                &services.scope,
+                format!("{label}-{index}").as_bytes(),
+            ));
+        }
+
+        let (receiver_result, source_result) = contact_test_pair_with_forwarding_results(
+            TestForwardingNode {
+                store: source_store.clone(),
+                mission: services.member.clone(),
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                clock: NodeCustodyClock::injected([0xe1; 16], 0, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: vec![
+                    TestCustodyPreopenRace::EventPageTargetEntries(1),
+                    race,
+                ],
+            },
+            TestForwardingNode {
+                store: receiver_store.clone(),
+                mission: services.other.clone(),
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                clock: NodeCustodyClock::injected([0xe2; 16], 0, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: vec![TestCustodyPreopenRace::EventPageTargetEntries(1)],
+            },
+        )
+        .await;
+        let source_error = source_result.expect_err("sender race must fail closed");
+        assert!(
+            expected_source_error(&source_error),
+            "{label}: unexpected sender rejection: {source_error:?}"
+        );
+        assert!(
+            receiver_result.is_err(),
+            "{label}: receiver must observe the failed page turn"
+        );
+        let durable_prefix = receiver_store
+            .event_count()
+            .expect("sender-race durable prefix") as usize;
+        assert!(
+            durable_prefix <= 1,
+            "{label}: the affected second page must never become visible"
+        );
+
+        if reconnects_exact_remainder {
+            let (receiver_receipt, source_receipt) = contact_test_pair(
+                source_store.clone(),
+                services.member.clone(),
+                receiver_store.clone(),
+                services.other.clone(),
+            )
+            .await;
+            let reconnect_remainder = 3 - durable_prefix;
+            assert_eq!(
+                receiver_receipt.event_page_entries_received, reconnect_remainder,
+                "{label}"
+            );
+            assert_eq!(
+                source_receipt.event_page_entries_sent, reconnect_remainder,
+                "{label}"
+            );
+            assert_eq!(source_receipt.receiptful_event_offers, 0, "{label}");
+            assert_eq!(
+                receiver_store.event_count().expect("converged Event count"),
+                3,
+                "{label}: reconnect receives only the computed remainder"
+            );
+            for id in ids {
+                assert!(
+                    receiver_store
+                        .get_event(id)
+                        .expect("converged Event lookup")
+                        .is_some(),
+                    "{label}: every Event converges after reconnect"
+                );
+            }
+        }
+
+        drop(source_store);
+        drop(receiver_store);
+        fs::remove_dir_all(source_state).expect("source cleanup");
+        fs::remove_dir_all(receiver_state).expect("receiver cleanup");
+    }
+
+    async fn assert_event_page_boundary_receiver_failure<F>(
+        label: &str,
+        page_target_entries: usize,
+        expected_durable_prefix: u64,
+        receiver_race: TestCustodyPreopenRace,
+        expected_receiver_error: F,
+    ) where
+        F: Fn(&NodeError) -> bool,
+    {
+        let services = control_test_services([0xee; 32]);
+        let source_state = root(&format!("{label}-source"));
+        let receiver_state = root(&format!("{label}-receiver"));
+        fs::create_dir_all(&source_state).expect("source state");
+        fs::create_dir_all(&receiver_state).expect("receiver state");
+        let authority = services.member.mission_authority_id();
+        let source_store = Arc::new(
+            Store::open_for_mission(source_state.join(STORE_FILE), authority)
+                .expect("source store"),
+        );
+        let receiver_store = Arc::new(
+            Store::open_for_mission(receiver_state.join(STORE_FILE), authority)
+                .expect("receiver store"),
+        );
+        seed_test_event_subscription(
+            &receiver_store,
+            EventSubscriptionMode::Consume,
+            &services.topic,
+            &services.scope,
+            format!("{label}-consume").as_bytes(),
+        );
+        let mut source_sealer = open_test_sealer(&services.member);
+        for index in 0..3 {
+            publish_test_epoch_one_event(
+                &source_store,
+                &mut source_sealer,
+                &services.topic,
+                &services.scope,
+                format!("{label}-{index}").as_bytes(),
+            );
+        }
+
+        let (receiver_result, source_result) = contact_test_pair_with_forwarding_results(
+            TestForwardingNode {
+                store: source_store.clone(),
+                mission: services.member.clone(),
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                clock: NodeCustodyClock::injected([0xe3; 16], 0, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: vec![TestCustodyPreopenRace::EventPageTargetEntries(
+                    page_target_entries,
+                )],
+            },
+            TestForwardingNode {
+                store: receiver_store.clone(),
+                mission: services.other.clone(),
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                clock: NodeCustodyClock::injected([0xe4; 16], 0, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: vec![
+                    TestCustodyPreopenRace::EventPageTargetEntries(page_target_entries),
+                    receiver_race,
+                ],
+            },
+        )
+        .await;
+        let receiver_error = receiver_result.expect_err("receiver failure must be surfaced");
+        assert!(
+            expected_receiver_error(&receiver_error),
+            "{label}: unexpected receiver rejection: {receiver_error:?}"
+        );
+        assert!(
+            source_result.is_err(),
+            "{label}: sender observes failed turn"
+        );
+        assert_eq!(
+            receiver_store.event_count().expect("durable prefix count"),
+            expected_durable_prefix,
+            "{label}: only complete storage sub-batches may remain durable"
+        );
+
+        let (receiver_receipt, source_receipt) = contact_test_pair(
+            source_store.clone(),
+            services.member,
+            receiver_store.clone(),
+            services.other,
+        )
+        .await;
+        let expected_remainder = 3usize - expected_durable_prefix as usize;
+        assert_eq!(
+            receiver_receipt.event_page_entries_received, expected_remainder,
+            "{label}"
+        );
+        assert_eq!(
+            source_receipt.event_page_entries_sent, expected_remainder,
+            "{label}"
+        );
+        assert_eq!(source_receipt.receiptful_event_offers, 0, "{label}");
+        assert_eq!(
+            receiver_store.event_count().expect("converged Event count"),
+            3,
+            "{label}: reconnect receives exactly the remainder"
+        );
+
+        drop(source_store);
+        drop(receiver_store);
+        fs::remove_dir_all(source_state).expect("source cleanup");
+        fs::remove_dir_all(receiver_state).expect("receiver cleanup");
+    }
+
+    #[tokio::test]
+    async fn event_page_boundary_authorization_selector_and_emission_races_fail_closed() {
+        let revocation = control_test_services([0xe5; 32]);
+        let mut authority = open_test_sealer(&revocation.authority);
+        let exact = authority
+            .seal_chained_revocation_control(revocation.other.identity(), 1, 1, None)
+            .expect("seal receiver revocation");
+        let transfer_id = ControlTransferId::new(
+            authority
+                .verify_control(&exact)
+                .expect("verify receiver revocation")
+                .envelope_id(),
+        );
+        assert_event_page_boundary_sender_race(
+            "page-boundary-revocation",
+            &revocation,
+            TestCustodyPreopenRace::PageControlChangeBeforeEventPage {
+                remaining: 2,
+                authority: revocation.authority.identity(),
+                transfer_id,
+                exact,
+            },
+            |error| matches!(error, NodeError::Revoked(peer) if *peer == revocation.other.identity()),
+            false,
+        )
+        .await;
+
+        let epoch = control_test_services([0xe6; 32]);
+        let recipients = vec![
+            ScopeRekeyRecipient::member(epoch.authority.identity(), vec![epoch.topic.clone()])
+                .expect("authority epoch recipient"),
+            ScopeRekeyRecipient::member(epoch.member.identity(), vec![epoch.topic.clone()])
+                .expect("source epoch recipient"),
+            ScopeRekeyRecipient::member(epoch.other.identity(), vec![epoch.topic.clone()])
+                .expect("receiver epoch recipient"),
+        ];
+        let mut authority = open_test_sealer(&epoch.authority);
+        let (exact, _) = authority
+            .seal_chained_scope_rekey_control_from_registry(
+                &epoch.registry,
+                0,
+                epoch.scope.clone(),
+                2,
+                recipients,
+                1,
+                None,
+            )
+            .expect("seal epoch advance");
+        let transfer_id = ControlTransferId::new(
+            authority
+                .verify_control(&exact)
+                .expect("verify epoch advance")
+                .envelope_id(),
+        );
+        assert_event_page_boundary_sender_race(
+            "page-boundary-epoch",
+            &epoch,
+            TestCustodyPreopenRace::PageControlChangeBeforeEventPage {
+                remaining: 2,
+                authority: epoch.authority.identity(),
+                transfer_id,
+                exact,
+            },
+            |error| matches!(error, NodeError::Store(StoreError::ControlPolicyChanged)),
+            false,
+        )
+        .await;
+
+        let route = control_test_services([0xe7; 32]);
+        let recipients = vec![
+            ScopeRekeyRecipient::member(route.authority.identity(), vec![route.topic.clone()])
+                .expect("authority route recipient"),
+            ScopeRekeyRecipient::member(route.member.identity(), vec![route.topic.clone()])
+                .expect("source route recipient"),
+        ];
+        let mut authority = open_test_sealer(&route.authority);
+        let (exact, _) = authority
+            .seal_chained_scope_rekey_control_from_registry(
+                &route.registry,
+                0,
+                route.scope.clone(),
+                1,
+                recipients,
+                1,
+                None,
+            )
+            .expect("seal receiver route replacement");
+        let transfer_id = ControlTransferId::new(
+            authority
+                .verify_control(&exact)
+                .expect("verify receiver route replacement")
+                .envelope_id(),
+        );
+        assert_event_page_boundary_sender_race(
+            "page-boundary-route-grant",
+            &route,
+            TestCustodyPreopenRace::PageControlChangeBeforeEventPage {
+                remaining: 2,
+                authority: route.authority.identity(),
+                transfer_id,
+                exact,
+            },
+            |error| matches!(error, NodeError::Store(StoreError::ControlPolicyChanged)),
+            false,
+        )
+        .await;
+
+        let selector = control_test_services([0xe8; 32]);
+        assert_event_page_boundary_sender_race(
+            "page-boundary-selector",
+            &selector,
+            TestCustodyPreopenRace::PageSelectorChangeBeforeEventPage {
+                remaining: 2,
+                topic: selector.topic.clone(),
+                scope: selector.scope.clone(),
+                key: b"page-boundary-selector-change".to_vec(),
+            },
+            |error| {
+                matches!(
+                    error,
+                    NodeError::Store(StoreError::EventSelectorRevisionChanged)
+                )
+            },
+            true,
+        )
+        .await;
+
+        let emission = control_test_services([0xe9; 32]);
+        assert_event_page_boundary_sender_race(
+            "page-boundary-emission",
+            &emission,
+            TestCustodyPreopenRace::FinalPolicyChangeBeforeEventPage(2),
+            |error| matches!(error, NodeError::EmissionPolicyChanged),
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn event_page_boundary_capacity_and_storage_failures_retry_exact_remainder() {
+        assert_event_page_boundary_receiver_failure(
+            "page-boundary-storage",
+            1,
+            1,
+            TestCustodyPreopenRace::FailEventPageStoreBeforePages(2),
+            |error| {
+                matches!(
+                    error,
+                    NodeError::Store(StoreError::ItemLimitExceeded {
+                        current: 1,
+                        limit: 1
+                    })
+                )
+            },
+        )
+        .await;
+        assert_event_page_boundary_receiver_failure(
+            "page-boundary-capacity",
+            1,
+            1,
+            TestCustodyPreopenRace::ExhaustEventCapacityBeforePages(2),
+            |error| {
+                matches!(
+                    error,
+                    NodeError::Protocol(message)
+                        if message == "Event page entry would consume the later-lane item reserve"
+                )
+            },
+        )
+        .await;
+    }
+    #[tokio::test]
+    async fn event_page_validates_complete_page_before_any_storage_write() {
+        assert_event_page_boundary_receiver_failure(
+            "page-validation-before-storage",
+            3,
+            0,
+            TestCustodyPreopenRace::FailEventPageValidationAfterEntries(2),
+            |error| {
+                matches!(
+                    error,
+                    NodeError::Protocol(message)
+                        if message == "injected Event page validation failure"
+                )
+            },
+        )
+        .await;
+    }
+
+    #[test]
+    fn event_page_batch_fatal_first_half_does_not_evaluate_second_half() {
+        let second_half_evaluated = std::cell::Cell::new(false);
+        let result = evaluate_event_batch_split(
+            Err(NodeError::Store(StoreError::SemanticInvariant(
+                "injected fatal batch failure",
+            ))),
+            || {
+                second_half_evaluated.set(true);
+                Ok(Vec::new())
+            },
+        );
+
+        assert!(!second_half_evaluated.get());
+        assert!(matches!(
+            result,
+            Err(NodeError::Store(StoreError::SemanticInvariant(
+                "injected fatal batch failure"
+            )))
+        ));
+    }
+
+    #[test]
+    fn event_page_batch_isolates_item_local_conflict_and_commits_valid_companions() {
+        let services = control_test_services([0xec; 32]);
+        let authority = services.member.mission_authority_id();
+        let source_state = root("page-batch-poison-source");
+        let conflict_state = root("page-batch-poison-conflict");
+        let receiver_state = root("page-batch-poison-receiver");
+        for state in [&source_state, &conflict_state, &receiver_state] {
+            fs::create_dir_all(state).expect("page poison state root");
+        }
+        let source_store = Store::open_for_mission(source_state.join(STORE_FILE), authority)
+            .expect("page poison source store");
+        let conflict_store = Store::open_for_mission(conflict_state.join(STORE_FILE), authority)
+            .expect("page poison conflict store");
+        let receiver_store = Store::open_for_mission(receiver_state.join(STORE_FILE), authority)
+            .expect("page poison receiver store");
+        seed_test_event_subscription(
+            &receiver_store,
+            EventSubscriptionMode::Consume,
+            &services.topic,
+            &services.scope,
+            b"page-batch-poison-consume",
+        );
+
+        let mut source_sealer = open_test_sealer(&services.member);
+        let source_ids = (0..3)
+            .map(|index| {
+                publish_test_epoch_one_event(
+                    &source_store,
+                    &mut source_sealer,
+                    &services.topic,
+                    &services.scope,
+                    format!("page-batch-source-{index}").as_bytes(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut conflict_sealer = open_test_sealer(&services.member);
+        let conflict_id = publish_test_epoch_one_event(
+            &conflict_store,
+            &mut conflict_sealer,
+            &services.topic,
+            &services.scope,
+            b"page-batch-conflict",
+        );
+        let conflict = conflict_store
+            .get_event(conflict_id)
+            .expect("load conflict Event")
+            .expect("conflict Event exists");
+        let mut receiver_verifier = open_test_sealer(&services.other);
+        let route = receiver_verifier
+            .verify_event(&conflict.sealed)
+            .expect("verify conflict route");
+        let EventContentVerification::ContentVerified {
+            event: conflict_event,
+            ..
+        } = receiver_verifier
+            .verify_event_content(route, &conflict.sealed)
+            .expect("verify conflict content")
+        else {
+            panic!("receiver lost conflict content grant")
+        };
+        let replication = receiver_store
+            .event_replication_policy_snapshot()
+            .expect("page poison replication snapshot");
+        receiver_store
+            .apply_verified_event_with_replication_policy(
+                &replication,
+                &conflict_event,
+                &conflict.sealed,
+            )
+            .expect("seed conflicting receiver Event");
+
+        let source_events = source_ids
+            .iter()
+            .map(|id| {
+                source_store
+                    .get_event(*id)
+                    .expect("load source page Event")
+                    .expect("source page Event exists")
+            })
+            .collect::<Vec<_>>();
+        let prepared = prepare_test_received_page(&mut receiver_verifier, &source_events);
+        assert!(matches!(
+            apply_prepared_event_page(
+                &receiver_store,
+                &mut receiver_verifier,
+                &replication,
+                None,
+                &prepared,
+            ),
+            Err(NodeError::Store(StoreError::CausalEquivocation { .. }))
+        ));
+        assert!(
+            receiver_store
+                .get_event(source_ids[0])
+                .expect("poison source lookup")
+                .is_none()
+        );
+        for id in &source_ids[1..] {
+            assert!(
+                receiver_store
+                    .get_event(*id)
+                    .expect("valid companion lookup")
+                    .is_some(),
+                "valid companion must survive poison isolation"
+            );
+        }
+        assert_eq!(receiver_store.event_count().expect("receiver count"), 3);
+
+        drop(receiver_store);
+        drop(conflict_store);
+        drop(source_store);
+        for state in [source_state, conflict_state, receiver_state] {
+            fs::remove_dir_all(state).expect("page poison cleanup");
+        }
+    }
+
+    #[test]
+    fn event_page_batch_splits_only_to_local_capacity_and_reopens_exact_remainder() {
+        let services = control_test_services([0xed; 32]);
+        let authority = services.member.mission_authority_id();
+        let source_state = root("page-batch-capacity-source");
+        let receiver_state = root("page-batch-capacity-receiver");
+        fs::create_dir_all(&source_state).expect("capacity source root");
+        fs::create_dir_all(&receiver_state).expect("capacity receiver root");
+        let source_store = Store::open_for_mission(source_state.join(STORE_FILE), authority)
+            .expect("capacity source store");
+        let receiver_path = receiver_state.join(STORE_FILE);
+        let limits = StoreLimits::new(
+            MAX_CONTROL_ITEMS + CUSTODY_EMERGENCY_ITEM_RESERVE + 2,
+            DEFAULT_MAX_TOTAL_PAYLOAD_BYTES,
+        )
+        .expect("two ordinary Event limits");
+        let receiver_store = Store::open_with_limits_for_mission(&receiver_path, limits, authority)
+            .expect("capacity receiver store");
+        seed_test_event_subscription(
+            &receiver_store,
+            EventSubscriptionMode::Consume,
+            &services.topic,
+            &services.scope,
+            b"page-batch-capacity-consume",
+        );
+        let replication = receiver_store
+            .event_replication_policy_snapshot()
+            .expect("capacity replication snapshot");
+
+        let mut source_sealer = open_test_sealer(&services.member);
+        let source_ids = (0..3)
+            .map(|index| {
+                publish_test_epoch_one_event(
+                    &source_store,
+                    &mut source_sealer,
+                    &services.topic,
+                    &services.scope,
+                    format!("page-batch-capacity-{index}").as_bytes(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let source_events = source_ids
+            .iter()
+            .map(|id| {
+                source_store
+                    .get_event(*id)
+                    .expect("load capacity Event")
+                    .expect("capacity Event exists")
+            })
+            .collect::<Vec<_>>();
+        let mut receiver_verifier = open_test_sealer(&services.other);
+        let prepared = prepare_test_received_page(&mut receiver_verifier, &source_events);
+        let error = apply_prepared_event_page(
+            &receiver_store,
+            &mut receiver_verifier,
+            &replication,
+            None,
+            &prepared,
+        )
+        .expect_err("third Event must exceed local capacity");
+        assert!(matches!(error, NodeError::Store(ref error) if event_batch_hit_capacity(error)));
+        assert_eq!(receiver_store.event_count().expect("capacity prefix"), 2);
+        assert!(
+            receiver_store
+                .get_event(source_ids[2])
+                .expect("capacity remainder lookup")
+                .is_none()
+        );
+
+        drop(prepared);
+        drop(receiver_store);
+        let receiver_store = Store::open_for_mission(&receiver_path, authority)
+            .expect("reopen receiver without test capacity constraint");
+        receiver_store
+            .set_custody_quota(
+                CustodyQuota::for_store_limits(StoreLimits::default())
+                    .expect("default reopened custody quota"),
+            )
+            .expect("raise reopened custody quota");
+        let replication = receiver_store
+            .event_replication_policy_snapshot()
+            .expect("reopened replication snapshot");
+        let mut receiver_verifier = open_test_sealer(&services.other);
+        let prepared = prepare_test_received_page(&mut receiver_verifier, &source_events[2..]);
+        let applied = apply_prepared_event_page(
+            &receiver_store,
+            &mut receiver_verifier,
+            &replication,
+            None,
+            &prepared,
+        )
+        .expect("apply exact capacity remainder");
+        assert_eq!(applied, vec![ReceivedEventApply::accepted(true)]);
+        assert_eq!(receiver_store.event_count().expect("converged count"), 3);
+
+        drop(receiver_store);
+        drop(source_store);
+        for state in [source_state, receiver_state] {
+            fs::remove_dir_all(state).expect("page capacity cleanup");
+        }
+    }
+
+    #[test]
+    fn event_page_batch_byte_capacity_isolates_unfit_head_and_commits_small_companion() {
+        let services = control_test_services([0xeb; 32]);
+        let authority = services.member.mission_authority_id();
+        let source_state = root("page-batch-byte-source");
+        let receiver_state = root("page-batch-byte-receiver");
+        fs::create_dir_all(&source_state).expect("byte source root");
+        fs::create_dir_all(&receiver_state).expect("byte receiver root");
+        let source_store = Store::open_for_mission(source_state.join(STORE_FILE), authority)
+            .expect("byte source store");
+        let mut source_sealer = open_test_sealer(&services.member);
+        let large_id = publish_test_epoch_one_event_with_payload(
+            &source_store,
+            &mut source_sealer,
+            &services.topic,
+            &services.scope,
+            b"page-batch-byte-large",
+            &[0x7a; 4096],
+            Priority::Routine,
+        );
+        let small_id = publish_test_epoch_one_event_with_payload(
+            &source_store,
+            &mut source_sealer,
+            &services.topic,
+            &services.scope,
+            b"page-batch-byte-small",
+            b"x",
+            Priority::Routine,
+        );
+        let source_events = [large_id, small_id]
+            .into_iter()
+            .map(|id| {
+                source_store
+                    .get_event(id)
+                    .expect("load byte-capacity Event")
+                    .expect("byte-capacity Event exists")
+            })
+            .collect::<Vec<_>>();
+        assert!(source_events[0].sealed.len() > source_events[1].sealed.len());
+        let small_bytes = u64::try_from(source_events[1].sealed.len()).expect("small Event length");
+        let limits = StoreLimits::new(
+            MAX_CONTROL_ITEMS + CUSTODY_EMERGENCY_ITEM_RESERVE + 2,
+            MAX_CONTROL_BYTES + CUSTODY_EMERGENCY_BYTE_RESERVE + small_bytes,
+        )
+        .expect("small-only byte capacity");
+        let receiver_store =
+            Store::open_with_limits_for_mission(receiver_state.join(STORE_FILE), limits, authority)
+                .expect("byte receiver store");
+        seed_test_event_subscription(
+            &receiver_store,
+            EventSubscriptionMode::Consume,
+            &services.topic,
+            &services.scope,
+            b"page-batch-byte-consume",
+        );
+        let replication = receiver_store
+            .event_replication_policy_snapshot()
+            .expect("byte replication snapshot");
+        let mut receiver_verifier = open_test_sealer(&services.other);
+        let prepared = prepare_test_received_page(&mut receiver_verifier, &source_events);
+        let error = apply_prepared_event_page(
+            &receiver_store,
+            &mut receiver_verifier,
+            &replication,
+            None,
+            &prepared,
+        )
+        .expect_err("large leading Event must exceed byte capacity");
+        assert!(matches!(error, NodeError::Store(ref error) if event_batch_hit_capacity(error)));
+        assert!(
+            receiver_store
+                .get_event(large_id)
+                .expect("large Event lookup")
+                .is_none()
+        );
+        assert!(
+            receiver_store
+                .get_event(small_id)
+                .expect("small companion lookup")
+                .is_some(),
+            "small companion must commit despite an unfit leading Event"
+        );
+        assert_eq!(
+            receiver_store.event_count().expect("byte receiver count"),
+            1
+        );
+
+        drop(receiver_store);
+        drop(source_store);
+        for state in [source_state, receiver_state] {
+            fs::remove_dir_all(state).expect("page byte cleanup");
+        }
+    }
+
+    #[tokio::test]
+    async fn event_page_header_policy_failure_does_not_advance_attempt_cursor() {
+        let services = control_test_services([0xd1; 32]);
+        let source_state = root("page-header-policy-source");
+        let receiver_state = root("page-header-policy-receiver");
+        fs::create_dir_all(&source_state).expect("source state");
+        fs::create_dir_all(&receiver_state).expect("receiver state");
+        let authority = services.member.mission_authority_id();
+        let source_store = Arc::new(
+            Store::open_for_mission(source_state.join(STORE_FILE), authority)
+                .expect("source store"),
+        );
+        let receiver_store = Arc::new(
+            Store::open_for_mission(receiver_state.join(STORE_FILE), authority)
+                .expect("receiver store"),
+        );
+        seed_test_event_subscription(
+            &receiver_store,
+            EventSubscriptionMode::Consume,
+            &services.topic,
+            &services.scope,
+            b"page-header-policy-consume",
+        );
+        let mut source_sealer = open_test_sealer(&services.member);
+        let source_id = publish_test_epoch_one_event(
+            &source_store,
+            &mut source_sealer,
+            &services.topic,
+            &services.scope,
+            b"page-header-policy-source",
+        );
+        let receiver_peer = services.other.identity();
+        let source_policy = Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal));
+
+        let (receiver_result, source_result) = contact_test_pair_with_forwarding_results(
+            TestForwardingNode {
+                store: source_store.clone(),
+                mission: services.member.clone(),
+                policy: source_policy.clone(),
+                clock: NodeCustodyClock::injected([0xd2; 16], 0, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: vec![TestCustodyPreopenRace::FinalPolicyChange],
+            },
+            TestForwardingNode {
+                store: receiver_store.clone(),
+                mission: services.other.clone(),
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                clock: NodeCustodyClock::injected([0xd3; 16], 0, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            },
+        )
+        .await;
+        assert!(
+            receiver_result.is_err(),
+            "receiver must observe failed page turn"
+        );
+        assert!(matches!(
+            source_result,
+            Err(NodeError::EmissionPolicyChanged)
+        ));
+        assert_eq!(
+            source_store
+                .event_page_attempt_cursor(receiver_peer, Priority::Routine)
+                .expect("source cursor lookup"),
+            None,
+            "failure before header emission must not advance scheduling state"
+        );
+        assert!(
+            receiver_store
+                .get_event(source_id)
+                .expect("receiver Event lookup")
+                .is_none(),
+            "failed header authorization must emit no Event page"
+        );
+        assert_eq!(
+            source_policy.snapshot().expect("changed policy").policy,
+            EventEmissionPolicy::ReceiveOnly
+        );
+
+        drop(source_store);
+        drop(receiver_store);
+        fs::remove_dir_all(source_state).expect("source cleanup");
+        fs::remove_dir_all(receiver_state).expect("receiver cleanup");
+    }
+
+    #[tokio::test]
+    async fn event_page_policy_failure_after_header_keeps_attempt_cursor_without_applying_page() {
+        let services = control_test_services([0xd4; 32]);
+        let source_state = root("page-policy-source");
+        let receiver_state = root("page-policy-receiver");
+        fs::create_dir_all(&source_state).expect("source state");
+        fs::create_dir_all(&receiver_state).expect("receiver state");
+        let authority = services.member.mission_authority_id();
+        let source_store = Arc::new(
+            Store::open_for_mission(source_state.join(STORE_FILE), authority)
+                .expect("source store"),
+        );
+        let receiver_store = Arc::new(
+            Store::open_for_mission(receiver_state.join(STORE_FILE), authority)
+                .expect("receiver store"),
+        );
+        seed_test_event_subscription(
+            &receiver_store,
+            EventSubscriptionMode::Consume,
+            &services.topic,
+            &services.scope,
+            b"page-policy-consume",
+        );
+        let mut source_sealer = open_test_sealer(&services.member);
+        let source_id = publish_test_epoch_one_event(
+            &source_store,
+            &mut source_sealer,
+            &services.topic,
+            &services.scope,
+            b"page-policy-source",
+        );
+        let receiver_peer = services.other.identity();
+        let source_policy = Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal));
+
+        let (receiver_result, source_result) = contact_test_pair_with_forwarding_results(
+            TestForwardingNode {
+                store: source_store.clone(),
+                mission: services.member.clone(),
+                policy: source_policy.clone(),
+                clock: NodeCustodyClock::injected([0xd5; 16], 0, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: vec![
+                    TestCustodyPreopenRace::FinalPolicyChangeBeforeEventPage(1),
+                ],
+            },
+            TestForwardingNode {
+                store: receiver_store.clone(),
+                mission: services.other.clone(),
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                clock: NodeCustodyClock::injected([0xd6; 16], 0, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            },
+        )
+        .await;
+        assert!(
+            receiver_result.is_err(),
+            "receiver must observe failed page turn"
+        );
+        assert!(matches!(
+            source_result,
+            Err(NodeError::EmissionPolicyChanged)
+        ));
+        let cursor = source_store
+            .event_page_attempt_cursor(receiver_peer, Priority::Routine)
+            .expect("source cursor lookup")
+            .expect("header emission advances the attempt cursor");
+        assert_eq!(cursor.last_attempted(), *source_id.as_bytes());
+        assert!(
+            receiver_store
+                .get_event(source_id)
+                .expect("receiver Event lookup")
+                .is_none(),
+            "page-adjacent policy failure must emit no affected page"
+        );
+        assert_eq!(
+            source_policy.snapshot().expect("changed policy").policy,
+            EventEmissionPolicy::ReceiveOnly
+        );
+
+        drop(source_store);
+        drop(receiver_store);
+        fs::remove_dir_all(source_state).expect("source cleanup");
+        fs::remove_dir_all(receiver_state).expect("receiver cleanup");
+    }
+
+    #[tokio::test]
+    async fn interrupted_event_page_preserves_prefix_and_reconnects_only_the_remainder() {
+        let scope = Scope::new("test/page-interruption").expect("interruption scope");
+        let topic = Topic::new("telemetry").expect("interruption topic");
+        let access = ProvisioningAccess::member(scope.clone(), vec![1], vec![topic.clone()])
+            .expect("interruption access");
+        let mut provisioner =
+            ReferenceProvisioner::from_seed([0x95; 32]).expect("interruption provisioner");
+        let source_mission = UnprotectedReferenceMission::from_bytes(
+            provisioner
+                .issue_node(1, std::slice::from_ref(&access))
+                .and_then(|bundle| bundle.to_bytes())
+                .expect("source bundle"),
+        )
+        .expect("source mission");
+        let receiver_mission = UnprotectedReferenceMission::from_bytes(
+            provisioner
+                .issue_node(2, &[access])
+                .and_then(|bundle| bundle.to_bytes())
+                .expect("receiver bundle"),
+        )
+        .expect("receiver mission");
+        let source_state = root("page-interruption-source");
+        let receiver_state = root("page-interruption-receiver");
+        fs::create_dir_all(&source_state).expect("source state");
+        fs::create_dir_all(&receiver_state).expect("receiver state");
+        let authority = source_mission.mission_authority_id();
+        let source_path = source_state.join(STORE_FILE);
+        let source_store =
+            Arc::new(Store::open_for_mission(&source_path, authority).expect("source store"));
+        let receiver_path = receiver_state.join(STORE_FILE);
+        let receiver_store =
+            Arc::new(Store::open_for_mission(&receiver_path, authority).expect("receiver store"));
+        seed_test_event_subscription(
+            &receiver_store,
+            EventSubscriptionMode::Consume,
+            &topic,
+            &scope,
+            b"interruption-consume",
+        );
+        let mut source_sealer = open_test_sealer(&source_mission);
+        let mut ids = Vec::new();
+        for index in 0..=EVENT_PAGE_SENDER_TARGET_ENTRIES {
+            let key = format!("telemetry-{index:04}");
+            ids.push(publish_test_epoch_one_event(
+                &source_store,
+                &mut source_sealer,
+                &topic,
+                &scope,
+                key.as_bytes(),
+            ));
+        }
+
+        let (receiver_result, source_result) = contact_test_pair_with_forwarding_results(
+            TestForwardingNode {
+                store: source_store.clone(),
+                mission: source_mission.clone(),
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                clock: NodeCustodyClock::injected([0xc1; 16], 0, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: vec![
+                    TestCustodyPreopenRace::FailEventPageReceiveAfterPages(1),
+                ],
+            },
+            TestForwardingNode {
+                store: receiver_store.clone(),
+                mission: receiver_mission.clone(),
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                clock: NodeCustodyClock::injected([0xc2; 16], 0, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: vec![
+                    TestCustodyPreopenRace::FailEventPageReceiveAfterPages(1),
+                ],
+            },
+        )
+        .await;
+        let _source_result = source_result;
+        assert!(
+            receiver_result.is_err(),
+            "injected post-commit interruption must fail receiver contact"
+        );
+        let durable_prefix = receiver_store.event_count().expect("durable prefix count") as usize;
+        assert!(
+            durable_prefix > 0,
+            "the first page must commit a durable prefix"
+        );
+        assert!(
+            durable_prefix < ids.len(),
+            "the injected failure must leave a reconnect remainder"
+        );
+        drop(source_store);
+        let custody = Store::inspect_existing(&source_path)
+            .expect("source custody inspection")
+            .custody_stats;
+        assert_eq!(custody.peer_receipts, 0);
+        assert_eq!(custody.retries, 0);
+        let source_store = Arc::new(
+            Store::open_for_mission(&source_path, authority).expect("reopen source store"),
+        );
+
+        drop(receiver_store);
+        let receiver_store = Arc::new(
+            Store::open_for_mission(&receiver_path, authority).expect("reopen receiver store"),
+        );
+        let (receiver_receipt, source_receipt) = contact_test_pair(
+            source_store.clone(),
+            source_mission,
+            receiver_store.clone(),
+            receiver_mission,
+        )
+        .await;
+        let reconnect_remainder = ids.len() - durable_prefix;
+        assert_eq!(receiver_receipt.fetched, reconnect_remainder);
+        assert_eq!(
+            receiver_receipt.event_page_entries_received,
+            reconnect_remainder
+        );
+        assert_eq!(source_receipt.offered, reconnect_remainder);
+        assert_eq!(source_receipt.event_page_entries_sent, reconnect_remainder);
+        assert_eq!(source_receipt.receiptful_event_offers, 0);
+        assert_eq!(
+            receiver_store.event_count().expect("converged count"),
+            ids.len() as u64
+        );
+        for id in ids {
+            assert!(
+                receiver_store
+                    .get_event(id)
+                    .expect("converged Event lookup")
+                    .is_some()
+            );
+        }
+
+        drop(source_store);
+        drop(receiver_store);
+        fs::remove_dir_all(source_state).expect("source cleanup");
+        fs::remove_dir_all(receiver_state).expect("receiver cleanup");
+    }
+
+    #[tokio::test]
+    async fn finite_route_only_restart_forwards_age_and_rejects_expiry_and_clock_loss() {
+        let scope = Scope::new("test/route-restart-forward").expect("route-forward scope");
+        let topic = Topic::new("telemetry").expect("route-forward topic");
+        let access = ProvisioningAccess::member(scope.clone(), vec![1], vec![topic.clone()])
+            .expect("route-forward access");
+        let mut provisioner =
+            ReferenceProvisioner::from_seed([0xb1; 32]).expect("route-forward provisioner");
+        let source_mission = UnprotectedReferenceMission::from_bytes(
+            provisioner
+                .issue_node(1, std::slice::from_ref(&access))
+                .and_then(|bundle| bundle.to_bytes())
+                .expect("source bundle"),
+        )
+        .expect("source mission");
+        let relay_mission = UnprotectedReferenceMission::from_bytes(
+            provisioner
+                .issue_node(2, std::slice::from_ref(&access))
+                .and_then(|bundle| bundle.to_bytes())
+                .expect("relay bundle"),
+        )
+        .expect("relay mission");
+        let consumer_mission = UnprotectedReferenceMission::from_bytes(
+            provisioner
+                .issue_node(3, &[access])
+                .and_then(|bundle| bundle.to_bytes())
+                .expect("consumer bundle"),
+        )
+        .expect("consumer mission");
+
+        let source_state = root("route-restart-source");
+        let relay_state = root("route-restart-relay");
+        let consumer_state = root("route-restart-consumer");
+        for state in [&source_state, &relay_state, &consumer_state] {
+            fs::create_dir_all(state).expect("route-forward state");
+        }
+        let authority = source_mission.mission_authority_id();
+        let source_store = Arc::new(
+            Store::open_for_mission(source_state.join(STORE_FILE), authority)
+                .expect("source store"),
+        );
+        let relay_path = relay_state.join(STORE_FILE);
+        let relay_store =
+            Arc::new(Store::open_for_mission(&relay_path, authority).expect("relay store"));
+        let consumer_store = Arc::new(
+            Store::open_for_mission(consumer_state.join(STORE_FILE), authority)
+                .expect("consumer store"),
+        );
+        seed_test_event_subscription(
+            &relay_store,
+            EventSubscriptionMode::Carry,
+            &topic,
+            &scope,
+            b"route-forward-carry",
+        );
+        seed_test_event_subscription(
+            &consumer_store,
+            EventSubscriptionMode::Consume,
+            &topic,
+            &scope,
+            b"route-forward-consume",
+        );
+        let source_clock_id = [0xb2; 16];
+        let relay_clock_id = [0xb3; 16];
+        let consumer_clock_id = [0xb4; 16];
+        let mut source_sealer = open_test_sealer(&source_mission);
+        let live = publish_test_custody_event(
+            &source_store,
+            &mut source_sealer,
+            TestCustodyPublication {
+                operation: b"route-forward/live",
+                topic: &topic,
+                scope: &scope,
+                priority: Priority::Routine,
+                ttl_ms: Some(10_000),
+                sample: CustodySample {
+                    clock_id: source_clock_id,
+                    tick_ms: 0,
+                },
+                payload: b"route-forward-live",
+                tombstone: false,
+            },
+        );
+
+        let (relay_receipt, source_receipt) = contact_test_pair_with_forwarding(
+            TestForwardingNode {
+                store: source_store.clone(),
+                mission: source_mission.clone(),
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                clock: NodeCustodyClock::injected(source_clock_id, 0, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            },
+            TestForwardingNode {
+                store: relay_store.clone(),
+                mission: relay_mission.clone(),
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                clock: NodeCustodyClock::injected(relay_clock_id, 0, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            },
+        )
+        .await;
+        assert_eq!(relay_receipt.event_page_entries_received, 1);
+        assert_eq!(source_receipt.event_page_entries_sent, 1);
+        assert_eq!(source_receipt.receiptful_event_offers, 0);
+        assert_eq!(relay_store.event_count().expect("relay semantic Events"), 0);
+        assert_eq!(
+            relay_store.event_stats().expect("relay stats").route_cached,
+            1
+        );
+
+        drop(relay_store);
+        let relay_store =
+            Arc::new(Store::open_for_mission(&relay_path, authority).expect("reopen relay store"));
+        assert_eq!(
+            relay_store
+                .event_stats()
+                .expect("reopened relay stats")
+                .route_cached,
+            1
+        );
+        let (consumer_receipt, relay_receipt) = contact_test_pair_with_forwarding(
+            TestForwardingNode {
+                store: relay_store.clone(),
+                mission: relay_mission.clone(),
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                clock: NodeCustodyClock::injected(relay_clock_id, 100, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            },
+            TestForwardingNode {
+                store: consumer_store.clone(),
+                mission: consumer_mission.clone(),
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                clock: NodeCustodyClock::injected(consumer_clock_id, 0, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            },
+        )
+        .await;
+        assert_eq!(consumer_receipt.event_page_entries_received, 1);
+        assert_eq!(consumer_receipt.event_page_inserts, 1);
+        assert_eq!(consumer_receipt.receiptful_event_offers, 0);
+        assert_eq!(relay_receipt.event_page_entries_sent, 1);
+        assert_eq!(relay_receipt.receiptful_event_offers, 0);
+        assert!(
+            consumer_store
+                .get_event(live.transfer_id)
+                .expect("downstream Event lookup")
+                .is_some()
+        );
+
+        let expiring = publish_test_custody_event(
+            &source_store,
+            &mut source_sealer,
+            TestCustodyPublication {
+                operation: b"route-forward/expiring",
+                topic: &topic,
+                scope: &scope,
+                priority: Priority::Routine,
+                ttl_ms: Some(150),
+                sample: CustodySample {
+                    clock_id: source_clock_id,
+                    tick_ms: 200,
+                },
+                payload: b"route-forward-expiring",
+                tombstone: false,
+            },
+        );
+        let (relay_expiring, source_expiring) = contact_test_pair_with_forwarding(
+            TestForwardingNode {
+                store: source_store.clone(),
+                mission: source_mission.clone(),
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                clock: NodeCustodyClock::injected(source_clock_id, 200, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            },
+            TestForwardingNode {
+                store: relay_store.clone(),
+                mission: relay_mission.clone(),
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                clock: NodeCustodyClock::injected(relay_clock_id, 200, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            },
+        )
+        .await;
+        assert_eq!(source_expiring.event_page_entries_sent, 1);
+        assert_eq!(relay_expiring.event_page_entries_received, 1);
+        drop(relay_store);
+        let relay_store = Arc::new(
+            Store::open_for_mission(&relay_path, authority).expect("reopen expiring relay store"),
+        );
+        let (consumer_expired, relay_expired) = contact_test_pair_with_forwarding(
+            TestForwardingNode {
+                store: relay_store.clone(),
+                mission: relay_mission.clone(),
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                clock: NodeCustodyClock::injected(relay_clock_id, 400, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            },
+            TestForwardingNode {
+                store: consumer_store.clone(),
+                mission: consumer_mission.clone(),
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                clock: NodeCustodyClock::injected(consumer_clock_id, 100, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            },
+        )
+        .await;
+        assert_eq!(relay_expired.event_page_entries_sent, 0);
+        assert_eq!(consumer_expired.event_page_entries_received, 0);
+        assert!(
+            consumer_store
+                .get_event(expiring.transfer_id)
+                .expect("expired downstream lookup")
+                .is_none()
+        );
+
+        let continuity = publish_test_custody_event(
+            &source_store,
+            &mut source_sealer,
+            TestCustodyPublication {
+                operation: b"route-forward/continuity",
+                topic: &topic,
+                scope: &scope,
+                priority: Priority::Routine,
+                ttl_ms: Some(10_000),
+                sample: CustodySample {
+                    clock_id: source_clock_id,
+                    tick_ms: 500,
+                },
+                payload: b"route-forward-continuity",
+                tombstone: false,
+            },
+        );
+        let (relay_continuity, source_continuity) = contact_test_pair_with_forwarding(
+            TestForwardingNode {
+                store: source_store.clone(),
+                mission: source_mission,
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                clock: NodeCustodyClock::injected(source_clock_id, 500, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            },
+            TestForwardingNode {
+                store: relay_store.clone(),
+                mission: relay_mission.clone(),
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                clock: NodeCustodyClock::injected(relay_clock_id, 500, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            },
+        )
+        .await;
+        assert_eq!(source_continuity.event_page_entries_sent, 1);
+        assert_eq!(relay_continuity.event_page_entries_received, 1);
+        drop(relay_store);
+        let relay_store = Arc::new(
+            Store::open_for_mission(&relay_path, authority).expect("reopen continuity relay store"),
+        );
+        let (consumer_discontinuous, relay_discontinuous) = contact_test_pair_with_forwarding(
+            TestForwardingNode {
+                store: relay_store.clone(),
+                mission: relay_mission,
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                clock: NodeCustodyClock::injected([0xbd; 16], 0, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            },
+            TestForwardingNode {
+                store: consumer_store.clone(),
+                mission: consumer_mission,
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                clock: NodeCustodyClock::injected(consumer_clock_id, 200, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            },
+        )
+        .await;
+        assert_eq!(relay_discontinuous.event_page_entries_sent, 0);
+        assert_eq!(consumer_discontinuous.event_page_entries_received, 0);
+        assert!(
+            consumer_store
+                .get_event(continuity.transfer_id)
+                .expect("continuity-loss downstream lookup")
+                .is_none()
+        );
+
+        drop(relay_store);
+        let custody = Store::inspect_existing(&relay_path)
+            .expect("relay custody inspection")
+            .custody_stats;
+        assert_eq!(custody.transfer_leases, 0);
+        assert_eq!(custody.peer_receipts, 0);
+        assert_eq!(custody.retries, 0);
+
+        drop(source_store);
+        drop(consumer_store);
+        for state in [source_state, relay_state, consumer_state] {
+            fs::remove_dir_all(state).expect("route-forward cleanup");
         }
     }
 
@@ -41595,26 +47992,29 @@ mod tests {
         let source_clock_id = [0x4e; 16];
         let receiver_clock_id = [0x4f; 16];
 
-        let (first_receiver, first_source) = contact_test_pair_with_forwarding(
-            TestForwardingNode {
-                store: source_store.clone(),
-                mission: source_mission.clone(),
-                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
-                clock: NodeCustodyClock::injected(source_clock_id, 0, 0),
-                reconciliation_exchanges_before_defer: None,
-                preopen_custody_races: Vec::new(),
-            },
-            TestForwardingNode {
-                store: receiver_store.clone(),
-                mission: receiver_mission.clone(),
-                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
-                clock: NodeCustodyClock::injected(receiver_clock_id, 0, 0),
-                reconciliation_exchanges_before_defer: None,
-                preopen_custody_races: vec![
-                    TestCustodyPreopenRace::ForceRouteOnly(common_id),
-                    TestCustodyPreopenRace::ForceRouteOnly(due_id),
-                ],
-            },
+        let (first_receiver, first_source) = with_test_transfer_profile_offer(
+            TransferProfileOfferV1::legacy_only(),
+            contact_test_pair_with_forwarding(
+                TestForwardingNode {
+                    store: source_store.clone(),
+                    mission: source_mission.clone(),
+                    policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                    clock: NodeCustodyClock::injected(source_clock_id, 0, 0),
+                    reconciliation_exchanges_before_defer: None,
+                    preopen_custody_races: Vec::new(),
+                },
+                TestForwardingNode {
+                    store: receiver_store.clone(),
+                    mission: receiver_mission.clone(),
+                    policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                    clock: NodeCustodyClock::injected(receiver_clock_id, 0, 0),
+                    reconciliation_exchanges_before_defer: None,
+                    preopen_custody_races: vec![
+                        TestCustodyPreopenRace::ForceRouteOnly(common_id),
+                        TestCustodyPreopenRace::ForceRouteOnly(due_id),
+                    ],
+                },
+            ),
         )
         .await;
         assert_eq!(first_receiver.fetched, 2);
@@ -41637,8 +48037,9 @@ mod tests {
         );
 
         // One exact transfer becomes accepted independently. The following
-        // normal reconciliation proves it common and settles only that retry;
-        // the other transfer remains missing but is not yet due.
+        // normal reconciliation proves it common and settles only that legacy
+        // retry. The unrelated durable missing Event is paged immediately; that
+        // page must not mutate its pre-existing legacy custody row.
         let receiver_policy = receiver_store
             .event_replication_policy_snapshot()
             .expect("receiver Consume policy");
@@ -41689,8 +48090,13 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(immediate_receiver.fetched, 0);
-        assert_eq!(immediate_source.offered, 0);
+        assert_eq!(immediate_receiver.fetched, 1);
+        assert_eq!(immediate_receiver.event_pages_received, 1);
+        assert_eq!(immediate_receiver.event_page_entries_received, 1);
+        assert_eq!(immediate_source.offered, 1);
+        assert_eq!(immediate_source.event_pages_sent, 1);
+        assert_eq!(immediate_source.event_page_entries_sent, 1);
+        assert_eq!(immediate_source.receiptful_event_offers, 0);
         drop(source_store);
         let common_stats = Store::inspect_existing(&source_path)
             .expect("source custody after common settlement")
@@ -41721,9 +48127,12 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(due_receiver.fetched, 1);
-        assert_eq!(due_receiver.inserted, 1);
-        assert_eq!(due_source.offered, 1);
+        assert_eq!(due_receiver.fetched, 0);
+        assert_eq!(due_receiver.inserted, 0);
+        assert_eq!(due_receiver.event_pages_received, 0);
+        assert_eq!(due_source.offered, 0);
+        assert_eq!(due_source.event_pages_sent, 0);
+        assert_eq!(due_source.receiptful_event_offers, 0);
         assert!(matches!(
             receiver_store
                 .get_transfer_with_policy(receiver_policy.control_policy(), due_id)
@@ -43385,7 +49794,7 @@ mod tests {
         let hidden_id = EventTransferId::new(event.envelope_id());
         let matching_interest = exact_event_interest(&topic, &allowed_scope);
 
-        let server_task = tokio::spawn({
+        let mut server_task = Some(tokio::spawn({
             let server = server.clone();
             let store = server_store.clone();
             let credentials = server_mission.clone();
@@ -43403,7 +49812,7 @@ mod tests {
                 )
                 .await
             }
-        });
+        }));
 
         let connection = client
             .connect(ExpectedPeer {
@@ -43426,7 +49835,30 @@ mod tests {
             matching_interest.clone(),
         )
         .await;
-        if mission.semantic_version() >= MIN_CUSTODY_SEMANTIC_VERSION {
+        if mission.semantic_version() == SEMANTIC_PROTOCOL_V7 {
+            defer_empty_mutable_classes(&connection, &mut mission, &mut receipt).await;
+            assert_eq!(
+                request_mission_frame(
+                    &connection,
+                    &mut mission,
+                    Frame::BridgeHello { enabled: false },
+                    &mut receipt,
+                )
+                .await
+                .expect("disabled v7 bridge hello"),
+                Frame::BridgeHelloAck { enabled: false }
+            );
+            connection
+                .finish_as_initiator()
+                .await
+                .expect("finish low-level v7 initiator");
+            server_task
+                .take()
+                .expect("unconsumed server task")
+                .await
+                .expect("server task")
+                .expect("v7 contact must finish without disclosing the hidden ID");
+        } else if mission.semantic_version() >= MIN_CUSTODY_SEMANTIC_VERSION {
             finish_v3_event_lane(
                 &connection,
                 &mut mission,
@@ -43453,78 +49885,84 @@ mod tests {
                 }
             );
         }
-        reconcile_equal_event_lane(
-            &connection,
-            &mut mission,
-            InventorySnapshot::default(),
-            EventDirection::ToSessionInitiator,
-            &mut receipt,
-        )
-        .await;
-        if mission.semantic_version() >= MIN_CUSTODY_SEMANTIC_VERSION {
-            let wire_budget = exchange_wire_budget(&receipt).expect("v3 finish wire budget");
-            let (complete, request_bytes, response_bytes) = respond_mission_frame(
+        if mission.semantic_version() != SEMANTIC_PROTOCOL_V7 {
+            reconcile_equal_event_lane(
                 &connection,
                 &mut mission,
-                wire_budget,
-                |frame, _, _mission| match frame {
-                    Frame::FinishV3 {
-                        direction: EventDirection::ToSessionInitiator,
-                        remaining: 0,
-                    } => Ok((
-                        Frame::FinishedV3 {
-                            direction: EventDirection::ToSessionInitiator,
-                            remaining: 0,
-                        },
-                        true,
-                    )),
-                    other => Err(NodeError::Protocol(format!(
-                        "out-of-scope v3 sender emitted an object-bearing frame: {other:?}"
-                    ))),
-                },
-            )
-            .await
-            .expect("complete source-push lane without disclosure");
-            assert!(complete);
-            account(&mut receipt, request_bytes, response_bytes).expect("account v3 finish");
-            defer_empty_mutable_classes(&connection, &mut mission, &mut receipt).await;
-            // This low-level client drives the protocol without
-            // `sync_authenticated_session`, so it must perform the initiator's
-            // completion handshake after consuming the final response.
-            connection
-                .finish_as_initiator()
-                .await
-                .expect("finish low-level initiator");
-            server_task
-                .await
-                .expect("server task")
-                .expect("source-push contact must finish without disclosing the hidden ID");
-        } else {
-            let client_error = request_mission_frame(
-                &connection,
-                &mut mission,
-                Frame::Fetch {
-                    direction: EventDirection::ToSessionInitiator,
-                    id: hidden_id,
-                },
+                InventorySnapshot::default(),
+                EventDirection::ToSessionInitiator,
                 &mut receipt,
             )
-            .await
-            .expect_err("out-of-scope hidden Event must not be fetchable");
-            assert!(matches!(
-                client_error,
-                NodeError::Carrier(_) | NodeError::Mission(_)
-            ));
-            let server_error = server_task
+            .await;
+            if mission.semantic_version() >= MIN_CUSTODY_SEMANTIC_VERSION {
+                let wire_budget = exchange_wire_budget(&receipt).expect("v3 finish wire budget");
+                let (complete, request_bytes, response_bytes) = respond_mission_frame(
+                    &connection,
+                    &mut mission,
+                    wire_budget,
+                    |frame, _, _mission| match frame {
+                        Frame::FinishV3 {
+                            direction: EventDirection::ToSessionInitiator,
+                            remaining: 0,
+                        } => Ok((
+                            Frame::FinishedV3 {
+                                direction: EventDirection::ToSessionInitiator,
+                                remaining: 0,
+                            },
+                            true,
+                        )),
+                        other => Err(NodeError::Protocol(format!(
+                            "out-of-scope v3 sender emitted an object-bearing frame: {other:?}"
+                        ))),
+                    },
+                )
                 .await
-                .expect("server task")
-                .expect_err("server must reject hidden fetch");
-            assert!(
-                server_error
-                    .to_string()
-                    .contains("outside this authenticated contact's negotiated difference"),
-                "unexpected server rejection: {server_error}"
-            );
+                .expect("complete source-push lane without disclosure");
+                assert!(complete);
+                account(&mut receipt, request_bytes, response_bytes).expect("account v3 finish");
+                defer_empty_mutable_classes(&connection, &mut mission, &mut receipt).await;
+                // This low-level client drives the protocol without
+                // `sync_authenticated_session`, so it must perform the initiator's
+                // completion handshake after consuming the final response.
+                connection
+                    .finish_as_initiator()
+                    .await
+                    .expect("finish low-level initiator");
+                server_task
+                    .take()
+                    .expect("unconsumed server task")
+                    .await
+                    .expect("server task")
+                    .expect("source-push contact must finish without disclosing the hidden ID");
+            } else {
+                let client_error = request_mission_frame(
+                    &connection,
+                    &mut mission,
+                    Frame::Fetch {
+                        direction: EventDirection::ToSessionInitiator,
+                        id: hidden_id,
+                    },
+                    &mut receipt,
+                )
+                .await
+                .expect_err("out-of-scope hidden Event must not be fetchable");
+                assert!(matches!(
+                    client_error,
+                    NodeError::Carrier(_) | NodeError::Mission(_)
+                ));
+                let server_error = server_task
+                    .take()
+                    .expect("unconsumed server task")
+                    .await
+                    .expect("server task")
+                    .expect_err("server must reject hidden fetch");
+                assert!(
+                    server_error
+                        .to_string()
+                        .contains("outside this authenticated contact's negotiated difference"),
+                    "unexpected server rejection: {server_error}"
+                );
+            }
         }
         assert_eq!(server_store.event_count().expect("server Event count"), 1);
         client.close().await;

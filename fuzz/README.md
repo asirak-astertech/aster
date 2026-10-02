@@ -21,9 +21,11 @@ pass does not establish coverage of those two targets; Linux CI runs them.
 canonical encoding. The selected-frame target reaches the exact production
 decoder through an opt-in, doc-hidden fuzz seam that is absent from normal
 `aster-node` builds; each case exercises both the raw hostile input and one
-structured candidate distributed across all 30 current mechanics-frame variants,
-including both protected Event-interest variants and the object-class-distinct
-Event and Flash control lanes.
+structured candidate distributed across all 78 current mechanics-frame tags,
+including the five semantic-v7 profile/plan/page codecs. The same target drives
+the production-shared `ASTU\x01` preamble, frame-length, per-frame, and aggregate
+uni-turn bound checks with arbitrary input and wraps every structured mechanics
+candidate in one valid complete uni turn.
 `selected_negentropy` drives both arbitrary hostile frames and valid stateful
 exchanges while asserting the selected wrapper's byte, cardinality, and round
 limits. These mechanics-only targets earn no mission semantics or security

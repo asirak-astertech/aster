@@ -23,7 +23,7 @@ use crate::model::{
 };
 use crate::wire::{
     ObjectId, ObjectKind, SEMANTIC_PROTOCOL_V2, SEMANTIC_PROTOCOL_V3, SEMANTIC_PROTOCOL_V4,
-    SEMANTIC_PROTOCOL_V5, SEMANTIC_PROTOCOL_V6,
+    SEMANTIC_PROTOCOL_V5, SEMANTIC_PROTOCOL_V6, SEMANTIC_PROTOCOL_V7,
 };
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use sha2::{Digest, Sha256};
@@ -1190,13 +1190,13 @@ fn transfer_resume_is_compatible(
         (None, None) => true,
         (None, Some(_)) | (Some(_), None) => false,
         (Some(origin), Some(requested))
-            if !matches!(origin, 1..=6) || !matches!(requested, 1..=6) =>
+            if !matches!(origin, 1..=7) || !matches!(requested, 1..=7) =>
         {
             false
         }
         (Some(_), Some(_)) if kind == ObjectKind::BlobChunk => true,
         (Some(1), Some(requested))
-            if kind == ObjectKind::SourceEnvelope && matches!(requested, 1..=6) =>
+            if kind == ObjectKind::SourceEnvelope && matches!(requested, 1..=7) =>
         {
             true
         }
@@ -1617,7 +1617,7 @@ pub trait RecordStore {
         now_ms: Option<u64>,
         semantic_version: u16,
     ) -> Result<(), StoreError> {
-        if !matches!(semantic_version, 1..=6) {
+        if !matches!(semantic_version, 1..=7) {
             return Err(StoreError::Invalid(
                 "unsupported transfer semantic version".into(),
             ));
@@ -2144,7 +2144,7 @@ impl SqliteStore {
         now_ms: Option<u64>,
         origin_semantic_version: Option<u16>,
     ) -> Result<(), StoreError> {
-        if origin_semantic_version.is_some_and(|version| !matches!(version, 1..=6)) {
+        if origin_semantic_version.is_some_and(|version| !matches!(version, 1..=7)) {
             return Err(StoreError::Invalid(
                 "unsupported transfer semantic version".into(),
             ));
@@ -2234,7 +2234,7 @@ impl SqliteStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        if selected_version.is_some_and(|version| !matches!(version, 1..=6)) {
+        if selected_version.is_some_and(|version| !matches!(version, 1..=7)) {
             return Err(StoreError::Invalid(
                 "unsupported transfer semantic version".into(),
             ));
@@ -2255,11 +2255,11 @@ impl SqliteStore {
                 values.push(vec![ObjectKind::SourceEnvelope as u8].into());
                 values.push(vec![ObjectKind::BlobChunk as u8].into());
             }
-            Some(2) | Some(3) | Some(4) | Some(5) | Some(6) => {
+            Some(2) | Some(3) | Some(4) | Some(5) | Some(6) | Some(7) => {
                 sql.push_str(
                     " WHERE i.origin_semantic_version IS NOT NULL AND\n\
                        (substr(i.object_id,1,1) IN (?,?) OR\n\
-                        (i.origin_semantic_version IN (2,3,4,5,6) AND\n\
+                        (i.origin_semantic_version IN (2,3,4,5,6,7) AND\n\
                          substr(i.object_id,1,1) IN (?,?,?)))",
                 );
                 values.push(vec![ObjectKind::SourceEnvelope as u8].into());
@@ -2360,6 +2360,7 @@ impl SqliteStore {
                 | SEMANTIC_PROTOCOL_V4
                 | SEMANTIC_PROTOCOL_V5
                 | SEMANTIC_PROTOCOL_V6
+                | SEMANTIC_PROTOCOL_V7
         ) {
             return Ok(None);
         }
@@ -3520,7 +3521,7 @@ impl SqliteStore {
         item_id: &ItemId,
         semantic_version: u16,
     ) -> Result<Option<StoredItemRepresentation>, StoreError> {
-        if !matches!(semantic_version, 1..=6) {
+        if !matches!(semantic_version, 1..=7) {
             return Err(StoreError::Invalid(
                 "unsupported representation semantic version".into(),
             ));
@@ -12375,7 +12376,7 @@ fn migrate_v15_to_v16(connection: &Connection) -> Result<(), StoreError> {
              CHECK(length(storage_key)=32),\n\
            object_id BLOB NOT NULL UNIQUE CHECK(length(object_id)=33),\n\
            origin_semantic_version INTEGER\n\
-             CHECK(origin_semantic_version IS NULL OR origin_semantic_version IN (1,2,3,4,5,6))\n\
+             CHECK(origin_semantic_version IS NULL OR origin_semantic_version IN (1,2,3,4,5,6,7))\n\
          ) STRICT;\n\
          INSERT INTO transfer_identities(storage_key,object_id,origin_semantic_version)\n\
            SELECT storage_key,object_id,origin_semantic_version FROM transfer_identities_v15;\n\
@@ -18490,7 +18491,7 @@ mod sqlite_integration_tests {
         ));
         let existing_v5 = ObjectId::new(ObjectKind::SourceBatchProof, [0xd8; 32]);
         let new_v6 = ObjectId::new(ObjectKind::BridgeRouteWrapper, [0xd9; 32]);
-        let rejected_v7 = ObjectId::new(ObjectKind::SourceEnvelope, [0xda; 32]);
+        let rejected_v8 = ObjectId::new(ObjectKind::SourceEnvelope, [0xda; 32]);
         {
             let mut store = SqliteStore::open(&path, StoreConfig::default()).unwrap();
             store
@@ -18533,11 +18534,11 @@ mod sqlite_integration_tests {
                 .unwrap();
             assert!(matches!(
                 store.begin_transfer_for_semantic_version(
-                    rejected_v7,
+                    rejected_v8,
                     7,
                     Priority::Routine,
                     None,
-                    7
+                    8
                 ),
                 Err(StoreError::Invalid(_))
             ));
@@ -18587,7 +18588,7 @@ mod sqlite_integration_tests {
                 .unwrap();
             connection
                 .execute(
-                    "UPDATE transfer_identities SET origin_semantic_version=7\n\
+                    "UPDATE transfer_identities SET origin_semantic_version=8\n\
                      WHERE storage_key=?1",
                     params![storage_key.as_slice()],
                 )
@@ -18619,7 +18620,7 @@ mod sqlite_integration_tests {
                         |row| row.get::<_, i64>(0),
                     )
                     .unwrap(),
-                7
+                8
             );
             assert_eq!(
                 connection
@@ -21117,8 +21118,11 @@ mod sqlite_integration_tests {
         store
             .begin_transfer_for_semantic_version(proof_v4, 8, Priority::Immediate, None, 6)
             .unwrap();
+        store
+            .begin_transfer_for_semantic_version(proof_v4, 8, Priority::Immediate, None, 7)
+            .unwrap();
         assert!(matches!(
-            store.begin_transfer_for_semantic_version(proof_v4, 8, Priority::Immediate, None, 7),
+            store.begin_transfer_for_semantic_version(proof_v4, 8, Priority::Immediate, None, 8),
             Err(StoreError::Invalid(_))
         ));
 
@@ -21195,7 +21199,14 @@ mod sqlite_integration_tests {
                 .len(),
             5
         );
-        assert!(store.transfer_progress_for_semantic_version(7, 16).is_err());
+        assert_eq!(
+            store
+                .transfer_progress_for_semantic_version(7, 16)
+                .unwrap()
+                .len(),
+            5
+        );
+        assert!(store.transfer_progress_for_semantic_version(8, 16).is_err());
     }
 
     #[test]
@@ -22552,7 +22563,15 @@ mod sqlite_integration_tests {
                 .envelope_id,
             compact.envelope_id
         );
-        assert!(store.stored_item_representation(&compact.id, 7).is_err());
+        assert_eq!(
+            store
+                .stored_item_representation(&compact.id, 7)
+                .unwrap()
+                .unwrap()
+                .envelope_id,
+            compact.envelope_id
+        );
+        assert!(store.stored_item_representation(&compact.id, 8).is_err());
         let next = store
             .reserve_batch_publish(
                 [7; 32],
