@@ -4447,10 +4447,13 @@ pub(crate) fn publish_selected_event_once(
     )))
 }
 
+pub(crate) type SelectedEventPublishOutcome = Result<(StoredEvent, bool), NodeError>;
+pub(crate) type SelectedEventGroupResult = Result<Vec<SelectedEventPublishOutcome>, NodeError>;
+
 pub(crate) struct SelectedEventGroupAttempt {
     /// An outer error precedes a shared commit and permits singleton fallback.
     /// Inner errors are committed per-input outcomes and must not be replayed.
-    pub(crate) result: Result<Vec<Result<(StoredEvent, bool), NodeError>>, NodeError>,
+    pub(crate) result: SelectedEventGroupResult,
     pub(crate) writer_commits: u64,
 }
 
@@ -4484,7 +4487,7 @@ fn publish_selected_event_group_once_counted(
     sealer: &mut ReferenceEnvelopeSealer,
     requests: &[SelectedEventPublish<'_>],
     writer_commits: &mut u64,
-) -> Result<Vec<Result<(StoredEvent, bool), NodeError>>, NodeError> {
+) -> SelectedEventGroupResult {
     let first = requests
         .first()
         .ok_or_else(|| NodeError::Configuration("Event publication group is empty".into()))?;
