@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Upgrade dependencies: Iroh 1.3.0
+- Upgrade dependencies: Iroh 1.3.0 (public DNS disabled)
 - Reduced CI turnaround with Rust compiler caching and partitioned nextest runs.
 - Aligned the wire and envelope contract with semantic protocol version 6.
 
