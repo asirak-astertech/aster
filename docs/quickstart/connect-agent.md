@@ -401,6 +401,14 @@ advertised telemetry rates, or target-device validation results.
 `scanned_through` while `has_more` is true rather than raising the request
 above its bound.
 
+## Inspect Event subscriptions
+
+`ListEventSubscriptions` takes an empty request and returns `subscriptions`, a
+full list of this node's Consume subscriptions ordered by subscription ID. Each row
+contains `subscription_id`, `topic`, `scope`, `include_descendant_scopes`, and
+the `operation_key` bytes (including non-UTF-8 keys; Protobuf
+JSON represents bytes as base64).
+
 ## Commit before acknowledging
 
 `CreateEventSubscription` creates or replays an immutable durable selector by
