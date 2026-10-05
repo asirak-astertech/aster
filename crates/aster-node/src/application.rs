@@ -1858,8 +1858,12 @@ impl SelectedEventNode {
                         .checked_add(group.writer_commits)
                         .expect("bounded publication group writer count");
                     if let Ok(outcomes) = group.result {
-                        for (stored, inserted) in outcomes {
-                            let result = self.finish_published_event(stored, inserted);
+                        for outcome in outcomes {
+                            let result = outcome
+                                .map_err(|error| application_error("publish", error))
+                                .and_then(|(stored, inserted)| {
+                                    self.finish_published_event(stored, inserted)
+                                });
                             if result.as_ref().is_ok_and(|result| result.inserted) {
                                 diagnostic.accepted_new = diagnostic.accepted_new.saturating_add(1);
                             } else if result.is_ok() {
@@ -1951,9 +1955,10 @@ impl SelectedEventNode {
             publish_selected_event_group_once(&self.store, &policy, &mut self.verifier, &selected);
         let result = match attempt.result {
             Ok(mut outcomes) => match outcomes.pop() {
-                Some((stored, inserted)) if outcomes.is_empty() => {
+                Some(Ok((stored, inserted))) if outcomes.is_empty() => {
                     self.finish_published_event(stored, inserted)
                 }
+                Some(Err(error)) if outcomes.is_empty() => Err(application_error("publish", error)),
                 _ => Err(ApplicationError::new(
                     ApplicationErrorKind::Integrity,
                     "publish",
@@ -3921,6 +3926,45 @@ mod tests {
         assert_eq!(group.diagnostic.failures, 1);
         assert_eq!(group.diagnostic.singleton_fallbacks, 3);
         assert_eq!(group.diagnostic.accepted_new, 2);
+    }
+
+    #[test]
+    fn selected_event_publish_group_preserves_committed_sibling_before_retired_retry() {
+        let root = TestRoot::new("selected-event-publish-group-retired-sibling");
+        let mut node = selected_node(&root);
+        let clock_id = [0xa7; 16];
+        let finite = EventPublishOptions::finite_ttl_ms(10).expect("finite TTL");
+        let retired = request(b"group/retired", "ops.alpha", b"asset-retired", b"retired");
+        node.custody_clock = NodeCustodyClock::injected(clock_id, 0, 0);
+        node.publish_with_options(retired.clone(), finite)
+            .expect("seed finite Event");
+        node.custody_clock = NodeCustodyClock::injected(clock_id, 10, 0);
+        node.maintain_custody().expect("retire finite Event");
+        node.custody_clock = NodeCustodyClock::injected(clock_id, 11, 0);
+
+        let group = node.publish_group_with_options(vec![
+            (
+                request(b"group/new", "ops.alpha", b"asset-new", b"new"),
+                finite,
+            ),
+            (retired, finite),
+        ]);
+
+        assert!(
+            group.results[0]
+                .as_ref()
+                .is_ok_and(|result| result.inserted),
+            "the newly committed sibling must retain inserted=true"
+        );
+        assert_eq!(
+            group.results[1].as_ref().expect_err("retired retry").kind(),
+            ApplicationErrorKind::ExpiredOrRetired
+        );
+        assert_eq!(group.diagnostic.event_writer_commits, 1);
+        assert_eq!(group.diagnostic.accepted_new, 1);
+        assert_eq!(group.diagnostic.failures, 1);
+        assert_eq!(group.diagnostic.exact_retries, 0);
+        assert_eq!(group.diagnostic.singleton_fallbacks, 0);
     }
 
     #[test]

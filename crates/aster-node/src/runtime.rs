@@ -4448,7 +4448,9 @@ pub(crate) fn publish_selected_event_once(
 }
 
 pub(crate) struct SelectedEventGroupAttempt {
-    pub(crate) result: Result<Vec<(StoredEvent, bool)>, NodeError>,
+    /// An outer error precedes a shared commit and permits singleton fallback.
+    /// Inner errors are committed per-input outcomes and must not be replayed.
+    pub(crate) result: Result<Vec<Result<(StoredEvent, bool), NodeError>>, NodeError>,
     pub(crate) writer_commits: u64,
 }
 
@@ -4482,7 +4484,7 @@ fn publish_selected_event_group_once_counted(
     sealer: &mut ReferenceEnvelopeSealer,
     requests: &[SelectedEventPublish<'_>],
     writer_commits: &mut u64,
-) -> Result<Vec<(StoredEvent, bool)>, NodeError> {
+) -> Result<Vec<Result<(StoredEvent, bool), NodeError>>, NodeError> {
     let first = requests
         .first()
         .ok_or_else(|| NodeError::Configuration("Event publication group is empty".into()))?;
@@ -4646,83 +4648,85 @@ fn publish_selected_event_group_once_counted(
                     })?;
                 let mut outcomes = Vec::with_capacity(requests.len());
                 for (request, outcome) in requests.iter().zip(group.into_outcomes()) {
-                    let (transfer_id, semantic_id, inserted) = match outcome {
-                        EventOnceOutcome::Inserted {
-                            transfer_id,
-                            semantic_id,
-                            ..
-                        } => (transfer_id, semantic_id, true),
-                        EventOnceOutcome::BoundExisting {
-                            transfer_id,
-                            semantic_id,
-                            ..
-                        }
-                        | EventOnceOutcome::Existing {
-                            transfer_id,
-                            semantic_id,
-                            ..
-                        } => (transfer_id, semantic_id, false),
-                        EventOnceOutcome::Retired { .. }
-                        | EventOnceOutcome::RetiredOperation { .. } => {
-                            return Err(NodeError::Protocol(EVENT_OPERATION_RETIRED.into()));
-                        }
-                    };
-                    let stored = match store.get_transfer_with_policy(policy, transfer_id)? {
-                        Some(StoredEventTransfer::Accepted(stored)) => stored,
-                        Some(StoredEventTransfer::RouteCached(_)) => {
+                    outcomes.push((|| {
+                        let (transfer_id, semantic_id, inserted) = match outcome {
+                            EventOnceOutcome::Inserted {
+                                transfer_id,
+                                semantic_id,
+                                ..
+                            } => (transfer_id, semantic_id, true),
+                            EventOnceOutcome::BoundExisting {
+                                transfer_id,
+                                semantic_id,
+                                ..
+                            }
+                            | EventOnceOutcome::Existing {
+                                transfer_id,
+                                semantic_id,
+                                ..
+                            } => (transfer_id, semantic_id, false),
+                            EventOnceOutcome::Retired { .. }
+                            | EventOnceOutcome::RetiredOperation { .. } => {
+                                return Err(NodeError::Protocol(EVENT_OPERATION_RETIRED.into()));
+                            }
+                        };
+                        let stored = match store.get_transfer_with_policy(policy, transfer_id)? {
+                            Some(StoredEventTransfer::Accepted(stored)) => stored,
+                            Some(StoredEventTransfer::RouteCached(_)) => {
+                                return Err(NodeError::Protocol(
+                                    "committed local Event operation resolved only to route cache"
+                                        .into(),
+                                ));
+                            }
+                            None => {
+                                return Err(NodeError::Protocol(
+                                    "committed Event operation is missing its exact representation"
+                                        .into(),
+                                ));
+                            }
+                        };
+                        if stored.semantic_id != semantic_id {
                             return Err(NodeError::Protocol(
-                                "committed local Event operation resolved only to route cache"
-                                    .into(),
+                                "committed Event operation changed semantic identity".into(),
                             ));
                         }
-                        None => {
-                            return Err(NodeError::Protocol(
-                                "committed Event operation is missing its exact representation"
-                                    .into(),
-                            ));
+                        let stored_route = sealer.verify_event(&stored.sealed)?;
+                        verify_stored_claim(
+                            &stored_route,
+                            stored.transfer_id,
+                            stored.semantic_id,
+                            &stored.header,
+                        )?;
+                        let reopened =
+                            match sealer.verify_event_content(stored_route, &stored.sealed)? {
+                                EventContentVerification::ContentVerified {
+                                    event,
+                                    payload: reopened,
+                                } => {
+                                    verify_content_stored_claim(&event, &stored)?;
+                                    reopened
+                                }
+                                EventContentVerification::RouteOnly(_) => {
+                                    return Err(NodeError::Protocol(
+                                        "durable local Event operation lost content authorization"
+                                            .into(),
+                                    ));
+                                }
+                            };
+                        if reopened != request.payload
+                            || stored.header.stamp.dot.publisher != sealer.identity()
+                            || &stored.header.topic != request.topic
+                            || &stored.header.scope != request.scope
+                            || stored.header.priority != request.priority
+                            || stored.header.logical_key.as_slice() != request.logical_key
+                            || stored.header.ttl_ms != request.ttl_ms
+                            || stored.header.tombstone != request.tombstone
+                            || (inserted && stored.header.key_epoch != key_epoch)
+                        {
+                            return Err(NodeError::Protocol(EVENT_OPERATION_CONFLICT.into()));
                         }
-                    };
-                    if stored.semantic_id != semantic_id {
-                        return Err(NodeError::Protocol(
-                            "committed Event operation changed semantic identity".into(),
-                        ));
-                    }
-                    let stored_route = sealer.verify_event(&stored.sealed)?;
-                    verify_stored_claim(
-                        &stored_route,
-                        stored.transfer_id,
-                        stored.semantic_id,
-                        &stored.header,
-                    )?;
-                    let reopened = match sealer
-                        .verify_event_content(stored_route, &stored.sealed)?
-                    {
-                        EventContentVerification::ContentVerified {
-                            event,
-                            payload: reopened,
-                        } => {
-                            verify_content_stored_claim(&event, &stored)?;
-                            reopened
-                        }
-                        EventContentVerification::RouteOnly(_) => {
-                            return Err(NodeError::Protocol(
-                                "durable local Event operation lost content authorization".into(),
-                            ));
-                        }
-                    };
-                    if reopened != request.payload
-                        || stored.header.stamp.dot.publisher != sealer.identity()
-                        || &stored.header.topic != request.topic
-                        || &stored.header.scope != request.scope
-                        || stored.header.priority != request.priority
-                        || stored.header.logical_key.as_slice() != request.logical_key
-                        || stored.header.ttl_ms != request.ttl_ms
-                        || stored.header.tombstone != request.tombstone
-                        || (inserted && stored.header.key_epoch != key_epoch)
-                    {
-                        return Err(NodeError::Protocol(EVENT_OPERATION_CONFLICT.into()));
-                    }
-                    outcomes.push((stored, inserted));
+                        Ok((stored, inserted))
+                    })());
                 }
                 return Ok(outcomes);
             }
