@@ -789,6 +789,93 @@ pub(crate) struct EventPageScheduleLimits {
     pub(crate) max_protected_frame_bytes: usize,
     /// Sender-local packing target. This is never a receiver rejection rule.
     pub(crate) page_target_entries: usize,
+    /// Sender-local target for pages containing finite-TTL entries.
+    pub(crate) finite_page_target_entries: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct EventPagePackingState {
+    pub(crate) codec_bytes: usize,
+    pub(crate) entries: usize,
+    pub(crate) contains_finite: bool,
+}
+
+impl EventPagePackingState {
+    pub(crate) const fn empty() -> Self {
+        Self {
+            codec_bytes: CHANGE_PAGE_FIXED_BYTES,
+            entries: 0,
+            contains_finite: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct EventPagePackingDecision {
+    pub(crate) starts_page: bool,
+    pub(crate) state: EventPagePackingState,
+    pub(crate) turn_byte_delta: usize,
+}
+
+pub(crate) fn pack_event_page_entry(
+    current: EventPagePackingState,
+    entry_bytes: usize,
+    finite: bool,
+    max_codec_bytes: usize,
+    page_target_entries: usize,
+    finite_page_target_entries: usize,
+) -> Result<Option<EventPagePackingDecision>, EventPagesError> {
+    if page_target_entries == 0 || finite_page_target_entries == 0 {
+        return Err(EventPagesError::invalid(
+            "Event page sender targets must be nonzero",
+        ));
+    }
+    let effective_target = if finite || current.contains_finite {
+        page_target_entries.min(finite_page_target_entries)
+    } else {
+        page_target_entries
+    };
+    let starts_page = current.entries == 0
+        || current.entries >= effective_target
+        || current
+            .codec_bytes
+            .checked_add(entry_bytes)
+            .is_none_or(|bytes| bytes > max_codec_bytes);
+    let (codec_bytes, entries) = if starts_page {
+        let codec_bytes = CHANGE_PAGE_FIXED_BYTES
+            .checked_add(entry_bytes)
+            .ok_or_else(|| EventPagesError::invalid("Event page length overflows"))?;
+        if codec_bytes > max_codec_bytes {
+            return Ok(None);
+        }
+        (codec_bytes, 1)
+    } else {
+        (
+            current
+                .codec_bytes
+                .checked_add(entry_bytes)
+                .ok_or_else(|| EventPagesError::invalid("Event page length overflows"))?,
+            current
+                .entries
+                .checked_add(1)
+                .ok_or_else(|| EventPagesError::invalid("Event page entry count overflows"))?,
+        )
+    };
+    let turn_byte_delta = if starts_page {
+        framed_turn_bytes(codec_bytes)
+            .ok_or_else(|| EventPagesError::invalid("Event page turn length overflows"))?
+    } else {
+        entry_bytes
+    };
+    Ok(Some(EventPagePackingDecision {
+        starts_page,
+        state: EventPagePackingState {
+            codec_bytes,
+            entries,
+            contains_finite: finite || (!starts_page && current.contains_finite),
+        },
+        turn_byte_delta,
+    }))
 }
 
 fn framed_turn_bytes(codec_bytes: usize) -> Option<usize> {
@@ -818,9 +905,9 @@ pub(crate) fn plan_event_page_schedule(
     ),
     EventPagesError,
 > {
-    if limits.page_target_entries == 0 {
+    if limits.page_target_entries == 0 || limits.finite_page_target_entries == 0 {
         return Err(EventPagesError::invalid(
-            "Event page sender target must be nonzero",
+            "Event page sender targets must be nonzero",
         ));
     }
     let max_protected_frame_bytes = limits
@@ -846,9 +933,11 @@ pub(crate) fn plan_event_page_schedule(
     };
     let mut frame_count = 2usize;
     let mut header_codec_bytes = CHANGE_TURN_HEADER_FIXED_BYTES;
-    let mut page_codec_bytes = 0usize;
-    let mut page_entries = 0usize;
+    let mut page = EventPagePackingState::empty();
     let page_target_entries = limits.page_target_entries.min(MAX_CHANGE_PAGE_ENTRIES);
+    let finite_page_target_entries = limits
+        .finite_page_target_entries
+        .min(MAX_CHANGE_PAGE_ENTRIES);
     let mut scheduled = Vec::with_capacity(ordered.len());
 
     for metadata in ordered {
@@ -864,37 +953,25 @@ pub(crate) fn plan_event_page_schedule(
         if next_header_codec_bytes > max_codec_bytes {
             break;
         }
-        let starts_page = page_entries == 0
-            || page_entries >= page_target_entries
-            || page_codec_bytes
-                .checked_add(entry_bytes)
-                .is_none_or(|bytes| bytes > max_codec_bytes);
-        let (next_page_codec_bytes, next_page_entries, page_delta, frame_delta) = if starts_page {
-            let Some(codec_bytes) = CHANGE_PAGE_FIXED_BYTES.checked_add(entry_bytes) else {
-                return Err(EventPagesError::invalid("Event page length overflows"));
-            };
-            if codec_bytes > max_codec_bytes {
-                break;
-            }
-            let Some(delta) = framed_turn_bytes(codec_bytes) else {
-                return Err(EventPagesError::invalid("Event page turn length overflows"));
-            };
-            (codec_bytes, 1usize, delta, 1usize)
-        } else {
-            (
-                page_codec_bytes + entry_bytes,
-                page_entries + 1,
-                entry_bytes,
-                0usize,
-            )
+        let Some(packing) = pack_event_page_entry(
+            page,
+            entry_bytes,
+            metadata.ttl_ms.is_some() && !metadata.tombstone,
+            max_codec_bytes,
+            page_target_entries,
+            finite_page_target_entries,
+        )?
+        else {
+            break;
         };
         let Some(next_turn_bytes) = turn_bytes
             .checked_add(32)
-            .and_then(|bytes| bytes.checked_add(page_delta))
+            .and_then(|bytes| bytes.checked_add(packing.turn_byte_delta))
         else {
             return Err(EventPagesError::invalid("Event turn byte count overflows"));
         };
-        let Some(next_frame_count) = frame_count.checked_add(frame_delta) else {
+        let Some(next_frame_count) = frame_count.checked_add(usize::from(packing.starts_page))
+        else {
             return Err(EventPagesError::invalid("Event turn frame count overflows"));
         };
         if next_turn_bytes > limits.turn_bytes || next_frame_count > limits.frame_capacity {
@@ -904,8 +981,7 @@ pub(crate) fn plan_event_page_schedule(
         turn_bytes = next_turn_bytes;
         frame_count = next_frame_count;
         header_codec_bytes = next_header_codec_bytes;
-        page_codec_bytes = next_page_codec_bytes;
-        page_entries = next_page_entries;
+        page = packing.state;
     }
     let advanced = attempted_positions(&scheduled);
     Ok((scheduled, advanced))
@@ -943,6 +1019,7 @@ pub(crate) fn build_local_event_send_plan(
             turn_bytes: usize::MAX,
             max_protected_frame_bytes: MAX_CHANGE_PAGE_PROTECTED_BYTES,
             page_target_entries: MAX_CHANGE_PAGE_ENTRIES,
+            finite_page_target_entries: MAX_CHANGE_PAGE_ENTRIES,
         },
         last_attempted_by_priority,
     )
@@ -2711,6 +2788,7 @@ mod tests {
                 + CHANGE_PAGE_ENTRY_FIXED_BYTES
                 + 100,
             page_target_entries: 256,
+            finite_page_target_entries: 16,
         };
 
         let (scheduled, advanced) =
@@ -2773,6 +2851,50 @@ mod tests {
             unscheduled_count: 4,
         };
         validate_remote_event_page_budget(&zero_schedule, no_progress).unwrap();
+    }
+
+    #[test]
+    fn page_schedule_accounts_for_mixed_finite_ttl_page_boundaries() {
+        let mut candidates = (1..=17)
+            .map(|index| metadata(id(index), Some(60_000), false))
+            .collect::<Vec<_>>();
+        candidates[0].ttl_ms = None;
+        let single_page_turn_bytes =
+            framed_turn_bytes(CHANGE_TURN_HEADER_FIXED_BYTES + 32 * candidates.len())
+                .and_then(|header| {
+                    candidates
+                        .iter()
+                        .map(|metadata| planned_change_page_entry_bytes(*metadata))
+                        .try_fold(CHANGE_PAGE_FIXED_BYTES, |total, entry| {
+                            total.checked_add(entry.ok()?)
+                        })
+                        .and_then(framed_turn_bytes)
+                        .and_then(|page| header.checked_add(page))
+                })
+                .and_then(|bytes| {
+                    framed_turn_bytes(CHANGE_TURN_FINISHED_FIXED_BYTES)
+                        .and_then(|terminal| bytes.checked_add(terminal))
+                })
+                .expect("single-page turn bytes");
+
+        let limits = EventPageScheduleLimits {
+            item_capacity: candidates.len(),
+            frame_capacity: 4,
+            // This fits all entries in one page, but not the extra fixed frame
+            // overhead required by the finite-TTL sender boundary.
+            turn_bytes: single_page_turn_bytes,
+            max_protected_frame_bytes: MAX_CHANGE_PAGE_PROTECTED_BYTES,
+            page_target_entries: 256,
+            finite_page_target_entries: 16,
+        };
+
+        let (scheduled, _) = plan_event_page_schedule(&candidates, limits, [None; 4]).unwrap();
+
+        assert_eq!(
+            scheduled.len(),
+            16,
+            "the planner must reserve the same mixed finite-TTL page boundary as the sender"
+        );
     }
 
     #[test]

@@ -121,13 +121,13 @@ use crate::{
     event_pages::{
         AuthenticatedEventMetadata, BuiltLocalEventSendPlan, CHANGE_PAGE_ENTRY_FIXED_BYTES,
         CHANGE_PAGE_FIXED_BYTES, ChangePageCustody, ChangePageEntry, ChangePageV7,
-        ChangeTurnFinishedV1, ChangeTurnHeaderV1, EventPageScheduleLimits,
+        ChangeTurnFinishedV1, ChangeTurnHeaderV1, EventPagePackingState, EventPageScheduleLimits,
         EventPageSchedulePosition, EventTurnPlanV1, LaneId, LocalEventSendDifference,
         MAX_CHANGE_PAGE_CODEC_BYTES, MAX_EVENT_TURN_PLAN_CODEC_BYTES, NegotiatedTransferProfiles,
         SEMANTIC_PROTOCOL_V7, TransferProfileOfferV1, blind_set_commitment,
-        build_local_event_send_plan_with_limits, negotiate_transfer_profiles, schedule_digest,
-        transfer_profile_digest, validate_remote_event_page_budget,
-        validate_remote_event_send_plan,
+        build_local_event_send_plan_with_limits, negotiate_transfer_profiles,
+        pack_event_page_entry, schedule_digest, transfer_profile_digest,
+        validate_remote_event_page_budget, validate_remote_event_send_plan,
     },
     format_node_id, format_path_field, format_receipt_field,
     frame::{
@@ -15420,6 +15420,7 @@ fn directional_event_schedule_limits(
         turn_bytes,
         max_protected_frame_bytes,
         page_target_entries: event_page_sender_target_entries(),
+        finite_page_target_entries: FINITE_EVENT_PAGE_SENDER_TARGET_ENTRIES,
     };
     Ok((
         limits(to_responder_items, to_responder_frames, to_responder_bytes),
@@ -16574,9 +16575,9 @@ async fn send_event_page_turn(
         .map(|bytes| bytes.min(MAX_CHANGE_PAGE_CODEC_BYTES))
         .ok_or_else(|| NodeError::Protocol("carrier frame bound cannot hold Event pages".into()))?;
     let page_target_entries = local_plan.schedule_limits.page_target_entries;
+    let finite_page_target_entries = local_plan.schedule_limits.finite_page_target_entries;
     let mut loaded_entries = Vec::new();
-    let mut page_contains_finite = false;
-    let mut encoded_bytes = CHANGE_PAGE_FIXED_BYTES;
+    let mut page_packing = EventPagePackingState::empty();
     let mut consumed = 0usize;
     let mut page_number = 0usize;
     for metadata in &built.scheduled_metadata {
@@ -16594,17 +16595,21 @@ async fn send_event_page_turn(
             .checked_add(source_bytes)
             .and_then(|bytes| bytes.checked_add(custody_reserve))
             .ok_or_else(|| NodeError::Protocol("Event page entry length overflow".into()))?;
-        let effective_page_target_entries = if finite || page_contains_finite {
-            page_target_entries.min(FINITE_EVENT_PAGE_SENDER_TARGET_ENTRIES)
-        } else {
-            page_target_entries
+        let Some(packing) = pack_event_page_entry(
+            page_packing,
+            planned_entry_bytes,
+            finite,
+            max_page_codec_bytes,
+            page_target_entries,
+            finite_page_target_entries,
+        )
+        .map_err(|error| NodeError::Protocol(error.to_string()))?
+        else {
+            return Err(NodeError::Protocol(
+                "scheduled Event does not fit its authenticated page budget".into(),
+            ));
         };
-        if !loaded_entries.is_empty()
-            && (loaded_entries.len() >= effective_page_target_entries
-                || encoded_bytes
-                    .checked_add(planned_entry_bytes)
-                    .is_none_or(|bytes| bytes > max_page_codec_bytes))
-        {
+        if packing.starts_page && !loaded_entries.is_empty() {
             let prepared = prepare_loaded_event_page_entries(
                 store,
                 mission,
@@ -16650,8 +16655,6 @@ async fn send_event_page_turn(
             )
             .await?;
             page_number += 1;
-            encoded_bytes = CHANGE_PAGE_FIXED_BYTES;
-            page_contains_finite = false;
         }
         lane.guard.check(store)?;
         let (verified, bytes, state) = load_verified_transfer_for_peer_with_claims(
@@ -16674,24 +16677,13 @@ async fn send_event_page_turn(
         }
         #[cfg(test)]
         apply_test_event_page_source_preparation_delay()?;
-        if encoded_bytes
-            .checked_add(planned_entry_bytes)
-            .is_none_or(|bytes| bytes > max_page_codec_bytes)
-        {
-            return Err(NodeError::Protocol(
-                "scheduled Event does not fit its authenticated page budget".into(),
-            ));
-        }
-        encoded_bytes = encoded_bytes
-            .checked_add(planned_entry_bytes)
-            .ok_or_else(|| NodeError::Protocol("Event page length overflow".into()))?;
+        page_packing = packing.state;
         loaded_entries.push(LoadedEventPageEntry {
             metadata: *metadata,
             verified,
             state,
             source_event: bytes,
         });
-        page_contains_finite |= finite;
         consumed += 1;
     }
     if !loaded_entries.is_empty() {
@@ -27681,6 +27673,7 @@ mod tests {
             turn_bytes: 1_024,
             max_protected_frame_bytes: 512,
             page_target_entries: 1,
+            finite_page_target_entries: 1,
         };
         let mut frames_read = 0;
         account_event_turn_received_frame(&mut frames_read, narrow).expect("header");
