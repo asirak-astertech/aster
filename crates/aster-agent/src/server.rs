@@ -1204,6 +1204,57 @@ mod tests {
         assert_eq!(permits.available_permits(), 1);
     }
 
+    #[cfg(feature = "client")]
+    #[tokio::test(start_paused = true)]
+    async fn publish_events_uses_the_existing_ten_second_default_stream_deadline() {
+        let router = Router::new().route_bidi_stream(
+            api::ASTER_APPLICATION_SERVICE_SERVICE_NAME,
+            "PublishEvents",
+            connectrpc::bidi_streaming_handler_fn(
+                |_ctx, _requests: connectrpc::ServiceStream<api::PublishEventsRequest>| async {
+                    Ok(connectrpc::Response::new(
+                        Box::pin(futures::stream::pending::<
+                            Result<api::PublishEventsResponse, ConnectError>,
+                        >())
+                            as connectrpc::ServiceStream<api::PublishEventsResponse>,
+                    ))
+                },
+            ),
+        );
+        let permits = Arc::new(Semaphore::new(1));
+        let client = api::AsterApplicationServiceClient::new(
+            ServiceTransport::new(PreBodyGate::new(
+                crate::event_service::configured_service(router),
+                token(),
+                ready(),
+                permits.clone(),
+                ConnectionAuthState::detached(),
+                16 * 1024,
+            )),
+            ClientConfig::new("http://localhost".parse().unwrap()).with_default_header(
+                http::header::AUTHORIZATION,
+                format!("Bearer {}", String::from_utf8_lossy(TEST_TOKEN)),
+            ),
+        );
+        let mut stream = client.publish_events().await.unwrap();
+        stream
+            .send(api::PublishEventsRequest::default())
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(11),
+            stream.message::<api::PublishEventsResponse>(),
+        )
+        .await;
+        assert!(result.is_ok(), "stream exceeded the default deadline");
+        assert_eq!(
+            result.unwrap().unwrap_err().code,
+            ErrorCode::DeadlineExceeded
+        );
+        drop(stream);
+        assert_eq!(permits.available_permits(), 1);
+    }
+
     #[tokio::test]
     async fn draining_request_is_rejected_without_polling_body() {
         let status = ready();

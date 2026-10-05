@@ -58,6 +58,66 @@ async fn grpc_status(
 }
 ```
 
+### Pipelined durable Event publication
+
+Native Connect and gRPC clients over HTTP/2 can keep independent ordinary
+Event publications in flight with [`sdk::PipelinedEventPublisher`]. Each
+ordered published outcome is returned only after the running selected node's
+local durable authority has committed that Event and its operation-key mapping.
+A sanitized application failure is returned in order without claiming an Event
+commit. Neither outcome waits for mesh delivery: synchronization starts from a
+successfully published durable local object independently.
+
+Persist every operation key before calling the publisher. If a bounded stream
+session rotates or disconnects, the helper resends only sent requests without
+an observed response and keeps their original keys. The durable operation
+ledger resolves a commit whose response was lost. The retry budget passed to
+`new` bounds consecutive transport disconnects; healthy session rotation does
+not consume it.
+
+```no_run
+# #[cfg(feature = "client")]
+async fn publish_telemetry(
+    token: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use aster_agent::{
+        proto::aster::application::v1alpha1 as api,
+        sdk::PipelinedEventPublisher,
+    };
+    use connectrpc::{Protocol, client::{ClientConfig, Http2Connection}};
+
+    let uri = "http://127.0.0.1:8181".parse()?;
+    let connection = Http2Connection::connect_plaintext(uri).await?.shared(32);
+    let config = ClientConfig::new("http://127.0.0.1:8181".parse()?)
+        .with_protocol(Protocol::Connect)
+        .with_default_header("authorization", format!("Bearer {token}"));
+    let client = api::AsterApplicationServiceClient::new(connection, config);
+    let requests = (0_u8..4)
+        .map(|sample| api::PublishEventRequest {
+            operation_key: format!("sensor-a/{sample}").into_bytes(),
+            topic: "telemetry.temperature".to_owned(),
+            scope: "mission/team/alpha".to_owned(),
+            priority: api::Priority::Routine.into(),
+            logical_key: b"sensor-a".to_vec(),
+            payload: vec![sample],
+            ..Default::default()
+        })
+        .collect();
+    let outcomes = PipelinedEventPublisher::new(client, 3)
+        .publish_all(requests)
+        .await?;
+    assert_eq!(outcomes.len(), 4);
+    Ok(())
+}
+```
+
+The helper's active window and session-rotation interval are bounded reference
+implementation choices, not protocol rate or batch limits. The stream keeps
+ordinary publications independent; it is not the atomic cryptographic batch
+API and does not accept numbered publication. gRPC-Web cannot stream request
+bodies, so browser clients must use a bounded application-selected window of
+concurrent unary `PublishEvent` calls with the same operation-key retry rule.
+
 ### Crash-safe numbered publication
 
 With the `client` feature, [`sdk::PublicationJournal`] and

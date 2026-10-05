@@ -12,7 +12,7 @@ use std::{
 use aster_agent::{
     BoundAgent, ClientToken,
     proto::aster::application::v1alpha1 as api,
-    sdk::{NumberedEventSdk, PublicationJournal, RecoveredState},
+    sdk::{NumberedEventSdk, PipelinedEventPublisher, PublicationJournal, RecoveredState},
 };
 use aster_node::mission::UnprotectedReferenceMission;
 use aster_node::{MutableSourceInterests, NodeApplication, NodeConfig, start_node};
@@ -349,6 +349,28 @@ fn connect_client_uses_the_real_live_event_authority() {
             })
             .await
             .expect("acknowledge redelivery");
+
+        let pipelined = PipelinedEventPublisher::new(client.clone(), 1)
+            .publish_all(
+                (0_u8..2)
+                    .map(|suffix| api::PublishEventRequest {
+                        operation_key: format!("real-node-pipelined/{suffix}").into_bytes(),
+                        topic: "chat.events".to_owned(),
+                        scope: "mission/team/alpha".to_owned(),
+                        priority: api::Priority::Routine.into(),
+                        logical_key: vec![suffix],
+                        payload: vec![suffix],
+                        ..Default::default()
+                    })
+                    .collect(),
+            )
+            .await
+            .expect("publish pipelined Events through the real agent");
+        assert_eq!(pipelined.len(), 2);
+        assert!(pipelined.into_iter().all(|response| matches!(
+            response.outcome,
+            Some(api::publish_events_response::Outcome::Published(_))
+        )));
 
         shutdown_tx.send(true).expect("request agent shutdown");
         tokio::time::timeout(Duration::from_secs(5), server)

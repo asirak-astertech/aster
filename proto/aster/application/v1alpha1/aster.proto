@@ -41,6 +41,8 @@ service AsterApplicationService {
   rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
   // PublishEvent durably accepts an idempotent offline-first publication.
   rpc PublishEvent(PublishEventRequest) returns (PublishEventResponse);
+  // PublishEvents pipelines ordered independent publications over native HTTP/2.
+  rpc PublishEvents(stream PublishEventsRequest) returns (stream PublishEventsResponse);
   // BeginEventPublicationSession fences the prior publisher and returns one complete recovery image.
   rpc BeginEventPublicationSession(BeginEventPublicationSessionRequest) returns (BeginEventPublicationSessionResponse);
   // CompleteEventPublicationRecovery authorizes mutations for the exact recovered revision.
@@ -218,6 +220,17 @@ message PublishEventResponse {
   bool inserted = 7;
   // Exact source-authenticated duration; omitted for durable Events.
   optional uint64 ttl_ms = 8;
+}
+
+message PublishEventsRequest {
+  PublishEventRequest publication = 1;
+}
+
+message PublishEventsResponse {
+  oneof outcome {
+    PublishEventResponse published = 1;
+    PublicErrorDetail failure = 2;
+  }
 }
 
 message BeginEventPublicationSessionRequest {

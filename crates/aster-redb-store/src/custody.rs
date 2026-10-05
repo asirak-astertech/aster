@@ -819,6 +819,28 @@ pub struct CustodyGcReport {
     pub blocked_by_leases: u64,
 }
 
+/// One custody collection attempt paired with its exact durable writer count.
+///
+/// The result may be an error after a policy-significant continuity transition
+/// was deliberately committed. Callers that retry maintenance can therefore
+/// account for every redb commit without inferring it from the report.
+pub struct CustodyCollectionAttempt {
+    result: Result<CustodyGcReport, StoreError>,
+    writer_commits: u64,
+}
+
+impl CustodyCollectionAttempt {
+    /// Returns the exact number of redb writer transactions committed.
+    pub const fn writer_commits(&self) -> u64 {
+        self.writer_commits
+    }
+
+    /// Consumes the attempt and returns its collection report or exact error.
+    pub fn into_result(self) -> Result<CustodyGcReport, StoreError> {
+        self.result
+    }
+}
+
 /// Structurally audited custody-schema counts.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CustodyStoreStats {
@@ -5779,6 +5801,39 @@ impl Store {
         expected_policy: CustodyPolicyRevision,
         limit: usize,
     ) -> Result<CustodyGcReport, StoreError> {
+        self.collect_custody_garbage_observed(sample, expected_policy, limit)
+            .into_result()
+    }
+
+    /// Runs one bounded garbage-collection attempt and reports every writer
+    /// transaction that durably committed, including a continuity transition
+    /// that invalidates the supplied policy revision.
+    pub fn collect_custody_garbage_observed(
+        &self,
+        sample: Option<CustodySample>,
+        expected_policy: CustodyPolicyRevision,
+        limit: usize,
+    ) -> CustodyCollectionAttempt {
+        let mut writer_commits = 0u64;
+        let result = self.collect_custody_garbage_counted(
+            sample,
+            expected_policy,
+            limit,
+            &mut writer_commits,
+        );
+        CustodyCollectionAttempt {
+            result,
+            writer_commits,
+        }
+    }
+
+    fn collect_custody_garbage_counted(
+        &self,
+        sample: Option<CustodySample>,
+        expected_policy: CustodyPolicyRevision,
+        limit: usize,
+        writer_commits: &mut u64,
+    ) -> Result<CustodyGcReport, StoreError> {
         if limit == 0 || limit > MAX_CUSTODY_PAGE {
             return Err(CustodyStoreError::PageLimitExceeded {
                 requested: limit,
@@ -5798,6 +5853,9 @@ impl Store {
         let sample = continuity.map(|record| record.sample).or(sample);
         if policy_revision_write(&write)? != expected_policy {
             write.commit()?;
+            *writer_commits = (*writer_commits)
+                .checked_add(1)
+                .ok_or(CustodyStoreError::CounterOverflow)?;
             return Err(CustodyStoreError::PolicyChanged.into());
         }
         let rows = write
@@ -5860,6 +5918,9 @@ impl Store {
                 .ok_or(CustodyStoreError::CounterOverflow)?;
         }
         write.commit()?;
+        *writer_commits = (*writer_commits)
+            .checked_add(1)
+            .ok_or(CustodyStoreError::CounterOverflow)?;
         Ok(report)
     }
 
@@ -5873,6 +5934,44 @@ impl Store {
         sample: Option<CustodySample>,
         expected_policy: CustodyPolicyRevision,
         limit: usize,
+    ) -> Result<CustodyGcReport, StoreError> {
+        self.collect_custody_pressure_observed(scope, demand, sample, expected_policy, limit)
+            .into_result()
+    }
+
+    /// Runs one bounded pressure-collection attempt and reports its exact
+    /// durable writer count.
+    pub fn collect_custody_pressure_observed(
+        &self,
+        scope: Option<&Scope>,
+        demand: CustodyPressureDemand,
+        sample: Option<CustodySample>,
+        expected_policy: CustodyPolicyRevision,
+        limit: usize,
+    ) -> CustodyCollectionAttempt {
+        let mut writer_commits = 0u64;
+        let result = self.collect_custody_pressure_counted(
+            scope,
+            demand,
+            sample,
+            expected_policy,
+            limit,
+            &mut writer_commits,
+        );
+        CustodyCollectionAttempt {
+            result,
+            writer_commits,
+        }
+    }
+
+    fn collect_custody_pressure_counted(
+        &self,
+        scope: Option<&Scope>,
+        demand: CustodyPressureDemand,
+        sample: Option<CustodySample>,
+        expected_policy: CustodyPolicyRevision,
+        limit: usize,
+        writer_commits: &mut u64,
     ) -> Result<CustodyGcReport, StoreError> {
         if limit == 0 || limit > MAX_CUSTODY_PAGE {
             return Err(CustodyStoreError::PageLimitExceeded {
@@ -5893,6 +5992,9 @@ impl Store {
         let sample = continuity.map(|record| record.sample).or(sample);
         if policy_revision_write(&write)? != expected_policy {
             write.commit()?;
+            *writer_commits = (*writer_commits)
+                .checked_add(1)
+                .ok_or(CustodyStoreError::CounterOverflow)?;
             return Err(CustodyStoreError::PolicyChanged.into());
         }
         let quota = match quota_write(&write, scope)? {
@@ -6016,6 +6118,9 @@ impl Store {
                 .is_ok()
             {
                 write.commit()?;
+                *writer_commits = (*writer_commits)
+                    .checked_add(1)
+                    .ok_or(CustodyStoreError::CounterOverflow)?;
                 return Ok(report);
             }
         }
@@ -6023,6 +6128,9 @@ impl Store {
         // or protected rows prevent enough immediate capacity.  Commit them,
         // then report the still-exceeded bound to the caller.
         write.commit()?;
+        *writer_commits = (*writer_commits)
+            .checked_add(1)
+            .ok_or(CustodyStoreError::CounterOverflow)?;
         let retired =
             u64::try_from(report.retired.len()).map_err(|_| CustodyStoreError::CounterOverflow)?;
         require_quota_capacity(

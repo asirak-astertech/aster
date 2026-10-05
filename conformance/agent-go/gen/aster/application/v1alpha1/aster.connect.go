@@ -38,6 +38,9 @@ const (
 	// AsterApplicationServicePublishEventProcedure is the fully-qualified name of the
 	// AsterApplicationService's PublishEvent RPC.
 	AsterApplicationServicePublishEventProcedure = "/aster.application.v1alpha1.AsterApplicationService/PublishEvent"
+	// AsterApplicationServicePublishEventsProcedure is the fully-qualified name of the
+	// AsterApplicationService's PublishEvents RPC.
+	AsterApplicationServicePublishEventsProcedure = "/aster.application.v1alpha1.AsterApplicationService/PublishEvents"
 	// AsterApplicationServiceBeginEventPublicationSessionProcedure is the fully-qualified name of the
 	// AsterApplicationService's BeginEventPublicationSession RPC.
 	AsterApplicationServiceBeginEventPublicationSessionProcedure = "/aster.application.v1alpha1.AsterApplicationService/BeginEventPublicationSession"
@@ -83,6 +86,8 @@ type AsterApplicationServiceClient interface {
 	GetStatus(context.Context, *connect.Request[GetStatusRequest]) (*connect.Response[GetStatusResponse], error)
 	// PublishEvent durably accepts an idempotent offline-first publication.
 	PublishEvent(context.Context, *connect.Request[PublishEventRequest]) (*connect.Response[PublishEventResponse], error)
+	// PublishEvents pipelines ordered independent publications over native HTTP/2.
+	PublishEvents(context.Context) *connect.BidiStreamForClient[PublishEventsRequest, PublishEventsResponse]
 	// BeginEventPublicationSession fences the prior publisher and returns one complete recovery image.
 	BeginEventPublicationSession(context.Context, *connect.Request[BeginEventPublicationSessionRequest]) (*connect.Response[BeginEventPublicationSessionResponse], error)
 	// CompleteEventPublicationRecovery authorizes mutations for the exact recovered revision.
@@ -131,6 +136,12 @@ func NewAsterApplicationServiceClient(httpClient connect.HTTPClient, baseURL str
 			httpClient,
 			baseURL+AsterApplicationServicePublishEventProcedure,
 			connect.WithSchema(asterApplicationServiceMethods.ByName("PublishEvent")),
+			connect.WithClientOptions(opts...),
+		),
+		publishEvents: connect.NewClient[PublishEventsRequest, PublishEventsResponse](
+			httpClient,
+			baseURL+AsterApplicationServicePublishEventsProcedure,
+			connect.WithSchema(asterApplicationServiceMethods.ByName("PublishEvents")),
 			connect.WithClientOptions(opts...),
 		),
 		beginEventPublicationSession: connect.NewClient[BeginEventPublicationSessionRequest, BeginEventPublicationSessionResponse](
@@ -212,6 +223,7 @@ func NewAsterApplicationServiceClient(httpClient connect.HTTPClient, baseURL str
 type asterApplicationServiceClient struct {
 	getStatus                         *connect.Client[GetStatusRequest, GetStatusResponse]
 	publishEvent                      *connect.Client[PublishEventRequest, PublishEventResponse]
+	publishEvents                     *connect.Client[PublishEventsRequest, PublishEventsResponse]
 	beginEventPublicationSession      *connect.Client[BeginEventPublicationSessionRequest, BeginEventPublicationSessionResponse]
 	completeEventPublicationRecovery  *connect.Client[CompleteEventPublicationRecoveryRequest, CompleteEventPublicationRecoveryResponse]
 	publishNumberedEvent              *connect.Client[PublishNumberedEventRequest, PublishNumberedEventResponse]
@@ -234,6 +246,11 @@ func (c *asterApplicationServiceClient) GetStatus(ctx context.Context, req *conn
 // PublishEvent calls aster.application.v1alpha1.AsterApplicationService.PublishEvent.
 func (c *asterApplicationServiceClient) PublishEvent(ctx context.Context, req *connect.Request[PublishEventRequest]) (*connect.Response[PublishEventResponse], error) {
 	return c.publishEvent.CallUnary(ctx, req)
+}
+
+// PublishEvents calls aster.application.v1alpha1.AsterApplicationService.PublishEvents.
+func (c *asterApplicationServiceClient) PublishEvents(ctx context.Context) *connect.BidiStreamForClient[PublishEventsRequest, PublishEventsResponse] {
+	return c.publishEvents.CallBidiStream(ctx)
 }
 
 // BeginEventPublicationSession calls
@@ -310,6 +327,8 @@ type AsterApplicationServiceHandler interface {
 	GetStatus(context.Context, *connect.Request[GetStatusRequest]) (*connect.Response[GetStatusResponse], error)
 	// PublishEvent durably accepts an idempotent offline-first publication.
 	PublishEvent(context.Context, *connect.Request[PublishEventRequest]) (*connect.Response[PublishEventResponse], error)
+	// PublishEvents pipelines ordered independent publications over native HTTP/2.
+	PublishEvents(context.Context, *connect.BidiStream[PublishEventsRequest, PublishEventsResponse]) error
 	// BeginEventPublicationSession fences the prior publisher and returns one complete recovery image.
 	BeginEventPublicationSession(context.Context, *connect.Request[BeginEventPublicationSessionRequest]) (*connect.Response[BeginEventPublicationSessionResponse], error)
 	// CompleteEventPublicationRecovery authorizes mutations for the exact recovered revision.
@@ -353,6 +372,12 @@ func NewAsterApplicationServiceHandler(svc AsterApplicationServiceHandler, opts 
 		AsterApplicationServicePublishEventProcedure,
 		svc.PublishEvent,
 		connect.WithSchema(asterApplicationServiceMethods.ByName("PublishEvent")),
+		connect.WithHandlerOptions(opts...),
+	)
+	asterApplicationServicePublishEventsHandler := connect.NewBidiStreamHandler(
+		AsterApplicationServicePublishEventsProcedure,
+		svc.PublishEvents,
+		connect.WithSchema(asterApplicationServiceMethods.ByName("PublishEvents")),
 		connect.WithHandlerOptions(opts...),
 	)
 	asterApplicationServiceBeginEventPublicationSessionHandler := connect.NewUnaryHandler(
@@ -433,6 +458,8 @@ func NewAsterApplicationServiceHandler(svc AsterApplicationServiceHandler, opts 
 			asterApplicationServiceGetStatusHandler.ServeHTTP(w, r)
 		case AsterApplicationServicePublishEventProcedure:
 			asterApplicationServicePublishEventHandler.ServeHTTP(w, r)
+		case AsterApplicationServicePublishEventsProcedure:
+			asterApplicationServicePublishEventsHandler.ServeHTTP(w, r)
 		case AsterApplicationServiceBeginEventPublicationSessionProcedure:
 			asterApplicationServiceBeginEventPublicationSessionHandler.ServeHTTP(w, r)
 		case AsterApplicationServiceCompleteEventPublicationRecoveryProcedure:
@@ -472,6 +499,10 @@ func (UnimplementedAsterApplicationServiceHandler) GetStatus(context.Context, *c
 
 func (UnimplementedAsterApplicationServiceHandler) PublishEvent(context.Context, *connect.Request[PublishEventRequest]) (*connect.Response[PublishEventResponse], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("aster.application.v1alpha1.AsterApplicationService.PublishEvent is not implemented"))
+}
+
+func (UnimplementedAsterApplicationServiceHandler) PublishEvents(context.Context, *connect.BidiStream[PublishEventsRequest, PublishEventsResponse]) error {
+	return connect.NewError(connect.CodeUnimplemented, errors.New("aster.application.v1alpha1.AsterApplicationService.PublishEvents is not implemented"))
 }
 
 func (UnimplementedAsterApplicationServiceHandler) BeginEventPublicationSession(context.Context, *connect.Request[BeginEventPublicationSessionRequest]) (*connect.Response[BeginEventPublicationSessionResponse], error) {

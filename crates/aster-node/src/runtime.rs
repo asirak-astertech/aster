@@ -72,11 +72,11 @@ use aster_redb_store::{
     MAX_MUTABLE_TRANSFER_CURSOR_PEERS, MAX_NETWORK_BLOB_BYTES, MAX_NETWORK_BLOB_CHUNKS,
     MAX_ROUTE_CACHE_ITEMS, MutableTransferCursorClass, MutableTransferCursorMode,
     NumberedEventOperationRequest, NumberedEventPublishOutcome, RecordSenderProjection,
-    RecordTransferId, RejectedControl, RouteCacheOutcome, ScopeRekeyPublicationIntent,
-    StateSenderProjection, StateTransferId, Store, StoreBackingIdentity, StoreError,
-    StoreInspection, StoreLimits, StoreZeroizationState, StoredControl, StoredControlEffect,
-    StoredEvent, StoredEventTransfer, StoredRecord, StoredState, TransferLease,
-    ZeroizationArtifact, ZeroizationIntent, ZeroizationStore,
+    RecordTransferId, RejectedControl, ReservedEventOnceCommit, RouteCacheOutcome,
+    ScopeRekeyPublicationIntent, StateSenderProjection, StateTransferId, Store,
+    StoreBackingIdentity, StoreError, StoreInspection, StoreLimits, StoreZeroizationState,
+    StoredControl, StoredControlEffect, StoredEvent, StoredEventTransfer, StoredRecord,
+    StoredState, TransferLease, ZeroizationArtifact, ZeroizationIntent, ZeroizationStore,
 };
 use sha2::{Digest as _, Sha256};
 #[cfg(unix)]
@@ -103,12 +103,13 @@ use crate::mission::{initiate_discovered_over_iroh_metered, respond_discovered_o
 use crate::{
     NodeIdentity,
     application::{
-        AuthenticatedPeerStatus, ContactSyncStatus, EventOperationCapacity, EventPublishOptions,
-        EventSyncStatus, NumberedEventPublishRequest, PeerAuthorization,
-        SelectedApplicationCommand, SelectedBlobCommand, SelectedBlobHandle, SelectedBlobNode,
-        SelectedEventCommand, SelectedEventHandle, SelectedEventNode, SelectedEventStatus,
-        SelectedRecordCommand, SelectedRecordHandle, SelectedRecordNode, SelectedStateCommand,
-        SelectedStateHandle, SelectedStateNode, runtime_application_error,
+        AuthenticatedPeerStatus, ContactSyncStatus, EventOperationCapacity,
+        EventPublicationGroupDiagnostic, EventPublishOptions, EventPublishRequest, EventSyncStatus,
+        NumberedEventPublishRequest, PeerAuthorization, SelectedApplicationCommand,
+        SelectedBlobCommand, SelectedBlobHandle, SelectedBlobNode, SelectedEventCommand,
+        SelectedEventHandle, SelectedEventNode, SelectedEventStatus, SelectedRecordCommand,
+        SelectedRecordHandle, SelectedRecordNode, SelectedStateCommand, SelectedStateHandle,
+        SelectedStateNode, runtime_application_error,
     },
     bridge_runtime::{
         SelectedEventBridgeApplyDisposition, SelectedEventBridgeConfig,
@@ -142,14 +143,14 @@ use aster_redb_store::{
 /// Operator-output policy for one selected-node runtime.
 ///
 /// Existing node entry points use [`Self::Legacy`]. The customer-agent
-/// composition opts into [`Self::CustomerSafe`], which emits no node receipts
-/// so only the agent's bounded lifecycle records reach process output.
+/// composition opts into [`Self::CustomerSafe`], which suppresses legacy node
+/// receipts while retaining explicitly bounded, identifier-free diagnostics.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum NodeOperatorOutputPolicy {
     /// Preserve the established READY, STOP, CONTACT, and related receipts.
     #[default]
     Legacy,
-    /// Suppress every selected-node operator receipt and error.
+    /// Suppress every legacy selected-node operator receipt and error.
     CustomerSafe,
 }
 
@@ -204,6 +205,11 @@ impl NodeOperatorOutput {
             self.sink.write(stream, &arguments.to_string());
         }
     }
+
+    fn bounded_diagnostic(&self, arguments: fmt::Arguments<'_>) {
+        self.sink
+            .write(NodeOutputStream::Stderr, &arguments.to_string());
+    }
 }
 
 tokio::task_local! {
@@ -216,6 +222,15 @@ fn emit_node_output(stream: NodeOutputStream, arguments: fmt::Arguments<'_>) {
         .is_err()
     {
         ProcessNodeOperatorOutputSink.write(stream, &arguments.to_string());
+    }
+}
+
+fn emit_bounded_node_diagnostic(arguments: fmt::Arguments<'_>) {
+    if NODE_OPERATOR_OUTPUT
+        .try_with(|output| output.bounded_diagnostic(arguments))
+        .is_err()
+    {
+        ProcessNodeOperatorOutputSink.write(NodeOutputStream::Stderr, &arguments.to_string());
     }
 }
 
@@ -241,6 +256,12 @@ macro_rules! node_stdout {
 macro_rules! node_stderr {
     ($($argument:tt)*) => {
         emit_node_output(NodeOutputStream::Stderr, format_args!($($argument)*))
+    };
+}
+
+macro_rules! bounded_node_diagnostic {
+    ($($argument:tt)*) => {
+        emit_bounded_node_diagnostic(format_args!($($argument)*))
     };
 }
 
@@ -1688,7 +1709,7 @@ impl NodeCustodyClock {
     }
 
     #[cfg(any(target_os = "linux", test))]
-    fn open_from_linux_boot_id(
+    pub(crate) fn open_from_linux_boot_id(
         identity: NodeId,
         boot_id: Option<&[u8]>,
     ) -> Result<Self, NodeError> {
@@ -1842,12 +1863,50 @@ pub(crate) fn drive_custody_maintenance(
     clock: &NodeCustodyClock,
     scope_quotas: &[CustodyQuota],
 ) -> Result<(), NodeError> {
+    drive_custody_maintenance_observed(store, clock, scope_quotas).result
+}
+
+pub(crate) struct CustodyMaintenanceAttempt {
+    pub(crate) writer_commits: u64,
+    pub(crate) result: Result<(), NodeError>,
+}
+
+pub(crate) fn drive_custody_maintenance_observed(
+    store: &Store,
+    clock: &NodeCustodyClock,
+    scope_quotas: &[CustodyQuota],
+) -> CustodyMaintenanceAttempt {
+    let mut writer_commits = 0u64;
     for _ in 0..MAX_CUSTODY_MAINTENANCE_RETRIES {
-        let policy_revision = store.custody_policy_revision()?;
-        let sample = clock.sample()?;
+        let policy_revision = match store.custody_policy_revision() {
+            Ok(revision) => revision,
+            Err(error) => {
+                return CustodyMaintenanceAttempt {
+                    writer_commits,
+                    result: Err(error.into()),
+                };
+            }
+        };
+        let sample = match clock.sample() {
+            Ok(sample) => sample,
+            Err(error) => {
+                return CustodyMaintenanceAttempt {
+                    writer_commits,
+                    result: Err(error),
+                };
+            }
+        };
         let pass = (|| -> Result<(), StoreError> {
-            store.collect_custody_garbage(Some(sample), policy_revision, MAX_CUSTODY_PAGE)?;
-            store.collect_custody_pressure(
+            let garbage = store.collect_custody_garbage_observed(
+                Some(sample),
+                policy_revision,
+                MAX_CUSTODY_PAGE,
+            );
+            writer_commits = writer_commits.checked_add(garbage.writer_commits()).ok_or(
+                StoreError::SemanticInvariant("custody maintenance writer count overflowed"),
+            )?;
+            garbage.into_result()?;
+            let global = store.collect_custody_pressure_observed(
                 None,
                 CustodyPressureDemand {
                     usage: CustodyUsage { items: 0, bytes: 0 },
@@ -1856,9 +1915,13 @@ pub(crate) fn drive_custody_maintenance(
                 Some(sample),
                 policy_revision,
                 MAX_CUSTODY_PAGE,
+            );
+            writer_commits = writer_commits.checked_add(global.writer_commits()).ok_or(
+                StoreError::SemanticInvariant("custody maintenance writer count overflowed"),
             )?;
+            global.into_result()?;
             for quota in scope_quotas {
-                store.collect_custody_pressure(
+                let scoped = store.collect_custody_pressure_observed(
                     quota.scope(),
                     CustodyPressureDemand {
                         usage: CustodyUsage { items: 0, bytes: 0 },
@@ -1867,19 +1930,36 @@ pub(crate) fn drive_custody_maintenance(
                     Some(sample),
                     policy_revision,
                     MAX_CUSTODY_PAGE,
+                );
+                writer_commits = writer_commits.checked_add(scoped.writer_commits()).ok_or(
+                    StoreError::SemanticInvariant("custody maintenance writer count overflowed"),
                 )?;
+                scoped.into_result()?;
             }
             Ok(())
         })();
         match pass {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                return CustodyMaintenanceAttempt {
+                    writer_commits,
+                    result: Ok(()),
+                };
+            }
             Err(StoreError::Custody(CustodyStoreError::PolicyChanged)) => continue,
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                return CustodyMaintenanceAttempt {
+                    writer_commits,
+                    result: Err(error.into()),
+                };
+            }
         }
     }
-    Err(NodeError::Protocol(format!(
-        "custody maintenance policy changed {MAX_CUSTODY_MAINTENANCE_RETRIES} times"
-    )))
+    CustodyMaintenanceAttempt {
+        writer_commits,
+        result: Err(NodeError::Protocol(format!(
+            "custody maintenance policy changed {MAX_CUSTODY_MAINTENANCE_RETRIES} times"
+        ))),
+    }
 }
 
 #[cfg(unix)]
@@ -4350,6 +4430,301 @@ pub(crate) fn publish_selected_event_once(
                     return Err(NodeError::Protocol(EVENT_OPERATION_CONFLICT.into()));
                 }
                 return Ok((stored, inserted));
+            }
+            Err(StoreError::ReservationChanged) => continue,
+            Err(StoreError::Custody(CustodyStoreError::PolicyChanged)) => continue,
+            Err(StoreError::Custody(CustodyStoreError::AlreadyRetired)) => {
+                return Err(NodeError::Protocol(EVENT_OPERATION_RETIRED.into()));
+            }
+            Err(StoreError::EventOperationConflict | StoreError::OperationPredecessorMismatch) => {
+                return Err(NodeError::Protocol(EVENT_OPERATION_CONFLICT.into()));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(NodeError::Protocol(format!(
+        "Event publication reservation changed {MAX_EVENT_PUBLISH_RETRIES} times"
+    )))
+}
+
+pub(crate) struct SelectedEventGroupAttempt {
+    pub(crate) result: Result<Vec<(StoredEvent, bool)>, NodeError>,
+    pub(crate) writer_commits: u64,
+}
+
+/// Publishes one homogeneous ordinary Event cohort in one durable writer.
+///
+/// The caller owns cohort partitioning and singleton fallback. This function
+/// never acknowledges an Event before the shared durable commit succeeds.
+pub(crate) fn publish_selected_event_group_once(
+    store: &Store,
+    policy: &ControlPolicySnapshot,
+    sealer: &mut ReferenceEnvelopeSealer,
+    requests: &[SelectedEventPublish<'_>],
+) -> SelectedEventGroupAttempt {
+    let mut writer_commits = 0u64;
+    let result = publish_selected_event_group_once_counted(
+        store,
+        policy,
+        sealer,
+        requests,
+        &mut writer_commits,
+    );
+    SelectedEventGroupAttempt {
+        result,
+        writer_commits,
+    }
+}
+
+fn publish_selected_event_group_once_counted(
+    store: &Store,
+    policy: &ControlPolicySnapshot,
+    sealer: &mut ReferenceEnvelopeSealer,
+    requests: &[SelectedEventPublish<'_>],
+    writer_commits: &mut u64,
+) -> Result<Vec<(StoredEvent, bool)>, NodeError> {
+    let first = requests
+        .first()
+        .ok_or_else(|| NodeError::Configuration("Event publication group is empty".into()))?;
+    if requests.iter().any(|request| {
+        request.topic != first.topic
+            || request.scope != first.scope
+            || request.custody_sample.is_some() != first.custody_sample.is_some()
+    }) {
+        return Err(NodeError::Configuration(
+            "Event publication group crosses a topic, scope, or custody boundary".into(),
+        ));
+    }
+    for request in requests {
+        if request.ttl_ms == Some(0) {
+            return Err(NodeError::Configuration(
+                "finite Event TTL must be greater than zero milliseconds".into(),
+            ));
+        }
+        if request.ttl_ms.is_some() && request.custody_sample.is_none() {
+            return Err(NodeError::Configuration(
+                "finite Event publication requires a continuous custody sample".into(),
+            ));
+        }
+        if request.tombstone && request.ttl_ms.is_some() {
+            return Err(NodeError::Configuration(
+                "Event tombstones are durable and cannot carry finite TTL".into(),
+            ));
+        }
+        if request.tombstone && !request.payload.is_empty() {
+            return Err(NodeError::Configuration(
+                "Event tombstones must carry an empty payload".into(),
+            ));
+        }
+    }
+
+    let intents = requests
+        .iter()
+        .map(|request| {
+            EventPublicationIntent::new(
+                EventPublicationSpec::new(
+                    sealer.identity(),
+                    request.topic.clone(),
+                    request.scope.clone(),
+                    request.priority,
+                    request.logical_key.to_vec(),
+                    request.tombstone,
+                    request.ttl_ms,
+                )?,
+                request.payload,
+            )
+        })
+        .collect::<Result<Vec<_>, StoreError>>()?;
+    let operation_requests = requests
+        .iter()
+        .zip(&intents)
+        .map(|(request, intent)| {
+            EventOperationRequest::new(
+                request.operation,
+                intent,
+                request.payload,
+                request.predecessor,
+            )
+        })
+        .collect::<Result<Vec<_>, StoreError>>()?;
+    for ((request, intent), operation_request) in
+        requests.iter().zip(&intents).zip(&operation_requests)
+    {
+        match store.event_operation_resolution_for_request(operation_request) {
+            Ok(Some(EventOperationResolution::Live(stored))) => {
+                verify_existing_event_publication(sealer, &stored, intent, request.payload)?;
+            }
+            Ok(_) => {}
+            Err(StoreError::EventOperationConflict | StoreError::OperationPredecessorMismatch) => {
+                return Err(NodeError::Protocol(EVENT_OPERATION_CONFLICT.into()));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    let key_epoch = store
+        .active_scope_epoch(first.scope)?
+        .map_or(1, |(epoch, _)| epoch);
+    let predecessors = requests
+        .iter()
+        .map(|request| request.predecessor)
+        .collect::<Vec<_>>();
+    for _ in 0..MAX_EVENT_PUBLISH_RETRIES {
+        let custody_revision = first
+            .custody_sample
+            .map(|_| store.custody_policy_revision())
+            .transpose()?;
+        let reservations = store.reserve_event_group_with_policy(
+            policy,
+            sealer.identity(),
+            first.topic,
+            first.scope,
+            &predecessors,
+        )?;
+        let mut sealed_events = Vec::with_capacity(requests.len());
+        let mut verified_events = Vec::with_capacity(requests.len());
+        for (request, reservation) in requests.iter().zip(&reservations) {
+            let header = reservation.header(
+                request.priority,
+                request.logical_key.to_vec(),
+                request.ttl_ms,
+                u64::try_from(request.payload.len()).map_err(|_| {
+                    NodeError::Protocol("Event payload length overflows u64".into())
+                })?,
+                request.tombstone,
+                key_epoch,
+            )?;
+            let sealed = sealer.seal_event(&header, request.payload)?;
+            let route_verified = sealer.verify_event(&sealed.bytes)?;
+            let verified = match sealer.verify_event_content(route_verified, &sealed.bytes)? {
+                EventContentVerification::ContentVerified { event, payload }
+                    if payload == request.payload =>
+                {
+                    event
+                }
+                EventContentVerification::ContentVerified { .. } => {
+                    return Err(NodeError::Protocol(
+                        "locally sealed Event reopened with different content".into(),
+                    ));
+                }
+                EventContentVerification::RouteOnly(_) => {
+                    return Err(NodeError::Protocol(
+                        "local Event publisher lacks content authorization".into(),
+                    ));
+                }
+            };
+            sealed_events.push(sealed);
+            verified_events.push(verified);
+        }
+        let commits = operation_requests
+            .iter()
+            .zip(&reservations)
+            .zip(&verified_events)
+            .zip(&sealed_events)
+            .map(|(((operation, reservation), verified), sealed)| {
+                ReservedEventOnceCommit::new(operation, reservation, verified, &sealed.bytes)
+            })
+            .collect::<Vec<_>>();
+        let committed = match (first.custody_sample, custody_revision) {
+            (Some(sample), Some(revision)) => store
+                .commit_reserved_event_group_once_with_custody_policy(
+                    policy,
+                    LocalCustodyCheckpoint::new(revision, sample),
+                    &commits,
+                ),
+            (None, None) => store.commit_reserved_event_group_once_with_policy(policy, &commits),
+            _ => Err(StoreError::SemanticInvariant(
+                "custody sample and policy revision were not captured together",
+            )),
+        };
+        match committed {
+            Ok(group) => {
+                *writer_commits = writer_commits
+                    .checked_add(group.writer_commits())
+                    .ok_or_else(|| {
+                        NodeError::Protocol("Event writer commit count overflowed".into())
+                    })?;
+                let mut outcomes = Vec::with_capacity(requests.len());
+                for (request, outcome) in requests.iter().zip(group.into_outcomes()) {
+                    let (transfer_id, semantic_id, inserted) = match outcome {
+                        EventOnceOutcome::Inserted {
+                            transfer_id,
+                            semantic_id,
+                            ..
+                        } => (transfer_id, semantic_id, true),
+                        EventOnceOutcome::BoundExisting {
+                            transfer_id,
+                            semantic_id,
+                            ..
+                        }
+                        | EventOnceOutcome::Existing {
+                            transfer_id,
+                            semantic_id,
+                            ..
+                        } => (transfer_id, semantic_id, false),
+                        EventOnceOutcome::Retired { .. }
+                        | EventOnceOutcome::RetiredOperation { .. } => {
+                            return Err(NodeError::Protocol(EVENT_OPERATION_RETIRED.into()));
+                        }
+                    };
+                    let stored = match store.get_transfer_with_policy(policy, transfer_id)? {
+                        Some(StoredEventTransfer::Accepted(stored)) => stored,
+                        Some(StoredEventTransfer::RouteCached(_)) => {
+                            return Err(NodeError::Protocol(
+                                "committed local Event operation resolved only to route cache"
+                                    .into(),
+                            ));
+                        }
+                        None => {
+                            return Err(NodeError::Protocol(
+                                "committed Event operation is missing its exact representation"
+                                    .into(),
+                            ));
+                        }
+                    };
+                    if stored.semantic_id != semantic_id {
+                        return Err(NodeError::Protocol(
+                            "committed Event operation changed semantic identity".into(),
+                        ));
+                    }
+                    let stored_route = sealer.verify_event(&stored.sealed)?;
+                    verify_stored_claim(
+                        &stored_route,
+                        stored.transfer_id,
+                        stored.semantic_id,
+                        &stored.header,
+                    )?;
+                    let reopened = match sealer
+                        .verify_event_content(stored_route, &stored.sealed)?
+                    {
+                        EventContentVerification::ContentVerified {
+                            event,
+                            payload: reopened,
+                        } => {
+                            verify_content_stored_claim(&event, &stored)?;
+                            reopened
+                        }
+                        EventContentVerification::RouteOnly(_) => {
+                            return Err(NodeError::Protocol(
+                                "durable local Event operation lost content authorization".into(),
+                            ));
+                        }
+                    };
+                    if reopened != request.payload
+                        || stored.header.stamp.dot.publisher != sealer.identity()
+                        || &stored.header.topic != request.topic
+                        || &stored.header.scope != request.scope
+                        || stored.header.priority != request.priority
+                        || stored.header.logical_key.as_slice() != request.logical_key
+                        || stored.header.ttl_ms != request.ttl_ms
+                        || stored.header.tombstone != request.tombstone
+                        || (inserted && stored.header.key_epoch != key_epoch)
+                    {
+                        return Err(NodeError::Protocol(EVENT_OPERATION_CONFLICT.into()));
+                    }
+                    outcomes.push((stored, inserted));
+                }
+                return Ok(outcomes);
             }
             Err(StoreError::ReservationChanged) => continue,
             Err(StoreError::Custody(CustodyStoreError::PolicyChanged)) => continue,
@@ -11197,6 +11572,144 @@ async fn run_selected_blob_worker(
     Ok(())
 }
 
+struct PendingEventPublication {
+    request: EventPublishRequest,
+    options: EventPublishOptions,
+    response: oneshot::Sender<
+        Result<crate::application::EventPublishResult, crate::application::ApplicationError>,
+    >,
+}
+
+// Ownership must return the unmatched command intact so FIFO can retain it;
+// boxing would add an allocation to every non-publication actor command.
+#[allow(clippy::result_large_err)]
+fn ordinary_event_publication(
+    command: SelectedApplicationCommand,
+) -> Result<PendingEventPublication, SelectedApplicationCommand> {
+    match command {
+        SelectedApplicationCommand::Event(SelectedEventCommand::Publish {
+            request,
+            options,
+            response,
+        }) if request.priority != Priority::Flash => Ok(PendingEventPublication {
+            request,
+            options,
+            response,
+        }),
+        command => Err(command),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_selected_application_command_coalesced(
+    events: &mut SelectedEventNode,
+    state: &mut SelectedStateNode,
+    records: &mut SelectedRecordNode,
+    blobs: &mpsc::Sender<SelectedBlobCommand>,
+    store: &Store,
+    emission_policy: &LiveEmissionPolicy,
+    status: &mut SelectedEventStatusTracker,
+    receipt: &NodeReceipt,
+    command: SelectedApplicationCommand,
+    commands: &mut mpsc::Receiver<SelectedApplicationCommand>,
+    commands_open: &mut bool,
+    pending: &mut Option<SelectedApplicationCommand>,
+    group_sequence: &mut u64,
+    max_group_size: usize,
+    #[cfg(all(test, unix))] execution_gate: &mut Option<(
+        Arc<std::sync::Barrier>,
+        Arc<std::sync::Barrier>,
+    )>,
+) -> usize {
+    let first = match ordinary_event_publication(command) {
+        Ok(first) => first,
+        Err(command) => {
+            execute_selected_application_command(
+                events,
+                state,
+                records,
+                blobs,
+                store,
+                emission_policy,
+                status,
+                receipt,
+                command,
+            );
+            return 1;
+        }
+    };
+    let mut group = vec![first];
+    while group.len() < max_group_size.max(1) {
+        match commands.try_recv() {
+            Ok(command) => match ordinary_event_publication(command) {
+                Ok(publication) => group.push(publication),
+                Err(command) => {
+                    *pending = Some(command);
+                    break;
+                }
+            },
+            Err(mpsc::error::TryRecvError::Empty) => break,
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                *commands_open = false;
+                break;
+            }
+        }
+    }
+    #[cfg(all(test, unix))]
+    if let Some((reached, release)) = execution_gate.take() {
+        reached.wait();
+        release.wait();
+    }
+    let Some(sequence) = group_sequence.checked_add(1) else {
+        let processed = group.len();
+        for publication in group {
+            let _ = publication
+                .response
+                .send(Err(crate::application::actor_unavailable("publish")));
+        }
+        return processed;
+    };
+    *group_sequence = sequence;
+    let publications = group
+        .iter()
+        .map(|publication| (publication.request.clone(), publication.options))
+        .collect::<Vec<_>>();
+    let result = if status.operation_audit.state == EventOperationAuditState::Failed {
+        let collected = u64::try_from(group.len()).unwrap_or(u64::MAX);
+        crate::application::EventPublicationGroupResult {
+            results: (0..group.len())
+                .map(|_| Err(crate::application::actor_unavailable("publish")))
+                .collect(),
+            diagnostic: EventPublicationGroupDiagnostic {
+                collected,
+                failures: collected,
+                ..EventPublicationGroupDiagnostic::default()
+            },
+        }
+    } else {
+        status.observe_operation_commit(store, || events.publish_group_with_options(publications))
+    };
+    let diagnostic = result.diagnostic;
+    for (publication, outcome) in group.into_iter().zip(result.results) {
+        let _ = publication.response.send(outcome);
+    }
+    bounded_node_diagnostic!(
+        "event_publication_group group_sequence={} collected={} cohorts={} custody_writer_commits={} event_writer_commits={} total_writer_commits={} accepted_new={} exact_retries={} failures={} max_cohort_size={} singleton_fallbacks={}",
+        sequence,
+        diagnostic.collected,
+        diagnostic.cohorts,
+        diagnostic.custody_writer_commits,
+        diagnostic.event_writer_commits,
+        diagnostic.total_writer_commits(),
+        diagnostic.accepted_new,
+        diagnostic.exact_retries,
+        diagnostic.failures,
+        diagnostic.max_cohort_size,
+        diagnostic.singleton_fallbacks,
+    );
+    usize::try_from(diagnostic.collected).unwrap_or(APPLICATION_COMMAND_BUDGET)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_selected_application_command(
     events: &mut SelectedEventNode,
@@ -11531,6 +12044,7 @@ struct RunNodeActorTestControl {
     zeroization_queued: oneshot::Sender<()>,
     blob_worker_fatal_on_shutdown: bool,
     blob_final_read_gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
+    event_group_execution_gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
 }
 
 #[cfg(all(test, unix))]
@@ -12146,6 +12660,7 @@ async fn run_node_actor_inner(
         zeroization_queued,
         blob_worker_fatal_on_shutdown,
         blob_final_read_gate,
+        mut event_group_execution_gate,
         mut event_operation_audit_control,
     ) = match test_control.take() {
         Some(control) => (
@@ -12154,9 +12669,10 @@ async fn run_node_actor_inner(
             Some(control.zeroization_queued),
             control.blob_worker_fatal_on_shutdown,
             control.blob_final_read_gate,
+            control.event_group_execution_gate,
             control.event_operation_audit,
         ),
-        None => (None, None, None, false, None, None),
+        None => (None, None, None, false, None, None, None),
     };
     #[cfg(not(all(test, unix)))]
     let blob_worker_fatal_on_shutdown = false;
@@ -12245,6 +12761,7 @@ async fn run_node_actor_inner(
     let mut application_tick_pending = false;
     let mut application_tick_yield_required = false;
     let mut application_commands_since_yield = 0usize;
+    let mut event_publication_group_sequence = 0u64;
     let mut network_events_since_application = 0usize;
     let mut inbound: JoinSet<(EndpointId, Result<CompletedPeerContact, NodeError>)> =
         JoinSet::new();
@@ -12765,7 +13282,7 @@ async fn run_node_actor_inner(
                 let command = pending_application_command
                     .take()
                     .expect("application policy lease requires a pending command");
-                execute_selected_application_command(
+                let processed_application_commands = execute_selected_application_command_coalesced(
                     &mut application,
                     &mut state_application,
                     &mut record_application,
@@ -12775,10 +13292,19 @@ async fn run_node_actor_inner(
                     &mut selected_event_status,
                     &receipt,
                     command,
+                    &mut application_receiver,
+                    &mut application_commands_open,
+                    &mut pending_application_command,
+                    &mut event_publication_group_sequence,
+                    APPLICATION_COMMAND_BUDGET
+                        .saturating_sub(application_commands_since_yield),
+                    #[cfg(all(test, unix))]
+                    &mut event_group_execution_gate,
                 );
                 application_tick_yield_required = false;
                 network_events_since_application = 0;
-                application_commands_since_yield += 1;
+                application_commands_since_yield = application_commands_since_yield
+                    .saturating_add(processed_application_commands);
                 if application_commands_since_yield >= APPLICATION_COMMAND_BUDGET {
                     application_commands_since_yield = 0;
                     tokio::task::yield_now().await;
@@ -13122,7 +13648,7 @@ async fn run_node_actor_inner(
                 let command = pending_application_command
                     .take()
                     .expect("application policy lease requires a pending command");
-                execute_selected_application_command(
+                let processed_application_commands = execute_selected_application_command_coalesced(
                     &mut application,
                     &mut state_application,
                     &mut record_application,
@@ -13132,10 +13658,19 @@ async fn run_node_actor_inner(
                     &mut selected_event_status,
                     &receipt,
                     command,
+                    &mut application_receiver,
+                    &mut application_commands_open,
+                    &mut pending_application_command,
+                    &mut event_publication_group_sequence,
+                    APPLICATION_COMMAND_BUDGET
+                        .saturating_sub(application_commands_since_yield),
+                    #[cfg(all(test, unix))]
+                    &mut event_group_execution_gate,
                 );
                 application_tick_yield_required = false;
                 network_events_since_application = 0;
-                application_commands_since_yield += 1;
+                application_commands_since_yield = application_commands_since_yield
+                    .saturating_add(processed_application_commands);
                 if application_commands_since_yield >= APPLICATION_COMMAND_BUDGET {
                     application_commands_since_yield = 0;
                     tokio::task::yield_now().await;
@@ -22658,7 +23193,7 @@ mod tests {
     }
 
     #[test]
-    fn customer_safe_output_suppresses_every_selected_node_record_class() {
+    fn customer_safe_output_suppresses_every_legacy_selected_node_record_class() {
         // Break caught: allowing any selected-node receipt class through the
         // customer policy can disclose paths, peers, providers, or errors next
         // to the agent's fixed-field lifecycle records.
@@ -27506,6 +28041,7 @@ mod tests {
                     blob_worker_fatal_on_shutdown: true,
                     event_operation_audit: None,
                     blob_final_read_gate: None,
+                    event_group_execution_gate: None,
                 }),
             },
         ));
@@ -27645,6 +28181,7 @@ mod tests {
                         Arc::clone(&page_reached),
                         Arc::clone(&page_release),
                     )),
+                    event_group_execution_gate: None,
                     event_operation_audit: None,
                 }),
             },
@@ -27926,6 +28463,479 @@ mod tests {
             .expect("issue local mission");
         UnprotectedReferenceMission::from_bytes(bundle.to_bytes().expect("encode bundle"))
             .expect("parse local mission")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_event_group_coalesces_adjacent_ordinary_publications() {
+        let state = root("live-event-group");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&state)
+            .expect("state");
+        let mission = test_mission();
+        let (application_sender, application_receiver) =
+            mpsc::channel(APPLICATION_COMMAND_CAPACITY);
+        let application_admission = Arc::new(AtomicBool::new(true));
+        let (_control_sender, control_receiver) = mpsc::channel(CONTROL_COMMAND_CAPACITY);
+        let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
+        let (ready_sender, ready_receiver) = oneshot::channel();
+        let (before_loop_ready, before_loop_reached) = oneshot::channel();
+        let (before_loop_release, release_loop) = oneshot::channel();
+        let (zeroization_queued, _zeroization_observer) = oneshot::channel();
+        let (output, captured) = captured_node_output(NodeOperatorOutputPolicy::CustomerSafe);
+        let actor = tokio::spawn(run_node_actor_with_forwarding_output(
+            NodeConfig {
+                state: state.clone(),
+                bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                mission,
+                peers: Vec::new(),
+                mutable_interests: Default::default(),
+                sync_interval: Duration::from_secs(60),
+                run_for: None,
+                application: NodeApplication::Relay,
+            },
+            SelectedForwardingConfig::default(),
+            Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+            output,
+            NodeActorChannels {
+                handle_sigint: false,
+                application_receiver,
+                application_admission,
+                control_receiver,
+                shutdown_receiver,
+                ready: ready_sender,
+                test_control: Some(RunNodeActorTestControl {
+                    event_operation_audit: None,
+                    before_loop_ready,
+                    before_loop_release: release_loop,
+                    zeroization_queued,
+                    blob_worker_fatal_on_shutdown: false,
+                    blob_final_read_gate: None,
+                    event_group_execution_gate: None,
+                }),
+            },
+        ));
+        timeout(Duration::from_secs(10), ready_receiver)
+            .await
+            .expect("ready deadline")
+            .expect("ready");
+        timeout(Duration::from_secs(10), before_loop_reached)
+            .await
+            .expect("loop gate deadline")
+            .expect("loop gate");
+
+        let mut responses = Vec::new();
+        let queue_publication = |index: u8,
+                                 priority: Priority,
+                                 responses: &mut Vec<
+            oneshot::Receiver<
+                Result<
+                    crate::application::EventPublishResult,
+                    crate::application::ApplicationError,
+                >,
+            >,
+        >| {
+            let (response, received) = oneshot::channel();
+            application_sender
+                .try_send(SelectedApplicationCommand::Event(
+                    SelectedEventCommand::Publish {
+                        request: EventPublishRequest {
+                            operation_key: vec![b'g', index],
+                            predecessor: None,
+                            topic: Topic::new("opaque").expect("topic"),
+                            scope: Scope::new("test/runtime").expect("scope"),
+                            priority,
+                            logical_key: vec![index],
+                            payload: vec![index],
+                            tombstone: false,
+                        },
+                        options: EventPublishOptions::durable(),
+                        response,
+                    },
+                ))
+                .expect("queue publication");
+            responses.push(received);
+        };
+        for index in 0..2u8 {
+            queue_publication(index, Priority::Priority, &mut responses);
+        }
+        let (status_response, status_received) = oneshot::channel();
+        application_sender
+            .try_send(SelectedApplicationCommand::Event(
+                SelectedEventCommand::Status {
+                    response: status_response,
+                },
+            ))
+            .expect("queue non-publication boundary");
+        for index in 2..4u8 {
+            queue_publication(index, Priority::Priority, &mut responses);
+        }
+        queue_publication(4, Priority::Flash, &mut responses);
+        for index in 5..7u8 {
+            queue_publication(index, Priority::Priority, &mut responses);
+        }
+        before_loop_release.send(()).expect("release actor");
+        let mut counters = Vec::new();
+        for response in responses {
+            counters.push(
+                timeout(Duration::from_secs(10), response)
+                    .await
+                    .expect("publication deadline")
+                    .expect("publication response")
+                    .expect("publication accepted")
+                    .publisher_counter,
+            );
+        }
+        assert_eq!(counters, (1..=7).collect::<Vec<_>>());
+        timeout(Duration::from_secs(10), status_received)
+            .await
+            .expect("status deadline")
+            .expect("status response")
+            .expect("status accepted");
+        shutdown_sender.send(()).await.expect("request shutdown");
+        timeout(Duration::from_secs(10), actor)
+            .await
+            .expect("actor shutdown deadline")
+            .expect("join actor")
+            .expect("actor result");
+
+        let group_records = captured
+            .records()
+            .into_iter()
+            .filter(|(_, record)| record.starts_with("event_publication_group "))
+            .collect::<Vec<_>>();
+        assert_eq!(group_records.len(), 3);
+        for (index, (_, record)) in group_records.iter().enumerate() {
+            assert!(record.contains(&format!("group_sequence={}", index + 1)));
+            assert!(record.contains("collected=2"));
+            assert!(record.contains("event_writer_commits=1"));
+            assert!(record.contains("accepted_new=2"));
+            assert!(record.contains("singleton_fallbacks=0"));
+        }
+        fs::remove_dir_all(state).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn live_event_group_finishes_collected_work_and_rejects_queue_on_shutdown() {
+        use crate::application::ApplicationErrorKind;
+
+        let state = root("live-event-group-shutdown-boundary");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&state)
+            .expect("state");
+        let mission = test_mission();
+        let (application_sender, application_receiver) =
+            mpsc::channel(APPLICATION_COMMAND_CAPACITY);
+        let application_admission = Arc::new(AtomicBool::new(true));
+        let (_control_sender, control_receiver) = mpsc::channel(CONTROL_COMMAND_CAPACITY);
+        let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
+        let (ready_sender, ready_receiver) = oneshot::channel();
+        let (before_loop_ready, before_loop_reached) = oneshot::channel();
+        let (before_loop_release, release_loop) = oneshot::channel();
+        let (zeroization_queued, _zeroization_observer) = oneshot::channel();
+        let group_reached = Arc::new(Barrier::new(2));
+        let group_release = Arc::new(Barrier::new(2));
+        let actor = tokio::spawn(run_node_actor_inner(
+            NodeConfig {
+                state: state.clone(),
+                bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                mission,
+                peers: Vec::new(),
+                mutable_interests: Default::default(),
+                sync_interval: Duration::from_secs(60),
+                run_for: None,
+                application: NodeApplication::Relay,
+            },
+            SelectedForwardingConfig::default(),
+            Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+            NodeActorChannels {
+                handle_sigint: false,
+                application_receiver,
+                application_admission,
+                control_receiver,
+                shutdown_receiver,
+                ready: ready_sender,
+                test_control: Some(RunNodeActorTestControl {
+                    event_operation_audit: None,
+                    before_loop_ready,
+                    before_loop_release: release_loop,
+                    zeroization_queued,
+                    blob_worker_fatal_on_shutdown: false,
+                    blob_final_read_gate: None,
+                    event_group_execution_gate: Some((
+                        Arc::clone(&group_reached),
+                        Arc::clone(&group_release),
+                    )),
+                }),
+            },
+        ));
+        timeout(Duration::from_secs(10), ready_receiver)
+            .await
+            .expect("ready deadline")
+            .expect("ready");
+        timeout(Duration::from_secs(10), before_loop_reached)
+            .await
+            .expect("loop gate deadline")
+            .expect("loop gate");
+
+        let mut collected = Vec::new();
+        for index in 0..2u8 {
+            let (response, received) = oneshot::channel();
+            application_sender
+                .try_send(SelectedApplicationCommand::Event(
+                    SelectedEventCommand::Publish {
+                        request: EventPublishRequest {
+                            operation_key: vec![b's', index],
+                            predecessor: None,
+                            topic: Topic::new("opaque").expect("topic"),
+                            scope: Scope::new("test/runtime").expect("scope"),
+                            priority: Priority::Priority,
+                            logical_key: vec![index],
+                            payload: vec![index],
+                            tombstone: false,
+                        },
+                        options: EventPublishOptions::durable(),
+                        response,
+                    },
+                ))
+                .expect("queue collected publication");
+            collected.push(received);
+        }
+        let (status_response, status_received) = oneshot::channel();
+        application_sender
+            .try_send(SelectedApplicationCommand::Event(
+                SelectedEventCommand::Status {
+                    response: status_response,
+                },
+            ))
+            .expect("queue retained boundary");
+        let (trailing_response, trailing_received) = oneshot::channel();
+        application_sender
+            .try_send(SelectedApplicationCommand::Event(
+                SelectedEventCommand::Publish {
+                    request: EventPublishRequest {
+                        operation_key: b"shutdown-trailing".to_vec(),
+                        predecessor: None,
+                        topic: Topic::new("opaque").expect("topic"),
+                        scope: Scope::new("test/runtime").expect("scope"),
+                        priority: Priority::Priority,
+                        logical_key: b"trailing".to_vec(),
+                        payload: b"must-not-commit".to_vec(),
+                        tombstone: false,
+                    },
+                    options: EventPublishOptions::durable(),
+                    response: trailing_response,
+                },
+            ))
+            .expect("queue trailing publication");
+
+        before_loop_release.send(()).expect("release actor loop");
+        group_reached.wait();
+        shutdown_sender.try_send(()).expect("queue shutdown");
+        group_release.wait();
+
+        for response in collected {
+            assert!(
+                timeout(Duration::from_secs(10), response)
+                    .await
+                    .expect("collected deadline")
+                    .expect("collected response")
+                    .is_ok()
+            );
+        }
+        let status_error = timeout(Duration::from_secs(10), status_received)
+            .await
+            .expect("status rejection deadline")
+            .expect("status response")
+            .expect_err("retained boundary must be rejected");
+        assert_eq!(status_error.kind(), ApplicationErrorKind::StateUnavailable);
+        let trailing_error = timeout(Duration::from_secs(10), trailing_received)
+            .await
+            .expect("trailing rejection deadline")
+            .expect("trailing response")
+            .expect_err("trailing publication must be rejected");
+        assert_eq!(
+            trailing_error.kind(),
+            ApplicationErrorKind::StateUnavailable
+        );
+        timeout(Duration::from_secs(10), actor)
+            .await
+            .expect("actor shutdown deadline")
+            .expect("join actor")
+            .expect("actor result");
+        drop(application_sender);
+        fs::remove_dir_all(state).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn live_event_group_finishes_collected_work_and_rejects_queue_on_zeroization() {
+        use crate::application::ApplicationErrorKind;
+
+        let root = root("live-event-group-zeroization-boundary");
+        let state = root.join("state");
+        let mission_path = root.join("mission.bundle");
+        fs::create_dir_all(&state).expect("state");
+        persist_zeroization_test_mission(&mission_path, 0xcf);
+        let mission = UnprotectedReferenceMission::load(&mission_path).expect("mission");
+        let (application_sender, application_receiver) =
+            mpsc::channel(APPLICATION_COMMAND_CAPACITY);
+        let application_admission = Arc::new(AtomicBool::new(true));
+        let (_control_sender, control_receiver) = mpsc::channel(CONTROL_COMMAND_CAPACITY);
+        let (_shutdown_sender, shutdown_receiver) = mpsc::channel(1);
+        let (ready_sender, ready_receiver) = oneshot::channel();
+        let (before_loop_ready, before_loop_reached) = oneshot::channel();
+        let (before_loop_release, release_loop) = oneshot::channel();
+        let (zeroization_queued, zeroization_observer) = oneshot::channel();
+        let group_reached = Arc::new(Barrier::new(2));
+        let group_release = Arc::new(Barrier::new(2));
+        let actor = tokio::spawn(run_node_actor_inner(
+            NodeConfig {
+                state: state.clone(),
+                bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                mission,
+                peers: Vec::new(),
+                mutable_interests: Default::default(),
+                sync_interval: Duration::from_secs(60),
+                run_for: None,
+                application: NodeApplication::Relay,
+            },
+            SelectedForwardingConfig::default(),
+            Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+            NodeActorChannels {
+                handle_sigint: false,
+                application_receiver,
+                application_admission,
+                control_receiver,
+                shutdown_receiver,
+                ready: ready_sender,
+                test_control: Some(RunNodeActorTestControl {
+                    event_operation_audit: None,
+                    before_loop_ready,
+                    before_loop_release: release_loop,
+                    zeroization_queued,
+                    blob_worker_fatal_on_shutdown: false,
+                    blob_final_read_gate: None,
+                    event_group_execution_gate: Some((
+                        Arc::clone(&group_reached),
+                        Arc::clone(&group_release),
+                    )),
+                }),
+            },
+        ));
+        timeout(Duration::from_secs(10), ready_receiver)
+            .await
+            .expect("ready deadline")
+            .expect("ready");
+        timeout(Duration::from_secs(10), before_loop_reached)
+            .await
+            .expect("loop gate deadline")
+            .expect("loop gate");
+
+        let mut collected = Vec::new();
+        for index in 0..2u8 {
+            let (response, received) = oneshot::channel();
+            application_sender
+                .try_send(SelectedApplicationCommand::Event(
+                    SelectedEventCommand::Publish {
+                        request: EventPublishRequest {
+                            operation_key: vec![b'z', index],
+                            predecessor: None,
+                            topic: Topic::new("zeroization").expect("topic"),
+                            scope: Scope::new("test/zeroization").expect("scope"),
+                            priority: Priority::Priority,
+                            logical_key: vec![index],
+                            payload: vec![index],
+                            tombstone: false,
+                        },
+                        options: EventPublishOptions::durable(),
+                        response,
+                    },
+                ))
+                .expect("queue collected publication");
+            collected.push(received);
+        }
+        let (status_response, status_received) = oneshot::channel();
+        application_sender
+            .try_send(SelectedApplicationCommand::Event(
+                SelectedEventCommand::Status {
+                    response: status_response,
+                },
+            ))
+            .expect("queue retained boundary");
+        let (trailing_response, trailing_received) = oneshot::channel();
+        application_sender
+            .try_send(SelectedApplicationCommand::Event(
+                SelectedEventCommand::Publish {
+                    request: EventPublishRequest {
+                        operation_key: b"zeroization-trailing".to_vec(),
+                        predecessor: None,
+                        topic: Topic::new("zeroization").expect("topic"),
+                        scope: Scope::new("test/zeroization").expect("scope"),
+                        priority: Priority::Priority,
+                        logical_key: b"trailing".to_vec(),
+                        payload: b"must-not-commit".to_vec(),
+                        tombstone: false,
+                    },
+                    options: EventPublishOptions::durable(),
+                    response: trailing_response,
+                },
+            ))
+            .expect("queue trailing publication");
+
+        before_loop_release.send(()).expect("release actor loop");
+        group_reached.wait();
+        let zeroize_state = state.clone();
+        let zeroize_mission = mission_path.clone();
+        let zeroization = tokio::spawn(async move {
+            zeroize_node(&zeroize_state, &zeroize_mission, Duration::from_secs(10)).await
+        });
+        timeout(Duration::from_secs(10), zeroization_observer)
+            .await
+            .expect("zeroization queue deadline")
+            .expect("zeroization queued");
+        group_release.wait();
+
+        for response in collected {
+            assert!(
+                timeout(Duration::from_secs(10), response)
+                    .await
+                    .expect("collected deadline")
+                    .expect("collected response")
+                    .is_ok()
+            );
+        }
+        let status_error = timeout(Duration::from_secs(10), status_received)
+            .await
+            .expect("status rejection deadline")
+            .expect("status response")
+            .expect_err("retained boundary must be rejected");
+        assert_eq!(status_error.kind(), ApplicationErrorKind::StateUnavailable);
+        let trailing_error = timeout(Duration::from_secs(10), trailing_received)
+            .await
+            .expect("trailing rejection deadline")
+            .expect("trailing response")
+            .expect_err("trailing publication must be rejected");
+        assert_eq!(
+            trailing_error.kind(),
+            ApplicationErrorKind::StateUnavailable
+        );
+        let zeroized = timeout(Duration::from_secs(15), zeroization)
+            .await
+            .expect("zeroization completion deadline")
+            .expect("join zeroization")
+            .expect("zeroization succeeds");
+        assert_eq!(zeroized.state, SoftwareZeroizationState::Complete);
+        timeout(Duration::from_secs(10), actor)
+            .await
+            .expect("actor shutdown deadline")
+            .expect("join actor")
+            .expect("actor result");
+        drop(application_sender);
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     fn live_blob_request(
@@ -29262,6 +30272,7 @@ mod tests {
                     zeroization_queued,
                     blob_worker_fatal_on_shutdown: false,
                     blob_final_read_gate: None,
+                    event_group_execution_gate: None,
                     event_operation_audit: Some(audit_control),
                 }),
             },
@@ -32626,6 +33637,7 @@ mod tests {
                     zeroization_queued,
                     blob_worker_fatal_on_shutdown: false,
                     blob_final_read_gate: None,
+                    event_group_execution_gate: None,
                     event_operation_audit: None,
                 }),
             },

@@ -13,6 +13,7 @@ pub enum PublicOperation {
     Unspecified,
     GetStatus,
     PublishEvent,
+    PublishEvents,
     BeginEventPublicationSession,
     CompleteEventPublicationRecovery,
     PublishNumberedEvent,
@@ -34,6 +35,7 @@ impl PublicOperation {
             Self::Unspecified => "unspecified",
             Self::GetStatus => "get_status",
             Self::PublishEvent => "publish_event",
+            Self::PublishEvents => "publish_events",
             Self::BeginEventPublicationSession => "begin_event_publication_session",
             Self::CompleteEventPublicationRecovery => "complete_event_publication_recovery",
             Self::PublishNumberedEvent => "publish_numbered_event",
@@ -130,15 +132,24 @@ pub fn public_error(
     retryable: bool,
     retry_delay: Option<Duration>,
 ) -> ConnectError {
-    let detail = api::PublicErrorDetail {
+    let detail = public_error_detail(reason, operation, retryable, retry_delay);
+    ConnectError::new(code, reason.public_message())
+        .with_detail(ErrorDetail::from_message(PUBLIC_ERROR_DETAIL_TYPE, &detail))
+}
+
+pub(crate) fn public_error_detail(
+    reason: api::PublicErrorReason,
+    operation: PublicOperation,
+    retryable: bool,
+    retry_delay: Option<Duration>,
+) -> api::PublicErrorDetail {
+    api::PublicErrorDetail {
         reason: reason.into(),
         operation: operation.as_str().to_owned(),
         retryable,
         retry_delay_ms: retry_delay.and_then(bounded_millis),
         ..Default::default()
-    };
-    ConnectError::new(code, reason.public_message())
-        .with_detail(ErrorDetail::from_message(PUBLIC_ERROR_DETAIL_TYPE, &detail))
+    }
 }
 
 fn bounded_millis(delay: Duration) -> Option<u32> {
@@ -256,6 +267,19 @@ pub fn connect_application_error(error: ApplicationError) -> ConnectError {
         mapping.code,
         mapping.reason,
         mapping.operation,
+        mapping.retryable,
+        mapping.retry_delay,
+    )
+}
+
+pub(crate) fn public_application_error_detail(
+    error: ApplicationError,
+    operation: PublicOperation,
+) -> api::PublicErrorDetail {
+    let mapping = application_error_mapping(error.kind(), error.operation());
+    public_error_detail(
+        mapping.reason,
+        operation,
         mapping.retryable,
         mapping.retry_delay,
     )

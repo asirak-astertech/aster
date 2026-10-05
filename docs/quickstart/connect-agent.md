@@ -366,6 +366,37 @@ with `Aborted` and `PUBLIC_ERROR_REASON_OPERATION_KEY_CONFLICT`. This resolves
 uncertain outcomes; it does not make two different application effects
 equivalent.
 
+For sustained ordinary telemetry, native Connect and gRPC clients over HTTP/2
+may use the bidirectional `PublishEvents` method. Send one
+`PublishEventsRequest.publication` per independent Event and read one ordered
+`PublishEventsResponse` per input. A response contains either the existing
+durable `published` result or one sanitized application `failure`. A malformed
+or conflicting input does not close the stream or suppress a later valid
+input.
+
+The maintained Rust client helper
+`aster_agent::sdk::PipelinedEventPublisher` rotates bounded stream sessions
+before the server's existing default deadline. On a disconnect it replays each
+sent-but-unanswered request with the original operation key. A response is
+progress only when its `published` or `failure` outcome is present. Persist the
+requests and keys according to the application's recovery needs before
+sending; the ordinary helper is not the crash-safe numbered-publication
+journal.
+
+Pipelining overlaps local durable requests and allows the selected node to
+group compatible commands that are already admitted. It never acknowledges
+volatile memory, waits for remote delivery, or delays an Event to wait for a
+future group member. Each Event keeps independent validation and retry
+semantics and its singleton source representation. This is separate from the
+explicit atomic cryptographic batch API.
+
+`PublishEvents` request streaming is supported only by native HTTP/2 Connect
+and gRPC transports. The agent rejects it over gRPC-Web. Browser clients use a
+bounded application-selected number of concurrent unary `PublishEvent` calls
+and apply the same operation-key rule. The reference SDK's active window and
+session-rotation interval are implementation details, not protocol limits,
+advertised telemetry rates, or target-device validation results.
+
 `QueryEvents` returns an acceptance-marker-ordered page. Continue from
 `scanned_through` while `has_more` is true rather than raising the request
 above its bound.

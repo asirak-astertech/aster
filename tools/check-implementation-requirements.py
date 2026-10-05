@@ -218,9 +218,16 @@ LINUX_CUSTODY_ACCEPTANCE_SLICE = (
 )
 AGENT_SLICE = (
     "proto/aster/application/v1alpha1/aster.proto; crates/aster-agent/src/lib.rs; "
-    "crates/aster-agent/src/main.rs; crates/aster-agent/tests/real_node_connect.rs; "
+    "crates/aster-agent/src/main.rs; crates/aster-agent/src/sdk.rs; "
+    "crates/aster-agent/src/event_service.rs; "
+    "crates/aster-agent/tests/real_node_connect.rs; "
     "examples/connect_agent.sh; docs/quickstart/connect-agent.md; "
-    "docs/decisions/0030-event-first-local-connect-agent.md"
+    "docs/decisions/0030-event-first-local-connect-agent.md; "
+    "docs/decisions/0044-pipeline-durable-event-publication.md"
+)
+PIPELINED_EVENT_PHYSICAL_EVIDENCE = (
+    "docs/validation/evidence/"
+    "2026-10-05-pipelined-event-publication-cm4-validation.md"
 )
 STATE_LOCAL_SLICE = (
     "crates/aster-core/src/source_state.rs; crates/aster-redb-store/src/lib.rs; "
@@ -1332,14 +1339,14 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     "DM-7-10": selected_claim(
         "implemented-uncredited",
         "aster-agent",
-        f"{AGENT_SLICE}; the repository-owned v1alpha1 Protobuf service accepts Connect, gRPC, and gRPC-Web calls without requiring the Buf Schema Registry",
-        "Only same-implementation Connect client evidence exists. Independent gRPC/gRPC-Web clients, supported-target packaging, protected provisioning, and production local-IPC acceptance remain open.",
+        f"{AGENT_SLICE}; {PIPELINED_EVENT_PHYSICAL_EVIDENCE}; the repository-owned v1alpha1 Protobuf service accepts unary Connect, gRPC, and gRPC-Web calls without requiring the Buf Schema Registry and adds ordered bidirectional Event publication for native HTTP/2 Connect/gRPC with explicit gRPC-Web request-streaming rejection plus concurrent-unary fallback",
+        "Current-code same-implementation tests cover native Connect/gRPC bidirectional publication and gRPC-Web rejection plus unary fallback. One bounded two-CM4 same-implementation engineering comparison observes exact delivery and saturated admission gains without establishing a supported rate, general efficiency, qualification, or independent interoperability. Independent clients or servers, supported-target packaging, protected provisioning, and production local-IPC acceptance remain open.",
     ),
     "DM-7-11": selected_claim(
         "implemented-uncredited",
         "aster-node::application + aster-agent",
-        f"{EVENT_LIVE_SLICE}; {LIVE_MUTABLE_SLICE}; {LIVE_MUTABLE_RECEIPT}; {BLOB_LIVE_SLICE}; {LIVE_BLOB_ACCEPTANCE_SLICE}; {LIVE_BLOB_RECEIPT}; {STATE_SUBSCRIPTION_SLICE}; {LIVE_STATE_SUBSCRIPTION_ACCEPTANCE_SLICE}; {LIVE_STATE_SUBSCRIPTION_RECEIPT}; {RECORD_SUBSCRIPTION_SLICE}; {LIVE_RECORD_SUBSCRIPTION_ACCEPTANCE_SLICE}; {LIVE_RECORD_SUBSCRIPTION_RECEIPT}; {BLOB_SUBSCRIPTION_SLICE}; {LIVE_BLOB_SUBSCRIPTION_EVIDENCE}; {AGENT_SLICE}; the actor-owned Event, State, Record, and Blob handles expose typed high-level publication/query or bounded page-read operations with sanitized errors; all four add durable subscribe/poll/acknowledge/unsubscribe operations, Blob adds read-only local delivery-ledger status, and retained State/Record acceptance runs exercise their distinct positive-Current or whole-key delivery contracts through those Rust handles; the retained Blob-delivery producer exercises SelectedBlobHandle subscribe, poll, acknowledge, reacknowledge, delivery_status, and closed-handle behavior through three processes and four actor lifetimes while returning bounded source-publication metadata plus opaque token commitments",
-        "Blob delivery_status is intentionally not sync, contact, peer, transfer-progress, or convergence status, and the peerless receipt adds none of those behaviors. State has no Current-to-None withdrawal signal, the agent remains Event-only, and selected-node bindings, operational provisioning, independent usability, Blob peer/convergence status, and the complete adopter-facing API remain open; retained acceptance harnesses are not binding or usability studies.",
+        f"{EVENT_LIVE_SLICE}; {LIVE_MUTABLE_SLICE}; {LIVE_MUTABLE_RECEIPT}; {BLOB_LIVE_SLICE}; {LIVE_BLOB_ACCEPTANCE_SLICE}; {LIVE_BLOB_RECEIPT}; {STATE_SUBSCRIPTION_SLICE}; {LIVE_STATE_SUBSCRIPTION_ACCEPTANCE_SLICE}; {LIVE_STATE_SUBSCRIPTION_RECEIPT}; {RECORD_SUBSCRIPTION_SLICE}; {LIVE_RECORD_SUBSCRIPTION_ACCEPTANCE_SLICE}; {LIVE_RECORD_SUBSCRIPTION_RECEIPT}; {BLOB_SUBSCRIPTION_SLICE}; {LIVE_BLOB_SUBSCRIPTION_EVIDENCE}; {AGENT_SLICE}; {PIPELINED_EVENT_PHYSICAL_EVIDENCE}; the actor-owned Event, State, Record, and Blob handles expose typed high-level publication/query or bounded page-read operations with sanitized errors; all four add durable subscribe/poll/acknowledge/unsubscribe operations, Blob adds read-only local delivery-ledger status, and retained State/Record acceptance runs exercise their distinct positive-Current or whole-key delivery contracts through those Rust handles; the retained Blob-delivery producer exercises SelectedBlobHandle subscribe, poll, acknowledge, reacknowledge, delivery_status, and closed-handle behavior through three processes and four actor lifetimes while returning bounded source-publication metadata plus opaque token commitments",
+        "Blob delivery_status is intentionally not sync, contact, peer, transfer-progress, or convergence status, and the peerless receipt adds none of those behaviors. The bounded physical Event comparison is same-implementation engineering evidence, not supported-target, general-efficiency, usability, or release acceptance. State has no Current-to-None withdrawal signal, the agent remains Event-only, and selected-node bindings, operational provisioning, independent usability, Blob peer/convergence status, and the complete adopter-facing API remain open; retained acceptance harnesses are not binding or usability studies.",
     ),
     "DM-7-14": selected_claim(
         "implemented-uncredited",
