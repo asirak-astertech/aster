@@ -1632,6 +1632,38 @@ the bounded work limits below. Authentication failure reveals one
 indistinguishable error externally. Rate, byte, fragment, partial-transfer,
 peer, and handshake limits are configured.
 
+### 18.1 Reference local Event publication boundary
+
+The local application protocol is an adapter over the running selected node,
+not a sixth mesh layer or a second durable authority. Unary `PublishEvent` and
+native HTTP/2 bidirectional `PublishEvents` return successful results only
+after the Event and its operation-key mapping commit in the node's local
+durable store. They do not wait for, request, or imply a remote mesh receipt.
+The replication layer independently reconciles the committed source object
+when an eligible contact becomes available.
+
+`PublishEvents` preserves request order and returns one durable result or one
+sanitized application failure per input. Transport loss can occur after a
+local commit but before its response. A client recovers that uncertain boundary
+by resending each sent-but-unanswered request with its unchanged operation key;
+the durable operation ledger returns the existing result rather than creating
+a duplicate. gRPC-Web request streaming is unsupported, so browser clients use
+bounded concurrent unary calls with the same retry rule.
+
+The selected-node actor may group adjacent compatible ordinary non-Flash Event
+commands already present in its bounded application lane into one local durable
+transaction. It does not wait for future input, skip intervening work, or
+change an input's independent outcome. Flash and experimental numbered
+publication retain their existing paths. Grouped Events keep their ordinary
+singleton source representation; this optimization is distinct from the
+explicit content-committing cryptographic batch in §6.1.
+
+This local API addition allocates no semantic version, source-envelope format,
+reconciliation frame, or stable mesh registry value. Reference window,
+fairness, and session-rotation values are implementation bounds rather than
+protocol data-rate limits or supported-target performance claims. The exact
+reference decision is [Decision 0044](decisions/0044-pipeline-durable-event-publication.md).
+
 The reference adapter and authenticated adjacency enforce these work,
 outbound, and replay limits:
 
