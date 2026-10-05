@@ -194,8 +194,9 @@ where
     <T::ResponseBody as connectrpc::http_body::Body>::Error: fmt::Display,
 {
     /// Creates a publisher. `max_disconnect_retries` bounds consecutive
-    /// transport failures; normal eight-second session rotation is not a
-    /// failure and does not consume this budget.
+    /// transport failures and consecutive sessions that expire without one
+    /// durable response. A bounded session that made progress may rotate
+    /// without consuming this budget.
     pub fn new(
         client: api::AsterApplicationServiceClient<T>,
         max_disconnect_retries: usize,
@@ -218,6 +219,7 @@ where
             let mut stream = self.client.publish_events().await?;
             let deadline = tokio::time::Instant::now() + PIPELINED_PUBLICATION_SESSION;
             let mut rotate = false;
+            let mut session_made_progress = false;
 
             while !state.is_complete() && !rotate {
                 for request in state.fill_window(PIPELINED_PUBLICATION_WINDOW) {
@@ -228,6 +230,11 @@ where
                     match tokio::time::timeout_at(deadline, send).await {
                         Ok(Ok(())) => {}
                         Err(_) => {
+                            record_no_progress_rotation(
+                                session_made_progress,
+                                &mut consecutive_disconnects,
+                                self.max_disconnect_retries,
+                            )?;
                             rotate = true;
                             break;
                         }
@@ -251,9 +258,17 @@ where
                 )
                 .await
                 {
-                    Err(_) => rotate = true,
+                    Err(_) => {
+                        record_no_progress_rotation(
+                            session_made_progress,
+                            &mut consecutive_disconnects,
+                            self.max_disconnect_retries,
+                        )?;
+                        rotate = true;
+                    }
                     Ok(Ok(Some(response))) => {
                         state.accept_response(response.to_owned_message())?;
+                        session_made_progress = true;
                         consecutive_disconnects = 0;
                     }
                     Ok(Ok(None)) => {
@@ -279,6 +294,24 @@ where
         }
         Ok(state.into_responses())
     }
+}
+
+fn record_no_progress_rotation(
+    session_made_progress: bool,
+    consecutive_failures: &mut usize,
+    max_retries: usize,
+) -> std::result::Result<(), connectrpc::ConnectError> {
+    if session_made_progress {
+        return Ok(());
+    }
+    let error = connectrpc::ConnectError::deadline_exceeded(
+        "publication stream made no progress before its bounded session deadline",
+    );
+    if *consecutive_failures >= max_retries {
+        return Err(error);
+    }
+    *consecutive_failures += 1;
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1491,9 +1524,12 @@ mod tests {
                                     ));
                                 }
                             };
-                            captured.lock().expect("session capture")[session]
-                                .push(publication.operation_key);
-                            if session == 0 {
+                            let session_requests = {
+                                let mut sessions = captured.lock().expect("session capture");
+                                sessions[session].push(publication.operation_key);
+                                sessions[session].len()
+                            };
+                            if session == 0 && session_requests > 1 {
                                 futures::future::pending::<()>().await;
                                 unreachable!("pending session is rotated by the SDK")
                             }
@@ -1530,10 +1566,60 @@ mod tests {
         assert_eq!(
             *sessions.lock().expect("session capture"),
             vec![
-                vec![b"first".to_vec()],
                 vec![b"first".to_vec(), b"second".to_vec()],
+                vec![b"second".to_vec()],
             ]
         );
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test(start_paused = true)]
+    async fn publish_events_transport_bounds_consecutive_no_progress_rotations() {
+        let sessions = Arc::new(Mutex::new(0_usize));
+        let captured = sessions.clone();
+        let handler = connectrpc::bidi_streaming_handler_fn(
+            move |_ctx, requests: connectrpc::ServiceStream<api::PublishEventsRequest>| {
+                let captured = captured.clone();
+                async move {
+                    *captured.lock().expect("session capture") += 1;
+                    let responses = requests.take(1).then(|_request| async {
+                        futures::future::pending::<
+                            std::result::Result<
+                                api::PublishEventsResponse,
+                                connectrpc::ConnectError,
+                            >,
+                        >()
+                        .await
+                    });
+                    connectrpc::Response::stream_ok(responses)
+                }
+            },
+        );
+        let router = connectrpc::Router::new().route_bidi_stream(
+            api::ASTER_APPLICATION_SERVICE_SERVICE_NAME,
+            "PublishEvents",
+            handler,
+        );
+        let client = api::AsterApplicationServiceClient::new(
+            ServiceTransport::new(crate::event_service::configured_service(router)),
+            ClientConfig::new("http://localhost".parse().expect("URI")),
+        );
+        let publisher = PipelinedEventPublisher::new(client, 0);
+        let request = api::PublishEventRequest {
+            operation_key: b"stalled".to_vec(),
+            ..Default::default()
+        };
+
+        let error = tokio::time::timeout(
+            PIPELINED_PUBLICATION_SESSION + Duration::from_secs(1),
+            publisher.publish_all(vec![request]),
+        )
+        .await
+        .expect("publisher must stop after the bounded no-progress session")
+        .expect_err("a session without any response must fail");
+
+        assert_eq!(error.code, connectrpc::ErrorCode::DeadlineExceeded);
+        assert_eq!(*sessions.lock().expect("session capture"), 1);
     }
 
     #[cfg(feature = "server")]
