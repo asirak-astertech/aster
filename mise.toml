@@ -27,6 +27,8 @@ run = [
   "sh tools/check-agent-proto.sh",
   "python3 tools/check-project-license.py",
   "python3 tools/check-implementation-requirements.py",
+  "python3 tools/check-protocol-version-contract.py",
+  "python3 tools/test-protocol-version-contract.py",
   "python3 tools/test-run-fuzz-smoke.py",
   "python3 tools/test_aster_tour_ui.py",
   "python3 tools/test_aster_mesh_playground.py",
@@ -239,6 +241,13 @@ description = "Verify the rejected libp2p provider remains an unpublished, opt-i
 run = [
   "python3 tools/check-retained-libp2p-oracle-boundary.py",
   "python3 tools/test-retained-libp2p-oracle-boundary.py",
+]
+
+[tasks.protocol-version-contract]
+description = "Verify implemented and normative semantic-version registries align"
+run = [
+  "python3 tools/check-protocol-version-contract.py",
+  "python3 tools/test-protocol-version-contract.py",
 ]
 
 [tasks.age-reference-interop]
