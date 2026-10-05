@@ -17,7 +17,7 @@ getrandom.workspace = true
 iroh = { workspace = true, optional = true }
 iroh-relay = { workspace = true, features = ["server"], optional = true }
 libc = { workspace = true, optional = true }
-rcgen = { version = "=0.14.9", default-features = false, features = ["crypto", "ring"], optional = true }
+rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "ring"], optional = true }
 rustls = { workspace = true, optional = true }
 sha2.workspace = true
 tokio = { workspace = true, features = ["macros"], optional = true }
