@@ -9844,6 +9844,46 @@ mod tests {
     }
 
     #[test]
+    fn semantic_registry_negotiates_each_supported_version_and_rejects_neighbors() {
+        for version in [
+            SEMANTIC_PROTOCOL_V1,
+            SEMANTIC_PROTOCOL_V2,
+            SEMANTIC_PROTOCOL_V3,
+            SEMANTIC_PROTOCOL_V4,
+            SEMANTIC_PROTOCOL_V5,
+            SEMANTIC_PROTOCOL_V6,
+        ] {
+            let mut provisioner = ReferenceProvisioner::from_seed([0x40 + version as u8; 32])
+                .unwrap_or_else(|error| panic!("v{version} provisioner failed: {error}"));
+            let initiator_bundle = provisioner
+                .issue_node(1, &[member_access(vec![0])])
+                .unwrap_or_else(|error| panic!("v{version} initiator issue failed: {error}"));
+            let responder_bundle = provisioner
+                .issue_node(2, &[member_access(vec![0])])
+                .unwrap_or_else(|error| panic!("v{version} responder issue failed: {error}"));
+            let (initiator, responder) =
+                complete_sessions_with_versions(initiator_bundle, responder_bundle, vec![version]);
+            assert_eq!(initiator.semantic_version(), version);
+            assert_eq!(responder.semantic_version(), version);
+        }
+
+        for unsupported in [0, SEMANTIC_PROTOCOL_V6 + 1] {
+            let mut provisioner = ReferenceProvisioner::from_seed([0x50 + unsupported as u8; 32])
+                .unwrap_or_else(|error| panic!("v{unsupported} provisioner failed: {error}"));
+            let initiator_bundle = provisioner
+                .issue_node(1, &[member_access(vec![0])])
+                .unwrap_or_else(|error| panic!("v{unsupported} initiator issue failed: {error}"));
+            assert!(
+                ReferenceSessionInitiator::start_with_semantic_versions(
+                    initiator_bundle,
+                    vec![unsupported],
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn mission_proof_rejects_version_and_suite_offer_stripping() {
         let mut provisioner = ReferenceProvisioner::from_seed([0x32; 32])
             .unwrap_or_else(|error| panic!("provisioner failed: {error}"));
