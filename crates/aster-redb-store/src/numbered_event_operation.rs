@@ -123,6 +123,8 @@ pub struct NumberedEventResult {
     pub content: CommittedEventContent,
 }
 
+type StoredNumberedEventResultRow = (Vec<u8>, NumberedEventResult, [u8; 32]);
+
 /// One bounded restart-recovery snapshot returned by session claim.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EventRecoverySnapshot {
@@ -529,6 +531,93 @@ pub(crate) fn canonical_numbered_result_write(
     }
 }
 
+fn validate_numbered_result_authority(
+    result: NumberedEventResult,
+    authority: crate::custody::EventCustodyAuthority,
+) -> Result<(), StoreError> {
+    use crate::custody::EventCustodyAuthority;
+
+    let (semantic_id, acceptance_marker) = match authority {
+        EventCustodyAuthority::Live {
+            semantic_id,
+            acceptance_marker,
+        }
+        | EventCustodyAuthority::Retired {
+            semantic_id,
+            acceptance_marker,
+            ..
+        } => (semantic_id, acceptance_marker),
+        EventCustodyAuthority::Missing => {
+            return Err(NumberedEventOperationError::Invariant(
+                "numbered Event result lacks custody authority",
+            )
+            .into());
+        }
+    };
+    if result.receipt.semantic_id != semantic_id
+        || result.receipt.acceptance_marker != acceptance_marker
+    {
+        return Err(NumberedEventOperationError::Invariant(
+            "numbered Event result differs from custody authority",
+        )
+        .into());
+    }
+    match (result.content, authority) {
+        (CommittedEventContent::Available, EventCustodyAuthority::Live { .. }) => Ok(()),
+        (
+            CommittedEventContent::Available,
+            EventCustodyAuthority::Retired {
+                cleanup_pending: true,
+                ..
+            },
+        ) => Ok(()),
+        (CommittedEventContent::Available, EventCustodyAuthority::Retired { .. }) => {
+            Err(NumberedEventOperationError::Invariant(
+                "available numbered Event result has clean retired custody authority",
+            )
+            .into())
+        }
+        (CommittedEventContent::Retired(_), EventCustodyAuthority::Live { .. }) => {
+            Err(NumberedEventOperationError::Invariant(
+                "retired numbered Event result has live custody authority",
+            )
+            .into())
+        }
+        (CommittedEventContent::Retired(stored), EventCustodyAuthority::Retired { reason, .. })
+            if stored == reason =>
+        {
+            Ok(())
+        }
+        (CommittedEventContent::Retired(_), EventCustodyAuthority::Retired { .. }) => {
+            Err(NumberedEventOperationError::Invariant(
+                "retired numbered Event result differs from custody authority",
+            )
+            .into())
+        }
+        (_, EventCustodyAuthority::Missing) => unreachable!("handled missing authority"),
+    }
+}
+
+fn validate_numbered_result_authority_write(
+    write: &redb::WriteTransaction,
+    result: NumberedEventResult,
+) -> Result<(), StoreError> {
+    validate_numbered_result_authority(
+        result,
+        crate::custody::event_custody_authority_write(write, result.receipt.transfer_id)?,
+    )
+}
+
+fn validate_numbered_result_authority_read(
+    read: &redb::ReadTransaction,
+    result: NumberedEventResult,
+) -> Result<(), StoreError> {
+    validate_numbered_result_authority(
+        result,
+        crate::custody::event_custody_authority_read(read, result.receipt.transfer_id)?,
+    )
+}
+
 fn validate_numbered_result_reverse_write(
     write: &redb::WriteTransaction,
     client: &EventClientId,
@@ -691,16 +780,7 @@ pub(crate) fn cleanup_numbered_results_write(
     budget: &mut crate::custody::MaintenanceBudget,
 ) -> Result<crate::custody::RetirementCleanupProgress, StoreError> {
     if let Some(cursor) = cursor.as_deref() {
-        let valid = cursor.get(..32) == Some(transfer_id.as_bytes().as_slice())
-            && decode_reverse_key(cursor).is_ok_and(|(client, sequence)| {
-                reverse_key(transfer_id, &client, sequence) == cursor
-            });
-        if !valid {
-            return Err(NumberedEventOperationError::Invariant(
-                "numbered Event cleanup cursor key is invalid",
-            )
-            .into());
-        }
+        validate_numbered_cleanup_cursor(transfer_id, cursor)?;
     }
     let prefix = transfer_id.as_bytes();
     let mut successor = *prefix;
@@ -718,7 +798,7 @@ pub(crate) fn cleanup_numbered_results_write(
         );
         let next = write
             .open_table(RESULT_BY_EVENT)?
-            .range::<&[u8]>((lower, upper.clone()))?
+            .range::<&[u8]>((lower, upper))?
             .next()
             .transpose()?
             .map(|(key, value)| (key.value().to_vec(), value.value().to_vec()));
@@ -791,6 +871,22 @@ pub(crate) fn cleanup_numbered_results_write(
         *cursor = Some(reverse_key_bytes);
         budget.record_examined_numbered_result(rewritten)?;
     }
+}
+
+pub(crate) fn validate_numbered_cleanup_cursor(
+    transfer_id: EventTransferId,
+    cursor: &[u8],
+) -> Result<(), StoreError> {
+    let valid = cursor.get(..32) == Some(transfer_id.as_bytes().as_slice())
+        && decode_reverse_key(cursor)
+            .is_ok_and(|(client, sequence)| reverse_key(transfer_id, &client, sequence) == cursor);
+    if !valid {
+        return Err(NumberedEventOperationError::Invariant(
+            "numbered Event cleanup cursor key is invalid",
+        )
+        .into());
+    }
+    Ok(())
 }
 
 pub(crate) fn legacy_operation_allowed_write(
@@ -975,6 +1071,261 @@ pub(crate) fn audit_numbered_tables_write(
     Ok(stats)
 }
 
+pub(crate) fn audit_numbered_result_authority_write(
+    write: &redb::WriteTransaction,
+) -> Result<(), StoreError> {
+    for row in write.open_table(RESULTS)?.iter()? {
+        let (key, value) = row?;
+        let (_, sequence) = decode_result_key(key.value())?;
+        let result = decode_result(sequence, value.value())?;
+        validate_numbered_result_authority_write(write, result)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn audit_numbered_tables_read(
+    read: &redb::ReadTransaction,
+) -> Result<NumberedEventOperationStats, StoreError> {
+    let table_names = [
+        "aster.numbered-event-clients.v1",
+        "aster.numbered-event-results.v1",
+        "aster.numbered-event-result-by-event.v1",
+    ];
+    let regular = read
+        .list_tables()?
+        .map(|table| table.name().to_owned())
+        .collect::<BTreeSet<_>>();
+    let present = table_names
+        .iter()
+        .filter(|name| regular.contains(**name))
+        .count();
+    if present != 0 && present != table_names.len() {
+        return Err(NumberedEventOperationError::Invariant(
+            "numbered Event operation schema group is incomplete",
+        )
+        .into());
+    }
+    let legacy_rows = (regular.contains(EVENT_OPERATION_LEDGER_V3.name())
+        && read.open_table(EVENT_OPERATION_LEDGER_V3)?.len()? != 0)
+        || (regular.contains(ACTIVE_OPERATION_BY_EVENT_V1.name())
+            && read.open_table(ACTIVE_OPERATION_BY_EVENT_V1)?.len()? != 0);
+    let mode = read
+        .open_table(METADATA)?
+        .get(MODE)?
+        .map(|value| value.value());
+    if present == 0 {
+        if legacy_rows && mode == Some(1) {
+            return Err(NumberedEventOperationError::LegacyStoreRequiresFreshState.into());
+        }
+        if let Some(value) = mode
+            && value != 1
+        {
+            return Err(NumberedEventOperationError::Invariant(
+                "numbered Event operation mode is unknown",
+            )
+            .into());
+        }
+        let metadata = read.open_table(METADATA)?;
+        let stored = (
+            metadata.get(CLIENT_COUNT)?.map(|value| value.value()),
+            metadata.get(RESULT_COUNT)?.map(|value| value.value()),
+            metadata.get(REVERSE_COUNT)?.map(|value| value.value()),
+            metadata.get(LOGICAL_BYTES)?.map(|value| value.value()),
+        );
+        return match stored {
+            (None, None, None, None) => Ok(NumberedEventOperationStats::default()),
+            (Some(clients), Some(results), Some(reverse), Some(bytes)) => {
+                let persisted = NumberedEventOperationStats {
+                    clients,
+                    outstanding_results: results,
+                    reverse_edges: reverse,
+                    logical_bytes: bytes,
+                };
+                if persisted != NumberedEventOperationStats::default() {
+                    return Err(NumberedEventOperationError::Invariant(
+                        "numbered Event operation accounting differs from table truth",
+                    )
+                    .into());
+                }
+                Ok(persisted)
+            }
+            _ => Err(NumberedEventOperationError::Invariant(
+                "numbered Event operation accounting group is incomplete",
+            )
+            .into()),
+        };
+    }
+
+    let clients = read.open_table(CLIENTS)?;
+    let results = read.open_table(RESULTS)?;
+    let reverse = read.open_table(RESULT_BY_EVENT)?;
+    let numbered_rows = clients.len()? != 0 || results.len()? != 0 || reverse.len()? != 0;
+    if legacy_rows && (numbered_rows || mode == Some(1)) {
+        return Err(NumberedEventOperationError::LegacyStoreRequiresFreshState.into());
+    }
+    match mode {
+        None if numbered_rows => {
+            return Err(NumberedEventOperationError::Invariant(
+                "numbered Event rows lack numbered mode",
+            )
+            .into());
+        }
+        None | Some(1) => {}
+        Some(_) => {
+            return Err(NumberedEventOperationError::Invariant(
+                "numbered Event operation mode is unknown",
+            )
+            .into());
+        }
+    }
+    if clients.len()? > MAX_NUMBERED_EVENT_CLIENTS {
+        return Err(NumberedEventOperationError::Invariant(
+            "numbered Event client table exceeds its client limit",
+        )
+        .into());
+    }
+    let mut stats = NumberedEventOperationStats::default();
+    let mut client_frontiers = BTreeMap::<EventClientId, (u64, u64)>::new();
+    for row in clients.iter()? {
+        let (key, value) = row?;
+        let client = EventClientId::new(key.value().to_vec())?;
+        let record = decode_client(value.value())?;
+        client_frontiers.insert(client, (record.allocated_through, 0));
+        checked_accounting_add(&mut stats.clients, 1)?;
+        checked_accounting_add_lengths(
+            &mut stats.logical_bytes,
+            &[key.value().len(), value.value().len()],
+        )?;
+    }
+    for row in results.iter()? {
+        let (key, value) = row?;
+        let (client, sequence) = decode_result_key(key.value())?;
+        let (frontier, count) =
+            client_frontiers
+                .get_mut(&client)
+                .ok_or(NumberedEventOperationError::Invariant(
+                    "numbered Event result has no client",
+                ))?;
+        if sequence.get() > *frontier {
+            return Err(NumberedEventOperationError::Invariant(
+                "numbered Event result exceeds client frontier",
+            )
+            .into());
+        }
+        checked_accounting_add(count, 1)?;
+        if *count > MAX_OUTSTANDING_EVENT_RESULTS_PER_CLIENT {
+            return Err(NumberedEventOperationError::Invariant(
+                "client exceeds its outstanding numbered Event result limit",
+            )
+            .into());
+        }
+        let (result, _) = decode_result_with_digest(sequence, value.value())?;
+        let reverse_key = reverse_key(result.receipt.transfer_id, &client, sequence);
+        if reverse.get(reverse_key.as_slice())?.is_none() {
+            return Err(NumberedEventOperationError::Invariant(
+                "numbered Event result is missing its reverse edge",
+            )
+            .into());
+        }
+        checked_accounting_add(&mut stats.outstanding_results, 1)?;
+        checked_accounting_add_lengths(
+            &mut stats.logical_bytes,
+            &[key.value().len(), value.value().len()],
+        )?;
+    }
+    for row in reverse.iter()? {
+        let (key, value) = row?;
+        if !value.value().is_empty() {
+            return Err(NumberedEventOperationError::Invariant(
+                "numbered Event reverse value is not empty",
+            )
+            .into());
+        }
+        let (client, sequence) = decode_reverse_key(key.value())?;
+        let result_key = result_key(&client, sequence);
+        let result_value =
+            results
+                .get(result_key.as_slice())?
+                .ok_or(NumberedEventOperationError::Invariant(
+                    "numbered Event reverse edge is orphaned",
+                ))?;
+        let result = decode_result(sequence, result_value.value())?;
+        if &key.value()[..32] != result.receipt.transfer_id.as_bytes() {
+            return Err(NumberedEventOperationError::Invariant(
+                "numbered Event reverse edge targets another Event",
+            )
+            .into());
+        }
+        checked_accounting_add(&mut stats.reverse_edges, 1)?;
+        checked_accounting_add_lengths(&mut stats.logical_bytes, &[key.value().len()])?;
+    }
+    let metadata = read.open_table(METADATA)?;
+    let stored = (
+        metadata.get(CLIENT_COUNT)?.map(|value| value.value()),
+        metadata.get(RESULT_COUNT)?.map(|value| value.value()),
+        metadata.get(REVERSE_COUNT)?.map(|value| value.value()),
+        metadata.get(LOGICAL_BYTES)?.map(|value| value.value()),
+    );
+    match stored {
+        (None, None, None, None) => {}
+        (Some(clients), Some(results), Some(reverse), Some(bytes)) => {
+            let persisted = NumberedEventOperationStats {
+                clients,
+                outstanding_results: results,
+                reverse_edges: reverse,
+                logical_bytes: bytes,
+            };
+            if persisted != stats {
+                return Err(NumberedEventOperationError::Invariant(
+                    "numbered Event operation accounting differs from table truth",
+                )
+                .into());
+            }
+        }
+        _ => {
+            return Err(NumberedEventOperationError::Invariant(
+                "numbered Event operation accounting group is incomplete",
+            )
+            .into());
+        }
+    }
+    Ok(stats)
+}
+
+pub(crate) fn audit_numbered_result_authority_read(
+    read: &redb::ReadTransaction,
+) -> Result<(), StoreError> {
+    let table_names = [
+        "aster.numbered-event-clients.v1",
+        "aster.numbered-event-results.v1",
+        "aster.numbered-event-result-by-event.v1",
+    ];
+    let regular = read
+        .list_tables()?
+        .map(|table| table.name().to_owned())
+        .collect::<BTreeSet<_>>();
+    let present = table_names
+        .iter()
+        .filter(|name| regular.contains(**name))
+        .count();
+    if present == 0 {
+        return Ok(());
+    }
+    if present != table_names.len() {
+        return Err(NumberedEventOperationError::Invariant(
+            "numbered Event operation schema group is incomplete",
+        )
+        .into());
+    }
+    for row in read.open_table(RESULTS)?.iter()? {
+        let (key, value) = row?;
+        let (_, sequence) = decode_result_key(key.value())?;
+        let result = decode_result(sequence, value.value())?;
+        validate_numbered_result_authority_read(read, result)?;
+    }
+    Ok(())
+}
+
 fn checked_accounting_add(total: &mut u64, amount: u64) -> Result<(), StoreError> {
     *total = total
         .checked_add(amount)
@@ -1129,8 +1480,8 @@ fn results_for_client_write(
 fn stored_results_for_client_write(
     write: &redb::WriteTransaction,
     client: &EventClientId,
-) -> Result<Vec<(Vec<u8>, NumberedEventResult, [u8; 32])>, StoreError> {
-    let mut values = Vec::new();
+) -> Result<Vec<StoredNumberedEventResultRow>, StoreError> {
+    let mut values: Vec<StoredNumberedEventResultRow> = Vec::new();
     let lower = result_key(client, EventOperationSequence(1));
     let upper = result_key(client, EventOperationSequence(u64::MAX));
     let rows = write
@@ -1565,6 +1916,10 @@ mod tests {
             Store::open_for_mission(&self.0, CORRUPTION_MISSION)
                 .err()
                 .expect("corrupt store must not open")
+        }
+
+        fn inspect_error(&self) -> StoreError {
+            Store::inspect_existing(&self.0).expect_err("corrupt store must not be inspectable")
         }
     }
 
@@ -2055,6 +2410,11 @@ mod tests {
         );
     }
 
+    fn assert_reopen_and_inspect_invariant(file: &CorruptionFile, message: &'static str) {
+        assert_invariant(&file.inspect_error(), message);
+        assert_invariant(&file.reopen_error(), message);
+    }
+
     #[test]
     fn live_claim_rejects_unknown_mode_without_repairing_marker() {
         let file = CorruptionFile::new("live-unknown-mode");
@@ -2115,8 +2475,8 @@ mod tests {
         write_stats(&write, stats).expect("exact accounting");
         write.commit().expect("commit");
         drop(store);
-        assert_invariant(
-            &file.reopen_error(),
+        assert_reopen_and_inspect_invariant(
+            &file,
             "numbered Event client table exceeds its client limit",
         );
     }
@@ -2130,8 +2490,8 @@ mod tests {
         write_stats(&write, NumberedEventOperationStats::default()).expect("zero accounting");
         write.commit().expect("commit");
         drop(store);
-        assert_invariant(
-            &file.reopen_error(),
+        assert_reopen_and_inspect_invariant(
+            &file,
             "numbered Event operation accounting differs from table truth",
         );
     }
@@ -2149,8 +2509,8 @@ mod tests {
             .expect("remove counter");
         write.commit().expect("commit");
         drop(store);
-        assert_invariant(
-            &file.reopen_error(),
+        assert_reopen_and_inspect_invariant(
+            &file,
             "numbered Event operation accounting group is incomplete",
         );
     }
@@ -2168,10 +2528,7 @@ mod tests {
             .expect("remove mode");
         write.commit().expect("commit");
         drop(store);
-        assert_invariant(
-            &file.reopen_error(),
-            "numbered Event rows lack numbered mode",
-        );
+        assert_reopen_and_inspect_invariant(&file, "numbered Event rows lack numbered mode");
     }
 
     #[test]
@@ -2190,10 +2547,7 @@ mod tests {
         );
         write.commit().expect("commit");
         drop(store);
-        assert_invariant(
-            &file.reopen_error(),
-            "numbered Event operation mode is unknown",
-        );
+        assert_reopen_and_inspect_invariant(&file, "numbered Event operation mode is unknown");
     }
 
     #[test]
@@ -2217,11 +2571,13 @@ mod tests {
             }
             write.commit().expect("commit");
             drop(store);
-            assert_eq!(
-                numbered_error(&file.reopen_error()),
-                Some(&NumberedEventOperationError::LegacyStoreRequiresFreshState),
-                "marker {marker:?}"
-            );
+            for error in [file.inspect_error(), file.reopen_error()] {
+                assert_eq!(
+                    numbered_error(&error),
+                    Some(&NumberedEventOperationError::LegacyStoreRequiresFreshState),
+                    "marker {marker:?}"
+                );
+            }
         }
     }
 
@@ -2243,7 +2599,7 @@ mod tests {
         write_stats(&write, stats).expect("accounting");
         write.commit().expect("commit");
         drop(store);
-        assert_invariant(&file.reopen_error(), "numbered Event result has no client");
+        assert_reopen_and_inspect_invariant(&file, "numbered Event result has no client");
     }
 
     #[test]
@@ -2255,10 +2611,7 @@ mod tests {
         fixture_results(&write, &client, 1, 0);
         write.commit().expect("commit");
         drop(store);
-        assert_invariant(
-            &file.reopen_error(),
-            "numbered Event result exceeds client frontier",
-        );
+        assert_reopen_and_inspect_invariant(&file, "numbered Event result exceeds client frontier");
     }
 
     #[test]
@@ -2275,8 +2628,8 @@ mod tests {
         );
         write.commit().expect("commit");
         drop(store);
-        assert_invariant(
-            &file.reopen_error(),
+        assert_reopen_and_inspect_invariant(
+            &file,
             "client exceeds its outstanding numbered Event result limit",
         );
     }
@@ -2303,8 +2656,8 @@ mod tests {
             .expect("insert");
         write.commit().expect("commit");
         drop(store);
-        assert_invariant(
-            &file.reopen_error(),
+        assert_reopen_and_inspect_invariant(
+            &file,
             "numbered Event result is missing its reverse edge",
         );
     }
@@ -2332,10 +2685,58 @@ mod tests {
         write_stats(&write, stats).expect("accounting");
         write.commit().expect("commit");
         drop(store);
-        assert_invariant(
-            &file.reopen_error(),
+        assert_reopen_and_inspect_invariant(
+            &file,
             "numbered Event reverse edge targets another Event",
         );
+    }
+
+    #[test]
+    fn reopen_and_inspection_reject_nonempty_numbered_reverse_value() {
+        let file = CorruptionFile::new("nonempty-reverse");
+        let store = file.open();
+        let client = fixture_client(&store);
+        let write = store.database.begin_write().expect("write");
+        fixture_results(&write, &client, 1, 1);
+        let reverse = reverse_key(
+            EventTransferId::new([0x72; 32]),
+            &client,
+            EventOperationSequence::new(1).expect("sequence"),
+        );
+        write
+            .open_table(RESULT_BY_EVENT)
+            .expect("reverse")
+            .insert(reverse.as_slice(), &[1][..])
+            .expect("replace reverse value");
+        write.commit().expect("commit");
+        drop(store);
+        assert_reopen_and_inspect_invariant(&file, "numbered Event reverse value is not empty");
+    }
+
+    #[test]
+    fn reopen_and_inspection_reject_orphaned_numbered_reverse_edge() {
+        let file = CorruptionFile::new("orphaned-reverse");
+        let store = file.open();
+        let client = fixture_client(&store);
+        let write = store.database.begin_write().expect("write");
+        fixture_results(&write, &client, 1, 1);
+        let orphan = reverse_key(
+            EventTransferId::new([0x72; 32]),
+            &client,
+            EventOperationSequence::new(2).expect("sequence"),
+        );
+        write
+            .open_table(RESULT_BY_EVENT)
+            .expect("reverse")
+            .insert(orphan.as_slice(), &[][..])
+            .expect("insert orphaned reverse");
+        let mut stats = read_stats_write(&write).expect("stats");
+        stats.reverse_edges += 1;
+        stats.logical_bytes += orphan.len() as u64;
+        write_stats(&write, stats).expect("accounting");
+        write.commit().expect("commit");
+        drop(store);
+        assert_reopen_and_inspect_invariant(&file, "numbered Event reverse edge is orphaned");
     }
 
     fn store_path(name: &str) -> std::path::PathBuf {

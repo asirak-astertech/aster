@@ -914,6 +914,10 @@ pub enum CustodyStoreError {
         maximum: usize,
     },
     CounterOverflow,
+    UnsupportedSchemaVersion {
+        found: u64,
+        supported: u64,
+    },
     UnsupportedRetirementClass(CustodyObjectClass),
     Invariant(&'static str),
 }
@@ -989,6 +993,10 @@ impl fmt::Display for CustodyStoreError {
                 "custody page limit {requested} exceeds {maximum}"
             ),
             Self::CounterOverflow => formatter.write_str("custody accounting counter overflowed"),
+            Self::UnsupportedSchemaVersion { found, supported } => write!(
+                formatter,
+                "custody schema version {found} is unsupported; recreate the store for version {supported}"
+            ),
             Self::UnsupportedRetirementClass(class) => write!(
                 formatter,
                 "payload retirement for {class:?} is not selected"
@@ -1359,6 +1367,7 @@ pub(crate) enum EventCustodyAuthority {
         semantic_id: EventSemanticId,
         acceptance_marker: u64,
         reason: CustodyRetirementReason,
+        cleanup_pending: bool,
     },
     Missing,
 }
@@ -1547,6 +1556,7 @@ fn validate_cleanup_identity(
             || item.revision != cleanup.original_revision
             || item.priority != cleanup.priority
             || item.semantic_id != cleanup.semantic_id
+            || deferred_retirement_reason(item) != cleanup.reason
         {
             return Err(CustodyStoreError::Invariant(
                 "custody retirement cleanup differs from its marked item",
@@ -1566,6 +1576,41 @@ fn validate_cleanup_identity(
         return Err(CustodyStoreError::Invariant(
             "custody retirement cleanup differs from its fence",
         ));
+    }
+    Ok(())
+}
+
+fn validate_cleanup_control_state(
+    object: CustodyObjectKey,
+    acceptance_order: u64,
+    cleanup: &RetirementCleanupRecord,
+    item: Option<&CustodyItemRecord>,
+    fence: Option<&RetirementRecord>,
+) -> Result<(), StoreError> {
+    validate_cleanup_identity(cleanup, item, fence)?;
+    let authority_order = item
+        .map(|item| item.acceptance_order)
+        .or_else(|| fence.map(|fence| fence.acceptance_order))
+        .ok_or(CustodyStoreError::Invariant(
+            "custody retirement cleanup lacks marked item or fence",
+        ))?;
+    if acceptance_order != authority_order {
+        return Err(CustodyStoreError::Invariant(
+            "custody retirement cleanup order differs from its authority",
+        )
+        .into());
+    }
+    if let Some(cursor) = cleanup.numbered_cursor.as_deref() {
+        if object.class != CustodyObjectClass::Event {
+            return Err(CustodyStoreError::Invariant(
+                "non-Event custody cleanup has a numbered result cursor",
+            )
+            .into());
+        }
+        crate::numbered_event_operation::validate_numbered_cleanup_cursor(
+            EventTransferId::new(object.transfer_id),
+            cursor,
+        )?;
     }
     Ok(())
 }
@@ -1643,13 +1688,26 @@ pub(crate) fn event_custody_authority_write(
                 semantic_id: EventSemanticId::new(cleanup.semantic_id),
                 acceptance_marker: item.acceptance_order,
                 reason: cleanup.reason,
+                cleanup_pending: true,
             })
         }
-        (None, Some(fence)) => Ok(EventCustodyAuthority::Retired {
-            semantic_id: EventSemanticId::new(fence.semantic_id),
-            acceptance_marker: fence.acceptance_order,
-            reason: fence.reason,
-        }),
+        (None, Some(fence)) => {
+            let cleanup_key = retirement_cleanup_key_for_authority(key, fence.acceptance_order);
+            let cleanup = write
+                .open_table(CUSTODY_RETIRING)?
+                .get(cleanup_key.as_slice())?
+                .map(|value| cleanup_record_for_row(value.value(), None))
+                .transpose()?;
+            if let Some(cleanup) = &cleanup {
+                validate_cleanup_identity(cleanup, None, Some(&fence))?;
+            }
+            Ok(EventCustodyAuthority::Retired {
+                semantic_id: EventSemanticId::new(fence.semantic_id),
+                acceptance_marker: fence.acceptance_order,
+                reason: fence.reason,
+                cleanup_pending: cleanup.is_some(),
+            })
+        }
         (None, None) => Ok(EventCustodyAuthority::Missing),
         (Some(_), Some(_)) => Err(CustodyStoreError::Invariant(
             "custody Event overlaps live and retired authority",
@@ -1695,13 +1753,26 @@ pub(crate) fn event_custody_authority_read(
                 semantic_id: EventSemanticId::new(cleanup.semantic_id),
                 acceptance_marker: item.acceptance_order,
                 reason: cleanup.reason,
+                cleanup_pending: true,
             })
         }
-        (None, Some(fence)) => Ok(EventCustodyAuthority::Retired {
-            semantic_id: EventSemanticId::new(fence.semantic_id),
-            acceptance_marker: fence.acceptance_order,
-            reason: fence.reason,
-        }),
+        (None, Some(fence)) => {
+            let cleanup_key = retirement_cleanup_key_for_authority(key, fence.acceptance_order);
+            let cleanup = read
+                .open_table(CUSTODY_RETIRING)?
+                .get(cleanup_key.as_slice())?
+                .map(|value| cleanup_record_for_row(value.value(), None))
+                .transpose()?;
+            if let Some(cleanup) = &cleanup {
+                validate_cleanup_identity(cleanup, None, Some(&fence))?;
+            }
+            Ok(EventCustodyAuthority::Retired {
+                semantic_id: EventSemanticId::new(fence.semantic_id),
+                acceptance_marker: fence.acceptance_order,
+                reason: fence.reason,
+                cleanup_pending: cleanup.is_some(),
+            })
+        }
         (None, None) => Ok(EventCustodyAuthority::Missing),
         (Some(_), Some(_)) => Err(CustodyStoreError::Invariant(
             "custody Event overlaps live and retired authority",
@@ -2226,6 +2297,36 @@ impl<'a> CustodyCursor<'a> {
     }
 }
 
+const CUSTODY_SCHEMA_V1_TABLE_NAMES: [&str; 11] = [
+    "aster.custody-items.v1",
+    "aster.custody-retirements.v1",
+    "aster.custody-retired-semantics.v1",
+    "aster.custody-transfer-leases.v1",
+    "aster.custody-peer-receipts.v1",
+    "aster.custody-peer-retries.v1",
+    "aster.custody-quotas.v1",
+    "aster.custody-scope-usage.v1",
+    "aster.custody-continuity.v1",
+    "aster.custody-domain.v1",
+    "aster.custody-metadata.v1",
+];
+
+const CUSTODY_SCHEMA_V2_TABLE_NAMES: [&str; 13] = [
+    "aster.custody-items.v1",
+    "aster.custody-expirations.v2",
+    "aster.custody-retiring.v2",
+    "aster.custody-retirements.v1",
+    "aster.custody-retired-semantics.v1",
+    "aster.custody-transfer-leases.v1",
+    "aster.custody-peer-receipts.v1",
+    "aster.custody-peer-retries.v1",
+    "aster.custody-quotas.v1",
+    "aster.custody-scope-usage.v1",
+    "aster.custody-continuity.v1",
+    "aster.custody-domain.v1",
+    "aster.custody-metadata.v1",
+];
+
 const CUSTODY_TABLE_NAMES: [&str; 14] = [
     "aster.custody-items.v1",
     "aster.custody-expirations.v2",
@@ -2242,6 +2343,25 @@ const CUSTODY_TABLE_NAMES: [&str; 14] = [
     "aster.custody-domain.v1",
     "aster.custody-metadata.v1",
 ];
+
+fn unsupported_predecessor_version(
+    regular: &BTreeSet<String>,
+    metadata_version: Option<u64>,
+) -> Option<u64> {
+    [
+        (1, &CUSTODY_SCHEMA_V1_TABLE_NAMES[..]),
+        (2, &CUSTODY_SCHEMA_V2_TABLE_NAMES[..]),
+    ]
+    .into_iter()
+    .find_map(|(version, names)| {
+        let exact = names.iter().all(|name| regular.contains(*name))
+            && CUSTODY_TABLE_NAMES
+                .iter()
+                .filter(|name| !names.contains(name))
+                .all(|name| !regular.contains(*name));
+        (exact && metadata_version == Some(version)).then_some(version)
+    })
+}
 
 fn preflight_custody_schema_write(write: &redb::WriteTransaction) -> Result<bool, StoreError> {
     let regular = write
@@ -2266,6 +2386,21 @@ fn preflight_custody_schema_write(write: &redb::WriteTransaction) -> Result<bool
         .filter(|name| regular.contains(**name))
         .count();
     if present != 0 && present != CUSTODY_TABLE_NAMES.len() {
+        let metadata_version = if regular.contains(CUSTODY_METADATA.name()) {
+            write
+                .open_table(CUSTODY_METADATA)?
+                .get(CUSTODY_SCHEMA_VERSION_KEY)?
+                .map(|value| value.value())
+        } else {
+            None
+        };
+        if let Some(found) = unsupported_predecessor_version(&regular, metadata_version) {
+            return Err(CustodyStoreError::UnsupportedSchemaVersion {
+                found,
+                supported: CUSTODY_SCHEMA_VERSION,
+            }
+            .into());
+        }
         return Err(CustodyStoreError::Invariant("custody schema group is incomplete").into());
     }
     Ok(present == CUSTODY_TABLE_NAMES.len())
@@ -2294,6 +2429,20 @@ fn custody_schema_present_read(read: &redb::ReadTransaction) -> Result<bool, Sto
         .filter(|name| regular.contains(**name))
         .count();
     if present != 0 && present != CUSTODY_TABLE_NAMES.len() {
+        let metadata_version = if regular.contains(CUSTODY_METADATA.name()) {
+            read.open_table(CUSTODY_METADATA)?
+                .get(CUSTODY_SCHEMA_VERSION_KEY)?
+                .map(|value| value.value())
+        } else {
+            None
+        };
+        if let Some(found) = unsupported_predecessor_version(&regular, metadata_version) {
+            return Err(CustodyStoreError::UnsupportedSchemaVersion {
+                found,
+                supported: CUSTODY_SCHEMA_VERSION,
+            }
+            .into());
+        }
         return Err(CustodyStoreError::Invariant("custody schema group is incomplete").into());
     }
     Ok(present == CUSTODY_TABLE_NAMES.len())
@@ -7782,9 +7931,333 @@ fn expected_custody_maintenance_indexes(
     Ok((expirations, retiring))
 }
 
-fn expected_event_retirement_references_write(
+struct ParsedRetirementReference<'a> {
+    kind: u8,
+    target: &'a [u8],
+    primary: &'a [u8],
+}
+
+fn parse_retirement_reference_key(
+    encoded: &[u8],
+) -> Result<ParsedRetirementReference<'_>, StoreError> {
+    let (&kind, rest) = encoded.split_first().ok_or(CustodyStoreError::Invariant(
+        "custody retirement reference key is empty",
+    ))?;
+    let target_len = match kind {
+        RETIREMENT_REFERENCE_LEASE | RETIREMENT_REFERENCE_RETRY | RETIREMENT_REFERENCE_RECEIPT => {
+            33
+        }
+        RETIREMENT_REFERENCE_PENDING | RETIREMENT_REFERENCE_ACKNOWLEDGEMENT => 32,
+        _ => {
+            return Err(CustodyStoreError::Invariant(
+                "custody retirement reference kind is invalid",
+            )
+            .into());
+        }
+    };
+    if rest.len() <= target_len {
+        return Err(CustodyStoreError::Invariant(
+            "custody retirement reference key has invalid length",
+        )
+        .into());
+    }
+    let (target, primary) = rest.split_at(target_len);
+    match kind {
+        RETIREMENT_REFERENCE_LEASE => {
+            let _ = CustodyObjectKey::decode(target)?;
+            let _: [u8; 8] = primary.try_into().map_err(|_| {
+                CustodyStoreError::Invariant("lease retirement reference has invalid primary key")
+            })?;
+        }
+        RETIREMENT_REFERENCE_RETRY | RETIREMENT_REFERENCE_RECEIPT => {
+            let _ = CustodyObjectKey::decode(target)?;
+            let _ = parse_peer_object_key(primary)?;
+        }
+        RETIREMENT_REFERENCE_PENDING => {
+            let _: [u8; 32] = target.try_into().expect("checked semantic target length");
+            let _ = parse_event_pending_delivery_key(primary)?;
+        }
+        RETIREMENT_REFERENCE_ACKNOWLEDGEMENT => {
+            let _: [u8; 32] = target.try_into().expect("checked semantic target length");
+            let _ = parse_event_acknowledgement_key(primary)?;
+        }
+        _ => unreachable!("validated retirement reference kind"),
+    }
+    Ok(ParsedRetirementReference {
+        kind,
+        target,
+        primary,
+    })
+}
+
+fn require_retirement_reference_write(
     write: &redb::WriteTransaction,
-    expected: &mut BTreeSet<Vec<u8>>,
+    kind: u8,
+    target: &[u8],
+    primary: &[u8],
+) -> Result<(), StoreError> {
+    let key = retirement_reference_key(kind, target, primary);
+    let value = write
+        .open_table(CUSTODY_RETIREMENT_REFERENCES)?
+        .get(key.as_slice())?
+        .map(|value| value.value().to_vec())
+        .ok_or(CustodyStoreError::Invariant(
+            "custody retirement reference is missing for its source row",
+        ))?;
+    if !value.is_empty() {
+        return Err(
+            CustodyStoreError::Invariant("custody retirement reference value is invalid").into(),
+        );
+    }
+    Ok(())
+}
+
+fn require_retirement_reference_read(
+    read: &redb::ReadTransaction,
+    kind: u8,
+    target: &[u8],
+    primary: &[u8],
+) -> Result<(), StoreError> {
+    let key = retirement_reference_key(kind, target, primary);
+    let value = read
+        .open_table(CUSTODY_RETIREMENT_REFERENCES)?
+        .get(key.as_slice())?
+        .map(|value| value.value().to_vec())
+        .ok_or(CustodyStoreError::Invariant(
+            "custody retirement reference is missing for its source row",
+        ))?;
+    if !value.is_empty() {
+        return Err(
+            CustodyStoreError::Invariant("custody retirement reference value is invalid").into(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_dependency_authority_write(
+    write: &redb::WriteTransaction,
+    object: CustodyObjectKey,
+    allow_fenced: bool,
+    expected_semantic: Option<[u8; 32]>,
+    expected_revision: Option<u64>,
+    expected_priority: Option<Priority>,
+) -> Result<(), StoreError> {
+    let encoded = object.encoded();
+    let item = write
+        .open_table(CUSTODY_ITEMS)?
+        .get(encoded.as_slice())?
+        .map(|value| decode_item(value.value()))
+        .transpose()?;
+    let fence = write
+        .open_table(CUSTODY_RETIREMENTS)?
+        .get(encoded.as_slice())?
+        .map(|value| decode_retirement(value.value()))
+        .transpose()?;
+    if item.is_some() && fence.is_some() {
+        return Err(CustodyStoreError::Invariant(
+            "custody dependency authority overlaps live and retired state",
+        )
+        .into());
+    }
+    if let Some(item) = item {
+        if expected_semantic.is_some_and(|semantic| semantic != item.semantic_id)
+            || expected_revision.is_some_and(|revision| revision != item.revision)
+            || expected_priority.is_some_and(|priority| priority != item.priority)
+        {
+            return Err(CustodyStoreError::Invariant(
+                "custody dependency differs from its live authority",
+            )
+            .into());
+        }
+        if item.retiring {
+            let key = retirement_cleanup_key_for_authority(object, item.acceptance_order);
+            let value = write
+                .open_table(CUSTODY_RETIRING)?
+                .get(key.as_slice())?
+                .map(|value| value.value().to_vec())
+                .ok_or(CustodyStoreError::Invariant(
+                    "marked custody dependency lacks its cleanup authority",
+                ))?;
+            let cleanup = cleanup_record_for_row(&value, Some(&item))?;
+            validate_cleanup_identity(&cleanup, Some(&item), None)?;
+        }
+        return Ok(());
+    }
+    let fence = fence.ok_or(CustodyStoreError::Invariant(
+        "custody dependency references missing authority",
+    ))?;
+    if !allow_fenced {
+        return Err(CustodyStoreError::Invariant("custody lease survived payload fencing").into());
+    }
+    if expected_semantic.is_some_and(|semantic| semantic != fence.semantic_id) {
+        return Err(CustodyStoreError::Invariant(
+            "custody dependency semantic identity differs from its fence",
+        )
+        .into());
+    }
+    let key = retirement_cleanup_key_for_authority(object, fence.acceptance_order);
+    let value = write
+        .open_table(CUSTODY_RETIRING)?
+        .get(key.as_slice())?
+        .map(|value| value.value().to_vec())
+        .ok_or(CustodyStoreError::Invariant(
+            "custody retirement reference targets a clean fence",
+        ))?;
+    let cleanup = cleanup_record_for_row(&value, None)?;
+    validate_cleanup_identity(&cleanup, None, Some(&fence))?;
+    if expected_revision.is_some_and(|revision| revision != cleanup.original_revision)
+        || expected_priority.is_some_and(|priority| priority != cleanup.priority)
+    {
+        return Err(CustodyStoreError::Invariant(
+            "custody dependency differs from its cleanup authority",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_dependency_authority_read(
+    read: &redb::ReadTransaction,
+    object: CustodyObjectKey,
+    allow_fenced: bool,
+    expected_semantic: Option<[u8; 32]>,
+    expected_revision: Option<u64>,
+    expected_priority: Option<Priority>,
+) -> Result<(), StoreError> {
+    let encoded = object.encoded();
+    let item = read
+        .open_table(CUSTODY_ITEMS)?
+        .get(encoded.as_slice())?
+        .map(|value| decode_item(value.value()))
+        .transpose()?;
+    let fence = read
+        .open_table(CUSTODY_RETIREMENTS)?
+        .get(encoded.as_slice())?
+        .map(|value| decode_retirement(value.value()))
+        .transpose()?;
+    if item.is_some() && fence.is_some() {
+        return Err(CustodyStoreError::Invariant(
+            "custody dependency authority overlaps live and retired state",
+        )
+        .into());
+    }
+    if let Some(item) = item {
+        if expected_semantic.is_some_and(|semantic| semantic != item.semantic_id)
+            || expected_revision.is_some_and(|revision| revision != item.revision)
+            || expected_priority.is_some_and(|priority| priority != item.priority)
+        {
+            return Err(CustodyStoreError::Invariant(
+                "custody dependency differs from its live authority",
+            )
+            .into());
+        }
+        if item.retiring {
+            let key = retirement_cleanup_key_for_authority(object, item.acceptance_order);
+            let value = read
+                .open_table(CUSTODY_RETIRING)?
+                .get(key.as_slice())?
+                .map(|value| value.value().to_vec())
+                .ok_or(CustodyStoreError::Invariant(
+                    "marked custody dependency lacks its cleanup authority",
+                ))?;
+            let cleanup = cleanup_record_for_row(&value, Some(&item))?;
+            validate_cleanup_identity(&cleanup, Some(&item), None)?;
+        }
+        return Ok(());
+    }
+    let fence = fence.ok_or(CustodyStoreError::Invariant(
+        "custody dependency references missing authority",
+    ))?;
+    if !allow_fenced {
+        return Err(CustodyStoreError::Invariant("custody lease survived payload fencing").into());
+    }
+    if expected_semantic.is_some_and(|semantic| semantic != fence.semantic_id) {
+        return Err(CustodyStoreError::Invariant(
+            "custody dependency semantic identity differs from its fence",
+        )
+        .into());
+    }
+    let key = retirement_cleanup_key_for_authority(object, fence.acceptance_order);
+    let value = read
+        .open_table(CUSTODY_RETIRING)?
+        .get(key.as_slice())?
+        .map(|value| value.value().to_vec())
+        .ok_or(CustodyStoreError::Invariant(
+            "custody retirement reference targets a clean fence",
+        ))?;
+    let cleanup = cleanup_record_for_row(&value, None)?;
+    validate_cleanup_identity(&cleanup, None, Some(&fence))?;
+    if expected_revision.is_some_and(|revision| revision != cleanup.original_revision)
+        || expected_priority.is_some_and(|priority| priority != cleanup.priority)
+    {
+        return Err(CustodyStoreError::Invariant(
+            "custody dependency differs from its cleanup authority",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn event_object_for_semantic_write(
+    write: &redb::WriteTransaction,
+    semantic_id: EventSemanticId,
+) -> Result<CustodyObjectKey, StoreError> {
+    let transfer = write
+        .open_table(SEMANTIC_ITEMS)?
+        .get(semantic_id.as_bytes().as_slice())?
+        .map(|value| parse_transfer_id("semantic item table", value.value()))
+        .transpose()?
+        .ok_or(CustodyStoreError::Invariant(
+            "Event delivery dependency lacks retained semantic metadata",
+        ))?;
+    let metadata = write
+        .open_table(EVENTS)?
+        .get(transfer.as_bytes().as_slice())?
+        .map(|value| decode_event_metadata(value.value()))
+        .transpose()?
+        .ok_or(CustodyStoreError::Invariant(
+            "Event delivery dependency lacks retained Event metadata",
+        ))?;
+    if metadata.semantic_id != semantic_id {
+        return Err(CustodyStoreError::Invariant(
+            "Event delivery dependency semantic index is inconsistent",
+        )
+        .into());
+    }
+    Ok(CustodyObjectKey::event(transfer))
+}
+
+fn event_object_for_semantic_read(
+    read: &redb::ReadTransaction,
+    semantic_id: EventSemanticId,
+) -> Result<CustodyObjectKey, StoreError> {
+    let transfer = read
+        .open_table(SEMANTIC_ITEMS)?
+        .get(semantic_id.as_bytes().as_slice())?
+        .map(|value| parse_transfer_id("semantic item table", value.value()))
+        .transpose()?
+        .ok_or(CustodyStoreError::Invariant(
+            "Event delivery dependency lacks retained semantic metadata",
+        ))?;
+    let metadata = read
+        .open_table(EVENTS)?
+        .get(transfer.as_bytes().as_slice())?
+        .map(|value| decode_event_metadata(value.value()))
+        .transpose()?
+        .ok_or(CustodyStoreError::Invariant(
+            "Event delivery dependency lacks retained Event metadata",
+        ))?;
+    if metadata.semantic_id != semantic_id {
+        return Err(CustodyStoreError::Invariant(
+            "Event delivery dependency semantic index is inconsistent",
+        )
+        .into());
+    }
+    Ok(CustodyObjectKey::event(transfer))
+}
+
+fn audit_event_retirement_reference_sources_write(
+    write: &redb::WriteTransaction,
 ) -> Result<(), StoreError> {
     let tables = write
         .list_tables()?
@@ -7794,11 +8267,21 @@ fn expected_event_retirement_references_write(
         for row in write.open_table(EVENT_SUBSCRIPTION_PENDING)?.iter()? {
             let (key, value) = row?;
             let pending = decode_event_pending_delivery_record(value.value())?;
-            expected.insert(retirement_reference_key(
+            let object = event_object_for_semantic_write(write, pending.semantic_id)?;
+            validate_dependency_authority_write(
+                write,
+                object,
+                true,
+                Some(*pending.semantic_id.as_bytes()),
+                None,
+                None,
+            )?;
+            require_retirement_reference_write(
+                write,
                 RETIREMENT_REFERENCE_PENDING,
                 pending.semantic_id.as_bytes(),
                 key.value(),
-            ));
+            )?;
         }
     }
     if tables.contains(EVENT_DELIVERY_ACKNOWLEDGEMENTS.name()) {
@@ -7806,19 +8289,28 @@ fn expected_event_retirement_references_write(
             let (key, value) = row?;
             let (_, semantic_id) = parse_event_acknowledgement_key(key.value())?;
             let _ = decode_event_acknowledgement_record(value.value())?;
-            expected.insert(retirement_reference_key(
+            let object = event_object_for_semantic_write(write, semantic_id)?;
+            validate_dependency_authority_write(
+                write,
+                object,
+                true,
+                Some(*semantic_id.as_bytes()),
+                None,
+                None,
+            )?;
+            require_retirement_reference_write(
+                write,
                 RETIREMENT_REFERENCE_ACKNOWLEDGEMENT,
                 semantic_id.as_bytes(),
                 key.value(),
-            ));
+            )?;
         }
     }
     Ok(())
 }
 
-fn expected_event_retirement_references_read(
+fn audit_event_retirement_reference_sources_read(
     read: &redb::ReadTransaction,
-    expected: &mut BTreeSet<Vec<u8>>,
 ) -> Result<(), StoreError> {
     let tables = read
         .list_tables()?
@@ -7828,11 +8320,21 @@ fn expected_event_retirement_references_read(
         for row in read.open_table(EVENT_SUBSCRIPTION_PENDING)?.iter()? {
             let (key, value) = row?;
             let pending = decode_event_pending_delivery_record(value.value())?;
-            expected.insert(retirement_reference_key(
+            let object = event_object_for_semantic_read(read, pending.semantic_id)?;
+            validate_dependency_authority_read(
+                read,
+                object,
+                true,
+                Some(*pending.semantic_id.as_bytes()),
+                None,
+                None,
+            )?;
+            require_retirement_reference_read(
+                read,
                 RETIREMENT_REFERENCE_PENDING,
                 pending.semantic_id.as_bytes(),
                 key.value(),
-            ));
+            )?;
         }
     }
     if tables.contains(EVENT_DELIVERY_ACKNOWLEDGEMENTS.name()) {
@@ -7840,21 +8342,27 @@ fn expected_event_retirement_references_read(
             let (key, value) = row?;
             let (_, semantic_id) = parse_event_acknowledgement_key(key.value())?;
             let _ = decode_event_acknowledgement_record(value.value())?;
-            expected.insert(retirement_reference_key(
+            let object = event_object_for_semantic_read(read, semantic_id)?;
+            validate_dependency_authority_read(
+                read,
+                object,
+                true,
+                Some(*semantic_id.as_bytes()),
+                None,
+                None,
+            )?;
+            require_retirement_reference_read(
+                read,
                 RETIREMENT_REFERENCE_ACKNOWLEDGEMENT,
                 semantic_id.as_bytes(),
                 key.value(),
-            ));
+            )?;
         }
     }
     Ok(())
 }
 
-fn audit_retirement_references_write(
-    write: &redb::WriteTransaction,
-    expected: &BTreeSet<Vec<u8>>,
-) -> Result<(), StoreError> {
-    let mut durable = BTreeSet::new();
+fn audit_retirement_references_write(write: &redb::WriteTransaction) -> Result<(), StoreError> {
     for row in write.open_table(CUSTODY_RETIREMENT_REFERENCES)?.iter()? {
         let (key, value) = row?;
         if !value.value().is_empty() {
@@ -7863,22 +8371,142 @@ fn audit_retirement_references_write(
             )
             .into());
         }
-        durable.insert(key.value().to_vec());
-    }
-    if &durable != expected {
-        return Err(CustodyStoreError::Invariant(
-            "custody retirement references differ from source rows",
-        )
-        .into());
+        let parsed = parse_retirement_reference_key(key.value())?;
+        match parsed.kind {
+            RETIREMENT_REFERENCE_LEASE => {
+                let id =
+                    u64::from_be_bytes(parsed.primary.try_into().expect("validated lease key"));
+                let lease = write
+                    .open_table(CUSTODY_LEASES)?
+                    .get(id)?
+                    .map(|value| decode_lease(value.value()))
+                    .transpose()?
+                    .ok_or(CustodyStoreError::Invariant(
+                        "custody retirement reference points to a missing lease",
+                    ))?;
+                if lease.object.encoded().as_slice() != parsed.target {
+                    return Err(CustodyStoreError::Invariant(
+                        "lease retirement reference targets the wrong object",
+                    )
+                    .into());
+                }
+                validate_dependency_authority_write(
+                    write,
+                    lease.object,
+                    false,
+                    None,
+                    Some(lease.item_revision),
+                    None,
+                )?;
+            }
+            RETIREMENT_REFERENCE_RETRY => {
+                let retry = write
+                    .open_table(CUSTODY_RETRIES)?
+                    .get(parsed.primary)?
+                    .map(|value| decode_retry(value.value()))
+                    .transpose()?
+                    .ok_or(CustodyStoreError::Invariant(
+                        "custody retirement reference points to a missing retry",
+                    ))?;
+                let (_, object) = parse_peer_object_key(parsed.primary)?;
+                if object.encoded().as_slice() != parsed.target {
+                    return Err(CustodyStoreError::Invariant(
+                        "retry retirement reference targets the wrong object",
+                    )
+                    .into());
+                }
+                validate_dependency_authority_write(
+                    write,
+                    object,
+                    true,
+                    None,
+                    Some(retry.item_revision),
+                    Some(retry.priority),
+                )?;
+            }
+            RETIREMENT_REFERENCE_RECEIPT => {
+                let receipt = write
+                    .open_table(CUSTODY_PEER_RECEIPTS)?
+                    .get(parsed.primary)?
+                    .map(|value| decode_receipt(value.value()))
+                    .transpose()?
+                    .ok_or(CustodyStoreError::Invariant(
+                        "custody retirement reference points to a missing receipt",
+                    ))?;
+                let (_, object) = parse_peer_object_key(parsed.primary)?;
+                if object.encoded().as_slice() != parsed.target {
+                    return Err(CustodyStoreError::Invariant(
+                        "receipt retirement reference targets the wrong object",
+                    )
+                    .into());
+                }
+                validate_dependency_authority_write(
+                    write,
+                    object,
+                    true,
+                    None,
+                    Some(receipt.item_revision),
+                    None,
+                )?;
+            }
+            RETIREMENT_REFERENCE_PENDING => {
+                let pending = write
+                    .open_table(EVENT_SUBSCRIPTION_PENDING)?
+                    .get(parsed.primary)?
+                    .map(|value| decode_event_pending_delivery_record(value.value()))
+                    .transpose()?
+                    .ok_or(CustodyStoreError::Invariant(
+                        "custody retirement reference points to a missing pending delivery",
+                    ))?;
+                if pending.semantic_id.as_bytes() != parsed.target {
+                    return Err(CustodyStoreError::Invariant(
+                        "pending retirement reference targets the wrong Event",
+                    )
+                    .into());
+                }
+                let object = event_object_for_semantic_write(write, pending.semantic_id)?;
+                validate_dependency_authority_write(
+                    write,
+                    object,
+                    true,
+                    Some(*pending.semantic_id.as_bytes()),
+                    None,
+                    None,
+                )?;
+            }
+            RETIREMENT_REFERENCE_ACKNOWLEDGEMENT => {
+                let (_, semantic_id) = parse_event_acknowledgement_key(parsed.primary)?;
+                let _ = write
+                    .open_table(EVENT_DELIVERY_ACKNOWLEDGEMENTS)?
+                    .get(parsed.primary)?
+                    .map(|value| decode_event_acknowledgement_record(value.value()))
+                    .transpose()?
+                    .ok_or(CustodyStoreError::Invariant(
+                        "custody retirement reference points to a missing acknowledgement",
+                    ))?;
+                if semantic_id.as_bytes() != parsed.target {
+                    return Err(CustodyStoreError::Invariant(
+                        "acknowledgement retirement reference targets the wrong Event",
+                    )
+                    .into());
+                }
+                let object = event_object_for_semantic_write(write, semantic_id)?;
+                validate_dependency_authority_write(
+                    write,
+                    object,
+                    true,
+                    Some(*semantic_id.as_bytes()),
+                    None,
+                    None,
+                )?;
+            }
+            _ => unreachable!("validated retirement reference kind"),
+        }
     }
     Ok(())
 }
 
-fn audit_retirement_references_read(
-    read: &redb::ReadTransaction,
-    expected: &BTreeSet<Vec<u8>>,
-) -> Result<(), StoreError> {
-    let mut durable = BTreeSet::new();
+fn audit_retirement_references_read(read: &redb::ReadTransaction) -> Result<(), StoreError> {
     for row in read.open_table(CUSTODY_RETIREMENT_REFERENCES)?.iter()? {
         let (key, value) = row?;
         if !value.value().is_empty() {
@@ -7887,13 +8515,137 @@ fn audit_retirement_references_read(
             )
             .into());
         }
-        durable.insert(key.value().to_vec());
-    }
-    if &durable != expected {
-        return Err(CustodyStoreError::Invariant(
-            "custody retirement references differ from source rows",
-        )
-        .into());
+        let parsed = parse_retirement_reference_key(key.value())?;
+        match parsed.kind {
+            RETIREMENT_REFERENCE_LEASE => {
+                let id =
+                    u64::from_be_bytes(parsed.primary.try_into().expect("validated lease key"));
+                let lease = read
+                    .open_table(CUSTODY_LEASES)?
+                    .get(id)?
+                    .map(|value| decode_lease(value.value()))
+                    .transpose()?
+                    .ok_or(CustodyStoreError::Invariant(
+                        "custody retirement reference points to a missing lease",
+                    ))?;
+                if lease.object.encoded().as_slice() != parsed.target {
+                    return Err(CustodyStoreError::Invariant(
+                        "lease retirement reference targets the wrong object",
+                    )
+                    .into());
+                }
+                validate_dependency_authority_read(
+                    read,
+                    lease.object,
+                    false,
+                    None,
+                    Some(lease.item_revision),
+                    None,
+                )?;
+            }
+            RETIREMENT_REFERENCE_RETRY => {
+                let retry = read
+                    .open_table(CUSTODY_RETRIES)?
+                    .get(parsed.primary)?
+                    .map(|value| decode_retry(value.value()))
+                    .transpose()?
+                    .ok_or(CustodyStoreError::Invariant(
+                        "custody retirement reference points to a missing retry",
+                    ))?;
+                let (_, object) = parse_peer_object_key(parsed.primary)?;
+                if object.encoded().as_slice() != parsed.target {
+                    return Err(CustodyStoreError::Invariant(
+                        "retry retirement reference targets the wrong object",
+                    )
+                    .into());
+                }
+                validate_dependency_authority_read(
+                    read,
+                    object,
+                    true,
+                    None,
+                    Some(retry.item_revision),
+                    Some(retry.priority),
+                )?;
+            }
+            RETIREMENT_REFERENCE_RECEIPT => {
+                let receipt = read
+                    .open_table(CUSTODY_PEER_RECEIPTS)?
+                    .get(parsed.primary)?
+                    .map(|value| decode_receipt(value.value()))
+                    .transpose()?
+                    .ok_or(CustodyStoreError::Invariant(
+                        "custody retirement reference points to a missing receipt",
+                    ))?;
+                let (_, object) = parse_peer_object_key(parsed.primary)?;
+                if object.encoded().as_slice() != parsed.target {
+                    return Err(CustodyStoreError::Invariant(
+                        "receipt retirement reference targets the wrong object",
+                    )
+                    .into());
+                }
+                validate_dependency_authority_read(
+                    read,
+                    object,
+                    true,
+                    None,
+                    Some(receipt.item_revision),
+                    None,
+                )?;
+            }
+            RETIREMENT_REFERENCE_PENDING => {
+                let pending = read
+                    .open_table(EVENT_SUBSCRIPTION_PENDING)?
+                    .get(parsed.primary)?
+                    .map(|value| decode_event_pending_delivery_record(value.value()))
+                    .transpose()?
+                    .ok_or(CustodyStoreError::Invariant(
+                        "custody retirement reference points to a missing pending delivery",
+                    ))?;
+                if pending.semantic_id.as_bytes() != parsed.target {
+                    return Err(CustodyStoreError::Invariant(
+                        "pending retirement reference targets the wrong Event",
+                    )
+                    .into());
+                }
+                let object = event_object_for_semantic_read(read, pending.semantic_id)?;
+                validate_dependency_authority_read(
+                    read,
+                    object,
+                    true,
+                    Some(*pending.semantic_id.as_bytes()),
+                    None,
+                    None,
+                )?;
+            }
+            RETIREMENT_REFERENCE_ACKNOWLEDGEMENT => {
+                let (_, semantic_id) = parse_event_acknowledgement_key(parsed.primary)?;
+                let _ = read
+                    .open_table(EVENT_DELIVERY_ACKNOWLEDGEMENTS)?
+                    .get(parsed.primary)?
+                    .map(|value| decode_event_acknowledgement_record(value.value()))
+                    .transpose()?
+                    .ok_or(CustodyStoreError::Invariant(
+                        "custody retirement reference points to a missing acknowledgement",
+                    ))?;
+                if semantic_id.as_bytes() != parsed.target {
+                    return Err(CustodyStoreError::Invariant(
+                        "acknowledgement retirement reference targets the wrong Event",
+                    )
+                    .into());
+                }
+                let object = event_object_for_semantic_read(read, semantic_id)?;
+                validate_dependency_authority_read(
+                    read,
+                    object,
+                    true,
+                    Some(*semantic_id.as_bytes()),
+                    None,
+                    None,
+                )?;
+            }
+            _ => unreachable!("validated retirement reference kind"),
+        }
     }
     Ok(())
 }
@@ -8227,15 +8979,13 @@ pub(crate) fn audit_custody_tables_write(
         retirement_count = next_counter(retirement_count)?;
     }
     for (object, (acceptance_order, cleanup)) in &retirement_cleanups {
-        if let Some(item) = items.get(object)
-            && item.acceptance_order != *acceptance_order
-        {
-            return Err(CustodyStoreError::Invariant(
-                "custody retirement cleanup order differs from its marked item",
-            )
-            .into());
-        }
-        validate_cleanup_identity(cleanup, items.get(object), retirements.get(object))?;
+        validate_cleanup_control_state(
+            *object,
+            *acceptance_order,
+            cleanup,
+            items.get(object),
+            retirements.get(object),
+        )?;
     }
     require_unique_event_transfer_state(items.keys().chain(retirements.keys()).copied())?;
     if retirement_count > MAX_CUSTODY_RETIREMENTS {
@@ -8274,7 +9024,6 @@ pub(crate) fn audit_custody_tables_write(
         .into());
     }
 
-    let mut expected_retirement_references = BTreeSet::new();
     let mut lease_count = 0u64;
     let mut max_lease = 0u64;
     let mut lease_ids = Vec::new();
@@ -8299,11 +9048,12 @@ pub(crate) fn audit_custody_tables_write(
         lease_count = next_counter(lease_count)?;
         max_lease = max_lease.max(id);
         lease_ids.push(id);
-        expected_retirement_references.insert(retirement_reference_key(
+        require_retirement_reference_write(
+            write,
             RETIREMENT_REFERENCE_LEASE,
             lease.object.encoded().as_slice(),
             &id.to_be_bytes(),
-        ));
+        )?;
     }
     if lease_count > MAX_CUSTODY_TRANSFER_LEASES || max_lease > next_lease {
         return Err(
@@ -8336,11 +9086,12 @@ pub(crate) fn audit_custody_tables_write(
         if receipt.peer_selector_revision.is_none() {
             legacy_receipt_keys.push(key.value().to_vec());
         }
-        expected_retirement_references.insert(retirement_reference_key(
+        require_retirement_reference_write(
+            write,
             RETIREMENT_REFERENCE_RECEIPT,
             object.encoded().as_slice(),
             key.value(),
-        ));
+        )?;
         receipt_count = next_counter(receipt_count)?;
     }
     if receipt_count > MAX_CUSTODY_PEER_RECEIPTS {
@@ -8373,19 +9124,20 @@ pub(crate) fn audit_custody_tables_write(
             )
             .into());
         }
-        expected_retirement_references.insert(retirement_reference_key(
+        require_retirement_reference_write(
+            write,
             RETIREMENT_REFERENCE_RETRY,
             object.encoded().as_slice(),
             key.value(),
-        ));
+        )?;
         retry_count = next_counter(retry_count)?;
     }
     if retry_count > MAX_CUSTODY_RETRY_RECORDS {
         return Err(CustodyStoreError::Invariant("retry cap is exceeded").into());
     }
     drop(receipts);
-    expected_event_retirement_references_write(write, &mut expected_retirement_references)?;
-    audit_retirement_references_write(write, &expected_retirement_references)?;
+    audit_event_retirement_reference_sources_write(write)?;
+    audit_retirement_references_write(write)?;
 
     let mut quota_count = 0u64;
     let mut quotas = BTreeMap::new();
@@ -8907,15 +9659,13 @@ pub(crate) fn inspect_custody_tables_read(
         retirements.insert(key, record);
     }
     for (object, (acceptance_order, cleanup)) in &retirement_cleanups {
-        if let Some(item) = items.get(object)
-            && item.acceptance_order != *acceptance_order
-        {
-            return Err(CustodyStoreError::Invariant(
-                "custody retirement cleanup order differs from its marked item",
-            )
-            .into());
-        }
-        validate_cleanup_identity(cleanup, items.get(object), retirements.get(object))?;
+        validate_cleanup_control_state(
+            *object,
+            *acceptance_order,
+            cleanup,
+            items.get(object),
+            retirements.get(object),
+        )?;
     }
     require_unique_event_transfer_state(items.keys().chain(retirements.keys()).copied())?;
     let retirement_count =
@@ -8955,7 +9705,6 @@ pub(crate) fn inspect_custody_tables_read(
         )
         .into());
     }
-    let mut expected_retirement_references = BTreeSet::new();
     let mut lease_count = 0u64;
     let mut max_lease = 0u64;
     for row in read.open_table(CUSTODY_LEASES)?.iter()? {
@@ -8973,11 +9722,12 @@ pub(crate) fn inspect_custody_tables_read(
         }
         lease_count = next_counter(lease_count)?;
         max_lease = max_lease.max(id.value());
-        expected_retirement_references.insert(retirement_reference_key(
+        require_retirement_reference_read(
+            read,
             RETIREMENT_REFERENCE_LEASE,
             lease.object.encoded().as_slice(),
             &id.value().to_be_bytes(),
-        ));
+        )?;
     }
     if lease_count > MAX_CUSTODY_TRANSFER_LEASES || max_lease > next_lease {
         return Err(
@@ -9005,11 +9755,12 @@ pub(crate) fn inspect_custody_tables_read(
             )
             .into());
         }
-        expected_retirement_references.insert(retirement_reference_key(
+        require_retirement_reference_read(
+            read,
             RETIREMENT_REFERENCE_RECEIPT,
             object.encoded().as_slice(),
             key.value(),
-        ));
+        )?;
         receipt_count = next_counter(receipt_count)?;
     }
     if receipt_count > MAX_CUSTODY_PEER_RECEIPTS {
@@ -9041,18 +9792,19 @@ pub(crate) fn inspect_custody_tables_read(
             )
             .into());
         }
-        expected_retirement_references.insert(retirement_reference_key(
+        require_retirement_reference_read(
+            read,
             RETIREMENT_REFERENCE_RETRY,
             object.encoded().as_slice(),
             key.value(),
-        ));
+        )?;
         retry_count = next_counter(retry_count)?;
     }
     if retry_count > MAX_CUSTODY_RETRY_RECORDS {
         return Err(CustodyStoreError::Invariant("retry cap is exceeded").into());
     }
-    expected_event_retirement_references_read(read, &mut expected_retirement_references)?;
-    audit_retirement_references_read(read, &expected_retirement_references)?;
+    audit_event_retirement_reference_sources_read(read)?;
+    audit_retirement_references_read(read)?;
     let mut quotas = BTreeMap::new();
     for row in read.open_table(CUSTODY_QUOTAS)?.iter()? {
         let (key, value) = row?;

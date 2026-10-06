@@ -1077,6 +1077,141 @@ fn numbered_cleanup_rejects_receipt_identity_corruption_without_retirement_progr
     );
 }
 
+fn mutate_first_numbered_result(store: &Store, mutate: impl FnOnce(&mut [u8])) {
+    const RESULTS: redb::TableDefinition<&[u8], &[u8]> =
+        redb::TableDefinition::new("aster.numbered-event-results.v1");
+
+    let write = store
+        .database
+        .begin_write()
+        .expect("corrupt numbered result");
+    let (key, mut value) = write
+        .open_table(RESULTS)
+        .expect("result table")
+        .iter()
+        .expect("result rows")
+        .next()
+        .expect("one result")
+        .map(|(key, value)| (key.value().to_vec(), value.value().to_vec()))
+        .expect("read result");
+    mutate(&mut value);
+    write
+        .open_table(RESULTS)
+        .expect("result table")
+        .insert(key.as_slice(), value.as_slice())
+        .expect("write corrupt result");
+    write.commit().expect("commit result corruption");
+}
+
+#[test]
+fn numbered_result_audits_reject_custody_authority_corruption_without_mutation() {
+    enum Corruption {
+        RetiredWithLiveCustody,
+        WrongSemantic,
+        WrongAcceptanceMarker,
+        WrongRetirementReason,
+        AvailableAtCleanFence,
+    }
+
+    for (index, corruption) in [
+        Corruption::RetiredWithLiveCustody,
+        Corruption::WrongSemantic,
+        Corruption::WrongAcceptanceMarker,
+        Corruption::WrongRetirementReason,
+        Corruption::AvailableAtCleanFence,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (file, services, store, _client, _before, published, _replay) =
+            numbered_finite_fixture(Priority::Routine);
+        if matches!(
+            corruption,
+            Corruption::WrongRetirementReason | Corruption::AvailableAtCleanFence
+        ) {
+            assert_eq!(
+                retire(&store)
+                    .expect("complete clean-fence retirement")
+                    .retired,
+                vec![CustodyObjectKey::event(published.receipt.transfer_id)]
+            );
+        }
+        mutate_first_numbered_result(&store, |encoded| match corruption {
+            Corruption::RetiredWithLiveCustody => {
+                encoded[105] = 2;
+                encoded[106] = CustodyRetirementReason::Expired as u8;
+            }
+            Corruption::WrongSemantic => encoded[65] ^= 1,
+            Corruption::WrongAcceptanceMarker => {
+                let marker = u64::from_be_bytes(encoded[97..105].try_into().expect("marker bytes"));
+                encoded[97..105].copy_from_slice(&(marker + 1).to_be_bytes());
+            }
+            Corruption::WrongRetirementReason => {
+                encoded[105] = 2;
+                encoded[106] = CustodyRetirementReason::QuotaPressure as u8;
+            }
+            Corruption::AvailableAtCleanFence => {
+                encoded[105] = 1;
+                encoded[106] = 0;
+            }
+        });
+        drop(store);
+
+        for result in [
+            Store::inspect_existing(&file.0).map(|_| ()),
+            Store::open_for_mission(&file.0, services.authority).map(|_| ()),
+        ] {
+            assert!(
+                matches!(result, Err(StoreError::NumberedEventOperation(_))),
+                "numbered authority corruption {index} was accepted: {result:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn numbered_result_audits_accept_raw_available_only_while_cleanup_is_pending() {
+    let (marked_file, marked_services, marked_store, _client, _before, published, _replay) =
+        numbered_finite_fixture(Priority::Routine);
+    let key = CustodyObjectKey::event(published.receipt.transfer_id);
+    let _lease = marked_store
+        .begin_custody_send(
+            marked_services.relay.identity(),
+            key,
+            CustodyPeerSelectorRevision::new(1),
+            Some(SAMPLE),
+            1,
+            marked_store
+                .custody_policy_revision()
+                .expect("marked policy revision"),
+        )
+        .expect("hold marked payload");
+    assert_eq!(
+        retire(&marked_store).expect("mark with lease").marked,
+        vec![key]
+    );
+    drop(marked_store);
+    Store::inspect_existing(&marked_file.0).expect("inspect raw Marked result");
+    drop(
+        Store::open_for_mission(&marked_file.0, marked_services.authority)
+            .expect("reopen raw Marked result"),
+    );
+
+    let (fenced_file, fenced_services, fenced_store, _client, _before, published, _replay) =
+        numbered_finite_fixture(Priority::Routine);
+    let key = CustodyObjectKey::event(published.receipt.transfer_id);
+    seed_peer_receipt_fanout(&fenced_store, key, MAX_CUSTODY_PAGE);
+    let fenced = retire(&fenced_store).expect("fence with pending cleanup");
+    assert!(fenced.retired.is_empty());
+    assert_eq!(fenced.examined_dependencies, MAX_CUSTODY_PAGE as u64);
+    drop(fenced_store);
+    Store::inspect_existing(&fenced_file.0).expect("inspect raw FencedCleaning result");
+    drop(
+        Store::open_for_mission(&fenced_file.0, fenced_services.authority)
+            .expect("reopen raw FencedCleaning result"),
+    );
+}
+
 #[test]
 fn numbered_cleanup_rewrites_raw_pages_and_persists_client_revision() {
     let (file, services, store, client, _before, published, _replay) =
@@ -1133,25 +1268,90 @@ fn numbered_cleanup_rewrites_raw_pages_and_persists_client_revision() {
 
 #[test]
 fn malformed_durable_numbered_cursor_cannot_control_cleanup_after_reopen() {
-    let (file, services, store, client, _before, published, _replay) =
-        numbered_finite_fixture(Priority::Routine);
-    let write = store.database.begin_write().expect("seed cursor fan-out");
-    crate::numbered_event_operation::seed_numbered_result_fanout_write(
-        &write,
-        &client,
-        published.receipt,
-        1_024,
-    )
-    .expect("seed cursor results");
-    write.commit().expect("commit cursor fan-out");
-    let first = retire(&store).expect("create durable cursor");
-    assert!(first.retired.is_empty());
+    for foreign_prefix in [false, true] {
+        let (file, services, store, client, _before, published, _replay) =
+            numbered_finite_fixture(Priority::Routine);
+        let write = store.database.begin_write().expect("seed cursor fan-out");
+        crate::numbered_event_operation::seed_numbered_result_fanout_write(
+            &write,
+            &client,
+            published.receipt,
+            1_024,
+        )
+        .expect("seed cursor results");
+        write.commit().expect("commit cursor fan-out");
+        let first = retire(&store).expect("create durable cursor");
+        assert!(first.retired.is_empty());
 
-    let write = store
-        .database
-        .begin_write()
-        .expect("corrupt cleanup cursor");
-    let (cleanup_key, mut cleanup) = write
+        let write = store
+            .database
+            .begin_write()
+            .expect("corrupt cleanup cursor");
+        let (cleanup_key, mut cleanup) = write
+            .open_table(custody::CUSTODY_RETIRING)
+            .expect("cleanup table")
+            .iter()
+            .expect("cleanup rows")
+            .next()
+            .expect("one cleanup row")
+            .map(|(key, value)| (key.value().to_vec(), value.value().to_vec()))
+            .expect("read cleanup row");
+        assert_eq!(cleanup[43], 1, "cursor must be present before corruption");
+        if foreign_prefix {
+            cleanup[48] ^= 1;
+        } else {
+            cleanup[44..48].copy_from_slice(&32u32.to_be_bytes());
+            cleanup.truncate(80);
+        }
+        write
+            .open_table(custody::CUSTODY_RETIRING)
+            .expect("cleanup table")
+            .insert(cleanup_key.as_slice(), cleanup.as_slice())
+            .expect("write malformed cursor");
+        write.commit().expect("commit malformed cursor");
+        drop(store);
+
+        for result in [
+            Store::inspect_existing(&file.0).map(|_| ()),
+            Store::open_for_mission(&file.0, services.authority).map(|_| ()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(StoreError::NumberedEventOperation(
+                    NumberedEventOperationError::Invariant(
+                        "numbered Event cleanup cursor key is invalid"
+                    )
+                ))
+            ));
+        }
+        let database = redb::Builder::new()
+            .open_read_only(&file.0)
+            .expect("read rejected image");
+        let read = database.begin_read().expect("read transaction");
+        assert_eq!(
+            read.open_table(custody::CUSTODY_RETIRING)
+                .expect("cleanup table")
+                .get(cleanup_key.as_slice())
+                .expect("read cleanup row")
+                .expect("cleanup row retained")
+                .value(),
+            cleanup.as_slice(),
+            "audit rejection must retain malformed cleanup control state"
+        );
+    }
+}
+
+#[test]
+fn fenced_cleanup_audits_reject_wrong_queue_order() {
+    let (file, services, store, _client, _before, published, _replay) =
+        numbered_finite_fixture(Priority::Routine);
+    let object = CustodyObjectKey::event(published.receipt.transfer_id);
+    seed_peer_receipt_fanout(&store, object, MAX_CUSTODY_PAGE);
+    let fenced = retire(&store).expect("fence with pending cleanup");
+    assert!(fenced.retired.is_empty());
+
+    let write = store.database.begin_write().expect("corrupt cleanup order");
+    let (mut cleanup_key, cleanup_value) = write
         .open_table(custody::CUSTODY_RETIRING)
         .expect("cleanup table")
         .iter()
@@ -1160,51 +1360,36 @@ fn malformed_durable_numbered_cursor_cannot_control_cleanup_after_reopen() {
         .expect("one cleanup row")
         .map(|(key, value)| (key.value().to_vec(), value.value().to_vec()))
         .expect("read cleanup row");
-    assert_eq!(cleanup[43], 1, "cursor must be present before corruption");
-    cleanup[44..48].copy_from_slice(&32u32.to_be_bytes());
-    cleanup.truncate(80);
     write
         .open_table(custody::CUSTODY_RETIRING)
         .expect("cleanup table")
-        .insert(cleanup_key.as_slice(), cleanup.as_slice())
-        .expect("write malformed cursor");
-    write.commit().expect("commit malformed cursor");
-    let revision_before =
-        crate::numbered_event_operation::client_snapshot_revision_for_test(&store, &client)
-            .expect("revision before malformed cursor pass");
+        .remove(cleanup_key.as_slice())
+        .expect("remove exact cleanup")
+        .expect("cleanup existed");
+    let order = u64::from_be_bytes(cleanup_key[..8].try_into().expect("order bytes"));
+    cleanup_key[..8].copy_from_slice(&(order + 1).to_be_bytes());
+    write
+        .open_table(custody::CUSTODY_RETIRING)
+        .expect("cleanup table")
+        .insert(cleanup_key.as_slice(), cleanup_value.as_slice())
+        .expect("insert wrong-order cleanup");
+    write.commit().expect("commit wrong cleanup order");
     drop(store);
 
-    let reopened =
-        Store::open_for_mission(&file.0, services.authority).expect("reopen malformed cursor");
-    assert!(matches!(
-        retire(&reopened),
-        Err(StoreError::NumberedEventOperation(
-            NumberedEventOperationError::Invariant("numbered Event cleanup cursor key is invalid")
-        ))
-    ));
-    assert_eq!(
-        crate::numbered_event_operation::client_snapshot_revision_for_test(&reopened, &client)
-            .expect("revision after cursor rejection"),
-        revision_before
-    );
-    let read = reopened
-        .database
-        .begin_read()
-        .expect("read rejected cleanup");
-    assert_eq!(
-        read.open_table(custody::CUSTODY_RETIRING)
-            .expect("cleanup table")
-            .len()
-            .expect("cleanup rows"),
-        1
-    );
-    assert_eq!(
-        read.open_table(custody::CUSTODY_RETIREMENTS)
-            .expect("retirement fences")
-            .len()
-            .expect("fence rows"),
-        1
-    );
+    for result in [
+        Store::inspect_existing(&file.0).map(|_| ()),
+        Store::open_for_mission(&file.0, services.authority).map(|_| ()),
+    ] {
+        assert!(
+            matches!(
+                result,
+                Err(StoreError::Custody(CustodyStoreError::Invariant(
+                    "custody retirement cleanup order differs from its authority"
+                )))
+            ),
+            "wrong fenced cleanup order did not preserve its structural diagnostic: {result:?}"
+        );
+    }
 }
 
 #[test]

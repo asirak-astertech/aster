@@ -5791,6 +5791,7 @@ impl Store {
             ));
         }
         custody::audit_custody_tables_write(&write, limits, mission_authority)?;
+        numbered_event_operation::audit_numbered_result_authority_write(&write)?;
         if operation_migration.is_some() {
             // A failed physical audit must not leave a committed operation
             // migration behind. Keep all fallible depot validation/reclaim in
@@ -10260,6 +10261,7 @@ impl Store {
                 semantic_id,
                 acceptance_marker,
                 reason,
+                ..
             } = custody::event_custody_authority_write(&write, accepted)?
             {
                 let metadata = write
@@ -23298,8 +23300,10 @@ fn inspect_readable(
             .checked_add(metadata.get(field)?.map_or(0, |value| value.value()))
             .ok_or(StoreError::ItemCountAccountingOverflow)
     })?;
+    numbered_event_operation::audit_numbered_tables_read(&read)?;
     let custody_stats =
         custody::inspect_custody_tables_read(&read, mission_authority, aggregate_items)?;
+    numbered_event_operation::audit_numbered_result_authority_read(&read)?;
     let (retiring_events, retiring_route_cached) = custody::retiring_event_counts_read(&read)?;
     event_stats.retiring_events = retiring_events;
     event_stats.retiring_route_cached = retiring_route_cached;
@@ -38529,9 +38533,388 @@ mod tests {
             assert!(matches!(
                 result,
                 Err(StoreError::Custody(CustodyStoreError::Invariant(
-                    "custody retirement references differ from source rows"
+                    "custody retirement reference is missing for its source row"
                 )))
             ));
+        }
+    }
+
+    fn retirement_reference_fixture(kind: u8, seed: u8) -> (TestFile, NodeId) {
+        let file = TestFile::new(&format!("retirement reference kind {kind}"));
+        let mut services = event_services(seed);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("store");
+        let publisher = services.publisher.identity();
+        let stored = accept_event(
+            &store,
+            &mut services,
+            event_header(
+                publisher,
+                1,
+                1,
+                VersionVector::default(),
+                &[kind],
+                b"reference-kind",
+                None,
+            ),
+            b"reference-kind",
+        );
+        let sample = aster_mesh::CustodySample {
+            clock_id: [seed; 16],
+            tick_ms: 1_000,
+        };
+        match kind {
+            1..=3 => {
+                let selector = CustodyPeerSelectorRevision::new(1);
+                let policy = store.custody_policy_revision().expect("custody policy");
+                let lease = store
+                    .begin_custody_send(
+                        services.relay.identity(),
+                        CustodyObjectKey::event(stored.transfer_id),
+                        selector,
+                        Some(sample),
+                        1,
+                        policy,
+                    )
+                    .expect("seed transfer authority");
+                match kind {
+                    1 => {}
+                    2 => store
+                        .release_transfer_lease(lease.id)
+                        .expect("seed retry source"),
+                    3 => {
+                        store
+                            .require_custody_send(&lease, Some(sample), policy)
+                            .expect("authorize receipt source");
+                        store
+                            .record_peer_custody_receipt(&lease, 0, Some(sample), selector, policy)
+                            .expect("seed receipt source");
+                    }
+                    _ => unreachable!("matched peer custody kind"),
+                }
+            }
+            4 | 5 => {
+                let policy = store.control_policy_snapshot().expect("control policy");
+                let subscription = store
+                    .create_event_subscription_with_policy(
+                        &policy,
+                        &EventSubscriptionKey::new(vec![kind]).expect("subscription key"),
+                        subscription_spec(EventSubscriptionMode::Consume),
+                    )
+                    .expect("subscription")
+                    .id;
+                let plan = store
+                    .prepare_event_subscription_poll_with_policy(&policy, subscription, 1, 1)
+                    .expect("poll plan");
+                let selection = verify_subscription_plan(&mut services.reader, &plan);
+                store
+                    .commit_event_subscription_poll_with_policy(&policy, &plan, &selection)
+                    .expect("seed pending source");
+                if kind == 5 {
+                    assert_eq!(
+                        store
+                            .acknowledge_event_delivery_with_policy(
+                                &policy,
+                                subscription,
+                                stored.semantic_id,
+                            )
+                            .expect("seed acknowledgement source"),
+                        EventDeliveryAck::Acknowledged
+                    );
+                }
+            }
+            _ => panic!("unknown retirement reference kind"),
+        }
+        let authority = services.authority;
+        drop(store);
+        (file, authority)
+    }
+
+    #[test]
+    fn custody_audit_rejects_orphaned_malformed_wrong_kind_and_wrong_target_references() {
+        enum Corruption {
+            Missing,
+            Orphaned,
+            Malformed,
+            WrongKind,
+            WrongTarget,
+            NonemptyValue,
+        }
+
+        for kind in 1_u8..=5 {
+            for (index, corruption) in [
+                Corruption::Missing,
+                Corruption::Orphaned,
+                Corruption::Malformed,
+                Corruption::WrongKind,
+                Corruption::WrongTarget,
+                Corruption::NonemptyValue,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let (file, authority) =
+                    retirement_reference_fixture(kind, 0x20 + kind * 8 + index as u8);
+                let database = Database::open(&file.0).expect("raw database");
+                let write = database.begin_write().expect("raw write");
+                let reference_key = write
+                    .open_table(custody::CUSTODY_RETIREMENT_REFERENCES)
+                    .expect("references")
+                    .iter()
+                    .expect("reference rows")
+                    .filter_map(|row| {
+                        let (key, _) = row.expect("read reference");
+                        (key.value().first() == Some(&kind)).then(|| key.value().to_vec())
+                    })
+                    .next()
+                    .expect("reference for requested kind");
+                let mut corrupt_key = reference_key.clone();
+                match corruption {
+                    Corruption::Missing => {
+                        write
+                            .open_table(custody::CUSTODY_RETIREMENT_REFERENCES)
+                            .expect("references")
+                            .remove(reference_key.as_slice())
+                            .expect("remove reference")
+                            .expect("reference existed");
+                    }
+                    Corruption::Orphaned => {
+                        let last = corrupt_key.last_mut().expect("reference primary");
+                        *last = last.wrapping_add(1);
+                        write
+                            .open_table(custody::CUSTODY_RETIREMENT_REFERENCES)
+                            .expect("references")
+                            .insert(corrupt_key.as_slice(), &[][..])
+                            .expect("orphaned reference");
+                    }
+                    Corruption::Malformed => {
+                        corrupt_key.pop().expect("truncate primary");
+                        write
+                            .open_table(custody::CUSTODY_RETIREMENT_REFERENCES)
+                            .expect("references")
+                            .insert(corrupt_key.as_slice(), &[][..])
+                            .expect("malformed reference");
+                    }
+                    Corruption::WrongKind => {
+                        corrupt_key[0] = 0xff;
+                        write
+                            .open_table(custody::CUSTODY_RETIREMENT_REFERENCES)
+                            .expect("references")
+                            .insert(corrupt_key.as_slice(), &[][..])
+                            .expect("wrong-kind reference");
+                    }
+                    Corruption::WrongTarget => {
+                        let target_last = if kind <= 3 { 33 } else { 32 };
+                        corrupt_key[target_last] ^= 1;
+                        write
+                            .open_table(custody::CUSTODY_RETIREMENT_REFERENCES)
+                            .expect("references")
+                            .insert(corrupt_key.as_slice(), &[][..])
+                            .expect("wrong-target reference");
+                    }
+                    Corruption::NonemptyValue => {
+                        write
+                            .open_table(custody::CUSTODY_RETIREMENT_REFERENCES)
+                            .expect("references")
+                            .insert(reference_key.as_slice(), &[1][..])
+                            .expect("nonempty reference value");
+                    }
+                }
+                write.commit().expect("commit reference corruption");
+                drop(database);
+
+                for result in [
+                    Store::inspect_existing(&file.0).map(|_| ()),
+                    Store::open_for_mission(&file.0, authority).map(|_| ()),
+                ] {
+                    assert!(
+                        result.is_err(),
+                        "reference kind {kind} corruption {index} was accepted: {result:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn custody_audit_rejects_pending_reference_against_a_clean_retirement_fence() {
+        // Break caught: a source/reverse pair is not valid merely because both
+        // rows exist. Once cleanup is complete, a permanent fence cannot retain
+        // an Event delivery dependency.
+        let file = TestFile::new("clean fence pending retirement reference");
+        let mut services = event_services(0xea);
+        let initial = aster_mesh::CustodySample {
+            clock_id: [0x6a; 16],
+            tick_ms: 1_000,
+        };
+        let store = Store::open_for_mission(&file.0, services.authority).expect("store");
+        let policy = store.control_policy_snapshot().expect("policy");
+        let subscription = store
+            .create_event_subscription_with_policy(
+                &policy,
+                &EventSubscriptionKey::new(b"retirement/clean-fence".to_vec()).expect("key"),
+                subscription_spec(EventSubscriptionMode::Consume),
+            )
+            .expect("subscription")
+            .id;
+        let transfer =
+            accept_local_finite_event(&store, &mut services, 0, b"clean fence", 100, initial);
+        let plan = store
+            .prepare_event_subscription_poll_with_policy(&policy, subscription, 1, 1)
+            .expect("poll plan");
+        let selection = verify_subscription_plan(&mut services.reader, &plan);
+        store
+            .commit_event_subscription_poll_with_policy(&policy, &plan, &selection)
+            .expect("commit pending delivery");
+
+        let write = store.database.begin_write().expect("raw fence write");
+        custody::fence_retirement_without_cleanup_write(
+            &write,
+            CustodyObjectKey::event(transfer),
+            1_100,
+        )
+        .expect("fence while retaining pending dependency");
+        let cleanup_key = write
+            .open_table(custody::CUSTODY_RETIRING)
+            .expect("cleanup queue")
+            .iter()
+            .expect("cleanup rows")
+            .next()
+            .expect("cleanup row")
+            .expect("read cleanup row")
+            .0
+            .value()
+            .to_vec();
+        write
+            .open_table(custody::CUSTODY_RETIRING)
+            .expect("cleanup queue")
+            .remove(cleanup_key.as_slice())
+            .expect("remove cleanup row")
+            .expect("cleanup row existed");
+        write.commit().expect("commit clean-fence corruption");
+        drop(store);
+
+        for result in [
+            Store::inspect_existing(&file.0).map(|_| ()),
+            Store::open_for_mission(&file.0, services.authority).map(|_| ()),
+        ] {
+            assert!(matches!(result, Err(StoreError::Custody(_))));
+        }
+    }
+
+    #[test]
+    fn custody_audit_rejects_missing_or_mismatched_cleanup_authority() {
+        enum Corruption {
+            Missing,
+            OriginalRevision,
+            Priority,
+            Reason,
+        }
+
+        for (index, corruption) in [
+            Corruption::Missing,
+            Corruption::OriginalRevision,
+            Corruption::Priority,
+            Corruption::Reason,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let file = TestFile::new(&format!("cleanup authority corruption {index}"));
+            let mut services = event_services(0xc0 + index as u8);
+            let initial = aster_mesh::CustodySample {
+                clock_id: [0x70 + index as u8; 16],
+                tick_ms: 1_000,
+            };
+            let store = Store::open_for_mission(&file.0, services.authority).expect("store");
+            let key = CustodyObjectKey::event(accept_local_finite_event(
+                &store,
+                &mut services,
+                0,
+                b"cleanup authority",
+                100,
+                initial,
+            ));
+            let _lease = store
+                .begin_custody_send(
+                    services.relay.identity(),
+                    key,
+                    CustodyPeerSelectorRevision::new(1),
+                    Some(initial),
+                    1,
+                    store.custody_policy_revision().expect("lease policy"),
+                )
+                .expect("hold lease");
+            let expired = aster_mesh::CustodySample {
+                clock_id: initial.clock_id,
+                tick_ms: 1_100,
+            };
+            let marked = store
+                .collect_custody_garbage(
+                    Some(expired),
+                    store.custody_policy_revision().expect("mark policy"),
+                    1,
+                )
+                .expect("mark while lease holds payload");
+            assert_eq!(marked.marked, vec![key]);
+
+            let write = store.database.begin_write().expect("raw cleanup write");
+            let (cleanup_key, mut cleanup_value) = write
+                .open_table(custody::CUSTODY_RETIRING)
+                .expect("cleanup queue")
+                .iter()
+                .expect("cleanup rows")
+                .next()
+                .expect("cleanup row")
+                .map(|(key, value)| (key.value().to_vec(), value.value().to_vec()))
+                .expect("read cleanup row");
+            match corruption {
+                Corruption::Missing => {
+                    write
+                        .open_table(custody::CUSTODY_RETIRING)
+                        .expect("cleanup queue")
+                        .remove(cleanup_key.as_slice())
+                        .expect("remove cleanup")
+                        .expect("cleanup existed");
+                }
+                Corruption::OriginalRevision => {
+                    let revision =
+                        u64::from_be_bytes(cleanup_value[1..9].try_into().expect("revision bytes"));
+                    cleanup_value[1..9].copy_from_slice(&(revision + 1).to_be_bytes());
+                    write
+                        .open_table(custody::CUSTODY_RETIRING)
+                        .expect("cleanup queue")
+                        .insert(cleanup_key.as_slice(), cleanup_value.as_slice())
+                        .expect("mismatched revision");
+                }
+                Corruption::Priority => {
+                    cleanup_value[9] = Priority::Flash as u8;
+                    write
+                        .open_table(custody::CUSTODY_RETIRING)
+                        .expect("cleanup queue")
+                        .insert(cleanup_key.as_slice(), cleanup_value.as_slice())
+                        .expect("mismatched priority");
+                }
+                Corruption::Reason => {
+                    cleanup_value[42] = CustodyRetirementReason::QuotaPressure as u8;
+                    write
+                        .open_table(custody::CUSTODY_RETIRING)
+                        .expect("cleanup queue")
+                        .insert(cleanup_key.as_slice(), cleanup_value.as_slice())
+                        .expect("mismatched reason");
+                }
+            }
+            write.commit().expect("commit cleanup corruption");
+            drop(store);
+
+            for result in [
+                Store::inspect_existing(&file.0).map(|_| ()),
+                Store::open_for_mission(&file.0, services.authority).map(|_| ()),
+            ] {
+                assert!(
+                    matches!(result, Err(StoreError::Custody(_))),
+                    "cleanup corruption {index} was accepted: {result:?}"
+                );
+            }
         }
     }
 
@@ -40017,50 +40400,75 @@ mod tests {
         assert_eq!(second.retired, vec![key]);
     }
 
-    #[test]
-    fn custody_schema_v1_is_rejected_without_migration() {
-        let file = TestFile::new("custody schema v1 rejection");
-        let services = event_services(0xe7);
-        let store = Store::open_for_mission(&file.0, services.authority).expect("store");
-        drop(store);
+    fn assert_unsupported_custody_schema(version: u64, seed: u8) {
+        let file = TestFile::new(&format!("custody schema v{version} rejection"));
+        let services = event_services(seed);
+        drop(Store::open_for_mission(&file.0, services.authority).expect("store"));
 
         let database = Database::open(&file.0).expect("raw database");
         let write = database.begin_write().expect("raw write");
+        if version == 1 {
+            write
+                .delete_table(custody::CUSTODY_EXPIRATIONS)
+                .expect("delete v2 expiration index");
+            write
+                .delete_table(custody::CUSTODY_RETIRING)
+                .expect("delete v2 retiring index");
+        }
         write
-            .delete_table(custody::CUSTODY_EXPIRATIONS)
-            .expect("delete v2 expiration index");
+            .delete_table(custody::CUSTODY_RETIREMENT_REFERENCES)
+            .expect("delete v3 retirement-reference index");
         write
-            .delete_table(custody::CUSTODY_RETIRING)
-            .expect("delete v2 retiring index");
-        write.commit().expect("commit v1 image");
+            .open_table(custody::CUSTODY_METADATA)
+            .expect("custody metadata")
+            .insert("schema_version", version)
+            .expect("predecessor schema version");
+        write.commit().expect("commit predecessor schema image");
         drop(database);
 
         for result in [
             Store::inspect_existing(&file.0).map(|_| ()),
             Store::open_for_mission(&file.0, services.authority).map(|_| ()),
         ] {
+            let error = result.expect_err("predecessor custody schemas require recreation");
             assert!(matches!(
-                result,
-                Err(StoreError::Custody(CustodyStoreError::Invariant(
-                    "custody schema group is incomplete"
-                )))
+                &error,
+                StoreError::Custody(CustodyStoreError::UnsupportedSchemaVersion {
+                    found,
+                    supported: 3,
+                }) if *found == version
             ));
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "custody schema version {version} is unsupported; recreate the store for version 3"
+                )
+            );
         }
     }
 
     #[test]
-    fn custody_schema_without_retirement_references_is_rejected() {
-        let file = TestFile::new("custody retirement reference schema rejection");
+    fn custody_schema_v1_is_rejected_without_migration() {
+        assert_unsupported_custody_schema(1, 0xe7);
+    }
+
+    #[test]
+    fn custody_schema_v2_is_rejected_without_migration() {
+        assert_unsupported_custody_schema(2, 0xe8);
+    }
+
+    #[test]
+    fn custody_schema_partial_v3_is_corruption_not_an_unsupported_predecessor() {
+        let file = TestFile::new("partial custody schema v3 rejection");
         let services = event_services(0xe9);
-        let store = Store::open_for_mission(&file.0, services.authority).expect("store");
-        drop(store);
+        drop(Store::open_for_mission(&file.0, services.authority).expect("store"));
 
         let database = Database::open(&file.0).expect("raw database");
         let write = database.begin_write().expect("raw write");
         write
             .delete_table(custody::CUSTODY_RETIREMENT_REFERENCES)
             .expect("delete retirement reference index");
-        write.commit().expect("commit incomplete schema");
+        write.commit().expect("commit incomplete v3 schema");
         drop(database);
 
         for result in [
