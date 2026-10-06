@@ -268,6 +268,16 @@ impl Store {
             .get(client.as_bytes())?
             .map(|value| decode_client(value.value()))
             .transpose()?;
+        let outstanding = if existing.is_some() {
+            results_for_client_write(&write, client)?
+        } else {
+            Vec::new()
+        };
+        let existing = if existing.is_some() {
+            Some(load_client_write(&write, client)?)
+        } else {
+            None
+        };
         let record = match existing {
             Some(record)
                 if record.last_claim_expected == expected_session
@@ -309,7 +319,6 @@ impl Store {
             }
         };
         let creating = existing.is_none();
-        let outstanding = results_for_client_write(&write, client)?;
         let snapshot = snapshot(record, outstanding)?;
         if recovery_snapshot_proto_len(&snapshot) > MAX_EVENT_RECOVERY_SNAPSHOT_PROTO_BYTES {
             return Err(NumberedEventOperationError::RecoverySnapshotTooLarge.into());
@@ -344,9 +353,11 @@ impl Store {
         let write = self.database.begin_write()?;
         crate::enforce_live_write(&write)?;
         require_numbered_mode_write(&write, false)?;
+        let _ = results_for_client_write(&write, client)?;
         let mut record = load_client_write(&write, client)?;
         require_session(record, session)?;
         if record.snapshot_revision != snapshot_revision {
+            write.commit()?;
             return Err(NumberedEventOperationError::RecoveryRevisionChanged.into());
         }
         record.completed_session = record.session;
@@ -456,6 +467,90 @@ impl Store {
     }
 }
 
+pub(crate) fn canonical_numbered_result_write(
+    write: &redb::WriteTransaction,
+    mut result: NumberedEventResult,
+) -> Result<(NumberedEventResult, bool), StoreError> {
+    use crate::custody::EventCustodyAuthority;
+
+    let authority =
+        crate::custody::event_custody_authority_write(write, result.receipt.transfer_id)?;
+    let (semantic_id, acceptance_marker) = match authority {
+        EventCustodyAuthority::Live {
+            semantic_id,
+            acceptance_marker,
+        }
+        | EventCustodyAuthority::Retired {
+            semantic_id,
+            acceptance_marker,
+            ..
+        } => (semantic_id, acceptance_marker),
+        EventCustodyAuthority::Missing => {
+            return Err(NumberedEventOperationError::Invariant(
+                "numbered Event result lacks custody authority",
+            )
+            .into());
+        }
+    };
+    if result.receipt.semantic_id != semantic_id
+        || result.receipt.acceptance_marker != acceptance_marker
+    {
+        return Err(NumberedEventOperationError::Invariant(
+            "numbered Event result differs from custody authority",
+        )
+        .into());
+    }
+    match (result.content, authority) {
+        (CommittedEventContent::Available, EventCustodyAuthority::Live { .. }) => {
+            Ok((result, false))
+        }
+        (CommittedEventContent::Available, EventCustodyAuthority::Retired { reason, .. }) => {
+            result.content = CommittedEventContent::Retired(reason);
+            Ok((result, true))
+        }
+        (CommittedEventContent::Retired(stored), EventCustodyAuthority::Retired { reason, .. })
+            if stored == reason =>
+        {
+            Ok((result, false))
+        }
+        (CommittedEventContent::Retired(_), EventCustodyAuthority::Live { .. }) => {
+            Err(NumberedEventOperationError::Invariant(
+                "retired numbered Event result has live custody authority",
+            )
+            .into())
+        }
+        (CommittedEventContent::Retired(_), EventCustodyAuthority::Retired { .. }) => {
+            Err(NumberedEventOperationError::Invariant(
+                "retired numbered Event result differs from custody authority",
+            )
+            .into())
+        }
+        (_, EventCustodyAuthority::Missing) => unreachable!("handled missing authority"),
+    }
+}
+
+fn validate_numbered_result_reverse_write(
+    write: &redb::WriteTransaction,
+    client: &EventClientId,
+    result: NumberedEventResult,
+) -> Result<(), StoreError> {
+    let key = reverse_key(result.receipt.transfer_id, client, result.sequence);
+    let reverse_table = write.open_table(RESULT_BY_EVENT)?;
+    let reverse =
+        reverse_table
+            .get(key.as_slice())?
+            .ok_or(NumberedEventOperationError::Invariant(
+                "numbered Event result is missing its reverse edge",
+            ))?;
+    if !reverse.value().is_empty() {
+        return Err(NumberedEventOperationError::Invariant(
+            "numbered Event reverse value is not empty",
+        )
+        .into());
+    }
+    Ok(())
+}
+
 pub(crate) fn resolve_numbered_operation_write(
     write: &redb::WriteTransaction,
     operation: PendingNumberedEventOperation<'_>,
@@ -471,6 +566,20 @@ pub(crate) fn resolve_numbered_operation_write(
         };
         if digest != operation.intent_digest {
             return Err(NumberedEventOperationError::IntentConflict.into());
+        }
+        validate_numbered_result_reverse_write(write, operation.client, stored)?;
+        let (stored, rewritten) = canonical_numbered_result_write(write, stored)?;
+        if rewritten {
+            write.open_table(RESULTS)?.insert(
+                result_key(operation.client, operation.sequence).as_slice(),
+                encode_result(stored, digest).as_slice(),
+            )?;
+            let mut client_record = load_client_write(write, operation.client)?;
+            advance_revision_preserving_recovery_state(&mut client_record)?;
+            write.open_table(CLIENTS)?.insert(
+                operation.client.as_bytes(),
+                encode_client(client_record).as_slice(),
+            )?;
         }
         return Ok(NumberedOperationResolution::Existing(stored));
     }
@@ -492,6 +601,7 @@ pub(crate) fn admit_numbered_result_write(
     limits: EventOperationLimits,
     tombstone: bool,
 ) -> Result<NumberedEventResult, StoreError> {
+    let outstanding = results_for_client_write(write, operation.client)?;
     let mut client_record = load_client_write(write, operation.client)?;
     require_mutating_session(client_record, operation.session)?;
     let expected = client_record
@@ -501,7 +611,6 @@ pub(crate) fn admit_numbered_result_write(
     if operation.sequence.get() != expected {
         return Err(NumberedEventOperationError::SequenceGap.into());
     }
-    let outstanding = results_for_client_write(write, operation.client)?;
     if outstanding.len() as u64 >= MAX_OUTSTANDING_EVENT_RESULTS_PER_CLIENT {
         return Err(NumberedEventOperationError::OutstandingLimitExceeded.into());
     }
@@ -562,11 +671,37 @@ pub(crate) fn admit_numbered_result_write(
     Ok(result)
 }
 
+#[cfg(test)]
 pub(crate) fn retire_numbered_results_write(
     write: &redb::WriteTransaction,
     transfer_id: EventTransferId,
     reason: CustodyRetirementReason,
 ) -> Result<(), StoreError> {
+    let mut cursor = None;
+    let mut budget = crate::custody::MaintenanceBudget::default();
+    let _ = cleanup_numbered_results_write(write, transfer_id, reason, &mut cursor, &mut budget)?;
+    Ok(())
+}
+
+pub(crate) fn cleanup_numbered_results_write(
+    write: &redb::WriteTransaction,
+    transfer_id: EventTransferId,
+    reason: CustodyRetirementReason,
+    cursor: &mut Option<Vec<u8>>,
+    budget: &mut crate::custody::MaintenanceBudget,
+) -> Result<crate::custody::RetirementCleanupProgress, StoreError> {
+    if let Some(cursor) = cursor.as_deref() {
+        let valid = cursor.get(..32) == Some(transfer_id.as_bytes().as_slice())
+            && decode_reverse_key(cursor).is_ok_and(|(client, sequence)| {
+                reverse_key(transfer_id, &client, sequence) == cursor
+            });
+        if !valid {
+            return Err(NumberedEventOperationError::Invariant(
+                "numbered Event cleanup cursor key is invalid",
+            )
+            .into());
+        }
+    }
     let prefix = transfer_id.as_bytes();
     let mut successor = *prefix;
     let upper = if let Some(index) = successor.iter().rposition(|byte| *byte != u8::MAX) {
@@ -576,30 +711,38 @@ pub(crate) fn retire_numbered_results_write(
     } else {
         std::ops::Bound::Unbounded
     };
-    let mut matches = Vec::new();
-    for row in write
-        .open_table(RESULT_BY_EVENT)?
-        .range::<&[u8]>((std::ops::Bound::Included(prefix.as_slice()), upper))?
-    {
-        let (key, value) = row?;
+    loop {
+        let lower = cursor.as_deref().map_or(
+            std::ops::Bound::Included(prefix.as_slice()),
+            std::ops::Bound::Excluded,
+        );
+        let next = write
+            .open_table(RESULT_BY_EVENT)?
+            .range::<&[u8]>((lower, upper.clone()))?
+            .next()
+            .transpose()?
+            .map(|(key, value)| (key.value().to_vec(), value.value().to_vec()));
+        let Some((reverse_key_bytes, reverse_value)) = next else {
+            return Ok(crate::custody::RetirementCleanupProgress::Complete);
+        };
+        if !budget.try_consume_dependency()? {
+            return Ok(crate::custody::RetirementCleanupProgress::Pending);
+        }
         #[cfg(test)]
         REVERSE_ROWS_VISITED.with(|count| count.set(count.get() + 1));
-        if !value.value().is_empty() {
+        if !reverse_value.is_empty() {
             return Err(NumberedEventOperationError::Invariant(
                 "numbered Event reverse value is not empty",
             )
             .into());
         }
-        let (client, sequence) = decode_reverse_key(key.value())?;
-        if key.value().get(..32) != Some(prefix.as_slice()) {
+        let (client, sequence) = decode_reverse_key(&reverse_key_bytes)?;
+        if reverse_key_bytes.get(..32) != Some(prefix.as_slice()) {
             return Err(NumberedEventOperationError::Invariant(
                 "numbered Event reverse edge targets another Event",
             )
             .into());
         }
-        matches.push((client, sequence));
-    }
-    for (client, sequence) in matches {
         let key = result_key(&client, sequence);
         let results = write.open_table(RESULTS)?;
         let encoded =
@@ -608,7 +751,7 @@ pub(crate) fn retire_numbered_results_write(
                 .ok_or(NumberedEventOperationError::Invariant(
                     "numbered Event reverse edge lost its result",
                 ))?;
-        let (mut result, intent_digest) = decode_result_with_digest(sequence, encoded.value())?;
+        let (result, intent_digest) = decode_result_with_digest(sequence, encoded.value())?;
         drop(encoded);
         drop(results);
         if result.receipt.transfer_id != transfer_id {
@@ -617,21 +760,37 @@ pub(crate) fn retire_numbered_results_write(
             )
             .into());
         }
-        if matches!(result.content, CommittedEventContent::Retired(_)) {
-            continue;
+        let (result, rewritten) = canonical_numbered_result_write(write, result)?;
+        match result.content {
+            CommittedEventContent::Retired(stored) if stored == reason => {
+                if rewritten {
+                    write.open_table(RESULTS)?.insert(
+                        key.as_slice(),
+                        encode_result(result, intent_digest).as_slice(),
+                    )?;
+                    let mut client_record = load_client_write(write, &client)?;
+                    advance_revision_preserving_recovery_state(&mut client_record)?;
+                    write
+                        .open_table(CLIENTS)?
+                        .insert(client.as_bytes(), encode_client(client_record).as_slice())?;
+                }
+            }
+            CommittedEventContent::Available => {
+                return Err(NumberedEventOperationError::Invariant(
+                    "numbered Event cleanup lacks retired custody authority",
+                )
+                .into());
+            }
+            CommittedEventContent::Retired(_) => {
+                return Err(NumberedEventOperationError::Invariant(
+                    "retired numbered Event result differs from cleanup authority",
+                )
+                .into());
+            }
         }
-        result.content = CommittedEventContent::Retired(reason);
-        write.open_table(RESULTS)?.insert(
-            key.as_slice(),
-            encode_result(result, intent_digest).as_slice(),
-        )?;
-        let mut client_record = load_client_write(write, &client)?;
-        advance_revision_preserving_recovery_state(&mut client_record)?;
-        write
-            .open_table(CLIENTS)?
-            .insert(client.as_bytes(), encode_client(client_record).as_slice())?;
+        *cursor = Some(reverse_key_bytes);
+        budget.record_examined_numbered_result(rewritten)?;
     }
-    Ok(())
 }
 
 pub(crate) fn legacy_operation_allowed_write(
@@ -947,24 +1106,50 @@ fn results_for_client_write(
     write: &redb::WriteTransaction,
     client: &EventClientId,
 ) -> Result<Vec<NumberedEventResult>, StoreError> {
+    let rows = stored_results_for_client_write(write, client)?;
+    let mut values = Vec::new();
+    for (key, raw, digest) in rows {
+        validate_numbered_result_reverse_write(write, client, raw)?;
+        let (canonical, rewritten) = canonical_numbered_result_write(write, raw)?;
+        if rewritten {
+            write
+                .open_table(RESULTS)?
+                .insert(key.as_slice(), encode_result(canonical, digest).as_slice())?;
+            let mut client_record = load_client_write(write, client)?;
+            advance_revision_preserving_recovery_state(&mut client_record)?;
+            write
+                .open_table(CLIENTS)?
+                .insert(client.as_bytes(), encode_client(client_record).as_slice())?;
+        }
+        values.push(canonical);
+    }
+    Ok(values)
+}
+
+fn stored_results_for_client_write(
+    write: &redb::WriteTransaction,
+    client: &EventClientId,
+) -> Result<Vec<(Vec<u8>, NumberedEventResult, [u8; 32])>, StoreError> {
     let mut values = Vec::new();
     let lower = result_key(client, EventOperationSequence(1));
     let upper = result_key(client, EventOperationSequence(u64::MAX));
-    for row in write
+    let rows = write
         .open_table(RESULTS)?
         .range(lower.as_slice()..=upper.as_slice())?
-    {
-        let (key, value) = row?;
+        .map(|row| row.map(|(key, value)| (key.value().to_vec(), value.value().to_vec())))
+        .collect::<Result<Vec<_>, redb::StorageError>>()?;
+    for (key, value) in rows {
         #[cfg(test)]
         RESULT_ROWS_VISITED.with(|count| count.set(count.get() + 1));
-        let (stored_client, sequence) = decode_result_key(key.value())?;
+        let (stored_client, sequence) = decode_result_key(&key)?;
         if &stored_client != client {
             return Err(NumberedEventOperationError::Invariant(
                 "numbered Event result range contains another client",
             )
             .into());
         }
-        values.push(decode_result(sequence, value.value())?);
+        let (raw, digest) = decode_result_with_digest(sequence, &value)?;
+        values.push((key, raw, digest));
     }
     if values.len() as u64 > MAX_OUTSTANDING_EVENT_RESULTS_PER_CLIENT {
         return Err(NumberedEventOperationError::Invariant(
@@ -973,6 +1158,66 @@ fn results_for_client_write(
         .into());
     }
     Ok(values)
+}
+
+#[cfg(test)]
+pub(crate) fn seed_numbered_result_fanout_write(
+    write: &redb::WriteTransaction,
+    client: &EventClientId,
+    receipt: CommittedEventReceipt,
+    additional: u64,
+) -> Result<(), StoreError> {
+    let mut record = load_client_write(write, client)?;
+    let mut stats = read_stats_write(write)?;
+    let start = record
+        .allocated_through
+        .checked_add(1)
+        .ok_or(NumberedEventOperationError::SequenceExhausted)?;
+    let end = record
+        .allocated_through
+        .checked_add(additional)
+        .ok_or(NumberedEventOperationError::SequenceExhausted)?;
+    for raw_sequence in start..=end {
+        let sequence = EventOperationSequence::new(raw_sequence)?;
+        let result = NumberedEventResult {
+            sequence,
+            receipt,
+            content: CommittedEventContent::Available,
+        };
+        let key = result_key(client, sequence);
+        let value = encode_result(result, [raw_sequence as u8; 32]);
+        let reverse = reverse_key(receipt.transfer_id, client, sequence);
+        write
+            .open_table(RESULTS)?
+            .insert(key.as_slice(), value.as_slice())?;
+        write
+            .open_table(RESULT_BY_EVENT)?
+            .insert(reverse.as_slice(), &[][..])?;
+        stats.outstanding_results += 1;
+        stats.reverse_edges += 1;
+        stats.logical_bytes = stats
+            .logical_bytes
+            .checked_add((key.len() + value.len() + reverse.len()) as u64)
+            .ok_or(NumberedEventOperationError::Invariant(
+                "numbered Event fixture accounting overflowed",
+            ))?;
+        record.allocated_through = raw_sequence;
+        advance_revision_preserving_recovery_state(&mut record)?;
+    }
+    write_stats(write, stats)?;
+    write
+        .open_table(CLIENTS)?
+        .insert(client.as_bytes(), encode_client(record).as_slice())?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn client_snapshot_revision_for_test(
+    store: &Store,
+    client: &EventClientId,
+) -> Result<u64, StoreError> {
+    let write = store.database.begin_write()?;
+    Ok(load_client_write(&write, client)?.snapshot_revision)
 }
 
 fn load_result_write(
@@ -1369,15 +1614,17 @@ mod tests {
         limits: EventOperationLimits,
     ) -> Result<NumberedEventResult, StoreError> {
         let write = store.database.begin_write()?;
+        let receipt = CommittedEventReceipt {
+            transfer_id: EventTransferId::new([sequence as u8; 32]),
+            semantic_id: EventSemanticId::new([sequence as u8 + 10; 32]),
+            acceptance_marker: sequence,
+        };
+        crate::custody::seed_event_custody_authority_for_numbered_test(&write, receipt)?;
         let result = crate::admit_pending_event_operation_write(
             &write,
             &[0x71; 32],
             crate::PendingEventOperation::Numbered(capacity_operation(client, sequence)),
-            CommittedEventReceipt {
-                transfer_id: EventTransferId::new([sequence as u8; 32]),
-                semantic_id: EventSemanticId::new([sequence as u8 + 10; 32]),
-                acceptance_marker: sequence,
-            },
+            receipt,
             CommittedEventContent::Available,
             limits,
             tombstone,
@@ -1531,15 +1778,22 @@ mod tests {
             .insert(client.as_bytes(), encode_client(record).as_slice())
             .expect("update client");
         let mut stats = read_stats_write(write).expect("stats");
+        let receipt = CommittedEventReceipt {
+            transfer_id: EventTransferId::new([0x72; 32]),
+            semantic_id: EventSemanticId::new([0x73; 32]),
+            acceptance_marker: 1,
+        };
+        crate::custody::seed_retired_event_custody_authority_for_numbered_test(
+            write,
+            receipt,
+            CustodyRetirementReason::Expired,
+        )
+        .expect("retired custody authority");
         for sequence in 1..=count {
             let sequence = EventOperationSequence::new(sequence).expect("sequence");
             let result = NumberedEventResult {
                 sequence,
-                receipt: CommittedEventReceipt {
-                    transfer_id: EventTransferId::new([0x72; 32]),
-                    semantic_id: EventSemanticId::new([0x73; 32]),
-                    acceptance_marker: 1,
-                },
+                receipt,
                 content: CommittedEventContent::Available,
             };
             let key = result_key(client, sequence);
@@ -1569,13 +1823,20 @@ mod tests {
         transfer_id: EventTransferId,
     ) {
         let sequence = EventOperationSequence::new(sequence).expect("sequence");
+        let receipt = CommittedEventReceipt {
+            transfer_id,
+            semantic_id: EventSemanticId::new(*transfer_id.as_bytes()),
+            acceptance_marker: 1,
+        };
+        crate::custody::seed_retired_event_custody_authority_for_numbered_test(
+            write,
+            receipt,
+            CustodyRetirementReason::Expired,
+        )
+        .expect("retired custody authority");
         let result = NumberedEventResult {
             sequence,
-            receipt: CommittedEventReceipt {
-                transfer_id,
-                semantic_id: EventSemanticId::new([0x93; 32]),
-                acceptance_marker: sequence.get(),
-            },
+            receipt,
             content: CommittedEventContent::Available,
         };
         write
@@ -1609,7 +1870,11 @@ mod tests {
         insert_lookup_result(&write, &clients[1], 2, EventTransferId::new([0x82; 32]));
 
         RESULT_ROWS_VISITED.with(|count| count.set(0));
-        let recovered = results_for_client_write(&write, &clients[1]).expect("recovery");
+        let recovered = stored_results_for_client_write(&write, &clients[1])
+            .expect("recovery")
+            .into_iter()
+            .map(|(_, result, _)| result)
+            .collect::<Vec<_>>();
         assert_eq!(
             recovered
                 .iter()
@@ -1688,6 +1953,20 @@ mod tests {
                 "{name} retry"
             );
         }
+    }
+
+    #[test]
+    fn retirement_does_not_process_more_than_one_numbered_result_page() {
+        let file = CorruptionFile::new("numbered-retirement-page");
+        let store = file.open();
+        let client = fixture_client(&store);
+        let transfer = EventTransferId::new([0x72; 32]);
+        let write = store.database.begin_write().expect("write");
+        fixture_results(&write, &client, 1_025, 1_025);
+        REVERSE_ROWS_VISITED.with(|count| count.set(0));
+        retire_numbered_results_write(&write, transfer, CustodyRetirementReason::Expired)
+            .expect("bounded retirement page");
+        assert_eq!(REVERSE_ROWS_VISITED.with(|count| count.get()), 1_024);
     }
 
     #[test]

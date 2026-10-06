@@ -757,12 +757,6 @@ pub(crate) fn checked_retire_event_operation_records(
     Ok(next)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct EventOperationRetirementDelta {
-    pub(crate) records_retired: u64,
-    pub(crate) logical_bytes_released: u64,
-}
-
 /// Only the ledger compaction boundary may label these otherwise shared
 /// logical errors as operation-specific. Storage-engine errors must propagate
 /// unchanged, even when the selected runtime has quarantined a failed audit.
@@ -782,11 +776,12 @@ pub(crate) fn classify_retirement_invariant(error: StoreError) -> StoreError {
 /// Compacts every alias in the final custody-retirement transaction. Validate
 /// the entire bounded prefix and its accounting before changing any row; no
 /// admission quota applies because conversion only releases logical bytes.
-pub(crate) fn retire_event_operations_write(
+pub(crate) fn cleanup_retired_event_operations_write(
     write: &redb::WriteTransaction,
     transfer_id: EventTransferId,
     reason: CustodyRetirementReason,
-) -> Result<EventOperationRetirementDelta, StoreError> {
+    budget: &mut custody::MaintenanceBudget,
+) -> Result<custody::RetirementCleanupProgress, StoreError> {
     let mut ledger = write.open_table(EVENT_OPERATION_LEDGER_V3)?;
     let mut reverse = write.open_table(ACTIVE_OPERATION_BY_EVENT_V1)?;
     let mut metadata = write.open_table(METADATA)?;
@@ -843,15 +838,24 @@ pub(crate) fn retire_event_operations_write(
         }
         aliases.push((fingerprint, intent_digest));
     }
-    let records_retired = aliases.len() as u64; // Bounded above by 64.
+    if aliases.is_empty() {
+        return Ok(custody::RetirementCleanupProgress::Complete);
+    }
+    let mut batch = Vec::new();
+    for alias in aliases.iter().copied() {
+        if !budget.try_consume_dependency()? {
+            break;
+        }
+        batch.push(alias);
+    }
+    if batch.is_empty() {
+        return Ok(custody::RetirementCleanupProgress::Pending);
+    }
+    let records_retired = batch.len() as u64;
     let next = checked_retire_event_operation_records(current, records_retired)?;
-    let logical_bytes_released = current
-        .logical_bytes
-        .checked_sub(next.logical_bytes)
-        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
     #[cfg(test)]
     retirement_test_fault(1)?;
-    for (fingerprint, intent_digest) in aliases {
+    for (fingerprint, intent_digest) in batch {
         let retired = encode_event_operation_ledger_record(EventOperationLedgerRecord::Retired {
             intent_digest,
             reason,
@@ -863,15 +867,17 @@ pub(crate) fn retire_event_operations_write(
                 "Event operation reverse edge disappeared during retirement",
             ));
         }
+        budget.record_removed_pair()?;
         #[cfg(test)]
         retirement_test_fault(2)?;
     }
     write_event_operation_stats(&mut metadata, next)?;
     #[cfg(test)]
     retirement_test_fault(3)?;
-    Ok(EventOperationRetirementDelta {
-        records_retired,
-        logical_bytes_released,
+    Ok(if records_retired == aliases.len() as u64 {
+        custody::RetirementCleanupProgress::Complete
+    } else {
+        custody::RetirementCleanupProgress::Pending
     })
 }
 
