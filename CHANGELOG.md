@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Reduced CI turnaround with Rust compiler caching and partitioned nextest runs.
 - Prefiltered Event query candidates before authentication to avoid unnecessary verification work.
 - Aligned the wire and envelope contract with semantic protocol version 6.
-- Indexed custody-maintenance candidates and their cleanup dependencies so routine wakes scale with the selected page, and made publication-triggered Event sync immediate in either node-identity direction.
+- Bounded indexed Event-custody expiry and retirement to a resumable 1,024-dependency-unit cleanup pass. Pressure eviction still scans all retained custody rows while keeping at most 1,024 candidates in scratch memory. New local and selected-reconciliation Events schedule coalesced prompt contact attempts, with failed attempts falling back to periodic retry; bridge propagation is unchanged. Custody schema v1/v2 stores require recreation, and the supporting measurements are current-code engineering evidence rather than target qualification.
 
 ### Security
 
