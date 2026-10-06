@@ -11,7 +11,13 @@ const EXPIRED: aster_mesh::CustodySample = aster_mesh::CustodySample {
     ..SAMPLE
 };
 
-fn fixture(aliases: u8) -> (TestFile, EventServices, Store, StoredEvent) {
+struct LegacyReplay {
+    reservation: EventReservation,
+    intent: EventPublicationIntent,
+    sealed: Vec<u8>,
+}
+
+fn fixture(aliases: u8) -> (TestFile, EventServices, Store, StoredEvent, LegacyReplay) {
     let file = TestFile::new("operation retirement");
     let mut services = event_services(0xa5);
     // Exactly 64 active aliases plus the mandatory one-record reserve.
@@ -84,7 +90,17 @@ fn fixture(aliases: u8) -> (TestFile, EventServices, Store, StoredEvent) {
             .expect("alias");
     }
     let stored = store.get_event(transfer).expect("lookup").expect("Event");
-    (file, services, store, stored)
+    (
+        file,
+        services,
+        store,
+        stored,
+        LegacyReplay {
+            reservation,
+            intent,
+            sealed: sealed.bytes,
+        },
+    )
 }
 
 fn stats(store: &Store) -> EventOperationStats {
@@ -139,7 +155,7 @@ fn retirement_compacts_zero_one_and_64_aliases_at_full_capacity_and_reopens() {
     // Missing compaction, a wrong delta, quota admission during conversion, or
     // deleting shared metadata breaks these hand-derived expectations.
     for (aliases, before_bytes, after_bytes) in [(0, 0, 0), (1, 162, 67), (64, 10_368, 4_288)] {
-        let (file, services, store, stored) = fixture(aliases);
+        let (file, services, store, stored, _replay) = fixture(aliases);
         let audit = store
             .audit_event_operations(7, |_| {})
             .expect("audit active aliases");
@@ -242,6 +258,165 @@ fn retirement_compacts_zero_one_and_64_aliases_at_full_capacity_and_reopens() {
 }
 
 #[test]
+fn exact_legacy_replay_resolves_retired_while_marked_and_after_reopen() {
+    let (file, services, store, stored, _replay) = fixture(1);
+    let operation = EventOperationKey::new(vec![0xa5, 0]).expect("operation key");
+    let object = CustodyObjectKey::event(stored.transfer_id);
+    let _lease = store
+        .begin_custody_send(
+            services.relay.identity(),
+            object,
+            CustodyPeerSelectorRevision::new(1),
+            Some(SAMPLE),
+            1,
+            store.custody_policy_revision().expect("lease revision"),
+        )
+        .expect("hold payload lease");
+
+    let marked = retire(&store).expect("mark retirement");
+    assert_eq!(marked.marked, vec![object]);
+    assert_eq!(marked.blocked_by_leases, 1);
+    assert_eq!(
+        store
+            .event_operation_resolution(&operation)
+            .expect("marked replay"),
+        Some(EventOperationResolution::RetiredOperation {
+            reason: CustodyRetirementReason::Expired,
+        })
+    );
+    assert_eq!(stats(&store).records_active, 1);
+    assert_eq!(stats(&store).reverse_rows, 1);
+
+    drop(store);
+    let reopened = Store::open_for_mission(&file.0, services.authority).expect("reopen marked");
+    assert_eq!(
+        reopened
+            .event_operation_resolution(&operation)
+            .expect("reopened marked replay"),
+        Some(EventOperationResolution::RetiredOperation {
+            reason: CustodyRetirementReason::Expired,
+        })
+    );
+    assert_eq!(stats(&reopened).records_active, 1);
+    assert_eq!(stats(&reopened).reverse_rows, 1);
+
+    assert_eq!(
+        retire(&reopened).expect("finish retirement").retired,
+        vec![object]
+    );
+    assert_eq!(stats(&reopened).records_active, 0);
+    assert_eq!(stats(&reopened).records_retired, 1);
+    assert_eq!(stats(&reopened).reverse_rows, 0);
+}
+
+#[test]
+fn legacy_commit_replay_uses_retired_authority_in_marked_and_fenced_cleaning() {
+    let (_file, mut services, store, stored, replay) = fixture(1);
+    let object = CustodyObjectKey::event(stored.transfer_id);
+    seed_peer_receipt_fanout(&store, object, MAX_CUSTODY_PAGE);
+    let lease = store
+        .begin_custody_send(
+            services.relay.identity(),
+            object,
+            CustodyPeerSelectorRevision::new(1),
+            Some(SAMPLE),
+            1,
+            store.custody_policy_revision().expect("lease revision"),
+        )
+        .expect("hold payload lease");
+    let marked = retire(&store).expect("mark retirement");
+    assert_eq!(marked.marked, vec![object]);
+    assert_eq!(marked.blocked_by_leases, 1);
+
+    let event = content_event(&mut services.reader, &replay.sealed);
+    for (key, label) in [
+        (
+            EventOperationKey::new(vec![0xa5, 0]).expect("existing marked key"),
+            "existing marked replay",
+        ),
+        (
+            EventOperationKey::new(vec![0xa5, 0xf0]).expect("new marked key"),
+            "new marked replay",
+        ),
+    ] {
+        let request = EventOperationRequest::new(&key, &replay.intent, b"payload", None)
+            .expect("marked request");
+        assert_eq!(
+            store
+                .commit_reserved_event_once_with_custody_policy(
+                    replay.reservation.control_policy(),
+                    LocalCustodyCheckpoint::new(
+                        store.custody_policy_revision().expect("marked revision"),
+                        EXPIRED,
+                    ),
+                    &request,
+                    &replay.reservation,
+                    &event,
+                    &replay.sealed,
+                )
+                .unwrap_or_else(|error| panic!("{label}: {error}")),
+            EventOnceOutcome::RetiredOperation {
+                reason: CustodyRetirementReason::Expired,
+            }
+        );
+    }
+    assert_eq!(
+        stats(&store),
+        EventOperationStats {
+            records_total: 2,
+            records_active: 1,
+            records_retired: 1,
+            reverse_rows: 1,
+            logical_bytes: 229,
+        }
+    );
+
+    store
+        .release_transfer_lease(lease.id)
+        .expect("release fencing lease");
+    let fenced = retire(&store).expect("fence with exhausted cleanup budget");
+    assert!(fenced.retired.is_empty());
+    assert_eq!(fenced.examined_dependencies, MAX_CUSTODY_PAGE as u64);
+    assert_eq!(stats(&store).records_active, 1);
+    assert_eq!(stats(&store).reverse_rows, 1);
+
+    for (key, label) in [
+        (
+            EventOperationKey::new(vec![0xa5, 0]).expect("existing fenced key"),
+            "existing fenced replay",
+        ),
+        (
+            EventOperationKey::new(vec![0xa5, 0xf1]).expect("new fenced key"),
+            "new fenced replay",
+        ),
+    ] {
+        let request = EventOperationRequest::new(&key, &replay.intent, b"payload", None)
+            .expect("fenced request");
+        assert_eq!(
+            store
+                .commit_reserved_event_once_with_custody_policy(
+                    replay.reservation.control_policy(),
+                    LocalCustodyCheckpoint::new(
+                        store.custody_policy_revision().expect("fenced revision"),
+                        EXPIRED,
+                    ),
+                    &request,
+                    &replay.reservation,
+                    &event,
+                    &replay.sealed,
+                )
+                .unwrap_or_else(|error| panic!("{label}: {error}")),
+            EventOnceOutcome::RetiredOperation {
+                reason: CustodyRetirementReason::Expired,
+            }
+        );
+    }
+    assert_eq!(stats(&store).records_active, 1);
+    assert_eq!(stats(&store).records_retired, 2);
+    assert_eq!(stats(&store).reverse_rows, 1);
+}
+
+#[test]
 fn retirement_rejects_corrupt_edges_targets_and_counters_without_any_commit() {
     // Each mutation must abort the complete GC transaction, including marks,
     // continuity, custody fences, payload deletion, and all earlier aliases.
@@ -265,7 +440,7 @@ fn retirement_rejects_corrupt_edges_targets_and_counters_without_any_commit() {
         "coherent-undercount",
         "65-aliases",
     ] {
-        let (file, _services, store, stored) = fixture(2);
+        let (file, _services, store, stored, _replay) = fixture(2);
         let write = store.database.begin_write().expect("corrupt transaction");
         let (fingerprint, encoded) = {
             let ledger = write.open_table(EVENT_OPERATION_LEDGER_V3).expect("ledger");
@@ -442,7 +617,7 @@ fn retirement_faults_before_during_and_after_compaction_reopen_the_complete_befo
     let _reset = FaultReset;
     let mut missed = Vec::new();
     for point in 1..=4 {
-        let (file, services, store, stored) = fixture(2);
+        let (file, services, store, stored, _replay) = fixture(2);
         let before = snapshot(&store.database.begin_read().expect("before"));
         RETIREMENT_TEST_FAULT.set(point);
         let result = retire(&store);
@@ -510,7 +685,7 @@ fn retirement_faults_before_during_and_after_compaction_reopen_the_complete_befo
 
 #[test]
 fn retirement_ranges_only_the_selected_event_and_preserves_other_aliases() {
-    let (file, mut services, store, stored) = fixture(2);
+    let (file, mut services, store, stored, _replay) = fixture(2);
     let other = accept_local_finite_event(&store, &mut services, 7, b"other", 10_000, SAMPLE);
     let key = EventOperationKey::new(vec![b'f', 7]).expect("other key");
     let fingerprint = event_operation_fingerprint(&services.authority, &key);
@@ -574,7 +749,7 @@ fn retirement_ranges_only_the_selected_event_and_preserves_other_aliases() {
 
 #[test]
 fn retirement_compacts_live_pressure_victims_with_the_pressure_reason() {
-    let (file, services, store, stored) = fixture(1);
+    let (file, services, store, stored, _replay) = fixture(1);
     let shared = shared_snapshot(&store);
     let revision = store
         .set_custody_quota(CustodyQuota::global(1, 1_000_000).expect("quota"))
@@ -611,6 +786,12 @@ fn retirement_compacts_live_pressure_victims_with_the_pressure_reason() {
     );
 }
 
+struct NumberedReplay {
+    reservation: EventReservation,
+    intent: EventPublicationIntent,
+    sealed: Vec<u8>,
+}
+
 fn numbered_finite_fixture(
     priority: Priority,
 ) -> (
@@ -620,6 +801,7 @@ fn numbered_finite_fixture(
     EventClientId,
     EventRecoverySnapshot,
     NumberedEventResult,
+    NumberedReplay,
 ) {
     let file = TestFile::new("numbered finite retirement");
     let mut services = event_services(0xa6);
@@ -685,12 +867,24 @@ fn numbered_finite_fixture(
         .begin_event_publication_session(&client, claimed.session.get(), b"before-retirement")
         .expect("recover committed result");
     assert_eq!(before.outstanding, vec![published.result]);
-    (file, services, store, client, before, published.result)
+    (
+        file,
+        services,
+        store,
+        client,
+        before,
+        published.result,
+        NumberedReplay {
+            reservation,
+            intent,
+            sealed: sealed.bytes,
+        },
+    )
 }
 
 #[test]
 fn numbered_result_retires_at_expiry_mark_while_lease_holds_payload() {
-    let (_file, services, store, client, before, published) =
+    let (_file, services, store, client, before, published, _replay) =
         numbered_finite_fixture(Priority::Routine);
     let key = CustodyObjectKey::event(published.receipt.transfer_id);
     let lease = store
@@ -715,6 +909,21 @@ fn numbered_result_retires_at_expiry_mark_while_lease_holds_payload() {
         None
     );
     assert_eq!(store.event_stats().expect("retained bytes").events, 1);
+    assert!(matches!(
+        store.complete_event_publication_recovery(
+            &client,
+            before.session,
+            before.snapshot_revision,
+        ),
+        Err(StoreError::NumberedEventOperation(
+            NumberedEventOperationError::RecoveryRevisionChanged
+        ))
+    ));
+    assert_eq!(
+        crate::numbered_event_operation::client_snapshot_revision_for_test(&store, &client)
+            .expect("durable normalized revision"),
+        before.snapshot_revision + 1
+    );
     let first = store
         .begin_event_publication_session(&client, before.session.get(), b"after-mark")
         .expect("recover after logical mark");
@@ -751,7 +960,7 @@ fn numbered_result_retires_at_expiry_mark_while_lease_holds_payload() {
 
 #[test]
 fn numbered_result_keeps_quota_pressure_reason_after_later_expiry() {
-    let (_file, services, store, client, before, published) =
+    let (_file, services, store, client, before, published, _replay) =
         numbered_finite_fixture(Priority::Routine);
     let key = CustodyObjectKey::event(published.receipt.transfer_id);
     let quota_revision = store
@@ -813,8 +1022,316 @@ fn numbered_result_keeps_quota_pressure_reason_after_later_expiry() {
 }
 
 #[test]
-fn numbered_retirement_invariant_failure_rolls_back_custody_mark() {
-    let (_file, services, store, client, before, published) =
+fn numbered_cleanup_rejects_receipt_identity_corruption_without_retirement_progress() {
+    const RESULTS: redb::TableDefinition<&[u8], &[u8]> =
+        redb::TableDefinition::new("aster.numbered-event-results.v1");
+
+    let (_file, _services, store, client, _before, published, _replay) =
+        numbered_finite_fixture(Priority::Routine);
+    let revision_before =
+        crate::numbered_event_operation::client_snapshot_revision_for_test(&store, &client)
+            .expect("client revision before corruption");
+    let write = store
+        .database
+        .begin_write()
+        .expect("corrupt result receipt");
+    let (key, mut value) = write
+        .open_table(RESULTS)
+        .expect("result table")
+        .iter()
+        .expect("result rows")
+        .next()
+        .expect("one result")
+        .map(|(key, value)| (key.value().to_vec(), value.value().to_vec()))
+        .expect("read result");
+    value[65] ^= 1;
+    write
+        .open_table(RESULTS)
+        .expect("result table")
+        .insert(key.as_slice(), value.as_slice())
+        .expect("write corrupt semantic identity");
+    write.commit().expect("commit result corruption");
+
+    assert!(matches!(
+        retire(&store),
+        Err(StoreError::NumberedEventOperation(
+            NumberedEventOperationError::Invariant(
+                "numbered Event result differs from custody authority"
+            )
+        ))
+    ));
+    assert!(
+        store
+            .get_event(published.receipt.transfer_id)
+            .expect("retirement rollback keeps payload")
+            .is_some()
+    );
+    assert_eq!(
+        store.event_stats().expect("rollback stats").retiring_events,
+        0
+    );
+    assert_eq!(
+        crate::numbered_event_operation::client_snapshot_revision_for_test(&store, &client)
+            .expect("client revision after rollback"),
+        revision_before
+    );
+}
+
+#[test]
+fn numbered_cleanup_rewrites_raw_pages_and_persists_client_revision() {
+    let (file, services, store, client, _before, published, _replay) =
+        numbered_finite_fixture(Priority::Routine);
+    let key = CustodyObjectKey::event(published.receipt.transfer_id);
+    let write = store
+        .database
+        .begin_write()
+        .expect("seed raw numbered fan-out");
+    crate::numbered_event_operation::seed_numbered_result_fanout_write(
+        &write,
+        &client,
+        published.receipt,
+        1_024,
+    )
+    .expect("seed 1,025 raw results");
+    write.commit().expect("commit raw numbered fan-out");
+    let revision_before =
+        crate::numbered_event_operation::client_snapshot_revision_for_test(&store, &client)
+            .expect("revision before cleanup");
+
+    let first = retire(&store).expect("rewrite first raw page");
+    assert_eq!(first.marked, vec![key]);
+    assert!(first.retired.is_empty());
+    assert_eq!(first.examined_dependencies, MAX_CUSTODY_PAGE as u64);
+    assert_eq!(first.examined_numbered_results, MAX_CUSTODY_PAGE as u64);
+    assert_eq!(first.rewritten_numbered_results, MAX_CUSTODY_PAGE as u64);
+    assert_eq!(
+        crate::numbered_event_operation::client_snapshot_revision_for_test(&store, &client)
+            .expect("revision after first raw page"),
+        revision_before + MAX_CUSTODY_PAGE as u64
+    );
+    drop(store);
+
+    let reopened =
+        Store::open_for_mission(&file.0, services.authority).expect("reopen partial raw cleanup");
+    let second = retire(&reopened).expect("rewrite final raw result");
+    assert_eq!(second.retired, vec![key]);
+    assert_eq!(second.examined_numbered_results, 1);
+    assert_eq!(second.rewritten_numbered_results, 1);
+    assert_eq!(
+        crate::numbered_event_operation::client_snapshot_revision_for_test(&reopened, &client)
+            .expect("revision after final raw result"),
+        revision_before + 1_025
+    );
+    assert_eq!(
+        reopened
+            .numbered_event_operation_stats()
+            .expect("numbered reverse-edge stats")
+            .reverse_edges,
+        1_025
+    );
+}
+
+#[test]
+fn malformed_durable_numbered_cursor_cannot_control_cleanup_after_reopen() {
+    let (file, services, store, client, _before, published, _replay) =
+        numbered_finite_fixture(Priority::Routine);
+    let write = store.database.begin_write().expect("seed cursor fan-out");
+    crate::numbered_event_operation::seed_numbered_result_fanout_write(
+        &write,
+        &client,
+        published.receipt,
+        1_024,
+    )
+    .expect("seed cursor results");
+    write.commit().expect("commit cursor fan-out");
+    let first = retire(&store).expect("create durable cursor");
+    assert!(first.retired.is_empty());
+
+    let write = store
+        .database
+        .begin_write()
+        .expect("corrupt cleanup cursor");
+    let (cleanup_key, mut cleanup) = write
+        .open_table(custody::CUSTODY_RETIRING)
+        .expect("cleanup table")
+        .iter()
+        .expect("cleanup rows")
+        .next()
+        .expect("one cleanup row")
+        .map(|(key, value)| (key.value().to_vec(), value.value().to_vec()))
+        .expect("read cleanup row");
+    assert_eq!(cleanup[43], 1, "cursor must be present before corruption");
+    cleanup[44..48].copy_from_slice(&32u32.to_be_bytes());
+    cleanup.truncate(80);
+    write
+        .open_table(custody::CUSTODY_RETIRING)
+        .expect("cleanup table")
+        .insert(cleanup_key.as_slice(), cleanup.as_slice())
+        .expect("write malformed cursor");
+    write.commit().expect("commit malformed cursor");
+    let revision_before =
+        crate::numbered_event_operation::client_snapshot_revision_for_test(&store, &client)
+            .expect("revision before malformed cursor pass");
+    drop(store);
+
+    let reopened =
+        Store::open_for_mission(&file.0, services.authority).expect("reopen malformed cursor");
+    assert!(matches!(
+        retire(&reopened),
+        Err(StoreError::NumberedEventOperation(
+            NumberedEventOperationError::Invariant("numbered Event cleanup cursor key is invalid")
+        ))
+    ));
+    assert_eq!(
+        crate::numbered_event_operation::client_snapshot_revision_for_test(&reopened, &client)
+            .expect("revision after cursor rejection"),
+        revision_before
+    );
+    let read = reopened
+        .database
+        .begin_read()
+        .expect("read rejected cleanup");
+    assert_eq!(
+        read.open_table(custody::CUSTODY_RETIRING)
+            .expect("cleanup table")
+            .len()
+            .expect("cleanup rows"),
+        1
+    );
+    assert_eq!(
+        read.open_table(custody::CUSTODY_RETIREMENTS)
+            .expect("retirement fences")
+            .len()
+            .expect("fence rows"),
+        1
+    );
+}
+
+#[test]
+fn numbered_cleanup_cursor_bounds_canonical_prefix_and_preserves_reverse_edges() {
+    let (file, mut services, store, client, before, published, replay) =
+        numbered_finite_fixture(Priority::Routine);
+    let key = CustodyObjectKey::event(published.receipt.transfer_id);
+    let write = store.database.begin_write().expect("seed numbered fan-out");
+    crate::numbered_event_operation::seed_numbered_result_fanout_write(
+        &write,
+        &client,
+        published.receipt,
+        1_024,
+    )
+    .expect("seed 1,025 total results");
+    write.commit().expect("commit numbered fan-out");
+
+    let lease = store
+        .begin_custody_send(
+            services.relay.identity(),
+            key,
+            CustodyPeerSelectorRevision::new(1),
+            Some(SAMPLE),
+            1,
+            store.custody_policy_revision().expect("lease revision"),
+        )
+        .expect("hold marked payload");
+    let marked = retire(&store).expect("mark while leased");
+    assert_eq!(marked.blocked_by_leases, 1);
+
+    let canonical = store
+        .begin_event_publication_session(&client, before.session.get(), b"canonical-prefix")
+        .expect("canonicalize marked results");
+    assert_eq!(canonical.outstanding.len(), 1_025);
+    assert!(canonical.outstanding.iter().all(|result| {
+        result.content == CommittedEventContent::Retired(CustodyRetirementReason::Expired)
+    }));
+    assert_eq!(
+        store
+            .numbered_event_operation_stats()
+            .expect("canonical stats")
+            .reverse_edges,
+        1_025
+    );
+
+    store
+        .release_transfer_lease(lease.id)
+        .expect("release payload lease");
+    let first = retire(&store).expect("first cursor page");
+    assert!(first.retired.is_empty());
+    assert_eq!(first.examined_dependencies, 1_024);
+    assert_eq!(first.removed_pairs, 1);
+    assert_eq!(first.examined_numbered_results, 1_023);
+    assert_eq!(first.rewritten_numbered_results, 0);
+
+    let behind = EventClientId::new(b"a".to_vec()).expect("behind-cursor client");
+    let claim = store
+        .begin_event_publication_session(&behind, 0, b"behind-cursor")
+        .expect("claim behind client");
+    store
+        .complete_event_publication_recovery(&behind, claim.session, claim.snapshot_revision)
+        .expect("complete behind recovery");
+    let payload = b"numbered";
+    let request = NumberedEventOperationRequest::new(
+        &behind,
+        claim.session,
+        EventOperationSequence::new(1).expect("behind sequence"),
+        None,
+        &replay.intent,
+        payload,
+    )
+    .expect("behind-cursor exact request");
+    let event = content_event(&mut services.reader, &replay.sealed);
+    let behind_result = store
+        .commit_reserved_numbered_event_with_custody_policy(
+            replay.reservation.control_policy(),
+            LocalCustodyCheckpoint::new(
+                store.custody_policy_revision().expect("custody revision"),
+                EXPIRED,
+            ),
+            &request,
+            &replay.reservation,
+            &event,
+            &replay.sealed,
+        )
+        .expect("retired exact replay behind cursor")
+        .result;
+    assert_eq!(
+        behind_result.content,
+        CommittedEventContent::Retired(CustodyRetirementReason::Expired)
+    );
+    drop(store);
+    let store = Store::open_for_mission(&file.0, services.authority).expect("reopen cursor state");
+
+    let second = retire(&store).expect("finish cursor cleanup");
+    assert_eq!(second.retired, vec![key]);
+    assert_eq!(second.examined_numbered_results, 2);
+    assert_eq!(second.rewritten_numbered_results, 0);
+    assert_eq!(
+        store
+            .numbered_event_operation_stats()
+            .expect("retained reverse stats")
+            .reverse_edges,
+        1_026
+    );
+    assert_eq!(
+        store
+            .acknowledge_event_publication_result(
+                &behind,
+                claim.session,
+                EventOperationSequence::new(1).expect("behind sequence"),
+            )
+            .expect("ack behind result"),
+        EventResultAcknowledgement::Acknowledged
+    );
+    assert_eq!(
+        store
+            .numbered_event_operation_stats()
+            .expect("acknowledged reverse stats")
+            .reverse_edges,
+        1_025
+    );
+}
+
+#[test]
+fn numbered_retirement_invariant_is_reported_without_unbounded_mark_scan() {
+    let (_file, services, store, client, before, published, _replay) =
         numbered_finite_fixture(Priority::Routine);
     let key = CustodyObjectKey::event(published.receipt.transfer_id);
     let _lease = store
@@ -849,22 +1366,22 @@ fn numbered_retirement_invariant_failure_rolls_back_custody_mark() {
         edge
     };
 
-    retire(&store).expect_err("invalid numbered result must abort custody mark");
-    assert!(
+    let marked = retire(&store).expect("constant-work mark does not scan result fan-out");
+    assert_eq!(marked.marked, vec![key]);
+    assert_eq!(marked.blocked_by_leases, 1);
+    assert_eq!(
         store
             .get_event(published.receipt.transfer_id)
-            .expect("Event remains available")
-            .is_some()
+            .expect("withheld Event"),
+        None
     );
     assert_eq!(
-        store.event_stats().expect("unmarked stats").retiring_events,
-        0
+        store.event_stats().expect("marked stats").retiring_events,
+        1
     );
-    let after_failure = store
+    store
         .begin_event_publication_session(&client, before.session.get(), b"after-failure")
-        .expect("recover after rollback");
-    assert_eq!(after_failure.snapshot_revision, before.snapshot_revision);
-    assert_eq!(after_failure.outstanding, before.outstanding);
+        .expect_err("logical overlay validates the malformed reverse row");
 
     let write = store.database.begin_write().expect("repair reverse edge");
     write
@@ -873,12 +1390,10 @@ fn numbered_retirement_invariant_failure_rolls_back_custody_mark() {
         .insert(edge.as_slice(), &[][..])
         .expect("restore empty reverse value");
     write.commit().expect("commit reverse repair");
-    let marked = retire(&store).expect("mark repaired Event");
-    assert_eq!(marked.marked, vec![key]);
-    assert_eq!(marked.blocked_by_leases, 1);
     let recovered = store
-        .begin_event_publication_session(&client, after_failure.session.get(), b"after-repair")
+        .begin_event_publication_session(&client, before.session.get(), b"after-repair")
         .expect("recover after repaired mark");
+    assert_eq!(recovered.snapshot_revision, before.snapshot_revision + 1);
     assert_eq!(
         recovered.outstanding[0].content,
         CommittedEventContent::Retired(CustodyRetirementReason::Expired)
@@ -887,7 +1402,7 @@ fn numbered_retirement_invariant_failure_rolls_back_custody_mark() {
 
 #[test]
 fn route_only_pressure_retirement_does_not_scan_numbered_result_edges() {
-    let (_file, mut services, store, client, before, published) =
+    let (_file, mut services, store, client, before, published, _replay) =
         numbered_finite_fixture(Priority::Flash);
     let payload = b"route-only";
     let mut header = event_header(

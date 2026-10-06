@@ -1349,6 +1349,20 @@ pub(crate) struct RetirementCleanupRecord {
     pub(crate) numbered_cursor: Option<Vec<u8>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EventCustodyAuthority {
+    Live {
+        semantic_id: EventSemanticId,
+        acceptance_marker: u64,
+    },
+    Retired {
+        semantic_id: EventSemanticId,
+        acceptance_marker: u64,
+        reason: CustodyRetirementReason,
+    },
+    Missing,
+}
+
 fn encode_retirement_cleanup(
     record: &RetirementCleanupRecord,
 ) -> Result<Vec<u8>, CustodyStoreError> {
@@ -1583,6 +1597,189 @@ fn fenced_cleanup_record_write(
     let cleanup = cleanup_record_for_row(&cleanup_value, None)?;
     validate_cleanup_identity(&cleanup, None, Some(&fence))?;
     Ok(cleanup)
+}
+
+fn retirement_cleanup_key_for_authority(key: CustodyObjectKey, acceptance_order: u64) -> Vec<u8> {
+    let mut cleanup_key = Vec::with_capacity(CUSTODY_RETIRING_KEY_LEN);
+    cleanup_key.extend_from_slice(&acceptance_order.to_be_bytes());
+    cleanup_key.extend_from_slice(&key.encoded());
+    cleanup_key
+}
+
+pub(crate) fn event_custody_authority_write(
+    write: &redb::WriteTransaction,
+    transfer_id: EventTransferId,
+) -> Result<EventCustodyAuthority, StoreError> {
+    let key = CustodyObjectKey::event(transfer_id);
+    let encoded_key = key.encoded();
+    let item = write
+        .open_table(CUSTODY_ITEMS)?
+        .get(encoded_key.as_slice())?
+        .map(|value| decode_item(value.value()))
+        .transpose()?;
+    let fence = write
+        .open_table(CUSTODY_RETIREMENTS)?
+        .get(encoded_key.as_slice())?
+        .map(|value| decode_retirement(value.value()))
+        .transpose()?;
+    match (item, fence) {
+        (Some(item), None) if !item.retiring => Ok(EventCustodyAuthority::Live {
+            semantic_id: EventSemanticId::new(item.semantic_id),
+            acceptance_marker: item.acceptance_order,
+        }),
+        (Some(item), None) => {
+            let cleanup_key = retirement_cleanup_key_for_authority(key, item.acceptance_order);
+            let cleanup_value = write
+                .open_table(CUSTODY_RETIRING)?
+                .get(cleanup_key.as_slice())?
+                .ok_or(CustodyStoreError::Invariant(
+                    "marked custody Event lacks its cleanup authority",
+                ))?
+                .value()
+                .to_vec();
+            let cleanup = cleanup_record_for_row(&cleanup_value, Some(&item))?;
+            validate_cleanup_identity(&cleanup, Some(&item), None)?;
+            Ok(EventCustodyAuthority::Retired {
+                semantic_id: EventSemanticId::new(cleanup.semantic_id),
+                acceptance_marker: item.acceptance_order,
+                reason: cleanup.reason,
+            })
+        }
+        (None, Some(fence)) => Ok(EventCustodyAuthority::Retired {
+            semantic_id: EventSemanticId::new(fence.semantic_id),
+            acceptance_marker: fence.acceptance_order,
+            reason: fence.reason,
+        }),
+        (None, None) => Ok(EventCustodyAuthority::Missing),
+        (Some(_), Some(_)) => Err(CustodyStoreError::Invariant(
+            "custody Event overlaps live and retired authority",
+        )
+        .into()),
+    }
+}
+
+pub(crate) fn event_custody_authority_read(
+    read: &redb::ReadTransaction,
+    transfer_id: EventTransferId,
+) -> Result<EventCustodyAuthority, StoreError> {
+    let key = CustodyObjectKey::event(transfer_id);
+    let encoded_key = key.encoded();
+    let item = read
+        .open_table(CUSTODY_ITEMS)?
+        .get(encoded_key.as_slice())?
+        .map(|value| decode_item(value.value()))
+        .transpose()?;
+    let fence = read
+        .open_table(CUSTODY_RETIREMENTS)?
+        .get(encoded_key.as_slice())?
+        .map(|value| decode_retirement(value.value()))
+        .transpose()?;
+    match (item, fence) {
+        (Some(item), None) if !item.retiring => Ok(EventCustodyAuthority::Live {
+            semantic_id: EventSemanticId::new(item.semantic_id),
+            acceptance_marker: item.acceptance_order,
+        }),
+        (Some(item), None) => {
+            let cleanup_key = retirement_cleanup_key_for_authority(key, item.acceptance_order);
+            let cleanup_value = read
+                .open_table(CUSTODY_RETIRING)?
+                .get(cleanup_key.as_slice())?
+                .ok_or(CustodyStoreError::Invariant(
+                    "marked custody Event lacks its cleanup authority",
+                ))?
+                .value()
+                .to_vec();
+            let cleanup = cleanup_record_for_row(&cleanup_value, Some(&item))?;
+            validate_cleanup_identity(&cleanup, Some(&item), None)?;
+            Ok(EventCustodyAuthority::Retired {
+                semantic_id: EventSemanticId::new(cleanup.semantic_id),
+                acceptance_marker: item.acceptance_order,
+                reason: cleanup.reason,
+            })
+        }
+        (None, Some(fence)) => Ok(EventCustodyAuthority::Retired {
+            semantic_id: EventSemanticId::new(fence.semantic_id),
+            acceptance_marker: fence.acceptance_order,
+            reason: fence.reason,
+        }),
+        (None, None) => Ok(EventCustodyAuthority::Missing),
+        (Some(_), Some(_)) => Err(CustodyStoreError::Invariant(
+            "custody Event overlaps live and retired authority",
+        )
+        .into()),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn seed_event_custody_authority_for_numbered_test(
+    write: &redb::WriteTransaction,
+    receipt: CommittedEventReceipt,
+) -> Result<(), StoreError> {
+    let key = CustodyObjectKey::event(receipt.transfer_id);
+    if write
+        .open_table(CUSTODY_ITEMS)?
+        .get(key.encoded().as_slice())?
+        .is_some()
+    {
+        return Ok(());
+    }
+    let record = CustodyItemRecord {
+        semantic_id: *receipt.semantic_id.as_bytes(),
+        topic: Topic::new("test")
+            .map_err(|_| CustodyStoreError::Invariant("test numbered custody topic is invalid"))?,
+        scope: Scope::new("alpha")
+            .map_err(|_| CustodyStoreError::Invariant("test numbered custody scope is invalid"))?,
+        source_publisher: [0x71; 32],
+        key_epoch: 1,
+        priority: Priority::Routine,
+        ttl_ms: None,
+        tombstone: false,
+        route_only: false,
+        retiring: false,
+        continuity_lost: false,
+        protection: CustodyProtection::NONE,
+        accounted_bytes: 1,
+        cumulative_age_ms: 0,
+        checkpoint: None,
+        continuity_generation: 0,
+        acceptance_order: receipt.acceptance_marker,
+        revision: 1,
+    };
+    write
+        .open_table(CUSTODY_ITEMS)?
+        .insert(key.encoded().as_slice(), encode_item(&record)?.as_slice())?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn seed_retired_event_custody_authority_for_numbered_test(
+    write: &redb::WriteTransaction,
+    receipt: CommittedEventReceipt,
+    reason: CustodyRetirementReason,
+) -> Result<(), StoreError> {
+    let key = CustodyObjectKey::event(receipt.transfer_id);
+    write
+        .open_table(CUSTODY_ITEMS)?
+        .remove(key.encoded().as_slice())?;
+    let record = RetirementRecord {
+        semantic_id: *receipt.semantic_id.as_bytes(),
+        topic: Topic::new("test")
+            .map_err(|_| CustodyStoreError::Invariant("test numbered custody topic is invalid"))?,
+        scope: Scope::new("alpha")
+            .map_err(|_| CustodyStoreError::Invariant("test numbered custody scope is invalid"))?,
+        source_publisher: [0x71; 32],
+        key_epoch: 1,
+        reason,
+        cumulative_age_ms: 0,
+        accounted_bytes: 1,
+        acceptance_order: receipt.acceptance_marker,
+        retired_revision: 1,
+    };
+    write.open_table(CUSTODY_RETIREMENTS)?.insert(
+        key.encoded().as_slice(),
+        encode_retirement(&record)?.as_slice(),
+    )?;
+    Ok(())
 }
 
 fn replace_custody_maintenance_indexes_write(
@@ -3785,8 +3982,19 @@ impl MaintenanceBudget {
         Ok(true)
     }
 
-    fn record_removed_pair(&mut self) -> Result<(), StoreError> {
+    pub(crate) fn record_removed_pair(&mut self) -> Result<(), StoreError> {
         self.removed_pairs = next_counter(self.removed_pairs)?;
+        Ok(())
+    }
+
+    pub(crate) fn record_examined_numbered_result(
+        &mut self,
+        rewritten: bool,
+    ) -> Result<(), StoreError> {
+        self.examined_numbered_results = next_counter(self.examined_numbered_results)?;
+        if rewritten {
+            self.rewritten_numbered_results = next_counter(self.rewritten_numbered_results)?;
+        }
         Ok(())
     }
 
@@ -4291,7 +4499,7 @@ pub(crate) fn cleanup_retirement_dependencies_write(
         })
         .transpose()?;
         let Some((kind, target, primary)) = next else {
-            return Ok(RetirementCleanupProgress::Complete);
+            break;
         };
         if !budget.try_consume_dependency()? {
             return Ok(RetirementCleanupProgress::Pending);
@@ -4404,6 +4612,56 @@ pub(crate) fn cleanup_retirement_dependencies_write(
         )?;
         budget.record_removed_pair()?;
     }
+    if key.class == CustodyObjectClass::Event {
+        match crate::event_operation::cleanup_retired_event_operations_write(
+            write,
+            EventTransferId::new(key.transfer_id),
+            cleanup.reason,
+            budget,
+        )
+        .map_err(crate::event_operation::classify_retirement_invariant)?
+        {
+            RetirementCleanupProgress::Pending => {
+                return Ok(RetirementCleanupProgress::Pending);
+            }
+            RetirementCleanupProgress::Complete => {}
+        }
+        match crate::numbered_event_operation::cleanup_numbered_results_write(
+            write,
+            EventTransferId::new(key.transfer_id),
+            cleanup.reason,
+            &mut cleanup.numbered_cursor,
+            budget,
+        )? {
+            RetirementCleanupProgress::Pending => {
+                let cleanup_key = if let Some(item) = write
+                    .open_table(CUSTODY_ITEMS)?
+                    .get(key.encoded().as_slice())?
+                    .map(|value| decode_item(value.value()))
+                    .transpose()?
+                {
+                    retirement_cleanup_key_for_authority(key, item.acceptance_order)
+                } else {
+                    let fence = write
+                        .open_table(CUSTODY_RETIREMENTS)?
+                        .get(key.encoded().as_slice())?
+                        .map(|value| decode_retirement(value.value()))
+                        .transpose()?
+                        .ok_or(CustodyStoreError::Invariant(
+                            "retirement cleanup lost its item and fence authority",
+                        ))?;
+                    retirement_cleanup_key_for_authority(key, fence.acceptance_order)
+                };
+                let encoded = encode_retirement_cleanup(cleanup)?;
+                write
+                    .open_table(CUSTODY_RETIRING)?
+                    .insert(cleanup_key.as_slice(), encoded.as_slice())?;
+                return Ok(RetirementCleanupProgress::Pending);
+            }
+            RetirementCleanupProgress::Complete => {}
+        }
+    }
+    Ok(RetirementCleanupProgress::Complete)
 }
 
 fn retire_event_payload_write(

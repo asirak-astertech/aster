@@ -9458,12 +9458,19 @@ impl Store {
                 return Ok(Some(EventOperationResolution::RetiredOperation { reason }));
             }
         };
-        if custody::sender_row_live_read(&read, CustodyObjectKey::event(transfer_id))? {
-            let event =
-                load_event_from_read(&read, transfer_id)?.ok_or(StoreError::SemanticInvariant(
-                    "sender-live Event operation lost exact retained bytes",
-                ))?;
-            return Ok(Some(EventOperationResolution::Live(Box::new(event))));
+        match custody::event_custody_authority_read(&read, transfer_id)? {
+            custody::EventCustodyAuthority::Live { .. } => {
+                let event = load_event_from_read(&read, transfer_id)?.ok_or(
+                    StoreError::SemanticInvariant(
+                        "sender-live Event operation lost exact retained bytes",
+                    ),
+                )?;
+                return Ok(Some(EventOperationResolution::Live(Box::new(event))));
+            }
+            custody::EventCustodyAuthority::Retired { reason, .. } => {
+                return Ok(Some(EventOperationResolution::RetiredOperation { reason }));
+            }
+            custody::EventCustodyAuthority::Missing => {}
         }
         if let Some((semantic_id, acceptance_marker, reason)) =
             custody::retired_event_receipt_read(&read, transfer_id)?
@@ -10092,6 +10099,7 @@ impl Store {
                             &write, operation,
                         )?
                     {
+                        write.commit()?;
                         return Ok(EventCommitResult::Numbered {
                             result,
                             inserted: false,
@@ -10130,13 +10138,14 @@ impl Store {
                         if intent_digest != operation.intent_digest {
                             return Err(StoreError::EventOperationConflict);
                         }
-                        if !custody::sender_row_live_write(
-                            &write,
-                            CustodyObjectKey::event(transfer_id),
-                        )? && custody::retired_event_receipt_write(&write, transfer_id)?
-                            .is_none()
-                        {
-                            return Err(CustodyStoreError::AlreadyRetired.into());
+                        match custody::event_custody_authority_write(&write, transfer_id)? {
+                            custody::EventCustodyAuthority::Retired { reason, .. } => {
+                                return Ok(EventCommitResult::RetiredOperation { reason });
+                            }
+                            custody::EventCustodyAuthority::Live { .. } => {}
+                            custody::EventCustodyAuthority::Missing => {
+                                return Err(CustodyStoreError::AlreadyRetired.into());
+                            }
                         }
                         if let Some(stored) = load_event_from_write(&write, transfer_id)? {
                             return Ok(EventCommitResult::Retained(EventCommit {
@@ -10247,8 +10256,11 @@ impl Store {
                     received_envelope_id: prepared.transfer_id,
                 });
             }
-            if let Some((semantic_id, acceptance_marker, reason)) =
-                custody::retired_event_receipt_write(&write, accepted)?
+            if let custody::EventCustodyAuthority::Retired {
+                semantic_id,
+                acceptance_marker,
+                reason,
+            } = custody::event_custody_authority_write(&write, accepted)?
             {
                 let metadata = write
                     .open_table(EVENTS)?
@@ -38298,7 +38310,9 @@ mod tests {
             store
                 .event_operation_resolution(&operation)
                 .expect("operation resolution"),
-            Some(EventOperationResolution::Withheld { .. })
+            Some(EventOperationResolution::RetiredOperation {
+                reason: CustodyRetirementReason::Expired,
+            })
         ));
         store
             .create_event_subscription_with_policy(
@@ -39154,8 +39168,8 @@ mod tests {
             )
             .expect("resume legacy cleanup");
         assert_eq!(completed.retired, vec![key]);
-        assert_eq!(completed.examined_dependencies, 1);
-        assert_eq!(completed.removed_pairs, 1);
+        assert_eq!(completed.examined_dependencies, 2);
+        assert_eq!(completed.removed_pairs, 2);
     }
 
     #[test]
@@ -39324,8 +39338,8 @@ mod tests {
             )
             .expect("resume bounded retirement");
         assert_eq!(second.retired, vec![key]);
-        assert_eq!(second.examined_dependencies, 1);
-        assert_eq!(second.removed_pairs, 1);
+        assert_eq!(second.examined_dependencies, 2);
+        assert_eq!(second.removed_pairs, 2);
         assert!(
             second.removed_pairs + second.examined_numbered_results <= second.examined_dependencies
         );
