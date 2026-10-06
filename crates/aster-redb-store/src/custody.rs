@@ -2238,6 +2238,25 @@ fn continuity_write(
         .transpose()
 }
 
+/// Returns whether a maintenance pass must enter the single-writer queue to
+/// preserve an observed local elapsed-clock continuity sample.
+pub(crate) fn continuity_sample_requires_write_read(
+    read: &redb::ReadTransaction,
+    sample: Option<CustodySample>,
+) -> Result<bool, StoreError> {
+    let Some(sample) = sample else {
+        return Ok(false);
+    };
+    let current = read
+        .open_table(CUSTODY_CONTINUITY)?
+        .get(CUSTODY_CONTINUITY_KEY)?
+        .map(|value| decode_continuity(value.value()).map_err(StoreError::from))
+        .transpose()?;
+    Ok(current.is_none_or(|current| {
+        current.sample.clock_id != sample.clock_id || sample.tick_ms > current.sample.tick_ms
+    }))
+}
+
 /// Updates only the local elapsed-clock continuity domain. Same-clock samples
 /// normalize to the durable tick high-water; only a changed clock ID advances
 /// the generation and makes every prior finite row sticky-unknown.
@@ -6490,14 +6509,12 @@ impl Store {
                 None => return Err(CustodyStoreError::MissionNotBound.into()),
             }
             require_policy_revision_read(&read, expected_policy)?;
+            let continuity_write_required = continuity_sample_requires_write_read(&read, sample)?;
             let continuity = read
                 .open_table(CUSTODY_CONTINUITY)?
                 .get(CUSTODY_CONTINUITY_KEY)?
                 .map(|value| decode_continuity(value.value()))
                 .transpose()?;
-            let discontinuity = sample.is_some_and(|sample| {
-                continuity.is_none_or(|current| current.sample.clock_id != sample.clock_id)
-            });
             let due_expiration = match (continuity, sample) {
                 (Some(current), Some(sample)) if current.sample.clock_id == sample.clock_id => {
                     let mut lower = Vec::with_capacity(CUSTODY_EXPIRATION_KEY_LEN);
@@ -6526,7 +6543,7 @@ impl Store {
                 .next()
                 .transpose()?
                 .is_some();
-            if !discontinuity && !due_expiration && !retiring {
+            if !continuity_write_required && !due_expiration && !retiring {
                 return Ok(CustodyGcReport::default());
             }
         }
@@ -6726,8 +6743,9 @@ impl Store {
                 None => return Err(CustodyStoreError::MissionNotBound.into()),
             }
             require_policy_revision_read(&read, expected_policy)?;
-            // Preserve continuity-row validation even though a capacity-fit
-            // write transaction would discard its sampled high-water update.
+            let continuity_write_required = continuity_sample_requires_write_read(&read, sample)?;
+            // Validate the continuity row before this capacity-fit fast-path
+            // can return without entering the writer queue.
             read.open_table(CUSTODY_CONTINUITY)?
                 .get(CUSTODY_CONTINUITY_KEY)?
                 .map(|value| decode_continuity(value.value()))
@@ -6739,7 +6757,9 @@ impl Store {
                 ))?,
             };
             let usage = custody_usage_read(&read, scope)?;
-            if require_quota_capacity(usage, &quota, demand.usage.items, demand.usage.bytes).is_ok()
+            if !continuity_write_required
+                && require_quota_capacity(usage, &quota, demand.usage.items, demand.usage.bytes)
+                    .is_ok()
             {
                 return Ok(CustodyGcReport::default());
             }
@@ -6764,6 +6784,7 @@ impl Store {
         };
         let usage = custody_usage_write(&write, scope)?;
         if require_quota_capacity(usage, &quota, demand.usage.items, demand.usage.bytes).is_ok() {
+            write.commit()?;
             return Ok(CustodyGcReport::default());
         }
         let rows = write
