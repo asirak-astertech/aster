@@ -12246,6 +12246,7 @@ async fn run_node_actor_inner(
     let mut control_yield_required = false;
     let mut discovery_yield_required = false;
     let mut application_tick_pending = false;
+    let mut event_contact_wake_pending = false;
     let mut application_tick_yield_required = false;
     let mut application_commands_since_yield = 0usize;
     let mut network_events_since_application = 0usize;
@@ -12685,11 +12686,14 @@ async fn run_node_actor_inner(
                 if peer_count == 0 {
                     continue;
                 }
+                let force_contact_initiation = event_contact_wake_pending;
                 let start = next_outbound_peer % peer_count;
                 next_outbound_peer = (start + 1) % peer_count;
                 let election_now = Instant::now();
+                let mut event_wake_has_busy_peer = false;
                 for offset in 0..peer_count {
                     if outbound.len() >= MAX_OUTBOUND_CONTACTS {
+                        event_wake_has_busy_peer = force_contact_initiation;
                         break;
                     }
                     let peer = contact_peers[(start + offset) % peer_count];
@@ -12701,16 +12705,23 @@ async fn run_node_actor_inner(
                     // becomes eligible only after a bounded quiet period, which keeps
                     // the normal case single-sided while allowing a normal peer to
                     // reach a lower-identity ReceiveOnly peer.
-                    if inbound_peers.contains(&peer_id)
-                        || !contact_initiation_is_due(
+                    if inbound_peers.contains(&peer_id) {
+                        event_wake_has_busy_peer |= force_contact_initiation;
+                        continue;
+                    }
+                    if !force_contact_initiation
+                        && !contact_initiation_is_due(
                             local_id,
                             peer_id,
                             *last_activity,
                             election_now,
                             non_preferred_fallback_delay,
                         )
-                        || !outbound_peers.insert(peer_id)
                     {
+                        continue;
+                    }
+                    if !outbound_peers.insert(peer_id) {
+                        event_wake_has_busy_peer |= force_contact_initiation;
                         continue;
                     }
                     *last_activity = election_now;
@@ -12754,6 +12765,9 @@ async fn run_node_actor_inner(
                     outbound_tasks.insert(task_id, peer);
                     outbound_abort_handles.insert(peer_id, (task_id, task));
                 }
+                if force_contact_initiation {
+                    event_contact_wake_pending = event_wake_has_busy_peer;
+                }
             }
             lease = acquire_application_policy_lease(
                 policy_lock.clone(),
@@ -12782,6 +12796,7 @@ async fn run_node_actor_inner(
                 application_tick_yield_required = false;
                 if new_event_inserted {
                     application_tick_pending = true;
+                    event_contact_wake_pending = true;
                 }
                 network_events_since_application = 0;
                 application_commands_since_yield += 1;
@@ -12988,6 +13003,9 @@ async fn run_node_actor_inner(
                     }
                     None => {}
                 }
+                if event_contact_wake_pending {
+                    application_tick_pending = true;
+                }
                 if yield_for_network {
                     tokio::task::yield_now().await;
                 }
@@ -13100,6 +13118,9 @@ async fn run_node_actor_inner(
                     }
                     None => {}
                 }
+                if event_contact_wake_pending {
+                    application_tick_pending = true;
+                }
                 if yield_for_network {
                     tokio::task::yield_now().await;
                 }
@@ -13142,6 +13163,7 @@ async fn run_node_actor_inner(
                 application_tick_yield_required = false;
                 if new_event_inserted {
                     application_tick_pending = true;
+                    event_contact_wake_pending = true;
                 }
                 network_events_since_application = 0;
                 application_commands_since_yield += 1;
@@ -30444,11 +30466,14 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn newly_published_event_wakes_idle_peer_sync() {
+    async fn assert_newly_published_event_wakes_idle_peer_sync(source_is_higher: bool) {
         use crate::application::{EventPollRequest, EventPublishRequest, EventSubscriptionRequest};
 
-        let test_root = root("new-event-wakes-idle-peer-sync");
+        let test_root = root(if source_is_higher {
+            "new-event-wakes-idle-peer-sync-higher"
+        } else {
+            "new-event-wakes-idle-peer-sync-lower"
+        });
         let first_state = test_root.join("first");
         let second_state = test_root.join("second");
         fs::create_dir_all(&test_root).expect("event wake test root");
@@ -30481,7 +30506,7 @@ mod tests {
             receiver_state,
             receiver_carrier,
             receiver_mission,
-        ) = if first_carrier < second_carrier {
+        ) = if (first_carrier > second_carrier) == source_is_higher {
             (
                 first_state,
                 first_carrier,
@@ -30530,15 +30555,19 @@ mod tests {
             .await
             .expect("stop offline event wake receiver");
 
-        let placeholder = SocketAddr::from(([127, 0, 0, 1], 0));
+        let source_socket = UdpSocket::bind(("127.0.0.1", 0)).expect("reserve source port");
+        let receiver_socket = UdpSocket::bind(("127.0.0.1", 0)).expect("reserve receiver port");
+        let source_address = source_socket.local_addr().expect("source address");
+        let receiver_address = receiver_socket.local_addr().expect("receiver address");
+        drop((source_socket, receiver_socket));
         let source_config = NodeConfig {
             state: source_state,
-            bind: placeholder,
+            bind: source_address,
             mission: source_mission.credentials,
             peers: vec![MissionExpectedPeer {
                 carrier: ExpectedPeer {
                     id: receiver_carrier,
-                    address: placeholder,
+                    address: receiver_address,
                 },
                 mission: receiver_mission.identity,
             }],
@@ -30549,12 +30578,12 @@ mod tests {
         };
         let receiver_config = NodeConfig {
             state: receiver_state,
-            bind: placeholder,
+            bind: receiver_address,
             mission: receiver_mission.credentials,
             peers: vec![MissionExpectedPeer {
                 carrier: ExpectedPeer {
                     id: source_carrier,
-                    address: placeholder,
+                    address: source_address,
                 },
                 mission: source_mission.identity,
             }],
@@ -30563,13 +30592,23 @@ mod tests {
             run_for: None,
             application: NodeApplication::Relay,
         };
-        let (source, receiver) = start_test_pair(
-            source_config,
-            receiver_config,
-            source_carrier,
-            receiver_carrier,
-        )
-        .await;
+        let (source, receiver) = if source_carrier > receiver_carrier {
+            let source = start_node(source_config)
+                .await
+                .expect("start higher Event wake source");
+            let receiver = start_node(receiver_config)
+                .await
+                .expect("start lower Event wake receiver");
+            (source, receiver)
+        } else {
+            let receiver = start_node(receiver_config)
+                .await
+                .expect("start higher Event wake receiver");
+            let source = start_node(source_config)
+                .await
+                .expect("start lower Event wake source");
+            (source, receiver)
+        };
         let source_events = source.selected_events();
         let receiver_events = receiver.selected_events();
 
@@ -30631,6 +30670,16 @@ mod tests {
         assert!(source_receipt.expect("source shutdown").contacts > 0);
         assert_eq!(receiver_receipt.expect("receiver shutdown").events, 1);
         fs::remove_dir_all(test_root).expect("event wake test cleanup");
+    }
+
+    #[tokio::test]
+    async fn newly_published_event_on_lower_identity_wakes_idle_peer_sync() {
+        assert_newly_published_event_wakes_idle_peer_sync(false).await;
+    }
+
+    #[tokio::test]
+    async fn newly_published_event_on_higher_identity_wakes_idle_peer_sync() {
+        assert_newly_published_event_wakes_idle_peer_sync(true).await;
     }
 
     #[tokio::test]

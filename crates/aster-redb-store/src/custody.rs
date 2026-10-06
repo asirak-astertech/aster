@@ -20,6 +20,8 @@ pub(crate) const CUSTODY_EXPIRATIONS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.custody-expirations.v2");
 pub(crate) const CUSTODY_RETIRING: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.custody-retiring.v2");
+pub(crate) const CUSTODY_RETIREMENT_REFERENCES: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("aster.custody-retirement-references.v3");
 pub(crate) const CUSTODY_RETIREMENTS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.custody-retirements.v1");
 pub(crate) const CUSTODY_RETIRED_SEMANTICS: TableDefinition<&[u8], &[u8]> =
@@ -59,7 +61,7 @@ const CUSTODY_MISSION_AUTHORITY_KEY: &str = "mission_authority";
 const CUSTODY_CONTINUITY_KEY: &str = "clock";
 const GLOBAL_QUOTA_KEY: &str = "";
 
-const CUSTODY_SCHEMA_VERSION: u64 = 2;
+const CUSTODY_SCHEMA_VERSION: u64 = 3;
 const CUSTODY_ITEM_VERSION: u8 = 1;
 const CUSTODY_RETIREMENT_VERSION: u8 = 1;
 const CUSTODY_LEASE_LEGACY_VERSION: u8 = 1;
@@ -88,6 +90,10 @@ pub const MAX_CUSTODY_TRANSFER_LEASES: u64 = 4_096;
 pub const MAX_CUSTODY_PEER_RECEIPTS: u64 = 262_144;
 /// Maximum retained DATA retry records selected by protocol section 18.
 pub const MAX_CUSTODY_RETRY_RECORDS: u64 = 128;
+const MAX_CUSTODY_RETIREMENT_REFERENCES: u64 = MAX_CUSTODY_TRANSFER_LEASES
+    + MAX_CUSTODY_PEER_RECEIPTS
+    + MAX_CUSTODY_RETRY_RECORDS
+    + MAX_EVENT_ACKNOWLEDGEMENT_RECEIPTS;
 /// Maximum global plus scope-specific custody quotas.
 pub const MAX_CUSTODY_QUOTAS: u64 = 1_025;
 /// Maximum candidates returned by one bounded outbound or collection call.
@@ -1756,10 +1762,11 @@ impl<'a> CustodyCursor<'a> {
     }
 }
 
-const CUSTODY_TABLE_NAMES: [&str; 13] = [
+const CUSTODY_TABLE_NAMES: [&str; 14] = [
     "aster.custody-items.v1",
     "aster.custody-expirations.v2",
     "aster.custody-retiring.v2",
+    "aster.custody-retirement-references.v3",
     "aster.custody-retirements.v1",
     "aster.custody-retired-semantics.v1",
     "aster.custody-transfer-leases.v1",
@@ -2036,6 +2043,34 @@ fn initialize_custody_schema(
     }
     write.open_table(CUSTODY_EXPIRATIONS)?;
     write.open_table(CUSTODY_RETIRING)?;
+    write.open_table(CUSTODY_RETIREMENT_REFERENCES)?;
+    let regular_tables = write
+        .list_tables()?
+        .map(|table| table.name().to_owned())
+        .collect::<BTreeSet<_>>();
+    if regular_tables.contains(EVENT_SUBSCRIPTION_PENDING.name()) {
+        for row in write.open_table(EVENT_SUBSCRIPTION_PENDING)?.iter()? {
+            let (key, value) = row?;
+            let pending = decode_event_pending_delivery_record(value.value())?;
+            insert_event_pending_retirement_reference_write(
+                write,
+                pending.semantic_id,
+                key.value(),
+            )?;
+        }
+    }
+    if regular_tables.contains(EVENT_DELIVERY_ACKNOWLEDGEMENTS.name()) {
+        for row in write.open_table(EVENT_DELIVERY_ACKNOWLEDGEMENTS)?.iter()? {
+            let (key, value) = row?;
+            let (_, semantic_id) = parse_event_acknowledgement_key(key.value())?;
+            let _ = decode_event_acknowledgement_record(value.value())?;
+            insert_event_acknowledgement_retirement_reference_write(
+                write,
+                semantic_id,
+                key.value(),
+            )?;
+        }
+    }
     for (key, record) in &backfill {
         replace_custody_maintenance_indexes_write(write, *key, None, Some(record))?;
     }
@@ -2256,8 +2291,14 @@ pub(crate) fn observe_continuity_write(
                 .collect::<Result<Vec<_>, redb::StorageError>>()?;
             if !retry_keys.is_empty() {
                 let mut retries = write.open_table(CUSTODY_RETRIES)?;
-                for key in retry_keys {
+                for key in &retry_keys {
                     retries.remove(key.as_slice())?;
+                    remove_peer_retirement_reference_write(
+                        write,
+                        RETIREMENT_REFERENCE_RETRY,
+                        key,
+                        "discontinuity retry retirement reference disappeared",
+                    )?;
                 }
                 drop(retries);
                 write
@@ -2973,8 +3014,8 @@ fn make_admission_capacity_write(
             Ok((key.value().to_vec(), value.value().to_vec()))
         })
         .collect::<Result<Vec<_>, redb::StorageError>>()?;
-    let mut retirement_batch = RetirementBatchIndex::build(write)?;
-    let pending_deliveries = retirement_batch.pending_semantics();
+    let mut retirement_batch = RetirementBatchIndex::default();
+    let pending_deliveries = pending_delivery_semantics_write(write)?;
     let mut candidates = Vec::new();
     for (encoded_key, encoded_item) in rows {
         let key = CustodyObjectKey::decode(&encoded_key)?;
@@ -3026,6 +3067,11 @@ fn make_admission_capacity_write(
     }
     candidates.sort_by_key(|candidate| candidate.0);
     for (_, key, item, age_ms, expired) in candidates {
+        retirement_batch.load_object(
+            write,
+            key,
+            (key.class == CustodyObjectClass::Event).then_some(item.semantic_id),
+        )?;
         let marked = mark_retiring_write_indexed(write, key, item, age_ms, &mut retirement_batch)?;
         if retirement_batch.has_active_lease(key) {
             continue;
@@ -3097,8 +3143,8 @@ pub(crate) fn make_aggregate_capacity_write(
             Ok((key.value().to_vec(), value.value().to_vec()))
         })
         .collect::<Result<Vec<_>, redb::StorageError>>()?;
-    let mut retirement_batch = RetirementBatchIndex::build(write)?;
-    let pending_deliveries = retirement_batch.pending_semantics();
+    let mut retirement_batch = RetirementBatchIndex::default();
+    let pending_deliveries = pending_delivery_semantics_write(write)?;
     let mut candidates = Vec::new();
     for (encoded_key, encoded_item) in rows {
         let key = CustodyObjectKey::decode(&encoded_key)?;
@@ -3149,6 +3195,11 @@ pub(crate) fn make_aggregate_capacity_write(
     }
     candidates.sort_by_key(|candidate| candidate.0);
     for (_, key, item, age_ms, expired) in candidates {
+        retirement_batch.load_object(
+            write,
+            key,
+            (key.class == CustodyObjectClass::Event).then_some(item.semantic_id),
+        )?;
         let marked = mark_retiring_write_indexed(write, key, item, age_ms, &mut retirement_batch)?;
         if retirement_batch.has_active_lease(key) {
             continue;
@@ -3231,12 +3282,237 @@ fn insert_retirement_fence(
     Ok(())
 }
 
-/// One bounded, transaction-local reverse index for a retirement batch.
-///
-/// Peer/object keys are deliberately peer-prefixed for contact lookup, while
-/// retirement is object-oriented. Building these reverse maps once prevents a
-/// pressure or GC batch from rescanning every receipt and delivery
-/// for every victim.
+const RETIREMENT_REFERENCE_LEASE: u8 = 1;
+const RETIREMENT_REFERENCE_RETRY: u8 = 2;
+const RETIREMENT_REFERENCE_RECEIPT: u8 = 3;
+const RETIREMENT_REFERENCE_PENDING: u8 = 4;
+const RETIREMENT_REFERENCE_ACKNOWLEDGEMENT: u8 = 5;
+
+fn retirement_reference_key(kind: u8, target: &[u8], primary: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(1 + target.len() + primary.len());
+    encoded.push(kind);
+    encoded.extend_from_slice(target);
+    encoded.extend_from_slice(primary);
+    encoded
+}
+
+fn insert_retirement_reference_write(
+    write: &redb::WriteTransaction,
+    kind: u8,
+    target: &[u8],
+    primary: &[u8],
+) -> Result<(), StoreError> {
+    let key = retirement_reference_key(kind, target, primary);
+    let empty: &[u8] = &[];
+    write
+        .open_table(CUSTODY_RETIREMENT_REFERENCES)?
+        .insert(key.as_slice(), empty)?;
+    Ok(())
+}
+
+fn remove_retirement_reference_write(
+    write: &redb::WriteTransaction,
+    kind: u8,
+    target: &[u8],
+    primary: &[u8],
+    missing: &'static str,
+) -> Result<(), StoreError> {
+    let key = retirement_reference_key(kind, target, primary);
+    if write
+        .open_table(CUSTODY_RETIREMENT_REFERENCES)?
+        .remove(key.as_slice())?
+        .is_none()
+    {
+        return Err(CustodyStoreError::Invariant(missing).into());
+    }
+    Ok(())
+}
+
+fn insert_lease_retirement_reference_write(
+    write: &redb::WriteTransaction,
+    object: CustodyObjectKey,
+    lease_id: u64,
+) -> Result<(), StoreError> {
+    insert_retirement_reference_write(
+        write,
+        RETIREMENT_REFERENCE_LEASE,
+        object.encoded().as_slice(),
+        &lease_id.to_be_bytes(),
+    )
+}
+
+fn remove_lease_retirement_reference_write(
+    write: &redb::WriteTransaction,
+    object: CustodyObjectKey,
+    lease_id: u64,
+) -> Result<(), StoreError> {
+    remove_retirement_reference_write(
+        write,
+        RETIREMENT_REFERENCE_LEASE,
+        object.encoded().as_slice(),
+        &lease_id.to_be_bytes(),
+        "lease retirement reference disappeared",
+    )
+}
+
+fn insert_peer_retirement_reference_write(
+    write: &redb::WriteTransaction,
+    kind: u8,
+    primary: &[u8],
+) -> Result<(), StoreError> {
+    let (_, object) = parse_peer_object_key(primary)?;
+    insert_retirement_reference_write(write, kind, object.encoded().as_slice(), primary)
+}
+
+fn remove_peer_retirement_reference_write(
+    write: &redb::WriteTransaction,
+    kind: u8,
+    primary: &[u8],
+    missing: &'static str,
+) -> Result<(), StoreError> {
+    let (_, object) = parse_peer_object_key(primary)?;
+    remove_retirement_reference_write(write, kind, object.encoded().as_slice(), primary, missing)
+}
+
+pub(crate) fn insert_event_pending_retirement_reference_write(
+    write: &redb::WriteTransaction,
+    semantic_id: EventSemanticId,
+    primary: &[u8],
+) -> Result<(), StoreError> {
+    insert_retirement_reference_write(
+        write,
+        RETIREMENT_REFERENCE_PENDING,
+        semantic_id.as_bytes(),
+        primary,
+    )
+}
+
+pub(crate) fn remove_event_pending_retirement_reference_write(
+    write: &redb::WriteTransaction,
+    semantic_id: EventSemanticId,
+    primary: &[u8],
+) -> Result<(), StoreError> {
+    remove_retirement_reference_write(
+        write,
+        RETIREMENT_REFERENCE_PENDING,
+        semantic_id.as_bytes(),
+        primary,
+        "pending Event retirement reference disappeared",
+    )
+}
+
+pub(crate) fn insert_event_acknowledgement_retirement_reference_write(
+    write: &redb::WriteTransaction,
+    semantic_id: EventSemanticId,
+    primary: &[u8],
+) -> Result<(), StoreError> {
+    insert_retirement_reference_write(
+        write,
+        RETIREMENT_REFERENCE_ACKNOWLEDGEMENT,
+        semantic_id.as_bytes(),
+        primary,
+    )
+}
+
+pub(crate) fn remove_event_acknowledgement_retirement_reference_write(
+    write: &redb::WriteTransaction,
+    semantic_id: EventSemanticId,
+    primary: &[u8],
+) -> Result<(), StoreError> {
+    remove_retirement_reference_write(
+        write,
+        RETIREMENT_REFERENCE_ACKNOWLEDGEMENT,
+        semantic_id.as_bytes(),
+        primary,
+        "Event acknowledgement retirement reference disappeared",
+    )
+}
+
+fn retirement_reference_primary_keys(
+    write: &redb::WriteTransaction,
+    kind: u8,
+    target: &[u8],
+) -> Result<Vec<Vec<u8>>, StoreError> {
+    let mut prefix = Vec::with_capacity(1 + target.len());
+    prefix.push(kind);
+    prefix.extend_from_slice(target);
+    let mut upper = prefix.clone();
+    let mut successor = None;
+    for index in (0..upper.len()).rev() {
+        if upper[index] != u8::MAX {
+            upper[index] += 1;
+            upper.truncate(index + 1);
+            successor = Some(upper);
+            break;
+        }
+    }
+    let upper = successor.ok_or(CustodyStoreError::CounterOverflow)?;
+    let bounds = (
+        std::ops::Bound::Included(prefix.as_slice()),
+        std::ops::Bound::Excluded(upper.as_slice()),
+    );
+    let table = write.open_table(CUSTODY_RETIREMENT_REFERENCES)?;
+    let mut primaries = Vec::new();
+    for row in table.range::<&[u8]>(bounds)? {
+        let (key, value) = row?;
+        if !value.value().is_empty() {
+            return Err(CustodyStoreError::Invariant(
+                "custody retirement reference value is invalid",
+            )
+            .into());
+        }
+        primaries.push(key.value()[prefix.len()..].to_vec());
+    }
+    Ok(primaries)
+}
+
+fn pending_delivery_semantics_write(
+    write: &redb::WriteTransaction,
+) -> Result<BTreeSet<[u8; 32]>, StoreError> {
+    let lower = [RETIREMENT_REFERENCE_PENDING];
+    let upper = [RETIREMENT_REFERENCE_PENDING + 1];
+    let bounds = (
+        std::ops::Bound::Included(lower.as_slice()),
+        std::ops::Bound::Excluded(upper.as_slice()),
+    );
+    let mut semantics = BTreeSet::new();
+    for row in write
+        .open_table(CUSTODY_RETIREMENT_REFERENCES)?
+        .range::<&[u8]>(bounds)?
+    {
+        let (key, value) = row?;
+        if !value.value().is_empty() || key.value().len() != 73 {
+            return Err(
+                CustodyStoreError::Invariant("pending retirement reference is malformed").into(),
+            );
+        }
+        let semantic_id: [u8; 32] = key.value()[1..33]
+            .try_into()
+            .expect("checked retirement reference length");
+        let primary = &key.value()[33..];
+        let _ = parse_event_pending_delivery_key(primary)?;
+        let pending = write
+            .open_table(EVENT_SUBSCRIPTION_PENDING)?
+            .get(primary)?
+            .map(|record| decode_event_pending_delivery_record(record.value()))
+            .transpose()?
+            .ok_or(CustodyStoreError::Invariant(
+                "pending retirement reference points to a missing delivery",
+            ))?;
+        if pending.semantic_id.as_bytes() != &semantic_id {
+            return Err(CustodyStoreError::Invariant(
+                "pending retirement reference targets a different Event",
+            )
+            .into());
+        }
+        semantics.insert(semantic_id);
+    }
+    Ok(semantics)
+}
+
+/// One transaction-local view of only the dependencies referenced by the
+/// selected retirement page. Durable reverse references make construction
+/// proportional to that page rather than to the complete custody ledger.
 #[derive(Default)]
 struct RetirementBatchIndex {
     lease_counts: BTreeMap<CustodyObjectKey, u64>,
@@ -3244,66 +3520,142 @@ struct RetirementBatchIndex {
     receipt_keys: BTreeMap<CustodyObjectKey, Vec<Vec<u8>>>,
     pending_keys: BTreeMap<[u8; 32], Vec<Vec<u8>>>,
     acknowledgement_keys: BTreeMap<[u8; 32], Vec<Vec<u8>>>,
+    loaded_objects: BTreeSet<CustodyObjectKey>,
+    loaded_semantics: BTreeSet<[u8; 32]>,
 }
 
 impl RetirementBatchIndex {
-    fn build(write: &redb::WriteTransaction) -> Result<Self, StoreError> {
-        let mut index = Self::default();
-        for row in write.open_table(CUSTODY_LEASES)?.iter()? {
-            let (_, value) = row?;
-            let lease = decode_lease(value.value())?;
-            let count = index.lease_counts.entry(lease.object).or_default();
-            *count = next_counter(*count)?;
+    fn load_object(
+        &mut self,
+        write: &redb::WriteTransaction,
+        object: CustodyObjectKey,
+        semantic_id: Option<[u8; 32]>,
+    ) -> Result<(), StoreError> {
+        if self.loaded_objects.insert(object) {
+            let encoded_object = object.encoded();
+            for primary in retirement_reference_primary_keys(
+                write,
+                RETIREMENT_REFERENCE_LEASE,
+                encoded_object.as_slice(),
+            )? {
+                let lease_id = u64::from_be_bytes(primary.as_slice().try_into().map_err(|_| {
+                    CustodyStoreError::Invariant("lease retirement reference has invalid key")
+                })?);
+                let lease = write
+                    .open_table(CUSTODY_LEASES)?
+                    .get(lease_id)?
+                    .map(|value| decode_lease(value.value()))
+                    .transpose()?
+                    .ok_or(CustodyStoreError::Invariant(
+                        "lease retirement reference points to a missing lease",
+                    ))?;
+                if lease.object != object {
+                    return Err(CustodyStoreError::Invariant(
+                        "lease retirement reference targets a different object",
+                    )
+                    .into());
+                }
+                let count = self.lease_counts.entry(object).or_default();
+                *count = next_counter(*count)?;
+            }
+            for (kind, table, target) in [
+                (
+                    RETIREMENT_REFERENCE_RETRY,
+                    CUSTODY_RETRIES,
+                    &mut self.retry_keys,
+                ),
+                (
+                    RETIREMENT_REFERENCE_RECEIPT,
+                    CUSTODY_PEER_RECEIPTS,
+                    &mut self.receipt_keys,
+                ),
+            ] {
+                for primary in
+                    retirement_reference_primary_keys(write, kind, encoded_object.as_slice())?
+                {
+                    let (_, referenced_object) = parse_peer_object_key(&primary)?;
+                    let source = write.open_table(table)?;
+                    let value =
+                        source
+                            .get(primary.as_slice())?
+                            .ok_or(CustodyStoreError::Invariant(
+                                "peer retirement reference points to a missing row",
+                            ))?;
+                    match kind {
+                        RETIREMENT_REFERENCE_RETRY => {
+                            let _ = decode_retry(value.value())?;
+                        }
+                        RETIREMENT_REFERENCE_RECEIPT => {
+                            let _ = decode_receipt(value.value())?;
+                        }
+                        _ => unreachable!("selected peer reference kind"),
+                    }
+                    if referenced_object != object {
+                        return Err(CustodyStoreError::Invariant(
+                            "peer retirement reference differs from its source row",
+                        )
+                        .into());
+                    }
+                    target.entry(object).or_default().push(primary);
+                }
+            }
         }
-        for row in write.open_table(CUSTODY_RETRIES)?.iter()? {
-            let (key, value) = row?;
-            let (_, object) = parse_peer_object_key(key.value())?;
-            let _ = decode_retry(value.value())?;
-            index
-                .retry_keys
-                .entry(object)
-                .or_default()
-                .push(key.value().to_vec());
+        if let Some(semantic_id) = semantic_id
+            && self.loaded_semantics.insert(semantic_id)
+        {
+            for (kind, table, target) in [
+                (
+                    RETIREMENT_REFERENCE_PENDING,
+                    EVENT_SUBSCRIPTION_PENDING,
+                    &mut self.pending_keys,
+                ),
+                (
+                    RETIREMENT_REFERENCE_ACKNOWLEDGEMENT,
+                    EVENT_DELIVERY_ACKNOWLEDGEMENTS,
+                    &mut self.acknowledgement_keys,
+                ),
+            ] {
+                for primary in retirement_reference_primary_keys(write, kind, &semantic_id)? {
+                    let source = write.open_table(table)?;
+                    let value =
+                        source
+                            .get(primary.as_slice())?
+                            .ok_or(CustodyStoreError::Invariant(
+                                "Event delivery retirement reference points to a missing row",
+                            ))?;
+                    match kind {
+                        RETIREMENT_REFERENCE_PENDING => {
+                            let pending = decode_event_pending_delivery_record(value.value())?;
+                            if pending.semantic_id.as_bytes() != &semantic_id {
+                                return Err(CustodyStoreError::Invariant(
+                                    "pending Event retirement reference targets a different Event",
+                                )
+                                .into());
+                            }
+                            let _ = parse_event_pending_delivery_key(&primary)?;
+                        }
+                        RETIREMENT_REFERENCE_ACKNOWLEDGEMENT => {
+                            let (_, referenced_semantic) =
+                                parse_event_acknowledgement_key(&primary)?;
+                            let _ = decode_event_acknowledgement_record(value.value())?;
+                            if referenced_semantic.as_bytes() != &semantic_id {
+                                return Err(CustodyStoreError::Invariant(
+                                    "Event acknowledgement retirement reference targets a different Event",
+                                )
+                                .into());
+                            }
+                        }
+                        _ => unreachable!("selected Event delivery reference kind"),
+                    }
+                    target.entry(semantic_id).or_default().push(primary);
+                }
+            }
         }
-        for row in write.open_table(CUSTODY_PEER_RECEIPTS)?.iter()? {
-            let (key, value) = row?;
-            let (_, object) = parse_peer_object_key(key.value())?;
-            let _ = decode_receipt(value.value())?;
-            index
-                .receipt_keys
-                .entry(object)
-                .or_default()
-                .push(key.value().to_vec());
-        }
-        for row in write.open_table(EVENT_SUBSCRIPTION_PENDING)?.iter()? {
-            let (key, value) = row?;
-            let _ = parse_event_pending_delivery_key(key.value())?;
-            let pending = decode_event_pending_delivery_record(value.value())?;
-            index
-                .pending_keys
-                .entry(*pending.semantic_id.as_bytes())
-                .or_default()
-                .push(key.value().to_vec());
-        }
-        for row in write.open_table(EVENT_DELIVERY_ACKNOWLEDGEMENTS)?.iter()? {
-            let (key, value) = row?;
-            let (_, semantic_id) = parse_event_acknowledgement_key(key.value())?;
-            let _ = decode_event_acknowledgement_record(value.value())?;
-            index
-                .acknowledgement_keys
-                .entry(*semantic_id.as_bytes())
-                .or_default()
-                .push(key.value().to_vec());
-        }
-        Ok(index)
+        Ok(())
     }
 
     fn has_active_lease(&self, object: CustodyObjectKey) -> bool {
         self.lease_counts.get(&object).copied().unwrap_or(0) != 0
-    }
-
-    fn pending_semantics(&self) -> BTreeSet<[u8; 32]> {
-        self.pending_keys.keys().copied().collect()
     }
 
     fn remove_peer_rows(
@@ -3323,6 +3675,12 @@ impl RetirementBatchIndex {
                     )
                     .into());
                 }
+                remove_peer_retirement_reference_write(
+                    write,
+                    RETIREMENT_REFERENCE_RECEIPT,
+                    key,
+                    "peer receipt retirement reference disappeared",
+                )?;
             }
             drop(receipts);
             decrement_custody_counter(
@@ -3351,6 +3709,12 @@ impl RetirementBatchIndex {
                     )
                     .into());
                 }
+                remove_peer_retirement_reference_write(
+                    write,
+                    RETIREMENT_REFERENCE_RETRY,
+                    key,
+                    "retry retirement reference disappeared",
+                )?;
             }
             drop(retries);
             decrement_custody_counter(
@@ -3378,6 +3742,11 @@ impl RetirementBatchIndex {
                     )
                     .into());
                 }
+                remove_event_pending_retirement_reference_write(
+                    write,
+                    EventSemanticId::new(semantic_id),
+                    key,
+                )?;
             }
             drop(pending);
             decrement_shared_counter(
@@ -3401,6 +3770,11 @@ impl RetirementBatchIndex {
                     )
                     .into());
                 }
+                remove_event_acknowledgement_retirement_reference_write(
+                    write,
+                    EventSemanticId::new(semantic_id),
+                    key,
+                )?;
             }
             drop(acknowledgements);
             decrement_shared_counter(
@@ -3504,6 +3878,12 @@ fn replace_expendable_retry(
     {
         return Err(CustodyStoreError::Invariant("retry replacement victim disappeared").into());
     }
+    remove_peer_retirement_reference_write(
+        write,
+        RETIREMENT_REFERENCE_RETRY,
+        victim.as_slice(),
+        "retry replacement retirement reference disappeared",
+    )?;
     Ok(true)
 }
 
@@ -3875,7 +4255,12 @@ fn mark_retiring_write(
     record: CustodyItemRecord,
     age_ms: u64,
 ) -> Result<CustodyItemRecord, StoreError> {
-    let mut batch = RetirementBatchIndex::build(write)?;
+    let mut batch = RetirementBatchIndex::default();
+    batch.load_object(
+        write,
+        key,
+        (key.class == CustodyObjectClass::Event).then_some(record.semantic_id),
+    )?;
     mark_retiring_write_indexed(write, key, record, age_ms, &mut batch)
 }
 
@@ -4184,7 +4569,8 @@ pub(crate) fn admit_event_custody_row_write(
                 Some(&record),
             )?;
         }
-        let mut retirement_batch = RetirementBatchIndex::build(write)?;
+        let mut retirement_batch = RetirementBatchIndex::default();
+        retirement_batch.load_object(write, route_key, None)?;
         let marked = mark_retiring_write_indexed(
             write,
             route_key,
@@ -4253,6 +4639,12 @@ pub(crate) fn admit_event_custody_row_write(
                 )
                 .into());
             }
+            remove_peer_retirement_reference_write(
+                write,
+                RETIREMENT_REFERENCE_RECEIPT,
+                key.as_slice(),
+                "route receipt retirement reference disappeared during promotion",
+            )?;
         }
         drop(receipts);
         decrement_custody_counter(
@@ -4286,6 +4678,12 @@ pub(crate) fn admit_event_custody_row_write(
                 )
                 .into());
             }
+            remove_peer_retirement_reference_write(
+                write,
+                RETIREMENT_REFERENCE_RETRY,
+                key.as_slice(),
+                "route retry retirement reference disappeared during promotion",
+            )?;
         }
         drop(retries);
         decrement_custody_counter(
@@ -4465,8 +4863,14 @@ impl Store {
             .collect::<Result<Vec<_>, redb::StorageError>>()?;
         {
             let mut retries = write.open_table(CUSTODY_RETRIES)?;
-            for key in retry_keys {
+            for key in &retry_keys {
                 retries.remove(key.as_slice())?;
+                remove_peer_retirement_reference_write(
+                    &write,
+                    RETIREMENT_REFERENCE_RETRY,
+                    key.as_slice(),
+                    "quota-change retry retirement reference disappeared",
+                )?;
             }
         }
         let mut metadata = write.open_table(CUSTODY_METADATA)?;
@@ -4957,6 +5361,12 @@ impl Store {
                     )
                     .into());
                 }
+                remove_peer_retirement_reference_write(
+                    &write,
+                    RETIREMENT_REFERENCE_RECEIPT,
+                    key.as_slice(),
+                    "reconciled peer receipt retirement reference disappeared",
+                )?;
             }
             drop(receipts);
             decrement_custody_counter(
@@ -5132,6 +5542,12 @@ impl Store {
                         )
                         .into());
                     }
+                    remove_peer_retirement_reference_write(
+                        &write,
+                        RETIREMENT_REFERENCE_RECEIPT,
+                        replacement.as_slice(),
+                        "peer receipt replacement retirement reference disappeared",
+                    )?;
                 } else if receipt_count < MAX_CUSTODY_PEER_RECEIPTS {
                     receipt_count = next_counter(receipt_count)?;
                 } else {
@@ -5147,6 +5563,11 @@ impl Store {
                 };
                 let encoded_receipt = encode_receipt(receipt)?;
                 receipts.insert(encoded_key.as_slice(), encoded_receipt.as_slice())?;
+                insert_peer_retirement_reference_write(
+                    &write,
+                    RETIREMENT_REFERENCE_RECEIPT,
+                    encoded_key.as_slice(),
+                )?;
             }
             if retries.remove(encoded_key.as_slice())?.is_none() {
                 return Err(CustodyStoreError::Invariant(
@@ -5154,6 +5575,12 @@ impl Store {
                 )
                 .into());
             }
+            remove_peer_retirement_reference_write(
+                &write,
+                RETIREMENT_REFERENCE_RETRY,
+                encoded_key.as_slice(),
+                "settled retry retirement reference disappeared",
+            )?;
             retry_count = retry_count
                 .checked_sub(1)
                 .ok_or(CustodyStoreError::Invariant(
@@ -5342,6 +5769,12 @@ impl Store {
                     )
                     .into());
                 }
+                remove_peer_retirement_reference_write(
+                    &write,
+                    RETIREMENT_REFERENCE_RECEIPT,
+                    key.as_slice(),
+                    "stale peer receipt retirement reference disappeared",
+                )?;
             }
             drop(receipts);
             decrement_custody_counter(
@@ -5415,6 +5848,12 @@ impl Store {
                 )
                 .into());
             }
+            remove_peer_retirement_reference_write(
+                &write,
+                RETIREMENT_REFERENCE_RECEIPT,
+                receipt_key.as_slice(),
+                "stale peer receipt retirement reference disappeared",
+            )?;
             decrement_custody_counter(
                 &write,
                 CUSTODY_RECEIPT_COUNT_KEY,
@@ -5469,6 +5908,7 @@ impl Store {
         write
             .open_table(CUSTODY_LEASES)?
             .insert(lease_id, encoded.as_slice())?;
+        insert_lease_retirement_reference_write(&write, key, lease_id)?;
         {
             let mut metadata = write.open_table(CUSTODY_METADATA)?;
             metadata.insert(CUSTODY_LEASE_COUNT_KEY, next_counter(lease_count)?)?;
@@ -5534,6 +5974,11 @@ impl Store {
         write
             .open_table(CUSTODY_RETRIES)?
             .insert(retry_key.as_slice(), encoded_retry.as_slice())?;
+        insert_peer_retirement_reference_write(
+            &write,
+            RETIREMENT_REFERENCE_RETRY,
+            retry_key.as_slice(),
+        )?;
         advance_revision(&write, false)?;
         write.commit()?;
         Ok(TransferLease {
@@ -5635,9 +6080,13 @@ impl Store {
         let write = self.database.begin_write()?;
         enforce_live_write(&write)?;
         require_custody_mission_write(&write, authority)?;
-        if write.open_table(CUSTODY_LEASES)?.remove(lease.0)?.is_none() {
-            return Err(CustodyStoreError::LeaseNotFound.into());
-        }
+        let removed = write
+            .open_table(CUSTODY_LEASES)?
+            .remove(lease.0)?
+            .map(|value| decode_lease(value.value()))
+            .transpose()?
+            .ok_or(CustodyStoreError::LeaseNotFound)?;
+        remove_lease_retirement_reference_write(&write, removed.object, lease.0)?;
         let metadata = write.open_table(CUSTODY_METADATA)?;
         let current = metadata_value(&metadata, CUSTODY_LEASE_COUNT_KEY)?;
         drop(metadata);
@@ -5840,6 +6289,12 @@ impl Store {
                         )
                         .into());
                     }
+                    remove_peer_retirement_reference_write(
+                        &write,
+                        RETIREMENT_REFERENCE_RECEIPT,
+                        replacement.as_slice(),
+                        "peer receipt replacement retirement reference disappeared",
+                    )?;
                 } else {
                     write
                         .open_table(CUSTODY_METADATA)?
@@ -5857,14 +6312,25 @@ impl Store {
             write
                 .open_table(CUSTODY_PEER_RECEIPTS)?
                 .insert(receipt_key.as_slice(), encoded_receipt.as_slice())?;
+            insert_peer_retirement_reference_write(
+                &write,
+                RETIREMENT_REFERENCE_RECEIPT,
+                receipt_key.as_slice(),
+            )?;
         }
 
-        if disposition == CustodyPeerApplyDisposition::ContentAcceptancePending
+        let receipt_removed = disposition == CustodyPeerApplyDisposition::ContentAcceptancePending
             && write
                 .open_table(CUSTODY_PEER_RECEIPTS)?
                 .remove(receipt_key.as_slice())?
-                .is_some()
-        {
+                .is_some();
+        if receipt_removed {
+            remove_peer_retirement_reference_write(
+                &write,
+                RETIREMENT_REFERENCE_RECEIPT,
+                receipt_key.as_slice(),
+                "removed peer receipt retirement reference disappeared",
+            )?;
             let metadata = write.open_table(CUSTODY_METADATA)?;
             let receipts = metadata_value(&metadata, CUSTODY_RECEIPT_COUNT_KEY)?;
             drop(metadata);
@@ -5887,12 +6353,18 @@ impl Store {
             )
             .into());
         }
-        if !retain_retry
+        let retry_removed = !retain_retry
             && write
                 .open_table(CUSTODY_RETRIES)?
                 .remove(receipt_key.as_slice())?
-                .is_some()
-        {
+                .is_some();
+        if retry_removed {
+            remove_peer_retirement_reference_write(
+                &write,
+                RETIREMENT_REFERENCE_RETRY,
+                receipt_key.as_slice(),
+                "removed retry retirement reference disappeared",
+            )?;
             let metadata = write.open_table(CUSTODY_METADATA)?;
             let retries = metadata_value(&metadata, CUSTODY_RETRY_COUNT_KEY)?;
             drop(metadata);
@@ -5926,6 +6398,7 @@ impl Store {
             let mut leases = write.open_table(CUSTODY_LEASES)?;
             for lease_id in &lease_ids {
                 leases.remove(*lease_id)?;
+                remove_lease_retirement_reference_write(&write, lease.object, *lease_id)?;
             }
         }
         let metadata = write.open_table(CUSTODY_METADATA)?;
@@ -6112,7 +6585,7 @@ impl Store {
             return Ok(report);
         }
 
-        let mut retirement_batch = RetirementBatchIndex::build(&write)?;
+        let mut retirement_batch = RetirementBatchIndex::default();
         for encoded_expiration in due_expirations {
             report.examined_expirations = report
                 .examined_expirations
@@ -6143,6 +6616,11 @@ impl Store {
             let CustodyAgeStatus::Expired { age_ms } = status else {
                 continue;
             };
+            retirement_batch.load_object(
+                &write,
+                key,
+                (key.class == CustodyObjectClass::Event).then_some(item.semantic_id),
+            )?;
             mark_retiring_write_indexed(&write, key, item, age_ms, &mut retirement_batch)?;
             report.marked.push(key);
         }
@@ -6179,6 +6657,11 @@ impl Store {
                 )
                 .into());
             }
+            retirement_batch.load_object(
+                &write,
+                key,
+                (key.class == CustodyObjectClass::Event).then_some(item.semantic_id),
+            )?;
             if retirement_batch.has_active_lease(key) {
                 report.blocked_by_leases = report
                     .blocked_by_leases
@@ -6291,8 +6774,8 @@ impl Store {
                 Ok((key.value().to_vec(), value.value().to_vec()))
             })
             .collect::<Result<Vec<_>, redb::StorageError>>()?;
-        let mut retirement_batch = RetirementBatchIndex::build(&write)?;
-        let pending_deliveries = retirement_batch.pending_semantics();
+        let mut retirement_batch = RetirementBatchIndex::default();
+        let pending_deliveries = pending_delivery_semantics_write(&write)?;
         let mut candidates = Vec::new();
         for (encoded_key, encoded_item) in rows {
             let key = CustodyObjectKey::decode(&encoded_key)?;
@@ -6350,6 +6833,11 @@ impl Store {
             if report.marked.len() == limit {
                 break;
             }
+            retirement_batch.load_object(
+                &write,
+                key,
+                (key.class == CustodyObjectClass::Event).then_some(item.semantic_id),
+            )?;
             let marked =
                 mark_retiring_write_indexed(&write, key, item, age_ms, &mut retirement_batch)?;
             report.marked.push(key);
@@ -6659,6 +7147,122 @@ fn expected_custody_maintenance_indexes(
     Ok((expirations, retiring))
 }
 
+fn expected_event_retirement_references_write(
+    write: &redb::WriteTransaction,
+    expected: &mut BTreeSet<Vec<u8>>,
+) -> Result<(), StoreError> {
+    let tables = write
+        .list_tables()?
+        .map(|table| table.name().to_owned())
+        .collect::<BTreeSet<_>>();
+    if tables.contains(EVENT_SUBSCRIPTION_PENDING.name()) {
+        for row in write.open_table(EVENT_SUBSCRIPTION_PENDING)?.iter()? {
+            let (key, value) = row?;
+            let pending = decode_event_pending_delivery_record(value.value())?;
+            expected.insert(retirement_reference_key(
+                RETIREMENT_REFERENCE_PENDING,
+                pending.semantic_id.as_bytes(),
+                key.value(),
+            ));
+        }
+    }
+    if tables.contains(EVENT_DELIVERY_ACKNOWLEDGEMENTS.name()) {
+        for row in write.open_table(EVENT_DELIVERY_ACKNOWLEDGEMENTS)?.iter()? {
+            let (key, value) = row?;
+            let (_, semantic_id) = parse_event_acknowledgement_key(key.value())?;
+            let _ = decode_event_acknowledgement_record(value.value())?;
+            expected.insert(retirement_reference_key(
+                RETIREMENT_REFERENCE_ACKNOWLEDGEMENT,
+                semantic_id.as_bytes(),
+                key.value(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn expected_event_retirement_references_read(
+    read: &redb::ReadTransaction,
+    expected: &mut BTreeSet<Vec<u8>>,
+) -> Result<(), StoreError> {
+    let tables = read
+        .list_tables()?
+        .map(|table| table.name().to_owned())
+        .collect::<BTreeSet<_>>();
+    if tables.contains(EVENT_SUBSCRIPTION_PENDING.name()) {
+        for row in read.open_table(EVENT_SUBSCRIPTION_PENDING)?.iter()? {
+            let (key, value) = row?;
+            let pending = decode_event_pending_delivery_record(value.value())?;
+            expected.insert(retirement_reference_key(
+                RETIREMENT_REFERENCE_PENDING,
+                pending.semantic_id.as_bytes(),
+                key.value(),
+            ));
+        }
+    }
+    if tables.contains(EVENT_DELIVERY_ACKNOWLEDGEMENTS.name()) {
+        for row in read.open_table(EVENT_DELIVERY_ACKNOWLEDGEMENTS)?.iter()? {
+            let (key, value) = row?;
+            let (_, semantic_id) = parse_event_acknowledgement_key(key.value())?;
+            let _ = decode_event_acknowledgement_record(value.value())?;
+            expected.insert(retirement_reference_key(
+                RETIREMENT_REFERENCE_ACKNOWLEDGEMENT,
+                semantic_id.as_bytes(),
+                key.value(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn audit_retirement_references_write(
+    write: &redb::WriteTransaction,
+    expected: &BTreeSet<Vec<u8>>,
+) -> Result<(), StoreError> {
+    let mut durable = BTreeSet::new();
+    for row in write.open_table(CUSTODY_RETIREMENT_REFERENCES)?.iter()? {
+        let (key, value) = row?;
+        if !value.value().is_empty() {
+            return Err(CustodyStoreError::Invariant(
+                "custody retirement reference value is invalid",
+            )
+            .into());
+        }
+        durable.insert(key.value().to_vec());
+    }
+    if &durable != expected {
+        return Err(CustodyStoreError::Invariant(
+            "custody retirement references differ from source rows",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn audit_retirement_references_read(
+    read: &redb::ReadTransaction,
+    expected: &BTreeSet<Vec<u8>>,
+) -> Result<(), StoreError> {
+    let mut durable = BTreeSet::new();
+    for row in read.open_table(CUSTODY_RETIREMENT_REFERENCES)?.iter()? {
+        let (key, value) = row?;
+        if !value.value().is_empty() {
+            return Err(CustodyStoreError::Invariant(
+                "custody retirement reference value is invalid",
+            )
+            .into());
+        }
+        durable.insert(key.value().to_vec());
+    }
+    if &durable != expected {
+        return Err(CustodyStoreError::Invariant(
+            "custody retirement references differ from source rows",
+        )
+        .into());
+    }
+    Ok(())
+}
+
 fn preflight_custody_cardinality_write(
     write: &redb::WriteTransaction,
     limits: StoreLimits,
@@ -6705,6 +7309,11 @@ fn preflight_custody_cardinality_write(
         write.open_table(CUSTODY_RETRIES)?.len()?,
         MAX_CUSTODY_RETRY_RECORDS,
         "retry cap is exceeded",
+    )?;
+    require_audit_table_bound(
+        write.open_table(CUSTODY_RETIREMENT_REFERENCES)?.len()?,
+        MAX_CUSTODY_RETIREMENT_REFERENCES,
+        "custody retirement reference cap is exceeded",
     )?;
     require_audit_table_bound(
         write.open_table(CUSTODY_QUOTAS)?.len()?,
@@ -6765,6 +7374,11 @@ fn preflight_custody_cardinality_read(
         read.open_table(CUSTODY_RETRIES)?.len()?,
         MAX_CUSTODY_RETRY_RECORDS,
         "retry cap is exceeded",
+    )?;
+    require_audit_table_bound(
+        read.open_table(CUSTODY_RETIREMENT_REFERENCES)?.len()?,
+        MAX_CUSTODY_RETIREMENT_REFERENCES,
+        "custody retirement reference cap is exceeded",
     )?;
     require_audit_table_bound(
         read.open_table(CUSTODY_QUOTAS)?.len()?,
@@ -7004,6 +7618,7 @@ pub(crate) fn audit_custody_tables_write(
         .into());
     }
 
+    let mut expected_retirement_references = BTreeSet::new();
     let mut lease_count = 0u64;
     let mut max_lease = 0u64;
     let mut lease_ids = Vec::new();
@@ -7028,6 +7643,11 @@ pub(crate) fn audit_custody_tables_write(
         lease_count = next_counter(lease_count)?;
         max_lease = max_lease.max(id);
         lease_ids.push(id);
+        expected_retirement_references.insert(retirement_reference_key(
+            RETIREMENT_REFERENCE_LEASE,
+            lease.object.encoded().as_slice(),
+            &id.to_be_bytes(),
+        ));
     }
     if lease_count > MAX_CUSTODY_TRANSFER_LEASES || max_lease > next_lease {
         return Err(
@@ -7054,6 +7674,11 @@ pub(crate) fn audit_custody_tables_write(
         if receipt.peer_selector_revision.is_none() {
             legacy_receipt_keys.push(key.value().to_vec());
         }
+        expected_retirement_references.insert(retirement_reference_key(
+            RETIREMENT_REFERENCE_RECEIPT,
+            object.encoded().as_slice(),
+            key.value(),
+        ));
         receipt_count = next_counter(receipt_count)?;
     }
     if receipt_count > MAX_CUSTODY_PEER_RECEIPTS {
@@ -7079,12 +7704,19 @@ pub(crate) fn audit_custody_tables_write(
             )
             .into());
         }
+        expected_retirement_references.insert(retirement_reference_key(
+            RETIREMENT_REFERENCE_RETRY,
+            object.encoded().as_slice(),
+            key.value(),
+        ));
         retry_count = next_counter(retry_count)?;
     }
     if retry_count > MAX_CUSTODY_RETRY_RECORDS {
         return Err(CustodyStoreError::Invariant("retry cap is exceeded").into());
     }
     drop(receipts);
+    expected_event_retirement_references_write(write, &mut expected_retirement_references)?;
+    audit_retirement_references_write(write, &expected_retirement_references)?;
 
     let mut quota_count = 0u64;
     let mut quotas = BTreeMap::new();
@@ -7188,6 +7820,12 @@ pub(crate) fn audit_custody_tables_write(
                 )
                 .into());
             }
+            remove_peer_retirement_reference_write(
+                write,
+                RETIREMENT_REFERENCE_RECEIPT,
+                key.as_slice(),
+                "legacy receipt retirement reference disappeared",
+            )?;
         }
         drop(receipts);
         let removed = u64::try_from(legacy_receipt_keys.len())
@@ -7209,12 +7847,14 @@ pub(crate) fn audit_custody_tables_write(
     if !lease_ids.is_empty() {
         let mut leases = write.open_table(CUSTODY_LEASES)?;
         for lease_id in lease_ids {
-            if leases.remove(lease_id)?.is_none() {
-                return Err(CustodyStoreError::Invariant(
+            let lease = leases
+                .remove(lease_id)?
+                .map(|value| decode_lease(value.value()))
+                .transpose()?
+                .ok_or(CustodyStoreError::Invariant(
                     "lease disappeared during reopen recovery",
-                )
-                .into());
-            }
+                ))?;
+            remove_lease_retirement_reference_write(write, lease.object, lease_id)?;
         }
         write
             .open_table(CUSTODY_METADATA)?
@@ -7629,6 +8269,7 @@ pub(crate) fn inspect_custody_tables_read(
         )
         .into());
     }
+    let mut expected_retirement_references = BTreeSet::new();
     let mut lease_count = 0u64;
     let mut max_lease = 0u64;
     for row in read.open_table(CUSTODY_LEASES)?.iter()? {
@@ -7646,6 +8287,11 @@ pub(crate) fn inspect_custody_tables_read(
         }
         lease_count = next_counter(lease_count)?;
         max_lease = max_lease.max(id.value());
+        expected_retirement_references.insert(retirement_reference_key(
+            RETIREMENT_REFERENCE_LEASE,
+            lease.object.encoded().as_slice(),
+            &id.value().to_be_bytes(),
+        ));
     }
     if lease_count > MAX_CUSTODY_TRANSFER_LEASES || max_lease > next_lease {
         return Err(
@@ -7667,6 +8313,11 @@ pub(crate) fn inspect_custody_tables_read(
             )
             .into());
         }
+        expected_retirement_references.insert(retirement_reference_key(
+            RETIREMENT_REFERENCE_RECEIPT,
+            object.encoded().as_slice(),
+            key.value(),
+        ));
         receipt_count = next_counter(receipt_count)?;
     }
     if receipt_count > MAX_CUSTODY_PEER_RECEIPTS {
@@ -7691,11 +8342,18 @@ pub(crate) fn inspect_custody_tables_read(
             )
             .into());
         }
+        expected_retirement_references.insert(retirement_reference_key(
+            RETIREMENT_REFERENCE_RETRY,
+            object.encoded().as_slice(),
+            key.value(),
+        ));
         retry_count = next_counter(retry_count)?;
     }
     if retry_count > MAX_CUSTODY_RETRY_RECORDS {
         return Err(CustodyStoreError::Invariant("retry cap is exceeded").into());
     }
+    expected_event_retirement_references_read(read, &mut expected_retirement_references)?;
+    audit_retirement_references_read(read, &expected_retirement_references)?;
     let mut quotas = BTreeMap::new();
     for row in read.open_table(CUSTODY_QUOTAS)?.iter()? {
         let (key, value) = row?;

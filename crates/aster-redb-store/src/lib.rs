@@ -6385,8 +6385,8 @@ impl Store {
                 })?;
                 let (row_subscription, _) = parse_event_pending_delivery_key(&key_bytes)?;
                 if row_subscription == id {
-                    decode_event_pending_delivery_record(value.value())?;
-                    pending_removals.push(key_bytes);
+                    let pending = decode_event_pending_delivery_record(value.value())?;
+                    pending_removals.push((key_bytes, pending.semantic_id));
                 }
             }
         }
@@ -6398,10 +6398,10 @@ impl Store {
                 let key_bytes: [u8; 64] = key.value().try_into().map_err(|_| {
                     StoreError::SemanticInvariant("Event acknowledgement key has invalid length")
                 })?;
-                let (row_subscription, _) = parse_event_acknowledgement_key(&key_bytes)?;
+                let (row_subscription, semantic_id) = parse_event_acknowledgement_key(&key_bytes)?;
                 if row_subscription == id {
                     decode_event_acknowledgement_record(value.value())?;
-                    acknowledgement_removals.push(key_bytes);
+                    acknowledgement_removals.push((key_bytes, semantic_id));
                 }
             }
         }
@@ -6426,14 +6426,24 @@ impl Store {
 
         {
             let mut pending = write.open_table(EVENT_SUBSCRIPTION_PENDING)?;
-            for key in &pending_removals {
+            for (key, semantic_id) in &pending_removals {
                 pending.remove(key.as_slice())?;
+                custody::remove_event_pending_retirement_reference_write(
+                    &write,
+                    *semantic_id,
+                    key.as_slice(),
+                )?;
             }
         }
         {
             let mut acknowledgements = write.open_table(EVENT_DELIVERY_ACKNOWLEDGEMENTS)?;
-            for key in &acknowledgement_removals {
+            for (key, semantic_id) in &acknowledgement_removals {
                 acknowledgements.remove(key.as_slice())?;
+                custody::remove_event_acknowledgement_retirement_reference_write(
+                    &write,
+                    *semantic_id,
+                    key.as_slice(),
+                )?;
             }
         }
         if write
@@ -6843,6 +6853,11 @@ impl Store {
                 if pending.remove(key.as_slice())?.is_none() {
                     return Err(StoreError::EventSubscriptionPlanChanged);
                 }
+                custody::remove_event_pending_retirement_reference_write(
+                    &write,
+                    *semantic_id,
+                    key.as_slice(),
+                )?;
             }
         }
 
@@ -6870,6 +6885,11 @@ impl Store {
             write
                 .open_table(EVENT_SUBSCRIPTION_PENDING)?
                 .insert(key.as_slice(), encoded.as_slice())?;
+            custody::insert_event_pending_retirement_reference_write(
+                &write,
+                *semantic_id,
+                key.as_slice(),
+            )?;
             deliveries.push(EventSubscriptionDelivery { event, attempt });
         }
 
@@ -7012,6 +7032,11 @@ impl Store {
         {
             return Err(StoreError::EventSubscriptionPlanChanged);
         }
+        custody::insert_event_acknowledgement_retirement_reference_write(
+            &write,
+            semantic_id,
+            acknowledgement_key.as_slice(),
+        )?;
         if write
             .open_table(EVENT_SUBSCRIPTION_PENDING)?
             .remove(key.as_slice())?
@@ -7019,6 +7044,11 @@ impl Store {
         {
             return Err(StoreError::EventSubscriptionPlanChanged);
         }
+        custody::remove_event_pending_retirement_reference_write(
+            &write,
+            semantic_id,
+            key.as_slice(),
+        )?;
         let pending_count =
             durable_pending_count
                 .checked_sub(1)
@@ -38199,9 +38229,10 @@ mod tests {
         let mut services = event_services(0xe4);
         let store = Store::open_for_mission(&file.0, services.authority).expect("store");
         let publisher = services.publisher.identity();
+        let mut unrelated_transfer = None;
         for sequence in 1_u64..=64 {
             let logical_key = sequence.to_be_bytes();
-            accept_event(
+            let stored = accept_event(
                 &store,
                 &mut services,
                 event_header(
@@ -38215,6 +38246,7 @@ mod tests {
                 ),
                 &logical_key,
             );
+            unrelated_transfer.get_or_insert(stored.transfer_id);
         }
 
         let clock_id = [0x64; 16];
@@ -38224,6 +38256,40 @@ mod tests {
         };
         let finite =
             accept_local_finite_event(&store, &mut services, 0, b"finite", 100, initial_sample);
+
+        // Seed one unrelated dependency, then make only its value malformed.
+        // A collection wake for the finite Event must range only that Event's
+        // reverse-reference prefix; the unrelated retry remains an audit-time
+        // failure but cannot turn per-wake maintenance back into a ledger scan.
+        let unrelated = CustodyObjectKey::event(unrelated_transfer.expect("durable Event"));
+        let peer = services.relay.identity();
+        let lease = store
+            .begin_custody_send(
+                peer,
+                unrelated,
+                CustodyPeerSelectorRevision::new(1),
+                Some(initial_sample),
+                1,
+                store.custody_policy_revision().expect("retry policy"),
+            )
+            .expect("seed unrelated retry");
+        store
+            .release_transfer_lease(lease.id)
+            .expect("retain unrelated retry");
+        let mut retry_key = [0u8; 65];
+        retry_key[..32].copy_from_slice(&peer);
+        retry_key[32] = CustodyObjectClass::Event as u8;
+        retry_key[33..].copy_from_slice(unrelated_transfer.expect("durable Event").as_bytes());
+        let corrupt = store
+            .database
+            .begin_write()
+            .expect("corrupt unrelated retry");
+        corrupt
+            .open_table(custody::CUSTODY_RETRIES)
+            .expect("retry table")
+            .insert(retry_key.as_slice(), &[0u8].as_slice())
+            .expect("replace unrelated retry");
+        corrupt.commit().expect("commit unrelated corruption");
 
         let before_due = store
             .collect_custody_garbage(
@@ -38271,6 +38337,80 @@ mod tests {
         assert_eq!(at_due.marked, vec![CustodyObjectKey::event(finite)]);
         assert_eq!(at_due.retired, vec![CustodyObjectKey::event(finite)]);
         assert_eq!(store.event_count().expect("durable Events remain"), 64);
+    }
+
+    #[test]
+    fn custody_retirement_reference_corruption_fails_inspection_and_reopen() {
+        let file = TestFile::new("custody retirement reference corruption");
+        let mut services = event_services(0xe8);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("store");
+        let publisher = services.publisher.identity();
+        let stored = accept_event(
+            &store,
+            &mut services,
+            event_header(
+                publisher,
+                1,
+                1,
+                VersionVector::default(),
+                b"indexed-retry",
+                b"payload",
+                None,
+            ),
+            b"payload",
+        );
+        let sample = aster_mesh::CustodySample {
+            clock_id: [0x68; 16],
+            tick_ms: 1_000,
+        };
+        let lease = store
+            .begin_custody_send(
+                services.relay.identity(),
+                CustodyObjectKey::event(stored.transfer_id),
+                CustodyPeerSelectorRevision::new(1),
+                Some(sample),
+                1,
+                store.custody_policy_revision().expect("retry policy"),
+            )
+            .expect("seed retry");
+        store
+            .release_transfer_lease(lease.id)
+            .expect("retain retry");
+        drop(store);
+
+        let database = Database::open(&file.0).expect("raw database");
+        let write = database.begin_write().expect("raw write");
+        let reference_keys = write
+            .open_table(custody::CUSTODY_RETIREMENT_REFERENCES)
+            .expect("retirement reference table")
+            .iter()
+            .expect("retirement reference rows")
+            .map(|row| row.map(|(key, _)| key.value().to_vec()))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("retirement reference keys");
+        assert_eq!(reference_keys.len(), 1);
+        write
+            .open_table(custody::CUSTODY_RETIREMENT_REFERENCES)
+            .expect("retirement reference table")
+            .remove(reference_keys[0].as_slice())
+            .expect("remove retirement reference")
+            .expect("retirement reference existed");
+        write
+            .commit()
+            .expect("commit retirement reference corruption");
+        drop(database);
+
+        for result in [
+            Store::inspect_existing(&file.0).map(|_| ()),
+            Store::open_for_mission(&file.0, services.authority).map(|_| ()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(StoreError::Custody(CustodyStoreError::Invariant(
+                    "custody retirement references differ from source rows"
+                )))
+            ));
+        }
     }
 
     #[test]
@@ -38534,6 +38674,34 @@ mod tests {
             .delete_table(custody::CUSTODY_RETIRING)
             .expect("delete v2 retiring index");
         write.commit().expect("commit v1 image");
+        drop(database);
+
+        for result in [
+            Store::inspect_existing(&file.0).map(|_| ()),
+            Store::open_for_mission(&file.0, services.authority).map(|_| ()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(StoreError::Custody(CustodyStoreError::Invariant(
+                    "custody schema group is incomplete"
+                )))
+            ));
+        }
+    }
+
+    #[test]
+    fn custody_schema_without_retirement_references_is_rejected() {
+        let file = TestFile::new("custody retirement reference schema rejection");
+        let services = event_services(0xe9);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("store");
+        drop(store);
+
+        let database = Database::open(&file.0).expect("raw database");
+        let write = database.begin_write().expect("raw write");
+        write
+            .delete_table(custody::CUSTODY_RETIREMENT_REFERENCES)
+            .expect("delete retirement reference index");
+        write.commit().expect("commit incomplete schema");
         drop(database);
 
         for result in [

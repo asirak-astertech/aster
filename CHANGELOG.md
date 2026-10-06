@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Reduced CI turnaround with Rust compiler caching and partitioned nextest runs.
 - Prefiltered Event query candidates before authentication to avoid unnecessary verification work.
 - Aligned the wire and envelope contract with semantic protocol version 6.
-- Bounded custody maintenance scans and wake processing to keep background work predictable.
+- Indexed custody-maintenance candidates and their cleanup dependencies so routine wakes scale with the selected page, and made publication-triggered Event sync immediate in either node-identity direction.
 
 ### Security
 
