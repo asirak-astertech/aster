@@ -24162,6 +24162,68 @@ mod tests {
         }
     }
 
+    fn custody_continuity_tick(store: &Store) -> u64 {
+        store
+            .database
+            .begin_read()
+            .expect("continuity read")
+            .open_table(custody::CUSTODY_CONTINUITY)
+            .expect("continuity table")
+            .get("clock")
+            .expect("continuity lookup")
+            .expect("continuity row")
+            .value()[25..33]
+            .try_into()
+            .map(u64::from_be_bytes)
+            .expect("continuity tick bytes")
+    }
+
+    fn assert_custody_maintenance_fast_path_does_not_enter_write_queue<F>(
+        store: &std::sync::Arc<Store>,
+        sample: aster_mesh::CustodySample,
+        maintenance: F,
+    ) where
+        F: FnOnce(
+                &Store,
+                aster_mesh::CustodySample,
+                CustodyPolicyRevision,
+            ) -> Result<CustodyGcReport, StoreError>
+            + Send
+            + 'static,
+    {
+        let policy_revision = store
+            .custody_policy_revision()
+            .expect("maintenance policy revision");
+        let blocker = store.database.begin_write().expect("hold writer queue");
+        let ready = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let worker_ready = std::sync::Arc::clone(&ready);
+        let worker_store = std::sync::Arc::clone(store);
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            worker_ready.wait();
+            send.send(maintenance(&worker_store, sample, policy_revision))
+                .expect("report maintenance result");
+        });
+        ready.wait();
+        let before_release = receive.recv_timeout(std::time::Duration::from_millis(250));
+        drop(blocker);
+        let completed_without_writer = before_release.is_ok();
+        let report = match before_release {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => receive
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("maintenance pass completes after writer releases"),
+            Err(error) => panic!("maintenance worker disconnected: {error}"),
+        }
+        .expect("maintenance pass");
+        worker.join().expect("maintenance worker");
+        assert_eq!(report, CustodyGcReport::default());
+        assert!(
+            completed_without_writer,
+            "an equal or stale same-clock sample must not wait for redb's single-writer queue"
+        );
+    }
+
     fn write_metadata(path: &std::path::Path, key: &'static str, value: u64) {
         let database = Database::open(path).expect("open raw database");
         let write = database.begin_write().expect("begin raw write");
@@ -38307,20 +38369,8 @@ mod tests {
         assert_eq!(before_due.examined_retirements, 0);
         assert!(before_due.marked.is_empty());
         assert!(before_due.retired.is_empty());
-        let persisted_tick = store
-            .database
-            .begin_read()
-            .expect("continuity read")
-            .open_table(custody::CUSTODY_CONTINUITY)
-            .expect("continuity table")
-            .get("clock")
-            .expect("continuity lookup")
-            .expect("continuity row")
-            .value()[25..33]
-            .try_into()
-            .map(u64::from_be_bytes)
-            .expect("continuity tick bytes");
-        assert_eq!(persisted_tick, initial_sample.tick_ms);
+        let persisted_tick = custody_continuity_tick(&store);
+        assert_eq!(persisted_tick, 1_099);
 
         let at_due = store
             .collect_custody_garbage(
@@ -38458,6 +38508,295 @@ mod tests {
             completed_without_writer,
             "a no-pressure pass must not wait for redb's single-writer queue"
         );
+    }
+
+    #[test]
+    fn custody_gc_equal_sample_does_not_enter_write_queue() {
+        let file = TestFile::new("equal custody GC continuity fast path");
+        let services = event_services(0xed);
+        let store = std::sync::Arc::new(
+            Store::open_for_mission(&file.0, services.authority).expect("store"),
+        );
+        let sample = aster_mesh::CustodySample {
+            clock_id: [0x6d; 16],
+            tick_ms: 1_000,
+        };
+        store
+            .collect_custody_garbage(
+                Some(sample),
+                store
+                    .custody_policy_revision()
+                    .expect("initial GC revision"),
+                1,
+            )
+            .expect("initial GC pass");
+
+        assert_custody_maintenance_fast_path_does_not_enter_write_queue(
+            &store,
+            sample,
+            |store, sample, policy_revision| {
+                store.collect_custody_garbage(Some(sample), policy_revision, 1)
+            },
+        );
+    }
+
+    #[test]
+    fn custody_gc_stale_sample_does_not_enter_write_queue() {
+        let file = TestFile::new("stale custody GC continuity fast path");
+        let services = event_services(0xee);
+        let store = std::sync::Arc::new(
+            Store::open_for_mission(&file.0, services.authority).expect("store"),
+        );
+        let initial = aster_mesh::CustodySample {
+            clock_id: [0x6e; 16],
+            tick_ms: 1_000,
+        };
+        store
+            .collect_custody_garbage(
+                Some(initial),
+                store
+                    .custody_policy_revision()
+                    .expect("initial GC revision"),
+                1,
+            )
+            .expect("initial GC pass");
+
+        assert_custody_maintenance_fast_path_does_not_enter_write_queue(
+            &store,
+            aster_mesh::CustodySample {
+                clock_id: initial.clock_id,
+                tick_ms: initial.tick_ms - 1,
+            },
+            |store, sample, policy_revision| {
+                store.collect_custody_garbage(Some(sample), policy_revision, 1)
+            },
+        );
+    }
+
+    #[test]
+    fn custody_pressure_equal_sample_does_not_enter_write_queue() {
+        let file = TestFile::new("equal custody pressure continuity fast path");
+        let services = event_services(0xef);
+        let store = std::sync::Arc::new(
+            Store::open_for_mission(&file.0, services.authority).expect("store"),
+        );
+        let sample = aster_mesh::CustodySample {
+            clock_id: [0x6f; 16],
+            tick_ms: 1_000,
+        };
+        store
+            .collect_custody_garbage(
+                Some(sample),
+                store
+                    .custody_policy_revision()
+                    .expect("initial GC revision"),
+                1,
+            )
+            .expect("initial GC pass");
+
+        assert_custody_maintenance_fast_path_does_not_enter_write_queue(
+            &store,
+            sample,
+            |store, sample, policy_revision| {
+                store.collect_custody_pressure(
+                    None,
+                    CustodyPressureDemand {
+                        usage: CustodyUsage { items: 0, bytes: 0 },
+                        priority: Priority::Flash,
+                    },
+                    Some(sample),
+                    policy_revision,
+                    MAX_CUSTODY_PAGE,
+                )
+            },
+        );
+    }
+
+    #[test]
+    fn custody_pressure_stale_sample_does_not_enter_write_queue() {
+        let file = TestFile::new("stale custody pressure continuity fast path");
+        let services = event_services(0xf0);
+        let store = std::sync::Arc::new(
+            Store::open_for_mission(&file.0, services.authority).expect("store"),
+        );
+        let initial = aster_mesh::CustodySample {
+            clock_id: [0x70; 16],
+            tick_ms: 1_000,
+        };
+        store
+            .collect_custody_garbage(
+                Some(initial),
+                store
+                    .custody_policy_revision()
+                    .expect("initial GC revision"),
+                1,
+            )
+            .expect("initial GC pass");
+
+        assert_custody_maintenance_fast_path_does_not_enter_write_queue(
+            &store,
+            aster_mesh::CustodySample {
+                clock_id: initial.clock_id,
+                tick_ms: initial.tick_ms - 1,
+            },
+            |store, sample, policy_revision| {
+                store.collect_custody_pressure(
+                    None,
+                    CustodyPressureDemand {
+                        usage: CustodyUsage { items: 0, bytes: 0 },
+                        priority: Priority::Flash,
+                    },
+                    Some(sample),
+                    policy_revision,
+                    MAX_CUSTODY_PAGE,
+                )
+            },
+        );
+    }
+
+    #[test]
+    fn custody_gc_advancing_noop_persists_continuity() {
+        let file = TestFile::new("custody GC continuity fast path");
+        let services = event_services(0xea);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("store");
+        let initial = aster_mesh::CustodySample {
+            clock_id: [0x6a; 16],
+            tick_ms: 1_000,
+        };
+        let advanced = aster_mesh::CustodySample {
+            clock_id: initial.clock_id,
+            tick_ms: 1_001,
+        };
+
+        assert_eq!(
+            store
+                .collect_custody_garbage(
+                    Some(initial),
+                    store
+                        .custody_policy_revision()
+                        .expect("initial GC revision"),
+                    1,
+                )
+                .expect("initial GC pass"),
+            CustodyGcReport::default()
+        );
+        assert_eq!(
+            store
+                .collect_custody_garbage(
+                    Some(advanced),
+                    store
+                        .custody_policy_revision()
+                        .expect("advancing GC revision"),
+                    1,
+                )
+                .expect("advancing GC pass"),
+            CustodyGcReport::default()
+        );
+
+        let persisted_tick = custody_continuity_tick(&store);
+        assert_eq!(persisted_tick, advanced.tick_ms);
+    }
+
+    #[test]
+    fn custody_pressure_advancing_noop_persists_continuity() {
+        let file = TestFile::new("custody pressure continuity fast path");
+        let services = event_services(0xeb);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("store");
+        let initial = aster_mesh::CustodySample {
+            clock_id: [0x6b; 16],
+            tick_ms: 1_000,
+        };
+        let advanced = aster_mesh::CustodySample {
+            clock_id: initial.clock_id,
+            tick_ms: 1_001,
+        };
+        store
+            .collect_custody_garbage(
+                Some(initial),
+                store
+                    .custody_policy_revision()
+                    .expect("initial GC revision"),
+                1,
+            )
+            .expect("initial GC pass");
+
+        assert_eq!(
+            store
+                .collect_custody_pressure(
+                    None,
+                    CustodyPressureDemand {
+                        usage: CustodyUsage { items: 0, bytes: 0 },
+                        priority: Priority::Flash,
+                    },
+                    Some(advanced),
+                    store
+                        .custody_policy_revision()
+                        .expect("advancing pressure revision"),
+                    MAX_CUSTODY_PAGE,
+                )
+                .expect("advancing pressure pass"),
+            CustodyGcReport::default()
+        );
+
+        let persisted_tick = custody_continuity_tick(&store);
+        assert_eq!(persisted_tick, advanced.tick_ms);
+    }
+
+    #[test]
+    fn custody_pressure_locked_fit_commits_observed_continuity() {
+        let file = TestFile::new("locked custody pressure continuity");
+        let services = event_services(0xec);
+        let store = std::sync::Arc::new(
+            Store::open_for_mission(&file.0, services.authority).expect("store"),
+        );
+        let initial = aster_mesh::CustodySample {
+            clock_id: [0x6c; 16],
+            tick_ms: 1_000,
+        };
+        let advanced = aster_mesh::CustodySample {
+            clock_id: initial.clock_id,
+            tick_ms: 1_001,
+        };
+        store
+            .collect_custody_garbage(
+                Some(initial),
+                store
+                    .custody_policy_revision()
+                    .expect("initial GC revision"),
+                1,
+            )
+            .expect("initial GC pass");
+        let policy_revision = store
+            .custody_policy_revision()
+            .expect("advancing pressure revision");
+        let blocker = store.database.begin_write().expect("hold writer queue");
+        let worker_store = std::sync::Arc::clone(&store);
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let result = worker_store.collect_custody_pressure(
+                None,
+                CustodyPressureDemand {
+                    usage: CustodyUsage { items: 0, bytes: 0 },
+                    priority: Priority::Flash,
+                },
+                Some(advanced),
+                policy_revision,
+                MAX_CUSTODY_PAGE,
+            );
+            send.send(result).expect("report pressure result");
+        });
+        drop(blocker);
+        assert_eq!(
+            receive
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("pressure pass completes")
+                .expect("advancing pressure pass"),
+            CustodyGcReport::default()
+        );
+        worker.join().expect("pressure worker");
+
+        let persisted_tick = custody_continuity_tick(&store);
+        assert_eq!(persisted_tick, advanced.tick_ms);
     }
 
     #[test]
