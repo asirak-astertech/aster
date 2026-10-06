@@ -85,7 +85,7 @@ use tokio::{
     net::{UnixListener, UnixStream},
 };
 use tokio::{
-    sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, mpsc, oneshot},
+    sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, mpsc, oneshot, watch},
     task::{AbortHandle, Id as TaskId, JoinHandle, JoinSet},
     time::{MissedTickBehavior, sleep, timeout},
 };
@@ -1901,6 +1901,279 @@ struct EmissionPolicySnapshot {
     revision: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PolicyUpdate {
+    snapshot: EmissionPolicySnapshot,
+    changed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EventContactCause {
+    ForcedOnly,
+    Normal,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DiscoveryWake {
+    normal_armed: bool,
+    forced_armed: bool,
+    saturated: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OutboundContactTask {
+    peer: ContactPeer,
+    launched_forced: bool,
+}
+
+#[derive(Default)]
+struct EventContactWakeState {
+    pending_peers: BTreeSet<EndpointId>,
+    policy_retry_peers: BTreeSet<EndpointId>,
+    normal_cause: bool,
+    peerless_event: bool,
+    forced_discovery: Option<EndpointId>,
+    seen_discovery: BTreeSet<EndpointId>,
+    discovery_saturation_events: u64,
+}
+
+impl EventContactWakeState {
+    fn arm_event(&mut self, peers: impl IntoIterator<Item = EndpointId>) {
+        let mut saw_peer = false;
+        for peer in peers.into_iter().take(MAX_CONFIGURED_PEERS) {
+            saw_peer = true;
+            self.pending_peers.insert(peer);
+        }
+        if !saw_peer {
+            self.peerless_event = true;
+        }
+    }
+
+    #[allow(dead_code)] // Task 6 consumes this contact-insertion transition.
+    fn arm_event_except(
+        &mut self,
+        peers: impl IntoIterator<Item = EndpointId>,
+        carrying_peer: EndpointId,
+    ) {
+        for peer in peers
+            .into_iter()
+            .filter(|peer| *peer != carrying_peer)
+            .take(MAX_CONFIGURED_PEERS)
+        {
+            self.pending_peers.insert(peer);
+        }
+    }
+
+    fn arm_normal_contact(&mut self) {
+        self.normal_cause = true;
+    }
+
+    fn arm_policy_relaxation(&mut self, active_peers: impl IntoIterator<Item = EndpointId>) {
+        self.arm_normal_contact();
+        let remaining = MAX_CONFIGURED_PEERS.saturating_sub(self.policy_retry_peers.len());
+        self.policy_retry_peers
+            .extend(active_peers.into_iter().take(remaining));
+    }
+
+    fn contact_cause(&self) -> Option<EventContactCause> {
+        if self.normal_cause {
+            Some(EventContactCause::Normal)
+        } else if self.has_forced_work() {
+            Some(EventContactCause::ForcedOnly)
+        } else {
+            None
+        }
+    }
+
+    fn contact_cause_for(&self, policy: EventEmissionPolicy) -> Option<EventContactCause> {
+        policy
+            .permits_contact_initiation()
+            .then(|| self.contact_cause())
+            .flatten()
+    }
+
+    fn has_forced_work(&self) -> bool {
+        !self.pending_peers.is_empty()
+            || !self.policy_retry_peers.is_empty()
+            || self.forced_discovery.is_some()
+    }
+
+    fn has_contact_work(&self) -> bool {
+        self.normal_cause || self.has_forced_work()
+    }
+
+    fn should_schedule_after_terminal(&self, policy: EventEmissionPolicy) -> bool {
+        policy.permits_contact_initiation() && self.has_contact_work()
+    }
+
+    fn clear_normal_without_candidates(&mut self) {
+        self.normal_cause = false;
+    }
+
+    fn considers(&self, peer: EndpointId, cause: EventContactCause) -> bool {
+        match cause {
+            EventContactCause::Normal => true,
+            EventContactCause::ForcedOnly => {
+                self.pending_peers.contains(&peer)
+                    || self.policy_retry_peers.contains(&peer)
+                    || self.forced_discovery == Some(peer)
+            }
+        }
+    }
+
+    fn bypasses_fallback(&self, peer: EndpointId) -> bool {
+        self.pending_peers.contains(&peer)
+            || self.policy_retry_peers.contains(&peer)
+            || self.forced_discovery == Some(peer)
+    }
+
+    /// Records that a contact actually launched and returns whether it consumed
+    /// a forced Event edge. Busy/cap-skipped candidates never call this method.
+    fn launched(&mut self, peer: EndpointId, cause: EventContactCause) -> bool {
+        if matches!(cause, EventContactCause::Normal) {
+            self.normal_cause = false;
+        }
+        let configured = self.pending_peers.remove(&peer);
+        self.policy_retry_peers.remove(&peer);
+        let discovered = self.forced_discovery == Some(peer);
+        if discovered {
+            self.forced_discovery = None;
+            self.peerless_event = false;
+        }
+        configured || discovered
+    }
+
+    fn restore_for_policy_change(
+        &mut self,
+        peer: ContactPeer,
+        launched_forced: bool,
+        _discovery_candidates: &BTreeSet<EndpointId>,
+    ) {
+        if !launched_forced {
+            return;
+        }
+        match peer {
+            ContactPeer::Configured(peer) => {
+                if self.pending_peers.len() < MAX_CONFIGURED_PEERS
+                    || self.pending_peers.contains(&peer.carrier)
+                {
+                    self.pending_peers.insert(peer.carrier);
+                }
+            }
+            #[cfg(feature = "nearby-discovery")]
+            ContactPeer::Discovered(peer) => {
+                self.peerless_event = true;
+                self.forced_discovery = if _discovery_candidates.contains(&peer) {
+                    Some(peer)
+                } else {
+                    _discovery_candidates.iter().next().copied()
+                };
+            }
+        }
+    }
+
+    fn discovered(&mut self, peer: EndpointId, candidates: &BTreeSet<EndpointId>) -> DiscoveryWake {
+        let mut wake = DiscoveryWake::default();
+        if !self.seen_discovery.contains(&peer) {
+            if self.seen_discovery.len() < MAX_CONFIGURED_PEERS {
+                self.seen_discovery.insert(peer);
+                self.normal_cause = true;
+                wake.normal_armed = true;
+            } else {
+                self.discovery_saturation_events =
+                    self.discovery_saturation_events.saturating_add(1);
+                wake.saturated = true;
+            }
+        }
+        if self.peerless_event && self.forced_discovery.is_none() {
+            self.forced_discovery = candidates.iter().next().copied();
+            wake.forced_armed = self.forced_discovery.is_some();
+        }
+        wake
+    }
+
+    fn discovery_expired(&mut self, peer: EndpointId, candidates: &BTreeSet<EndpointId>) -> bool {
+        if self.pending_peers.remove(&peer) && self.pending_peers.is_empty() {
+            self.peerless_event = true;
+        }
+        self.policy_retry_peers.remove(&peer);
+        if self.forced_discovery != Some(peer) {
+            return false;
+        }
+        self.forced_discovery = candidates.iter().next().copied();
+        self.forced_discovery.is_some()
+    }
+
+    fn discovery_window_closed(&mut self) {
+        if !self.pending_peers.is_empty() || self.forced_discovery.is_some() {
+            self.peerless_event = true;
+        }
+        self.pending_peers.clear();
+        self.policy_retry_peers.clear();
+        self.forced_discovery = None;
+        self.normal_cause = false;
+    }
+
+    fn stop_discovery(&mut self) {
+        self.pending_peers.clear();
+        self.policy_retry_peers.clear();
+        self.peerless_event = false;
+        self.forced_discovery = None;
+        self.seen_discovery.clear();
+        self.normal_cause = false;
+    }
+
+    #[cfg(test)]
+    fn pending_peer_count(&self) -> usize {
+        self.pending_peers.len()
+    }
+
+    #[cfg(test)]
+    fn is_peerless(&self) -> bool {
+        self.peerless_event
+    }
+
+    #[cfg(all(test, feature = "nearby-discovery"))]
+    fn forced_discovery(&self) -> Option<EndpointId> {
+        self.forced_discovery
+    }
+
+    #[cfg(all(test, feature = "nearby-discovery"))]
+    fn seen_discovery_count(&self) -> usize {
+        self.seen_discovery.len()
+    }
+}
+
+fn event_contact_candidate_is_due(
+    wake: &EventContactWakeState,
+    local: EndpointId,
+    peer: EndpointId,
+    cause: EventContactCause,
+    last_peer_activity: Instant,
+    now: Instant,
+    fallback_delay: Duration,
+) -> bool {
+    wake.considers(peer, cause)
+        && (wake.bypasses_fallback(peer)
+            || contact_initiation_is_due(local, peer, last_peer_activity, now, fallback_delay))
+}
+
+const fn event_policy_strictly_relaxes(
+    previous: EventEmissionPolicy,
+    current: EventEmissionPolicy,
+) -> bool {
+    match (previous, current) {
+        (EventEmissionPolicy::ReceiveOnly, next) => next.permits_contact_initiation(),
+        (EventEmissionPolicy::AtLeast(old), EventEmissionPolicy::AtLeast(new)) => {
+            (new as u8) < (old as u8)
+        }
+        (EventEmissionPolicy::AtLeast(old), EventEmissionPolicy::Normal) => {
+            !matches!(old, Priority::Routine)
+        }
+        _ => false,
+    }
+}
+
 /// Lock-free, revisioned live emission policy shared by the actor and contacts.
 ///
 /// The raw revision is a seqlock: odd values denote an update in progress and
@@ -1909,6 +2182,7 @@ struct EmissionPolicySnapshot {
 struct LiveEmissionPolicy {
     encoded: AtomicU8,
     revision: AtomicU64,
+    updates: watch::Sender<EmissionPolicySnapshot>,
 }
 
 #[derive(Clone)]
@@ -2056,11 +2330,21 @@ fn require_contact_frame_response(
 
 impl LiveEmissionPolicy {
     fn new(policy: EventEmissionPolicy) -> Self {
+        let initial = EmissionPolicySnapshot {
+            policy,
+            revision: 1,
+        };
+        let (updates, _) = watch::channel(initial);
         Self {
             encoded: AtomicU8::new(policy.encode()),
             // Public revision zero is reserved by the custody-claim codec.
             revision: AtomicU64::new(2),
+            updates,
         }
+    }
+
+    fn subscribe(&self) -> watch::Receiver<EmissionPolicySnapshot> {
+        self.updates.subscribe()
     }
 
     fn snapshot(&self) -> Result<EmissionPolicySnapshot, NodeError> {
@@ -2081,7 +2365,7 @@ impl LiveEmissionPolicy {
         }
     }
 
-    fn update(&self, policy: EventEmissionPolicy) -> Result<u64, NodeError> {
+    fn update(&self, policy: EventEmissionPolicy) -> Result<PolicyUpdate, NodeError> {
         loop {
             let current = self.revision.load(Ordering::Acquire);
             if current & 1 == 1 {
@@ -2090,7 +2374,16 @@ impl LiveEmissionPolicy {
             }
             let current_policy = EventEmissionPolicy::decode(self.encoded.load(Ordering::Acquire))?;
             if current_policy == policy {
-                return Ok(current / 2);
+                if self.revision.load(Ordering::Acquire) != current {
+                    continue;
+                }
+                return Ok(PolicyUpdate {
+                    snapshot: EmissionPolicySnapshot {
+                        policy,
+                        revision: current / 2,
+                    },
+                    changed: false,
+                });
             }
             let stable = current.checked_add(2).ok_or_else(|| {
                 NodeError::Protocol("Event emission policy revision is exhausted".into())
@@ -2104,7 +2397,24 @@ impl LiveEmissionPolicy {
             }
             self.encoded.store(policy.encode(), Ordering::Release);
             self.revision.store(stable, Ordering::Release);
-            return Ok(stable / 2);
+            let snapshot = EmissionPolicySnapshot {
+                policy,
+                revision: stable / 2,
+            };
+            // A later concurrent writer may complete before this notification.
+            // Never let its newer coalesced snapshot regress in the watch slot.
+            self.updates.send_if_modified(|notified| {
+                if notified.revision < snapshot.revision {
+                    *notified = snapshot;
+                    true
+                } else {
+                    false
+                }
+            });
+            return Ok(PolicyUpdate {
+                snapshot,
+                changed: true,
+            });
         }
     }
 
@@ -2587,7 +2897,7 @@ impl RunningNode {
     /// application/control frame send and durable receive commit. A changed
     /// revision closes that contact so later work starts from a fresh policy.
     pub fn set_event_emission_policy(&self, policy: EventEmissionPolicy) -> Result<u64, NodeError> {
-        let revision = self.emission_policy.update(policy)?;
+        let update = self.emission_policy.update(policy)?;
         #[cfg(feature = "nearby-discovery")]
         if policy != EventEmissionPolicy::Normal
             && let Some(stop) = &self.nearby_discovery_stop
@@ -2597,7 +2907,7 @@ impl RunningNode {
             // cannot be reopened by returning to Normal.
             stop.stop();
         }
-        Ok(revision)
+        Ok(update.snapshot.revision)
     }
 
     /// Requests graceful shutdown, closes command admission, and waits for cleanup.
@@ -11534,6 +11844,59 @@ struct RunNodeActorTestControl {
     zeroization_queued: oneshot::Sender<()>,
     blob_worker_fatal_on_shutdown: bool,
     blob_final_read_gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
+    outbound_contact: Option<ActorOutboundContactTestHook>,
+    initial_peer_contact_activity: Vec<(EndpointId, Instant)>,
+}
+
+#[cfg(all(test, unix))]
+#[derive(Clone, Copy, Debug)]
+enum ActorOutboundContactObservation {
+    Launched {
+        peer: EndpointId,
+        previous_activity: Instant,
+        launched_at: Instant,
+    },
+    DuplicateSuppressed {
+        peer: EndpointId,
+    },
+}
+
+#[cfg(all(test, unix))]
+#[derive(Clone)]
+struct ActorOutboundContactTestHook {
+    observations: mpsc::UnboundedSender<ActorOutboundContactObservation>,
+    results: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<NodeError>>>,
+}
+
+#[cfg(all(test, unix))]
+impl ActorOutboundContactTestHook {
+    fn observe_duplicate_suppression(&self, peer: EndpointId) {
+        let _ = self
+            .observations
+            .send(ActorOutboundContactObservation::DuplicateSuppressed { peer });
+    }
+
+    async fn contact(
+        &self,
+        peer: EndpointId,
+        previous_activity: Instant,
+        launched_at: Instant,
+    ) -> Result<CompletedPeerContact, NodeError> {
+        let _ = self
+            .observations
+            .send(ActorOutboundContactObservation::Launched {
+                peer,
+                previous_activity,
+                launched_at,
+            });
+        Err(self
+            .results
+            .lock()
+            .await
+            .recv()
+            .await
+            .expect("actor outbound-contact test result channel remains open"))
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -12149,6 +12512,8 @@ async fn run_node_actor_inner(
         zeroization_queued,
         blob_worker_fatal_on_shutdown,
         blob_final_read_gate,
+        outbound_contact_test_hook,
+        initial_peer_contact_activity,
         mut event_operation_audit_control,
     ) = match test_control.take() {
         Some(control) => (
@@ -12157,9 +12522,11 @@ async fn run_node_actor_inner(
             Some(control.zeroization_queued),
             control.blob_worker_fatal_on_shutdown,
             control.blob_final_read_gate,
+            control.outbound_contact,
+            control.initial_peer_contact_activity,
             control.event_operation_audit,
         ),
-        None => (None, None, None, false, None, None),
+        None => (None, None, None, false, None, None, Vec::new(), None),
     };
     #[cfg(not(all(test, unix)))]
     let blob_worker_fatal_on_shutdown = false;
@@ -12245,8 +12612,11 @@ async fn run_node_actor_inner(
     let mut control_commands_since_yield = 0usize;
     let mut control_yield_required = false;
     let mut discovery_yield_required = false;
+    let mut emission_policy_yield_required = false;
     let mut application_tick_pending = false;
-    let mut event_contact_wake_pending = false;
+    let mut event_contact_wake = EventContactWakeState::default();
+    let mut emission_policy_updates = emission_policy.subscribe();
+    let mut observed_emission_policy = emission_policy.snapshot()?;
     let mut application_tick_yield_required = false;
     let mut application_commands_since_yield = 0usize;
     let mut network_events_since_application = 0usize;
@@ -12257,7 +12627,7 @@ async fn run_node_actor_inner(
     let mut outbound: JoinSet<(ContactPeer, Result<CompletedPeerContact, NodeError>)> =
         JoinSet::new();
     let mut outbound_peers = BTreeSet::new();
-    let mut outbound_tasks = BTreeMap::<TaskId, ContactPeer>::new();
+    let mut outbound_tasks = BTreeMap::<TaskId, OutboundContactTask>::new();
     let mut outbound_abort_handles = BTreeMap::<EndpointId, (TaskId, AbortHandle)>::new();
     let mut collision_aborted_outbound = BTreeSet::<TaskId>::new();
     let non_preferred_fallback_delay = non_preferred_contact_fallback_delay(config.sync_interval);
@@ -12266,6 +12636,12 @@ async fn run_node_actor_inner(
         .iter()
         .map(|peer| (peer.carrier, contact_election_started))
         .collect::<BTreeMap<_, _>>();
+    #[cfg(all(test, unix))]
+    for (peer, activity) in initial_peer_contact_activity {
+        if peer_contact_activity.contains_key(&peer) {
+            peer_contact_activity.insert(peer, activity);
+        }
+    }
     let mut automatic_candidates = BTreeSet::<EndpointId>::new();
     let mut automatic_events_open = automatic_nearby;
     let mut next_outbound_peer = 0usize;
@@ -12511,6 +12887,55 @@ async fn run_node_actor_inner(
                     audit_progress_open = false;
                 }
             }
+            policy_update = emission_policy_updates.changed(), if !emission_policy_yield_required => {
+                control_yield_required = false;
+                discovery_yield_required = false;
+                application_tick_yield_required = false;
+                if policy_update.is_err() {
+                    fatal_error = Some(NodeError::Protocol(
+                        "live emission policy notification channel closed".into(),
+                    ));
+                    break;
+                }
+                let latest = match emission_policy.snapshot() {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        fatal_error = Some(error);
+                        break;
+                    }
+                };
+                #[cfg(feature = "nearby-discovery")]
+                let discovery_stopped = nearby_discovery_stop
+                    .as_ref()
+                    .is_some_and(NearbyDiscoveryControl::is_stopped);
+                #[cfg(not(feature = "nearby-discovery"))]
+                let discovery_stopped = false;
+                if discovery_stopped {
+                    automatic_events_open = false;
+                    automatic_candidates.clear();
+                    peer_contact_activity.clear();
+                    event_contact_wake.stop_discovery();
+                }
+                if !discovery_stopped
+                    && event_policy_strictly_relaxes(
+                        observed_emission_policy.policy,
+                        latest.policy,
+                    )
+                {
+                    event_contact_wake.arm_policy_relaxation(
+                        outbound_peers
+                            .iter()
+                            .chain(inbound_peers.iter())
+                            .copied(),
+                    );
+                    application_tick_pending = true;
+                }
+                observed_emission_policy = latest;
+                // Revisions coalesce in the watch slot. Yield one actor turn
+                // after rereading the latest stable snapshot so policy churn
+                // cannot starve network or application work.
+                emission_policy_yield_required = true;
+            }
             discovery = automatic_event_receiver.recv(),
                 if automatic_events_open && !discovery_yield_required => {
                 control_yield_required = false;
@@ -12529,12 +12954,26 @@ async fn run_node_actor_inner(
                                 endpoint_id,
                                 MAX_AUTOMATIC_NEARBY_CANDIDATES
                             );
-                        } else if automatic_candidates.insert(endpoint_id) {
-                            node_stdout!(
-                                "DISCOVERY status=candidate mode=nearby-auto carrier_peer={} retained_candidates={} authorization=pending-mission-handshake",
-                                endpoint_id,
-                                automatic_candidates.len()
-                            );
+                        } else {
+                            if automatic_candidates.insert(endpoint_id) {
+                                node_stdout!(
+                                    "DISCOVERY status=candidate mode=nearby-auto carrier_peer={} retained_candidates={} authorization=pending-mission-handshake",
+                                    endpoint_id,
+                                    automatic_candidates.len()
+                                );
+                            }
+                            let wake = event_contact_wake
+                                .discovered(endpoint_id, &automatic_candidates);
+                            if wake.saturated {
+                                node_stderr!(
+                                    "DISCOVERY status=scheduling-saturated mode=nearby-auto carrier_peer={} seen_limit={}",
+                                    endpoint_id,
+                                    MAX_CONFIGURED_PEERS,
+                                );
+                            }
+                            if wake.normal_armed || wake.forced_armed {
+                                application_tick_pending = true;
+                            }
                         }
                     }
                     Some(AutomaticNearbyEvent::Expired(endpoint_id)) => {
@@ -12546,15 +12985,22 @@ async fn run_node_actor_inner(
                                 automatic_candidates.len()
                             );
                         }
+                        if event_contact_wake
+                            .discovery_expired(endpoint_id, &automatic_candidates)
+                        {
+                            application_tick_pending = true;
+                        }
                     }
                     Some(AutomaticNearbyEvent::WindowClosed) => {
                         automatic_candidates.clear();
                         peer_contact_activity.clear();
+                        event_contact_wake.discovery_window_closed();
                     }
                     None => {
                         automatic_events_open = false;
                         automatic_candidates.clear();
                         peer_contact_activity.clear();
+                        event_contact_wake.stop_discovery();
                     }
                 }
                 // A biased, continuously ready discovery stream gets at most
@@ -12609,6 +13055,7 @@ async fn run_node_actor_inner(
             _ = ticker.tick(), if !application_tick_pending => {
                 control_yield_required = false;
                 discovery_yield_required = false;
+                event_contact_wake.arm_normal_contact();
                 application_tick_pending = true;
             }
             _policy_read = policy_lock.clone().read_owned(),
@@ -12659,9 +13106,11 @@ async fn run_node_actor_inner(
                         break;
                     }
                 };
-                if !emission_snapshot.policy.permits_contact_initiation() {
+                let Some(contact_cause) = event_contact_wake
+                    .contact_cause_for(emission_snapshot.policy)
+                else {
                     continue;
-                }
+                };
                 #[cfg(feature = "nearby-discovery")]
                 let contact_peers = if automatic_nearby {
                     automatic_candidates
@@ -12684,20 +13133,21 @@ async fn run_node_actor_inner(
                     .collect::<Vec<_>>();
                 let peer_count = contact_peers.len();
                 if peer_count == 0 {
+                    event_contact_wake.clear_normal_without_candidates();
                     continue;
                 }
-                let force_contact_initiation = event_contact_wake_pending;
                 let start = next_outbound_peer % peer_count;
                 next_outbound_peer = (start + 1) % peer_count;
                 let election_now = Instant::now();
-                let mut event_wake_has_busy_peer = false;
                 for offset in 0..peer_count {
                     if outbound.len() >= MAX_OUTBOUND_CONTACTS {
-                        event_wake_has_busy_peer = force_contact_initiation;
                         break;
                     }
                     let peer = contact_peers[(start + offset) % peer_count];
                     let peer_id = peer.carrier();
+                    if !event_contact_wake.considers(peer_id, contact_cause) {
+                        continue;
+                    }
                     let last_activity = peer_contact_activity
                         .entry(peer_id)
                         .or_insert(election_now);
@@ -12706,24 +13156,29 @@ async fn run_node_actor_inner(
                     // the normal case single-sided while allowing a normal peer to
                     // reach a lower-identity ReceiveOnly peer.
                     if inbound_peers.contains(&peer_id) {
-                        event_wake_has_busy_peer |= force_contact_initiation;
                         continue;
                     }
-                    if !force_contact_initiation
-                        && !contact_initiation_is_due(
-                            local_id,
-                            peer_id,
-                            *last_activity,
-                            election_now,
-                            non_preferred_fallback_delay,
-                        )
-                    {
+                    if !event_contact_candidate_is_due(
+                        &event_contact_wake,
+                        local_id,
+                        peer_id,
+                        contact_cause,
+                        *last_activity,
+                        election_now,
+                        non_preferred_fallback_delay,
+                    ) {
                         continue;
                     }
                     if !outbound_peers.insert(peer_id) {
-                        event_wake_has_busy_peer |= force_contact_initiation;
+                        #[cfg(all(test, unix))]
+                        if let Some(hook) = &outbound_contact_test_hook {
+                            hook.observe_duplicate_suppression(peer_id);
+                        }
                         continue;
                     }
+                    let launched_forced = event_contact_wake.launched(peer_id, contact_cause);
+                    #[cfg(all(test, unix))]
+                    let previous_activity = *last_activity;
                     *last_activity = election_now;
                     let store = store.clone();
                     let endpoint = endpoint.clone();
@@ -12737,7 +13192,16 @@ async fn run_node_actor_inner(
                     let controlled_relay = forwarding.controlled_relay.clone();
                     #[cfg(feature = "nearby-discovery")]
                     let automatic_admission = automatic_admission.clone();
+                    #[cfg(all(test, unix))]
+                    let outbound_contact_test_hook = outbound_contact_test_hook.clone();
                     let task = outbound.spawn(inherit_node_output(async move {
+                        #[cfg(all(test, unix))]
+                        if let Some(hook) = outbound_contact_test_hook {
+                            return (
+                                peer,
+                                hook.contact(peer_id, previous_activity, election_now).await,
+                            );
+                        }
                         (
                             peer,
                             sync_once_with_forwarding(
@@ -12762,11 +13226,14 @@ async fn run_node_actor_inner(
                         )
                     }));
                     let task_id = task.id();
-                    outbound_tasks.insert(task_id, peer);
+                    outbound_tasks.insert(
+                        task_id,
+                        OutboundContactTask {
+                            peer,
+                            launched_forced,
+                        },
+                    );
                     outbound_abort_handles.insert(peer_id, (task_id, task));
-                }
-                if force_contact_initiation {
-                    event_contact_wake_pending = event_wake_has_busy_peer;
                 }
             }
             lease = acquire_application_policy_lease(
@@ -12795,8 +13262,13 @@ async fn run_node_actor_inner(
                 );
                 application_tick_yield_required = false;
                 if new_event_inserted {
+                    if automatic_nearby {
+                        event_contact_wake.arm_event(automatic_candidates.iter().copied());
+                    } else {
+                        event_contact_wake
+                            .arm_event(configured_peers.iter().map(|peer| peer.carrier));
+                    }
                     application_tick_pending = true;
-                    event_contact_wake_pending = true;
                 }
                 network_events_since_application = 0;
                 application_commands_since_yield += 1;
@@ -13003,8 +13475,18 @@ async fn run_node_actor_inner(
                     }
                     None => {}
                 }
-                if event_contact_wake_pending {
-                    application_tick_pending = true;
+                match emission_policy.snapshot() {
+                    Ok(snapshot)
+                        if event_contact_wake
+                            .should_schedule_after_terminal(snapshot.policy) =>
+                    {
+                        application_tick_pending = true;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        fatal_error = Some(error);
+                        break;
+                    }
                 }
                 if yield_for_network {
                     tokio::task::yield_now().await;
@@ -13082,7 +13564,7 @@ async fn run_node_actor_inner(
                         );
                     }
                     Some(Ok((task, (peer, Err(error))))) => {
-                        outbound_tasks.remove(&task);
+                        let metadata = outbound_tasks.remove(&task);
                         outbound_peers.remove(&peer.carrier());
                         outbound_abort_handles.remove(&peer.carrier());
                         collision_aborted_outbound.remove(&task);
@@ -13093,6 +13575,15 @@ async fn run_node_actor_inner(
                             fatal_error = Some(error);
                             break;
                         }
+                        if matches!(&error, NodeError::EmissionPolicyChanged)
+                            && let Some(metadata) = metadata
+                        {
+                            event_contact_wake.restore_for_policy_change(
+                                metadata.peer,
+                                metadata.launched_forced,
+                                &automatic_candidates,
+                            );
+                        }
                         receipt.contact_errors += 1;
                         let expected_mission = peer
                             .expected_mission()
@@ -13102,24 +13593,33 @@ async fn run_node_actor_inner(
                     Some(Err(error)) => {
                         let task = error.id();
                         let collision_aborted = collision_aborted_outbound.remove(&task);
-                        let peer = outbound_tasks.remove(&task);
-                        if let Some(peer) = peer {
-                            outbound_peers.remove(&peer.carrier());
-                            outbound_abort_handles.remove(&peer.carrier());
-                            if let Some(last_activity) = peer_contact_activity.get_mut(&peer.carrier()) {
+                        let metadata = outbound_tasks.remove(&task);
+                        if let Some(metadata) = metadata {
+                            outbound_peers.remove(&metadata.peer.carrier());
+                            outbound_abort_handles.remove(&metadata.peer.carrier());
+                            if let Some(last_activity) = peer_contact_activity.get_mut(&metadata.peer.carrier()) {
                                 *last_activity = Instant::now();
                             }
                         }
-                        if collision_aborted {
-                            continue;
+                        if !collision_aborted {
+                            receipt.contact_errors += 1;
+                            node_stderr!("CONTACT direction=out carrier_peer={} status=error error={}", metadata.map_or_else(|| "unknown".into(), |metadata| metadata.peer.carrier().to_string()), format_receipt_field(&format!("task failed: {error}")));
                         }
-                        receipt.contact_errors += 1;
-                        node_stderr!("CONTACT direction=out carrier_peer={} status=error error={}", peer.map_or_else(|| "unknown".into(), |peer| peer.carrier().to_string()), format_receipt_field(&format!("task failed: {error}")));
                     }
                     None => {}
                 }
-                if event_contact_wake_pending {
-                    application_tick_pending = true;
+                match emission_policy.snapshot() {
+                    Ok(snapshot)
+                        if event_contact_wake
+                            .should_schedule_after_terminal(snapshot.policy) =>
+                    {
+                        application_tick_pending = true;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        fatal_error = Some(error);
+                        break;
+                    }
                 }
                 if yield_for_network {
                     tokio::task::yield_now().await;
@@ -13162,8 +13662,13 @@ async fn run_node_actor_inner(
                 );
                 application_tick_yield_required = false;
                 if new_event_inserted {
+                    if automatic_nearby {
+                        event_contact_wake.arm_event(automatic_candidates.iter().copied());
+                    } else {
+                        event_contact_wake
+                            .arm_event(configured_peers.iter().map(|peer| peer.carrier));
+                    }
                     application_tick_pending = true;
-                    event_contact_wake_pending = true;
                 }
                 network_events_since_application = 0;
                 application_commands_since_yield += 1;
@@ -13176,9 +13681,11 @@ async fn run_node_actor_inner(
                 if !audit_can_progress
                     || control_yield_required
                     || discovery_yield_required
+                    || emission_policy_yield_required
                     || (application_tick_pending && application_tick_yield_required) => {
                 control_yield_required = false;
                 discovery_yield_required = false;
+                emission_policy_yield_required = false;
                 application_tick_yield_required = false;
             }
             }
@@ -25212,6 +25719,376 @@ mod tests {
         );
     }
 
+    fn wake_test_endpoint() -> EndpointId {
+        aster_iroh::SecretKey::generate().public()
+    }
+
+    #[test]
+    fn event_contact_wake_forced_only_preserves_unlaunched_peers_and_drains_past_cap() {
+        // Break caught: one global boolean is cleared after the first scheduler
+        // turn, losing peers skipped because the 16-contact cap was full.
+        let peers = (0..(MAX_OUTBOUND_CONTACTS + 4))
+            .map(|_| wake_test_endpoint())
+            .collect::<BTreeSet<_>>();
+        let mut wake = EventContactWakeState::default();
+        wake.arm_event(peers.iter().copied());
+
+        assert_eq!(wake.contact_cause(), Some(EventContactCause::ForcedOnly));
+        let first_turn = peers
+            .iter()
+            .copied()
+            .filter(|peer| wake.considers(*peer, EventContactCause::ForcedOnly))
+            .take(MAX_OUTBOUND_CONTACTS)
+            .collect::<Vec<_>>();
+        for peer in &first_turn {
+            assert!(wake.launched(*peer, EventContactCause::ForcedOnly));
+        }
+        assert_eq!(wake.pending_peer_count(), 4);
+        assert_eq!(wake.contact_cause(), Some(EventContactCause::ForcedOnly));
+
+        for peer in peers.difference(&first_turn.into_iter().collect()) {
+            assert!(wake.launched(*peer, EventContactCause::ForcedOnly));
+        }
+        assert_eq!(wake.pending_peer_count(), 0);
+        assert_eq!(wake.contact_cause(), None, "completion must not self-arm");
+    }
+
+    #[test]
+    fn event_contact_wake_normal_cause_considers_all_and_prelaunch_bursts_coalesce() {
+        // Break caught: a global forced bit cannot distinguish a normal tick,
+        // which may consider all peers, from a forced-only drain.
+        let pending = wake_test_endpoint();
+        let ordinary = wake_test_endpoint();
+        let mut wake = EventContactWakeState::default();
+        wake.arm_event_except([pending, ordinary], ordinary);
+        wake.arm_event([pending]);
+        assert_eq!(wake.pending_peer_count(), 1);
+        wake.arm_normal_contact();
+
+        assert_eq!(wake.contact_cause(), Some(EventContactCause::Normal));
+        assert!(wake.considers(pending, EventContactCause::Normal));
+        assert!(wake.considers(ordinary, EventContactCause::Normal));
+        assert!(wake.launched(pending, EventContactCause::Normal));
+        assert_eq!(wake.contact_cause(), None);
+
+        let mut carrying_only = EventContactWakeState::default();
+        carrying_only.arm_event_except([ordinary], ordinary);
+        assert!(!carrying_only.is_peerless());
+        assert_eq!(carrying_only.contact_cause(), None);
+    }
+
+    #[test]
+    fn event_contact_wake_normal_cause_survives_prelaunch_blockers_until_launch() {
+        // Break caught: consuming the normal cause before the scheduling loop
+        // loses discovery/policy work when the contact cap is already full, a
+        // candidate is inbound-active, or the same peer is already outbound.
+        let peer = wake_test_endpoint();
+        let mut wake = EventContactWakeState::default();
+        wake.arm_normal_contact();
+
+        let first_attempt = wake
+            .contact_cause_for(EventEmissionPolicy::Normal)
+            .expect("normal contact cause");
+        assert_eq!(first_attempt, EventContactCause::Normal);
+        assert_eq!(
+            wake.contact_cause_for(EventEmissionPolicy::Normal),
+            Some(EventContactCause::Normal),
+            "a pre-launch contact-cap/busy skip must retain the normal cause"
+        );
+        assert!(wake.should_schedule_after_terminal(EventEmissionPolicy::Normal));
+
+        assert!(!wake.launched(peer, first_attempt));
+        assert_eq!(wake.contact_cause_for(EventEmissionPolicy::Normal), None);
+        assert!(!wake.should_schedule_after_terminal(EventEmissionPolicy::Normal));
+    }
+
+    #[test]
+    fn event_contact_wake_policy_relaxation_retries_after_older_contact_terminal() {
+        // Break caught: a strict policy relaxation can race an outbound
+        // contact holding the older snapshot. The scheduling turn observes
+        // that peer as busy, so its normal cause must survive until the older
+        // contact terminates with EmissionPolicyChanged and schedules retry.
+        let peer = wake_test_endpoint();
+        let mut wake = EventContactWakeState::default();
+        wake.arm_normal_contact();
+
+        assert_eq!(
+            wake.contact_cause_for(EventEmissionPolicy::at_least(Priority::Priority)),
+            Some(EventContactCause::Normal)
+        );
+        // No launch: the peer is already present in outbound_peers with an
+        // older emission snapshot.
+        assert!(
+            wake.should_schedule_after_terminal(EventEmissionPolicy::at_least(Priority::Priority))
+        );
+
+        let retry = wake
+            .contact_cause_for(EventEmissionPolicy::at_least(Priority::Priority))
+            .expect("normal cause retained for terminal retry");
+        assert!(!wake.launched(peer, retry));
+        assert!(
+            !wake.should_schedule_after_terminal(EventEmissionPolicy::at_least(Priority::Priority))
+        );
+    }
+
+    #[test]
+    fn event_contact_wake_policy_retry_bypasses_fallback_for_exact_peer_once() {
+        // Break caught: the terminal handler refreshes peer activity before
+        // rescheduling retained normal work. A higher-ID local node then fails
+        // the ordinary fallback election even though the older-snapshot
+        // contact ended with EmissionPolicyChanged.
+        let mut identities = [
+            wake_test_endpoint(),
+            wake_test_endpoint(),
+            wake_test_endpoint(),
+        ];
+        identities.sort();
+        let [peer, unrelated_peer, local] = identities;
+        let now = Instant::now();
+        let fallback = Duration::from_secs(60);
+        let mut wake = EventContactWakeState::default();
+        wake.arm_policy_relaxation([peer]);
+
+        let cause = wake
+            .contact_cause_for(EventEmissionPolicy::Normal)
+            .expect("strict-relaxation contact cause");
+        assert!(event_contact_candidate_is_due(
+            &wake, local, peer, cause, now, now, fallback,
+        ));
+        assert!(!event_contact_candidate_is_due(
+            &wake,
+            local,
+            unrelated_peer,
+            cause,
+            now,
+            now,
+            fallback,
+        ));
+
+        // The actor observes `peer` in outbound_peers and does not launch.
+        // Its EmissionPolicyChanged terminal edge must retain and reschedule
+        // the exact override despite the freshly stamped activity time.
+        assert!(wake.should_schedule_after_terminal(EventEmissionPolicy::Normal));
+        let retry = wake
+            .contact_cause_for(EventEmissionPolicy::Normal)
+            .expect("terminal policy retry");
+        assert!(event_contact_candidate_is_due(
+            &wake, local, peer, retry, now, now, fallback,
+        ));
+        assert!(!wake.launched(peer, retry));
+        assert!(!wake.should_schedule_after_terminal(EventEmissionPolicy::Normal));
+
+        // The override is launch-consumed. Later unrelated normal work for the
+        // same higher-ID node remains gated by the ordinary fallback delay.
+        wake.arm_normal_contact();
+        let ordinary = wake
+            .contact_cause_for(EventEmissionPolicy::Normal)
+            .expect("ordinary normal cause");
+        assert!(!event_contact_candidate_is_due(
+            &wake, local, peer, ordinary, now, now, fallback,
+        ));
+    }
+
+    #[test]
+    fn event_contact_wake_restores_only_policy_invalidated_forced_launches() {
+        // Break caught: blindly restoring every failed launch creates a
+        // self-arming redial loop; dropping policy-invalidated work loses it.
+        let peer = wake_test_endpoint();
+        let mut wake = EventContactWakeState::default();
+        wake.arm_event([peer]);
+        assert_eq!(wake.contact_cause(), Some(EventContactCause::ForcedOnly));
+        assert!(wake.launched(peer, EventContactCause::ForcedOnly));
+        wake.restore_for_policy_change(
+            ContactPeer::Configured(ConfiguredPeer {
+                carrier: peer,
+                mission: [0x91; 32],
+                locator: PeerLocator::Direct(SocketAddr::from(([127, 0, 0, 1], 9))),
+            }),
+            true,
+            &BTreeSet::new(),
+        );
+        assert_eq!(wake.pending_peer_count(), 1);
+        assert_eq!(
+            wake.contact_cause_for(EventEmissionPolicy::ReceiveOnly),
+            None,
+            "ReceiveOnly must retain forced work without initiating"
+        );
+        assert_eq!(wake.pending_peer_count(), 1);
+        assert_eq!(
+            wake.contact_cause_for(EventEmissionPolicy::at_least(Priority::Flash)),
+            Some(EventContactCause::ForcedOnly),
+            "a tightening-aborted launch retries under the latest initiating snapshot"
+        );
+        assert!(wake.launched(peer, EventContactCause::ForcedOnly));
+        assert_eq!(wake.contact_cause(), None);
+    }
+
+    #[test]
+    fn event_contact_wake_policy_partial_order_is_exact() {
+        // Break caught: treating every revision as a wake turns tightening and
+        // equivalent Normal/AtLeast(Routine) changes into needless contacts.
+        let policies = [
+            EventEmissionPolicy::ReceiveOnly,
+            EventEmissionPolicy::at_least(Priority::Flash),
+            EventEmissionPolicy::at_least(Priority::Immediate),
+            EventEmissionPolicy::at_least(Priority::Priority),
+            EventEmissionPolicy::at_least(Priority::Routine),
+            EventEmissionPolicy::Normal,
+        ];
+        for previous in policies {
+            for current in policies {
+                let expected = match (previous, current) {
+                    (EventEmissionPolicy::ReceiveOnly, next) => next.permits_contact_initiation(),
+                    (EventEmissionPolicy::AtLeast(old), EventEmissionPolicy::AtLeast(new)) => {
+                        (new as u8) < (old as u8)
+                    }
+                    (EventEmissionPolicy::AtLeast(old), EventEmissionPolicy::Normal) => {
+                        old != Priority::Routine
+                    }
+                    _ => false,
+                };
+                assert_eq!(
+                    event_policy_strictly_relaxes(previous, current),
+                    expected,
+                    "previous={previous:?} current={current:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn event_contact_wake_policy_updates_coalesce_to_latest_snapshot() {
+        // Break caught: policy mutation had no actor notification, so retained
+        // ReceiveOnly Event work waited for the next periodic tick.
+        let live = LiveEmissionPolicy::new(EventEmissionPolicy::ReceiveOnly);
+        let mut updates = live.subscribe();
+        let first = live
+            .update(EventEmissionPolicy::at_least(Priority::Immediate))
+            .expect("first policy update");
+        let latest = live
+            .update(EventEmissionPolicy::at_least(Priority::Routine))
+            .expect("latest policy update");
+        let same = live
+            .update(EventEmissionPolicy::at_least(Priority::Routine))
+            .expect("same policy update");
+
+        assert!(first.changed);
+        assert!(latest.changed);
+        assert!(!same.changed);
+        updates.changed().await.expect("coalesced policy update");
+        assert_eq!(*updates.borrow_and_update(), latest.snapshot);
+        assert_eq!(
+            live.snapshot().expect("latest live snapshot"),
+            latest.snapshot
+        );
+    }
+
+    #[cfg(feature = "nearby-discovery")]
+    #[test]
+    fn nearby_event_contact_wake_seen_identity_is_silent_without_peerless_work() {
+        // Break caught: reopening a discovery window rearmed the same
+        // continuously advertised identity once per window.
+        let peer = wake_test_endpoint();
+        let mut candidates = BTreeSet::from([peer]);
+        let mut wake = EventContactWakeState::default();
+        assert!(wake.discovered(peer, &candidates).normal_armed);
+        assert_eq!(wake.contact_cause(), Some(EventContactCause::Normal));
+        wake.discovery_window_closed();
+        candidates.clear();
+        candidates.insert(peer);
+
+        let rediscovered = wake.discovered(peer, &candidates);
+        assert!(!rediscovered.normal_armed);
+        assert!(!rediscovered.forced_armed);
+        assert_eq!(wake.contact_cause(), None);
+    }
+
+    #[cfg(feature = "nearby-discovery")]
+    #[test]
+    fn nearby_event_contact_wake_expiry_preserves_undispatched_candidate_work() {
+        // Break caught: expiring an automatic candidate that had pending Event
+        // work erased the pending identity without converting the work back to
+        // the peerless marker, so same-ID rediscovery remained silent forever.
+        let peer = wake_test_endpoint();
+        let mut candidates = BTreeSet::from([peer]);
+        let mut wake = EventContactWakeState::default();
+        assert!(wake.discovered(peer, &candidates).normal_armed);
+        assert_eq!(wake.contact_cause(), Some(EventContactCause::Normal));
+        wake.arm_event([peer]);
+
+        candidates.clear();
+        assert!(!wake.discovery_expired(peer, &candidates));
+        assert!(wake.is_peerless());
+        candidates.insert(peer);
+        assert!(wake.discovered(peer, &candidates).forced_armed);
+        assert_eq!(wake.forced_discovery(), Some(peer));
+    }
+
+    #[cfg(feature = "nearby-discovery")]
+    #[test]
+    fn nearby_event_contact_wake_peerless_override_survives_expiry_and_saturation() {
+        // Break caught: identity deduplication or its 256-entry saturation can
+        // strand newly published peerless Event work.
+        let mut wake = EventContactWakeState::default();
+        let mut candidates = BTreeSet::new();
+        for _ in 0..MAX_CONFIGURED_PEERS {
+            let peer = wake_test_endpoint();
+            candidates.clear();
+            candidates.insert(peer);
+            assert!(wake.discovered(peer, &candidates).normal_armed);
+            let _ = wake.contact_cause();
+            wake.discovery_window_closed();
+        }
+        assert_eq!(wake.seen_discovery_count(), MAX_CONFIGURED_PEERS);
+
+        let saturated = wake_test_endpoint();
+        candidates.clear();
+        candidates.insert(saturated);
+        let no_work = wake.discovered(saturated, &candidates);
+        assert!(!no_work.normal_armed);
+        assert!(no_work.saturated);
+
+        wake.arm_event(std::iter::empty());
+        let override_arm = wake.discovered(saturated, &candidates);
+        assert!(override_arm.forced_armed);
+        assert_eq!(wake.forced_discovery(), Some(saturated));
+
+        candidates.clear();
+        assert!(!wake.discovery_expired(saturated, &candidates));
+        assert!(wake.is_peerless());
+        assert_eq!(wake.forced_discovery(), None);
+        candidates.insert(saturated);
+        assert!(wake.discovered(saturated, &candidates).forced_armed);
+    }
+
+    #[cfg(feature = "nearby-discovery")]
+    #[test]
+    fn nearby_event_contact_wake_reselects_deterministically_and_stop_clears_automatic_state() {
+        // Break caught: expiry of the selected candidate cleared the only
+        // forced edge even when another current candidate was available.
+        let a = wake_test_endpoint();
+        let b = wake_test_endpoint();
+        let (first, second) = if a < b { (a, b) } else { (b, a) };
+        let mut candidates = BTreeSet::from([first]);
+        let mut wake = EventContactWakeState::default();
+        wake.arm_event(std::iter::empty());
+        assert!(wake.discovered(first, &candidates).forced_armed);
+        candidates.insert(second);
+        let _ = wake.discovered(second, &candidates);
+
+        candidates.remove(&first);
+        assert!(wake.discovery_expired(first, &candidates));
+        assert_eq!(wake.forced_discovery(), Some(second));
+        wake.arm_event([second]);
+        wake.arm_policy_relaxation([second]);
+        wake.stop_discovery();
+        assert_eq!(wake.forced_discovery(), None);
+        assert_eq!(wake.seen_discovery_count(), 0);
+        assert_eq!(wake.pending_peer_count(), 0);
+        assert!(!wake.is_peerless());
+        assert_eq!(wake.contact_cause(), None);
+    }
+
     struct IssuedMission {
         credentials: UnprotectedReferenceMission,
         identity: NodeId,
@@ -25240,6 +26117,181 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn higher_id_actor_relaunches_policy_changed_contact_before_fallback_or_tick() {
+        // Break caught: a strict live-policy relaxation races an outbound
+        // contact holding the older snapshot. The actor first observes the
+        // peer as outbound-active, then the failed task's terminal edge must
+        // stamp fresh activity, retain the exact retry, and bypass only that
+        // peer's higher-ID fallback on the next scheduler turn.
+        let state = root("higher-id-policy-contact-retry");
+        fs::create_dir_all(&state).expect("actor state");
+        let local_id = NodeIdentity::load_or_create(&state)
+            .expect("local carrier identity")
+            .id();
+        let peer_id = (0..1_024)
+            .find_map(|_| {
+                let candidate = aster_iroh::SecretKey::generate().public();
+                (candidate < local_id).then_some(candidate)
+            })
+            .expect("generate a carrier identity below the local identity");
+        assert!(local_id > peer_id, "test requires higher-ID local carrier");
+
+        let mut missions = issue_missions(2);
+        let peer_mission = missions.pop().expect("peer mission");
+        let local_mission = missions.pop().expect("local mission");
+        let sync_interval = Duration::from_secs(60);
+        let fallback_delay = non_preferred_contact_fallback_delay(sync_interval);
+        let initial_activity = Instant::now()
+            .checked_sub(fallback_delay + Duration::from_secs(1))
+            .expect("old peer activity instant");
+
+        let (observations_sender, mut observations_receiver) = mpsc::unbounded_channel();
+        let (contact_results_sender, contact_results_receiver) = mpsc::unbounded_channel();
+        let contact_hook = ActorOutboundContactTestHook {
+            observations: observations_sender,
+            results: Arc::new(tokio::sync::Mutex::new(contact_results_receiver)),
+        };
+        let (application_sender, application_receiver) =
+            mpsc::channel(APPLICATION_COMMAND_CAPACITY);
+        let application_admission = Arc::new(AtomicBool::new(true));
+        let (_control_sender, control_receiver) = mpsc::channel(CONTROL_COMMAND_CAPACITY);
+        let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
+        let (ready_sender, ready_receiver) = oneshot::channel();
+        let (before_loop_ready, before_loop_reached) = oneshot::channel();
+        let (before_loop_release, release_loop) = oneshot::channel();
+        let (zeroization_queued, _zeroization_observer) = oneshot::channel();
+        let initial_policy = EventEmissionPolicy::at_least(Priority::Flash);
+        let forwarding = SelectedForwardingConfig::default().with_emission_policy(initial_policy);
+        let emission_policy = Arc::new(LiveEmissionPolicy::new(initial_policy));
+        let mut actor = tokio::spawn(run_node_actor_inner(
+            NodeConfig {
+                state: state.clone(),
+                bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                mission: local_mission.credentials,
+                peers: vec![MissionExpectedPeer {
+                    carrier: ExpectedPeer {
+                        id: peer_id,
+                        address: SocketAddr::from(([127, 0, 0, 1], 9)),
+                    },
+                    mission: peer_mission.identity,
+                }],
+                mutable_interests: MutableSourceInterests::default(),
+                sync_interval,
+                run_for: None,
+                application: NodeApplication::Relay,
+            },
+            forwarding,
+            emission_policy.clone(),
+            NodeActorChannels {
+                handle_sigint: false,
+                application_receiver,
+                application_admission: application_admission.clone(),
+                control_receiver,
+                shutdown_receiver,
+                ready: ready_sender,
+                test_control: Some(RunNodeActorTestControl {
+                    event_operation_audit: None,
+                    before_loop_ready,
+                    before_loop_release: release_loop,
+                    zeroization_queued,
+                    blob_worker_fatal_on_shutdown: false,
+                    blob_final_read_gate: None,
+                    outbound_contact: Some(contact_hook),
+                    initial_peer_contact_activity: vec![(peer_id, initial_activity)],
+                }),
+            },
+        ));
+        match timeout(Duration::from_secs(10), ready_receiver).await {
+            Ok(Ok(_)) => {}
+            _ => {
+                let outcome = (&mut actor).await;
+                panic!("actor readiness failed; actor outcome: {outcome:?}");
+            }
+        }
+        timeout(Duration::from_secs(5), before_loop_reached)
+            .await
+            .expect("pre-loop gate deadline")
+            .expect("pre-loop gate");
+        before_loop_release.send(()).expect("release actor loop");
+
+        let first = timeout(Duration::from_secs(5), observations_receiver.recv())
+            .await
+            .expect("initial higher-ID contact deadline")
+            .expect("initial contact observation");
+        let first_launch = match first {
+            ActorOutboundContactObservation::Launched {
+                peer,
+                previous_activity,
+                launched_at,
+            } => {
+                assert_eq!(peer, peer_id);
+                assert_eq!(previous_activity, initial_activity);
+                launched_at
+            }
+            observation => panic!("expected initial contact launch, got {observation:?}"),
+        };
+
+        emission_policy
+            .update(EventEmissionPolicy::Normal)
+            .expect("strictly relax live emission policy");
+        let duplicate = timeout(Duration::from_secs(5), observations_receiver.recv())
+            .await
+            .expect("duplicate-suppression deadline")
+            .expect("duplicate-suppression observation");
+        assert!(
+            matches!(
+                duplicate,
+                ActorOutboundContactObservation::DuplicateSuppressed { peer }
+                    if peer == peer_id
+            ),
+            "strict relaxation must reach the actor election and suppress the active peer: {duplicate:?}"
+        );
+
+        let released_at = Instant::now();
+        assert!(released_at >= first_launch);
+        contact_results_sender
+            .send(NodeError::EmissionPolicyChanged)
+            .expect("release older-policy contact with exact terminal error");
+        let second = timeout(Duration::from_secs(2), observations_receiver.recv())
+            .await
+            .expect("policy retry must launch before fallback and periodic tick")
+            .expect("policy retry launch observation");
+        match second {
+            ActorOutboundContactObservation::Launched {
+                peer,
+                previous_activity,
+                launched_at,
+            } => {
+                assert_eq!(peer, peer_id);
+                assert!(
+                    previous_activity >= released_at,
+                    "terminal handling must stamp activity after the contact result is released"
+                );
+                let retry_delay = launched_at.saturating_duration_since(released_at);
+                assert!(retry_delay < sync_interval);
+                assert!(retry_delay < fallback_delay);
+            }
+            observation => panic!("expected policy retry launch, got {observation:?}"),
+        }
+
+        shutdown_sender
+            .send(())
+            .await
+            .expect("request actor shutdown");
+        let receipt = timeout(Duration::from_secs(10), actor)
+            .await
+            .expect("actor shutdown deadline")
+            .expect("actor task")
+            .expect("clean actor shutdown");
+        assert_eq!(receipt.contact_errors, 1);
+        assert!(!application_admission.load(Ordering::Acquire));
+
+        drop(application_sender);
+        fs::remove_dir_all(state).expect("cleanup actor state");
     }
 
     #[test]
@@ -27537,6 +28589,8 @@ mod tests {
                     blob_worker_fatal_on_shutdown: true,
                     event_operation_audit: None,
                     blob_final_read_gate: None,
+                    outbound_contact: None,
+                    initial_peer_contact_activity: Vec::new(),
                 }),
             },
         ));
@@ -27677,6 +28731,8 @@ mod tests {
                         Arc::clone(&page_release),
                     )),
                     event_operation_audit: None,
+                    outbound_contact: None,
+                    initial_peer_contact_activity: Vec::new(),
                 }),
             },
         ));
@@ -29294,6 +30350,8 @@ mod tests {
                     blob_worker_fatal_on_shutdown: false,
                     blob_final_read_gate: None,
                     event_operation_audit: Some(audit_control),
+                    outbound_contact: None,
+                    initial_peer_contact_activity: Vec::new(),
                 }),
             },
         ));
@@ -32874,6 +33932,8 @@ mod tests {
                     blob_worker_fatal_on_shutdown: false,
                     blob_final_read_gate: None,
                     event_operation_audit: None,
+                    outbound_contact: None,
+                    initial_peer_contact_activity: Vec::new(),
                 }),
             },
         ));
