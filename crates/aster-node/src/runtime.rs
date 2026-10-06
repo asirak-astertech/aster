@@ -1920,10 +1920,32 @@ struct DiscoveryWake {
     saturated: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct OutboundContactTask {
-    peer: ContactPeer,
+#[derive(Clone, Debug)]
+struct ContactTaskMetadata {
+    carrying_peer: EndpointId,
+    outbound_peer: Option<ContactPeer>,
     launched_forced: bool,
+    event_inserted: Arc<AtomicBool>,
+}
+
+impl ContactTaskMetadata {
+    fn inbound(carrying_peer: EndpointId, event_inserted: Arc<AtomicBool>) -> Self {
+        Self {
+            carrying_peer,
+            outbound_peer: None,
+            launched_forced: false,
+            event_inserted,
+        }
+    }
+
+    fn outbound(peer: ContactPeer, launched_forced: bool, event_inserted: Arc<AtomicBool>) -> Self {
+        Self {
+            carrying_peer: peer.carrier(),
+            outbound_peer: Some(peer),
+            launched_forced,
+            event_inserted,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -2144,6 +2166,24 @@ impl EventContactWakeState {
     }
 }
 
+fn handle_event_contact_terminal(
+    wake: &mut EventContactWakeState,
+    metadata: Option<&ContactTaskMetadata>,
+    emission_policy_changed: bool,
+    candidate_peers: impl IntoIterator<Item = EndpointId>,
+    discovery_candidates: &BTreeSet<EndpointId>,
+) {
+    let Some(metadata) = metadata else {
+        return;
+    };
+    if metadata.event_inserted.load(Ordering::Acquire) {
+        wake.arm_event_except(candidate_peers, metadata.carrying_peer);
+    }
+    if emission_policy_changed && let Some(peer) = metadata.outbound_peer {
+        wake.restore_for_policy_change(peer, metadata.launched_forced, discovery_candidates);
+    }
+}
+
 fn event_contact_candidate_is_due(
     wake: &EventContactWakeState,
     local: EndpointId,
@@ -2225,6 +2265,7 @@ impl ContactEmissionGuard {
 tokio::task_local! {
     static CONTACT_EMISSION_GUARD: ContactEmissionGuard;
     static CONTACT_EVENT_ROUTE_CACHE: Arc<AuthenticatedEventRouteCache>;
+    static CONTACT_EVENT_INSERTED: Arc<AtomicBool>;
 }
 
 #[cfg(test)]
@@ -2264,6 +2305,12 @@ fn contact_supports_finite_ttl() -> bool {
     CONTACT_EMISSION_GUARD
         .try_with(|guard| guard.custody_clock.supports_finite_ttl())
         .unwrap_or(false)
+}
+
+fn record_contact_event_insertion(inserted: bool) {
+    if inserted {
+        let _ = CONTACT_EVENT_INSERTED.try_with(|tracker| tracker.store(true, Ordering::Release));
+    }
 }
 
 fn contact_policy_or_normal() -> Result<EmissionPolicySnapshot, NodeError> {
@@ -2747,6 +2794,8 @@ fn account_blob_receipt(total: &mut NodeReceipt, contact: &PeerReceipt) -> Resul
 pub struct RunningNode {
     #[cfg(test)]
     bound_sockets: Vec<SocketAddr>,
+    #[cfg(test)]
+    contact_activity: Arc<ContactActivityProbe>,
     selected_events: SelectedEventHandle,
     selected_state: SelectedStateHandle,
     selected_records: SelectedRecordHandle,
@@ -2758,6 +2807,50 @@ pub struct RunningNode {
     nearby_discovery_stop: Option<NearbyDiscoveryControl>,
     shutdown: Option<mpsc::Sender<()>>,
     task: Option<JoinHandle<Result<NodeReceipt, NodeError>>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ContactActivitySnapshot {
+    launched: u64,
+    active: u64,
+    completed: u64,
+    failed: u64,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ContactActivityProbe {
+    launched: AtomicU64,
+    active: AtomicU64,
+    completed: AtomicU64,
+    failed: AtomicU64,
+}
+
+#[cfg(test)]
+impl ContactActivityProbe {
+    fn launched(&self) {
+        self.launched.fetch_add(1, Ordering::Relaxed);
+        self.active.fetch_add(1, Ordering::Release);
+    }
+
+    fn terminal(&self, failed: bool) {
+        self.completed.fetch_add(1, Ordering::Relaxed);
+        if failed {
+            self.failed.fetch_add(1, Ordering::Relaxed);
+        }
+        self.active.fetch_sub(1, Ordering::Release);
+    }
+
+    fn snapshot(&self) -> ContactActivitySnapshot {
+        let active = self.active.load(Ordering::Acquire);
+        ContactActivitySnapshot {
+            launched: self.launched.load(Ordering::Acquire),
+            active,
+            completed: self.completed.load(Ordering::Acquire),
+            failed: self.failed.load(Ordering::Acquire),
+        }
+    }
 }
 
 #[cfg(feature = "nearby-discovery")]
@@ -2860,6 +2953,11 @@ impl NearbyDiscoveryControl {
 }
 
 impl RunningNode {
+    #[cfg(test)]
+    fn contact_activity_snapshot(&self) -> ContactActivitySnapshot {
+        self.contact_activity.snapshot()
+    }
+
     /// Returns a cloneable, bounded live selected-Event application handle.
     pub fn selected_events(&self) -> SelectedEventHandle {
         self.selected_events.clone()
@@ -9093,6 +9191,7 @@ fn accept_received_transfer(
             )?
         };
         let apply = ReceivedEventApply::from_route_cache(outcome);
+        record_contact_event_insertion(apply.inserted);
         if apply.inserted {
             cache_contact_verified_event(verifier, route_claim)?;
         }
@@ -9127,8 +9226,10 @@ fn accept_received_transfer(
                     sealed,
                 )?
             };
+            let inserted = outcome.inserted();
+            record_contact_event_insertion(inserted);
             cache_contact_verified_event(verifier, accepted_claim)?;
-            Ok(ReceivedEventApply::accepted(outcome.inserted()))
+            Ok(ReceivedEventApply::accepted(inserted))
         }
         EventContentVerification::RouteOnly(event) => {
             let route_claim = AuthenticatedEventRouteClaim::from_verified(
@@ -9159,6 +9260,7 @@ fn accept_received_transfer(
                 )?
             };
             let apply = ReceivedEventApply::from_route_cache(outcome);
+            record_contact_event_insertion(apply.inserted);
             if apply.inserted {
                 cache_contact_verified_event(verifier, route_claim)?;
             }
@@ -11783,6 +11885,8 @@ async fn start_node_with_shutdown_ownership(
         ready_sender,
     );
     channels.handle_sigint = handle_sigint;
+    #[cfg(test)]
+    let contact_activity = channels.contact_activity.clone();
     let task = tokio::spawn(run_node_actor_with_forwarding_output(
         config,
         forwarding,
@@ -11806,6 +11910,8 @@ async fn start_node_with_shutdown_ownership(
     Ok(RunningNode {
         #[cfg(test)]
         bound_sockets: ready.bound_sockets,
+        #[cfg(test)]
+        contact_activity,
         selected_events,
         selected_state,
         selected_records,
@@ -11845,6 +11951,7 @@ struct RunNodeActorTestControl {
     blob_worker_fatal_on_shutdown: bool,
     blob_final_read_gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
     outbound_contact: Option<ActorOutboundContactTestHook>,
+    contact_lifecycle: Option<ActorContactLifecycleTestHook>,
     initial_peer_contact_activity: Vec<(EndpointId, Instant)>,
 }
 
@@ -11900,6 +12007,150 @@ impl ActorOutboundContactTestHook {
 }
 
 #[cfg(all(test, unix))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActorContactDirection {
+    Inbound,
+    Outbound,
+}
+
+#[cfg(all(test, unix))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActorContactTerminalScenario {
+    Success,
+    OrdinaryError,
+    FinishError,
+    Timeout,
+    Panic,
+    CollisionCancellation,
+    Pending,
+}
+
+#[cfg(all(test, unix))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ActorContactTerminalObservation {
+    direction: ActorContactDirection,
+    carrying_peer: EndpointId,
+    metadata_present: bool,
+    metadata_removed: bool,
+    tracker_set: bool,
+    carrying_peer_pending: bool,
+    eligible_peer_pending: bool,
+    join_panicked: bool,
+    join_cancelled: bool,
+    collision_cancelled: bool,
+}
+
+#[cfg(all(test, unix))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActorContactLifecycleObservation {
+    Launched {
+        direction: ActorContactDirection,
+        peer: EndpointId,
+    },
+    Terminal(ActorContactTerminalObservation),
+}
+
+#[cfg(all(test, unix))]
+#[derive(Clone)]
+struct ActorContactLifecycleTestHook {
+    direction: ActorContactDirection,
+    scenario: ActorContactTerminalScenario,
+    carrying_peer: EndpointId,
+    eligible_peer: EndpointId,
+    observations: mpsc::UnboundedSender<ActorContactLifecycleObservation>,
+}
+
+#[cfg(all(test, unix))]
+impl ActorContactLifecycleTestHook {
+    fn handles(&self, direction: ActorContactDirection, peer: EndpointId) -> bool {
+        direction == self.direction
+            && (peer == self.carrying_peer
+                || (direction == ActorContactDirection::Outbound && peer == self.eligible_peer))
+    }
+
+    async fn contact(
+        &self,
+        direction: ActorContactDirection,
+        peer: EndpointId,
+        mission_peer: NodeId,
+        store: &Store,
+    ) -> Result<CompletedPeerContact, NodeError> {
+        let _ = self
+            .observations
+            .send(ActorContactLifecycleObservation::Launched { direction, peer });
+        let scenario = if peer == self.carrying_peer {
+            record_contact_event_insertion(true);
+            self.scenario
+        } else {
+            ActorContactTerminalScenario::Pending
+        };
+        match scenario {
+            ActorContactTerminalScenario::Success => {
+                let policy = store.event_replication_policy_snapshot()?;
+                Ok(CompletedPeerContact {
+                    receipt: PeerReceipt {
+                        peer: Some(peer),
+                        mission_peer: Some(mission_peer),
+                        ..PeerReceipt::default()
+                    },
+                    event_policy: ContactEventPolicy::capture(&policy),
+                })
+            }
+            ActorContactTerminalScenario::OrdinaryError => Err(NodeError::Protocol(
+                "injected ordinary contact error".into(),
+            )),
+            ActorContactTerminalScenario::FinishError => Err(NodeError::Protocol(
+                "injected Event finish acknowledgement error".into(),
+            )),
+            ActorContactTerminalScenario::Timeout => Err(NodeError::Protocol(
+                "contact exceeded its total deadline".into(),
+            )),
+            ActorContactTerminalScenario::Panic => {
+                panic!("injected contact task panic after Event insertion")
+            }
+            ActorContactTerminalScenario::CollisionCancellation
+            | ActorContactTerminalScenario::Pending => {
+                std::future::pending::<Result<CompletedPeerContact, NodeError>>().await
+            }
+        }
+    }
+
+    fn observe_terminal(
+        &self,
+        direction: ActorContactDirection,
+        metadata: Option<&ContactTaskMetadata>,
+        metadata_removed: bool,
+        wake: &EventContactWakeState,
+        join_error: Option<&tokio::task::JoinError>,
+        collision_cancelled: bool,
+    ) {
+        let Some(metadata) = metadata.filter(|metadata| {
+            direction == self.direction && metadata.carrying_peer == self.carrying_peer
+        }) else {
+            return;
+        };
+        let _ = self
+            .observations
+            .send(ActorContactLifecycleObservation::Terminal(
+                ActorContactTerminalObservation {
+                    direction,
+                    carrying_peer: metadata.carrying_peer,
+                    // Reaching this branch means the task id removed and
+                    // returned its matching metadata from the actor map.
+                    metadata_present: true,
+                    metadata_removed,
+                    tracker_set: metadata.event_inserted.load(Ordering::Acquire),
+                    carrying_peer_pending: wake.pending_peers.contains(&metadata.carrying_peer),
+                    eligible_peer_pending: wake.pending_peers.contains(&self.eligible_peer),
+                    join_panicked: join_error.is_some_and(tokio::task::JoinError::is_panic),
+                    join_cancelled: join_error.is_some_and(tokio::task::JoinError::is_cancelled),
+                    collision_cancelled,
+                },
+            ));
+    }
+}
+
+#[cfg(all(test, unix))]
 struct EventOperationAuditTestControl {
     page_size: usize,
     on_progress: Box<dyn FnMut(EventOperationAuditProgress) + Send>,
@@ -11915,6 +12166,8 @@ struct NodeActorChannels {
     control_receiver: mpsc::Receiver<SelectedControlCommand>,
     shutdown_receiver: mpsc::Receiver<()>,
     ready: oneshot::Sender<NodeReady>,
+    #[cfg(test)]
+    contact_activity: Arc<ContactActivityProbe>,
     #[cfg(all(test, unix))]
     test_control: Option<RunNodeActorTestControl>,
 }
@@ -12038,6 +12291,8 @@ impl NodeActorChannels {
             control_receiver,
             shutdown_receiver,
             ready,
+            #[cfg(test)]
+            contact_activity: Arc::new(ContactActivityProbe::default()),
             #[cfg(all(test, unix))]
             test_control: None,
         }
@@ -12115,6 +12370,8 @@ async fn run_node_actor_inner(
         mut control_receiver,
         mut shutdown_receiver,
         ready,
+        #[cfg(test)]
+        contact_activity,
         #[cfg(all(test, unix))]
         mut test_control,
     } = channels;
@@ -12513,6 +12770,7 @@ async fn run_node_actor_inner(
         blob_worker_fatal_on_shutdown,
         blob_final_read_gate,
         outbound_contact_test_hook,
+        contact_lifecycle_test_hook,
         initial_peer_contact_activity,
         mut event_operation_audit_control,
     ) = match test_control.take() {
@@ -12523,10 +12781,11 @@ async fn run_node_actor_inner(
             control.blob_worker_fatal_on_shutdown,
             control.blob_final_read_gate,
             control.outbound_contact,
+            control.contact_lifecycle,
             control.initial_peer_contact_activity,
             control.event_operation_audit,
         ),
-        None => (None, None, None, false, None, None, Vec::new(), None),
+        None => (None, None, None, false, None, None, None, Vec::new(), None),
     };
     #[cfg(not(all(test, unix)))]
     let blob_worker_fatal_on_shutdown = false;
@@ -12623,11 +12882,11 @@ async fn run_node_actor_inner(
     let mut inbound: JoinSet<(EndpointId, Result<CompletedPeerContact, NodeError>)> =
         JoinSet::new();
     let mut inbound_peers = BTreeSet::new();
-    let mut inbound_tasks = BTreeMap::<TaskId, EndpointId>::new();
+    let mut inbound_tasks = BTreeMap::<TaskId, ContactTaskMetadata>::new();
     let mut outbound: JoinSet<(ContactPeer, Result<CompletedPeerContact, NodeError>)> =
         JoinSet::new();
     let mut outbound_peers = BTreeSet::new();
-    let mut outbound_tasks = BTreeMap::<TaskId, OutboundContactTask>::new();
+    let mut outbound_tasks = BTreeMap::<TaskId, ContactTaskMetadata>::new();
     let mut outbound_abort_handles = BTreeMap::<EndpointId, (TaskId, AbortHandle)>::new();
     let mut collision_aborted_outbound = BTreeSet::<TaskId>::new();
     let non_preferred_fallback_delay = non_preferred_contact_fallback_delay(config.sync_interval);
@@ -13194,46 +13453,73 @@ async fn run_node_actor_inner(
                     let automatic_admission = automatic_admission.clone();
                     #[cfg(all(test, unix))]
                     let outbound_contact_test_hook = outbound_contact_test_hook.clone();
-                    let task = outbound.spawn(inherit_node_output(async move {
-                        #[cfg(all(test, unix))]
-                        if let Some(hook) = outbound_contact_test_hook {
-                            return (
-                                peer,
-                                hook.contact(peer_id, previous_activity, election_now).await,
-                            );
-                        }
-                        (
-                            peer,
-                            sync_once_with_forwarding(
-                                &endpoint,
-                                OutboundContact {
-                                    store,
-                                    mission,
+                    #[cfg(all(test, unix))]
+                    let contact_lifecycle_test_hook = contact_lifecycle_test_hook.clone();
+                    let event_inserted = Arc::new(AtomicBool::new(false));
+                    let task_event_inserted = event_inserted.clone();
+                    let task = outbound.spawn(inherit_node_output(CONTACT_EVENT_INSERTED.scope(
+                        task_event_inserted,
+                        async move {
+                            #[cfg(all(test, unix))]
+                            if let Some(hook) = contact_lifecycle_test_hook
+                                && hook.handles(ActorContactDirection::Outbound, peer_id)
+                            {
+                                let result = match peer.expected_mission() {
+                                    Some(mission_peer) => {
+                                        hook.contact(
+                                            ActorContactDirection::Outbound,
+                                            peer_id,
+                                            mission_peer,
+                                            &store,
+                                        )
+                                        .await
+                                    }
+                                    None => Err(NodeError::Protocol(
+                                        "actor contact lifecycle hook requires a configured peer"
+                                            .into(),
+                                    )),
+                                };
+                                return (peer, result);
+                            }
+                            #[cfg(all(test, unix))]
+                            if let Some(hook) = outbound_contact_test_hook {
+                                return (
                                     peer,
-                                    #[cfg(feature = "nearby-discovery")]
-                                    automatic_admission,
-                                    policy_lock,
-                                    emission_policy,
-                                    emission_snapshot,
-                                    custody_clock,
-                                    event_route_cache,
-                                    event_bridge,
-                                    mutable_interests,
-                                    controlled_relay,
-                                },
+                                    hook.contact(peer_id, previous_activity, election_now).await,
+                                );
+                            }
+                            (
+                                peer,
+                                sync_once_with_forwarding(
+                                    &endpoint,
+                                    OutboundContact {
+                                        store,
+                                        mission,
+                                        peer,
+                                        #[cfg(feature = "nearby-discovery")]
+                                        automatic_admission,
+                                        policy_lock,
+                                        emission_policy,
+                                        emission_snapshot,
+                                        custody_clock,
+                                        event_route_cache,
+                                        event_bridge,
+                                        mutable_interests,
+                                        controlled_relay,
+                                    },
+                                )
+                                .await,
                             )
-                            .await,
-                        )
-                    }));
+                        },
+                    )));
                     let task_id = task.id();
                     outbound_tasks.insert(
                         task_id,
-                        OutboundContactTask {
-                            peer,
-                            launched_forced,
-                        },
+                        ContactTaskMetadata::outbound(peer, launched_forced, event_inserted),
                     );
                     outbound_abort_handles.insert(peer_id, (task_id, task));
+                    #[cfg(test)]
+                    contact_activity.launched();
                 }
             }
             lease = acquire_application_policy_lease(
@@ -13340,27 +13626,57 @@ async fn run_node_actor_inner(
                         debug_assert!(expected_peer.is_some());
                         #[cfg(feature = "nearby-discovery")]
                         let automatic_admission = automatic_admission.clone();
-                        let task = inbound.spawn(inherit_node_output(async move {
-                            (
-                                peer,
-                                serve_connection_with_forwarding(InboundContact {
-                                    store,
-                                    connection,
-                                    mission,
-                                    expected_peer,
-                                    #[cfg(feature = "nearby-discovery")]
-                                    automatic_admission,
-                                    policy_lock,
-                                    emission_policy,
-                                    custody_clock,
-                                    event_route_cache,
-                                    event_bridge,
-                                    mutable_interests,
-                                })
-                                .await,
-                            )
-                        }));
-                        inbound_tasks.insert(task.id(), peer);
+                        #[cfg(all(test, unix))]
+                        let contact_lifecycle_test_hook = contact_lifecycle_test_hook.clone();
+                        let event_inserted = Arc::new(AtomicBool::new(false));
+                        let task_event_inserted = event_inserted.clone();
+                        let task = inbound.spawn(inherit_node_output(CONTACT_EVENT_INSERTED.scope(
+                            task_event_inserted,
+                            async move {
+                                #[cfg(all(test, unix))]
+                                if let Some(hook) = contact_lifecycle_test_hook
+                                    && hook.handles(ActorContactDirection::Inbound, peer)
+                                {
+                                    let mission_peer = expected_peer
+                                        .expect("configured lifecycle-test inbound peer")
+                                        .mission_id();
+                                    return (
+                                        peer,
+                                        hook.contact(
+                                            ActorContactDirection::Inbound,
+                                            peer,
+                                            mission_peer,
+                                            &store,
+                                        )
+                                        .await,
+                                    );
+                                }
+                                (
+                                    peer,
+                                    serve_connection_with_forwarding(InboundContact {
+                                        store,
+                                        connection,
+                                        mission,
+                                        expected_peer,
+                                        #[cfg(feature = "nearby-discovery")]
+                                        automatic_admission,
+                                        policy_lock,
+                                        emission_policy,
+                                        custody_clock,
+                                        event_route_cache,
+                                        event_bridge,
+                                        mutable_interests,
+                                    })
+                                    .await,
+                                )
+                            },
+                        )));
+                        inbound_tasks.insert(
+                            task.id(),
+                            ContactTaskMetadata::inbound(peer, event_inserted),
+                        );
+                        #[cfg(test)]
+                        contact_activity.launched();
                     }
                     Some(Err(error)) => {
                         receipt.contact_errors += 1;
@@ -13387,9 +13703,50 @@ async fn run_node_actor_inner(
                 application_tick_yield_required = false;
                 let yield_for_network =
                     account_network_event(&mut network_events_since_application);
+                let terminal_task = match completed.as_ref() {
+                    Some(Ok((task, _))) => Some(*task),
+                    Some(Err(error)) => Some(error.id()),
+                    None => None,
+                };
+                let terminal_metadata =
+                    terminal_task.and_then(|task| inbound_tasks.remove(&task));
+                let event_contact_candidates = if automatic_nearby {
+                    automatic_candidates.iter().copied().collect::<Vec<_>>()
+                } else {
+                    configured_peers
+                        .iter()
+                        .map(|peer| peer.carrier)
+                        .collect::<Vec<_>>()
+                };
+                handle_event_contact_terminal(
+                    &mut event_contact_wake,
+                    terminal_metadata.as_ref(),
+                    false,
+                    event_contact_candidates,
+                    &automatic_candidates,
+                );
+                #[cfg(all(test, unix))]
+                if let Some(hook) = &contact_lifecycle_test_hook {
+                    hook.observe_terminal(
+                        ActorContactDirection::Inbound,
+                        terminal_metadata.as_ref(),
+                        terminal_task
+                            .map(|task| !inbound_tasks.contains_key(&task))
+                            .unwrap_or(true),
+                        &event_contact_wake,
+                        match completed.as_ref() {
+                            Some(Err(error)) => Some(error),
+                            _ => None,
+                        },
+                        false,
+                    );
+                }
+                #[cfg(test)]
+                if terminal_task.is_some() {
+                    contact_activity.terminal(!matches!(completed.as_ref(), Some(Ok((_, (_, Ok(_)))))));
+                }
                 match completed {
-                    Some(Ok((task, (peer, Ok(server_receipt))))) => {
-                        inbound_tasks.remove(&task);
+                    Some(Ok((_task, (peer, Ok(server_receipt))))) => {
                         inbound_peers.remove(&peer);
                         if let Some(last_activity) = peer_contact_activity.get_mut(&peer) {
                             *last_activity = Instant::now();
@@ -13449,8 +13806,7 @@ async fn run_node_actor_inner(
                             contact_status(&server_receipt),
                         );
                     }
-                    Some(Ok((task, (peer, Err(error))))) => {
-                        inbound_tasks.remove(&task);
+                    Some(Ok((_task, (peer, Err(error))))) => {
                         inbound_peers.remove(&peer);
                         if let Some(last_activity) = peer_contact_activity.get_mut(&peer) {
                             *last_activity = Instant::now();
@@ -13463,7 +13819,9 @@ async fn run_node_actor_inner(
                         node_stderr!("CONTACT direction=in carrier_peer={peer} status=error error={}", format_receipt_field(&error.to_string()));
                     }
                     Some(Err(error)) => {
-                        let peer = inbound_tasks.remove(&error.id());
+                        let peer = terminal_metadata
+                            .as_ref()
+                            .map(|metadata| metadata.carrying_peer);
                         if let Some(peer) = peer {
                             inbound_peers.remove(&peer);
                             if let Some(last_activity) = peer_contact_activity.get_mut(&peer) {
@@ -13498,9 +13856,55 @@ async fn run_node_actor_inner(
                 application_tick_yield_required = false;
                 let yield_for_network =
                     account_network_event(&mut network_events_since_application);
+                let terminal_task = match completed.as_ref() {
+                    Some(Ok((task, _))) => Some(*task),
+                    Some(Err(error)) => Some(error.id()),
+                    None => None,
+                };
+                let emission_policy_changed = matches!(
+                    completed.as_ref(),
+                    Some(Ok((_, (_, Err(NodeError::EmissionPolicyChanged)))))
+                );
+                let terminal_metadata =
+                    terminal_task.and_then(|task| outbound_tasks.remove(&task));
+                let event_contact_candidates = if automatic_nearby {
+                    automatic_candidates.iter().copied().collect::<Vec<_>>()
+                } else {
+                    configured_peers
+                        .iter()
+                        .map(|peer| peer.carrier)
+                        .collect::<Vec<_>>()
+                };
+                handle_event_contact_terminal(
+                    &mut event_contact_wake,
+                    terminal_metadata.as_ref(),
+                    emission_policy_changed,
+                    event_contact_candidates,
+                    &automatic_candidates,
+                );
+                #[cfg(all(test, unix))]
+                if let Some(hook) = &contact_lifecycle_test_hook {
+                    hook.observe_terminal(
+                        ActorContactDirection::Outbound,
+                        terminal_metadata.as_ref(),
+                        terminal_task
+                            .map(|task| !outbound_tasks.contains_key(&task))
+                            .unwrap_or(true),
+                        &event_contact_wake,
+                        match completed.as_ref() {
+                            Some(Err(error)) => Some(error),
+                            _ => None,
+                        },
+                        terminal_task
+                            .is_some_and(|task| collision_aborted_outbound.contains(&task)),
+                    );
+                }
+                #[cfg(test)]
+                if terminal_task.is_some() {
+                    contact_activity.terminal(!matches!(completed.as_ref(), Some(Ok((_, (_, Ok(_)))))));
+                }
                 match completed {
                     Some(Ok((task, (peer, Ok(peer_receipt))))) => {
-                        outbound_tasks.remove(&task);
                         outbound_peers.remove(&peer.carrier());
                         outbound_abort_handles.remove(&peer.carrier());
                         collision_aborted_outbound.remove(&task);
@@ -13564,7 +13968,6 @@ async fn run_node_actor_inner(
                         );
                     }
                     Some(Ok((task, (peer, Err(error))))) => {
-                        let metadata = outbound_tasks.remove(&task);
                         outbound_peers.remove(&peer.carrier());
                         outbound_abort_handles.remove(&peer.carrier());
                         collision_aborted_outbound.remove(&task);
@@ -13575,15 +13978,6 @@ async fn run_node_actor_inner(
                             fatal_error = Some(error);
                             break;
                         }
-                        if matches!(&error, NodeError::EmissionPolicyChanged)
-                            && let Some(metadata) = metadata
-                        {
-                            event_contact_wake.restore_for_policy_change(
-                                metadata.peer,
-                                metadata.launched_forced,
-                                &automatic_candidates,
-                            );
-                        }
                         receipt.contact_errors += 1;
                         let expected_mission = peer
                             .expected_mission()
@@ -13593,17 +13987,16 @@ async fn run_node_actor_inner(
                     Some(Err(error)) => {
                         let task = error.id();
                         let collision_aborted = collision_aborted_outbound.remove(&task);
-                        let metadata = outbound_tasks.remove(&task);
-                        if let Some(metadata) = metadata {
-                            outbound_peers.remove(&metadata.peer.carrier());
-                            outbound_abort_handles.remove(&metadata.peer.carrier());
-                            if let Some(last_activity) = peer_contact_activity.get_mut(&metadata.peer.carrier()) {
+                        if let Some(metadata) = terminal_metadata.as_ref() {
+                            outbound_peers.remove(&metadata.carrying_peer);
+                            outbound_abort_handles.remove(&metadata.carrying_peer);
+                            if let Some(last_activity) = peer_contact_activity.get_mut(&metadata.carrying_peer) {
                                 *last_activity = Instant::now();
                             }
                         }
                         if !collision_aborted {
                             receipt.contact_errors += 1;
-                            node_stderr!("CONTACT direction=out carrier_peer={} status=error error={}", metadata.map_or_else(|| "unknown".into(), |metadata| metadata.peer.carrier().to_string()), format_receipt_field(&format!("task failed: {error}")));
+                            node_stderr!("CONTACT direction=out carrier_peer={} status=error error={}", terminal_metadata.as_ref().map_or_else(|| "unknown".into(), |metadata| metadata.carrying_peer.to_string()), format_receipt_field(&format!("task failed: {error}")));
                         }
                     }
                     None => {}
@@ -25831,6 +26224,41 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn event_insertion_actor_terminal_paths_rearm_inbound_contacts() {
+        for scenario in [
+            ActorContactTerminalScenario::Success,
+            ActorContactTerminalScenario::OrdinaryError,
+            ActorContactTerminalScenario::FinishError,
+            ActorContactTerminalScenario::Timeout,
+            ActorContactTerminalScenario::Panic,
+        ] {
+            let observation =
+                run_event_insertion_actor_terminal_case(ActorContactDirection::Inbound, scenario)
+                    .await;
+            assert_actor_terminal_rearmed(observation, scenario);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn event_insertion_actor_terminal_paths_rearm_outbound_contacts() {
+        for scenario in [
+            ActorContactTerminalScenario::Success,
+            ActorContactTerminalScenario::OrdinaryError,
+            ActorContactTerminalScenario::FinishError,
+            ActorContactTerminalScenario::Timeout,
+            ActorContactTerminalScenario::Panic,
+            ActorContactTerminalScenario::CollisionCancellation,
+        ] {
+            let observation =
+                run_event_insertion_actor_terminal_case(ActorContactDirection::Outbound, scenario)
+                    .await;
+            assert_actor_terminal_rearmed(observation, scenario);
+        }
+    }
+
     #[test]
     fn event_contact_wake_policy_retry_bypasses_fallback_for_exact_peer_once() {
         // Break caught: the terminal handler refreshes peer activity before
@@ -26120,6 +26548,266 @@ mod tests {
     }
 
     #[cfg(unix)]
+    async fn run_event_insertion_actor_terminal_case(
+        direction: ActorContactDirection,
+        scenario: ActorContactTerminalScenario,
+    ) -> ActorContactTerminalObservation {
+        let label = format!("event-insertion-{direction:?}-{scenario:?}").to_ascii_lowercase();
+        let state = root(&label);
+        fs::create_dir_all(&state).expect("actor terminal state");
+        let local_id = NodeIdentity::load_or_create(&state)
+            .expect("actor terminal local identity")
+            .id();
+        let carrying_secret = loop {
+            let candidate = aster_iroh::SecretKey::generate();
+            if scenario != ActorContactTerminalScenario::CollisionCancellation
+                || candidate.public() < local_id
+            {
+                break candidate;
+            }
+        };
+        let carrying_peer = carrying_secret.public();
+        let eligible_secret = loop {
+            let candidate = aster_iroh::SecretKey::generate();
+            if candidate.public() != carrying_peer && candidate.public() != local_id {
+                break candidate;
+            }
+        };
+        let eligible_peer = eligible_secret.public();
+        let mut missions = issue_missions(3);
+        let local_mission = missions.remove(0);
+        let carrying_mission = missions.remove(0);
+        let eligible_mission = missions.remove(0);
+        let sync_interval = Duration::from_secs(60);
+        let old_activity = Instant::now()
+            .checked_sub(
+                non_preferred_contact_fallback_delay(sync_interval) + Duration::from_secs(1),
+            )
+            .expect("actor terminal old activity");
+        let (observations, mut observed) = mpsc::unbounded_channel();
+        let lifecycle = ActorContactLifecycleTestHook {
+            direction,
+            scenario,
+            carrying_peer,
+            eligible_peer,
+            observations,
+        };
+        let forwarding = SelectedForwardingConfig::default().with_emission_policy(
+            if direction == ActorContactDirection::Inbound {
+                EventEmissionPolicy::ReceiveOnly
+            } else {
+                EventEmissionPolicy::Normal
+            },
+        );
+        let emission_policy = Arc::new(LiveEmissionPolicy::new(forwarding.emission_policy()));
+        let (_application_sender, application_receiver) =
+            mpsc::channel(APPLICATION_COMMAND_CAPACITY);
+        let application_admission = Arc::new(AtomicBool::new(true));
+        let (_control_sender, control_receiver) = mpsc::channel(CONTROL_COMMAND_CAPACITY);
+        let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
+        let (ready_sender, ready_receiver) = oneshot::channel();
+        let (before_loop_ready, before_loop_reached) = oneshot::channel();
+        let (before_loop_release, release_loop) = oneshot::channel();
+        let (zeroization_queued, _zeroization_observer) = oneshot::channel();
+        let contact_activity = Arc::new(ContactActivityProbe::default());
+        let mut actor = tokio::spawn(run_node_actor_inner(
+            NodeConfig {
+                state: state.clone(),
+                bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                mission: local_mission.credentials,
+                peers: vec![
+                    MissionExpectedPeer {
+                        carrier: ExpectedPeer {
+                            id: carrying_peer,
+                            address: SocketAddr::from(([127, 0, 0, 1], 9)),
+                        },
+                        mission: carrying_mission.identity,
+                    },
+                    MissionExpectedPeer {
+                        carrier: ExpectedPeer {
+                            id: eligible_peer,
+                            address: SocketAddr::from(([127, 0, 0, 1], 10)),
+                        },
+                        mission: eligible_mission.identity,
+                    },
+                ],
+                mutable_interests: MutableSourceInterests::default(),
+                sync_interval,
+                run_for: None,
+                application: NodeApplication::Relay,
+            },
+            forwarding,
+            emission_policy,
+            NodeActorChannels {
+                handle_sigint: false,
+                application_receiver,
+                application_admission,
+                control_receiver,
+                shutdown_receiver,
+                ready: ready_sender,
+                contact_activity,
+                test_control: Some(RunNodeActorTestControl {
+                    event_operation_audit: None,
+                    before_loop_ready,
+                    before_loop_release: release_loop,
+                    zeroization_queued,
+                    blob_worker_fatal_on_shutdown: false,
+                    blob_final_read_gate: None,
+                    outbound_contact: None,
+                    contact_lifecycle: Some(lifecycle),
+                    initial_peer_contact_activity: vec![
+                        (carrying_peer, old_activity),
+                        (eligible_peer, old_activity),
+                    ],
+                }),
+            },
+        ));
+        let ready = match timeout(Duration::from_secs(10), ready_receiver).await {
+            Ok(Ok(ready)) => ready,
+            _ => {
+                let outcome = (&mut actor).await;
+                panic!("actor terminal readiness failed: {outcome:?}");
+            }
+        };
+        timeout(Duration::from_secs(5), before_loop_reached)
+            .await
+            .expect("actor terminal pre-loop deadline")
+            .expect("actor terminal pre-loop gate");
+        before_loop_release
+            .send(())
+            .expect("release actor terminal loop");
+
+        let mut carrier_endpoint = None;
+        let mut carrier_connection = None;
+        if direction == ActorContactDirection::Inbound {
+            let endpoint = Endpoint::bind(
+                carrying_secret.clone(),
+                EndpointConfig::direct("127.0.0.1:0".parse().expect("carrier bind")),
+            )
+            .await
+            .expect("bind inbound test carrier");
+            let actor_address = ready
+                .bound_sockets
+                .iter()
+                .copied()
+                .find(SocketAddr::is_ipv4)
+                .expect("actor terminal IPv4 socket");
+            let connection = endpoint
+                .connect(ExpectedPeer {
+                    id: local_id,
+                    address: actor_address,
+                })
+                .await
+                .expect("connect inbound test carrier");
+            carrier_connection = Some(connection);
+            carrier_endpoint = Some(endpoint);
+        }
+
+        loop {
+            let observation = timeout(Duration::from_secs(5), observed.recv())
+                .await
+                .expect("actor terminal launch deadline")
+                .expect("actor terminal launch observation");
+            if matches!(
+                observation,
+                ActorContactLifecycleObservation::Launched { peer, .. }
+                    if peer == carrying_peer
+            ) {
+                break;
+            }
+        }
+
+        if scenario == ActorContactTerminalScenario::CollisionCancellation {
+            let endpoint = Endpoint::bind(
+                carrying_secret,
+                EndpointConfig::direct("127.0.0.1:0".parse().expect("collision carrier bind")),
+            )
+            .await
+            .expect("bind collision carrier");
+            let actor_address = ready
+                .bound_sockets
+                .iter()
+                .copied()
+                .find(SocketAddr::is_ipv4)
+                .expect("collision actor IPv4 socket");
+            let connection = endpoint
+                .connect(ExpectedPeer {
+                    id: local_id,
+                    address: actor_address,
+                })
+                .await
+                .expect("connect collision carrier");
+            carrier_connection = Some(connection);
+            carrier_endpoint = Some(endpoint);
+        }
+
+        let terminal = loop {
+            let observation = timeout(Duration::from_secs(5), observed.recv())
+                .await
+                .expect("actor terminal completion deadline")
+                .expect("actor terminal completion observation");
+            if let ActorContactLifecycleObservation::Terminal(observation) = observation {
+                break observation;
+            }
+        };
+
+        shutdown_sender
+            .send(())
+            .await
+            .expect("request actor terminal shutdown");
+        timeout(Duration::from_secs(10), actor)
+            .await
+            .expect("actor terminal shutdown deadline")
+            .expect("actor terminal task")
+            .expect("clean actor terminal shutdown");
+        drop(carrier_connection);
+        if let Some(endpoint) = carrier_endpoint {
+            endpoint.close().await;
+        }
+        fs::remove_dir_all(state).expect("cleanup actor terminal state");
+        terminal
+    }
+
+    #[cfg(unix)]
+    fn assert_actor_terminal_rearmed(
+        observation: ActorContactTerminalObservation,
+        scenario: ActorContactTerminalScenario,
+    ) {
+        assert!(
+            observation.metadata_present,
+            "{scenario:?} lost task metadata"
+        );
+        assert!(
+            observation.metadata_removed,
+            "{scenario:?} retained terminal task metadata"
+        );
+        assert!(
+            observation.tracker_set,
+            "{scenario:?} did not preserve the contact-local Event tracker"
+        );
+        assert!(
+            !observation.carrying_peer_pending,
+            "{scenario:?} rearmed the carrying peer"
+        );
+        assert!(
+            observation.eligible_peer_pending,
+            "{scenario:?} failed to arm the eligible other peer"
+        );
+        assert_eq!(
+            observation.join_panicked,
+            scenario == ActorContactTerminalScenario::Panic
+        );
+        assert_eq!(
+            observation.join_cancelled,
+            scenario == ActorContactTerminalScenario::CollisionCancellation
+        );
+        assert_eq!(
+            observation.collision_cancelled,
+            scenario == ActorContactTerminalScenario::CollisionCancellation
+        );
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn higher_id_actor_relaunches_policy_changed_contact_before_fallback_or_tick() {
         // Break caught: a strict live-policy relaxation races an outbound
@@ -26193,6 +26881,7 @@ mod tests {
                 control_receiver,
                 shutdown_receiver,
                 ready: ready_sender,
+                contact_activity: Arc::new(ContactActivityProbe::default()),
                 test_control: Some(RunNodeActorTestControl {
                     event_operation_audit: None,
                     before_loop_ready,
@@ -26201,6 +26890,7 @@ mod tests {
                     blob_worker_fatal_on_shutdown: false,
                     blob_final_read_gate: None,
                     outbound_contact: Some(contact_hook),
+                    contact_lifecycle: None,
                     initial_peer_contact_activity: vec![(peer_id, initial_activity)],
                 }),
             },
@@ -26469,6 +27159,197 @@ mod tests {
         .expect("bounded exact Event interest")
     }
 
+    #[tokio::test]
+    async fn event_insertion_tracker_records_only_first_event_and_route_event() {
+        // Break caught: PeerReceipt::inserted aggregates all classes and is
+        // unavailable when a contact fails after the durable write. The
+        // private contact-local signal must be set by the real Event admission
+        // boundary, including Carry/RouteEvent, but not by exact replay.
+        let test_root = root("event-insertion-admission-tracker");
+        let source_state = test_root.join("source");
+        let consume_state = test_root.join("consume");
+        let carry_state = test_root.join("carry");
+        for state in [&source_state, &consume_state, &carry_state] {
+            fs::create_dir_all(state).expect("Event insertion tracker state");
+            #[cfg(unix)]
+            fs::set_permissions(state, fs::Permissions::from_mode(0o700))
+                .expect("owner-only Event insertion tracker state");
+        }
+        let mut missions = issue_missions(3);
+        let source_mission = missions.remove(0);
+        let consume_mission = missions.remove(0);
+        let carry_mission = missions.remove(0);
+        let authority = source_mission.credentials.mission_authority_id();
+        let source_store = Arc::new(
+            Store::open_for_mission(source_state.join(STORE_FILE), authority)
+                .expect("source store"),
+        );
+        let consume_store = Arc::new(
+            Store::open_for_mission(consume_state.join(STORE_FILE), authority)
+                .expect("consume store"),
+        );
+        let carry_store = Arc::new(
+            Store::open_for_mission(carry_state.join(STORE_FILE), authority).expect("carry store"),
+        );
+        let topic = Topic::new("opaque").expect("Event insertion tracker topic");
+        let scope = Scope::new("test/runtime-contact").expect("Event insertion tracker scope");
+        seed_test_event_subscription(
+            &consume_store,
+            EventSubscriptionMode::Consume,
+            &topic,
+            &scope,
+            b"event-insertion-consume",
+        );
+        seed_test_event_subscription(
+            &carry_store,
+            EventSubscriptionMode::Carry,
+            &topic,
+            &scope,
+            b"event-insertion-carry",
+        );
+        let mut source = open_test_sealer(&source_mission.credentials);
+        let transfer_id = publish_test_epoch_one_event(
+            &source_store,
+            &mut source,
+            &topic,
+            &scope,
+            b"event-insertion-source",
+        );
+        let (consume_receipt, _, consume_inserted, source_inserted) =
+            contact_test_pair_with_event_insertion_trackers(
+                source_store.clone(),
+                source_mission.credentials.clone(),
+                consume_store.clone(),
+                consume_mission.credentials.clone(),
+            )
+            .await;
+        assert_eq!(consume_receipt.inserted, 1);
+        assert!(consume_inserted);
+        assert!(!source_inserted);
+
+        let (duplicate_receipt, _, duplicate_inserted, _) =
+            contact_test_pair_with_event_insertion_trackers(
+                source_store.clone(),
+                source_mission.credentials.clone(),
+                consume_store.clone(),
+                consume_mission.credentials,
+            )
+            .await;
+        assert_eq!(duplicate_receipt.inserted, 0);
+        assert!(!duplicate_inserted);
+
+        let (route_receipt, _, route_inserted, _) =
+            contact_test_pair_with_event_insertion_trackers(
+                source_store.clone(),
+                source_mission.credentials,
+                carry_store.clone(),
+                carry_mission.credentials,
+            )
+            .await;
+        assert_eq!(route_receipt.inserted, 1);
+        assert!(route_inserted);
+        assert_eq!(carry_store.event_count().expect("Carry Event count"), 0);
+        assert_eq!(
+            carry_store
+                .event_stats()
+                .expect("Carry Event stats")
+                .route_cached,
+            1
+        );
+
+        assert!(
+            source_store
+                .get_event(transfer_id)
+                .expect("source Event")
+                .is_some()
+        );
+        drop((source_store, consume_store, carry_store));
+        fs::remove_dir_all(test_root).expect("Event insertion tracker cleanup");
+    }
+
+    #[tokio::test]
+    async fn event_insertion_tracker_records_route_only_real_contact_once() {
+        // Break caught: Consume admission can fall back from content opening to
+        // EventContentVerification::RouteOnly. Exercise that exact branch over
+        // a real contact rather than inferring it from explicit Carry mode.
+        let test_root = root("event-insertion-route-only-contact");
+        let source_state = test_root.join("source");
+        let receiver_state = test_root.join("receiver");
+        for state in [&source_state, &receiver_state] {
+            fs::create_dir_all(state).expect("RouteOnly tracker state");
+            #[cfg(unix)]
+            fs::set_permissions(state, fs::Permissions::from_mode(0o700))
+                .expect("owner-only RouteOnly tracker state");
+        }
+        let mut missions = issue_missions(2);
+        let source_mission = missions.remove(0);
+        let receiver_mission = missions.remove(0);
+        let authority = source_mission.credentials.mission_authority_id();
+        let source_store = Arc::new(
+            Store::open_for_mission(source_state.join(STORE_FILE), authority)
+                .expect("RouteOnly source store"),
+        );
+        let receiver_store = Arc::new(
+            Store::open_for_mission(receiver_state.join(STORE_FILE), authority)
+                .expect("RouteOnly receiver store"),
+        );
+        let topic = Topic::new("opaque").expect("RouteOnly tracker topic");
+        let scope = Scope::new("test/runtime-contact").expect("RouteOnly tracker scope");
+        seed_test_event_subscription(
+            &receiver_store,
+            EventSubscriptionMode::Consume,
+            &topic,
+            &scope,
+            b"event-insertion-route-only",
+        );
+        let mut source = open_test_sealer(&source_mission.credentials);
+        let transfer_id = publish_test_epoch_one_event(
+            &source_store,
+            &mut source,
+            &topic,
+            &scope,
+            b"event-insertion-route-only-source",
+        );
+
+        let (first, _, first_inserted, _) =
+            contact_test_pair_with_event_insertion_trackers_and_client_races(
+                source_store.clone(),
+                source_mission.credentials.clone(),
+                receiver_store.clone(),
+                receiver_mission.credentials.clone(),
+                vec![TestCustodyPreopenRace::ForceRouteOnly(transfer_id)],
+            )
+            .await;
+        assert_eq!(first.inserted, 1);
+        assert!(first_inserted);
+        assert_eq!(
+            receiver_store.event_count().expect("RouteOnly Event count"),
+            0
+        );
+        assert_eq!(
+            receiver_store
+                .event_stats()
+                .expect("RouteOnly Event stats")
+                .route_cached,
+            1
+        );
+
+        let (duplicate, _, duplicate_inserted, _) =
+            contact_test_pair_with_event_insertion_trackers_and_client_races(
+                source_store.clone(),
+                source_mission.credentials,
+                receiver_store.clone(),
+                receiver_mission.credentials,
+                vec![TestCustodyPreopenRace::ForceRouteOnly(transfer_id)],
+            )
+            .await;
+        assert_eq!(duplicate.inserted, 0);
+        assert!(!duplicate_inserted);
+
+        drop((source_store, receiver_store));
+        fs::remove_dir_all(test_root).expect("RouteOnly tracker cleanup");
+    }
+
     fn seed_test_event_subscription(
         store: &Store,
         mode: EventSubscriptionMode,
@@ -26501,13 +27382,13 @@ mod tests {
             .expect("IPv4 loopback binding")
     }
 
-    async fn run_test_mutable_contact(
+    async fn run_test_mutable_contact_tracked(
         client_store: Arc<Store>,
         server_store: Arc<Store>,
         client_mission: &IssuedMission,
         server_mission: &IssuedMission,
         interests: MutableSourceInterests,
-    ) -> (PeerReceipt, PeerReceipt) {
+    ) -> (PeerReceipt, PeerReceipt, bool, bool) {
         let server = Endpoint::bind(
             aster_iroh::SecretKey::generate(),
             EndpointConfig::direct("127.0.0.1:0".parse().expect("server address")),
@@ -26520,6 +27401,8 @@ mod tests {
         )
         .await
         .expect("client endpoint");
+        let server_event_inserted = Arc::new(AtomicBool::new(false));
+        let task_server_event_inserted = server_event_inserted.clone();
         let server_task = tokio::spawn({
             let server = server.clone();
             let store = server_store;
@@ -26528,41 +27411,145 @@ mod tests {
             let peer = MissionPeerBinding::new(client.id(), client_mission.identity);
             let interests = interests.clone();
             async move {
-                let connection = server.accept(&allowed).await.expect("accept carrier");
-                serve_connection(
-                    store,
-                    connection,
-                    credentials,
-                    peer,
+                CONTACT_EVENT_INSERTED
+                    .scope(task_server_event_inserted, async move {
+                        let connection = server.accept(&allowed).await.expect("accept carrier");
+                        serve_connection(
+                            store,
+                            connection,
+                            credentials,
+                            peer,
+                            Arc::new(RwLock::new(())),
+                            interests,
+                        )
+                        .await
+                    })
+                    .await
+            }
+        });
+        let client_event_inserted = Arc::new(AtomicBool::new(false));
+        let client_contact = CONTACT_EVENT_INSERTED
+            .scope(client_event_inserted.clone(), async {
+                sync_once_with_policy(
+                    client_store,
+                    &client,
+                    client_mission.credentials.clone(),
+                    MissionExpectedPeer {
+                        carrier: ExpectedPeer {
+                            id: server.id(),
+                            address: loopback(&server),
+                        },
+                        mission: server_mission.identity,
+                    },
                     Arc::new(RwLock::new(())),
                     interests,
                 )
                 .await
-            }
-        });
-        let client_contact = sync_once_with_policy(
-            client_store,
-            &client,
-            client_mission.credentials.clone(),
-            MissionExpectedPeer {
-                carrier: ExpectedPeer {
-                    id: server.id(),
-                    address: loopback(&server),
-                },
-                mission: server_mission.identity,
-            },
-            Arc::new(RwLock::new(())),
-            interests,
-        )
-        .await
-        .expect("real Iroh mutable client contact");
+            })
+            .await
+            .expect("real Iroh mutable client contact");
         let server_contact = server_task
             .await
             .expect("server task")
             .expect("real Iroh mutable server contact");
         client.close().await;
         server.close().await;
-        (client_contact.receipt, server_contact.receipt)
+        (
+            client_contact.receipt,
+            server_contact.receipt,
+            client_event_inserted.load(Ordering::Acquire),
+            server_event_inserted.load(Ordering::Acquire),
+        )
+    }
+
+    async fn run_test_mutable_contact(
+        client_store: Arc<Store>,
+        server_store: Arc<Store>,
+        client_mission: &IssuedMission,
+        server_mission: &IssuedMission,
+        interests: MutableSourceInterests,
+    ) -> (PeerReceipt, PeerReceipt) {
+        let (client_receipt, server_receipt, client_event_inserted, server_event_inserted) =
+            run_test_mutable_contact_tracked(
+                client_store,
+                server_store,
+                client_mission,
+                server_mission,
+                interests,
+            )
+            .await;
+        assert!(
+            !client_event_inserted && !server_event_inserted,
+            "mutable-only reconciliation must not arm the private Event insertion tracker"
+        );
+        (client_receipt, server_receipt)
+    }
+
+    #[tokio::test]
+    async fn event_insertion_tracker_ignores_mutable_only_contact() {
+        let mut issued = issue_missions(2);
+        let client_mission = issued.remove(0);
+        let server_mission = issued.remove(0);
+        let topic = Topic::new("opaque").expect("mutable-only tracker topic");
+        let scope = Scope::new("test/runtime-contact").expect("mutable-only tracker scope");
+        let interests = MutableSourceInterests::new(
+            vec![SourceInterestSelector::new(
+                topic.clone(),
+                scope.clone(),
+                false,
+            )],
+            Vec::new(),
+        );
+        let client_root = root("event-insertion-mutable-client");
+        let server_root = root("event-insertion-mutable-server");
+        fs::create_dir_all(&client_root).expect("mutable-only client root");
+        fs::create_dir_all(&server_root).expect("mutable-only server root");
+        let authority = client_mission.credentials.mission_authority_id();
+        assert_eq!(authority, server_mission.credentials.mission_authority_id());
+        let client_store = Arc::new(
+            Store::open_for_mission(client_root.join(STORE_FILE), authority)
+                .expect("mutable-only client store"),
+        );
+        let server_store = Arc::new(
+            Store::open_for_mission(server_root.join(STORE_FILE), authority)
+                .expect("mutable-only server store"),
+        );
+        let mut sealer = ReferenceEnvelopeSealer::open(
+            client_mission
+                .credentials
+                .fresh_bundle()
+                .expect("mutable-only client bundle"),
+        )
+        .expect("mutable-only client sealer");
+        publish_test_state(
+            &client_store,
+            &mut sealer,
+            &topic,
+            &scope,
+            b"asset/mutable-only-tracker",
+            b"state",
+        );
+        drop(sealer);
+
+        let (client_receipt, server_receipt, client_event_inserted, server_event_inserted) =
+            run_test_mutable_contact_tracked(
+                client_store.clone(),
+                server_store.clone(),
+                &client_mission,
+                &server_mission,
+                interests,
+            )
+            .await;
+        assert!(
+            client_receipt.inserted + server_receipt.inserted > 0,
+            "the contact must actually commit mutable data"
+        );
+        assert!(!client_event_inserted);
+        assert!(!server_event_inserted);
+
+        drop((client_store, server_store));
+        fs::remove_dir_all(client_root).expect("mutable-only client cleanup");
+        fs::remove_dir_all(server_root).expect("mutable-only server cleanup");
     }
 
     fn assert_mutable_convergence(
@@ -28582,6 +29569,7 @@ mod tests {
                 control_receiver,
                 shutdown_receiver,
                 ready: ready_sender,
+                contact_activity: Arc::new(ContactActivityProbe::default()),
                 test_control: Some(RunNodeActorTestControl {
                     before_loop_ready: before_loop_ready_sender,
                     before_loop_release: before_loop_release_receiver,
@@ -28590,6 +29578,7 @@ mod tests {
                     event_operation_audit: None,
                     blob_final_read_gate: None,
                     outbound_contact: None,
+                    contact_lifecycle: None,
                     initial_peer_contact_activity: Vec::new(),
                 }),
             },
@@ -28721,6 +29710,7 @@ mod tests {
                 control_receiver,
                 shutdown_receiver,
                 ready: ready_sender,
+                contact_activity: Arc::new(ContactActivityProbe::default()),
                 test_control: Some(RunNodeActorTestControl {
                     before_loop_ready,
                     before_loop_release: release_loop,
@@ -28732,6 +29722,7 @@ mod tests {
                     )),
                     event_operation_audit: None,
                     outbound_contact: None,
+                    contact_lifecycle: None,
                     initial_peer_contact_activity: Vec::new(),
                 }),
             },
@@ -30343,6 +31334,7 @@ mod tests {
                 control_receiver: controls,
                 shutdown_receiver,
                 ready,
+                contact_activity: Arc::new(ContactActivityProbe::default()),
                 test_control: Some(RunNodeActorTestControl {
                     before_loop_ready,
                     before_loop_release,
@@ -30351,6 +31343,7 @@ mod tests {
                     blob_final_read_gate: None,
                     event_operation_audit: Some(audit_control),
                     outbound_contact: None,
+                    contact_lifecycle: None,
                     initial_peer_contact_activity: Vec::new(),
                 }),
             },
@@ -30596,37 +31589,16 @@ mod tests {
                 first_mission,
             )
         };
-        let lower_socket = UdpSocket::bind(("127.0.0.1", 0)).expect("reserve lower port");
-        let higher_socket = UdpSocket::bind(("127.0.0.1", 0)).expect("reserve higher port");
-        let lower_address = lower_socket.local_addr().expect("lower address");
-        let higher_address = higher_socket.local_addr().expect("higher address");
-        drop((lower_socket, higher_socket));
         let lower_config = NodeConfig {
             state: lower_state,
-            bind: lower_address,
+            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
             mission: lower_mission.credentials.clone(),
             peers: vec![MissionExpectedPeer {
                 carrier: ExpectedPeer {
                     id: higher_carrier,
-                    address: higher_address,
+                    address: SocketAddr::from(([127, 0, 0, 1], 9)),
                 },
                 mission: higher_mission.identity,
-            }],
-            mutable_interests: MutableSourceInterests::default(),
-            sync_interval: Duration::from_millis(20),
-            run_for: None,
-            application: NodeApplication::Relay,
-        };
-        let higher_config = NodeConfig {
-            state: higher_state,
-            bind: higher_address,
-            mission: higher_mission.credentials,
-            peers: vec![MissionExpectedPeer {
-                carrier: ExpectedPeer {
-                    id: lower_carrier,
-                    address: lower_address,
-                },
-                mission: lower_mission.identity,
             }],
             mutable_interests: MutableSourceInterests::default(),
             sync_interval: Duration::from_millis(20),
@@ -30638,6 +31610,22 @@ mod tests {
         let lower = start_node_with_forwarding(lower_config, receive_only)
             .await
             .expect("start lower ReceiveOnly peer");
+        let higher_config = NodeConfig {
+            state: higher_state,
+            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            mission: higher_mission.credentials,
+            peers: vec![MissionExpectedPeer {
+                carrier: ExpectedPeer {
+                    id: lower_carrier,
+                    address: running_ipv4(&lower),
+                },
+                mission: lower_mission.identity,
+            }],
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_millis(20),
+            run_for: None,
+            application: NodeApplication::Relay,
+        };
         let lower_events = lower.selected_events();
         let topic = Topic::new("opaque").expect("topic");
         let scope = Scope::new("test/runtime-contact").expect("scope");
@@ -31524,6 +32512,151 @@ mod tests {
         }
     }
 
+    fn running_ipv4(node: &RunningNode) -> SocketAddr {
+        node.bound_sockets
+            .iter()
+            .copied()
+            .find(SocketAddr::is_ipv4)
+            .expect("running node IPv4 socket")
+    }
+
+    async fn seed_peerless_consume_subscription(
+        state: PathBuf,
+        mission: UnprotectedReferenceMission,
+        topic: Topic,
+        scope: Scope,
+        operation_key: &[u8],
+    ) -> crate::application::EventSubscriptionId {
+        let node = start_node(NodeConfig {
+            state,
+            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            mission,
+            peers: Vec::new(),
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_secs(60),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("start peerless subscription node");
+        let subscription = node
+            .selected_events()
+            .subscribe(crate::application::EventSubscriptionRequest {
+                operation_key: operation_key.to_vec(),
+                topic,
+                scope,
+                include_descendant_scopes: false,
+            })
+            .await
+            .expect("seed peerless subscription");
+        node.shutdown()
+            .await
+            .expect("shutdown peerless subscription node");
+        subscription.id
+    }
+
+    async fn wait_for_authenticated_contacts(
+        events: &crate::application::SelectedEventHandle,
+        minimum: u64,
+        label: &str,
+    ) {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if events
+                    .status()
+                    .await
+                    .expect("contact status")
+                    .authenticated_contacts
+                    >= minimum
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{label} contact deadline"));
+    }
+
+    async fn wait_for_event_delivery(
+        events: &crate::application::SelectedEventHandle,
+        subscription: crate::application::EventSubscriptionId,
+        event: crate::application::EventId,
+        label: &str,
+    ) {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let page = events
+                    .poll(crate::application::EventPollRequest {
+                        subscription,
+                        delivery_limit: 8,
+                        scan_limit: 8,
+                    })
+                    .await
+                    .expect("poll propagated Event");
+                if page
+                    .deliveries
+                    .iter()
+                    .any(|delivery| delivery.event.id == event)
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{label} propagation deadline"));
+    }
+
+    async fn assert_contact_activity_quiesces(nodes: &[&RunningNode], label: &str) {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if nodes
+                    .iter()
+                    .all(|node| node.contact_activity_snapshot().active == 0)
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{label} retained an active contact after convergence"));
+        let before = nodes
+            .iter()
+            .map(|node| node.contact_activity_snapshot())
+            .collect::<Vec<_>>();
+        assert!(
+            before.iter().all(|snapshot| snapshot.launched > 0),
+            "{label} did not observe each actor launch a contact"
+        );
+        assert!(
+            before
+                .iter()
+                .all(|snapshot| snapshot.completed == snapshot.launched),
+            "{label} reached apparent quiescence without every launched contact terminating"
+        );
+        assert!(
+            before
+                .iter()
+                .all(|snapshot| snapshot.failed <= snapshot.completed),
+            "{label} observed more failed contacts than terminal contacts"
+        );
+        sleep(MIN_NON_PREFERRED_CONTACT_FALLBACK_DELAY + Duration::from_millis(250)).await;
+        let after = nodes
+            .iter()
+            .map(|node| node.contact_activity_snapshot())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            after, before,
+            "{label} launched or failed a duplicate contact"
+        );
+        assert!(
+            after.iter().all(|snapshot| snapshot.active == 0),
+            "{label} left an in-flight contact for shutdown to mask"
+        );
+    }
+
     async fn assert_newly_published_event_wakes_idle_peer_sync(source_is_higher: bool) {
         use crate::application::{EventPollRequest, EventPublishRequest, EventSubscriptionRequest};
 
@@ -31613,19 +32746,14 @@ mod tests {
             .await
             .expect("stop offline event wake receiver");
 
-        let source_socket = UdpSocket::bind(("127.0.0.1", 0)).expect("reserve source port");
-        let receiver_socket = UdpSocket::bind(("127.0.0.1", 0)).expect("reserve receiver port");
-        let source_address = source_socket.local_addr().expect("source address");
-        let receiver_address = receiver_socket.local_addr().expect("receiver address");
-        drop((source_socket, receiver_socket));
         let source_config = NodeConfig {
             state: source_state,
-            bind: source_address,
+            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
             mission: source_mission.credentials,
             peers: vec![MissionExpectedPeer {
                 carrier: ExpectedPeer {
                     id: receiver_carrier,
-                    address: receiver_address,
+                    address: SocketAddr::from(([127, 0, 0, 1], 9)),
                 },
                 mission: receiver_mission.identity,
             }],
@@ -31636,12 +32764,12 @@ mod tests {
         };
         let receiver_config = NodeConfig {
             state: receiver_state,
-            bind: receiver_address,
+            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
             mission: receiver_mission.credentials,
             peers: vec![MissionExpectedPeer {
                 carrier: ExpectedPeer {
                     id: source_carrier,
-                    address: source_address,
+                    address: SocketAddr::from(([127, 0, 0, 1], 9)),
                 },
                 mission: source_mission.identity,
             }],
@@ -31650,23 +32778,13 @@ mod tests {
             run_for: None,
             application: NodeApplication::Relay,
         };
-        let (source, receiver) = if source_carrier > receiver_carrier {
-            let source = start_node(source_config)
-                .await
-                .expect("start higher Event wake source");
-            let receiver = start_node(receiver_config)
-                .await
-                .expect("start lower Event wake receiver");
-            (source, receiver)
-        } else {
-            let receiver = start_node(receiver_config)
-                .await
-                .expect("start higher Event wake receiver");
-            let source = start_node(source_config)
-                .await
-                .expect("start lower Event wake source");
-            (source, receiver)
-        };
+        let (source, receiver) = start_test_pair(
+            source_config,
+            receiver_config,
+            source_carrier,
+            receiver_carrier,
+        )
+        .await;
         let source_events = source.selected_events();
         let receiver_events = receiver.selected_events();
 
@@ -31738,6 +32856,326 @@ mod tests {
     #[tokio::test]
     async fn newly_published_event_on_higher_identity_wakes_idle_peer_sync() {
         assert_newly_published_event_wakes_idle_peer_sync(true).await;
+    }
+
+    #[tokio::test]
+    async fn newly_published_event_propagates_inbound_at_middle_node() {
+        // Break caught: B receives A's Event on an inbound contact after its
+        // empty B→C contact has quiesced. Without a task-local insertion signal
+        // carried through inbound terminal handling, C waits for the 60-second
+        // periodic tick instead of receiving within five seconds.
+        let test_root = root("new-event-three-node-inbound-middle");
+        fs::create_dir_all(&test_root).expect("three-node inbound root");
+        let mut carriers = (0..3)
+            .map(|index| {
+                let state = test_root.join(format!("carrier-{index}"));
+                let id = NodeIdentity::load_or_create(&state)
+                    .expect("three-node inbound carrier")
+                    .id();
+                #[cfg(unix)]
+                fs::set_permissions(&state, fs::Permissions::from_mode(0o700))
+                    .expect("owner-only three-node inbound state");
+                (id, state)
+            })
+            .collect::<Vec<_>>();
+        carriers.sort_by_key(|(id, _)| *id);
+        let (a_carrier, a_state) = carriers.remove(0);
+        let (b_carrier, b_state) = carriers.remove(0);
+        let (c_carrier, c_state) = carriers.remove(0);
+        assert!(a_carrier < b_carrier && b_carrier < c_carrier);
+        let mut missions = issue_missions(3);
+        let a_mission = missions.remove(0);
+        let b_mission = missions.remove(0);
+        let c_mission = missions.remove(0);
+        let topic = Topic::new("opaque").expect("three-node inbound topic");
+        let scope = Scope::new("test/runtime-contact").expect("three-node inbound scope");
+        let _b_subscription = seed_peerless_consume_subscription(
+            b_state.clone(),
+            b_mission.credentials.clone(),
+            topic.clone(),
+            scope.clone(),
+            b"three-node-inbound-b",
+        )
+        .await;
+        let c_subscription = seed_peerless_consume_subscription(
+            c_state.clone(),
+            c_mission.credentials.clone(),
+            topic.clone(),
+            scope.clone(),
+            b"three-node-inbound-c",
+        )
+        .await;
+
+        let c = start_node(NodeConfig {
+            state: c_state,
+            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            mission: c_mission.credentials,
+            peers: vec![MissionExpectedPeer {
+                carrier: ExpectedPeer {
+                    id: b_carrier,
+                    address: SocketAddr::from(([127, 0, 0, 1], 9)),
+                },
+                mission: b_mission.identity,
+            }],
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_secs(60),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("start passive C");
+        let c_address = running_ipv4(&c);
+        let c_events = c.selected_events();
+        let b = start_node(NodeConfig {
+            state: b_state,
+            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            mission: b_mission.credentials,
+            peers: vec![
+                MissionExpectedPeer {
+                    carrier: ExpectedPeer {
+                        id: a_carrier,
+                        address: SocketAddr::from(([127, 0, 0, 1], 9)),
+                    },
+                    mission: a_mission.identity,
+                },
+                MissionExpectedPeer {
+                    carrier: ExpectedPeer {
+                        id: c_carrier,
+                        address: c_address,
+                    },
+                    mission: c_mission.identity,
+                },
+            ],
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_secs(60),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("start middle B");
+        let b_address = running_ipv4(&b);
+        let b_events = b.selected_events();
+        wait_for_authenticated_contacts(&b_events, 1, "initial B to C").await;
+        wait_for_authenticated_contacts(&c_events, 1, "initial C from B").await;
+
+        let a = start_node(NodeConfig {
+            state: a_state,
+            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            mission: a_mission.credentials,
+            peers: vec![MissionExpectedPeer {
+                carrier: ExpectedPeer {
+                    id: b_carrier,
+                    address: b_address,
+                },
+                mission: b_mission.identity,
+            }],
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_secs(60),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("start source A");
+        let a_events = a.selected_events();
+        wait_for_authenticated_contacts(&a_events, 1, "initial A to B").await;
+        wait_for_authenticated_contacts(&b_events, 2, "initial B from A").await;
+        let published = a_events
+            .publish(crate::application::EventPublishRequest {
+                operation_key: b"three-node-inbound-publication".to_vec(),
+                predecessor: None,
+                topic,
+                scope,
+                priority: Priority::Priority,
+                logical_key: b"three-node-inbound".to_vec(),
+                payload: b"inbound insertion must wake onward contact".to_vec(),
+                tombstone: false,
+            })
+            .await
+            .expect("publish three-node inbound Event");
+        assert!(published.inserted);
+        wait_for_event_delivery(
+            &c_events,
+            c_subscription,
+            published.id,
+            "inbound-at-B A to B to C",
+        )
+        .await;
+        assert_contact_activity_quiesces(&[&a, &b, &c], "inbound topology").await;
+
+        let (a_receipt, b_receipt, c_receipt) =
+            tokio::join!(a.shutdown(), b.shutdown(), c.shutdown());
+        assert!(a_receipt.expect("A shutdown").contacts > 0);
+        assert!(b_receipt.expect("B shutdown").contacts >= 3);
+        assert!(c_receipt.expect("C shutdown").contacts > 0);
+        fs::remove_dir_all(test_root).expect("three-node inbound cleanup");
+    }
+
+    #[tokio::test]
+    async fn newly_published_event_propagates_outbound_at_middle_node() {
+        // Break caught: B receives A's preseeded Event on B's outbound contact.
+        // C is lower-ID and ReceiveOnly, so only B's insertion-triggered forced
+        // contact can deliver before the 60-second periodic/fallback cadence.
+        let test_root = root("new-event-three-node-outbound-middle");
+        fs::create_dir_all(&test_root).expect("three-node outbound root");
+        let mut carriers = (0..3)
+            .map(|index| {
+                let state = test_root.join(format!("carrier-{index}"));
+                let id = NodeIdentity::load_or_create(&state)
+                    .expect("three-node outbound carrier")
+                    .id();
+                #[cfg(unix)]
+                fs::set_permissions(&state, fs::Permissions::from_mode(0o700))
+                    .expect("owner-only three-node outbound state");
+                (id, state)
+            })
+            .collect::<Vec<_>>();
+        carriers.sort_by_key(|(id, _)| *id);
+        let (c_carrier, c_state) = carriers.remove(0);
+        let (b_carrier, b_state) = carriers.remove(0);
+        let (a_carrier, a_state) = carriers.remove(0);
+        assert!(c_carrier < b_carrier && b_carrier < a_carrier);
+        let mut missions = issue_missions(3);
+        let c_mission = missions.remove(0);
+        let b_mission = missions.remove(0);
+        let a_mission = missions.remove(0);
+        let topic = Topic::new("opaque").expect("three-node outbound topic");
+        let scope = Scope::new("test/runtime-contact").expect("three-node outbound scope");
+        let _b_subscription = seed_peerless_consume_subscription(
+            b_state.clone(),
+            b_mission.credentials.clone(),
+            topic.clone(),
+            scope.clone(),
+            b"three-node-outbound-b",
+        )
+        .await;
+        let c_subscription = seed_peerless_consume_subscription(
+            c_state.clone(),
+            c_mission.credentials.clone(),
+            topic.clone(),
+            scope.clone(),
+            b"three-node-outbound-c",
+        )
+        .await;
+        let peerless_a = start_node(NodeConfig {
+            state: a_state.clone(),
+            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            mission: a_mission.credentials.clone(),
+            peers: Vec::new(),
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_secs(60),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("start peerless A");
+        let published = peerless_a
+            .selected_events()
+            .publish(crate::application::EventPublishRequest {
+                operation_key: b"three-node-outbound-publication".to_vec(),
+                predecessor: None,
+                topic: topic.clone(),
+                scope: scope.clone(),
+                priority: Priority::Priority,
+                logical_key: b"three-node-outbound".to_vec(),
+                payload: b"outbound insertion must wake onward contact".to_vec(),
+                tombstone: false,
+            })
+            .await
+            .expect("preseed peerless A Event");
+        assert!(published.inserted);
+        peerless_a.shutdown().await.expect("shutdown peerless A");
+
+        let a = start_node(NodeConfig {
+            state: a_state,
+            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            mission: a_mission.credentials,
+            peers: vec![MissionExpectedPeer {
+                carrier: ExpectedPeer {
+                    id: b_carrier,
+                    address: SocketAddr::from(([127, 0, 0, 1], 9)),
+                },
+                mission: b_mission.identity,
+            }],
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_secs(60),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("start passive A");
+        let a_address = running_ipv4(&a);
+        let a_events = a.selected_events();
+        let receive_only = SelectedForwardingConfig::default()
+            .with_emission_policy(EventEmissionPolicy::ReceiveOnly);
+        let c = start_node_with_forwarding(
+            NodeConfig {
+                state: c_state,
+                bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                mission: c_mission.credentials,
+                peers: vec![MissionExpectedPeer {
+                    carrier: ExpectedPeer {
+                        id: b_carrier,
+                        address: SocketAddr::from(([127, 0, 0, 1], 9)),
+                    },
+                    mission: b_mission.identity,
+                }],
+                mutable_interests: MutableSourceInterests::default(),
+                sync_interval: Duration::from_secs(60),
+                run_for: None,
+                application: NodeApplication::Relay,
+            },
+            receive_only,
+        )
+        .await
+        .expect("start ReceiveOnly C");
+        let c_address = running_ipv4(&c);
+        let c_events = c.selected_events();
+        let b = start_node(NodeConfig {
+            state: b_state,
+            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            mission: b_mission.credentials,
+            peers: vec![
+                MissionExpectedPeer {
+                    carrier: ExpectedPeer {
+                        id: a_carrier,
+                        address: a_address,
+                    },
+                    mission: a_mission.identity,
+                },
+                MissionExpectedPeer {
+                    carrier: ExpectedPeer {
+                        id: c_carrier,
+                        address: c_address,
+                    },
+                    mission: c_mission.identity,
+                },
+            ],
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_secs(60),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("start middle B");
+        let b_events = b.selected_events();
+        wait_for_event_delivery(
+            &c_events,
+            c_subscription,
+            published.id,
+            "outbound-at-B A to B to C",
+        )
+        .await;
+        wait_for_authenticated_contacts(&a_events, 1, "A from B").await;
+        wait_for_authenticated_contacts(&b_events, 2, "B to A and C").await;
+        wait_for_authenticated_contacts(&c_events, 1, "C from B").await;
+        assert_contact_activity_quiesces(&[&a, &b, &c], "outbound topology").await;
+
+        let (a_receipt, b_receipt, c_receipt) =
+            tokio::join!(a.shutdown(), b.shutdown(), c.shutdown());
+        assert!(a_receipt.expect("A shutdown").contacts > 0);
+        assert!(b_receipt.expect("B shutdown").contacts >= 2);
+        assert!(c_receipt.expect("C shutdown").contacts > 0);
+        fs::remove_dir_all(test_root).expect("three-node outbound cleanup");
     }
 
     #[tokio::test]
@@ -33925,6 +35363,7 @@ mod tests {
                 control_receiver,
                 shutdown_receiver,
                 ready: ready_sender,
+                contact_activity: Arc::new(ContactActivityProbe::default()),
                 test_control: Some(RunNodeActorTestControl {
                     before_loop_ready,
                     before_loop_release: release_received,
@@ -33933,6 +35372,7 @@ mod tests {
                     blob_final_read_gate: None,
                     event_operation_audit: None,
                     outbound_contact: None,
+                    contact_lifecycle: None,
                     initial_peer_contact_activity: Vec::new(),
                 }),
             },
@@ -34566,6 +36006,57 @@ mod tests {
             },
         )
         .await
+    }
+
+    async fn contact_test_pair_with_event_insertion_trackers(
+        server_store: Arc<Store>,
+        server_mission: UnprotectedReferenceMission,
+        client_store: Arc<Store>,
+        client_mission: UnprotectedReferenceMission,
+    ) -> (PeerReceipt, PeerReceipt, bool, bool) {
+        contact_test_pair_with_event_insertion_trackers_and_client_races(
+            server_store,
+            server_mission,
+            client_store,
+            client_mission,
+            Vec::new(),
+        )
+        .await
+    }
+
+    async fn contact_test_pair_with_event_insertion_trackers_and_client_races(
+        server_store: Arc<Store>,
+        server_mission: UnprotectedReferenceMission,
+        client_store: Arc<Store>,
+        client_mission: UnprotectedReferenceMission,
+        client_races: Vec<TestCustodyPreopenRace>,
+    ) -> (PeerReceipt, PeerReceipt, bool, bool) {
+        let (client, server, client_tracker, server_tracker) =
+            contact_test_pair_with_forwarding_results_tracked(
+                TestForwardingNode {
+                    store: server_store,
+                    mission: server_mission,
+                    policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                    clock: NodeCustodyClock::injected([0xb1; 16], 0, 0),
+                    reconciliation_exchanges_before_defer: None,
+                    preopen_custody_races: Vec::new(),
+                },
+                TestForwardingNode {
+                    store: client_store,
+                    mission: client_mission,
+                    policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                    clock: NodeCustodyClock::injected([0xb2; 16], 0, 0),
+                    reconciliation_exchanges_before_defer: None,
+                    preopen_custody_races: client_races,
+                },
+            )
+            .await;
+        (
+            client.expect("client contact").receipt,
+            server.expect("server contact").receipt,
+            client_tracker.load(Ordering::Acquire),
+            server_tracker.load(Ordering::Acquire),
+        )
     }
 
     fn publish_test_blob(
@@ -36953,12 +38444,14 @@ mod tests {
         }
     }
 
-    async fn contact_test_pair_with_forwarding_results(
+    async fn contact_test_pair_with_forwarding_results_tracked(
         server_node: TestForwardingNode,
         client_node: TestForwardingNode,
     ) -> (
         Result<CompletedPeerContact, NodeError>,
         Result<CompletedPeerContact, NodeError>,
+        Arc<AtomicBool>,
+        Arc<AtomicBool>,
     ) {
         let TestForwardingNode {
             store: server_store,
@@ -36978,6 +38471,8 @@ mod tests {
         } = client_node;
         let server_event_route_cache = test_event_route_cache(&server_store, &server_mission);
         let client_event_route_cache = test_event_route_cache(&client_store, &client_mission);
+        let server_event_inserted = Arc::new(AtomicBool::new(false));
+        let client_event_inserted = Arc::new(AtomicBool::new(false));
         let server = Endpoint::bind(
             aster_iroh::SecretKey::generate(),
             EndpointConfig::direct("127.0.0.1:0".parse().expect("server address")),
@@ -36996,64 +38491,90 @@ mod tests {
             let credentials = server_mission.clone();
             let allowed = BTreeSet::from([client.id()]);
             let peer = MissionPeerBinding::new(client.id(), client_mission.identity());
+            let event_inserted = server_event_inserted.clone();
             async move {
                 let connection = server.accept(&allowed).await.expect("accept carrier");
-                with_test_contact_hooks(
-                    server_defer,
-                    server_races,
-                    serve_connection_with_forwarding(InboundContact {
-                        store,
-                        connection,
-                        mission: credentials,
-                        expected_peer: Some(peer),
-                        #[cfg(feature = "nearby-discovery")]
-                        automatic_admission: None,
-                        policy_lock: Arc::new(RwLock::new(())),
-                        emission_policy: server_policy,
-                        custody_clock: server_clock,
-                        event_route_cache: server_event_route_cache,
-                        event_bridge: None,
-                        mutable_interests: MutableSourceInterests::default(),
-                    }),
-                )
-                .await
+                CONTACT_EVENT_INSERTED
+                    .scope(
+                        event_inserted,
+                        with_test_contact_hooks(
+                            server_defer,
+                            server_races,
+                            serve_connection_with_forwarding(InboundContact {
+                                store,
+                                connection,
+                                mission: credentials,
+                                expected_peer: Some(peer),
+                                #[cfg(feature = "nearby-discovery")]
+                                automatic_admission: None,
+                                policy_lock: Arc::new(RwLock::new(())),
+                                emission_policy: server_policy,
+                                custody_clock: server_clock,
+                                event_route_cache: server_event_route_cache,
+                                event_bridge: None,
+                                mutable_interests: MutableSourceInterests::default(),
+                            }),
+                        ),
+                    )
+                    .await
             }
         });
         let snapshot = client_policy.snapshot().expect("client policy snapshot");
-        let client_receipt = with_test_contact_hooks(
-            client_defer,
-            client_races,
-            sync_once_with_forwarding(
-                &client,
-                OutboundContact {
-                    store: client_store,
-                    mission: client_mission,
-                    peer: MissionExpectedPeer {
-                        carrier: ExpectedPeer {
-                            id: server.id(),
-                            address: loopback(&server),
+        let client_receipt = CONTACT_EVENT_INSERTED
+            .scope(
+                client_event_inserted.clone(),
+                with_test_contact_hooks(
+                    client_defer,
+                    client_races,
+                    sync_once_with_forwarding(
+                        &client,
+                        OutboundContact {
+                            store: client_store,
+                            mission: client_mission,
+                            peer: MissionExpectedPeer {
+                                carrier: ExpectedPeer {
+                                    id: server.id(),
+                                    address: loopback(&server),
+                                },
+                                mission: server_mission.identity(),
+                            }
+                            .into(),
+                            #[cfg(feature = "nearby-discovery")]
+                            automatic_admission: None,
+                            policy_lock: Arc::new(RwLock::new(())),
+                            emission_policy: client_policy,
+                            emission_snapshot: snapshot,
+                            custody_clock: client_clock,
+                            event_route_cache: client_event_route_cache,
+                            event_bridge: None,
+                            mutable_interests: MutableSourceInterests::default(),
+                            controlled_relay: None,
                         },
-                        mission: server_mission.identity(),
-                    }
-                    .into(),
-                    #[cfg(feature = "nearby-discovery")]
-                    automatic_admission: None,
-                    policy_lock: Arc::new(RwLock::new(())),
-                    emission_policy: client_policy,
-                    emission_snapshot: snapshot,
-                    custody_clock: client_clock,
-                    event_route_cache: client_event_route_cache,
-                    event_bridge: None,
-                    mutable_interests: MutableSourceInterests::default(),
-                    controlled_relay: None,
-                },
-            ),
-        )
-        .await;
+                    ),
+                ),
+            )
+            .await;
         let server_receipt = server_task.await.expect("server task");
         client.close().await;
         server.close().await;
-        (client_receipt, server_receipt)
+        (
+            client_receipt,
+            server_receipt,
+            client_event_inserted,
+            server_event_inserted,
+        )
+    }
+
+    async fn contact_test_pair_with_forwarding_results(
+        server_node: TestForwardingNode,
+        client_node: TestForwardingNode,
+    ) -> (
+        Result<CompletedPeerContact, NodeError>,
+        Result<CompletedPeerContact, NodeError>,
+    ) {
+        let (client, server, _, _) =
+            contact_test_pair_with_forwarding_results_tracked(server_node, client_node).await;
+        (client, server)
     }
 
     async fn contact_test_pair_with_forwarding(
