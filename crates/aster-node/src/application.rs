@@ -2533,6 +2533,10 @@ fn custody_store_error_kind(error: &CustodyStoreError) -> ApplicationErrorKind {
         | CustodyStoreError::MissionMismatch
         | CustodyStoreError::ItemNotFound
         | CustodyStoreError::LeaseNotFound => ApplicationErrorKind::StateUnavailable,
+        // A recognized predecessor schema is not corrupt. It requires the
+        // same explicit fresh-store boundary as other non-migratable legacy
+        // application state.
+        CustodyStoreError::UnsupportedSchemaVersion { .. } => ApplicationErrorKind::LegacyState,
         CustodyStoreError::AgeOverflow
         | CustodyStoreError::CounterOverflow
         | CustodyStoreError::UnsupportedRetirementClass(_)
@@ -2633,6 +2637,22 @@ mod tests {
                 "test integrity"
             )),
             ApplicationErrorKind::Integrity
+        );
+    }
+
+    #[test]
+    fn unsupported_custody_schema_requires_a_fresh_store_without_claiming_corruption() {
+        let error = CustodyStoreError::UnsupportedSchemaVersion {
+            found: 2,
+            supported: 3,
+        };
+        assert_eq!(
+            custody_store_error_kind(&error),
+            ApplicationErrorKind::LegacyState
+        );
+        assert_eq!(
+            store_error_kind(&StoreError::Custody(error)),
+            ApplicationErrorKind::LegacyState
         );
     }
 
