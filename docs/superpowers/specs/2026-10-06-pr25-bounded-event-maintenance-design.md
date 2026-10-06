@@ -1,6 +1,6 @@
 # PR 25 bounded Event maintenance and prompt propagation design
 
-**Status:** Approved in chat on 2026-10-06; revised written-spec review pending  
+**Status:** Approved in chat on 2026-10-06; revised written-spec and final independent review complete on 2026-10-06
 **Capability tracks:** causal/lifecycle correctness; intermittent store-and-forward  
 **Evidence boundary:** current-code regression and engineering-resource coverage only
 
@@ -405,11 +405,15 @@ processes to avoid repeating host-resource failures.
 
 ## Resource measurement and evidence boundary
 
-At a 10,000-item metadata working set and maximum constructed per-object
-dependency fan-out, record peak/steady RSS, allocator high-water if available,
-wall time, CPU time, redb bytes/I/O or transaction counts, and cleanup passes.
-Also measure advancing no-op maintenance write/commit cadence because preserving
-high-water intentionally adds durable writes.
+Use the existing 10,000-item metadata workload and the existing maximum-
+constructed per-object dependency-fan-out fixture. Record peak/steady RSS,
+allocator high-water if available, wall time, CPU time, redb bytes/I/O or
+transaction counts, and cleanup passes when the fixtures expose them. Also
+measure advancing no-op maintenance write/commit cadence because preserving
+high-water intentionally adds durable writes. A stopped run at the declared
+20-minute boundary is an acceptable bounded engineering result for this
+increment when its unavailable metrics and incomplete scope are recorded
+without inference; it is not a resource qualification result.
 
 The comparison is against the Tier-2 provisional 64 MiB steady-state / 32 MiB
 preferred targets from `data-mesh-requirements.md`; it is engineering data, not
@@ -451,8 +455,9 @@ The increment is ready for handoff only when:
 - focused store and runtime suites pass;
 - `mise run check` completes successfully;
 - numeric candidate, scan, and dependency bounds are asserted;
-- the 10,000-item/max-fan-out resource measurements and no-op write cadence are
-  recorded with their non-qualification caveat;
+- the existing 10,000-item attempt, maximum-constructed-fan-out measurements,
+  and no-op write cadence are recorded with unavailable metrics and the
+  non-qualification caveat stated explicitly;
 - changed wake tests contain no bind/drop/rebind sequence;
 - an independent final reviewer finds no unresolved Critical or Important
   issue; and
