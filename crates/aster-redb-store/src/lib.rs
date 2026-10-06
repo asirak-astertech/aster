@@ -6506,6 +6506,7 @@ impl Store {
         }
 
         let mut pending_candidates = Vec::new();
+        let mut pending_rows_scanned = 0usize;
         let mut structurally_active = 0usize;
         let mut pending_has_more = false;
         let mut start = [0u8; 40];
@@ -6520,7 +6521,7 @@ impl Store {
             );
             let mut rows = pending.range::<&[u8]>(bounds)?;
             loop {
-                if pending_candidates.len() == scan_limit || structurally_active == delivery_limit {
+                if pending_rows_scanned == scan_limit || structurally_active == delivery_limit {
                     pending_has_more = rows.next().transpose()?.is_some();
                     break;
                 }
@@ -6528,6 +6529,9 @@ impl Store {
                     break;
                 };
                 let (key, value) = row;
+                pending_rows_scanned = pending_rows_scanned
+                    .checked_add(1)
+                    .ok_or(StoreError::ItemCountAccountingOverflow)?;
                 let (row_subscription, marker) = parse_event_pending_delivery_key(key.value())?;
                 if row_subscription != subscription {
                     return Err(StoreError::SemanticInvariant(
@@ -6535,14 +6539,30 @@ impl Store {
                     ));
                 }
                 let pending_record = decode_event_pending_delivery_record(value.value())?;
-                let event = load_event_by_semantic_from_read(&read, pending_record.semantic_id)?
-                    .ok_or(StoreError::SemanticInvariant(
+                let event = load_event_by_semantic_from_read(&read, pending_record.semantic_id)?;
+                let Some(event) = event else {
+                    if custody::event_pending_retirement_reference_exists_read(
+                        &read,
+                        pending_record.semantic_id,
+                        key.value(),
+                    )? {
+                        continue;
+                    }
+                    return Err(StoreError::SemanticInvariant(
                         "pending Event delivery references a missing Event",
-                    ))?;
+                    ));
+                };
                 if !custody::sender_row_live_read(
                     &read,
                     CustodyObjectKey::event(event.transfer_id),
                 )? {
+                    if custody::event_pending_retirement_reference_exists_read(
+                        &read,
+                        pending_record.semantic_id,
+                        key.value(),
+                    )? {
+                        continue;
+                    }
                     return Err(StoreError::SemanticInvariant(
                         "pending Event delivery references unavailable custody",
                     ));
@@ -6578,7 +6598,7 @@ impl Store {
         let mut scanned_rows = 0usize;
         let mut scanned_through = record.discovered_through;
         if !pending_has_more
-            && pending_candidates.len() < scan_limit
+            && pending_rows_scanned < scan_limit
             && structurally_active < delivery_limit
         {
             let acceptance_order = read.open_table(EVENT_ACCEPTANCE_ORDER)?;
@@ -6588,7 +6608,7 @@ impl Store {
             );
             let mut expected_marker = record.discovered_through.checked_add(1);
             for row in acceptance_order.range(bounds)? {
-                if pending_candidates.len() + scanned_rows == scan_limit
+                if pending_rows_scanned + scanned_rows == scan_limit
                     || structurally_active == delivery_limit
                 {
                     break;
@@ -6630,7 +6650,7 @@ impl Store {
         }
         if scanned_through < last_marker
             && !pending_has_more
-            && pending_candidates.len() + scanned_rows < scan_limit
+            && pending_rows_scanned + scanned_rows < scan_limit
             && structurally_active < delivery_limit
         {
             return Err(StoreError::SemanticInvariant(
@@ -6960,11 +6980,19 @@ impl Store {
             .map(|value| decode_event_acknowledgement_record(value.value()))
             .transpose()?;
         if let Some(receipt) = existing_receipt {
-            let event = load_event_by_semantic_from_write(&write, semantic_id)?.ok_or(
-                StoreError::SemanticInvariant(
+            let event = load_event_by_semantic_from_write(&write, semantic_id)?;
+            let Some(event) = event else {
+                if custody::event_acknowledgement_retirement_reference_exists_write(
+                    &write,
+                    semantic_id,
+                    acknowledgement_key.as_slice(),
+                )? {
+                    return Ok(EventDeliveryAck::AlreadyAcknowledged);
+                }
+                return Err(StoreError::SemanticInvariant(
                     "Event acknowledgement references a missing accepted Event",
-                ),
-            )?;
+                ));
+            };
             if receipt.acceptance_marker != event.acceptance_marker
                 || receipt.acceptance_marker > record.discovered_through
                 || !record.spec.matches(&event)
@@ -6987,6 +7015,9 @@ impl Store {
         }
         let event = load_event_by_semantic_from_write(&write, semantic_id)?
             .ok_or(StoreError::EventDeliveryNotFound)?;
+        if !custody::sender_row_live_write(&write, CustodyObjectKey::event(event.transfer_id))? {
+            return Err(StoreError::EventDeliveryNotFound);
+        }
         if event.acceptance_marker > record.discovered_through || !record.spec.matches(&event) {
             return Err(StoreError::EventDeliveryNotFound);
         }
@@ -18004,16 +18035,22 @@ fn audit_event_subscription_tables(write: &redb::WriteTransaction) -> Result<(),
                     "pending Event delivery references a Carry subscription",
                 ));
             }
-            let event = load_event_by_semantic_from_write(write, record.semantic_id)?.ok_or(
-                StoreError::SemanticInvariant("pending Event delivery references a missing Event"),
-            )?;
-            if event.acceptance_marker != marker
-                || marker > subscription_record.discovered_through
-                || !subscription_record.spec.matches(&event)
-            {
-                return Err(StoreError::SemanticInvariant(
-                    "pending Event delivery differs from its subscription ledger",
-                ));
+            match load_event_by_semantic_from_write(write, record.semantic_id)? {
+                Some(event)
+                    if event.acceptance_marker == marker
+                        && marker <= subscription_record.discovered_through
+                        && subscription_record.spec.matches(&event) => {}
+                None if marker <= subscription_record.discovered_through
+                    && custody::event_pending_retirement_reference_exists_write(
+                        write,
+                        record.semantic_id,
+                        key.value(),
+                    )? => {}
+                Some(_) | None => {
+                    return Err(StoreError::SemanticInvariant(
+                        "pending Event delivery differs from its subscription ledger",
+                    ));
+                }
             }
             if !pending_semantics.insert((subscription, record.semantic_id)) {
                 return Err(StoreError::SemanticInvariant(
@@ -18048,18 +18085,22 @@ fn audit_event_subscription_tables(write: &redb::WriteTransaction) -> Result<(),
                     "Event acknowledgement references a Carry subscription",
                 ));
             }
-            let event = load_event_by_semantic_from_write(write, semantic_id)?.ok_or(
-                StoreError::SemanticInvariant(
-                    "Event acknowledgement references a missing accepted Event",
-                ),
-            )?;
-            if receipt.acceptance_marker != event.acceptance_marker
-                || receipt.acceptance_marker > subscription_record.discovered_through
-                || !subscription_record.spec.matches(&event)
-            {
-                return Err(StoreError::SemanticInvariant(
-                    "Event acknowledgement differs from its subscription ledger",
-                ));
+            match load_event_by_semantic_from_write(write, semantic_id)? {
+                Some(event)
+                    if receipt.acceptance_marker == event.acceptance_marker
+                        && receipt.acceptance_marker <= subscription_record.discovered_through
+                        && subscription_record.spec.matches(&event) => {}
+                None if receipt.acceptance_marker <= subscription_record.discovered_through
+                    && custody::event_acknowledgement_retirement_reference_exists_write(
+                        write,
+                        semantic_id,
+                        key.value(),
+                    )? => {}
+                Some(_) | None => {
+                    return Err(StoreError::SemanticInvariant(
+                        "Event acknowledgement differs from its subscription ledger",
+                    ));
+                }
             }
             if pending_semantics.contains(&(subscription, semantic_id)) {
                 return Err(StoreError::SemanticInvariant(
@@ -22985,16 +23026,22 @@ fn event_subscription_stats_read(
                 "pending Event delivery references a Carry subscription",
             ));
         }
-        let event = load_event_by_semantic_from_read(read, record.semantic_id)?.ok_or(
-            StoreError::SemanticInvariant("pending Event delivery references a missing Event"),
-        )?;
-        if event.acceptance_marker != marker
-            || marker > subscription_record.discovered_through
-            || !subscription_record.spec.matches(&event)
-        {
-            return Err(StoreError::SemanticInvariant(
-                "pending Event delivery differs from its subscription ledger",
-            ));
+        match load_event_by_semantic_from_read(read, record.semantic_id)? {
+            Some(event)
+                if event.acceptance_marker == marker
+                    && marker <= subscription_record.discovered_through
+                    && subscription_record.spec.matches(&event) => {}
+            None if marker <= subscription_record.discovered_through
+                && custody::event_pending_retirement_reference_exists_read(
+                    read,
+                    record.semantic_id,
+                    key.value(),
+                )? => {}
+            Some(_) | None => {
+                return Err(StoreError::SemanticInvariant(
+                    "pending Event delivery differs from its subscription ledger",
+                ));
+            }
         }
         if !pending_semantics.insert((subscription, record.semantic_id)) {
             return Err(StoreError::SemanticInvariant(
@@ -23024,18 +23071,22 @@ fn event_subscription_stats_read(
                     "Event acknowledgement references a Carry subscription",
                 ));
             }
-            let event = load_event_by_semantic_from_read(read, semantic_id)?.ok_or(
-                StoreError::SemanticInvariant(
-                    "Event acknowledgement references a missing accepted Event",
-                ),
-            )?;
-            if receipt.acceptance_marker != event.acceptance_marker
-                || receipt.acceptance_marker > subscription_record.discovered_through
-                || !subscription_record.spec.matches(&event)
-            {
-                return Err(StoreError::SemanticInvariant(
-                    "Event acknowledgement differs from its subscription ledger",
-                ));
+            match load_event_by_semantic_from_read(read, semantic_id)? {
+                Some(event)
+                    if receipt.acceptance_marker == event.acceptance_marker
+                        && receipt.acceptance_marker <= subscription_record.discovered_through
+                        && subscription_record.spec.matches(&event) => {}
+                None if receipt.acceptance_marker <= subscription_record.discovered_through
+                    && custody::event_acknowledgement_retirement_reference_exists_read(
+                        read,
+                        semantic_id,
+                        key.value(),
+                    )? => {}
+                Some(_) | None => {
+                    return Err(StoreError::SemanticInvariant(
+                        "Event acknowledgement differs from its subscription ledger",
+                    ));
+                }
             }
             if pending_semantics.contains(&(subscription, semantic_id)) {
                 return Err(StoreError::SemanticInvariant(
@@ -24160,6 +24211,13 @@ mod tests {
             EventOnceOutcome::Inserted { transfer_id, .. } => transfer_id,
             outcome => panic!("unexpected finite Event outcome: {outcome:?}"),
         }
+    }
+
+    fn seed_peer_receipt_fanout(store: &Store, object: CustodyObjectKey, count: usize) {
+        let write = store.database.begin_write().expect("receipt fan-out write");
+        custody::seed_peer_receipt_fanout_write(&write, object, count)
+            .expect("seed receipt fan-out");
+        write.commit().expect("commit receipt fan-out");
     }
 
     fn custody_continuity_tick(store: &Store) -> u64 {
@@ -38887,6 +38945,24 @@ mod tests {
         assert!(marked.retired.is_empty());
         assert_eq!(marked.examined_retirements, 1);
         assert_eq!(marked.blocked_by_leases, 1);
+        let legacy = store.database.begin_write().expect("legacy cleanup write");
+        let cleanup_key = legacy
+            .open_table(custody::CUSTODY_RETIRING)
+            .expect("cleanup queue")
+            .iter()
+            .expect("cleanup rows")
+            .next()
+            .expect("marked cleanup row")
+            .expect("read cleanup row")
+            .0
+            .value()
+            .to_vec();
+        legacy
+            .open_table(custody::CUSTODY_RETIRING)
+            .expect("cleanup queue")
+            .insert(cleanup_key.as_slice(), &[][..])
+            .expect("replace with legacy empty cleanup value");
+        legacy.commit().expect("commit legacy cleanup value");
         drop(store);
 
         let reopened =
@@ -38995,6 +39071,936 @@ mod tests {
             )
             .expect("finish first retirement");
         assert_eq!(finished.retired, vec![first]);
+    }
+
+    #[test]
+    fn legacy_empty_cleanup_normalizes_before_partial_fence_and_reopens() {
+        let file = TestFile::new("legacy cleanup partial fence");
+        let mut services = event_services(0xf9);
+        let initial = aster_mesh::CustodySample {
+            clock_id: [0x79; 16],
+            tick_ms: 1_000,
+        };
+        let store = Store::open_for_mission(&file.0, services.authority).expect("store");
+        let transfer =
+            accept_local_finite_event(&store, &mut services, 0, b"legacy partial", 100, initial);
+        let key = CustodyObjectKey::event(transfer);
+        seed_peer_receipt_fanout(&store, key, MAX_CUSTODY_PAGE);
+        let lease = store
+            .begin_custody_send(
+                services.relay.identity(),
+                key,
+                CustodyPeerSelectorRevision::new(1),
+                Some(initial),
+                1,
+                store.custody_policy_revision().expect("lease revision"),
+            )
+            .expect("lease and retry");
+        let expired = aster_mesh::CustodySample {
+            clock_id: initial.clock_id,
+            tick_ms: 1_100,
+        };
+        let marked = store
+            .collect_custody_garbage(
+                Some(expired),
+                store.custody_policy_revision().expect("mark revision"),
+                1,
+            )
+            .expect("mark with active lease");
+        assert_eq!(marked.marked, vec![key]);
+        assert_eq!(marked.blocked_by_leases, 1);
+
+        let legacy = store.database.begin_write().expect("legacy cleanup write");
+        let cleanup_key = legacy
+            .open_table(custody::CUSTODY_RETIRING)
+            .expect("cleanup queue")
+            .iter()
+            .expect("cleanup rows")
+            .next()
+            .expect("marked cleanup row")
+            .expect("read cleanup row")
+            .0
+            .value()
+            .to_vec();
+        legacy
+            .open_table(custody::CUSTODY_RETIRING)
+            .expect("cleanup queue")
+            .insert(cleanup_key.as_slice(), &[][..])
+            .expect("replace with legacy empty cleanup value");
+        legacy.commit().expect("commit legacy cleanup value");
+        store
+            .release_transfer_lease(lease.id)
+            .expect("release fencing lease");
+
+        let partial = store
+            .collect_custody_garbage(
+                Some(expired),
+                store.custody_policy_revision().expect("fence revision"),
+                1,
+            )
+            .expect("fence with bounded cleanup");
+        assert!(partial.retired.is_empty());
+        assert_eq!(partial.examined_dependencies, MAX_CUSTODY_PAGE as u64);
+        assert_eq!(partial.removed_pairs, MAX_CUSTODY_PAGE as u64);
+        drop(store);
+
+        let reopened = Store::open_for_mission(&file.0, services.authority)
+            .expect("reopen normalized partial cleanup");
+        let completed = reopened
+            .collect_custody_garbage(
+                Some(expired),
+                reopened.custody_policy_revision().expect("resume revision"),
+                1,
+            )
+            .expect("resume legacy cleanup");
+        assert_eq!(completed.retired, vec![key]);
+        assert_eq!(completed.examined_dependencies, 1);
+        assert_eq!(completed.removed_pairs, 1);
+    }
+
+    #[test]
+    fn retirement_candidate_heap_retains_and_processes_best_1024_in_order() {
+        let descending = (0..=MAX_CUSTODY_PAGE as u64).rev().collect::<Vec<_>>();
+        let (peak_entries, processed) = custody::retirement_candidate_heap_probe(&descending);
+        assert_eq!(peak_entries, MAX_CUSTODY_PAGE);
+        assert_eq!(processed.len(), MAX_CUSTODY_PAGE);
+        assert_eq!(processed, (0..MAX_CUSTODY_PAGE as u64).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn retirement_scan_examines_all_blocked_leases_plus_one_page_and_stops() {
+        let blocked = usize::try_from(MAX_CUSTODY_TRANSFER_LEASES).expect("lease bound");
+        let mut rows = vec![true; blocked];
+        rows.extend(std::iter::repeat_n(false, MAX_CUSTODY_PAGE + 1));
+        let (examined, completed, has_unexamined) =
+            custody::retirement_scan_probe(&rows, MAX_CUSTODY_PAGE);
+        assert_eq!(examined, MAX_CUSTODY_RETIREMENT_SCAN);
+        assert_eq!(completed, MAX_CUSTODY_PAGE);
+        assert!(has_unexamined);
+    }
+
+    #[test]
+    fn retirement_fences_before_bounded_dependency_cleanup_and_resumes_after_reopen() {
+        let file = TestFile::new("bounded resumable custody retirement");
+        let mut services = event_services(0xfa);
+        let initial = aster_mesh::CustodySample {
+            clock_id: [0x7a; 16],
+            tick_ms: 1_000,
+        };
+        let store = Store::open_for_mission(&file.0, services.authority).expect("store");
+        let transfer =
+            accept_local_finite_event(&store, &mut services, 0, b"bounded", 100, initial);
+        let key = CustodyObjectKey::event(transfer);
+        seed_peer_receipt_fanout(&store, key, MAX_CUSTODY_PAGE);
+        let lease = store
+            .begin_custody_send(
+                services.relay.identity(),
+                key,
+                CustodyPeerSelectorRevision::new(1),
+                Some(initial),
+                1,
+                store.custody_policy_revision().expect("lease revision"),
+            )
+            .expect("seed retry");
+        store
+            .release_transfer_lease(lease.id)
+            .expect("retain one retry");
+
+        let expired = aster_mesh::CustodySample {
+            clock_id: initial.clock_id,
+            tick_ms: 1_100,
+        };
+        let first = store
+            .collect_custody_garbage(
+                Some(expired),
+                store.custody_policy_revision().expect("mark revision"),
+                1,
+            )
+            .expect("first bounded retirement pass");
+        assert_eq!(first.marked, vec![key]);
+        assert!(first.retired.is_empty());
+        assert_eq!(first.examined_dependencies, MAX_CUSTODY_PAGE as u64);
+        assert_eq!(first.removed_pairs, MAX_CUSTODY_PAGE as u64);
+        assert!(
+            first.removed_pairs + first.examined_numbered_results <= first.examined_dependencies
+        );
+        assert!(first.rewritten_numbered_results <= first.examined_numbered_results);
+        assert_eq!(
+            store.custody_usage(None).expect("released usage"),
+            CustodyUsage::default()
+        );
+        assert_eq!(
+            store.get_event(transfer).expect("fenced public lookup"),
+            None
+        );
+
+        let read = store.database.begin_read().expect("read partial cleanup");
+        assert_eq!(
+            read.open_table(custody::CUSTODY_ITEMS)
+                .expect("custody items")
+                .len()
+                .expect("item count"),
+            0
+        );
+        assert_eq!(
+            read.open_table(custody::CUSTODY_RETIRING)
+                .expect("cleanup queue")
+                .len()
+                .expect("cleanup count"),
+            1
+        );
+        assert_eq!(
+            read.open_table(custody::CUSTODY_RETIREMENTS)
+                .expect("retirement fences")
+                .len()
+                .expect("fence count"),
+            1
+        );
+        let remaining_sources = read
+            .open_table(custody::CUSTODY_PEER_RECEIPTS)
+            .expect("remaining receipts")
+            .len()
+            .expect("remaining receipt count")
+            + read
+                .open_table(custody::CUSTODY_RETRIES)
+                .expect("remaining retries")
+                .len()
+                .expect("remaining retry count");
+        let remaining_references = read
+            .open_table(custody::CUSTODY_RETIREMENT_REFERENCES)
+            .expect("remaining references")
+            .len()
+            .expect("remaining reference count");
+        assert_eq!(remaining_sources, remaining_references);
+        assert!(
+            remaining_sources > 0,
+            "one bounded pass must leave resumable work"
+        );
+        drop(read);
+        let stale_settlement = store.record_peer_custody_receipt(
+            &lease,
+            0,
+            Some(expired),
+            CustodyPeerSelectorRevision::new(1),
+            lease.policy_revision,
+        );
+        assert!(
+            matches!(
+                stale_settlement,
+                Err(StoreError::Custody(CustodyStoreError::LeaseNotFound))
+            ),
+            "unexpected stale settlement result: {stale_settlement:?}"
+        );
+        let read = store.database.begin_read().expect("post-settlement read");
+        assert_eq!(
+            read.open_table(custody::CUSTODY_PEER_RECEIPTS)
+                .expect("remaining receipts")
+                .len()
+                .expect("remaining receipt count")
+                + read
+                    .open_table(custody::CUSTODY_RETRIES)
+                    .expect("remaining retries")
+                    .len()
+                    .expect("remaining retry count"),
+            remaining_sources
+        );
+        assert_eq!(
+            read.open_table(custody::CUSTODY_RETIREMENT_REFERENCES)
+                .expect("remaining references")
+                .len()
+                .expect("remaining reference count"),
+            remaining_references
+        );
+        drop(read);
+        drop(store);
+
+        let reopened =
+            Store::open_for_mission(&file.0, services.authority).expect("reopen partial cleanup");
+        let second = reopened
+            .collect_custody_garbage(
+                Some(expired),
+                reopened.custody_policy_revision().expect("resume revision"),
+                1,
+            )
+            .expect("resume bounded retirement");
+        assert_eq!(second.retired, vec![key]);
+        assert_eq!(second.examined_dependencies, 1);
+        assert_eq!(second.removed_pairs, 1);
+        assert!(
+            second.removed_pairs + second.examined_numbered_results <= second.examined_dependencies
+        );
+        assert!(second.rewritten_numbered_results <= second.examined_numbered_results);
+        drop(reopened);
+
+        let inspection = Store::inspect_existing(&file.0).expect("inspect completed cleanup");
+        assert_eq!(inspection.custody_stats.items, 0);
+        assert_eq!(inspection.custody_stats.retirements, 1);
+        let database = redb::Builder::new()
+            .open_read_only(&file.0)
+            .expect("read completed cleanup");
+        let read = database.begin_read().expect("read transaction");
+        assert_eq!(
+            read.open_table(custody::CUSTODY_RETIRING)
+                .expect("cleanup queue")
+                .len()
+                .expect("cleanup count"),
+            0
+        );
+        assert_eq!(
+            read.open_table(custody::CUSTODY_RETIREMENT_REFERENCES)
+                .expect("retirement references")
+                .len()
+                .expect("reference count"),
+            0
+        );
+    }
+
+    #[test]
+    fn retiring_lease_settlement_drains_without_recreating_receipt_or_retry() {
+        let file = TestFile::new("retiring lease settlement");
+        let mut services = event_services(0xfb);
+        let initial = aster_mesh::CustodySample {
+            clock_id: [0x7b; 16],
+            tick_ms: 1_000,
+        };
+        let store = Store::open_for_mission(&file.0, services.authority).expect("store");
+        let key = CustodyObjectKey::event(accept_local_finite_event(
+            &store,
+            &mut services,
+            0,
+            b"settlement",
+            100,
+            initial,
+        ));
+        let selector = CustodyPeerSelectorRevision::new(1);
+        let policy_revision = store.custody_policy_revision().expect("policy revision");
+        let lease = store
+            .begin_custody_send(
+                services.relay.identity(),
+                key,
+                selector,
+                Some(initial),
+                1,
+                policy_revision,
+            )
+            .expect("lease");
+        let expired = aster_mesh::CustodySample {
+            clock_id: initial.clock_id,
+            tick_ms: 1_100,
+        };
+        let marked = store
+            .collect_custody_garbage(Some(expired), policy_revision, 1)
+            .expect("mark while lease holds");
+        assert_eq!(marked.marked, vec![key]);
+        assert_eq!(marked.blocked_by_leases, 1);
+
+        store
+            .record_peer_custody_receipt(&lease, 0, Some(expired), selector, policy_revision)
+            .expect("settle marked lease");
+        let read = store.database.begin_read().expect("settled read");
+        assert_eq!(
+            read.open_table(custody::CUSTODY_LEASES)
+                .expect("leases")
+                .len()
+                .expect("lease count"),
+            0
+        );
+        assert_eq!(
+            read.open_table(custody::CUSTODY_RETRIES)
+                .expect("retries")
+                .len()
+                .expect("retry count"),
+            0
+        );
+        assert_eq!(
+            read.open_table(custody::CUSTODY_PEER_RECEIPTS)
+                .expect("receipts")
+                .len()
+                .expect("receipt count"),
+            0
+        );
+        drop(read);
+
+        let fenced = store
+            .collect_custody_garbage(
+                Some(expired),
+                store.custody_policy_revision().expect("settled revision"),
+                1,
+            )
+            .expect("fence after lease settlement");
+        assert_eq!(fenced.retired, vec![key]);
+        let read = store.database.begin_read().expect("fenced read");
+        assert_eq!(
+            read.open_table(custody::CUSTODY_RETIREMENT_REFERENCES)
+                .expect("retirement references")
+                .len()
+                .expect("reference count"),
+            0
+        );
+    }
+
+    #[test]
+    fn authenticated_retry_settlement_after_fence_removes_only_without_receipt() {
+        let file = TestFile::new("fenced retry settlement");
+        let mut services = event_services(0xfa);
+        let initial = aster_mesh::CustodySample {
+            clock_id: [0x7a; 16],
+            tick_ms: 1_000,
+        };
+        let store = Store::open_for_mission(&file.0, services.authority).expect("store");
+        let transfer = accept_local_finite_event(&store, &mut services, 0, b"retry", 100, initial);
+        let key = CustodyObjectKey::event(transfer);
+        let peer = services.relay.identity();
+        let selector = CustodyPeerSelectorRevision::new(1);
+        let policy_revision = store.custody_policy_revision().expect("policy revision");
+        let lease = store
+            .begin_custody_send(peer, key, selector, Some(initial), 1, policy_revision)
+            .expect("lease");
+        store
+            .release_transfer_lease(lease.id)
+            .expect("release lease while retaining retry");
+        let expired = aster_mesh::CustodySample {
+            clock_id: initial.clock_id,
+            tick_ms: 1_100,
+        };
+        let write = store.database.begin_write().expect("fence write");
+        custody::fence_retirement_without_cleanup_write(&write, key, expired.tick_ms)
+            .expect("fence while retaining retry");
+        write.commit().expect("commit fenced cleanup state");
+        let settlement_policy = store
+            .custody_policy_revision()
+            .expect("settlement policy revision");
+
+        assert_eq!(
+            store
+                .settle_authenticated_peer_inventory(
+                    peer,
+                    &[transfer],
+                    &[],
+                    selector,
+                    settlement_policy,
+                )
+                .expect("settle fenced retry"),
+            1
+        );
+        let read = store.database.begin_read().expect("settled fenced read");
+        assert_eq!(
+            read.open_table(custody::CUSTODY_RETRIES)
+                .expect("retries")
+                .len()
+                .expect("retry count"),
+            0
+        );
+        assert_eq!(
+            read.open_table(custody::CUSTODY_PEER_RECEIPTS)
+                .expect("receipts")
+                .len()
+                .expect("receipt count"),
+            0
+        );
+        assert_eq!(
+            read.open_table(custody::CUSTODY_RETIREMENT_REFERENCES)
+                .expect("references")
+                .len()
+                .expect("reference count"),
+            0
+        );
+        assert_eq!(
+            read.open_table(custody::CUSTODY_RETIRING)
+                .expect("cleanup queue")
+                .len()
+                .expect("cleanup count"),
+            1
+        );
+        drop(read);
+
+        let completed = store
+            .collect_custody_garbage(
+                Some(expired),
+                store.custody_policy_revision().expect("cleanup revision"),
+                1,
+            )
+            .expect("finish fenced cleanup");
+        assert_eq!(completed.retired, vec![key]);
+    }
+
+    #[test]
+    fn admission_failure_after_victim_fence_rolls_back_victim_and_incoming_event() {
+        let file = TestFile::new("admission retirement rollback");
+        let mut services = event_services(0xfc);
+        let sample = aster_mesh::CustodySample {
+            clock_id: [0x7c; 16],
+            tick_ms: 1_000,
+        };
+        let store = Store::open_for_mission(&file.0, services.authority).expect("store");
+        let victim = accept_local_finite_event(&store, &mut services, 0, b"victim", 10_000, sample);
+        let usage = store.custody_usage(None).expect("victim usage");
+        store
+            .set_custody_quota(
+                CustodyQuota::global(1, usage.bytes.saturating_mul(4)).expect("tight quota"),
+            )
+            .expect("install tight quota");
+        let before = store.event_stats().expect("before stats");
+
+        let policy = store.control_policy_snapshot().expect("policy");
+        let operation = EventOperationKey::new(b"admission/rollback".to_vec()).expect("operation");
+        let reservation = store
+            .reserve_event_with_policy(
+                &policy,
+                services.publisher.identity(),
+                &event_topic(),
+                &event_scope(),
+            )
+            .expect("reservation");
+        let payload = b"incoming";
+        let header = reservation
+            .header(
+                Priority::Immediate,
+                b"incoming".to_vec(),
+                Some(10_000),
+                u64::try_from(payload.len()).expect("payload length"),
+                false,
+                1,
+            )
+            .expect("header");
+        let intent = event_publication_intent(&header, payload);
+        let request = EventOperationRequest::new(&operation, &intent, payload, None)
+            .expect("operation request");
+        let sealed = services
+            .publisher
+            .seal_event(&header, payload)
+            .expect("seal incoming");
+        let event = content_event(&mut services.reader, &sealed.bytes);
+        let incoming = EventTransferId::new(event.envelope_id());
+        event_operation::RETIREMENT_TEST_FAULT.set(5);
+        let result = store.commit_reserved_event_once_with_custody_policy(
+            &policy,
+            LocalCustodyCheckpoint::new(
+                store.custody_policy_revision().expect("admission revision"),
+                sample,
+            ),
+            &request,
+            &reservation,
+            &event,
+            &sealed.bytes,
+        );
+        event_operation::RETIREMENT_TEST_FAULT.set(0);
+        assert!(matches!(
+            result,
+            Err(StoreError::SemanticInvariant(
+                "injected Event operation retirement failure"
+            ))
+        ));
+        assert!(
+            store
+                .get_event(victim)
+                .expect("victim after rollback")
+                .is_some()
+        );
+        assert_eq!(
+            store.get_event(incoming).expect("incoming after rollback"),
+            None
+        );
+        assert_eq!(store.event_stats().expect("after stats"), before);
+        assert_eq!(
+            store.custody_usage(None).expect("usage after rollback"),
+            usage
+        );
+        let read = store.database.begin_read().expect("rollback read");
+        assert_eq!(
+            read.open_table(custody::CUSTODY_RETIREMENTS)
+                .expect("retirements")
+                .len()
+                .expect("retirement count"),
+            0
+        );
+        assert_eq!(
+            read.open_table(custody::CUSTODY_RETIRING)
+                .expect("cleanup queue")
+                .len()
+                .expect("cleanup count"),
+            0
+        );
+    }
+
+    #[test]
+    fn lease_blocked_admission_rolls_back_then_succeeds_atomically_after_release() {
+        let file = TestFile::new("lease blocked admission retirement");
+        let mut services = event_services(0xf9);
+        let sample = aster_mesh::CustodySample {
+            clock_id: [0x79; 16],
+            tick_ms: 1_000,
+        };
+        let store = Store::open_for_mission(&file.0, services.authority).expect("store");
+        let victim =
+            accept_local_finite_event(&store, &mut services, 0, b"leased victim", 10_000, sample);
+        let victim_key = CustodyObjectKey::event(victim);
+        let lease = store
+            .begin_custody_send(
+                services.relay.identity(),
+                victim_key,
+                CustodyPeerSelectorRevision::new(1),
+                Some(sample),
+                1,
+                store.custody_policy_revision().expect("lease revision"),
+            )
+            .expect("lease victim");
+        let usage = store.custody_usage(None).expect("victim usage");
+        store
+            .set_custody_quota(
+                CustodyQuota::global(1, usage.bytes.saturating_mul(4)).expect("tight quota"),
+            )
+            .expect("install tight quota");
+
+        let policy = store.control_policy_snapshot().expect("policy");
+        let operation =
+            EventOperationKey::new(b"admission/after-lease".to_vec()).expect("operation");
+        let reservation = store
+            .reserve_event_with_policy(
+                &policy,
+                services.publisher.identity(),
+                &event_topic(),
+                &event_scope(),
+            )
+            .expect("reservation");
+        let payload = b"incoming after lease";
+        let header = reservation
+            .header(
+                Priority::Immediate,
+                b"incoming after lease".to_vec(),
+                Some(10_000),
+                u64::try_from(payload.len()).expect("payload length"),
+                false,
+                1,
+            )
+            .expect("header");
+        let intent = event_publication_intent(&header, payload);
+        let request = EventOperationRequest::new(&operation, &intent, payload, None)
+            .expect("operation request");
+        let sealed = services
+            .publisher
+            .seal_event(&header, payload)
+            .expect("seal incoming");
+        let event = content_event(&mut services.reader, &sealed.bytes);
+        let incoming = EventTransferId::new(event.envelope_id());
+        let checkpoint = || {
+            LocalCustodyCheckpoint::new(
+                store.custody_policy_revision().expect("admission revision"),
+                sample,
+            )
+        };
+        assert!(
+            store
+                .commit_reserved_event_once_with_custody_policy(
+                    &policy,
+                    checkpoint(),
+                    &request,
+                    &reservation,
+                    &event,
+                    &sealed.bytes,
+                )
+                .is_err(),
+            "active lease must block victim fencing and incoming admission"
+        );
+        assert!(
+            store
+                .get_event(victim)
+                .expect("victim after blocked admission")
+                .is_some()
+        );
+        assert_eq!(
+            store
+                .get_event(incoming)
+                .expect("incoming after blocked admission"),
+            None
+        );
+        assert_eq!(
+            store
+                .database
+                .begin_read()
+                .expect("blocked read")
+                .open_table(custody::CUSTODY_RETIRING)
+                .expect("cleanup queue")
+                .len()
+                .expect("cleanup count"),
+            0
+        );
+
+        store
+            .release_transfer_lease(lease.id)
+            .expect("release victim lease");
+        assert!(matches!(
+            store
+                .commit_reserved_event_once_with_custody_policy(
+                    &policy,
+                    checkpoint(),
+                    &request,
+                    &reservation,
+                    &event,
+                    &sealed.bytes,
+                )
+                .expect("admit after release"),
+            EventOnceOutcome::Inserted { transfer_id, .. } if transfer_id == incoming
+        ));
+        assert_eq!(store.get_event(victim).expect("retired victim"), None);
+        assert!(
+            store
+                .get_event(incoming)
+                .expect("admitted incoming")
+                .is_some()
+        );
+        assert_eq!(store.custody_usage(None).expect("final usage").items, 1);
+    }
+
+    #[test]
+    fn event_poll_plan_racing_retirement_fails_closed_without_dependency_recreation() {
+        let file = TestFile::new("poll plan retirement race");
+        let mut services = event_services(0xfd);
+        let initial = aster_mesh::CustodySample {
+            clock_id: [0x7d; 16],
+            tick_ms: 1_000,
+        };
+        let store = Store::open_for_mission(&file.0, services.authority).expect("store");
+        let policy = store.control_policy_snapshot().expect("policy");
+        let subscription = store
+            .create_event_subscription_with_policy(
+                &policy,
+                &EventSubscriptionKey::new(b"retirement/race".to_vec()).expect("key"),
+                subscription_spec(EventSubscriptionMode::Consume),
+            )
+            .expect("subscription")
+            .id;
+        let transfer =
+            accept_local_finite_event(&store, &mut services, 0, b"poll race", 100, initial);
+        let event = store
+            .get_event(transfer)
+            .expect("event lookup")
+            .expect("event");
+        let plan = store
+            .prepare_event_subscription_poll_with_policy(&policy, subscription, 1, 1)
+            .expect("poll plan");
+        let selection = verify_subscription_plan(&mut services.reader, &plan);
+        let expired = aster_mesh::CustodySample {
+            clock_id: initial.clock_id,
+            tick_ms: 1_100,
+        };
+        let retired = store
+            .collect_custody_garbage(
+                Some(expired),
+                store
+                    .custody_policy_revision()
+                    .expect("retirement revision"),
+                1,
+            )
+            .expect("retire before plan commit");
+        assert_eq!(retired.retired, vec![CustodyObjectKey::event(transfer)]);
+        assert!(matches!(
+            store.commit_event_subscription_poll_with_policy(&policy, &plan, &selection),
+            Err(StoreError::EventSubscriptionPlanChanged)
+        ));
+        assert!(matches!(
+            store.acknowledge_event_delivery_with_policy(&policy, subscription, event.semantic_id),
+            Err(StoreError::EventDeliveryNotFound)
+        ));
+        assert_eq!(
+            store
+                .database
+                .begin_read()
+                .expect("read")
+                .open_table(custody::CUSTODY_RETIREMENT_REFERENCES)
+                .expect("references")
+                .len()
+                .expect("reference count"),
+            0
+        );
+    }
+
+    #[test]
+    fn late_acknowledgement_during_fenced_cleanup_is_idempotent_and_does_not_recreate_rows() {
+        let file = TestFile::new("late acknowledgement fenced cleanup");
+        let mut services = event_services(0xfe);
+        let initial = aster_mesh::CustodySample {
+            clock_id: [0x7e; 16],
+            tick_ms: 1_000,
+        };
+        let store = Store::open_for_mission(&file.0, services.authority).expect("store");
+        let policy = store.control_policy_snapshot().expect("policy");
+        let subscription = store
+            .create_event_subscription_with_policy(
+                &policy,
+                &EventSubscriptionKey::new(b"retirement/late-ack".to_vec()).expect("key"),
+                subscription_spec(EventSubscriptionMode::Consume),
+            )
+            .expect("subscription")
+            .id;
+        let transfer =
+            accept_local_finite_event(&store, &mut services, 0, b"late ack", 100, initial);
+        let event = store
+            .get_event(transfer)
+            .expect("event lookup")
+            .expect("event");
+        let plan = store
+            .prepare_event_subscription_poll_with_policy(&policy, subscription, 1, 1)
+            .expect("poll plan");
+        let selection = verify_subscription_plan(&mut services.reader, &plan);
+        store
+            .commit_event_subscription_poll_with_policy(&policy, &plan, &selection)
+            .expect("commit delivery");
+        assert_eq!(
+            store
+                .acknowledge_event_delivery_with_policy(&policy, subscription, event.semantic_id)
+                .expect("initial acknowledgement"),
+            EventDeliveryAck::Acknowledged
+        );
+        let key = CustodyObjectKey::event(transfer);
+        seed_peer_receipt_fanout(&store, key, MAX_CUSTODY_PAGE);
+        let expired = aster_mesh::CustodySample {
+            clock_id: initial.clock_id,
+            tick_ms: 1_100,
+        };
+        let first = store
+            .collect_custody_garbage(
+                Some(expired),
+                store
+                    .custody_policy_revision()
+                    .expect("retirement revision"),
+                1,
+            )
+            .expect("fence with acknowledgement remaining");
+        assert!(first.retired.is_empty());
+        assert_eq!(first.examined_dependencies, MAX_CUSTODY_PAGE as u64);
+        drop(store);
+        let store = Store::open_for_mission(&file.0, services.authority)
+            .expect("reopen fenced acknowledgement cleanup");
+        let policy = store.control_policy_snapshot().expect("reopened policy");
+        assert_eq!(
+            store
+                .acknowledge_event_delivery_with_policy(&policy, subscription, event.semantic_id)
+                .expect("late acknowledgement"),
+            EventDeliveryAck::AlreadyAcknowledged
+        );
+        let read = store.database.begin_read().expect("partial cleanup read");
+        assert_eq!(
+            read.open_table(EVENT_DELIVERY_ACKNOWLEDGEMENTS)
+                .expect("acknowledgements")
+                .len()
+                .expect("acknowledgement count"),
+            1
+        );
+        assert_eq!(
+            read.open_table(custody::CUSTODY_RETIREMENT_REFERENCES)
+                .expect("references")
+                .len()
+                .expect("reference count"),
+            1
+        );
+        drop(read);
+        let second = store
+            .collect_custody_garbage(
+                Some(expired),
+                store.custody_policy_revision().expect("cleanup revision"),
+                1,
+            )
+            .expect("finish acknowledgement cleanup");
+        assert_eq!(second.retired, vec![key]);
+    }
+
+    #[test]
+    fn polling_skips_stale_pending_delivery_during_fenced_cleanup_within_scan_bound() {
+        let file = TestFile::new("stale pending fenced cleanup");
+        let mut services = event_services(0xff);
+        let initial = aster_mesh::CustodySample {
+            clock_id: [0x7f; 16],
+            tick_ms: 1_000,
+        };
+        let store = Store::open_for_mission(&file.0, services.authority).expect("store");
+        let policy = store.control_policy_snapshot().expect("policy");
+        let subscription = store
+            .create_event_subscription_with_policy(
+                &policy,
+                &EventSubscriptionKey::new(b"retirement/stale-pending".to_vec()).expect("key"),
+                subscription_spec(EventSubscriptionMode::Consume),
+            )
+            .expect("subscription")
+            .id;
+        let transfer =
+            accept_local_finite_event(&store, &mut services, 0, b"stale pending", 100, initial);
+        let event = store
+            .get_event(transfer)
+            .expect("event lookup")
+            .expect("event");
+        let plan = store
+            .prepare_event_subscription_poll_with_policy(&policy, subscription, 1, 1)
+            .expect("poll plan");
+        let selection = verify_subscription_plan(&mut services.reader, &plan);
+        store
+            .commit_event_subscription_poll_with_policy(&policy, &plan, &selection)
+            .expect("commit pending delivery");
+        let key = CustodyObjectKey::event(transfer);
+        seed_peer_receipt_fanout(&store, key, MAX_CUSTODY_PAGE);
+        let expired = aster_mesh::CustodySample {
+            clock_id: initial.clock_id,
+            tick_ms: 1_100,
+        };
+        let first = store
+            .collect_custody_garbage(
+                Some(expired),
+                store
+                    .custody_policy_revision()
+                    .expect("retirement revision"),
+                1,
+            )
+            .expect("fence with pending row remaining");
+        assert!(first.retired.is_empty());
+        assert_eq!(first.examined_dependencies, MAX_CUSTODY_PAGE as u64);
+        drop(store);
+        let store = Store::open_for_mission(&file.0, services.authority)
+            .expect("reopen fenced pending cleanup");
+        let policy = store.control_policy_snapshot().expect("reopened policy");
+        let _later = accept_local_finite_event(
+            &store,
+            &mut services,
+            1,
+            b"later live event",
+            10_000,
+            expired,
+        );
+
+        let stale = store
+            .prepare_event_subscription_poll_with_policy(&policy, subscription, 1, 1)
+            .expect("skip stale pending within one scanned row");
+        assert!(stale.pending_candidates().is_empty());
+        assert!(stale.scanned_candidates().is_empty());
+        assert_eq!(stale.scanned_through(), event.acceptance_marker);
+        assert!(stale.has_more());
+        assert!(matches!(
+            store.acknowledge_event_delivery_with_policy(&policy, subscription, event.semantic_id),
+            Err(StoreError::EventDeliveryNotFound)
+        ));
+        let read = store.database.begin_read().expect("partial cleanup read");
+        assert_eq!(
+            read.open_table(EVENT_SUBSCRIPTION_PENDING)
+                .expect("pending deliveries")
+                .len()
+                .expect("pending count"),
+            1
+        );
+        assert_eq!(
+            read.open_table(custody::CUSTODY_RETIREMENT_REFERENCES)
+                .expect("references")
+                .len()
+                .expect("reference count"),
+            1
+        );
+        drop(read);
+        let second = store
+            .collect_custody_garbage(
+                Some(expired),
+                store.custody_policy_revision().expect("cleanup revision"),
+                1,
+            )
+            .expect("finish pending cleanup");
+        assert_eq!(second.retired, vec![key]);
     }
 
     #[test]
