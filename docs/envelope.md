@@ -1336,9 +1336,10 @@ ciphertext         b32(plaintext || GCM tag)     variable
 
 Application plaintext is at most 16 MiB; ciphertext is therefore 16 through
 `16 MiB + 16` bytes. The whole encoded frame is bounded by the reference decoder
-at `16 MiB + 128` bytes. The sender sequence starts at zero in each direction,
-increments by one for each encryption attempt, never repeats, and fails closed
-after using `u64::MAX`.
+at `16 MiB + 128` bytes. The sender has exactly one record sequence in each
+direction, shared by the ordinary and semantic-v7 contextual AAD domains. It
+starts at zero, increments by one for each encryption attempt in either domain,
+never repeats, and fails closed after using `u64::MAX`.
 
 For semantic versions 1 through 7, the application AAD for normal transport
 frames is the exact ASCII string `"aster/transport-frame/v1"`. Record AEAD
@@ -1373,21 +1374,27 @@ Event/State/Record/Blob/EventBridge frame keep the ordinary exact ASCII
 application AAD `"aster/transport-frame/v1"`; v1-v6 bytes remain unchanged.
 
 AES-256-GCM uses the directional traffic key from §8 and the transmitted nonce.
-The reference nonce generator chooses a fresh random 4-byte provider prefix and
-a fresh random starting `u64`, emits `prefix || counter`, and fails before a
-provider-lifetime wrap could repeat the starting value. Other implementations
-MAY use another construction but MUST guarantee key/nonce uniqueness.
+The nonce is not derived from the record sequence. Both AAD domains share the
+same directional nonce generator. The reference generator chooses a fresh
+random 4-byte provider prefix and a fresh random starting `u64`, emits
+`prefix || counter`, and fails before a provider-lifetime wrap could repeat the
+starting value. Other implementations MAY use another construction but MUST
+guarantee key/nonce uniqueness across both domains under the directional key.
 
-The receiver authenticates the record before mutating replay state. It maintains
-a 128-sequence sliding window independently in each receive direction. A valid
-sequence greater than the recorded maximum advances the window; an unseen
-sequence within 127 below the maximum is accepted; a duplicate or a sequence
-128 or more below the maximum is rejected. A forged high sequence cannot advance
-the window.
+The receiver has exactly two fixed 128-record sliding replay windows in each
+receive direction: one for ordinary records and one for semantic-v7 contextual
+records. It MUST authenticate a record under the selected exact AAD domain
+before mutating either window, then apply the authenticated record sequence only
+to that domain's window. In either window, a sequence greater than the recorded
+maximum advances the window; an unseen sequence within 127 below the maximum is
+accepted; a duplicate or a sequence 128 or more below the maximum is rejected.
+A forged high sequence cannot advance either window. Ordinary ciphertext opened
+as contextual, or contextual ciphertext opened as ordinary, MUST fail
+authentication and MUST mutate neither replay window.
 
 `ServerFinished` is not a record and consumes no transport sequence; its direct
-AEAD is specified in §8.6. The first normal protected frame in each direction
-therefore uses sequence zero.
+AEAD is specified in §8.6. The first protected transport record in each
+direction, ordinary or contextual, therefore uses sequence zero.
 
 ### 9.1 Semantic-v4 selected State/Record mechanics plaintext
 

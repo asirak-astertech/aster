@@ -2042,9 +2042,11 @@ impl SecureChannel {
 
     /// Authenticates and opens a record in the context-bound replay domain.
     ///
-    /// Both domains retain the single sender sequence, so a traffic key never
-    /// reuses an AEAD nonce. Separate receiver windows prevent an authenticated
-    /// outer record from aging nested evidence out of the ordinary domain.
+    /// Both domains share one sender record sequence. The provider allocates
+    /// AES-GCM nonces independently through the same nonce generator used by
+    /// `seal`; neither replay domain derives a nonce from the record sequence.
+    /// Separate receiver windows prevent an authenticated outer record from
+    /// aging nested evidence out of the ordinary domain.
     pub(crate) fn open_contextual<P: CryptoProvider>(
         &mut self,
         provider: &P,

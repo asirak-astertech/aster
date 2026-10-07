@@ -3290,6 +3290,83 @@ mod tests {
         );
     }
 
+    #[test]
+    fn semantic_v7_record_domains_reject_cross_domain_auth_without_poisoning_replay() {
+        const RECORD_SEQUENCE_OFFSET: usize = 8 + 2 + 2;
+
+        let mut provisioner = ReferenceProvisioner::from_seed([0x42; 32]).expect("provisioner");
+        let initiator = issue(&mut provisioner, 1);
+        let responder = issue(&mut provisioner, 2);
+        let (mut sender, mut receiver) =
+            establish(&initiator, &responder).expect("establish session");
+        let offer = crate::event_pages::TransferProfileOfferV1::current();
+        let negotiated = crate::event_pages::negotiate_transfer_profiles(&offer, &offer)
+            .expect("negotiate profiles");
+        let digest = crate::event_pages::transfer_profile_digest(&offer, &offer, &negotiated);
+        let lane = crate::event_pages::LaneId::Event;
+        let profile = crate::event_pages::TransferProfileId::EventPagesV1;
+        let direction = EventDirection::ToSessionResponder;
+
+        let contextual = sender
+            .seal_v7_application_frame(digest, lane, profile, direction, b"contextual")
+            .expect("seal contextual record");
+        assert!(
+            receiver.open_application_frame(&contextual).is_err(),
+            "contextual ciphertext must not authenticate in the ordinary domain"
+        );
+        let mut forged_high_contextual = contextual.clone();
+        forged_high_contextual[RECORD_SEQUENCE_OFFSET..RECORD_SEQUENCE_OFFSET + 8]
+            .copy_from_slice(&u64::MAX.to_be_bytes());
+        assert!(
+            receiver
+                .open_application_frame(&forged_high_contextual)
+                .is_err(),
+            "failed ordinary-domain authentication must not advance ordinary replay state"
+        );
+
+        let ordinary = sender
+            .seal_application_frame(b"ordinary")
+            .expect("seal ordinary record");
+        assert!(
+            receiver
+                .open_v7_application_frame(digest, lane, profile, direction, &ordinary)
+                .is_err(),
+            "ordinary ciphertext must not authenticate in the contextual domain"
+        );
+        let mut forged_high_ordinary = ordinary.clone();
+        forged_high_ordinary[RECORD_SEQUENCE_OFFSET..RECORD_SEQUENCE_OFFSET + 8]
+            .copy_from_slice(&u64::MAX.to_be_bytes());
+        assert!(
+            receiver
+                .open_v7_application_frame(digest, lane, profile, direction, &forged_high_ordinary,)
+                .is_err(),
+            "failed contextual authentication must not advance contextual replay state"
+        );
+
+        assert_eq!(
+            receiver
+                .open_v7_application_frame(digest, lane, profile, direction, &contextual)
+                .expect("cross-domain failures must not poison contextual replay state"),
+            b"contextual"
+        );
+        assert_eq!(
+            receiver
+                .open_application_frame(&ordinary)
+                .expect("cross-domain failures must not poison ordinary replay state"),
+            b"ordinary"
+        );
+        assert!(
+            receiver
+                .open_v7_application_frame(digest, lane, profile, direction, &contextual)
+                .is_err(),
+            "contextual replay must still be rejected"
+        );
+        assert!(
+            receiver.open_application_frame(&ordinary).is_err(),
+            "ordinary replay must still be rejected"
+        );
+    }
+
     fn finite_page_fixture(
         sender: &mut MissionSession,
         finite_entries: usize,

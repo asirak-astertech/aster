@@ -991,12 +991,14 @@ The protected mechanics tags are `0xd1` profile offer, `0xd2` Event turn plan,
 They are invalid in semantic-v1 through semantic-v6 sessions. The v7 Event
 plan/header/page/terminal records use the contextual AAD in
 [envelope.md](envelope.md) section 9. Profile offers and every `LegacyV6` lane
-record retain the ordinary transport-frame AAD. The reference keeps one
-directional send sequence across both AAD domains, preserving AEAD nonce
-uniqueness, and maintains a separate authenticated receive replay window for
-contextual v7 records. Authenticating an outer page therefore cannot age its
-embedded ordinary-domain custody records out of the receive window. Reuse in
-either domain and cross-domain reinterpretation still fail closed.
+record retain the ordinary transport-frame AAD. The reference shares one
+directional record sequence and one independently advancing AES-GCM nonce
+generator across both AAD domains; the nonce is not derived from the record
+sequence. It maintains fixed 128-record ordinary and contextual receive replay
+windows. Authenticating an outer page therefore cannot age its embedded
+ordinary-domain custody records out of the receive window. Authentication
+precedes replay-state mutation, and reuse within either domain or cross-domain
+reinterpretation fails closed without mutating either window.
 
 All following integers are unsigned big-endian. These are the complete canonical
 semantic-v7 plaintext layouts; decoders reject truncation, trailing bytes,
