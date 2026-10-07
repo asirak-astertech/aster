@@ -1429,6 +1429,7 @@ impl SessionKeys {
             receive: self.receive,
             send_sequence: SendSequence::default(),
             replay_window: ReplayWindow::default(),
+            contextual_replay_window: ReplayWindow::default(),
         }
     }
 }
@@ -1995,6 +1996,7 @@ pub(crate) struct SecureChannel {
     receive: Secret32,
     send_sequence: SendSequence,
     replay_window: ReplayWindow,
+    contextual_replay_window: ReplayWindow,
 }
 
 impl fmt::Debug for SecureChannel {
@@ -2002,6 +2004,7 @@ impl fmt::Debug for SecureChannel {
         f.debug_struct("SecureChannel")
             .field("send_sequence", &self.send_sequence)
             .field("replay_window", &self.replay_window)
+            .field("contextual_replay_window", &self.contextual_replay_window)
             .field("key_material", &"[REDACTED]")
             .finish()
     }
@@ -2028,11 +2031,47 @@ impl SecureChannel {
         record: &SequencedCiphertext,
         application_aad: &[u8],
     ) -> Result<Vec<u8>, CryptoError> {
+        Self::open_with_replay_window(
+            &self.receive,
+            &mut self.replay_window,
+            provider,
+            record,
+            application_aad,
+        )
+    }
+
+    /// Authenticates and opens a record in the context-bound replay domain.
+    ///
+    /// Both domains retain the single sender sequence, so a traffic key never
+    /// reuses an AEAD nonce. Separate receiver windows prevent an authenticated
+    /// outer record from aging nested evidence out of the ordinary domain.
+    pub(crate) fn open_contextual<P: CryptoProvider>(
+        &mut self,
+        provider: &P,
+        record: &SequencedCiphertext,
+        application_aad: &[u8],
+    ) -> Result<Vec<u8>, CryptoError> {
+        Self::open_with_replay_window(
+            &self.receive,
+            &mut self.contextual_replay_window,
+            provider,
+            record,
+            application_aad,
+        )
+    }
+
+    fn open_with_replay_window<P: CryptoProvider>(
+        receive: &Secret32,
+        replay_window: &mut ReplayWindow,
+        provider: &P,
+        record: &SequencedCiphertext,
+        application_aad: &[u8],
+    ) -> Result<Vec<u8>, CryptoError> {
         let aad = record_aad(record.sequence, application_aad)?;
         // Authenticate before mutating replay state. A forged high sequence therefore cannot
         // advance the window and suppress legitimate records.
-        let mut plaintext = provider.open(&self.receive, &record.sealed, &aad)?;
-        if let Err(error) = self.replay_window.accept(record.sequence) {
+        let mut plaintext = provider.open(receive, &record.sealed, &aad)?;
+        if let Err(error) = replay_window.accept(record.sequence) {
             plaintext.zeroize();
             return Err(error);
         }

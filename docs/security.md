@@ -285,7 +285,11 @@ are recorded separately in the
   has one registered complete suite.
 - Semantic-v7 profile, plan, header, page, and terminal records bind semantic
   version, the canonical transfer-profile digest, lane, selected profile, and
-  direction in record AAD. Substitution or cross-direction replay therefore
+  direction in record AAD. They retain the session's single directional send
+  sequence but use a receive replay window separate from ordinary frames and
+  embedded custody records. This preserves nonce uniqueness while preventing
+  outer-page authentication from aging nested evidence out; duplicates remain
+  rejected within each domain, and substitution or cross-direction replay
   fails before mechanics parsing. Receipt-free Event pages create no per-Event
   peer receipt or custody-settlement state; a successful local write remains
   only a send attempt, and later authenticated reconciliation determines the

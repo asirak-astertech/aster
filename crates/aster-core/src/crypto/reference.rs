@@ -4912,7 +4912,7 @@ impl ReferenceAuthenticatedSession {
         let record = decode_transport_frame(frame)?;
         let aad = transport_frame_context_aad(context)?;
         self.channel
-            .open(&self.provider, &record, &aad)
+            .open_contextual(&self.provider, &record, &aad)
             .map_err(handshake_error)
     }
 
