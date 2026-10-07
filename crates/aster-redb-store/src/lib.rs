@@ -29203,6 +29203,130 @@ mod tests {
     }
 
     #[test]
+    fn observed_event_singleton_persists_clock_transition_before_fresh_revision_retry() {
+        let file = TestFile::new("event-singleton-policy-transition-reopen");
+        let mut services = event_services(0x7a);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("finite store");
+        let policy = store.control_policy_snapshot().expect("finite policy");
+        let initial_sample = aster_mesh::CustodySample {
+            clock_id: [0x7a; 16],
+            tick_ms: 100,
+        };
+        let retained = accept_local_finite_event(
+            &store,
+            &mut services,
+            0x01,
+            b"retained before clock transition",
+            1_000,
+            initial_sample,
+        );
+
+        let operation =
+            EventOperationKey::new(b"singleton/transition/retry".to_vec()).expect("operation key");
+        let reservation = store
+            .reserve_event_with_policy(
+                &policy,
+                services.publisher.identity(),
+                &event_topic(),
+                &event_scope(),
+            )
+            .expect("transition reservation");
+        let payload = b"publish after clock transition";
+        let header = reservation
+            .header(
+                Priority::Routine,
+                b"singleton/transition".to_vec(),
+                Some(1_000),
+                payload.len() as u64,
+                false,
+                1,
+            )
+            .expect("transition header");
+        let intent = event_publication_intent(&header, payload);
+        let request = EventOperationRequest::new(&operation, &intent, payload, None)
+            .expect("transition request");
+        let sealed = services
+            .publisher
+            .seal_event(&header, payload)
+            .expect("seal transition Event");
+        let event = content_event(&mut services.reader, &sealed.bytes);
+        let transfer_id = EventTransferId::new(event.envelope_id());
+        let stale_revision = store
+            .custody_policy_revision()
+            .expect("pre-transition revision");
+        let changed_sample = aster_mesh::CustodySample {
+            clock_id: [0x7b; 16],
+            tick_ms: 1,
+        };
+
+        let transition = store.commit_reserved_event_once_with_custody_policy_observed(
+            &policy,
+            LocalCustodyCheckpoint::new(stale_revision, changed_sample),
+            &request,
+            &reservation,
+            &event,
+            &sealed.bytes,
+        );
+        let transition_writer_commits = transition.writer_commits();
+        assert!(matches!(
+            transition.into_result(),
+            Err(StoreError::Custody(CustodyStoreError::PolicyChanged))
+        ));
+        assert_eq!(store.event_count().expect("pre-reopen Event count"), 1);
+        drop(store);
+
+        let reopened = Store::open_for_mission(&file.0, services.authority).expect("reopen store");
+        let fresh_revision = reopened
+            .custody_policy_revision()
+            .expect("persisted transition revision");
+        assert_eq!(
+            fresh_revision.value(),
+            stale_revision
+                .value()
+                .checked_add(1)
+                .expect("bounded policy revision")
+        );
+        assert_eq!(transition_writer_commits, 1);
+        assert_eq!(
+            reopened
+                .custody_age_status(CustodyObjectKey::event(retained), Some(initial_sample))
+                .expect("persisted continuity status"),
+            Some(CustodyAgeStatus::WithheldUnknownAge),
+            "the old clock must remain invalid before the retry mutates the reopened store"
+        );
+        assert_eq!(
+            reopened
+                .get_event(transfer_id)
+                .expect("transition Event lookup"),
+            None
+        );
+        assert_eq!(
+            reopened
+                .event_operation_resolution(&operation)
+                .expect("transition operation lookup"),
+            None
+        );
+
+        let retry = reopened.commit_reserved_event_once_with_custody_policy_observed(
+            &policy,
+            LocalCustodyCheckpoint::new(fresh_revision, changed_sample),
+            &request,
+            &reservation,
+            &event,
+            &sealed.bytes,
+        );
+        assert_eq!(retry.writer_commits(), 1);
+        assert!(matches!(
+            retry.into_result(),
+            Ok(EventOnceOutcome::Inserted {
+                transfer_id: committed,
+                ..
+            }) if committed == transfer_id
+        ));
+        assert_eq!(reopened.event_count().expect("final Event count"), 2);
+    }
+
+    #[test]
     fn event_group_commit_custody_collection_reports_every_writer_commit() {
         let file = TestFile::new("event-group-custody-accounting");
         let mut services = event_services(0x76);
