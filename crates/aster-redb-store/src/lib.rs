@@ -24225,7 +24225,7 @@ mod tests {
             .expect("commit finite Event")
         {
             EventOnceOutcome::Inserted { transfer_id, .. } => transfer_id,
-            outcome => panic!("unexpected finite Event outcome: {outcome:?}"),
+            _ => panic!("expected a newly inserted finite Event"),
         }
     }
 
@@ -30674,7 +30674,7 @@ mod tests {
                     incoming,
                     limit: CUSTODY_EMERGENCY_BYTE_RESERVE,
                 })) if current + incoming > CUSTODY_EMERGENCY_BYTE_RESERVE => break,
-                outcome => panic!("unexpected tombstone partition outcome: {outcome:?}"),
+                _ => panic!("expected tombstone insertion or emergency byte-quota exhaustion"),
             }
         }
         assert!(admitted_tombstones > 0);
@@ -38182,7 +38182,7 @@ mod tests {
             .expect("finite commit")
         {
             EventOnceOutcome::Inserted { transfer_id, .. } => transfer_id,
-            outcome => panic!("unexpected finite commit: {outcome:?}"),
+            _ => panic!("expected finite Event insertion before retirement"),
         };
         let key = CustodyObjectKey::event(transfer_id);
         let lease = store
@@ -40538,7 +40538,7 @@ mod tests {
             .expect("commit")
         {
             EventOnceOutcome::Inserted { transfer_id, .. } => transfer_id,
-            outcome => panic!("unexpected outcome: {outcome:?}"),
+            _ => panic!("expected Event insertion before seeding a custody retry"),
         };
         let key = CustodyObjectKey::event(transfer_id);
         let lease = store
@@ -40685,7 +40685,7 @@ mod tests {
                 .expect("commit")
             {
                 EventOnceOutcome::Inserted { transfer_id, .. } => transfer_id,
-                outcome => panic!("unexpected outcome: {outcome:?}"),
+                _ => panic!("expected Event insertion before seeding a custody retry"),
             };
             let _abandoned = store
                 .begin_custody_send(

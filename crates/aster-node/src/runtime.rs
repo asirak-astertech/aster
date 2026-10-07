@@ -28398,7 +28398,9 @@ mod tests {
                     bytes
                 }
                 Frame::ControlInventoryReply(bytes) if !semantic_v3 => bytes,
-                response => panic!("control inventory response frame differs: {response:?}"),
+                _ => panic!(
+                    "expected control inventory response for the negotiated semantic version"
+                ),
             };
             match control_initiator
                 .reconcile_response(&response)
@@ -28500,7 +28502,7 @@ mod tests {
                 assert!(interest.is_empty());
             }
             Frame::EventInterestReply(interest) if !semantic_v3 => assert!(interest.is_empty()),
-            response => panic!("protected interest response frame differs: {response:?}"),
+            _ => panic!("expected protected interest response for the negotiated semantic version"),
         }
 
         let direction = EventDirection::ToSessionResponder;
