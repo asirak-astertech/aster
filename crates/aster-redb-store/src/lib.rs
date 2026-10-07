@@ -2807,6 +2807,29 @@ pub enum EventOnceOutcome {
     },
 }
 
+/// One ordinary Event publication attempt paired with its exact durable writer count.
+///
+/// The result may be an error after a policy-significant custody transition or
+/// permanent retirement fence was deliberately committed. Callers can retry
+/// or report the failure without losing that durable side effect from their
+/// writer diagnostics.
+pub struct EventOnceCommitAttempt {
+    result: Result<EventOnceOutcome, StoreError>,
+    writer_commits: u64,
+}
+
+impl EventOnceCommitAttempt {
+    /// Returns the exact number of redb writer transactions committed.
+    pub const fn writer_commits(&self) -> u64 {
+        self.writer_commits
+    }
+
+    /// Consumes the attempt and returns its publication outcome or exact error.
+    pub fn into_result(self) -> Result<EventOnceOutcome, StoreError> {
+        self.result
+    }
+}
+
 /// One already-reserved, source-verified ordinary Event operation prepared for
 /// an ordered durable group commit.
 pub struct ReservedEventOnceCommit<'a> {
@@ -9422,20 +9445,48 @@ impl Store {
         event: &ContentVerifiedEventEnvelope,
         sealed: &[u8],
     ) -> Result<EventOnceOutcome, StoreError> {
-        self.require_live()?;
-        if policy != &reservation.control_policy {
-            return Err(StoreError::ControlPolicyChanged);
+        self.commit_reserved_event_once_with_policy_observed(
+            policy,
+            request,
+            reservation,
+            event,
+            sealed,
+        )
+        .into_result()
+    }
+
+    /// Commits one idempotent local Event operation and reports every writer
+    /// transaction, including one that commits before returning an error.
+    pub fn commit_reserved_event_once_with_policy_observed(
+        &self,
+        policy: &ControlPolicySnapshot,
+        request: &EventOperationRequest<'_>,
+        reservation: &EventReservation,
+        event: &ContentVerifiedEventEnvelope,
+        sealed: &[u8],
+    ) -> EventOnceCommitAttempt {
+        let mut writer_commits = 0u64;
+        let result = (|| {
+            self.require_live()?;
+            if policy != &reservation.control_policy {
+                return Err(StoreError::ControlPolicyChanged);
+            }
+            let prepared = PreparedEvent::from_verified(event, sealed, EventOrigin::Local)?;
+            let operation = prepare_event_operation(request, event, &prepared.header)?;
+            let committed = self.commit_prepared_event_counted(
+                &prepared,
+                Some(reservation),
+                Some(PendingEventOperation::Legacy(operation)),
+                EventAdmissionGuard::Control(policy),
+                None,
+                &mut writer_commits,
+            )?;
+            event_once_outcome(committed)
+        })();
+        EventOnceCommitAttempt {
+            result,
+            writer_commits,
         }
-        let prepared = PreparedEvent::from_verified(event, sealed, EventOrigin::Local)?;
-        let operation = prepare_event_operation(request, event, &prepared.header)?;
-        let committed = self.commit_prepared_event(
-            &prepared,
-            Some(reservation),
-            Some(PendingEventOperation::Legacy(operation)),
-            EventAdmissionGuard::Control(policy),
-            None,
-        )?;
-        event_once_outcome(committed)
     }
 
     /// Atomically commits one local finite Event operation and establishes its
@@ -9450,25 +9501,56 @@ impl Store {
         event: &ContentVerifiedEventEnvelope,
         sealed: &[u8],
     ) -> Result<EventOnceOutcome, StoreError> {
-        self.require_live()?;
-        if policy != &reservation.control_policy {
-            return Err(StoreError::ControlPolicyChanged);
+        self.commit_reserved_event_once_with_custody_policy_observed(
+            policy,
+            custody,
+            request,
+            reservation,
+            event,
+            sealed,
+        )
+        .into_result()
+    }
+
+    /// Commits one finite local Event operation and reports every writer
+    /// transaction, including a continuity transition or retirement fence
+    /// committed before the returned error.
+    pub fn commit_reserved_event_once_with_custody_policy_observed(
+        &self,
+        policy: &ControlPolicySnapshot,
+        custody: LocalCustodyCheckpoint,
+        request: &EventOperationRequest<'_>,
+        reservation: &EventReservation,
+        event: &ContentVerifiedEventEnvelope,
+        sealed: &[u8],
+    ) -> EventOnceCommitAttempt {
+        let mut writer_commits = 0u64;
+        let result = (|| {
+            self.require_live()?;
+            if policy != &reservation.control_policy {
+                return Err(StoreError::ControlPolicyChanged);
+            }
+            let prepared =
+                PreparedEvent::from_verified_with_custody(event, sealed, EventOrigin::Local)?;
+            let operation = prepare_event_operation(request, event, &prepared.header)?;
+            let committed = self.commit_prepared_event_counted(
+                &prepared,
+                Some(reservation),
+                Some(PendingEventOperation::Legacy(operation)),
+                EventAdmissionGuard::Control(policy),
+                Some(PendingEventCustody {
+                    expected_policy: custody.policy_revision,
+                    authenticated_age_ms: 0,
+                    sample: Some(custody.sample),
+                }),
+                &mut writer_commits,
+            )?;
+            event_once_outcome(committed)
+        })();
+        EventOnceCommitAttempt {
+            result,
+            writer_commits,
         }
-        let prepared =
-            PreparedEvent::from_verified_with_custody(event, sealed, EventOrigin::Local)?;
-        let operation = prepare_event_operation(request, event, &prepared.header)?;
-        let committed = self.commit_prepared_event(
-            &prepared,
-            Some(reservation),
-            Some(PendingEventOperation::Legacy(operation)),
-            EventAdmissionGuard::Control(policy),
-            Some(PendingEventCustody {
-                expected_policy: custody.policy_revision,
-                authenticated_age_ms: 0,
-                sample: Some(custody.sample),
-            }),
-        )?;
-        event_once_outcome(committed)
     }
 
     /// Atomically commits an ordered cohort of durable ordinary Event operations.
@@ -10286,6 +10368,26 @@ impl Store {
         guard: EventAdmissionGuard<'_>,
         pending_custody: Option<PendingEventCustody>,
     ) -> Result<EventCommitResult, StoreError> {
+        let mut writer_commits = 0u64;
+        self.commit_prepared_event_counted(
+            prepared,
+            reservation,
+            operation,
+            guard,
+            pending_custody,
+            &mut writer_commits,
+        )
+    }
+
+    fn commit_prepared_event_counted(
+        &self,
+        prepared: &PreparedEvent,
+        reservation: Option<&EventReservation>,
+        operation: Option<PendingEventOperation<'_>>,
+        guard: EventAdmissionGuard<'_>,
+        pending_custody: Option<PendingEventCustody>,
+        writer_commits: &mut u64,
+    ) -> Result<EventCommitResult, StoreError> {
         self.require_mission_authority(prepared.mission_authority)?;
         let write = self.database.begin_write()?;
         enforce_live_write(&write)?;
@@ -10300,10 +10402,12 @@ impl Store {
             PreparedEventStage::NoCommit(outcome) => Ok(outcome),
             PreparedEventStage::Commit(outcome) => {
                 write.commit()?;
+                *writer_commits = 1;
                 Ok(outcome)
             }
             PreparedEventStage::CommitError(error) => {
                 write.commit()?;
+                *writer_commits = 1;
                 Err(error)
             }
         }
@@ -28915,6 +29019,186 @@ mod tests {
                 age_ms: 50,
                 remaining_ms: 200,
             })
+        );
+    }
+
+    #[test]
+    fn event_group_fallback_commits_retired_route_fence_and_counts_singletons() {
+        let file = TestFile::new("event-group-retired-route-fallback");
+        let mut services = event_services(0x79);
+        let publisher = services.publisher.identity();
+        let store = Store::open_for_mission(&file.0, services.authority).expect("finite store");
+        let policy = store.control_policy_snapshot().expect("finite policy");
+        let reservations = store
+            .reserve_event_group_with_policy(
+                &policy,
+                publisher,
+                &event_topic(),
+                &event_scope(),
+                &[None, None],
+            )
+            .expect("finite reservations");
+
+        let valid_payload = b"valid sibling";
+        let valid_header = reservations[0]
+            .header(
+                Priority::Routine,
+                b"group/retired-route/valid".to_vec(),
+                Some(100),
+                valid_payload.len() as u64,
+                false,
+                1,
+            )
+            .expect("valid header");
+        let valid_intent = event_publication_intent(&valid_header, valid_payload);
+        let valid_key =
+            EventOperationKey::new(b"group/retired-route/valid/once".to_vec()).expect("valid key");
+        let valid_request =
+            EventOperationRequest::new(&valid_key, &valid_intent, valid_payload, None)
+                .expect("valid request");
+        let valid_sealed = services
+            .publisher
+            .seal_event(&valid_header, valid_payload)
+            .expect("seal valid Event");
+        let valid_event = content_event(&mut services.reader, &valid_sealed.bytes);
+
+        let retired_payload = b"retired route sibling";
+        let retired_header = reservations[1]
+            .header(
+                Priority::Routine,
+                b"group/retired-route/expired".to_vec(),
+                Some(10),
+                retired_payload.len() as u64,
+                false,
+                1,
+            )
+            .expect("retired header");
+        let retired_intent = event_publication_intent(&retired_header, retired_payload);
+        let retired_key = EventOperationKey::new(b"group/retired-route/expired/once".to_vec())
+            .expect("retired key");
+        let retired_request =
+            EventOperationRequest::new(&retired_key, &retired_intent, retired_payload, None)
+                .expect("retired request");
+        let retired_sealed = services
+            .publisher
+            .seal_event(&retired_header, retired_payload)
+            .expect("seal retired Event");
+        let retired_route = services
+            .relay
+            .verify_event(&retired_sealed.bytes)
+            .expect("verify retired route");
+        let retired_event = content_event(&mut services.reader, &retired_sealed.bytes);
+        let retired_transfer = EventTransferId::new(retired_event.envelope_id());
+
+        let initial_sample = aster_mesh::CustodySample {
+            clock_id: [0x79; 16],
+            tick_ms: 100,
+        };
+        store
+            .cache_route_verified_event_internal(
+                EventAdmissionGuard::Control(&policy),
+                &retired_route,
+                &retired_sealed.bytes,
+                Some(PendingEventCustody {
+                    expected_policy: store
+                        .custody_policy_revision()
+                        .expect("initial custody revision"),
+                    authenticated_age_ms: 0,
+                    sample: Some(initial_sample),
+                }),
+            )
+            .expect("seed exact finite route");
+
+        let commits = [
+            ReservedEventOnceCommit::new(
+                &valid_request,
+                &reservations[0],
+                &valid_event,
+                &valid_sealed.bytes,
+            ),
+            ReservedEventOnceCommit::new(
+                &retired_request,
+                &reservations[1],
+                &retired_event,
+                &retired_sealed.bytes,
+            ),
+        ];
+        let expired_sample = aster_mesh::CustodySample {
+            clock_id: initial_sample.clock_id,
+            tick_ms: 110,
+        };
+        let checkpoint = LocalCustodyCheckpoint::new(
+            store
+                .custody_policy_revision()
+                .expect("group custody revision"),
+            expired_sample,
+        );
+        assert!(matches!(
+            store.commit_reserved_event_group_once_with_custody_policy(
+                &policy, checkpoint, &commits,
+            ),
+            Err(StoreError::Custody(CustodyStoreError::AlreadyRetired))
+        ));
+        assert_eq!(
+            store.event_stats().expect("rolled-back group stats").events,
+            0,
+            "the multi-item fast path must not commit its valid sibling before fallback"
+        );
+
+        let valid = store.commit_reserved_event_once_with_custody_policy_observed(
+            &policy,
+            checkpoint,
+            &valid_request,
+            &reservations[0],
+            &valid_event,
+            &valid_sealed.bytes,
+        );
+        assert_eq!(valid.writer_commits(), 1);
+        assert!(matches!(
+            valid.into_result(),
+            Ok(EventOnceOutcome::Inserted { .. })
+        ));
+        let retired = store.commit_reserved_event_once_with_custody_policy_observed(
+            &policy,
+            checkpoint,
+            &retired_request,
+            &reservations[1],
+            &retired_event,
+            &retired_sealed.bytes,
+        );
+        assert_eq!(retired.writer_commits(), 1);
+        assert!(matches!(
+            retired.into_result(),
+            Err(StoreError::Custody(CustodyStoreError::AlreadyRetired))
+        ));
+        assert_eq!(store.event_stats().expect("fallback stats").events, 1);
+        drop(store);
+
+        let inspection = Store::inspect_existing(&file.0).expect("inspect retired fence");
+        assert_eq!(inspection.event_stats.events, 1);
+        assert_eq!(inspection.event_stats.route_cached, 0);
+        assert_eq!(inspection.custody_stats.items, 1);
+        assert_eq!(inspection.custody_stats.retirements, 1);
+        let reopened = Store::open_for_mission(&file.0, services.authority).expect("reopen");
+        assert_eq!(
+            reopened
+                .custody_sender_status(
+                    CustodyObjectKey::route_event(retired_transfer),
+                    Some(expired_sample),
+                )
+                .expect("reopened retired route status"),
+            Some(CustodySenderStatus::Retired { age_ms: 10 })
+        );
+        assert_eq!(
+            reopened.get_event(retired_transfer).expect("retired get"),
+            None
+        );
+        assert_eq!(
+            reopened
+                .event_operation_resolution(&retired_key)
+                .expect("retired operation resolution"),
+            None,
+            "the narrow custody fence must not manufacture an operation result"
         );
     }
 
