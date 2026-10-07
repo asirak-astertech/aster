@@ -7146,6 +7146,26 @@ impl Store {
         self.mission_authority.ok_or(StoreError::MissionNotBound)
     }
 
+    /// Holds an uncommitted write transaction while `operation` runs.
+    ///
+    /// This test-only seam lets dependent crates prove that read-only work does
+    /// not enter redb's serialized writer queue. The transaction is always
+    /// dropped without a commit.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn with_test_uncommitted_write_transaction<T>(
+        &self,
+        operation: impl FnOnce() -> T,
+    ) -> Result<T, StoreError> {
+        let authority = self.require_bound_mission()?;
+        let write = self.database.begin_write()?;
+        enforce_live_write(&write)?;
+        custody::require_custody_mission_write(&write, authority)?;
+        let result = operation();
+        drop(write);
+        Ok(result)
+    }
+
     fn require_mission_authority(&self, received: NodeId) -> Result<(), StoreError> {
         let bound = self.require_bound_mission()?;
         if bound != received {
