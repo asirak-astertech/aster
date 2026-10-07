@@ -53,7 +53,8 @@ use crate::{
         ensure_principal_active, ensure_state_accepts_normal_operation, event_is_inactive,
         open_startup_event_verifier_and_cache,
         prune_authenticated_event_route_cache_to_sender_projection,
-        publish_selected_event_group_once, publish_selected_event_once, refresh_application_policy,
+        publish_selected_event_group_once, publish_selected_event_once,
+        publish_selected_event_once_observed, refresh_application_policy,
         verify_content_stored_claim, verify_stored_claim,
     },
 };
@@ -1986,7 +1987,7 @@ impl SelectedEventNode {
             Ok(policy) => policy,
             Err(error) => return (Err(error), 0),
         };
-        let selected = [SelectedEventPublish {
+        let selected = SelectedEventPublish {
             operation: &operation,
             predecessor,
             topic: &request.topic,
@@ -1997,20 +1998,15 @@ impl SelectedEventNode {
             logical_key: &request.logical_key,
             payload: &request.payload,
             tombstone: request.tombstone,
-        }];
-        let attempt =
-            publish_selected_event_group_once(&self.store, &policy, &mut self.verifier, &selected);
+        };
+        let attempt = publish_selected_event_once_observed(
+            &self.store,
+            &policy,
+            &mut self.verifier,
+            selected,
+        );
         let result = match attempt.result {
-            Ok(mut outcomes) => match outcomes.pop() {
-                Some(Ok((stored, inserted))) if outcomes.is_empty() => {
-                    self.finish_published_event(stored, inserted)
-                }
-                Some(Err(error)) if outcomes.is_empty() => Err(application_error("publish", error)),
-                _ => Err(ApplicationError::new(
-                    ApplicationErrorKind::Integrity,
-                    "publish",
-                )),
-            },
+            Ok((stored, inserted)) => self.finish_published_event(stored, inserted),
             Err(error) => Err(application_error("publish", error)),
         };
         (result, attempt.writer_commits)
@@ -4223,6 +4219,55 @@ mod tests {
     }
 
     #[test]
+    fn selected_event_publish_group_counts_committed_clock_transition_fallbacks() {
+        let root = TestRoot::new("selected-event-publish-group-clock-transition");
+        let mut node = selected_node(&root);
+        let finite = EventPublishOptions::finite_ttl_ms(1_000).expect("finite TTL");
+        node.custody_clock =
+            NodeCustodyClock::injected_with_clock_transition([0xb1; 16], [0xb2; 16], 2, 100, 1);
+
+        let group = node.publish_group_with_options(vec![
+            (
+                request(
+                    b"group/transition/one",
+                    "ops.alpha",
+                    b"asset-transition-1",
+                    b"one",
+                ),
+                finite,
+            ),
+            (
+                request(
+                    b"group/transition/two",
+                    "ops.alpha",
+                    b"asset-transition-2",
+                    b"two",
+                ),
+                finite,
+            ),
+        ]);
+
+        assert!(
+            group
+                .results
+                .iter()
+                .all(|result| result.as_ref().is_ok_and(|result| result.inserted)),
+            "the fresh-revision singleton retries must publish both siblings"
+        );
+        assert_eq!(group.diagnostic.collected, 2);
+        assert_eq!(group.diagnostic.cohorts, 1);
+        assert_eq!(group.diagnostic.custody_writer_commits, 2);
+        assert_eq!(group.diagnostic.event_writer_commits, 3);
+        assert_eq!(group.diagnostic.total_writer_commits(), 5);
+        assert_eq!(group.diagnostic.accepted_new, 2);
+        assert_eq!(group.diagnostic.exact_retries, 0);
+        assert_eq!(group.diagnostic.failures, 0);
+        assert_eq!(group.diagnostic.singleton_fallbacks, 2);
+        assert_eq!(group.diagnostic.max_cohort_size, 2);
+        assert_eq!(node.store.event_stats().expect("Event stats").events, 2);
+    }
+
+    #[test]
     fn selected_event_publish_group_isolates_a_conflicting_sibling_in_order() {
         let root = TestRoot::new("selected-event-publish-group-fallback");
         let mut node = selected_node(&root);
@@ -4264,6 +4309,9 @@ mod tests {
         assert_eq!(group.diagnostic.failures, 1);
         assert_eq!(group.diagnostic.singleton_fallbacks, 3);
         assert_eq!(group.diagnostic.accepted_new, 2);
+        assert_eq!(group.diagnostic.custody_writer_commits, 1);
+        assert_eq!(group.diagnostic.event_writer_commits, 2);
+        assert_eq!(group.diagnostic.total_writer_commits(), 3);
     }
 
     #[test]

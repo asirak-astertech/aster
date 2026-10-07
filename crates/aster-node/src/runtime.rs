@@ -1661,6 +1661,8 @@ pub(crate) struct NodeCustodyClock {
 struct InjectedCustodyClock {
     next_tick_ms: AtomicU64,
     step_ms: u64,
+    transition_after_samples: Option<(u64, [u8; 16])>,
+    samples: AtomicU64,
 }
 
 impl NodeCustodyClock {
@@ -1768,6 +1770,30 @@ impl NodeCustodyClock {
             injected: Some(Arc::new(InjectedCustodyClock {
                 next_tick_ms: AtomicU64::new(first_tick_ms),
                 step_ms,
+                transition_after_samples: None,
+                samples: AtomicU64::new(0),
+            })),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn injected_with_clock_transition(
+        initial_clock_id: [u8; 16],
+        transitioned_clock_id: [u8; 16],
+        transition_after_samples: u64,
+        first_tick_ms: u64,
+        step_ms: u64,
+    ) -> Self {
+        Self {
+            clock_id: initial_clock_id,
+            finite_ttl_supported: false,
+            #[cfg(not(unix))]
+            origin: Arc::new(Instant::now()),
+            injected: Some(Arc::new(InjectedCustodyClock {
+                next_tick_ms: AtomicU64::new(first_tick_ms),
+                step_ms,
+                transition_after_samples: Some((transition_after_samples, transitioned_clock_id)),
+                samples: AtomicU64::new(0),
             })),
         }
     }
@@ -1784,6 +1810,7 @@ impl NodeCustodyClock {
     pub(crate) fn sample(&self) -> Result<CustodySample, NodeError> {
         #[cfg(test)]
         if let Some(injected) = &self.injected {
+            let sample_index = injected.samples.fetch_add(1, Ordering::SeqCst);
             let tick_ms = injected
                 .next_tick_ms
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |tick| {
@@ -1791,7 +1818,10 @@ impl NodeCustodyClock {
                 })
                 .map_err(|_| NodeError::Protocol("injected custody clock overflowed".into()))?;
             return Ok(CustodySample {
-                clock_id: self.clock_id,
+                clock_id: injected
+                    .transition_after_samples
+                    .filter(|(after, _)| sample_index >= *after)
+                    .map_or(self.clock_id, |(_, clock_id)| clock_id),
                 tick_ms,
             });
         }
@@ -4236,6 +4266,36 @@ pub(crate) fn publish_selected_event_once(
     sealer: &mut ReferenceEnvelopeSealer,
     request: SelectedEventPublish<'_>,
 ) -> Result<(StoredEvent, bool), NodeError> {
+    publish_selected_event_once_observed(store, policy, sealer, request).result
+}
+
+pub(crate) struct SelectedEventPublishAttempt {
+    pub(crate) result: Result<(StoredEvent, bool), NodeError>,
+    pub(crate) writer_commits: u64,
+}
+
+pub(crate) fn publish_selected_event_once_observed(
+    store: &Store,
+    policy: &ControlPolicySnapshot,
+    sealer: &mut ReferenceEnvelopeSealer,
+    request: SelectedEventPublish<'_>,
+) -> SelectedEventPublishAttempt {
+    let mut writer_commits = 0u64;
+    let result =
+        publish_selected_event_once_counted(store, policy, sealer, request, &mut writer_commits);
+    SelectedEventPublishAttempt {
+        result,
+        writer_commits,
+    }
+}
+
+fn publish_selected_event_once_counted(
+    store: &Store,
+    policy: &ControlPolicySnapshot,
+    sealer: &mut ReferenceEnvelopeSealer,
+    request: SelectedEventPublish<'_>,
+    writer_commits: &mut u64,
+) -> Result<(StoredEvent, bool), NodeError> {
     let SelectedEventPublish {
         operation,
         predecessor,
@@ -4336,26 +4396,33 @@ pub(crate) fn publish_selected_event_once(
             }
         };
         let committed = match (custody_sample, custody_revision) {
-            (Some(sample), Some(revision)) => store.commit_reserved_event_once_with_custody_policy(
+            (Some(sample), Some(revision)) => store
+                .commit_reserved_event_once_with_custody_policy_observed(
+                    policy,
+                    LocalCustodyCheckpoint::new(revision, sample),
+                    &operation_request,
+                    &reservation,
+                    &verified,
+                    &sealed.bytes,
+                ),
+            (None, None) => store.commit_reserved_event_once_with_policy_observed(
                 policy,
-                LocalCustodyCheckpoint::new(revision, sample),
                 &operation_request,
                 &reservation,
                 &verified,
                 &sealed.bytes,
             ),
-            (None, None) => store.commit_reserved_event_once_with_policy(
-                policy,
-                &operation_request,
-                &reservation,
-                &verified,
-                &sealed.bytes,
-            ),
-            _ => Err(StoreError::SemanticInvariant(
-                "custody sample and policy revision were not captured together",
-            )),
+            _ => {
+                return Err(StoreError::SemanticInvariant(
+                    "custody sample and policy revision were not captured together",
+                )
+                .into());
+            }
         };
-        match committed {
+        *writer_commits = writer_commits
+            .checked_add(committed.writer_commits())
+            .ok_or_else(|| NodeError::Protocol("Event writer commit count overflowed".into()))?;
+        match committed.into_result() {
             Ok(outcome) => {
                 let (transfer_id, semantic_id, inserted) = match outcome {
                     EventOnceOutcome::Inserted {
