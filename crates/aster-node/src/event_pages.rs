@@ -1130,23 +1130,7 @@ pub(crate) fn build_local_event_send_plan_with_limits(
         });
     }
 
-    let exact_metadata = authenticated_metadata.len() == difference.len()
-        && authenticated_metadata
-            .iter()
-            .zip(difference)
-            .all(|(metadata, id)| {
-                let source_bytes = usize::try_from(metadata.source_bytes).ok();
-                metadata.id == *id
-                    && source_bytes.is_some_and(|bytes| {
-                        bytes > 0
-                            && bytes <= MAX_EVENT_BYTES
-                            && planned_change_page_entry_bytes(*metadata)
-                                .ok()
-                                .and_then(|entry| CHANGE_PAGE_FIXED_BYTES.checked_add(entry))
-                                .is_some_and(|encoded| encoded <= MAX_CHANGE_PAGE_CODEC_BYTES)
-                    })
-            });
-    if selected_profile != TransferProfileId::EventPagesV1 || !exact_metadata {
+    if selected_profile != TransferProfileId::EventPagesV1 {
         return Ok(BuiltLocalEventSendPlan {
             plan: EventTurnPlanV1::LegacyActive {
                 direction,
@@ -1163,11 +1147,31 @@ pub(crate) fn build_local_event_send_plan_with_limits(
             last_attempted_by_priority: [None; 4],
         });
     }
-    let (scheduled_metadata, advanced) = plan_event_page_schedule(
-        authenticated_metadata,
-        schedule_limits,
-        last_attempted_by_priority,
-    )?;
+
+    let difference_ids = difference.iter().copied().collect::<BTreeSet<_>>();
+    let mut seen_metadata = BTreeSet::new();
+    let mut page_metadata = Vec::with_capacity(authenticated_metadata.len());
+    for metadata in authenticated_metadata {
+        if !difference_ids.contains(&metadata.id) || !seen_metadata.insert(metadata.id) {
+            return Err(EventPagesError::invalid(
+                "authenticated Event metadata differs from the exact difference",
+            ));
+        }
+        let source_bytes = usize::try_from(metadata.source_bytes).ok();
+        let page_eligible = source_bytes.is_some_and(|bytes| {
+            bytes > 0
+                && bytes <= MAX_EVENT_BYTES
+                && planned_change_page_entry_bytes(*metadata)
+                    .ok()
+                    .and_then(|entry| CHANGE_PAGE_FIXED_BYTES.checked_add(entry))
+                    .is_some_and(|encoded| encoded <= MAX_CHANGE_PAGE_CODEC_BYTES)
+        });
+        if page_eligible {
+            page_metadata.push(*metadata);
+        }
+    }
+    let (scheduled_metadata, advanced) =
+        plan_event_page_schedule(&page_metadata, schedule_limits, last_attempted_by_priority)?;
     let scheduled = scheduled_metadata
         .iter()
         .map(|entry| entry.id)
@@ -1375,7 +1379,12 @@ pub(crate) fn validate_remote_event_send_plan(
                     set_commitment,
                 },
             ..
-        } if *difference_count == count && *set_commitment == commitment => Ok(()),
+        } if selected_profile == TransferProfileId::LegacyV6
+            && *difference_count == count
+            && *set_commitment == commitment =>
+        {
+            Ok(())
+        }
         EventTurnPlanV1::Empty {
             selected_profile: plan_profile,
             set_commitment,
@@ -2669,6 +2678,46 @@ mod tests {
     }
 
     #[test]
+    fn event_pages_v1_schedules_available_metadata_without_legacy_substitution() {
+        let current = TransferProfileOfferV1::current();
+        let profiles = negotiate_transfer_profiles(&current, &current).unwrap();
+        let digest = transfer_profile_digest(&current, &current, &profiles);
+        let difference = vec![id(1), id(2), id(3), id(4)];
+        let mut invalid_metadata = metadata(id(2), None, false);
+        invalid_metadata.source_bytes = 0;
+
+        let built = build_local_event_send_plan(
+            EventDirection::ToSessionResponder,
+            digest,
+            &profiles,
+            LocalEventSendDifference::Exact(&difference),
+            &[
+                metadata(id(1), None, false),
+                invalid_metadata,
+                metadata(id(3), None, false),
+            ],
+            false,
+            difference.len(),
+            [None; 4],
+        )
+        .unwrap();
+
+        assert_eq!(built.scheduled, vec![id(1), id(3)]);
+        assert_eq!(built.scheduled_metadata.len(), 2);
+        assert_eq!(
+            built.plan,
+            EventTurnPlanV1::PageActive {
+                direction: EventDirection::ToSessionResponder,
+                transfer_profile_digest: digest,
+                difference_count: 4,
+                set_commitment: event_difference_set_commitment(&difference).unwrap(),
+                scheduled_count: 2,
+                unscheduled_count: 2,
+            }
+        );
+    }
+
+    #[test]
     fn local_event_plan_prioritizes_tiers_and_rotates_only_within_equal_priority() {
         let current = TransferProfileOfferV1::current();
         let profiles = negotiate_transfer_profiles(&current, &current).unwrap();
@@ -2980,5 +3029,47 @@ mod tests {
             )
             .is_err()
         );
+
+        let exact_legacy = EventTurnPlanV1::LegacyActive {
+            direction: EventDirection::ToSessionResponder,
+            transfer_profile_digest: digest,
+            difference: LegacyDifference::Exact {
+                difference_count: u32::try_from(missing.len()).unwrap(),
+                set_commitment: event_difference_set_commitment(&missing).unwrap(),
+            },
+        };
+        assert!(
+            validate_remote_event_send_plan(
+                &exact_legacy,
+                EventDirection::ToSessionResponder,
+                digest,
+                &profiles,
+                LocalEventSendDifference::Exact(&missing),
+                false,
+            )
+            .is_err(),
+            "EventPagesV1 must not accept an exact LegacyActive substitution"
+        );
+
+        let legacy = legacy_only_offer();
+        let legacy_profiles = negotiate_transfer_profiles(&current, &legacy).unwrap();
+        let legacy_digest = transfer_profile_digest(&current, &legacy, &legacy_profiles);
+        let legacy_plan = EventTurnPlanV1::LegacyActive {
+            direction: EventDirection::ToSessionResponder,
+            transfer_profile_digest: legacy_digest,
+            difference: LegacyDifference::Exact {
+                difference_count: u32::try_from(missing.len()).unwrap(),
+                set_commitment: event_difference_set_commitment(&missing).unwrap(),
+            },
+        };
+        validate_remote_event_send_plan(
+            &legacy_plan,
+            EventDirection::ToSessionResponder,
+            legacy_digest,
+            &legacy_profiles,
+            LocalEventSendDifference::Exact(&missing),
+            false,
+        )
+        .expect("LegacyV6 must retain exact legacy scheduling");
     }
 }

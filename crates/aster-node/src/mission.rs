@@ -2421,12 +2421,18 @@ impl fmt::Debug for MissionSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event_pages::{
+        ChangePageCustody, ChangePageEntry, ChangePageV7, LaneId, TransferProfileId,
+        schedule_digest, transfer_profile_digest,
+    };
     use crate::frame::{EventDirection, Frame};
     use aster_iroh::{CarrierSecurityProfile, Endpoint, EndpointConfig, ExpectedPeer, SecretKey};
     use aster_mesh::{
-        ClassicalProvisioner, ClassicalProvisioningAccess, ProvisioningAccess,
+        ClassicalProvisioner, ClassicalProvisioningAccess, CustodyHop, CustodySample,
+        CustodyTransferClaims, CustodyTransferId, Priority, ProvisioningAccess,
         ProvisioningLoadReceipt, ReferenceEnvelopeSealer, ReferenceProvisioner, Scope, Topic,
     };
+    use aster_redb_store::EventTransferId;
     use std::{collections::BTreeSet, net::SocketAddr, time::Duration};
 
     struct IssuedNode {
@@ -3282,6 +3288,162 @@ mod tests {
                 .expect("open exact contextual v7 frame"),
             b"page"
         );
+    }
+
+    fn finite_page_fixture(
+        sender: &mut MissionSession,
+        finite_entries: usize,
+        durable_entries: usize,
+    ) -> (Vec<u8>, Vec<(Vec<u8>, CustodyExpectation)>) {
+        let current = crate::event_pages::TransferProfileOfferV1::current();
+        let profiles = crate::event_pages::negotiate_transfer_profiles(&current, &current)
+            .expect("negotiate current profiles");
+        let digest = transfer_profile_digest(&current, &current, &profiles);
+        let direction = EventDirection::ToSessionResponder;
+        let mut entries = Vec::with_capacity(finite_entries + durable_entries);
+        let mut custody = Vec::with_capacity(finite_entries);
+
+        for index in 0..finite_entries {
+            let mut exact_hash = [0u8; 32];
+            exact_hash[..8].copy_from_slice(&u64::try_from(index + 1).unwrap().to_be_bytes());
+            let transfer_id = CustodyTransferId::from_exact_hash(exact_hash);
+            let transfer =
+                CustodyTransferClaims::new(transfer_id, 1, Some(60_000), Priority::Routine)
+                    .expect("finite transfer claims");
+            let exchange_id = u64::try_from(index + 1).expect("bounded exchange ID");
+            let claims = CustodyClaims::new(
+                transfer,
+                exchange_id,
+                1,
+                CustodyHop::new(
+                    1,
+                    CustodySample {
+                        clock_id: [0x61; 16],
+                        tick_ms: 1,
+                    },
+                    0,
+                )
+                .expect("finite custody hop"),
+            )
+            .expect("finite custody claims");
+            let wrapper = sender
+                .seal_custody_wrapper(&claims)
+                .expect("seal finite custody wrapper");
+            entries.push(ChangePageEntry {
+                id: EventTransferId::new(exact_hash),
+                custody: Some(ChangePageCustody {
+                    exchange_id,
+                    wrapper: wrapper.clone(),
+                }),
+                source_event: vec![0x41],
+            });
+            custody.push((wrapper, CustodyExpectation::new(transfer, exchange_id)));
+        }
+        for index in 0..durable_entries {
+            let mut exact_hash = [0u8; 32];
+            exact_hash[0] = 0xff;
+            exact_hash[24..].copy_from_slice(&u64::try_from(index + 1).unwrap().to_be_bytes());
+            entries.push(ChangePageEntry {
+                id: EventTransferId::new(exact_hash),
+                custody: None,
+                source_event: vec![0x42],
+            });
+        }
+        let scheduled = entries.iter().map(|entry| entry.id).collect::<Vec<_>>();
+        let page = Frame::ChangePage(ChangePageV7 {
+            direction,
+            transfer_profile_digest: digest,
+            schedule_digest: schedule_digest(&scheduled),
+            page_number: 0,
+            entries,
+            remaining: 0,
+        })
+        .encode_for_semantic_version(crate::event_pages::SEMANTIC_PROTOCOL_V7)
+        .expect("encode valid finite Event page");
+        let protected = sender
+            .seal_v7_application_frame(
+                digest,
+                LaneId::Event,
+                TransferProfileId::EventPagesV1,
+                direction,
+                &page,
+            )
+            .expect("protect valid finite Event page");
+        (protected, custody)
+    }
+
+    fn open_finite_page_fixture(
+        receiver: &mut MissionSession,
+        protected: &[u8],
+        custody: &[(Vec<u8>, CustodyExpectation)],
+    ) {
+        let current = crate::event_pages::TransferProfileOfferV1::current();
+        let profiles = crate::event_pages::negotiate_transfer_profiles(&current, &current)
+            .expect("negotiate current profiles");
+        let digest = transfer_profile_digest(&current, &current, &profiles);
+        let plaintext = receiver
+            .open_v7_application_frame(
+                digest,
+                LaneId::Event,
+                TransferProfileId::EventPagesV1,
+                EventDirection::ToSessionResponder,
+                protected,
+            )
+            .expect("authenticate complete Event page before embedded evidence");
+        assert!(
+            receiver
+                .open_v7_application_frame(
+                    digest,
+                    LaneId::Event,
+                    TransferProfileId::EventPagesV1,
+                    EventDirection::ToSessionResponder,
+                    protected,
+                )
+                .is_err(),
+            "the context-bound page replay domain must reject a duplicate outer page"
+        );
+        let frame = Frame::decode_for_semantic_version(
+            &plaintext,
+            crate::event_pages::SEMANTIC_PROTOCOL_V7,
+        )
+        .expect("decode authenticated Event page");
+        let Frame::ChangePage(page) = frame else {
+            panic!("fixture did not decode as an Event page");
+        };
+        assert_eq!(
+            page.entries
+                .iter()
+                .filter(|entry| entry.custody.is_some())
+                .count(),
+            custody.len()
+        );
+        for (wrapper, expected) in custody {
+            receiver
+                .open_custody_wrapper(wrapper, *expected)
+                .expect("embedded custody evidence remains replay-valid after outer page");
+        }
+        if let Some((wrapper, expected)) = custody.first() {
+            assert!(
+                receiver.open_custody_wrapper(wrapper, *expected).is_err(),
+                "the ordinary custody replay domain must reject duplicate evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_v7_page_authentication_does_not_age_out_embedded_custody_evidence() {
+        for (finite_entries, durable_entries) in [(127, 0), (127, 1), (128, 0), (128, 1)] {
+            let mut provisioner =
+                ReferenceProvisioner::from_seed([finite_entries as u8; 32]).expect("provisioner");
+            let initiator = issue(&mut provisioner, 1);
+            let responder = issue(&mut provisioner, 2);
+            let (mut sender, mut receiver) =
+                establish(&initiator, &responder).expect("establish session");
+
+            let (protected, custody) =
+                finite_page_fixture(&mut sender, finite_entries, durable_entries);
+            open_finite_page_fixture(&mut receiver, &protected, &custody);
+        }
     }
 
     #[test]

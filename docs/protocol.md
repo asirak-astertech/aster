@@ -957,10 +957,16 @@ an exact authenticated difference and may contain durable Events, durable
 tombstones, finite-TTL Events, route-only Events, or a mix. `PageBlindActive`
 binds only bounded scheduled/unscheduled counts for traffic into an authenticated
 ReceiveOnly peer and discloses no receiver inventory or difference. `LegacyV6`
-is selected only when the peers did not negotiate `EventPagesV1`. `Suppressed`
-discloses no local inventory. Plans commit the direction, transfer-profile
-digest, exact difference cardinality and set commitment where knowable, and
-scheduled/unscheduled counts.
+is selected only when the peers did not negotiate `EventPagesV1`; a
+`LegacyActive` plan under selected `EventPagesV1` is a profile substitution and
+fails closed even when its exact difference count and commitment are otherwise
+correct. `Suppressed` discloses no local inventory. Plans commit the direction,
+transfer-profile digest, exact difference cardinality and set commitment where
+knowable, and scheduled/unscheduled counts. If an exact sender cannot load
+complete page-eligible authenticated metadata for the current difference, it
+schedules only the authenticated eligible subset and counts every omitted ID as
+unscheduled. It does not substitute legacy mechanics; a later contact
+recomputes the difference and metadata from current durable state.
 
 An active page direction with a positive `scheduled_count` opens exactly one
 role-ordered bounded QUIC unidirectional turn containing:
@@ -985,7 +991,12 @@ The protected mechanics tags are `0xd1` profile offer, `0xd2` Event turn plan,
 They are invalid in semantic-v1 through semantic-v6 sessions. The v7 Event
 plan/header/page/terminal records use the contextual AAD in
 [envelope.md](envelope.md) section 9. Profile offers and every `LegacyV6` lane
-record retain the ordinary transport-frame AAD.
+record retain the ordinary transport-frame AAD. The reference keeps one
+directional send sequence across both AAD domains, preserving AEAD nonce
+uniqueness, and maintains a separate authenticated receive replay window for
+contextual v7 records. Authenticating an outer page therefore cannot age its
+embedded ordinary-domain custody records out of the receive window. Reuse in
+either domain and cross-domain reinterpretation still fail closed.
 
 All following integers are unsigned big-endian. These are the complete canonical
 semantic-v7 plaintext layouts; decoders reject truncation, trailing bytes,
