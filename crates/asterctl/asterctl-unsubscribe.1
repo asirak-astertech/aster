@@ -1,0 +1,50 @@
+.\" Copyright 2026 Defense Unicorns, Inc.
+.\" SPDX-License-Identifier: Apache-2.0
+.\" Clean Room — Privileged
+.TH ASTERCTL-UNSUBSCRIBE 1 "2026-10-06" "Aster" "User Commands"
+.SH NAME
+asterctl-unsubscribe \- remove an Event subscription
+.SH SYNOPSIS
+.SY asterctl
+.RI [ GLOBAL-OPTIONS ]
+.B unsubscribe
+.I SUBSCRIPTION_ID
+.YS
+.SH DESCRIPTION
+Remove an Event subscription. Use the subscription ID returned by subscribe
+or listed by subscriptions.
+.SH OUTPUT
+Prints "Subscription removed" or "Subscription already absent" to stdout.
+Both outcomes succeed.
+.PP
+With \-\-json, prints alreadyAbsent: false when removed, true when already absent.
+.SH EXIT STATUS
+.TP
+.B 0
+Subscription removed or already absent.
+.TP
+.B 1
+Command failed.
+.TP
+.B 2
+Invalid or missing arguments.
+.SH EXAMPLES
+Remove a subscription:
+.PP
+.nf
+.RS
+asterctl \-\-token\-file ./client.token unsubscribe "$SUBSCRIPTION_ID"
+.RE
+.fi
+.PP
+Print the result as JSON:
+.PP
+.nf
+.RS
+asterctl \-\-token\-file ./client.token unsubscribe "$SUBSCRIPTION_ID" \-\-json
+.RE
+.fi
+.SH SEE ALSO
+.BR asterctl (1),
+.BR asterctl-subscribe (1),
+.BR asterctl-subscriptions (1)
