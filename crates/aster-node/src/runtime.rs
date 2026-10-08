@@ -8315,7 +8315,7 @@ impl CustodyLeaseGuard {
         policy_revision: CustodyPolicyRevision,
     ) -> Result<CustodySendAuthorization, NodeError> {
         #[cfg(test)]
-        record_test_custody_send_authorization(self.lease()?);
+        record_test_custody_send_authorization(&self.lease()?.object);
         Ok(self
             .store
             .require_custody_send(self.lease()?, Some(sample), policy_revision)?)
@@ -8462,6 +8462,8 @@ fn require_event_page_final_send(
         let prepared = custody.get(index).ok_or_else(|| {
             NodeError::Protocol("Event-page custody authorization index is invalid".into())
         })?;
+        #[cfg(test)]
+        record_test_custody_send_authorization(&prepared.object);
         let authorization_sample = authorization.sample.ok_or_else(|| {
             NodeError::Protocol(
                 "custody store omitted the normalized Event-page send checkpoint".into(),
@@ -17242,11 +17244,11 @@ enum V3OfferOutcome {
 }
 
 #[cfg(test)]
-fn record_test_custody_send_authorization(lease: &TransferLease) {
+fn record_test_custody_send_authorization(object: &CustodyObjectKey) {
     let _ = TEST_CUSTODY_PREOPEN_RACES.try_with(|races| {
         for race in races.borrow().iter() {
             if let TestCustodyPreopenRace::CountAuthorizations { transfer_id, count } = race
-                && transfer_id.as_bytes() == &lease.object.transfer_id()
+                && transfer_id.as_bytes() == &object.transfer_id()
             {
                 count.fetch_add(1, Ordering::Relaxed);
             }
@@ -18764,6 +18766,7 @@ async fn receive_event_page_turn(
                     &prepared,
                 )?;
                 for applied in applied {
+                    record_contact_event_insertion(applied.inserted);
                     receipt.fetched = receipt.fetched.checked_add(1).ok_or_else(|| {
                         NodeError::Protocol("fetched Event count overflow".into())
                     })?;
@@ -45183,29 +45186,32 @@ mod tests {
             .custody_policy_revision()
             .expect("custody policy before contact");
         let authorization_count = Arc::new(AtomicU64::new(0));
-        let (client, server) = contact_test_pair_with_forwarding_results(
-            TestForwardingNode {
-                store: server_store.clone(),
-                mission: services.member.clone(),
-                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::ReceiveOnly)),
-                clock: NodeCustodyClock::injected([0x7e; 16], 0, 0),
-                reconciliation_exchanges_before_defer: None,
-                preopen_custody_races: Vec::new(),
-            },
-            TestForwardingNode {
-                store: client_store.clone(),
-                mission: services.other.clone(),
-                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
-                clock: NodeCustodyClock::injected(clock_id, 0, 0),
-                reconciliation_exchanges_before_defer: None,
-                preopen_custody_races: vec![
-                    TestCustodyPreopenRace::FinalCustodyPolicyChange,
-                    TestCustodyPreopenRace::CountAuthorizations {
-                        transfer_id: source.transfer_id,
-                        count: authorization_count.clone(),
-                    },
-                ],
-            },
+        let (client, server) = with_test_transfer_profile_offer(
+            TransferProfileOfferV1::legacy_only(),
+            contact_test_pair_with_forwarding_results(
+                TestForwardingNode {
+                    store: server_store.clone(),
+                    mission: services.member.clone(),
+                    policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::ReceiveOnly)),
+                    clock: NodeCustodyClock::injected([0x7e; 16], 0, 0),
+                    reconciliation_exchanges_before_defer: None,
+                    preopen_custody_races: Vec::new(),
+                },
+                TestForwardingNode {
+                    store: client_store.clone(),
+                    mission: services.other.clone(),
+                    policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                    clock: NodeCustodyClock::injected(clock_id, 0, 0),
+                    reconciliation_exchanges_before_defer: None,
+                    preopen_custody_races: vec![
+                        TestCustodyPreopenRace::FinalCustodyPolicyChange,
+                        TestCustodyPreopenRace::CountAuthorizations {
+                            transfer_id: source.transfer_id,
+                            count: authorization_count.clone(),
+                        },
+                    ],
+                },
+            ),
         )
         .await;
         assert!(matches!(
@@ -45294,32 +45300,35 @@ mod tests {
         );
         let writer_hold = Arc::new(TestCustodyWriterHold::new());
         let authorization_count = Arc::new(AtomicU64::new(0));
-        let (client, server) = contact_test_pair_with_forwarding_results(
-            TestForwardingNode {
-                store: server_store.clone(),
-                mission: services.member.clone(),
-                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::ReceiveOnly)),
-                clock: NodeCustodyClock::injected([0x6c; 16], 0, 0),
-                reconciliation_exchanges_before_defer: None,
-                preopen_custody_races: Vec::new(),
-            },
-            TestForwardingNode {
-                store: client_store.clone(),
-                mission: services.other.clone(),
-                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
-                clock: NodeCustodyClock::injected(clock_id, 0, 0),
-                reconciliation_exchanges_before_defer: None,
-                preopen_custody_races: vec![
-                    TestCustodyPreopenRace::HoldWriterAfterLease {
-                        transfer_id: source.transfer_id,
-                        state: writer_hold.clone(),
-                    },
-                    TestCustodyPreopenRace::CountAuthorizations {
-                        transfer_id: source.transfer_id,
-                        count: authorization_count.clone(),
-                    },
-                ],
-            },
+        let (client, server) = with_test_transfer_profile_offer(
+            TransferProfileOfferV1::legacy_only(),
+            contact_test_pair_with_forwarding_results(
+                TestForwardingNode {
+                    store: server_store.clone(),
+                    mission: services.member.clone(),
+                    policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::ReceiveOnly)),
+                    clock: NodeCustodyClock::injected([0x6c; 16], 0, 0),
+                    reconciliation_exchanges_before_defer: None,
+                    preopen_custody_races: Vec::new(),
+                },
+                TestForwardingNode {
+                    store: client_store.clone(),
+                    mission: services.other.clone(),
+                    policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                    clock: NodeCustodyClock::injected(clock_id, 0, 0),
+                    reconciliation_exchanges_before_defer: None,
+                    preopen_custody_races: vec![
+                        TestCustodyPreopenRace::HoldWriterAfterLease {
+                            transfer_id: source.transfer_id,
+                            state: writer_hold.clone(),
+                        },
+                        TestCustodyPreopenRace::CountAuthorizations {
+                            transfer_id: source.transfer_id,
+                            count: authorization_count.clone(),
+                        },
+                    ],
+                },
+            ),
         )
         .await;
         let client = client.expect("client contact completes after releasing the writer");
