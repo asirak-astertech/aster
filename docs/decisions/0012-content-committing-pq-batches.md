@@ -283,6 +283,14 @@ operation; it does not silently buffer ordinary `publish` calls. This preserves
 the existing guarantee that an ordinary disconnected publish succeeds locally
 without an unbounded wait for future items.
 
+Decision 0044 permits an internal transaction optimization for ordinary Event
+publication: the selected-node actor may atomically group adjacent compatible
+ordinary publishes that are already admitted in its bounded command lane. It
+never waits for a future publish to complete a group. Each input retains its
+own operation key, result, singleton source representation, and independent
+failure outcome. This no-wait grouping therefore preserves the immediate
+publication rule above and is not this decision's explicit cryptographic batch.
+
 Batch construction follows this order:
 
 1. reserve the complete contiguous causal-counter range and, for Event, the
@@ -579,7 +587,10 @@ the only source-data representation allowed on a selected-version-1 adjacency;
 a selected-version-2-or-3 adjacency may carry either these singletons or the
 construction-marker-2 batch representation.
 
-- Ordinary `publish` remains an immediate singleton operation.
+- Ordinary `publish` remains an immediate singleton-representation operation.
+  The implementation may group only already-admitted compatible operations in
+  one local durable transaction as specified by Decision 0044; it never waits
+  for future work and does not create a `BatchProof`.
 - Flash/urgent items never wait for a batch. The singleton fallback is available
   on every selected protocol version; a version-2-or-3 adjacency can carry format 2.
   An already complete explicit batch may still be committed in the same call.
@@ -605,7 +616,8 @@ Reopen reauthenticates stored proofs before proof-backed application reads.
 Rust, C, Go, and Python expose the same retained-dual/batch-only transaction and
 atomic finalization of 2–64 distinct Blob writers; a failed Blob batch leaves
 those writers open and retryable. Ordinary `publish` remains an immediate
-singleton operation.
+singleton-representation operation; Decision 0044's no-wait local group commit
+does not change the cryptographic batch contract.
 
 The store also implements durable proof/pending/material paging, exact guarded
 range reads, per-peer attempts and receipts, proof-before-compact ordering,

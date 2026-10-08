@@ -17,10 +17,14 @@ use aster_redb_store::{CustodyRetirementReason, MAX_EVENT_PENDING_DELIVERIES};
 use connectrpc::{
     ConnectError, ErrorCode, RequestContext, Response, ServiceRequest, ServiceResult, ServiceStream,
 };
+use futures::StreamExt as _;
 
 use crate::{
     MAX_AGENT_RESPONSE_PROTO_BYTES, MAX_STREAM_BACKOFF_MS, MIN_STREAM_BACKOFF_MS, api,
-    error::{PublicOperation, connect_application_error, public_error},
+    error::{
+        PublicOperation, connect_application_error, public_application_error_detail, public_error,
+        public_error_detail,
+    },
 };
 
 use api::AsterApplicationServiceExt as _;
@@ -29,6 +33,7 @@ const APPLICATION_SERVICE_NAME: &str = api::ASTER_APPLICATION_SERVICE_SERVICE_NA
 const PROFILE_EVENT_OPERATION_WARNING: u64 = 512;
 const PROFILE_EVENT_OPERATION_BOUNDARY: u64 = 1_024;
 const PROFILE_EVENT_PENDING_DELIVERY_BOUNDARY: u64 = 256;
+const PUBLISH_EVENTS_WINDOW: usize = 8;
 
 /// High-level ConnectRPC service backed by the running node's sole authority.
 #[derive(Clone)]
@@ -112,6 +117,11 @@ pub(crate) fn rejection_router() -> connectrpc::Router {
             APPLICATION_SERVICE_NAME,
             "PublishEvent",
             rejection_handler::<api::PublishEventRequest, api::PublishEventResponse>(),
+        )
+        .route_bidi_stream(
+            APPLICATION_SERVICE_NAME,
+            "PublishEvents",
+            rejection_handler::<api::PublishEventsRequest, api::PublishEventsResponse>(),
         )
         .route_bidi_stream(
             APPLICATION_SERVICE_NAME,
@@ -234,6 +244,62 @@ impl api::AsterApplicationService for AsterConnectService {
             .await
             .map_err(connect_application_error)?;
         bounded_response(publish_response(result), PublicOperation::PublishEvent)
+    }
+
+    async fn publish_events(
+        &self,
+        ctx: RequestContext,
+        requests: connectrpc::InboundStream<api::PublishEventsRequest>,
+    ) -> ServiceResult<ServiceStream<api::PublishEventsResponse>> {
+        if ctx.protocol() == Some(connectrpc::Protocol::GrpcWeb) {
+            return Err(public_error(
+                ErrorCode::Unimplemented,
+                api::PublicErrorReason::UnsupportedValue,
+                PublicOperation::PublishEvents,
+                false,
+                None,
+            ));
+        }
+        let events = self.events.clone();
+        let responses = requests
+            .map(move |request| {
+                let events = events.clone();
+                async move {
+                    let request = request?.to_owned_message();
+                    let response = match stream_publication_request(request) {
+                        Ok((request, options)) => {
+                            match events.publish_with_options(request, options).await {
+                                Ok(published) => api::PublishEventsResponse {
+                                    outcome: Some(
+                                        api::publish_events_response::Outcome::Published(Box::new(
+                                            publish_response(published),
+                                        )),
+                                    ),
+                                    ..Default::default()
+                                },
+                                Err(error) => api::PublishEventsResponse {
+                                    outcome: Some(api::publish_events_response::Outcome::Failure(
+                                        Box::new(public_application_error_detail(
+                                            error,
+                                            PublicOperation::PublishEvents,
+                                        )),
+                                    )),
+                                    ..Default::default()
+                                },
+                            }
+                        }
+                        Err(failure) => api::PublishEventsResponse {
+                            outcome: Some(api::publish_events_response::Outcome::Failure(
+                                Box::new(failure),
+                            )),
+                            ..Default::default()
+                        },
+                    };
+                    bounded_message(response, PublicOperation::PublishEvents)
+                }
+            })
+            .buffered(PUBLISH_EVENTS_WINDOW);
+        Response::stream_ok(responses)
     }
 
     async fn begin_event_publication_session(
@@ -732,6 +798,64 @@ fn publish_request(request: api::PublishEventRequest) -> Result<EventPublishRequ
     })
 }
 
+fn stream_publication_request(
+    request: api::PublishEventsRequest,
+) -> Result<(EventPublishRequest, EventPublishOptions), api::PublicErrorDetail> {
+    let operation = PublicOperation::PublishEvents;
+    let malformed = || {
+        public_error_detail(
+            api::PublicErrorReason::MalformedInput,
+            operation,
+            false,
+            None,
+        )
+    };
+    let unsupported = || {
+        public_error_detail(
+            api::PublicErrorReason::UnsupportedValue,
+            operation,
+            false,
+            None,
+        )
+    };
+    let request = request.publication.into_option().ok_or_else(malformed)?;
+    let options = match request.ttl_ms {
+        None => EventPublishOptions::durable(),
+        Some(_) if request.tombstone => return Err(malformed()),
+        Some(ttl_ms) => EventPublishOptions::finite_ttl_ms(ttl_ms).map_err(|_| malformed())?,
+    };
+    let predecessor = request
+        .predecessor_id
+        .as_deref()
+        .map(|value| {
+            value
+                .try_into()
+                .map(EventId::from_bytes)
+                .map_err(|_| malformed())
+        })
+        .transpose()?;
+    let priority = match request.priority.as_known() {
+        Some(api::Priority::Routine) => NodePriority::Routine,
+        Some(api::Priority::Priority) => NodePriority::Priority,
+        Some(api::Priority::Immediate) => NodePriority::Immediate,
+        Some(api::Priority::Flash) => NodePriority::Flash,
+        Some(api::Priority::Unspecified) | None => return Err(unsupported()),
+    };
+    Ok((
+        EventPublishRequest {
+            operation_key: request.operation_key,
+            predecessor,
+            topic: Topic::new(request.topic).map_err(|_| malformed())?,
+            scope: Scope::new(request.scope).map_err(|_| malformed())?,
+            priority,
+            logical_key: request.logical_key,
+            payload: request.payload,
+            tombstone: request.tombstone,
+        },
+        options,
+    ))
+}
+
 fn query_request(request: api::QueryEventsRequest) -> Result<EventQuery, ConnectError> {
     let operation = PublicOperation::QueryEvents;
     Ok(EventQuery {
@@ -1130,6 +1254,8 @@ mod tests {
     use aster_redb_store::{AggregateStoreUsage, StoreLimits};
 
     use super::*;
+    #[cfg(all(feature = "client", feature = "server"))]
+    use crate::sdk::PipelinedEventPublisher;
     #[cfg(all(feature = "client", feature = "server"))]
     use crate::{BoundAgent, ClientToken};
     use crate::{api, error::PublicOperation};
@@ -1612,6 +1738,289 @@ mod tests {
             assert_eq!(audit.state, expected_state);
             assert_eq!((audit.scanned, audit.total), (scanned, total));
         }
+    }
+
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[test]
+    fn publish_events_preserves_order_and_keeps_item_failures_in_band_over_http2() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let state = TestState::new();
+            let mission = UnprotectedReferenceMission::from_bytes(
+                include_bytes!("../../../bindings/testdata/non-production-provisioning.bundle")
+                    .to_vec(),
+            )
+            .expect("load disposable public test mission");
+            let node = start_node(NodeConfig {
+                state: state.0.clone(),
+                bind: "127.0.0.1:0".parse().expect("mesh bind"),
+                mission,
+                peers: Vec::new(),
+                mutable_interests: MutableSourceInterests::default(),
+                sync_interval: Duration::from_millis(50),
+                run_for: None,
+                application: NodeApplication::Relay,
+            })
+            .await
+            .expect("start real selected node");
+
+            let agent = BoundAgent::bind("127.0.0.1:0".parse().expect("agent bind"))
+                .await
+                .expect("bind agent");
+            let address = agent.local_addr().expect("agent address");
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            let token = ClientToken::from_bytes(TEST_TOKEN.to_vec()).expect("valid test token");
+            let server = tokio::spawn(agent.serve(node.selected_events(), token, shutdown_rx));
+            let base_uri = format!("http://{address}");
+
+            for (protocol_index, protocol) in
+                [Protocol::Connect, Protocol::Grpc].into_iter().enumerate()
+            {
+                let transport =
+                    Http2Connection::connect_plaintext(base_uri.parse().expect("HTTP/2 URI"))
+                        .await
+                        .expect("connect HTTP/2 transport")
+                        .shared(8);
+                let client = api::AsterApplicationServiceClient::new(
+                    transport,
+                    ClientConfig::new(base_uri.parse().expect("client URI"))
+                        .with_protocol(protocol)
+                        .with_default_header(
+                            "authorization",
+                            format!("Bearer {}", String::from_utf8_lossy(TEST_TOKEN)),
+                        ),
+                );
+                let mut stream = client
+                    .publish_events()
+                    .await
+                    .expect("open publication stream");
+                let valid = |suffix: u8| api::PublishEventsRequest {
+                    publication: api::PublishEventRequest {
+                        operation_key: format!("publish-events/{protocol_index}/{suffix}")
+                            .into_bytes(),
+                        topic: "chat.events".to_owned(),
+                        scope: "mission/team/alpha".to_owned(),
+                        priority: api::Priority::Routine.into(),
+                        logical_key: vec![suffix],
+                        payload: vec![suffix],
+                        ..Default::default()
+                    }
+                    .into(),
+                    ..Default::default()
+                };
+                stream.send(valid(1)).await.expect("send first publication");
+                stream
+                    .send(api::PublishEventsRequest {
+                        publication: api::PublishEventRequest {
+                            operation_key: b"must-not-be-echoed".to_vec(),
+                            topic: "non canonical secret topic".to_owned(),
+                            scope: "mission/team/alpha".to_owned(),
+                            priority: api::Priority::Routine.into(),
+                            payload: b"must-not-be-echoed".to_vec(),
+                            ..Default::default()
+                        }
+                        .into(),
+                        ..Default::default()
+                    })
+                    .await
+                    .expect("send malformed publication");
+                stream
+                    .send(api::PublishEventsRequest {
+                        publication: api::PublishEventRequest {
+                            operation_key: format!("publish-events/{protocol_index}/1")
+                                .into_bytes(),
+                            topic: "chat.events".to_owned(),
+                            scope: "mission/team/alpha".to_owned(),
+                            priority: api::Priority::Routine.into(),
+                            logical_key: vec![1],
+                            payload: b"changed intent".to_vec(),
+                            ..Default::default()
+                        }
+                        .into(),
+                        ..Default::default()
+                    })
+                    .await
+                    .expect("send conflicting publication");
+                stream
+                    .send(valid(2))
+                    .await
+                    .expect("send trailing publication");
+                stream.close_send();
+
+                let first = stream
+                    .message::<api::PublishEventsResponse>()
+                    .await
+                    .expect("first response")
+                    .expect("first item")
+                    .to_owned_message();
+                let second = stream
+                    .message::<api::PublishEventsResponse>()
+                    .await
+                    .expect("second response")
+                    .expect("second item")
+                    .to_owned_message();
+                let third = stream
+                    .message::<api::PublishEventsResponse>()
+                    .await
+                    .expect("third response")
+                    .expect("third item")
+                    .to_owned_message();
+                let fourth = stream
+                    .message::<api::PublishEventsResponse>()
+                    .await
+                    .expect("fourth response")
+                    .expect("fourth item")
+                    .to_owned_message();
+                assert!(
+                    matches!(
+                        first.outcome,
+                        Some(api::publish_events_response::Outcome::Published(_))
+                    ),
+                    "first response: {first:?}"
+                );
+                let failure = match second.outcome {
+                    Some(api::publish_events_response::Outcome::Failure(failure)) => failure,
+                    other => panic!("expected ordered in-band failure, got {other:?}"),
+                };
+                assert_eq!(failure.reason, api::PublicErrorReason::MalformedInput);
+                assert_eq!(failure.operation, "publish_events");
+                assert!(!failure.retryable);
+                assert!(!format!("{failure:?}").contains("must-not-be-echoed"));
+                let conflict = match third.outcome {
+                    Some(api::publish_events_response::Outcome::Failure(failure)) => failure,
+                    other => panic!("expected ordered conflict failure, got {other:?}"),
+                };
+                assert_eq!(
+                    conflict.reason,
+                    api::PublicErrorReason::OperationKeyConflict
+                );
+                assert_eq!(conflict.operation, "publish_events");
+                assert!(!conflict.retryable);
+                assert!(matches!(
+                    fourth.outcome,
+                    Some(api::publish_events_response::Outcome::Published(_))
+                ));
+                assert!(
+                    stream
+                        .message::<api::PublishEventsResponse>()
+                        .await
+                        .expect("clean stream completion")
+                        .is_none()
+                );
+            }
+
+            let sdk_transport =
+                Http2Connection::connect_plaintext(base_uri.parse().expect("SDK HTTP/2 URI"))
+                    .await
+                    .expect("connect SDK HTTP/2 transport")
+                    .shared(8);
+            let sdk_client = api::AsterApplicationServiceClient::new(
+                sdk_transport,
+                ClientConfig::new(base_uri.parse().expect("SDK client URI"))
+                    .with_protocol(Protocol::Connect)
+                    .with_default_header(
+                        "authorization",
+                        format!("Bearer {}", String::from_utf8_lossy(TEST_TOKEN)),
+                    ),
+            );
+            let sdk = PipelinedEventPublisher::new(sdk_client, 2);
+            let sdk_responses = sdk
+                .publish_all(
+                    (0_u8..8)
+                        .map(|suffix| api::PublishEventRequest {
+                            operation_key: format!("publish-events/sdk/{suffix}").into_bytes(),
+                            topic: "chat.events".to_owned(),
+                            scope: "mission/team/alpha".to_owned(),
+                            priority: api::Priority::Routine.into(),
+                            logical_key: vec![suffix],
+                            payload: vec![suffix],
+                            ..Default::default()
+                        })
+                        .collect(),
+                )
+                .await
+                .expect("SDK pipelined publication");
+            assert_eq!(sdk_responses.len(), PUBLISH_EVENTS_WINDOW);
+            assert!(sdk_responses.into_iter().all(|response| matches!(
+                response.outcome,
+                Some(api::publish_events_response::Outcome::Published(_))
+            )));
+
+            let grpc_web_client = api::AsterApplicationServiceClient::new(
+                HttpClient::plaintext(),
+                ClientConfig::new(base_uri.parse().expect("gRPC-Web client URI"))
+                    .with_protocol(Protocol::GrpcWeb)
+                    .with_default_header(
+                        "authorization",
+                        format!("Bearer {}", String::from_utf8_lossy(TEST_TOKEN)),
+                    ),
+            );
+            let mut grpc_web_stream = grpc_web_client
+                .publish_events()
+                .await
+                .expect("gRPC-Web call initializes lazily");
+            let rejected_publication = api::PublishEventRequest {
+                operation_key: b"publish-events/grpc-web-rejected".to_vec(),
+                topic: "chat.events".to_owned(),
+                scope: "mission/team/alpha".to_owned(),
+                priority: api::Priority::Routine.into(),
+                logical_key: b"rejected-then-fallback".to_vec(),
+                payload: b"same publication".to_vec(),
+                ..Default::default()
+            };
+            grpc_web_stream
+                .send(api::PublishEventsRequest {
+                    publication: rejected_publication.clone().into(),
+                    ..Default::default()
+                })
+                .await
+                .expect("buffer rejected gRPC-Web request");
+            grpc_web_stream.close_send();
+            let grpc_web_error = grpc_web_stream
+                .message::<api::PublishEventsResponse>()
+                .await
+                .expect_err("gRPC-Web request streaming must fail closed");
+            assert_eq!(grpc_web_error.code, ErrorCode::Unimplemented);
+
+            let fallback_requests =
+                std::iter::once(rejected_publication).chain((1_u8..8).map(|suffix| {
+                    api::PublishEventRequest {
+                        operation_key: format!("publish-events/grpc-web-fallback/{suffix}")
+                            .into_bytes(),
+                        topic: "chat.events".to_owned(),
+                        scope: "mission/team/alpha".to_owned(),
+                        priority: api::Priority::Routine.into(),
+                        logical_key: vec![suffix],
+                        payload: vec![suffix],
+                        ..Default::default()
+                    }
+                }));
+            let fallback = futures::stream::iter(fallback_requests)
+                .map(|request| {
+                    let client = grpc_web_client.clone();
+                    async move { client.publish_event(request).await }
+                })
+                .buffered(PUBLISH_EVENTS_WINDOW)
+                .collect::<Vec<_>>()
+                .await;
+            assert_eq!(fallback.len(), PUBLISH_EVENTS_WINDOW);
+            assert!(fallback.into_iter().all(|result| {
+                result
+                    .map(|response| response.into_owned().inserted)
+                    .unwrap_or(false)
+            }));
+
+            shutdown_tx.send(true).expect("request agent shutdown");
+            tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .expect("agent shutdown timeout")
+                .expect("agent task")
+                .expect("agent serve");
+            node.shutdown().await.expect("node shutdown");
+        });
     }
 
     #[cfg(all(feature = "client", feature = "server"))]

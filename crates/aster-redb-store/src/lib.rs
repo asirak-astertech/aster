@@ -2807,6 +2807,79 @@ pub enum EventOnceOutcome {
     },
 }
 
+/// One ordinary Event publication attempt paired with its exact durable writer count.
+///
+/// The result may be an error after a policy-significant custody transition or
+/// permanent retirement fence was deliberately committed. Callers can retry
+/// or report the failure without losing that durable side effect from their
+/// writer diagnostics.
+pub struct EventOnceCommitAttempt {
+    result: Result<EventOnceOutcome, StoreError>,
+    writer_commits: u64,
+}
+
+impl EventOnceCommitAttempt {
+    /// Returns the exact number of redb writer transactions committed.
+    pub const fn writer_commits(&self) -> u64 {
+        self.writer_commits
+    }
+
+    /// Consumes the attempt and returns its publication outcome or exact error.
+    pub fn into_result(self) -> Result<EventOnceOutcome, StoreError> {
+        self.result
+    }
+}
+
+/// One already-reserved, source-verified ordinary Event operation prepared for
+/// an ordered durable group commit.
+pub struct ReservedEventOnceCommit<'a> {
+    request: &'a EventOperationRequest<'a>,
+    reservation: &'a EventReservation,
+    event: &'a ContentVerifiedEventEnvelope,
+    sealed: &'a [u8],
+}
+
+impl<'a> ReservedEventOnceCommit<'a> {
+    /// Binds one operation request to its exact reservation and verified bytes.
+    pub const fn new(
+        request: &'a EventOperationRequest<'a>,
+        reservation: &'a EventReservation,
+        event: &'a ContentVerifiedEventEnvelope,
+        sealed: &'a [u8],
+    ) -> Self {
+        Self {
+            request,
+            reservation,
+            event,
+            sealed,
+        }
+    }
+}
+
+/// Ordered outcomes and exact redb writer-commit count for one Event cohort.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventGroupCommitOutcome {
+    outcomes: Vec<EventOnceOutcome>,
+    writer_commits: u64,
+}
+
+impl EventGroupCommitOutcome {
+    /// Returns outcomes in the same order as the submitted cohort.
+    pub fn outcomes(&self) -> &[EventOnceOutcome] {
+        &self.outcomes
+    }
+
+    /// Returns the exact number of redb writer transactions committed.
+    pub const fn writer_commits(&self) -> u64 {
+        self.writer_commits
+    }
+
+    /// Consumes the group result and returns its ordered per-Event outcomes.
+    pub fn into_outcomes(self) -> Vec<EventOnceOutcome> {
+        self.outcomes
+    }
+}
+
 /// Stable resolution of one durable Event operation mapping.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EventOperationResolution {
@@ -4744,6 +4817,12 @@ enum EventCommitResult {
         result: NumberedEventResult,
         inserted: bool,
     },
+}
+
+enum PreparedEventStage {
+    NoCommit(EventCommitResult),
+    Commit(EventCommitResult),
+    CommitError(StoreError),
 }
 
 impl EventCommitResult {
@@ -8043,6 +8122,24 @@ impl Store {
         self.reserve_event_internal(publisher, topic, scope, Some(predecessor), Some(policy))
     }
 
+    /// Derives ordered local Event reservations from one exact durable snapshot.
+    ///
+    /// Every entry corresponds to the same publisher/topic/scope stream.  An
+    /// optional semantic predecessor augments only that entry's causal context.
+    /// Later reservations observe the preceding reserved local dot, exactly as
+    /// if each earlier Event had committed before the next reservation.
+    pub fn reserve_event_group_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        publisher: NodeId,
+        topic: &Topic,
+        scope: &Scope,
+        predecessors: &[Option<EventSemanticId>],
+    ) -> Result<Vec<EventReservation>, StoreError> {
+        self.require_live()?;
+        self.reserve_event_group_internal(publisher, topic, scope, predecessors, Some(policy))
+    }
+
     fn reserve_event_internal(
         &self,
         publisher: NodeId,
@@ -8051,6 +8148,32 @@ impl Store {
         predecessor: Option<EventSemanticId>,
         expected_policy: Option<&ControlPolicySnapshot>,
     ) -> Result<EventReservation, StoreError> {
+        self.reserve_event_group_internal(
+            publisher,
+            topic,
+            scope,
+            std::slice::from_ref(&predecessor),
+            expected_policy,
+        )?
+        .pop()
+        .ok_or(StoreError::SemanticInvariant(
+            "singleton Event reservation produced no result",
+        ))
+    }
+
+    fn reserve_event_group_internal(
+        &self,
+        publisher: NodeId,
+        topic: &Topic,
+        scope: &Scope,
+        predecessors: &[Option<EventSemanticId>],
+        expected_policy: Option<&ControlPolicySnapshot>,
+    ) -> Result<Vec<EventReservation>, StoreError> {
+        if predecessors.is_empty() {
+            return Err(StoreError::InvalidSemanticEvent(
+                "Event reservation group is empty",
+            ));
+        }
         let authority = self.require_bound_mission()?;
         let read = self.database.begin_read()?;
         let control_policy = match expected_policy {
@@ -8070,24 +8193,13 @@ impl Store {
         let previous_counter = publisher_high_water
             .get(publisher.as_slice())?
             .map_or(0, |value| value.value());
-        let counter = previous_counter
-            .checked_add(1)
-            .ok_or(StoreError::InvalidSemanticEvent(
-                "publisher causal counter is exhausted",
-            ))?;
         let stream = event_stream_key(publisher, topic, scope)?;
         let previous_event_sequence = event_high_water
             .get(stream.as_slice())?
             .map_or(0, |value| value.value());
-        let event_sequence =
-            previous_event_sequence
-                .checked_add(1)
-                .ok_or(StoreError::InvalidSemanticEvent(
-                    "publisher Event sequence is exhausted",
-                ))?;
 
         let prefix = event_domain_prefix(topic, scope)?;
-        let mut context = VersionVector::default();
+        let mut base_context = VersionVector::default();
         let mut direct_publishers = 0usize;
         for row in frontier.iter()? {
             let (key, value) = row?;
@@ -8117,58 +8229,86 @@ impl Store {
                     "causal frontier contains a zero counter",
                 ));
             }
-            context.observe(Dot {
+            base_context.observe(Dot {
                 publisher: context_publisher,
                 counter: context_counter,
             });
         }
-        if context.counter(&publisher) == 0 && direct_publishers == MAX_CAUSAL_CONTEXT_ENTRIES {
+        if base_context.counter(&publisher) == 0 && direct_publishers == MAX_CAUSAL_CONTEXT_ENTRIES
+        {
             return Err(StoreError::InvalidSemanticEvent(
                 "causal frontier publisher limit reached",
             ));
         }
 
-        if let Some(predecessor) = predecessor {
-            let semantic_items = read.open_table(SEMANTIC_ITEMS)?;
-            let predecessor_transfer = semantic_items
-                .get(predecessor.as_bytes().as_slice())?
-                .map(|value| parse_transfer_id("semantic item table", value.value()))
-                .transpose()?
-                .ok_or(StoreError::MissingReactionPredecessor {
-                    semantic_id: predecessor,
-                })?;
-            let events = read.open_table(EVENTS)?;
-            let predecessor_metadata = events
-                .get(predecessor_transfer.as_bytes().as_slice())?
-                .map(|value| decode_event_metadata(value.value()))
-                .transpose()?
-                .ok_or(StoreError::MissingReactionPredecessor {
-                    semantic_id: predecessor,
-                })?;
-            let predecessor_dot = predecessor_metadata.header.stamp.dot;
-            if context.counter(&predecessor_dot.publisher) < predecessor_dot.counter {
-                if context.counter(&predecessor_dot.publisher) == 0
-                    && context.len() == MAX_CAUSAL_CONTEXT_ENTRIES
-                {
-                    return Err(StoreError::InvalidSemanticEvent(
-                        "reaction context exceeds the proven context bound",
-                    ));
-                }
-                context.observe(predecessor_dot);
+        let semantic_items = read.open_table(SEMANTIC_ITEMS)?;
+        let events = read.open_table(EVENTS)?;
+        let mut reservations = Vec::with_capacity(predecessors.len());
+        let mut preceding_counter = previous_counter;
+        let mut preceding_event_sequence = previous_event_sequence;
+        for predecessor in predecessors.iter().copied() {
+            let counter =
+                preceding_counter
+                    .checked_add(1)
+                    .ok_or(StoreError::InvalidSemanticEvent(
+                        "publisher causal counter is exhausted",
+                    ))?;
+            let event_sequence =
+                preceding_event_sequence
+                    .checked_add(1)
+                    .ok_or(StoreError::InvalidSemanticEvent(
+                        "publisher Event sequence is exhausted",
+                    ))?;
+            let mut context = base_context.clone();
+            if preceding_counter > previous_counter {
+                context.observe(Dot {
+                    publisher,
+                    counter: preceding_counter,
+                });
             }
-        }
+            if let Some(predecessor) = predecessor {
+                let predecessor_transfer = semantic_items
+                    .get(predecessor.as_bytes().as_slice())?
+                    .map(|value| parse_transfer_id("semantic item table", value.value()))
+                    .transpose()?
+                    .ok_or(StoreError::MissingReactionPredecessor {
+                        semantic_id: predecessor,
+                    })?;
+                let predecessor_metadata = events
+                    .get(predecessor_transfer.as_bytes().as_slice())?
+                    .map(|value| decode_event_metadata(value.value()))
+                    .transpose()?
+                    .ok_or(StoreError::MissingReactionPredecessor {
+                        semantic_id: predecessor,
+                    })?;
+                let predecessor_dot = predecessor_metadata.header.stamp.dot;
+                if context.counter(&predecessor_dot.publisher) < predecessor_dot.counter {
+                    if context.counter(&predecessor_dot.publisher) == 0
+                        && context.len() == MAX_CAUSAL_CONTEXT_ENTRIES
+                    {
+                        return Err(StoreError::InvalidSemanticEvent(
+                            "reaction context exceeds the proven context bound",
+                        ));
+                    }
+                    context.observe(predecessor_dot);
+                }
+            }
 
-        Ok(EventReservation {
-            control_policy,
-            publisher,
-            topic: topic.clone(),
-            scope: scope.clone(),
-            previous_counter,
-            counter,
-            previous_event_sequence,
-            event_sequence,
-            context,
-        })
+            reservations.push(EventReservation {
+                control_policy,
+                publisher,
+                topic: topic.clone(),
+                scope: scope.clone(),
+                previous_counter: preceding_counter,
+                counter,
+                previous_event_sequence: preceding_event_sequence,
+                event_sequence,
+                context,
+            });
+            preceding_counter = counter;
+            preceding_event_sequence = event_sequence;
+        }
+        Ok(reservations)
     }
 
     /// Derives the next local State dot and topic/scope causal context from the
@@ -9305,20 +9445,48 @@ impl Store {
         event: &ContentVerifiedEventEnvelope,
         sealed: &[u8],
     ) -> Result<EventOnceOutcome, StoreError> {
-        self.require_live()?;
-        if policy != &reservation.control_policy {
-            return Err(StoreError::ControlPolicyChanged);
+        self.commit_reserved_event_once_with_policy_observed(
+            policy,
+            request,
+            reservation,
+            event,
+            sealed,
+        )
+        .into_result()
+    }
+
+    /// Commits one idempotent local Event operation and reports every writer
+    /// transaction, including one that commits before returning an error.
+    pub fn commit_reserved_event_once_with_policy_observed(
+        &self,
+        policy: &ControlPolicySnapshot,
+        request: &EventOperationRequest<'_>,
+        reservation: &EventReservation,
+        event: &ContentVerifiedEventEnvelope,
+        sealed: &[u8],
+    ) -> EventOnceCommitAttempt {
+        let mut writer_commits = 0u64;
+        let result = (|| {
+            self.require_live()?;
+            if policy != &reservation.control_policy {
+                return Err(StoreError::ControlPolicyChanged);
+            }
+            let prepared = PreparedEvent::from_verified(event, sealed, EventOrigin::Local)?;
+            let operation = prepare_event_operation(request, event, &prepared.header)?;
+            let committed = self.commit_prepared_event_counted(
+                &prepared,
+                Some(reservation),
+                Some(PendingEventOperation::Legacy(operation)),
+                EventAdmissionGuard::Control(policy),
+                None,
+                &mut writer_commits,
+            )?;
+            event_once_outcome(committed)
+        })();
+        EventOnceCommitAttempt {
+            result,
+            writer_commits,
         }
-        let prepared = PreparedEvent::from_verified(event, sealed, EventOrigin::Local)?;
-        let operation = prepare_event_operation(request, event, &prepared.header)?;
-        let committed = self.commit_prepared_event(
-            &prepared,
-            Some(reservation),
-            Some(PendingEventOperation::Legacy(operation)),
-            EventAdmissionGuard::Control(policy),
-            None,
-        )?;
-        event_once_outcome(committed)
     }
 
     /// Atomically commits one local finite Event operation and establishes its
@@ -9333,25 +9501,160 @@ impl Store {
         event: &ContentVerifiedEventEnvelope,
         sealed: &[u8],
     ) -> Result<EventOnceOutcome, StoreError> {
-        self.require_live()?;
-        if policy != &reservation.control_policy {
-            return Err(StoreError::ControlPolicyChanged);
+        self.commit_reserved_event_once_with_custody_policy_observed(
+            policy,
+            custody,
+            request,
+            reservation,
+            event,
+            sealed,
+        )
+        .into_result()
+    }
+
+    /// Commits one finite local Event operation and reports every writer
+    /// transaction, including a continuity transition or retirement fence
+    /// committed before the returned error.
+    pub fn commit_reserved_event_once_with_custody_policy_observed(
+        &self,
+        policy: &ControlPolicySnapshot,
+        custody: LocalCustodyCheckpoint,
+        request: &EventOperationRequest<'_>,
+        reservation: &EventReservation,
+        event: &ContentVerifiedEventEnvelope,
+        sealed: &[u8],
+    ) -> EventOnceCommitAttempt {
+        let mut writer_commits = 0u64;
+        let result = (|| {
+            self.require_live()?;
+            if policy != &reservation.control_policy {
+                return Err(StoreError::ControlPolicyChanged);
+            }
+            let prepared =
+                PreparedEvent::from_verified_with_custody(event, sealed, EventOrigin::Local)?;
+            let operation = prepare_event_operation(request, event, &prepared.header)?;
+            let committed = self.commit_prepared_event_counted(
+                &prepared,
+                Some(reservation),
+                Some(PendingEventOperation::Legacy(operation)),
+                EventAdmissionGuard::Control(policy),
+                Some(PendingEventCustody {
+                    expected_policy: custody.policy_revision,
+                    authenticated_age_ms: 0,
+                    sample: Some(custody.sample),
+                }),
+                &mut writer_commits,
+            )?;
+            event_once_outcome(committed)
+        })();
+        EventOnceCommitAttempt {
+            result,
+            writer_commits,
         }
-        let prepared =
-            PreparedEvent::from_verified_with_custody(event, sealed, EventOrigin::Local)?;
-        let operation = prepare_event_operation(request, event, &prepared.header)?;
-        let committed = self.commit_prepared_event(
-            &prepared,
-            Some(reservation),
-            Some(PendingEventOperation::Legacy(operation)),
-            EventAdmissionGuard::Control(policy),
+    }
+
+    /// Atomically commits an ordered cohort of durable ordinary Event operations.
+    pub fn commit_reserved_event_group_once_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        commits: &[ReservedEventOnceCommit<'_>],
+    ) -> Result<EventGroupCommitOutcome, StoreError> {
+        self.commit_reserved_event_group_once_internal(policy, None, commits)
+    }
+
+    /// Atomically commits an ordered cohort of finite ordinary Event operations
+    /// under one common commit-adjacent custody checkpoint.
+    pub fn commit_reserved_event_group_once_with_custody_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        custody: LocalCustodyCheckpoint,
+        commits: &[ReservedEventOnceCommit<'_>],
+    ) -> Result<EventGroupCommitOutcome, StoreError> {
+        self.commit_reserved_event_group_once_internal(
+            policy,
             Some(PendingEventCustody {
                 expected_policy: custody.policy_revision,
                 authenticated_age_ms: 0,
                 sample: Some(custody.sample),
             }),
-        )?;
-        event_once_outcome(committed)
+            commits,
+        )
+    }
+
+    fn commit_reserved_event_group_once_internal(
+        &self,
+        policy: &ControlPolicySnapshot,
+        custody: Option<PendingEventCustody>,
+        commits: &[ReservedEventOnceCommit<'_>],
+    ) -> Result<EventGroupCommitOutcome, StoreError> {
+        self.require_live()?;
+        let first = commits.first().ok_or(StoreError::InvalidSemanticEvent(
+            "Event commit group is empty",
+        ))?;
+        let cohort = (
+            first.reservation.publisher,
+            &first.reservation.topic,
+            &first.reservation.scope,
+        );
+        let mut prepared = Vec::with_capacity(commits.len());
+        for item in commits {
+            if policy != &item.reservation.control_policy {
+                return Err(StoreError::ControlPolicyChanged);
+            }
+            if item.reservation.publisher != cohort.0
+                || &item.reservation.topic != cohort.1
+                || &item.reservation.scope != cohort.2
+            {
+                return Err(StoreError::InvalidSemanticEvent(
+                    "Event commit group crosses a publisher, topic, or scope boundary",
+                ));
+            }
+            let event = match custody {
+                Some(_) => PreparedEvent::from_verified_with_custody(
+                    item.event,
+                    item.sealed,
+                    EventOrigin::Local,
+                )?,
+                None => PreparedEvent::from_verified(item.event, item.sealed, EventOrigin::Local)?,
+            };
+            self.require_mission_authority(event.mission_authority)?;
+            let operation = prepare_event_operation(item.request, item.event, &event.header)?;
+            prepared.push((event, operation, item.reservation));
+        }
+
+        let write = self.database.begin_write()?;
+        enforce_live_write(&write)?;
+        let mut outcomes = Vec::with_capacity(prepared.len());
+        let mut commit_required = false;
+        for (event, operation, reservation) in &prepared {
+            match self.stage_prepared_event(
+                &write,
+                event,
+                Some(reservation),
+                Some(PendingEventOperation::Legacy(*operation)),
+                EventAdmissionGuard::Control(policy),
+                custody,
+            )? {
+                PreparedEventStage::NoCommit(outcome) => {
+                    outcomes.push(event_once_outcome(outcome)?);
+                }
+                PreparedEventStage::Commit(outcome) => {
+                    commit_required = true;
+                    outcomes.push(event_once_outcome(outcome)?);
+                }
+                PreparedEventStage::CommitError(error) => return Err(error),
+            }
+        }
+        let writer_commits = if commit_required {
+            write.commit()?;
+            1
+        } else {
+            0
+        };
+        Ok(EventGroupCommitOutcome {
+            outcomes,
+            writer_commits,
+        })
     }
 
     /// Atomically commits one numbered local Event and its recoverable result.
@@ -10065,22 +10368,73 @@ impl Store {
         guard: EventAdmissionGuard<'_>,
         pending_custody: Option<PendingEventCustody>,
     ) -> Result<EventCommitResult, StoreError> {
+        let mut writer_commits = 0u64;
+        self.commit_prepared_event_counted(
+            prepared,
+            reservation,
+            operation,
+            guard,
+            pending_custody,
+            &mut writer_commits,
+        )
+    }
+
+    fn commit_prepared_event_counted(
+        &self,
+        prepared: &PreparedEvent,
+        reservation: Option<&EventReservation>,
+        operation: Option<PendingEventOperation<'_>>,
+        guard: EventAdmissionGuard<'_>,
+        pending_custody: Option<PendingEventCustody>,
+        writer_commits: &mut u64,
+    ) -> Result<EventCommitResult, StoreError> {
         self.require_mission_authority(prepared.mission_authority)?;
         let write = self.database.begin_write()?;
         enforce_live_write(&write)?;
-        enforce_event_policy_write(&write, prepared.mission_authority, guard, &prepared.header)?;
-        custody::require_custody_mission_write(&write, prepared.mission_authority)?;
+        match self.stage_prepared_event(
+            &write,
+            prepared,
+            reservation,
+            operation,
+            guard,
+            pending_custody,
+        )? {
+            PreparedEventStage::NoCommit(outcome) => Ok(outcome),
+            PreparedEventStage::Commit(outcome) => {
+                write.commit()?;
+                *writer_commits = 1;
+                Ok(outcome)
+            }
+            PreparedEventStage::CommitError(error) => {
+                write.commit()?;
+                *writer_commits = 1;
+                Err(error)
+            }
+        }
+    }
+
+    fn stage_prepared_event(
+        &self,
+        write: &redb::WriteTransaction,
+        prepared: &PreparedEvent,
+        reservation: Option<&EventReservation>,
+        operation: Option<PendingEventOperation<'_>>,
+        guard: EventAdmissionGuard<'_>,
+        pending_custody: Option<PendingEventCustody>,
+    ) -> Result<PreparedEventStage, StoreError> {
+        enforce_event_policy_write(write, prepared.mission_authority, guard, &prepared.header)?;
+        custody::require_custody_mission_write(write, prepared.mission_authority)?;
         let custody = pending_custody.unwrap_or(PendingEventCustody {
-            expected_policy: custody::policy_revision_write(&write)?,
+            expected_policy: custody::policy_revision_write(write)?,
             authenticated_age_ms: 0,
             sample: None,
         });
-        if custody::policy_revision_write(&write)? != custody.expected_policy {
+        if custody::policy_revision_write(write)? != custody.expected_policy {
             return Err(CustodyStoreError::PolicyChanged.into());
         }
         let custody_continuity = custody
             .sample
-            .map(|sample| custody::observe_continuity_write(&write, sample))
+            .map(|sample| custody::observe_continuity_write(write, sample))
             .transpose()?;
         let custody = PendingEventCustody {
             sample: custody_continuity
@@ -10088,11 +10442,12 @@ impl Store {
                 .or(custody.sample),
             ..custody
         };
-        if custody::policy_revision_write(&write)? != custody.expected_policy {
+        if custody::policy_revision_write(write)? != custody.expected_policy {
             // Persist a one-time clock transition even though the source
             // admission plan is now stale; no Event bytes have changed yet.
-            write.commit()?;
-            return Err(CustodyStoreError::PolicyChanged.into());
+            return Ok(PreparedEventStage::CommitError(
+                CustodyStoreError::PolicyChanged.into(),
+            ));
         }
 
         if write
@@ -10124,18 +10479,17 @@ impl Store {
                 PendingEventOperation::Numbered(operation) => {
                     if let numbered_event_operation::NumberedOperationResolution::Existing(result) =
                         numbered_event_operation::resolve_numbered_operation_write(
-                            &write, operation,
+                            write, operation,
                         )?
                     {
-                        write.commit()?;
-                        return Ok(EventCommitResult::Numbered {
+                        return Ok(PreparedEventStage::NoCommit(EventCommitResult::Numbered {
                             result,
                             inserted: false,
-                        });
+                        }));
                     }
                 }
                 PendingEventOperation::Legacy(operation) => {
-                    numbered_event_operation::legacy_operation_allowed_write(&write)?;
+                    numbered_event_operation::legacy_operation_allowed_write(write)?;
                     let fingerprint = event_operation::event_operation_fingerprint(
                         &prepared.mission_authority,
                         operation.key,
@@ -10160,45 +10514,53 @@ impl Store {
                                 if intent_digest != operation.intent_digest {
                                     return Err(StoreError::EventOperationConflict);
                                 }
-                                return Ok(EventCommitResult::RetiredOperation { reason });
+                                return Ok(PreparedEventStage::NoCommit(
+                                    EventCommitResult::RetiredOperation { reason },
+                                ));
                             }
                         };
                         if intent_digest != operation.intent_digest {
                             return Err(StoreError::EventOperationConflict);
                         }
-                        match custody::event_custody_authority_write(&write, transfer_id)? {
+                        match custody::event_custody_authority_write(write, transfer_id)? {
                             custody::EventCustodyAuthority::Retired { reason, .. } => {
-                                return Ok(EventCommitResult::RetiredOperation { reason });
+                                return Ok(PreparedEventStage::NoCommit(
+                                    EventCommitResult::RetiredOperation { reason },
+                                ));
                             }
                             custody::EventCustodyAuthority::Live { .. } => {}
                             custody::EventCustodyAuthority::Missing => {
                                 return Err(CustodyStoreError::AlreadyRetired.into());
                             }
                         }
-                        if let Some(stored) = load_event_from_write(&write, transfer_id)? {
-                            return Ok(EventCommitResult::Retained(EventCommit {
-                                transfer_id,
-                                semantic_id: stored.semantic_id,
-                                apply: ApplyOutcome::Duplicate {
-                                    acceptance_marker: stored.acceptance_marker,
+                        if let Some(stored) = load_event_from_write(write, transfer_id)? {
+                            return Ok(PreparedEventStage::NoCommit(EventCommitResult::Retained(
+                                EventCommit {
+                                    transfer_id,
+                                    semantic_id: stored.semantic_id,
+                                    apply: ApplyOutcome::Duplicate {
+                                        acceptance_marker: stored.acceptance_marker,
+                                    },
+                                    operation_existing: true,
+                                    retirement: None,
                                 },
-                                operation_existing: true,
-                                retirement: None,
-                            }));
+                            )));
                         }
                         let (semantic_id, acceptance_marker, reason) =
-                            custody::retired_event_receipt_write(&write, transfer_id)?.ok_or(
+                            custody::retired_event_receipt_write(write, transfer_id)?.ok_or(
                                 StoreError::SemanticInvariant(
                                     "Event operation points to missing live and retired authority",
                                 ),
                             )?;
-                        return Ok(EventCommitResult::Retained(EventCommit {
-                            transfer_id,
-                            semantic_id,
-                            apply: ApplyOutcome::Duplicate { acceptance_marker },
-                            operation_existing: true,
-                            retirement: Some(reason),
-                        }));
+                        return Ok(PreparedEventStage::NoCommit(EventCommitResult::Retained(
+                            EventCommit {
+                                transfer_id,
+                                semantic_id,
+                                apply: ApplyOutcome::Duplicate { acceptance_marker },
+                                operation_existing: true,
+                                retirement: Some(reason),
+                            },
+                        )));
                     }
                 }
             }
@@ -10257,7 +10619,7 @@ impl Store {
             });
         }
         if let Some(retired_route) =
-            custody::retired_route_semantic_write(&write, prepared.semantic_id.as_bytes())?
+            custody::retired_route_semantic_write(write, prepared.semantic_id.as_bytes())?
         {
             let retired_transfer = EventTransferId::new(retired_route.transfer_id());
             if retired_transfer == prepared.transfer_id {
@@ -10289,7 +10651,7 @@ impl Store {
                 acceptance_marker,
                 reason,
                 ..
-            } = custody::event_custody_authority_write(&write, accepted)?
+            } = custody::event_custody_authority_write(write, accepted)?
             {
                 let metadata = write
                     .open_table(EVENTS)?
@@ -10314,7 +10676,7 @@ impl Store {
                 }
                 if let Some(operation) = operation {
                     let numbered = admit_pending_event_operation_write(
-                        &write,
+                        write,
                         &prepared.mission_authority,
                         operation,
                         CommittedEventReceipt {
@@ -10326,26 +10688,26 @@ impl Store {
                         self.operation_limits,
                         prepared.header.tombstone,
                     )?;
-                    write.commit()?;
-                    return Ok(match numbered {
+                    return Ok(PreparedEventStage::Commit(match numbered {
                         Some(result) => EventCommitResult::Numbered {
                             result,
                             inserted: false,
                         },
                         None => EventCommitResult::RetiredOperation { reason },
-                    });
+                    }));
                 }
-                write.commit()?;
-                return Ok(EventCommitResult::Retained(EventCommit {
-                    transfer_id: accepted,
-                    semantic_id,
-                    apply: ApplyOutcome::Duplicate { acceptance_marker },
-                    operation_existing: false,
-                    retirement: Some(reason),
-                }));
+                return Ok(PreparedEventStage::Commit(EventCommitResult::Retained(
+                    EventCommit {
+                        transfer_id: accepted,
+                        semantic_id,
+                        apply: ApplyOutcome::Duplicate { acceptance_marker },
+                        operation_existing: false,
+                        retirement: Some(reason),
+                    },
+                )));
             }
             let stored =
-                load_event_from_write(&write, accepted)?.ok_or(StoreError::SemanticInvariant(
+                load_event_from_write(write, accepted)?.ok_or(StoreError::SemanticInvariant(
                     "semantic item index points to a missing Event representation",
                 ))?;
             if stored.semantic_id != prepared.semantic_id
@@ -10364,7 +10726,7 @@ impl Store {
             )?;
             if matches!(
                 custody::admit_event_custody_row_write(
-                    &write,
+                    write,
                     &custody_admission,
                     custody_continuity,
                     self.limits,
@@ -10376,7 +10738,7 @@ impl Store {
                 ));
             }
             purge_route_cache_semantic_claim(
-                &write,
+                write,
                 prepared.transfer_id,
                 prepared.semantic_id,
                 &prepared.header,
@@ -10384,7 +10746,7 @@ impl Store {
             )?;
             if let Some(operation) = operation {
                 let numbered = admit_pending_event_operation_write(
-                    &write,
+                    write,
                     &prepared.mission_authority,
                     operation,
                     CommittedEventReceipt {
@@ -10397,23 +10759,23 @@ impl Store {
                     prepared.header.tombstone,
                 )?;
                 if let Some(result) = numbered {
-                    write.commit()?;
-                    return Ok(EventCommitResult::Numbered {
+                    return Ok(PreparedEventStage::Commit(EventCommitResult::Numbered {
                         result,
                         inserted: false,
-                    });
+                    }));
                 }
             }
-            write.commit()?;
-            return Ok(EventCommitResult::Retained(EventCommit {
-                transfer_id: accepted,
-                semantic_id: prepared.semantic_id,
-                apply: ApplyOutcome::Duplicate {
-                    acceptance_marker: stored.acceptance_marker,
+            return Ok(PreparedEventStage::Commit(EventCommitResult::Retained(
+                EventCommit {
+                    transfer_id: accepted,
+                    semantic_id: prepared.semantic_id,
+                    apply: ApplyOutcome::Duplicate {
+                        acceptance_marker: stored.acceptance_marker,
+                    },
+                    operation_existing: false,
+                    retirement: None,
                 },
-                operation_existing: false,
-                retirement: None,
-            }));
+            )));
         }
 
         if let Some(reservation) = reservation {
@@ -10480,7 +10842,7 @@ impl Store {
         }
 
         ensure_frontier_capacity(
-            &write,
+            write,
             &prepared.header.topic,
             &prepared.header.scope,
             prepared.header.stamp.dot.publisher,
@@ -10523,7 +10885,7 @@ impl Store {
             prepared_event_custody_admission(prepared, false, custody, prospective_marker)?;
         if matches!(
             custody::admit_event_custody_row_write(
-                &write,
+                write,
                 &custody_admission,
                 custody_continuity,
                 self.limits,
@@ -10533,11 +10895,12 @@ impl Store {
             // The authenticated transfer is permanently fenced without ever
             // entering semantic visibility. Committing this narrow fence makes
             // exact replay stable while preserving all acceptance ledgers.
-            write.commit()?;
-            return Err(CustodyStoreError::AlreadyRetired.into());
+            return Ok(PreparedEventStage::CommitError(
+                CustodyStoreError::AlreadyRetired.into(),
+            ));
         }
         purge_route_cache_semantic_claim(
-            &write,
+            write,
             prepared.transfer_id,
             prepared.semantic_id,
             &prepared.header,
@@ -10546,7 +10909,7 @@ impl Store {
         let incoming = u64::try_from(prepared.sealed.len())
             .map_err(|_| StoreError::PayloadByteAccountingOverflow)?;
         custody::make_aggregate_capacity_write(
-            &write,
+            write,
             self.limits,
             custody::AggregateCapacityRequest {
                 usage: CustodyUsage {
@@ -10564,7 +10927,7 @@ impl Store {
             if prepared.header.tombstone {
                 require_aggregate_capacity(&metadata, self.limits, 1, incoming)?;
             } else {
-                require_ordinary_aggregate_capacity(&write, &metadata, self.limits, 1, incoming)?;
+                require_ordinary_aggregate_capacity(write, &metadata, self.limits, 1, incoming)?;
             }
             let semantic_items = metadata
                 .get(SEMANTIC_ITEM_COUNT)?
@@ -10629,7 +10992,7 @@ impl Store {
         )?;
 
         update_high_water(
-            &write,
+            write,
             prepared.header.stamp.dot.publisher,
             &prepared.header.topic,
             &prepared.header.scope,
@@ -10639,7 +11002,7 @@ impl Store {
 
         if let Some(operation) = operation {
             let numbered = admit_pending_event_operation_write(
-                &write,
+                write,
                 &prepared.mission_authority,
                 operation,
                 CommittedEventReceipt {
@@ -10652,24 +11015,23 @@ impl Store {
                 prepared.header.tombstone,
             )?;
             if let Some(result) = numbered {
-                write.commit()?;
-                return Ok(EventCommitResult::Numbered {
+                return Ok(PreparedEventStage::Commit(EventCommitResult::Numbered {
                     result,
                     inserted: true,
-                });
+                }));
             }
         }
-        write.commit()?;
-
-        Ok(EventCommitResult::Retained(EventCommit {
-            transfer_id: prepared.transfer_id,
-            semantic_id: prepared.semantic_id,
-            apply: ApplyOutcome::Inserted {
-                acceptance_marker: marker,
+        Ok(PreparedEventStage::Commit(EventCommitResult::Retained(
+            EventCommit {
+                transfer_id: prepared.transfer_id,
+                semantic_id: prepared.semantic_id,
+                apply: ApplyOutcome::Inserted {
+                    acceptance_marker: marker,
+                },
+                operation_existing: false,
+                retirement: None,
             },
-            operation_existing: false,
-            retirement: None,
-        }))
+        )))
     }
 
     /// Commits one locally sealed State against its optimistic durable reservation.
@@ -28138,6 +28500,926 @@ mod tests {
                 sequence: 1
             }) if source == publisher
         ));
+    }
+
+    #[test]
+    fn event_group_reservation_is_serial_equivalent_and_requires_unchanged_store() {
+        let file = TestFile::new("event-group-reservation");
+        let mut services = event_services(0x70);
+        let publisher = services.publisher.identity();
+        let store = Store::open_for_mission(&file.0, services.authority).expect("bound store");
+        let policy = store.control_policy_snapshot().expect("settled policy");
+
+        let predecessor_payload = b"cross-topic predecessor";
+        let predecessor_reservation = store
+            .reserve_event_with_policy(&policy, publisher, &event_topic(), &event_scope())
+            .expect("reserve predecessor");
+        let predecessor_header = predecessor_reservation
+            .header(
+                Priority::Immediate,
+                b"predecessor".to_vec(),
+                None,
+                predecessor_payload.len() as u64,
+                false,
+                1,
+            )
+            .expect("predecessor header");
+        let predecessor_sealed = services
+            .publisher
+            .seal_event(&predecessor_header, predecessor_payload)
+            .expect("seal predecessor");
+        let predecessor_event = content_event(&mut services.reader, &predecessor_sealed.bytes);
+        store
+            .commit_reserved_event_with_policy(
+                &policy,
+                &predecessor_reservation,
+                &predecessor_event,
+                &predecessor_sealed.bytes,
+            )
+            .expect("commit predecessor");
+        let predecessor = EventSemanticId::new(predecessor_event.item_id());
+
+        let reservations = store
+            .reserve_event_group_with_policy(
+                &policy,
+                publisher,
+                &reaction_topic(),
+                &event_scope(),
+                &[None, Some(predecessor), None],
+            )
+            .expect("reserve ordered group");
+        assert_eq!(reservations.len(), 3);
+        assert_eq!(reservations[0].counter(), 2);
+        assert_eq!(reservations[1].counter(), 3);
+        assert_eq!(reservations[2].counter(), 4);
+        assert_eq!(reservations[0].event_sequence(), 1);
+        assert_eq!(reservations[1].event_sequence(), 2);
+        assert_eq!(reservations[2].event_sequence(), 3);
+        assert!(reservations[1].context().observes(Dot {
+            publisher,
+            counter: reservations[0].counter(),
+        }));
+        assert!(reservations[1].context().observes(predecessor_event.dot()));
+        assert!(reservations[2].context().observes(Dot {
+            publisher,
+            counter: reservations[1].counter(),
+        }));
+
+        let intervening_payload = b"advance durable publisher state";
+        let intervening_reservation = store
+            .reserve_event_with_policy(&policy, publisher, &event_topic(), &event_scope())
+            .expect("reserve intervening Event");
+        let intervening_header = intervening_reservation
+            .header(
+                Priority::Immediate,
+                b"intervening".to_vec(),
+                None,
+                intervening_payload.len() as u64,
+                false,
+                1,
+            )
+            .expect("intervening header");
+        let intervening_sealed = services
+            .publisher
+            .seal_event(&intervening_header, intervening_payload)
+            .expect("seal intervening Event");
+        let intervening_event = content_event(&mut services.reader, &intervening_sealed.bytes);
+        store
+            .commit_reserved_event_with_policy(
+                &policy,
+                &intervening_reservation,
+                &intervening_event,
+                &intervening_sealed.bytes,
+            )
+            .expect("commit intervening Event");
+
+        let stale_payload = b"stale first group member";
+        let stale_header = reservations[0]
+            .header(
+                Priority::Immediate,
+                b"stale".to_vec(),
+                None,
+                stale_payload.len() as u64,
+                false,
+                1,
+            )
+            .expect("stale header");
+        let stale_sealed = services
+            .publisher
+            .seal_event(&stale_header, stale_payload)
+            .expect("seal stale Event");
+        let stale_event = content_event(&mut services.reader, &stale_sealed.bytes);
+        assert!(matches!(
+            store.commit_reserved_event_with_policy(
+                &policy,
+                &reservations[0],
+                &stale_event,
+                &stale_sealed.bytes,
+            ),
+            Err(StoreError::ReservationChanged)
+        ));
+    }
+
+    #[test]
+    fn event_group_commit_is_atomic_restart_idempotent_and_counts_one_writer() {
+        let file = TestFile::new("event-group-commit");
+        let mut services = event_services(0x72);
+        let publisher = services.publisher.identity();
+        let store = Store::open_for_mission(&file.0, services.authority).expect("bound store");
+        let policy = store.control_policy_snapshot().expect("settled policy");
+        let reservations = store
+            .reserve_event_group_with_policy(
+                &policy,
+                publisher,
+                &event_topic(),
+                &event_scope(),
+                &[None, None],
+            )
+            .expect("reserve commit group");
+
+        let first_payload = b"first grouped Event";
+        let first_header = reservations[0]
+            .header(
+                Priority::Immediate,
+                b"group/first".to_vec(),
+                None,
+                first_payload.len() as u64,
+                false,
+                1,
+            )
+            .expect("first header");
+        let first_intent = event_publication_intent(&first_header, first_payload);
+        let first_key = EventOperationKey::new(b"group/first/once".to_vec()).expect("first key");
+        let first_request =
+            EventOperationRequest::new(&first_key, &first_intent, first_payload, None)
+                .expect("first request");
+        let first_sealed = services
+            .publisher
+            .seal_event(&first_header, first_payload)
+            .expect("seal first");
+        let first_event = content_event(&mut services.reader, &first_sealed.bytes);
+
+        let second_payload = b"second grouped Event";
+        let second_header = reservations[1]
+            .header(
+                Priority::Routine,
+                b"group/second".to_vec(),
+                None,
+                second_payload.len() as u64,
+                false,
+                1,
+            )
+            .expect("second header");
+        let second_intent = event_publication_intent(&second_header, second_payload);
+        let second_key = EventOperationKey::new(b"group/second/once".to_vec()).expect("second key");
+        let second_request =
+            EventOperationRequest::new(&second_key, &second_intent, second_payload, None)
+                .expect("second request");
+        let second_sealed = services
+            .publisher
+            .seal_event(&second_header, second_payload)
+            .expect("seal second");
+        let second_event = content_event(&mut services.reader, &second_sealed.bytes);
+
+        let commits = [
+            ReservedEventOnceCommit::new(
+                &first_request,
+                &reservations[0],
+                &first_event,
+                &first_sealed.bytes,
+            ),
+            ReservedEventOnceCommit::new(
+                &second_request,
+                &reservations[1],
+                &second_event,
+                &second_sealed.bytes,
+            ),
+        ];
+        let committed = store
+            .commit_reserved_event_group_once_with_policy(&policy, &commits)
+            .expect("commit group");
+        assert_eq!(committed.writer_commits(), 1);
+        assert!(
+            committed
+                .outcomes()
+                .iter()
+                .all(|outcome| matches!(outcome, EventOnceOutcome::Inserted { .. }))
+        );
+        assert_eq!(store.event_stats().expect("group stats").events, 2);
+        drop(store);
+
+        let reopened = Store::open_for_mission(&file.0, services.authority).expect("reopen");
+        let retry_policy = reopened.control_policy_snapshot().expect("retry policy");
+        let retried = reopened
+            .commit_reserved_event_group_once_with_policy(&retry_policy, &commits)
+            .expect("retry exact group");
+        assert_eq!(retried.writer_commits(), 0);
+        assert!(
+            retried
+                .outcomes()
+                .iter()
+                .all(|outcome| matches!(outcome, EventOnceOutcome::Existing { .. }))
+        );
+        let next = reopened
+            .reserve_event_with_policy(&retry_policy, publisher, &event_topic(), &event_scope())
+            .expect("reserve after retry");
+        assert_eq!(next.counter(), 3);
+        assert_eq!(next.event_sequence(), 3);
+    }
+
+    #[test]
+    fn event_group_commit_duplicate_and_conflict_preserve_exact_operation_frontier() {
+        let duplicate_file = TestFile::new("event-group-duplicate");
+        let mut duplicate_services = event_services(0x73);
+        let duplicate_store =
+            Store::open_for_mission(&duplicate_file.0, duplicate_services.authority)
+                .expect("duplicate store");
+        let duplicate_policy = duplicate_store
+            .control_policy_snapshot()
+            .expect("duplicate policy");
+        let duplicate_reservation = duplicate_store
+            .reserve_event_group_with_policy(
+                &duplicate_policy,
+                duplicate_services.publisher.identity(),
+                &event_topic(),
+                &event_scope(),
+                &[None],
+            )
+            .expect("duplicate reservation")
+            .remove(0);
+        let duplicate_payload = b"same grouped operation";
+        let duplicate_header = duplicate_reservation
+            .header(
+                Priority::Immediate,
+                b"group/duplicate".to_vec(),
+                None,
+                duplicate_payload.len() as u64,
+                false,
+                1,
+            )
+            .expect("duplicate header");
+        let duplicate_intent = event_publication_intent(&duplicate_header, duplicate_payload);
+        let duplicate_key =
+            EventOperationKey::new(b"group/duplicate/once".to_vec()).expect("duplicate key");
+        let duplicate_request =
+            EventOperationRequest::new(&duplicate_key, &duplicate_intent, duplicate_payload, None)
+                .expect("duplicate request");
+        let duplicate_sealed = duplicate_services
+            .publisher
+            .seal_event(&duplicate_header, duplicate_payload)
+            .expect("seal duplicate");
+        let duplicate_event =
+            content_event(&mut duplicate_services.reader, &duplicate_sealed.bytes);
+        let duplicate_commits = [
+            ReservedEventOnceCommit::new(
+                &duplicate_request,
+                &duplicate_reservation,
+                &duplicate_event,
+                &duplicate_sealed.bytes,
+            ),
+            ReservedEventOnceCommit::new(
+                &duplicate_request,
+                &duplicate_reservation,
+                &duplicate_event,
+                &duplicate_sealed.bytes,
+            ),
+        ];
+        let duplicate_outcome = duplicate_store
+            .commit_reserved_event_group_once_with_policy(&duplicate_policy, &duplicate_commits)
+            .expect("commit duplicate group");
+        assert_eq!(duplicate_outcome.writer_commits(), 1);
+        assert!(matches!(
+            duplicate_outcome.outcomes(),
+            [
+                EventOnceOutcome::Inserted { .. },
+                EventOnceOutcome::Existing { .. }
+            ]
+        ));
+        let duplicate_next = duplicate_store
+            .reserve_event_with_policy(
+                &duplicate_policy,
+                duplicate_services.publisher.identity(),
+                &event_topic(),
+                &event_scope(),
+            )
+            .expect("reservation after duplicate");
+        assert_eq!(duplicate_next.counter(), 2);
+        assert_eq!(duplicate_next.event_sequence(), 2);
+
+        let conflict_file = TestFile::new("event-group-conflict");
+        let mut conflict_services = event_services(0x74);
+        let conflict_store = Store::open_for_mission(&conflict_file.0, conflict_services.authority)
+            .expect("conflict store");
+        let conflict_policy = conflict_store
+            .control_policy_snapshot()
+            .expect("conflict policy");
+        let conflict_reservations = conflict_store
+            .reserve_event_group_with_policy(
+                &conflict_policy,
+                conflict_services.publisher.identity(),
+                &event_topic(),
+                &event_scope(),
+                &[None, None],
+            )
+            .expect("conflict reservations");
+        let conflict_key =
+            EventOperationKey::new(b"group/conflict/once".to_vec()).expect("conflict key");
+        let first_payload = b"conflict first";
+        let first_header = conflict_reservations[0]
+            .header(
+                Priority::Immediate,
+                b"group/conflict/first".to_vec(),
+                None,
+                first_payload.len() as u64,
+                false,
+                1,
+            )
+            .expect("conflict first header");
+        let first_intent = event_publication_intent(&first_header, first_payload);
+        let first_request =
+            EventOperationRequest::new(&conflict_key, &first_intent, first_payload, None)
+                .expect("conflict first request");
+        let first_sealed = conflict_services
+            .publisher
+            .seal_event(&first_header, first_payload)
+            .expect("seal conflict first");
+        let first_event = content_event(&mut conflict_services.reader, &first_sealed.bytes);
+        let second_payload = b"conflict second";
+        let second_header = conflict_reservations[1]
+            .header(
+                Priority::Immediate,
+                b"group/conflict/second".to_vec(),
+                None,
+                second_payload.len() as u64,
+                false,
+                1,
+            )
+            .expect("conflict second header");
+        let second_intent = event_publication_intent(&second_header, second_payload);
+        let second_request =
+            EventOperationRequest::new(&conflict_key, &second_intent, second_payload, None)
+                .expect("conflict second request");
+        let second_sealed = conflict_services
+            .publisher
+            .seal_event(&second_header, second_payload)
+            .expect("seal conflict second");
+        let second_event = content_event(&mut conflict_services.reader, &second_sealed.bytes);
+        let conflict_commits = [
+            ReservedEventOnceCommit::new(
+                &first_request,
+                &conflict_reservations[0],
+                &first_event,
+                &first_sealed.bytes,
+            ),
+            ReservedEventOnceCommit::new(
+                &second_request,
+                &conflict_reservations[1],
+                &second_event,
+                &second_sealed.bytes,
+            ),
+        ];
+        assert!(matches!(
+            conflict_store
+                .commit_reserved_event_group_once_with_policy(&conflict_policy, &conflict_commits,),
+            Err(StoreError::EventOperationConflict)
+        ));
+        assert_eq!(
+            conflict_store
+                .event_stats()
+                .expect("rolled-back conflict stats")
+                .events,
+            0
+        );
+        let conflict_next = conflict_store
+            .reserve_event_with_policy(
+                &conflict_policy,
+                conflict_services.publisher.identity(),
+                &event_topic(),
+                &event_scope(),
+            )
+            .expect("reservation after conflict");
+        assert_eq!(conflict_next.counter(), 1);
+        assert_eq!(conflict_next.event_sequence(), 1);
+    }
+
+    #[test]
+    fn event_group_commit_finite_members_share_one_explicit_custody_checkpoint() {
+        let file = TestFile::new("event-group-finite-commit");
+        let mut services = event_services(0x75);
+        let publisher = services.publisher.identity();
+        let store = Store::open_for_mission(&file.0, services.authority).expect("finite store");
+        let policy = store.control_policy_snapshot().expect("finite policy");
+        let reservations = store
+            .reserve_event_group_with_policy(
+                &policy,
+                publisher,
+                &event_topic(),
+                &event_scope(),
+                &[None, None],
+            )
+            .expect("finite reservations");
+
+        let first_payload = b"first finite grouped Event";
+        let first_header = reservations[0]
+            .header(
+                Priority::Routine,
+                b"group/finite/first".to_vec(),
+                Some(100),
+                first_payload.len() as u64,
+                false,
+                1,
+            )
+            .expect("first finite header");
+        let first_intent = event_publication_intent(&first_header, first_payload);
+        let first_key =
+            EventOperationKey::new(b"group/finite/first/once".to_vec()).expect("first key");
+        let first_request =
+            EventOperationRequest::new(&first_key, &first_intent, first_payload, None)
+                .expect("first finite request");
+        let first_sealed = services
+            .publisher
+            .seal_event(&first_header, first_payload)
+            .expect("seal first finite Event");
+        let first_event = content_event(&mut services.reader, &first_sealed.bytes);
+
+        let second_payload = b"second finite grouped Event";
+        let second_header = reservations[1]
+            .header(
+                Priority::Routine,
+                b"group/finite/second".to_vec(),
+                Some(250),
+                second_payload.len() as u64,
+                false,
+                1,
+            )
+            .expect("second finite header");
+        let second_intent = event_publication_intent(&second_header, second_payload);
+        let second_key =
+            EventOperationKey::new(b"group/finite/second/once".to_vec()).expect("second key");
+        let second_request =
+            EventOperationRequest::new(&second_key, &second_intent, second_payload, None)
+                .expect("second finite request");
+        let second_sealed = services
+            .publisher
+            .seal_event(&second_header, second_payload)
+            .expect("seal second finite Event");
+        let second_event = content_event(&mut services.reader, &second_sealed.bytes);
+        let commits = [
+            ReservedEventOnceCommit::new(
+                &first_request,
+                &reservations[0],
+                &first_event,
+                &first_sealed.bytes,
+            ),
+            ReservedEventOnceCommit::new(
+                &second_request,
+                &reservations[1],
+                &second_event,
+                &second_sealed.bytes,
+            ),
+        ];
+        let initial_sample = aster_mesh::CustodySample {
+            clock_id: [0x75; 16],
+            tick_ms: 1_000,
+        };
+        let checkpoint = LocalCustodyCheckpoint::new(
+            store.custody_policy_revision().expect("custody revision"),
+            initial_sample,
+        );
+        let committed = store
+            .commit_reserved_event_group_once_with_custody_policy(&policy, checkpoint, &commits)
+            .expect("finite group commit");
+        assert_eq!(committed.writer_commits(), 1);
+        let transfer_ids = committed
+            .outcomes()
+            .iter()
+            .map(|outcome| match outcome {
+                EventOnceOutcome::Inserted { transfer_id, .. } => *transfer_id,
+                outcome => panic!("unexpected finite group outcome: {outcome:?}"),
+            })
+            .collect::<Vec<_>>();
+        let later_sample = aster_mesh::CustodySample {
+            clock_id: initial_sample.clock_id,
+            tick_ms: 1_050,
+        };
+        assert_eq!(
+            store
+                .custody_age_status(CustodyObjectKey::event(transfer_ids[0]), Some(later_sample))
+                .expect("first finite age"),
+            Some(CustodyAgeStatus::Forwardable {
+                age_ms: 50,
+                remaining_ms: 50,
+            })
+        );
+        assert_eq!(
+            store
+                .custody_age_status(CustodyObjectKey::event(transfer_ids[1]), Some(later_sample))
+                .expect("second finite age"),
+            Some(CustodyAgeStatus::Forwardable {
+                age_ms: 50,
+                remaining_ms: 200,
+            })
+        );
+    }
+
+    #[test]
+    fn event_group_fallback_commits_retired_route_fence_and_counts_singletons() {
+        let file = TestFile::new("event-group-retired-route-fallback");
+        let mut services = event_services(0x79);
+        let publisher = services.publisher.identity();
+        let store = Store::open_for_mission(&file.0, services.authority).expect("finite store");
+        let policy = store.control_policy_snapshot().expect("finite policy");
+        let reservations = store
+            .reserve_event_group_with_policy(
+                &policy,
+                publisher,
+                &event_topic(),
+                &event_scope(),
+                &[None, None],
+            )
+            .expect("finite reservations");
+
+        let valid_payload = b"valid sibling";
+        let valid_header = reservations[0]
+            .header(
+                Priority::Routine,
+                b"group/retired-route/valid".to_vec(),
+                Some(100),
+                valid_payload.len() as u64,
+                false,
+                1,
+            )
+            .expect("valid header");
+        let valid_intent = event_publication_intent(&valid_header, valid_payload);
+        let valid_key =
+            EventOperationKey::new(b"group/retired-route/valid/once".to_vec()).expect("valid key");
+        let valid_request =
+            EventOperationRequest::new(&valid_key, &valid_intent, valid_payload, None)
+                .expect("valid request");
+        let valid_sealed = services
+            .publisher
+            .seal_event(&valid_header, valid_payload)
+            .expect("seal valid Event");
+        let valid_event = content_event(&mut services.reader, &valid_sealed.bytes);
+
+        let retired_payload = b"retired route sibling";
+        let retired_header = reservations[1]
+            .header(
+                Priority::Routine,
+                b"group/retired-route/expired".to_vec(),
+                Some(10),
+                retired_payload.len() as u64,
+                false,
+                1,
+            )
+            .expect("retired header");
+        let retired_intent = event_publication_intent(&retired_header, retired_payload);
+        let retired_key = EventOperationKey::new(b"group/retired-route/expired/once".to_vec())
+            .expect("retired key");
+        let retired_request =
+            EventOperationRequest::new(&retired_key, &retired_intent, retired_payload, None)
+                .expect("retired request");
+        let retired_sealed = services
+            .publisher
+            .seal_event(&retired_header, retired_payload)
+            .expect("seal retired Event");
+        let retired_route = services
+            .relay
+            .verify_event(&retired_sealed.bytes)
+            .expect("verify retired route");
+        let retired_event = content_event(&mut services.reader, &retired_sealed.bytes);
+        let retired_transfer = EventTransferId::new(retired_event.envelope_id());
+
+        let initial_sample = aster_mesh::CustodySample {
+            clock_id: [0x79; 16],
+            tick_ms: 100,
+        };
+        store
+            .cache_route_verified_event_internal(
+                EventAdmissionGuard::Control(&policy),
+                &retired_route,
+                &retired_sealed.bytes,
+                Some(PendingEventCustody {
+                    expected_policy: store
+                        .custody_policy_revision()
+                        .expect("initial custody revision"),
+                    authenticated_age_ms: 0,
+                    sample: Some(initial_sample),
+                }),
+            )
+            .expect("seed exact finite route");
+
+        let commits = [
+            ReservedEventOnceCommit::new(
+                &valid_request,
+                &reservations[0],
+                &valid_event,
+                &valid_sealed.bytes,
+            ),
+            ReservedEventOnceCommit::new(
+                &retired_request,
+                &reservations[1],
+                &retired_event,
+                &retired_sealed.bytes,
+            ),
+        ];
+        let expired_sample = aster_mesh::CustodySample {
+            clock_id: initial_sample.clock_id,
+            tick_ms: 110,
+        };
+        let checkpoint = LocalCustodyCheckpoint::new(
+            store
+                .custody_policy_revision()
+                .expect("group custody revision"),
+            expired_sample,
+        );
+        assert!(matches!(
+            store.commit_reserved_event_group_once_with_custody_policy(
+                &policy, checkpoint, &commits,
+            ),
+            Err(StoreError::Custody(CustodyStoreError::AlreadyRetired))
+        ));
+        assert_eq!(
+            store.event_stats().expect("rolled-back group stats").events,
+            0,
+            "the multi-item fast path must not commit its valid sibling before fallback"
+        );
+
+        let valid = store.commit_reserved_event_once_with_custody_policy_observed(
+            &policy,
+            checkpoint,
+            &valid_request,
+            &reservations[0],
+            &valid_event,
+            &valid_sealed.bytes,
+        );
+        assert_eq!(valid.writer_commits(), 1);
+        assert!(matches!(
+            valid.into_result(),
+            Ok(EventOnceOutcome::Inserted { .. })
+        ));
+        let retired = store.commit_reserved_event_once_with_custody_policy_observed(
+            &policy,
+            checkpoint,
+            &retired_request,
+            &reservations[1],
+            &retired_event,
+            &retired_sealed.bytes,
+        );
+        assert_eq!(retired.writer_commits(), 1);
+        assert!(matches!(
+            retired.into_result(),
+            Err(StoreError::Custody(CustodyStoreError::AlreadyRetired))
+        ));
+        assert_eq!(store.event_stats().expect("fallback stats").events, 1);
+        drop(store);
+
+        let inspection = Store::inspect_existing(&file.0).expect("inspect retired fence");
+        assert_eq!(inspection.event_stats.events, 1);
+        assert_eq!(inspection.event_stats.route_cached, 0);
+        assert_eq!(inspection.custody_stats.items, 1);
+        assert_eq!(inspection.custody_stats.retirements, 1);
+        let reopened = Store::open_for_mission(&file.0, services.authority).expect("reopen");
+        assert_eq!(
+            reopened
+                .custody_sender_status(
+                    CustodyObjectKey::route_event(retired_transfer),
+                    Some(expired_sample),
+                )
+                .expect("reopened retired route status"),
+            Some(CustodySenderStatus::Retired { age_ms: 10 })
+        );
+        assert_eq!(
+            reopened.get_event(retired_transfer).expect("retired get"),
+            None
+        );
+        assert_eq!(
+            reopened
+                .event_operation_resolution(&retired_key)
+                .expect("retired operation resolution"),
+            None,
+            "the narrow custody fence must not manufacture an operation result"
+        );
+    }
+
+    #[test]
+    fn observed_event_singleton_persists_clock_transition_before_fresh_revision_retry() {
+        let file = TestFile::new("event-singleton-policy-transition-reopen");
+        let mut services = event_services(0x7a);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("finite store");
+        let policy = store.control_policy_snapshot().expect("finite policy");
+        let initial_sample = aster_mesh::CustodySample {
+            clock_id: [0x7a; 16],
+            tick_ms: 100,
+        };
+        let retained = accept_local_finite_event(
+            &store,
+            &mut services,
+            0x01,
+            b"retained before clock transition",
+            1_000,
+            initial_sample,
+        );
+
+        let operation =
+            EventOperationKey::new(b"singleton/transition/retry".to_vec()).expect("operation key");
+        let reservation = store
+            .reserve_event_with_policy(
+                &policy,
+                services.publisher.identity(),
+                &event_topic(),
+                &event_scope(),
+            )
+            .expect("transition reservation");
+        let payload = b"publish after clock transition";
+        let header = reservation
+            .header(
+                Priority::Routine,
+                b"singleton/transition".to_vec(),
+                Some(1_000),
+                payload.len() as u64,
+                false,
+                1,
+            )
+            .expect("transition header");
+        let intent = event_publication_intent(&header, payload);
+        let request = EventOperationRequest::new(&operation, &intent, payload, None)
+            .expect("transition request");
+        let sealed = services
+            .publisher
+            .seal_event(&header, payload)
+            .expect("seal transition Event");
+        let event = content_event(&mut services.reader, &sealed.bytes);
+        let transfer_id = EventTransferId::new(event.envelope_id());
+        let stale_revision = store
+            .custody_policy_revision()
+            .expect("pre-transition revision");
+        let changed_sample = aster_mesh::CustodySample {
+            clock_id: [0x7b; 16],
+            tick_ms: 1,
+        };
+
+        let transition = store.commit_reserved_event_once_with_custody_policy_observed(
+            &policy,
+            LocalCustodyCheckpoint::new(stale_revision, changed_sample),
+            &request,
+            &reservation,
+            &event,
+            &sealed.bytes,
+        );
+        let transition_writer_commits = transition.writer_commits();
+        assert!(matches!(
+            transition.into_result(),
+            Err(StoreError::Custody(CustodyStoreError::PolicyChanged))
+        ));
+        assert_eq!(store.event_count().expect("pre-reopen Event count"), 1);
+        drop(store);
+
+        let reopened = Store::open_for_mission(&file.0, services.authority).expect("reopen store");
+        let fresh_revision = reopened
+            .custody_policy_revision()
+            .expect("persisted transition revision");
+        assert_eq!(
+            fresh_revision.value(),
+            stale_revision
+                .value()
+                .checked_add(1)
+                .expect("bounded policy revision")
+        );
+        assert_eq!(transition_writer_commits, 1);
+        assert_eq!(
+            reopened
+                .custody_age_status(CustodyObjectKey::event(retained), Some(initial_sample))
+                .expect("persisted continuity status"),
+            Some(CustodyAgeStatus::WithheldUnknownAge),
+            "the old clock must remain invalid before the retry mutates the reopened store"
+        );
+        assert_eq!(
+            reopened
+                .get_event(transfer_id)
+                .expect("transition Event lookup"),
+            None
+        );
+        assert_eq!(
+            reopened
+                .event_operation_resolution(&operation)
+                .expect("transition operation lookup"),
+            None
+        );
+
+        let retry = reopened.commit_reserved_event_once_with_custody_policy_observed(
+            &policy,
+            LocalCustodyCheckpoint::new(fresh_revision, changed_sample),
+            &request,
+            &reservation,
+            &event,
+            &sealed.bytes,
+        );
+        assert_eq!(retry.writer_commits(), 1);
+        assert!(matches!(
+            retry.into_result(),
+            Ok(EventOnceOutcome::Inserted {
+                transfer_id: committed,
+                ..
+            }) if committed == transfer_id
+        ));
+        assert_eq!(reopened.event_count().expect("final Event count"), 2);
+    }
+
+    #[test]
+    fn event_group_commit_custody_collection_reports_every_writer_commit() {
+        let file = TestFile::new("event-group-custody-accounting");
+        let mut services = event_services(0x76);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("custody store");
+        let initial_sample = aster_mesh::CustodySample {
+            clock_id: [0x76; 16],
+            tick_ms: 1_000,
+        };
+        let initial = store.collect_custody_garbage_observed(
+            Some(initial_sample),
+            store.custody_policy_revision().expect("initial revision"),
+            MAX_CUSTODY_PAGE,
+        );
+        assert_eq!(initial.writer_commits(), 1);
+        assert!(
+            initial
+                .into_result()
+                .expect("initial maintenance")
+                .marked
+                .is_empty()
+        );
+
+        let no_pressure = store.collect_custody_pressure_observed(
+            None,
+            CustodyPressureDemand {
+                usage: CustodyUsage { items: 0, bytes: 0 },
+                priority: Priority::Flash,
+            },
+            Some(initial_sample),
+            store
+                .custody_policy_revision()
+                .expect("no-pressure revision"),
+            MAX_CUSTODY_PAGE,
+        );
+        assert_eq!(no_pressure.writer_commits(), 0);
+        assert!(
+            no_pressure
+                .into_result()
+                .expect("no-pressure collection")
+                .retired
+                .is_empty()
+        );
+
+        let changed_clock = aster_mesh::CustodySample {
+            clock_id: [0x77; 16],
+            tick_ms: 1,
+        };
+        let committed_transition = store.collect_custody_garbage_observed(
+            Some(changed_clock),
+            store
+                .custody_policy_revision()
+                .expect("pre-transition revision"),
+            MAX_CUSTODY_PAGE,
+        );
+        assert_eq!(committed_transition.writer_commits(), 1);
+        assert!(matches!(
+            committed_transition.into_result(),
+            Err(StoreError::Custody(CustodyStoreError::PolicyChanged))
+        ));
+
+        let finite_file = TestFile::new("event-group-custody-retirement-accounting");
+        let finite_store =
+            Store::open_for_mission(&finite_file.0, services.authority).expect("finite store");
+        let finite_sample = aster_mesh::CustodySample {
+            clock_id: [0x78; 16],
+            tick_ms: 100,
+        };
+        let transfer_id = accept_local_finite_event(
+            &finite_store,
+            &mut services,
+            0x76,
+            b"finite maintenance accounting",
+            100,
+            finite_sample,
+        );
+        let retired = finite_store.collect_custody_garbage_observed(
+            Some(aster_mesh::CustodySample {
+                clock_id: finite_sample.clock_id,
+                tick_ms: 200,
+            }),
+            finite_store
+                .custody_policy_revision()
+                .expect("retirement revision"),
+            MAX_CUSTODY_PAGE,
+        );
+        assert_eq!(retired.writer_commits(), 1);
+        assert_eq!(
+            retired
+                .into_result()
+                .expect("retirement collection")
+                .retired,
+            vec![CustodyObjectKey::event(transfer_id)]
+        );
     }
 
     #[test]
