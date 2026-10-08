@@ -93,6 +93,8 @@ const SEMANTIC_PROTOCOL_V4: u16 = super::SEMANTIC_PROTOCOL_V4;
 const SEMANTIC_PROTOCOL_V5: u16 = super::SEMANTIC_PROTOCOL_V5;
 #[cfg(test)]
 const SEMANTIC_PROTOCOL_V6: u16 = super::SEMANTIC_PROTOCOL_V6;
+#[cfg(test)]
+const SEMANTIC_PROTOCOL_V7: u16 = super::SEMANTIC_PROTOCOL_V7;
 const SUITE_ID: u16 = super::HYBRID_SUITE_ID;
 const PUBLIC_HEADER_LEN: usize = 44;
 const SELECTOR_LEN: usize = 16;
@@ -167,6 +169,9 @@ const CUSTODY_WRAPPER_AAD: &[u8] = b"aster/custody-wrapper/v3";
 const MAX_HANDSHAKE_FLIGHT_LEN: usize = 64 * 1024;
 const MAX_HANDSHAKE_OFFERS: usize = 16;
 const MAX_TRANSPORT_FRAME_LEN: usize = 16 * 1024 * 1024;
+/// Exact bytes added by the reference authenticated-session record around one plaintext frame.
+pub const REFERENCE_SESSION_FRAME_OVERHEAD_BYTES: usize =
+    FRAME_MAGIC.len() + 2 + 2 + 8 + NONCE_LEN + 4 + GCM_TAG_LEN;
 const ML_KEM_CIPHERTEXT_LEN: usize = 1088;
 const SCOPE_EPOCH_LEGACY_FORMAT: u16 = 0;
 const SCOPE_EPOCH_RECIPIENT_PACKAGES_FORMAT: u16 = 1;
@@ -4876,6 +4881,41 @@ impl ReferenceAuthenticatedSession {
             .map_err(handshake_error)
     }
 
+    /// Encrypts and authenticates one replication frame in a caller-supplied
+    /// subdomain of the established transport record domain.
+    ///
+    /// The context is authenticated but not carried in the frame. Both peers
+    /// must independently supply identical canonical bytes.
+    pub fn seal_frame_with_context(
+        &mut self,
+        plaintext: &[u8],
+        context: &[u8],
+    ) -> Result<Vec<u8>, EnvelopeError> {
+        if plaintext.len() > MAX_TRANSPORT_FRAME_LEN {
+            return Err(EnvelopeError("transport frame is too large".into()));
+        }
+        let aad = transport_frame_context_aad(context)?;
+        let record = self
+            .channel
+            .seal(&mut self.provider, plaintext, &aad)
+            .map_err(handshake_error)?;
+        encode_transport_frame(&record)
+    }
+
+    /// Authenticates and opens a frame only in the exact caller-supplied
+    /// transport-record subdomain used by its sender.
+    pub fn open_frame_with_context(
+        &mut self,
+        frame: &[u8],
+        context: &[u8],
+    ) -> Result<Vec<u8>, EnvelopeError> {
+        let record = decode_transport_frame(frame)?;
+        let aad = transport_frame_context_aad(context)?;
+        self.channel
+            .open_contextual(&self.provider, &record, &aad)
+            .map_err(handshake_error)
+    }
+
     /// Encrypts and authenticates one fixed, transfer-bound semantic-v3 custody claim.
     ///
     /// Stable source bytes and range payloads remain in the ordinary peer-neutral
@@ -5367,6 +5407,16 @@ fn decode_server_finished_flight(bytes: &[u8]) -> Result<ServerFinished, Envelop
         return Err(authentication_failed());
     }
     Ok(ServerFinished { protected_finished })
+}
+
+fn transport_frame_context_aad(context: &[u8]) -> Result<Vec<u8>, EnvelopeError> {
+    let context_len = u32::try_from(context.len())
+        .map_err(|_| EnvelopeError("transport frame context is too large".into()))?;
+    let mut aad = Vec::with_capacity(TRANSPORT_FRAME_AAD.len() + 4 + context.len());
+    aad.extend_from_slice(TRANSPORT_FRAME_AAD);
+    aad.extend_from_slice(&context_len.to_be_bytes());
+    aad.extend_from_slice(context);
+    Ok(aad)
 }
 
 fn encode_transport_frame(record: &SequencedCiphertext) -> Result<Vec<u8>, EnvelopeError> {
@@ -6352,6 +6402,7 @@ fn parse_batch_envelope(
             | super::SEMANTIC_PROTOCOL_V4
             | super::SEMANTIC_PROTOCOL_V5
             | super::SEMANTIC_PROTOCOL_V6
+            | super::SEMANTIC_PROTOCOL_V7
     ) {
         return Err(authentication_failed());
     }
@@ -9852,6 +9903,7 @@ mod tests {
             SEMANTIC_PROTOCOL_V4,
             SEMANTIC_PROTOCOL_V5,
             SEMANTIC_PROTOCOL_V6,
+            SEMANTIC_PROTOCOL_V7,
         ] {
             let mut provisioner = ReferenceProvisioner::from_seed([0x40 + version as u8; 32])
                 .unwrap_or_else(|error| panic!("v{version} provisioner failed: {error}"));
@@ -9867,7 +9919,7 @@ mod tests {
             assert_eq!(responder.semantic_version(), version);
         }
 
-        for unsupported in [0, SEMANTIC_PROTOCOL_V6 + 1] {
+        for unsupported in [0, SEMANTIC_PROTOCOL_V7 + 1] {
             let mut provisioner = ReferenceProvisioner::from_seed([0x50 + unsupported as u8; 32])
                 .unwrap_or_else(|error| panic!("v{unsupported} provisioner failed: {error}"));
             let initiator_bundle = provisioner
@@ -9929,7 +9981,7 @@ mod tests {
     }
 
     #[test]
-    fn mission_proof_rejects_stripping_v6_from_the_default_offer() {
+    fn mission_proof_rejects_stripping_v7_from_the_default_offer() {
         let mut provisioner = ReferenceProvisioner::from_seed([0x74; 32])
             .unwrap_or_else(|error| panic!("provisioner failed: {error}"));
         let initiator_bundle = provisioner
@@ -9945,6 +9997,7 @@ mod tests {
         assert_eq!(
             hello.supported_versions,
             vec![
+                SEMANTIC_PROTOCOL_V7,
                 SEMANTIC_PROTOCOL_V6,
                 SEMANTIC_PROTOCOL_V5,
                 SEMANTIC_PROTOCOL_V4,
@@ -9957,6 +10010,7 @@ mod tests {
         assert_eq!(
             hello.supported_versions,
             vec![
+                SEMANTIC_PROTOCOL_V6,
                 SEMANTIC_PROTOCOL_V5,
                 SEMANTIC_PROTOCOL_V4,
                 SEMANTIC_PROTOCOL_V3,
@@ -9989,6 +10043,7 @@ mod tests {
         assert_eq!(
             default_hello.supported_versions,
             vec![
+                SEMANTIC_PROTOCOL_V7,
                 SEMANTIC_PROTOCOL_V6,
                 SEMANTIC_PROTOCOL_V5,
                 SEMANTIC_PROTOCOL_V4,
@@ -10015,12 +10070,16 @@ mod tests {
             .unwrap_or_else(|error| panic!("server finished failed: {error}"));
         assert_eq!(initiator_session.peer_identity(), responder_id);
         assert_eq!(responder_session.peer_identity(), initiator_id);
-        assert_eq!(initiator_session.semantic_version(), SEMANTIC_PROTOCOL_V6);
-        assert_eq!(responder_session.semantic_version(), SEMANTIC_PROTOCOL_V6);
+        assert_eq!(initiator_session.semantic_version(), SEMANTIC_PROTOCOL_V7);
+        assert_eq!(responder_session.semantic_version(), SEMANTIC_PROTOCOL_V7);
 
         let frame = initiator_session
             .seal_frame(b"opaque replication frame")
             .unwrap_or_else(|error| panic!("frame seal failed: {error}"));
+        assert_eq!(
+            frame.len(),
+            b"opaque replication frame".len() + REFERENCE_SESSION_FRAME_OVERHEAD_BYTES
+        );
         assert_eq!(
             responder_session
                 .open_frame(&frame)
@@ -12532,7 +12591,7 @@ mod tests {
     }
 
     #[test]
-    fn on_path_rewrite_of_an_offered_v6_selection_to_v5_fails_authentication() {
+    fn on_path_rewrite_of_an_offered_v7_selection_to_v5_fails_authentication() {
         let mut provisioner = ReferenceProvisioner::from_seed([0x8e; 32])
             .unwrap_or_else(|error| panic!("provisioner failed: {error}"));
         let initiator_bundle = provisioner
@@ -12549,6 +12608,7 @@ mod tests {
         assert_eq!(
             hello.supported_versions,
             vec![
+                SEMANTIC_PROTOCOL_V7,
                 SEMANTIC_PROTOCOL_V6,
                 SEMANTIC_PROTOCOL_V5,
                 SEMANTIC_PROTOCOL_V4,
@@ -12564,7 +12624,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("client flight failed: {error}"));
         let mut server_hello = decode_server_flight(&second_flight)
             .unwrap_or_else(|error| panic!("server flight decode failed: {error}"));
-        assert_eq!(server_hello.selected_version, SEMANTIC_PROTOCOL_V6);
+        assert_eq!(server_hello.selected_version, SEMANTIC_PROTOCOL_V7);
 
         // Version 5 was genuinely offered, so membership checks alone would
         // accept it. The rewrite must still fail because selection is bound

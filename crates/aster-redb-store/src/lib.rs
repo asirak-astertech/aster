@@ -163,6 +163,12 @@ const MUTABLE_TRANSFER_CURSORS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.mutable-transfer-cursors.v1");
 const MUTABLE_TRANSFER_CURSOR_KEY_BYTES: usize = 34;
 const MUTABLE_TRANSFER_CURSOR_VALUE_BYTES: usize = 32;
+// Local receipt-free Event scheduling state. This is implementation metadata,
+// never delivery evidence and never part of the protocol acceptance surface.
+const EVENT_PAGE_ATTEMPT_CURSORS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("aster.event-page-attempt-cursors.v1");
+const EVENT_PAGE_ATTEMPT_CURSOR_KEY_BYTES: usize = 33;
+const EVENT_PAGE_ATTEMPT_CURSOR_VALUE_BYTES: usize = 64;
 const MISSION_AUTHORITY_ID: &str = "mission_authority_id";
 // Security-profile policy is an additive, explicitly selected store binding.
 // Legacy opens neither create nor require this table. The one retained record
@@ -318,6 +324,12 @@ pub const MAX_MUTABLE_NETWORK_BYTES_PER_CLASS: u64 = 16 * 1024 * 1024;
 pub const MAX_MUTABLE_TRANSFER_CURSOR_PEERS: usize = 256;
 /// Maximum durable mutable-transfer cursor rows across all three classes and local modes.
 pub const MAX_MUTABLE_TRANSFER_CURSORS: usize = MAX_MUTABLE_TRANSFER_CURSOR_PEERS * 3 * 2;
+/// Implementation-local peer bound for durable receipt-free Event attempt cursors.
+///
+/// This is a local allocation bound, not a wire limit or receiver rejection rule.
+pub const MAX_EVENT_PAGE_ATTEMPT_CURSOR_PEERS: usize = 256;
+/// Maximum local Event attempt cursor rows: one row per configured peer and priority.
+pub const MAX_EVENT_PAGE_ATTEMPT_CURSORS: usize = MAX_EVENT_PAGE_ATTEMPT_CURSOR_PEERS * 4;
 /// Maximum byte length of one durable Event subscription operation key.
 pub const MAX_EVENT_SUBSCRIPTION_KEY_BYTES: usize = 256;
 /// Maximum durable Consume plus Carry selectors in one mission-bound store.
@@ -405,6 +417,75 @@ impl MutableTransferCursorMode {
             _ => Err(StoreError::MutableTransferCursorInvariant(
                 "mutable-transfer cursor key has an invalid local-mode tag",
             )),
+        }
+    }
+}
+
+/// Durable local position for one peer and one Event priority tier.
+///
+/// The generations scope the position to the exact authenticated receiver
+/// selector and local emission policy used to construct the attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EventPageAttemptCursor {
+    last_attempted: [u8; 32],
+    acceptance_order: u64,
+    attempt_sequence: u64,
+    selector_generation: u64,
+    emission_generation: u64,
+}
+
+impl EventPageAttemptCursor {
+    pub const fn new(
+        last_attempted: [u8; 32],
+        acceptance_order: u64,
+        attempt_sequence: u64,
+        selector_generation: u64,
+        emission_generation: u64,
+    ) -> Self {
+        Self {
+            last_attempted,
+            acceptance_order,
+            attempt_sequence,
+            selector_generation,
+            emission_generation,
+        }
+    }
+
+    pub const fn last_attempted(self) -> [u8; 32] {
+        self.last_attempted
+    }
+    pub const fn acceptance_order(self) -> u64 {
+        self.acceptance_order
+    }
+    pub const fn attempt_sequence(self) -> u64 {
+        self.attempt_sequence
+    }
+    pub const fn selector_generation(self) -> u64 {
+        self.selector_generation
+    }
+    pub const fn emission_generation(self) -> u64 {
+        self.emission_generation
+    }
+}
+
+/// One member of an atomic Event-page attempt cursor update.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EventPageAttemptCursorUpdate {
+    priority: Priority,
+    expected: Option<EventPageAttemptCursor>,
+    new: EventPageAttemptCursor,
+}
+
+impl EventPageAttemptCursorUpdate {
+    pub const fn new(
+        priority: Priority,
+        expected: Option<EventPageAttemptCursor>,
+        new: EventPageAttemptCursor,
+    ) -> Self {
+        Self {
+            priority,
+            expected,
+            new,
         }
     }
 }
@@ -3758,6 +3839,12 @@ pub enum StoreError {
     MutableTransferCursorLimitExceeded { current: u64, limit: u64 },
     /// Durable mutable-transfer cursor metadata is malformed or overbound.
     MutableTransferCursorInvariant(&'static str),
+    /// A configured Event-page attempt peer set exceeds its local allocation bound.
+    EventPageAttemptCursorPeerLimitExceeded { requested: usize, limit: usize },
+    /// Inserting Event-page attempt cursors would exceed their dedicated row bound.
+    EventPageAttemptCursorLimitExceeded { current: u64, limit: u64 },
+    /// Durable Event-page attempt cursor metadata is malformed or overbound.
+    EventPageAttemptCursorInvariant(&'static str),
     /// One semantic claim reached its route-only representation cap.
     RouteCacheSemanticRepresentationLimit {
         semantic_id: EventSemanticId,
@@ -4400,6 +4487,18 @@ impl fmt::Display for StoreError {
             Self::MutableTransferCursorInvariant(reason) => write!(
                 formatter,
                 "durable mutable-transfer cursor invariant failed: {reason}"
+            ),
+            Self::EventPageAttemptCursorPeerLimitExceeded { requested, limit } => write!(
+                formatter,
+                "Event-page attempt cursor peer count {requested} exceeds limit {limit}"
+            ),
+            Self::EventPageAttemptCursorLimitExceeded { current, limit } => write!(
+                formatter,
+                "Event-page attempt cursor row count {current} is at limit {limit}"
+            ),
+            Self::EventPageAttemptCursorInvariant(reason) => write!(
+                formatter,
+                "durable Event-page attempt cursor invariant failed: {reason}"
             ),
             Self::RouteCacheSemanticRepresentationLimit { current, limit, .. } => write!(
                 formatter,
@@ -5835,6 +5934,8 @@ impl Store {
             bridge_event::audit_bridge_tables_write(&write, mission_authority, limits, true)?;
         let mutable_transfer_cursors =
             audit_mutable_transfer_cursors_write(&write, mission_authority)?;
+        let event_page_attempt_cursors =
+            audit_event_page_attempt_cursors_write(&write, mission_authority)?;
         if mission_authority.is_none()
             && (write.open_table(EVENTS)?.len()? != 0
                 || write.open_table(STATES)?.len()? != 0
@@ -5848,7 +5949,8 @@ impl Store {
                 || numbered_operation_stats.clients != 0
                 || numbered_operation_stats.outstanding_results != 0
                 || bridge_event_stats.aggregate_items()? != 0
-                || mutable_transfer_cursors.rows != 0)
+                || mutable_transfer_cursors.rows != 0
+                || event_page_attempt_cursors.rows != 0)
         {
             return Err(StoreError::SemanticInvariant(
                 "unbound store contains mission-scoped Event, State, Record, Blob, or control state",
@@ -6101,6 +6203,150 @@ impl Store {
         }
         {
             let mut table = write.open_table(MUTABLE_TRANSFER_CURSORS)?;
+            for key in stale {
+                table.remove(key.as_slice())?;
+            }
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    /// Reads one local receipt-free Event attempt cursor.
+    pub fn event_page_attempt_cursor(
+        &self,
+        peer: NodeId,
+        priority: Priority,
+    ) -> Result<Option<EventPageAttemptCursor>, StoreError> {
+        let authority = self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        require_mutable_transfer_cursor_mission_read(&read, authority)?;
+        let key = event_page_attempt_cursor_key(peer, priority);
+        read.open_table(EVENT_PAGE_ATTEMPT_CURSORS)?
+            .get(key.as_slice())?
+            .map(|value| decode_event_page_attempt_cursor_value(value.value()))
+            .transpose()
+    }
+
+    /// Atomically compare-and-advances all priority cursors for one attempted turn.
+    ///
+    /// This records scheduling progress immediately before carrier emission. It
+    /// does not assert remote receipt, durable application, or delivery.
+    pub fn compare_and_advance_event_page_attempt_cursors(
+        &self,
+        peer: NodeId,
+        updates: &[EventPageAttemptCursorUpdate],
+    ) -> Result<bool, StoreError> {
+        if updates.is_empty() {
+            return Ok(true);
+        }
+        let mut priorities = std::collections::BTreeSet::new();
+        if updates.len() > 4
+            || updates
+                .iter()
+                .any(|update| !priorities.insert(update.priority))
+        {
+            return Err(StoreError::EventPageAttemptCursorInvariant(
+                "Event-page attempt cursor update priorities are not unique and bounded",
+            ));
+        }
+        let authority = self.require_bound_mission()?;
+        let write = self.database.begin_write()?;
+        enforce_live_write(&write)?;
+        require_mutable_transfer_cursor_mission_write(&write, authority)?;
+        let audit = audit_event_page_attempt_cursors_write(&write, Some(authority))?;
+        let mut current_rows = Vec::with_capacity(updates.len());
+        {
+            let table = write.open_table(EVENT_PAGE_ATTEMPT_CURSORS)?;
+            for update in updates {
+                let key = event_page_attempt_cursor_key(peer, update.priority);
+                let current = table
+                    .get(key.as_slice())?
+                    .map(|value| decode_event_page_attempt_cursor_value(value.value()))
+                    .transpose()?;
+                if current != update.expected {
+                    return Ok(false);
+                }
+                current_rows.push((key, current));
+            }
+        }
+        let new_rows = current_rows
+            .iter()
+            .filter(|(_, current)| current.is_none())
+            .count();
+        let resulting_rows = audit
+            .rows
+            .checked_add(
+                u64::try_from(new_rows).map_err(|_| StoreError::ItemCountAccountingOverflow)?,
+            )
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        let limit = u64::try_from(MAX_EVENT_PAGE_ATTEMPT_CURSORS)
+            .map_err(|_| StoreError::ItemCountAccountingOverflow)?;
+        if resulting_rows > limit {
+            return Err(StoreError::EventPageAttemptCursorLimitExceeded {
+                current: audit.rows,
+                limit,
+            });
+        }
+        if new_rows != 0
+            && !audit.peers.contains(&peer)
+            && audit.peers.len() >= MAX_EVENT_PAGE_ATTEMPT_CURSOR_PEERS
+        {
+            return Err(StoreError::EventPageAttemptCursorPeerLimitExceeded {
+                requested: audit
+                    .peers
+                    .len()
+                    .checked_add(1)
+                    .ok_or(StoreError::ItemCountAccountingOverflow)?,
+                limit: MAX_EVENT_PAGE_ATTEMPT_CURSOR_PEERS,
+            });
+        }
+        {
+            let mut table = write.open_table(EVENT_PAGE_ATTEMPT_CURSORS)?;
+            for (update, (key, current)) in updates.iter().zip(&current_rows) {
+                if *current != Some(update.new) {
+                    let value = encode_event_page_attempt_cursor_value(update.new);
+                    table.insert(key.as_slice(), value.as_slice())?;
+                }
+            }
+        }
+        write.commit()?;
+        Ok(true)
+    }
+
+    /// Prunes Event attempt cursors for peers outside authenticated configuration.
+    pub fn reconcile_event_page_attempt_cursor_peers(
+        &self,
+        configured_peers: &[NodeId],
+    ) -> Result<(), StoreError> {
+        let authority = self.require_bound_mission()?;
+        let configured_peers = configured_peers
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        if configured_peers.len() > MAX_EVENT_PAGE_ATTEMPT_CURSOR_PEERS {
+            return Err(StoreError::EventPageAttemptCursorPeerLimitExceeded {
+                requested: configured_peers.len(),
+                limit: MAX_EVENT_PAGE_ATTEMPT_CURSOR_PEERS,
+            });
+        }
+        let write = self.database.begin_write()?;
+        enforce_live_write(&write)?;
+        require_mutable_transfer_cursor_mission_write(&write, authority)?;
+        audit_event_page_attempt_cursors_write(&write, Some(authority))?;
+        let mut stale = Vec::new();
+        {
+            let table = write.open_table(EVENT_PAGE_ATTEMPT_CURSORS)?;
+            for row in table.iter()? {
+                let (key, value) = row?;
+                let (peer, _, _) =
+                    decode_event_page_attempt_cursor_row(key.value(), value.value())?;
+                if !configured_peers.contains(&peer) {
+                    stale.push(key.value().to_vec());
+                }
+            }
+        }
+        {
+            let mut table = write.open_table(EVENT_PAGE_ATTEMPT_CURSORS)?;
             for key in stale {
                 table.remove(key.as_slice())?;
             }
@@ -9323,6 +9569,138 @@ impl Store {
             None,
         )
         .and_then(EventCommitResult::into_apply)
+    }
+    /// Atomically accepts a bounded group of remotely verified durable Events
+    /// while one exact replication snapshot remains current.
+    pub fn apply_verified_event_batch_with_replication_policy(
+        &self,
+        expected: &EventReplicationPolicySnapshot,
+        events: &[(&ContentVerifiedEventEnvelope, &[u8])],
+    ) -> Result<Vec<ApplyOutcome>, StoreError> {
+        self.require_live()?;
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+        let prepared = events
+            .iter()
+            .map(|(event, sealed)| PreparedEvent::from_verified(event, sealed, EventOrigin::Remote))
+            .collect::<Result<Vec<_>, _>>()?;
+        for event in &prepared {
+            self.require_mission_authority(event.mission_authority)?;
+        }
+        let write = self.database.begin_write()?;
+        enforce_live_write(&write)?;
+        let mut commit_required = false;
+        let mut outcomes = Vec::with_capacity(prepared.len());
+        for prepared in &prepared {
+            let staged = self.stage_prepared_event(
+                &write,
+                prepared,
+                None,
+                None,
+                EventAdmissionGuard::Replication {
+                    expected,
+                    requirement: EventReplicationRequirement::Consume,
+                },
+                None,
+            )?;
+            let outcome = match staged {
+                PreparedEventStage::NoCommit(outcome) => outcome,
+                PreparedEventStage::Commit(outcome) => {
+                    commit_required = true;
+                    outcome
+                }
+                PreparedEventStage::CommitError(error) => return Err(error),
+            };
+            outcomes.push(outcome.into_apply()?);
+        }
+        if commit_required {
+            write.commit()?;
+        }
+        Ok(outcomes)
+    }
+
+    /// Atomically accepts a bounded mixed durable/finite Event group while one
+    /// exact replication and custody-policy snapshot remains current.
+    ///
+    /// Finite non-tombstone entries must supply session-verified custody claims;
+    /// durable entries supply `None`. All source bytes, age claims, receiver
+    /// checkpoint establishment, policy checks, and content mutations share one
+    /// redb writer transaction.
+    pub fn apply_verified_event_batch_with_optional_custody_policy(
+        &self,
+        expected: &EventReplicationPolicySnapshot,
+        expected_custody: CustodyPolicyRevision,
+        receiver_sample: aster_mesh::CustodySample,
+        events: &[(
+            &ContentVerifiedEventEnvelope,
+            &[u8],
+            Option<&VerifiedCustodyClaims>,
+        )],
+    ) -> Result<Vec<ApplyOutcome>, StoreError> {
+        self.require_live()?;
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+        let prepared = events
+            .iter()
+            .map(|(event, sealed, claims)| {
+                let prepared = if claims.is_some() {
+                    PreparedEvent::from_verified_with_custody(event, sealed, EventOrigin::Remote)?
+                } else {
+                    PreparedEvent::from_verified(event, sealed, EventOrigin::Remote)?
+                };
+                let pending = claims
+                    .map(|claims| {
+                        validate_verified_event_custody_claims(
+                            claims,
+                            prepared.transfer_id,
+                            &prepared.header,
+                            &prepared.sealed,
+                        )
+                        .map(|authenticated_age_ms| PendingEventCustody {
+                            expected_policy: expected_custody,
+                            authenticated_age_ms,
+                            sample: Some(receiver_sample),
+                        })
+                    })
+                    .transpose()?;
+                Ok((prepared, pending))
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
+        for (event, _) in &prepared {
+            self.require_mission_authority(event.mission_authority)?;
+        }
+        let write = self.database.begin_write()?;
+        enforce_live_write(&write)?;
+        let mut commit_required = false;
+        let mut outcomes = Vec::with_capacity(prepared.len());
+        for (prepared, custody) in &prepared {
+            let staged = self.stage_prepared_event(
+                &write,
+                prepared,
+                None,
+                None,
+                EventAdmissionGuard::Replication {
+                    expected,
+                    requirement: EventReplicationRequirement::Consume,
+                },
+                *custody,
+            )?;
+            let outcome = match staged {
+                PreparedEventStage::NoCommit(outcome) => outcome,
+                PreparedEventStage::Commit(outcome) => {
+                    commit_required = true;
+                    outcome
+                }
+                PreparedEventStage::CommitError(error) => return Err(error),
+            };
+            outcomes.push(outcome.into_apply()?);
+        }
+        if commit_required {
+            write.commit()?;
+        }
+        Ok(outcomes)
     }
 
     /// Atomically accepts a remotely content-verified finite Event together
@@ -15868,6 +16246,7 @@ fn inspect_zeroization_read(
         None
     };
     inspect_mutable_transfer_cursors_read(read, mission_authority)?;
+    inspect_event_page_attempt_cursors_read(read, mission_authority)?;
     if !table_names.contains(ZEROIZATION.name()) {
         return Ok(StoreZeroizationStatus {
             state: StoreZeroizationState::Live,
@@ -16376,6 +16755,11 @@ fn inspect_mission_binding_read_only(path: &Path) -> Result<Option<NodeId>, Stor
         } else {
             0
         };
+        let event_attempt_cursor_rows = if table_names.contains(EVENT_PAGE_ATTEMPT_CURSORS.name()) {
+            read.open_table(EVENT_PAGE_ATTEMPT_CURSORS)?.len()?
+        } else {
+            0
+        };
         if semantic_rows != 0
             || state_rows != 0
             || record_rows != 0
@@ -16385,6 +16769,7 @@ fn inspect_mission_binding_read_only(path: &Path) -> Result<Option<NodeId>, Stor
             || cached_rows != 0
             || control_rows != 0
             || cursor_rows != 0
+            || event_attempt_cursor_rows != 0
         {
             return Err(StoreError::SemanticInvariant(
                 "unbound store contains mission-scoped Event, State, Record, Blob, or control state",
@@ -16461,6 +16846,146 @@ fn read_mission_binding_read(read: &redb::ReadTransaction) -> Result<Option<Node
         .get(MISSION_AUTHORITY_ID)?
         .map(|value| parse_node_id("semantic mission authority", value.value()))
         .transpose()
+}
+
+fn event_page_attempt_cursor_key(
+    peer: NodeId,
+    priority: Priority,
+) -> [u8; EVENT_PAGE_ATTEMPT_CURSOR_KEY_BYTES] {
+    let mut key = [0u8; EVENT_PAGE_ATTEMPT_CURSOR_KEY_BYTES];
+    key[..32].copy_from_slice(peer.as_slice());
+    key[32] = priority as u8;
+    key
+}
+
+fn encode_event_page_attempt_cursor_value(
+    cursor: EventPageAttemptCursor,
+) -> [u8; EVENT_PAGE_ATTEMPT_CURSOR_VALUE_BYTES] {
+    let mut value = [0u8; EVENT_PAGE_ATTEMPT_CURSOR_VALUE_BYTES];
+    value[..32].copy_from_slice(&cursor.last_attempted);
+    value[32..40].copy_from_slice(&cursor.acceptance_order.to_be_bytes());
+    value[40..48].copy_from_slice(&cursor.attempt_sequence.to_be_bytes());
+    value[48..56].copy_from_slice(&cursor.selector_generation.to_be_bytes());
+    value[56..64].copy_from_slice(&cursor.emission_generation.to_be_bytes());
+    value
+}
+
+fn decode_event_page_attempt_cursor_value(
+    value: &[u8],
+) -> Result<EventPageAttemptCursor, StoreError> {
+    let value: [u8; EVENT_PAGE_ATTEMPT_CURSOR_VALUE_BYTES] = value.try_into().map_err(|_| {
+        StoreError::EventPageAttemptCursorInvariant(
+            "Event-page attempt cursor value has invalid length",
+        )
+    })?;
+    Ok(EventPageAttemptCursor::new(
+        value[..32].try_into().expect("fixed Event cursor ID"),
+        u64::from_be_bytes(value[32..40].try_into().expect("fixed acceptance order")),
+        u64::from_be_bytes(value[40..48].try_into().expect("fixed attempt sequence")),
+        u64::from_be_bytes(value[48..56].try_into().expect("fixed selector generation")),
+        u64::from_be_bytes(value[56..64].try_into().expect("fixed emission generation")),
+    ))
+}
+
+fn decode_event_page_attempt_cursor_row(
+    key: &[u8],
+    value: &[u8],
+) -> Result<(NodeId, Priority, EventPageAttemptCursor), StoreError> {
+    let key: [u8; EVENT_PAGE_ATTEMPT_CURSOR_KEY_BYTES] = key.try_into().map_err(|_| {
+        StoreError::EventPageAttemptCursorInvariant(
+            "Event-page attempt cursor key has invalid length",
+        )
+    })?;
+    let peer = key[..32].try_into().map_err(|_| {
+        StoreError::EventPageAttemptCursorInvariant(
+            "Event-page attempt cursor key has an invalid peer",
+        )
+    })?;
+    let priority =
+        Priority::from_wire(key[32]).ok_or(StoreError::EventPageAttemptCursorInvariant(
+            "Event-page attempt cursor key has an invalid priority",
+        ))?;
+    Ok((
+        peer,
+        priority,
+        decode_event_page_attempt_cursor_value(value)?,
+    ))
+}
+
+#[derive(Default)]
+struct EventPageAttemptCursorAudit {
+    rows: u64,
+    peers: std::collections::BTreeSet<NodeId>,
+}
+
+fn audit_event_page_attempt_cursor_rows(
+    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    mission_authority: Option<NodeId>,
+) -> Result<EventPageAttemptCursorAudit, StoreError> {
+    let rows = table.len()?;
+    if rows
+        > u64::try_from(MAX_EVENT_PAGE_ATTEMPT_CURSORS)
+            .map_err(|_| StoreError::ItemCountAccountingOverflow)?
+    {
+        return Err(StoreError::EventPageAttemptCursorInvariant(
+            "Event-page attempt cursor table exceeds its row bound",
+        ));
+    }
+    if rows != 0 && mission_authority.is_none() {
+        return Err(StoreError::EventPageAttemptCursorInvariant(
+            "unbound store contains Event-page attempt cursor rows",
+        ));
+    }
+    let mut peers = std::collections::BTreeSet::new();
+    for row in table.iter()? {
+        let (key, value) = row?;
+        let (peer, _, _) = decode_event_page_attempt_cursor_row(key.value(), value.value())?;
+        peers.insert(peer);
+        if peers.len() > MAX_EVENT_PAGE_ATTEMPT_CURSOR_PEERS {
+            return Err(StoreError::EventPageAttemptCursorInvariant(
+                "Event-page attempt cursor table exceeds its peer bound",
+            ));
+        }
+    }
+    Ok(EventPageAttemptCursorAudit { rows, peers })
+}
+
+fn audit_event_page_attempt_cursors_write(
+    write: &redb::WriteTransaction,
+    mission_authority: Option<NodeId>,
+) -> Result<EventPageAttemptCursorAudit, StoreError> {
+    if write
+        .list_multimap_tables()?
+        .any(|table| table.name() == EVENT_PAGE_ATTEMPT_CURSORS.name())
+    {
+        return Err(StoreError::EventPageAttemptCursorInvariant(
+            "Event-page attempt cursor table has the wrong table kind",
+        ));
+    }
+    let table = write.open_table(EVENT_PAGE_ATTEMPT_CURSORS)?;
+    audit_event_page_attempt_cursor_rows(&table, mission_authority)
+}
+
+fn inspect_event_page_attempt_cursors_read(
+    read: &redb::ReadTransaction,
+    mission_authority: Option<NodeId>,
+) -> Result<EventPageAttemptCursorAudit, StoreError> {
+    if read
+        .list_multimap_tables()?
+        .any(|table| table.name() == EVENT_PAGE_ATTEMPT_CURSORS.name())
+    {
+        return Err(StoreError::EventPageAttemptCursorInvariant(
+            "Event-page attempt cursor table has the wrong table kind",
+        ));
+    }
+    if !read
+        .list_tables()?
+        .any(|table| table.name() == EVENT_PAGE_ATTEMPT_CURSORS.name())
+    {
+        return Ok(EventPageAttemptCursorAudit::default());
+    }
+    let table = read.open_table(EVENT_PAGE_ATTEMPT_CURSORS)?;
+    audit_event_page_attempt_cursor_rows(&table, mission_authority)
 }
 
 fn mutable_transfer_cursor_key(
@@ -26409,6 +26934,153 @@ mod tests {
     }
 
     #[test]
+    fn replication_batch_commits_valid_events_in_order() {
+        let file = TestFile::new("replication-semantic-batch");
+        let mut services = event_services(0x8d);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("bound store");
+        let policy = store.control_policy_snapshot().expect("settled policy");
+        store
+            .create_event_subscription_with_policy(
+                &policy,
+                &EventSubscriptionKey::new(b"application/consume-batch".to_vec())
+                    .expect("Consume key"),
+                subscription_spec(EventSubscriptionMode::Consume),
+            )
+            .expect("create Consume selector");
+        let replication = store
+            .event_replication_policy_snapshot()
+            .expect("Consume snapshot");
+
+        let first_payload = b"first batch Event";
+        let first_header = event_header(
+            services.publisher.identity(),
+            1,
+            1,
+            VersionVector::default(),
+            b"batch-first",
+            first_payload,
+            None,
+        );
+        let first = services
+            .publisher
+            .seal_event(&first_header, first_payload)
+            .expect("seal first Event");
+        let first_event = content_event(&mut services.reader, &first.bytes);
+
+        let second_payload = b"second batch Event";
+        let second_header = event_header(
+            services.publisher.identity(),
+            2,
+            2,
+            VersionVector::default(),
+            b"batch-second",
+            second_payload,
+            None,
+        );
+        let second = services
+            .publisher
+            .seal_event(&second_header, second_payload)
+            .expect("seal second Event");
+        let second_event = content_event(&mut services.reader, &second.bytes);
+
+        let outcomes = store
+            .apply_verified_event_batch_with_replication_policy(
+                &replication,
+                &[
+                    (&first_event, first.bytes.as_slice()),
+                    (&second_event, second.bytes.as_slice()),
+                ],
+            )
+            .expect("commit verified Event batch");
+
+        assert_eq!(
+            outcomes,
+            vec![
+                ApplyOutcome::Inserted {
+                    acceptance_marker: 1,
+                },
+                ApplyOutcome::Inserted {
+                    acceptance_marker: 2,
+                },
+            ]
+        );
+        assert_eq!(store.event_count().expect("batch Event count"), 2);
+    }
+
+    #[test]
+    fn replication_batch_rolls_back_when_a_later_event_conflicts() {
+        let file = TestFile::new("replication-semantic-batch-rollback");
+        let mut services = event_services(0x8e);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("bound store");
+        let policy = store.control_policy_snapshot().expect("settled policy");
+        store
+            .create_event_subscription_with_policy(
+                &policy,
+                &EventSubscriptionKey::new(b"application/consume-batch-rollback".to_vec())
+                    .expect("Consume key"),
+                subscription_spec(EventSubscriptionMode::Consume),
+            )
+            .expect("create Consume selector");
+        let replication = store
+            .event_replication_policy_snapshot()
+            .expect("Consume snapshot");
+
+        let first_payload = b"first representation";
+        let first_header = event_header(
+            services.publisher.identity(),
+            1,
+            1,
+            VersionVector::default(),
+            b"batch-first",
+            first_payload,
+            None,
+        );
+        let first = services
+            .publisher
+            .seal_event(&first_header, first_payload)
+            .expect("seal first Event");
+        let first_event = content_event(&mut services.reader, &first.bytes);
+        let first_id = EventTransferId::new(first_event.envelope_id());
+
+        let conflicting_payload = b"conflicting representation";
+        let conflicting_header = event_header(
+            services.publisher.identity(),
+            1,
+            1,
+            VersionVector::default(),
+            b"batch-conflict",
+            conflicting_payload,
+            None,
+        );
+        let conflicting = services
+            .publisher
+            .seal_event(&conflicting_header, conflicting_payload)
+            .expect("seal conflicting Event");
+        let conflicting_event = content_event(&mut services.reader, &conflicting.bytes);
+
+        assert!(matches!(
+            store.apply_verified_event_batch_with_replication_policy(
+                &replication,
+                &[
+                    (&first_event, first.bytes.as_slice()),
+                    (&conflicting_event, conflicting.bytes.as_slice()),
+                ],
+            ),
+            Err(StoreError::CausalEquivocation { .. })
+        ));
+        assert_eq!(
+            store.event_count().expect("rolled-back batch Event count"),
+            0
+        );
+        assert!(
+            store
+                .get_event(first_id)
+                .expect("read rolled-back first Event")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn cross_store_same_revision_snapshot_cannot_admit_route_cache() {
         let source_file = TestFile::new("cross-store-route-source");
         let target_file = TestFile::new("cross-store-route-target");
@@ -33177,6 +33849,101 @@ mod tests {
     }
 
     #[test]
+    fn event_page_attempt_cursor_batch_cas_reconcile_and_reopen() {
+        let file = TestFile::new("event-page-attempt-cursor-lifecycle");
+        let services = event_services(0x70);
+        let peer = cursor_peer(1);
+        let stale_peer = cursor_peer(2);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("mission store");
+        let routine = EventPageAttemptCursor::new([0x11; 32], 11, 1, 7, 9);
+        let flash = EventPageAttemptCursor::new([0x22; 32], 22, 1, 7, 9);
+
+        assert_eq!(
+            store
+                .event_page_attempt_cursor(peer, Priority::Routine)
+                .expect("missing Event cursor"),
+            None
+        );
+        assert!(
+            store
+                .compare_and_advance_event_page_attempt_cursors(
+                    peer,
+                    &[
+                        EventPageAttemptCursorUpdate::new(Priority::Routine, None, routine),
+                        EventPageAttemptCursorUpdate::new(Priority::Flash, None, flash),
+                    ],
+                )
+                .expect("create Event cursors")
+        );
+        let next_routine = EventPageAttemptCursor::new([0x33; 32], 33, 2, 8, 10);
+        assert!(
+            !store
+                .compare_and_advance_event_page_attempt_cursors(
+                    peer,
+                    &[EventPageAttemptCursorUpdate::new(
+                        Priority::Routine,
+                        None,
+                        next_routine,
+                    )],
+                )
+                .expect("stale Event cursor CAS")
+        );
+        assert_eq!(
+            store
+                .event_page_attempt_cursor(peer, Priority::Routine)
+                .expect("unchanged Event cursor"),
+            Some(routine)
+        );
+        assert!(
+            store
+                .compare_and_advance_event_page_attempt_cursors(
+                    peer,
+                    &[EventPageAttemptCursorUpdate::new(
+                        Priority::Routine,
+                        Some(routine),
+                        next_routine,
+                    )],
+                )
+                .expect("replace Event cursor generation")
+        );
+        store
+            .compare_and_advance_event_page_attempt_cursors(
+                stale_peer,
+                &[EventPageAttemptCursorUpdate::new(
+                    Priority::Immediate,
+                    None,
+                    EventPageAttemptCursor::new([0x44; 32], 44, 1, 1, 1),
+                )],
+            )
+            .expect("create stale-peer Event cursor");
+        store
+            .reconcile_event_page_attempt_cursor_peers(&[peer])
+            .expect("prune stale Event cursor peer");
+        assert_eq!(
+            store
+                .event_page_attempt_cursor(stale_peer, Priority::Immediate)
+                .expect("pruned Event cursor"),
+            None
+        );
+        drop(store);
+
+        let reopened = Store::open_for_mission(&file.0, services.authority)
+            .expect("reopen Event cursor store");
+        assert_eq!(
+            reopened
+                .event_page_attempt_cursor(peer, Priority::Routine)
+                .expect("persistent Event cursor"),
+            Some(next_routine)
+        );
+        assert_eq!(
+            reopened
+                .event_page_attempt_cursor(peer, Priority::Flash)
+                .expect("persistent Flash cursor"),
+            Some(flash)
+        );
+    }
+
+    #[test]
     fn mutable_transfer_cursor_cas_reconcile_reopen_and_terminal_preservation() {
         let file = TestFile::new("mutable-transfer-cursor-lifecycle");
         let services = event_services(0x71);
@@ -39568,6 +40335,308 @@ mod tests {
             CustodyUsage::default()
         );
         assert_eq!(reopened.event_stats().expect("Event stats").events, 1);
+    }
+
+    #[test]
+    fn receipt_free_custody_authorization_tracks_age_without_peer_state() {
+        let file = TestFile::new("receipt-free custody authorization");
+        let mut services = event_services(0xd3);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("store");
+        let policy = store.control_policy_snapshot().expect("policy");
+        let operation =
+            EventOperationKey::new(b"event/receipt-free-custody".to_vec()).expect("key");
+        let payload = b"finite page";
+        let reservation = store
+            .reserve_event_with_policy(
+                &policy,
+                services.publisher.identity(),
+                &event_topic(),
+                &event_scope(),
+            )
+            .expect("reservation");
+        let header = reservation
+            .header(
+                Priority::Routine,
+                b"receipt-free".to_vec(),
+                Some(100),
+                payload.len() as u64,
+                false,
+                1,
+            )
+            .expect("header");
+        let intent = event_publication_intent(&header, payload);
+        let request = EventOperationRequest::new(&operation, &intent, payload, None)
+            .expect("operation request");
+        let sealed = services
+            .publisher
+            .seal_event(&header, payload)
+            .expect("seal");
+        let event = content_event(&mut services.reader, &sealed.bytes);
+        let clock_id = [0x43; 16];
+        let initial_sample = aster_mesh::CustodySample {
+            clock_id,
+            tick_ms: 1_000,
+        };
+        let transfer_id = match store
+            .commit_reserved_event_once_with_custody_policy(
+                &policy,
+                LocalCustodyCheckpoint::new(
+                    store.custody_policy_revision().expect("custody revision"),
+                    initial_sample,
+                ),
+                &request,
+                &reservation,
+                &event,
+                &sealed.bytes,
+            )
+            .expect("finite commit")
+        {
+            EventOnceOutcome::Inserted { transfer_id, .. } => transfer_id,
+            outcome => panic!("unexpected finite commit: {outcome:?}"),
+        };
+        let object = CustodyObjectKey::event(transfer_id);
+        let revision = store.custody_policy_revision().expect("revision");
+        let authorized = store
+            .authorize_receipt_free_custody_send(
+                object,
+                Some(aster_mesh::CustodySample {
+                    clock_id,
+                    tick_ms: 1_050,
+                }),
+                revision,
+            )
+            .expect("receipt-free authorization");
+        assert_eq!(authorized.age_ms, 50);
+        assert_eq!(authorized.sample.expect("normalized sample").tick_ms, 1_050);
+
+        drop(store);
+        let inspection = Store::inspect_existing(&file.0).expect("inspect authorization");
+        assert_eq!(inspection.custody_stats.transfer_leases, 0);
+        assert_eq!(inspection.custody_stats.retries, 0);
+        assert_eq!(inspection.custody_stats.peer_receipts, 0);
+
+        let store = Store::open_for_mission(&file.0, services.authority).expect("reopen");
+        let revision = store.custody_policy_revision().expect("reopened revision");
+        assert!(matches!(
+            store.authorize_receipt_free_custody_send(
+                object,
+                Some(aster_mesh::CustodySample {
+                    clock_id,
+                    tick_ms: 1_100,
+                }),
+                revision,
+            ),
+            Err(StoreError::Custody(CustodyStoreError::Expired))
+        ));
+        drop(store);
+        let inspection = Store::inspect_existing(&file.0).expect("inspect expiry");
+        assert_eq!(inspection.custody_stats.transfer_leases, 0);
+        assert_eq!(inspection.custody_stats.retries, 0);
+        assert_eq!(inspection.custody_stats.peer_receipts, 0);
+    }
+
+    #[test]
+    fn receipt_free_custody_batch_authorization_preserves_order_and_common_sample() {
+        let file = TestFile::new("receipt-free custody batch authorization");
+        let mut services = event_services(0xd5);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("store");
+        let clock_id = [0x44; 16];
+        let first = accept_local_finite_event(
+            &store,
+            &mut services,
+            1,
+            b"first finite page entry",
+            1_000,
+            aster_mesh::CustodySample {
+                clock_id,
+                tick_ms: 1_000,
+            },
+        );
+        let second = accept_local_finite_event(
+            &store,
+            &mut services,
+            2,
+            b"second finite page entry",
+            1_000,
+            aster_mesh::CustodySample {
+                clock_id,
+                tick_ms: 1_020,
+            },
+        );
+        let revision = store.custody_policy_revision().expect("revision");
+        let authorization_sample = aster_mesh::CustodySample {
+            clock_id,
+            tick_ms: 1_050,
+        };
+
+        let authorized = store
+            .authorize_receipt_free_custody_sends(
+                &[
+                    CustodyObjectKey::event(second),
+                    CustodyObjectKey::event(first),
+                ],
+                Some(authorization_sample),
+                revision,
+            )
+            .expect("receipt-free batch authorization");
+
+        assert_eq!(authorized.len(), 2);
+        assert_eq!(authorized[0].age_ms, 30);
+        assert_eq!(authorized[1].age_ms, 50);
+        assert_eq!(authorized[0].sample, Some(authorization_sample));
+        assert_eq!(authorized[1].sample, Some(authorization_sample));
+
+        drop(store);
+        let inspection = Store::inspect_existing(&file.0).expect("inspect batch authorization");
+        assert_eq!(inspection.custody_stats.transfer_leases, 0);
+        assert_eq!(inspection.custody_stats.retries, 0);
+        assert_eq!(inspection.custody_stats.peer_receipts, 0);
+    }
+
+    #[test]
+    fn receipt_free_custody_batch_commits_terminal_lifecycle_state() {
+        let file = TestFile::new("receipt-free custody batch terminal state");
+        let mut services = event_services(0xd6);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("store");
+        let clock_id = [0x46; 16];
+        let valid = accept_local_finite_event(
+            &store,
+            &mut services,
+            1,
+            b"valid before terminal entry",
+            1_000,
+            aster_mesh::CustodySample {
+                clock_id,
+                tick_ms: 1_000,
+            },
+        );
+        let expiring = accept_local_finite_event(
+            &store,
+            &mut services,
+            2,
+            b"expiring",
+            50,
+            aster_mesh::CustodySample {
+                clock_id,
+                tick_ms: 1_000,
+            },
+        );
+        let valid_key = CustodyObjectKey::event(valid);
+        let expiring_key = CustodyObjectKey::event(expiring);
+        let revision = store.custody_policy_revision().expect("revision");
+        let expired_sample = aster_mesh::CustodySample {
+            clock_id,
+            tick_ms: 1_050,
+        };
+
+        assert!(matches!(
+            store.authorize_receipt_free_custody_sends(
+                &[valid_key, expiring_key],
+                Some(expired_sample),
+                revision,
+            ),
+            Err(StoreError::Custody(CustodyStoreError::Expired))
+        ));
+        assert_eq!(
+            store
+                .custody_sender_status(expiring_key, Some(expired_sample))
+                .expect("expired status"),
+            Some(CustodySenderStatus::Retiring)
+        );
+        let revision = store
+            .custody_policy_revision()
+            .expect("post-expiry revision");
+        let valid_after_terminal = store
+            .authorize_receipt_free_custody_send(
+                valid_key,
+                Some(aster_mesh::CustodySample {
+                    clock_id,
+                    tick_ms: 1_030,
+                }),
+                revision,
+            )
+            .expect("valid entry after committed terminal batch");
+        assert_eq!(valid_after_terminal.age_ms, 50);
+        assert_eq!(
+            valid_after_terminal
+                .sample
+                .expect("normalized sample")
+                .tick_ms,
+            1_050
+        );
+
+        let continuity_lost = accept_local_finite_event(
+            &store,
+            &mut services,
+            3,
+            b"continuity lost",
+            1_000,
+            aster_mesh::CustodySample {
+                clock_id,
+                tick_ms: 1_060,
+            },
+        );
+        let continuity_lost_key = CustodyObjectKey::event(continuity_lost);
+        let revision = store.custody_policy_revision().expect("revision");
+        assert!(matches!(
+            store.authorize_receipt_free_custody_sends(&[continuity_lost_key], None, revision,),
+            Err(StoreError::Custody(CustodyStoreError::ContinuityLost))
+        ));
+        assert_eq!(
+            store
+                .custody_sender_status(continuity_lost_key, None)
+                .expect("continuity-lost status"),
+            Some(CustodySenderStatus::Age(
+                CustodyAgeStatus::WithheldUnknownAge
+            ))
+        );
+    }
+
+    #[test]
+    fn receipt_free_custody_batch_rolls_back_on_missing_item() {
+        let file = TestFile::new("receipt-free custody batch missing item rollback");
+        let mut services = event_services(0xd7);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("store");
+        let clock_id = [0x48; 16];
+        let transfer_id = accept_local_finite_event(
+            &store,
+            &mut services,
+            1,
+            b"present",
+            1_000,
+            aster_mesh::CustodySample {
+                clock_id,
+                tick_ms: 1_000,
+            },
+        );
+        let key = CustodyObjectKey::event(transfer_id);
+        let missing = CustodyObjectKey::event(EventTransferId::new([0xff; 32]));
+        let revision = store.custody_policy_revision().expect("revision");
+
+        assert!(matches!(
+            store.authorize_receipt_free_custody_sends(
+                &[key, missing],
+                Some(aster_mesh::CustodySample {
+                    clock_id,
+                    tick_ms: 1_050,
+                }),
+                revision,
+            ),
+            Err(StoreError::Custody(CustodyStoreError::ItemNotFound))
+        ));
+
+        let authorized = store
+            .authorize_receipt_free_custody_send(
+                key,
+                Some(aster_mesh::CustodySample {
+                    clock_id,
+                    tick_ms: 1_030,
+                }),
+                revision,
+            )
+            .expect("authorization after rolled-back batch");
+        assert_eq!(authorized.age_ms, 30);
+        assert_eq!(authorized.sample.expect("sample").tick_ms, 1_030);
     }
 
     #[test]

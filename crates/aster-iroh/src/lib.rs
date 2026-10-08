@@ -35,7 +35,7 @@ use iroh::{
     TransportAddr,
     endpoint::{
         ConnectionError, NetReportConfig, PathEvent, PortmapperConfig, QuicTransportConfig,
-        ReadToEndError, VarInt, presets,
+        ReadToEndError, RecvStream, SendStream, VarInt, presets,
     },
     tls::CaTlsConfig,
 };
@@ -47,7 +47,7 @@ use swarm_discovery::{
     Peer as SwarmPeer,
 };
 use tokio::task::{AbortHandle, Id as TaskId, JoinError, JoinSet};
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout, timeout_at};
 
 pub use iroh::{EndpointId, RelayUrl, SecretKey};
 
@@ -265,6 +265,7 @@ impl fmt::Debug for ChannelBinding {
 }
 
 const RESPONSE_CONSUMED_MARKER: &[u8] = b"\0";
+const UNI_TURN_MAGIC: &[u8; 5] = b"ASTU\x01";
 
 /// Default upper bound for one opaque request or response.
 pub const DEFAULT_MAX_EXCHANGE_BYTES: usize = 2 * 1024 * 1024;
@@ -595,6 +596,8 @@ pub enum CarrierError {
     /// An opaque frame exceeded its configured bound. `actual` is the exact
     /// local size or the smallest size proven by a bounded remote read.
     FrameTooLarge { actual: usize, maximum: usize },
+    /// One length-delimited turn exceeded the caller-owned aggregate byte bound.
+    TurnTooLarge { actual: usize, maximum: usize },
 }
 
 impl fmt::Display for CarrierError {
@@ -608,6 +611,12 @@ impl fmt::Display for CarrierError {
                 write!(
                     formatter,
                     "carrier frame is at least {actual} bytes; maximum is {maximum}"
+                )
+            }
+            Self::TurnTooLarge { actual, maximum } => {
+                write!(
+                    formatter,
+                    "carrier turn is at least {actual} bytes; maximum is {maximum}"
                 )
             }
         }
@@ -1401,7 +1410,8 @@ impl Endpoint {
         }
         let transport = transport
             .max_concurrent_bidi_streams(VarInt::from_u32(16))
-            .max_concurrent_uni_streams(VarInt::from_u32(0))
+            // The role-ordered carrier state machine permits exactly one active uni turn.
+            .max_concurrent_uni_streams(VarInt::from_u32(1))
             .stream_receive_window(VarInt::from_u32(window))
             .receive_window(VarInt::from_u32(window.saturating_mul(2)))
             .send_window(u64::from(window.saturating_mul(2)))
@@ -1762,6 +1772,7 @@ impl Endpoint {
             self.config.exchange_timeout,
             self.config.max_exchange_bytes,
             self.security_profile,
+            UniTurnRole::Dialer,
         ))
     }
 
@@ -1848,6 +1859,7 @@ impl Endpoint {
             self.config.exchange_timeout,
             self.config.max_exchange_bytes,
             self.security_profile,
+            UniTurnRole::Acceptor,
         ))
     }
 
@@ -1940,6 +1952,162 @@ where
     Ok(checked)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UniTurnRole {
+    Dialer,
+    Acceptor,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UniTurnPosition {
+    First,
+    Second,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UniTurnState {
+    ExpectFirstSend,
+    SendingFirst,
+    ExpectFirstReceive,
+    ReceivingFirst,
+    ExpectSecondSend,
+    SendingSecond,
+    ExpectSecondReceive,
+    ReceivingSecond,
+    Complete,
+}
+
+impl UniTurnState {
+    fn initial(role: UniTurnRole) -> Self {
+        match role {
+            UniTurnRole::Dialer => Self::ExpectFirstSend,
+            UniTurnRole::Acceptor => Self::ExpectFirstReceive,
+        }
+    }
+
+    fn begin_send(&mut self) -> Result<UniTurnPosition, CarrierError> {
+        match *self {
+            Self::ExpectFirstSend => {
+                *self = Self::SendingFirst;
+                Ok(UniTurnPosition::First)
+            }
+            Self::ExpectSecondSend => {
+                *self = Self::SendingSecond;
+                Ok(UniTurnPosition::Second)
+            }
+            _ => Err(CarrierError::Transport(
+                "unidirectional turn send is concurrent, reordered, or extra".into(),
+            )),
+        }
+    }
+
+    fn begin_receive(&mut self) -> Result<UniTurnPosition, CarrierError> {
+        match *self {
+            Self::ExpectFirstReceive => {
+                *self = Self::ReceivingFirst;
+                Ok(UniTurnPosition::First)
+            }
+            Self::ExpectSecondReceive => {
+                *self = Self::ReceivingSecond;
+                Ok(UniTurnPosition::Second)
+            }
+            _ => Err(CarrierError::Transport(
+                "unidirectional turn receive is concurrent, reordered, or extra".into(),
+            )),
+        }
+    }
+
+    fn finish_send(&mut self, position: UniTurnPosition) -> Result<(), CarrierError> {
+        match (*self, position) {
+            (Self::SendingFirst, UniTurnPosition::First) => {
+                *self = Self::ExpectSecondReceive;
+                Ok(())
+            }
+            (Self::SendingSecond, UniTurnPosition::Second) => {
+                *self = Self::Complete;
+                Ok(())
+            }
+            _ => Err(CarrierError::Transport(
+                "unidirectional send turn completed out of phase".into(),
+            )),
+        }
+    }
+
+    fn finish_receive(&mut self, position: UniTurnPosition) -> Result<(), CarrierError> {
+        match (*self, position) {
+            (Self::ReceivingFirst, UniTurnPosition::First) => {
+                *self = Self::ExpectSecondSend;
+                Ok(())
+            }
+            (Self::ReceivingSecond, UniTurnPosition::Second) => {
+                *self = Self::Complete;
+                Ok(())
+            }
+            _ => Err(CarrierError::Transport(
+                "unidirectional receive turn completed out of phase".into(),
+            )),
+        }
+    }
+
+    fn skip(&mut self) -> Result<(), CarrierError> {
+        match *self {
+            Self::ExpectFirstSend => {
+                *self = Self::ExpectSecondReceive;
+                Ok(())
+            }
+            Self::ExpectFirstReceive => {
+                *self = Self::ExpectSecondSend;
+                Ok(())
+            }
+            Self::ExpectSecondSend | Self::ExpectSecondReceive => {
+                *self = Self::Complete;
+                Ok(())
+            }
+            _ => Err(CarrierError::Transport(
+                "unidirectional turn skip is concurrent or extra".into(),
+            )),
+        }
+    }
+
+    fn fail(&mut self) {
+        *self = Self::Complete;
+    }
+}
+
+fn lock_uni_turn_state(
+    state: &Arc<Mutex<UniTurnState>>,
+) -> Result<std::sync::MutexGuard<'_, UniTurnState>, CarrierError> {
+    state
+        .lock()
+        .map_err(|_| CarrierError::Transport("unidirectional turn state is poisoned".into()))
+}
+
+/// Owned sender for one ordered, bounded unidirectional carrier turn.
+pub struct SendUniTurn {
+    stream: SendStream,
+    deadline: Instant,
+    max_frame_bytes: usize,
+    max_turn_bytes: usize,
+    written_bytes: usize,
+    state: Arc<Mutex<UniTurnState>>,
+    position: UniTurnPosition,
+    complete: bool,
+    started: bool,
+}
+
+/// Owned receiver for one ordered, bounded unidirectional carrier turn.
+pub struct ReceiveUniTurn {
+    stream: RecvStream,
+    deadline: Instant,
+    max_frame_bytes: usize,
+    max_turn_bytes: usize,
+    read_bytes: usize,
+    state: Arc<Mutex<UniTurnState>>,
+    position: UniTurnPosition,
+    complete: bool,
+    eof: bool,
+}
+
 /// Authenticated, bounded opaque exchange channel.
 #[derive(Clone)]
 pub struct Connection {
@@ -1949,6 +2117,7 @@ pub struct Connection {
     max_exchange_bytes: usize,
     path_witness: Arc<Mutex<PathWitness>>,
     security_profile: CarrierSecurityProfile,
+    uni_turn_state: Arc<Mutex<UniTurnState>>,
 }
 
 impl Connection {
@@ -1958,6 +2127,7 @@ impl Connection {
         exchange_timeout: Duration,
         max_exchange_bytes: usize,
         security_profile: CarrierSecurityProfile,
+        uni_turn_role: UniTurnRole,
     ) -> Self {
         // Subscribe before the snapshot. Path events are not replayed, so the
         // opposite order has a window in which a selection change can vanish.
@@ -2005,6 +2175,7 @@ impl Connection {
             max_exchange_bytes,
             path_witness,
             security_profile,
+            uni_turn_state: Arc::new(Mutex::new(UniTurnState::initial(uni_turn_role))),
         }
     }
 
@@ -2084,6 +2255,102 @@ impl Connection {
                 witness
             }
         }
+    }
+
+    /// Returns the exact protected-frame ceiling enforced for ordered uni turns.
+    pub fn max_uni_frame_bytes(&self) -> usize {
+        self.max_exchange_bytes.min(DEFAULT_MAX_EXCHANGE_BYTES)
+    }
+
+    /// Opens the dialer-to-acceptor or acceptor-to-dialer unidirectional turn
+    /// required by the current carrier phase.
+    ///
+    /// `deadline` is absolute and retained by the returned turn. The aggregate
+    /// bound includes each four-byte length prefix and protected frame body.
+    pub async fn open_send_uni(
+        &self,
+        deadline: Instant,
+        max_turn_bytes: usize,
+    ) -> Result<SendUniTurn, CarrierError> {
+        let position = {
+            let mut state = lock_uni_turn_state(&self.uni_turn_state)?;
+            state.begin_send()?
+        };
+        let stream = match timeout_at(deadline, self.inner.open_uni()).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(error)) => {
+                if let Ok(mut state) = lock_uni_turn_state(&self.uni_turn_state) {
+                    state.fail();
+                }
+                return Err(CarrierError::Transport(error.to_string()));
+            }
+            Err(_) => {
+                if let Ok(mut state) = lock_uni_turn_state(&self.uni_turn_state) {
+                    state.fail();
+                }
+                return Err(CarrierError::Timeout("uni turn open"));
+            }
+        };
+        Ok(SendUniTurn {
+            stream,
+            deadline,
+            max_frame_bytes: self.max_uni_frame_bytes(),
+            max_turn_bytes,
+            written_bytes: 0,
+            state: Arc::clone(&self.uni_turn_state),
+            position,
+            complete: false,
+            started: false,
+        })
+    }
+
+    /// Accepts the exact unidirectional turn required by the current carrier phase.
+    ///
+    /// `deadline` is absolute and retained by the returned turn. The aggregate
+    /// bound includes each four-byte length prefix and protected frame body.
+    pub async fn accept_uni(
+        &self,
+        deadline: Instant,
+        max_turn_bytes: usize,
+    ) -> Result<ReceiveUniTurn, CarrierError> {
+        let position = {
+            let mut state = lock_uni_turn_state(&self.uni_turn_state)?;
+            state.begin_receive()?
+        };
+        let stream = match timeout_at(deadline, self.inner.accept_uni()).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(error)) => {
+                if let Ok(mut state) = lock_uni_turn_state(&self.uni_turn_state) {
+                    state.fail();
+                }
+                return Err(CarrierError::Transport(error.to_string()));
+            }
+            Err(_) => {
+                if let Ok(mut state) = lock_uni_turn_state(&self.uni_turn_state) {
+                    state.fail();
+                }
+                return Err(CarrierError::Timeout("uni turn accept"));
+            }
+        };
+        let mut turn = ReceiveUniTurn {
+            stream,
+            deadline,
+            max_frame_bytes: self.max_uni_frame_bytes(),
+            max_turn_bytes,
+            read_bytes: 0,
+            state: Arc::clone(&self.uni_turn_state),
+            position,
+            complete: false,
+            eof: false,
+        };
+        turn.read_preamble().await?;
+        Ok(turn)
+    }
+
+    /// Advances one role-ordered uni-turn phase that the authenticated higher
+    /// layer proved does not require a stream.
+    pub fn skip_uni_turn(&self) -> Result<(), CarrierError> {
+        lock_uni_turn_state(&self.uni_turn_state)?.skip()
     }
 
     /// Sends one opaque request and reads one opaque response.
@@ -2290,6 +2557,267 @@ impl Connection {
     }
 }
 
+impl SendUniTurn {
+    /// Writes one nonempty length-delimited protected frame after a synchronous
+    /// caller check. The metadata-free turn preamble is started first; a rejected
+    /// check writes no frame-length prefix or frame body.
+    pub async fn write_frame_checked<F, T, E>(
+        &mut self,
+        frame: &[u8],
+        before_write: F,
+    ) -> Result<T, E>
+    where
+        F: FnOnce() -> Result<T, E>,
+        E: From<CarrierError>,
+    {
+        if self.complete {
+            return Err(E::from(CarrierError::Transport(
+                "unidirectional send turn is already complete".into(),
+            )));
+        }
+        if frame.is_empty() {
+            return Err(E::from(CarrierError::Transport(
+                "unidirectional frame must be nonempty".into(),
+            )));
+        }
+        ensure_frame_bound(frame.len(), self.max_frame_bytes).map_err(E::from)?;
+        let encoded_bytes = std::mem::size_of::<u32>()
+            .checked_add(frame.len())
+            .ok_or_else(|| {
+                E::from(CarrierError::TurnTooLarge {
+                    actual: usize::MAX,
+                    maximum: self.max_turn_bytes,
+                })
+            })?;
+        let next_total = self
+            .written_bytes
+            .checked_add(encoded_bytes)
+            .ok_or_else(|| {
+                E::from(CarrierError::TurnTooLarge {
+                    actual: usize::MAX,
+                    maximum: self.max_turn_bytes,
+                })
+            })?;
+        if next_total > self.max_turn_bytes {
+            return Err(E::from(CarrierError::TurnTooLarge {
+                actual: next_total,
+                maximum: self.max_turn_bytes,
+            }));
+        }
+        self.ensure_started().await.map_err(E::from)?;
+        let checked = before_write()?;
+        let length = u32::try_from(frame.len())
+            .map_err(|_| {
+                E::from(CarrierError::FrameTooLarge {
+                    actual: frame.len(),
+                    maximum: u32::MAX as usize,
+                })
+            })?
+            .to_be_bytes();
+        let written = timeout_at(self.deadline, async {
+            self.stream
+                .write_all(&length)
+                .await
+                .map_err(|error| CarrierError::Transport(error.to_string()))?;
+            self.stream
+                .write_all(frame)
+                .await
+                .map_err(|error| CarrierError::Transport(error.to_string()))
+        })
+        .await;
+        match written {
+            Ok(Ok(())) => {
+                self.written_bytes = next_total;
+                Ok(checked)
+            }
+            Ok(Err(error)) => {
+                self.abort();
+                Err(E::from(error))
+            }
+            Err(_) => {
+                self.abort();
+                Err(E::from(CarrierError::Timeout("uni turn send")))
+            }
+        }
+    }
+
+    async fn ensure_started(&mut self) -> Result<(), CarrierError> {
+        if self.started {
+            return Ok(());
+        }
+        let written = timeout_at(self.deadline, self.stream.write_all(UNI_TURN_MAGIC)).await;
+        match written {
+            Ok(Ok(())) => {
+                self.started = true;
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                let error = CarrierError::Transport(error.to_string());
+                self.abort();
+                Err(error)
+            }
+            Err(_) => {
+                self.abort();
+                Err(CarrierError::Timeout("uni turn send"))
+            }
+        }
+    }
+
+    /// Finishes this transport stream without waiting for a peer receipt.
+    pub async fn finish(&mut self) -> Result<(), CarrierError> {
+        if self.complete {
+            return Err(CarrierError::Transport(
+                "unidirectional send turn is already complete".into(),
+            ));
+        }
+        self.ensure_started().await?;
+        if Instant::now() >= self.deadline {
+            self.abort();
+            return Err(CarrierError::Timeout("uni turn finish"));
+        }
+        if let Err(error) = self.stream.finish() {
+            self.abort();
+            return Err(CarrierError::Transport(error.to_string()));
+        }
+        let result = lock_uni_turn_state(&self.state)?.finish_send(self.position);
+        self.complete = true;
+        result
+    }
+
+    fn abort(&mut self) {
+        let _ = self.stream.reset(2u8.into());
+        if let Ok(mut state) = lock_uni_turn_state(&self.state) {
+            state.fail();
+        }
+        self.complete = true;
+    }
+}
+
+impl Drop for SendUniTurn {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.abort();
+        }
+    }
+}
+
+impl ReceiveUniTurn {
+    async fn read_preamble(&mut self) -> Result<(), CarrierError> {
+        let mut magic = [0u8; UNI_TURN_MAGIC.len()];
+        let mut read = 0usize;
+        while read < magic.len() {
+            match self.read_some(&mut magic[read..]).await? {
+                Some(count) => read += count,
+                None => {
+                    return Err(self.fail_with(CarrierError::Transport(
+                        "truncated unidirectional turn preamble".into(),
+                    )));
+                }
+            }
+        }
+        validate_uni_turn_magic(&magic).map_err(|error| self.fail_with(error))
+    }
+
+    /// Reads the next complete protected frame, or `None` only after exact EOF.
+    pub async fn read_frame(&mut self) -> Result<Option<Vec<u8>>, CarrierError> {
+        if self.eof {
+            return Ok(None);
+        }
+        if self.complete {
+            return Err(CarrierError::Transport(
+                "unidirectional receive turn failed before EOF".into(),
+            ));
+        }
+
+        let mut length = [0u8; std::mem::size_of::<u32>()];
+        let mut length_read = 0usize;
+        while length_read < length.len() {
+            match self.read_some(&mut length[length_read..]).await? {
+                None if length_read == 0 => {
+                    let result = lock_uni_turn_state(&self.state)?.finish_receive(self.position);
+                    self.complete = true;
+                    self.eof = true;
+                    result?;
+                    return Ok(None);
+                }
+                None => {
+                    return Err(self
+                        .fail_with(CarrierError::Transport("truncated uni frame length".into())));
+                }
+                Some(read) => length_read += read,
+            }
+        }
+
+        let frame_len = decode_uni_frame_length(length, self.max_frame_bytes)
+            .map_err(|error| self.fail_with(error))?;
+        let encoded_bytes = std::mem::size_of::<u32>()
+            .checked_add(frame_len)
+            .ok_or_else(|| {
+                self.fail_with(CarrierError::TurnTooLarge {
+                    actual: usize::MAX,
+                    maximum: self.max_turn_bytes,
+                })
+            })?;
+        let next_total = self.read_bytes.checked_add(encoded_bytes).ok_or_else(|| {
+            self.fail_with(CarrierError::TurnTooLarge {
+                actual: usize::MAX,
+                maximum: self.max_turn_bytes,
+            })
+        })?;
+        if next_total > self.max_turn_bytes {
+            return Err(self.fail_with(CarrierError::TurnTooLarge {
+                actual: next_total,
+                maximum: self.max_turn_bytes,
+            }));
+        }
+
+        let mut frame = vec![0u8; frame_len];
+        let mut frame_read = 0usize;
+        while frame_read < frame.len() {
+            match self.read_some(&mut frame[frame_read..]).await? {
+                Some(read) => frame_read += read,
+                None => {
+                    return Err(
+                        self.fail_with(CarrierError::Transport("truncated uni frame body".into()))
+                    );
+                }
+            }
+        }
+        self.read_bytes = next_total;
+        Ok(Some(frame))
+    }
+
+    async fn read_some(&mut self, output: &mut [u8]) -> Result<Option<usize>, CarrierError> {
+        let read = timeout_at(self.deadline, self.stream.read(output)).await;
+        match read {
+            Ok(Ok(read)) => Ok(read),
+            Ok(Err(error)) => Err(self.fail_with(CarrierError::Transport(error.to_string()))),
+            Err(_) => Err(self.fail_with(CarrierError::Timeout("uni turn receive"))),
+        }
+    }
+
+    fn fail_with(&mut self, error: CarrierError) -> CarrierError {
+        self.abort();
+        error
+    }
+
+    fn abort(&mut self) {
+        let _ = self.stream.stop(2u8.into());
+        if let Ok(mut state) = lock_uni_turn_state(&self.state) {
+            state.fail();
+        }
+        self.complete = true;
+    }
+}
+
+impl Drop for ReceiveUniTurn {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.abort();
+        }
+    }
+}
+
 fn selected_path(address: &TransportAddr) -> SelectedPath {
     if address.is_ip() {
         SelectedPath::Direct
@@ -2308,6 +2836,78 @@ fn selected_path_snapshot(connection: &iroh::endpoint::Connection) -> SelectedPa
         .map_or(SelectedPath::Unknown, |path| {
             selected_path(path.remote_addr())
         })
+}
+
+fn validate_uni_turn_magic(magic: &[u8; UNI_TURN_MAGIC.len()]) -> Result<(), CarrierError> {
+    if magic == UNI_TURN_MAGIC {
+        Ok(())
+    } else {
+        Err(CarrierError::Transport(
+            "invalid unidirectional turn preamble".into(),
+        ))
+    }
+}
+
+fn decode_uni_frame_length(
+    encoded: [u8; std::mem::size_of::<u32>()],
+    maximum: usize,
+) -> Result<usize, CarrierError> {
+    let actual = usize::try_from(u32::from_be_bytes(encoded))
+        .map_err(|_| CarrierError::Transport("uni frame length overflows".into()))?;
+    if actual == 0 {
+        return Err(CarrierError::Transport(
+            "unidirectional frame must be nonempty".into(),
+        ));
+    }
+    ensure_frame_bound(actual, maximum)?;
+    Ok(actual)
+}
+
+/// Exercises the production uni-turn preamble, length, frame, and aggregate
+/// bounds for hostile-input fuzzing without opening a network connection.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_decode_uni_turn(input: &[u8], max_frame_bytes: usize, max_turn_bytes: usize) -> bool {
+    let Some(magic) = input.get(..UNI_TURN_MAGIC.len()) else {
+        return false;
+    };
+    let Ok(magic) = <&[u8; UNI_TURN_MAGIC.len()]>::try_from(magic) else {
+        return false;
+    };
+    if validate_uni_turn_magic(magic).is_err() {
+        return false;
+    }
+    let mut offset = UNI_TURN_MAGIC.len();
+    let mut total = 0usize;
+    while offset < input.len() {
+        let Some(encoded) = input.get(offset..offset + std::mem::size_of::<u32>()) else {
+            return false;
+        };
+        let encoded = <[u8; std::mem::size_of::<u32>()]>::try_from(encoded)
+            .expect("length slice has the exact fixed width");
+        let Ok(frame_len) = decode_uni_frame_length(encoded, max_frame_bytes) else {
+            return false;
+        };
+        let Some(encoded_bytes) = std::mem::size_of::<u32>().checked_add(frame_len) else {
+            return false;
+        };
+        let Some(next_total) = total.checked_add(encoded_bytes) else {
+            return false;
+        };
+        if next_total > max_turn_bytes {
+            return false;
+        }
+        offset += std::mem::size_of::<u32>();
+        let Some(next_offset) = offset.checked_add(frame_len) else {
+            return false;
+        };
+        if next_offset > input.len() {
+            return false;
+        }
+        offset = next_offset;
+        total = next_total;
+    }
+    true
 }
 
 fn ensure_frame_bound(actual: usize, maximum: usize) -> Result<(), CarrierError> {
@@ -2445,6 +3045,30 @@ mod tests {
             .expect("connect");
         let server_connection = server_task.await.expect("server task");
         (server_connection, client_connection)
+    }
+
+    async fn direct_connection_pair() -> (Endpoint, Endpoint, Connection, Connection) {
+        direct_connection_pair_with_config(EndpointConfig::direct(
+            "127.0.0.1:0".parse().expect("address"),
+        ))
+        .await
+    }
+
+    async fn direct_connection_pair_with_config(
+        config: EndpointConfig,
+    ) -> (Endpoint, Endpoint, Connection, Connection) {
+        let server = Endpoint::bind(SecretKey::generate(), config)
+            .await
+            .expect("server");
+        let client = Endpoint::bind(SecretKey::generate(), config)
+            .await
+            .expect("client");
+        let (server_connection, client_connection) = connect_pair(&server, &client).await;
+        (server, client, server_connection, client_connection)
+    }
+
+    fn uni_deadline() -> tokio::time::Instant {
+        tokio::time::Instant::now() + Duration::from_secs(2)
     }
 
     #[cfg(feature = "test-utils")]
@@ -4223,6 +4847,494 @@ mod tests {
         assert!(server_task.await.expect("server task").is_err());
 
         connection.close();
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn uni_turn_preserves_frame_order_and_reports_exact_eof() {
+        let (server, client, receiver_connection, sender_connection) =
+            direct_connection_pair().await;
+        let receive = tokio::spawn(async move {
+            let mut turn = receiver_connection
+                .accept_uni(uni_deadline(), 64)
+                .await
+                .expect("accept uni turn");
+            assert_eq!(
+                turn.read_frame().await.expect("first frame"),
+                Some(b"first".to_vec())
+            );
+            assert_eq!(
+                turn.read_frame().await.expect("second frame"),
+                Some(b"second".to_vec())
+            );
+            assert_eq!(turn.read_frame().await.expect("exact EOF"), None);
+            assert_eq!(turn.read_frame().await.expect("stable EOF"), None);
+            receiver_connection
+        });
+
+        let mut turn = sender_connection
+            .open_send_uni(uni_deadline(), 64)
+            .await
+            .expect("open uni turn");
+        turn.write_frame_checked(b"first", || Ok::<_, CarrierError>(()))
+            .await
+            .expect("first frame");
+        turn.write_frame_checked(b"second", || Ok::<_, CarrierError>(()))
+            .await
+            .expect("second frame");
+        turn.finish().await.expect("finish uni turn");
+        let receiver_connection = receive.await.expect("receive task");
+
+        receiver_connection.close();
+        sender_connection.close();
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn uni_turn_zero_frame_and_prewrite_rejection_emit_no_frame_bytes() {
+        let (server, client, receiver_connection, sender_connection) =
+            direct_connection_pair().await;
+        let receive = tokio::spawn(async move {
+            let mut turn = receiver_connection
+                .accept_uni(uni_deadline(), 64)
+                .await
+                .expect("accept first uni turn");
+            assert_eq!(
+                turn.read_frame().await.expect("visible frame"),
+                Some(b"visible".to_vec())
+            );
+            assert_eq!(turn.read_frame().await.expect("first EOF"), None);
+
+            let mut zero = receiver_connection
+                .open_send_uni(uni_deadline(), 0)
+                .await
+                .expect("open reverse zero-frame turn");
+            zero.finish().await.expect("finish zero-frame turn");
+            receiver_connection
+        });
+
+        let mut turn = sender_connection
+            .open_send_uni(uni_deadline(), 64)
+            .await
+            .expect("open first uni turn");
+        let rejected: Result<(), CarrierError> = turn
+            .write_frame_checked(b"hidden", || {
+                Err(CarrierError::Configuration("test rejection".into()))
+            })
+            .await;
+        assert!(matches!(rejected, Err(CarrierError::Configuration(_))));
+        turn.write_frame_checked(b"visible", || Ok::<_, CarrierError>(()))
+            .await
+            .expect("visible frame");
+        turn.finish().await.expect("finish first uni turn");
+
+        let mut zero = sender_connection
+            .accept_uni(uni_deadline(), 0)
+            .await
+            .expect("accept reverse zero-frame turn");
+        assert_eq!(zero.read_frame().await.expect("zero-frame EOF"), None);
+        let receiver_connection = receive.await.expect("receive task");
+
+        receiver_connection.close();
+        sender_connection.close();
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn uni_turn_enforces_per_frame_and_aggregate_bounds_without_partial_writes() {
+        let (server, client, receiver_connection, sender_connection) =
+            direct_connection_pair().await;
+        let receive = tokio::spawn(async move {
+            let mut empty = receiver_connection
+                .accept_uni(uni_deadline(), usize::MAX)
+                .await
+                .expect("accept bounded first turn");
+            assert_eq!(
+                empty.read_frame().await.expect("oversize emitted no frame"),
+                None
+            );
+
+            let mut aggregate = receiver_connection
+                .open_send_uni(uni_deadline(), 8)
+                .await
+                .expect("open aggregate turn");
+            aggregate
+                .write_frame_checked(b"four", || Ok::<_, CarrierError>(()))
+                .await
+                .expect("exact aggregate bound");
+            assert!(matches!(
+                aggregate
+                    .write_frame_checked(b"x", || Ok::<_, CarrierError>(()))
+                    .await,
+                Err(CarrierError::TurnTooLarge {
+                    actual: 13,
+                    maximum: 8
+                })
+            ));
+            aggregate.finish().await.expect("finish aggregate turn");
+            receiver_connection
+        });
+
+        let mut bounded = sender_connection
+            .open_send_uni(uni_deadline(), usize::MAX)
+            .await
+            .expect("open bounded first turn");
+        let oversized = vec![0; DEFAULT_MAX_EXCHANGE_BYTES + 1];
+        assert!(matches!(
+            bounded
+                .write_frame_checked(&oversized, || Ok::<_, CarrierError>(()))
+                .await,
+            Err(CarrierError::FrameTooLarge {
+                actual,
+                maximum: DEFAULT_MAX_EXCHANGE_BYTES
+            }) if actual == DEFAULT_MAX_EXCHANGE_BYTES + 1
+        ));
+        bounded.finish().await.expect("finish bounded first turn");
+
+        let mut aggregate = sender_connection
+            .accept_uni(uni_deadline(), 8)
+            .await
+            .expect("accept aggregate turn");
+        assert_eq!(
+            aggregate
+                .read_frame()
+                .await
+                .expect("bounded aggregate frame"),
+            Some(b"four".to_vec())
+        );
+        assert_eq!(
+            aggregate
+                .read_frame()
+                .await
+                .expect("rejected frame emitted no bytes"),
+            None
+        );
+        let receiver_connection = receive.await.expect("receive task");
+
+        receiver_connection.close();
+        sender_connection.close();
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn uni_turn_rejects_truncated_length() {
+        let (server, client, receiver_connection, sender_connection) =
+            direct_connection_pair().await;
+        let mut raw = sender_connection
+            .inner
+            .open_uni()
+            .await
+            .expect("raw uni stream");
+        raw.write_all(UNI_TURN_MAGIC).await.expect("turn preamble");
+        raw.write_all(&[0, 0]).await.expect("partial length");
+        raw.finish().expect("finish partial length");
+
+        let mut turn = receiver_connection
+            .accept_uni(uni_deadline(), 64)
+            .await
+            .expect("accept malformed turn");
+        assert!(matches!(
+            turn.read_frame().await,
+            Err(CarrierError::Transport(message)) if message.contains("truncated uni frame length")
+        ));
+
+        sender_connection.close();
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn uni_turn_rejects_truncated_body_and_trailing_partial_length() {
+        let (server, client, receiver_connection, sender_connection) =
+            direct_connection_pair().await;
+        let mut raw = sender_connection
+            .inner
+            .open_uni()
+            .await
+            .expect("raw uni stream");
+        raw.write_all(UNI_TURN_MAGIC).await.expect("turn preamble");
+        raw.write_all(&5u32.to_be_bytes())
+            .await
+            .expect("body length");
+        raw.write_all(b"ab").await.expect("partial body");
+        raw.finish().expect("finish partial body");
+        let mut turn = receiver_connection
+            .accept_uni(uni_deadline(), 64)
+            .await
+            .expect("accept truncated body");
+        assert!(matches!(
+            turn.read_frame().await,
+            Err(CarrierError::Transport(message)) if message.contains("truncated uni frame body")
+        ));
+        sender_connection.close();
+        client.close().await;
+        server.close().await;
+
+        let (server, client, receiver_connection, sender_connection) =
+            direct_connection_pair().await;
+        let mut raw = sender_connection
+            .inner
+            .open_uni()
+            .await
+            .expect("raw uni stream");
+        raw.write_all(UNI_TURN_MAGIC).await.expect("turn preamble");
+        raw.write_all(&1u32.to_be_bytes())
+            .await
+            .expect("valid length");
+        raw.write_all(b"x").await.expect("valid body");
+        raw.write_all(&[0]).await.expect("trailing partial length");
+        raw.finish().expect("finish trailing partial length");
+        let mut turn = receiver_connection
+            .accept_uni(uni_deadline(), 64)
+            .await
+            .expect("accept trailing partial length");
+        assert_eq!(
+            turn.read_frame().await.expect("valid first frame"),
+            Some(b"x".to_vec())
+        );
+        assert!(matches!(
+            turn.read_frame().await,
+            Err(CarrierError::Transport(message)) if message.contains("truncated uni frame length")
+        ));
+        sender_connection.close();
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn uni_turn_uses_one_absolute_deadline_and_reports_peer_reset() {
+        let (server, client, receiver_connection, sender_connection) =
+            direct_connection_pair().await;
+        let raw_connection = sender_connection.inner.clone();
+        let stalled = tokio::spawn(async move {
+            let mut raw = raw_connection.open_uni().await.expect("raw stalled stream");
+            raw.write_all(UNI_TURN_MAGIC).await.expect("turn preamble");
+            for byte in [0, 0, 0, 1] {
+                if raw.write_all(&[byte]).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+            let _ = raw.write_all(b"x").await;
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+        let mut turn = receiver_connection
+            .accept_uni(deadline, 64)
+            .await
+            .expect("accept stalled turn");
+        assert!(matches!(
+            turn.read_frame().await,
+            Err(CarrierError::Timeout("uni turn receive"))
+        ));
+        stalled.abort();
+        sender_connection.close();
+        client.close().await;
+        server.close().await;
+
+        let (server, client, receiver_connection, sender_connection) =
+            direct_connection_pair().await;
+        let mut raw = sender_connection
+            .inner
+            .open_uni()
+            .await
+            .expect("raw reset stream");
+        raw.write_all(UNI_TURN_MAGIC).await.expect("turn preamble");
+        raw.write_all(&4u32.to_be_bytes())
+            .await
+            .expect("reset length");
+        raw.reset(9u8.into()).expect("reset stream");
+        match receiver_connection.accept_uni(uni_deadline(), 64).await {
+            Ok(mut turn) => assert!(matches!(
+                turn.read_frame().await,
+                Err(CarrierError::Transport(_))
+            )),
+            Err(CarrierError::Transport(_)) => {}
+            Err(error) => panic!("peer reset failed at the wrong stage: {error}"),
+        }
+        sender_connection.close();
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn uni_turn_uses_the_lower_configured_frame_bound() {
+        let mut config = EndpointConfig::direct("127.0.0.1:0".parse().expect("address"));
+        config.max_exchange_bytes = 8;
+        let (server, client, receiver_connection, sender_connection) =
+            direct_connection_pair_with_config(config).await;
+        assert_eq!(receiver_connection.max_uni_frame_bytes(), 8);
+        assert_eq!(sender_connection.max_uni_frame_bytes(), 8);
+        let receive = tokio::spawn(async move {
+            let mut turn = receiver_connection
+                .accept_uni(uni_deadline(), 64)
+                .await
+                .expect("accept lower-bound turn");
+            assert_eq!(turn.read_frame().await.expect("exact EOF"), None);
+            receiver_connection
+        });
+
+        let mut turn = sender_connection
+            .open_send_uni(uni_deadline(), 64)
+            .await
+            .expect("open lower-bound turn");
+        assert!(matches!(
+            turn.write_frame_checked(b"123456789", || Ok::<_, CarrierError>(()))
+                .await,
+            Err(CarrierError::FrameTooLarge {
+                actual: 9,
+                maximum: 8
+            })
+        ));
+        turn.finish().await.expect("finish lower-bound turn");
+        let receiver_connection = receive.await.expect("receive task");
+
+        receiver_connection.close();
+        sender_connection.close();
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn uni_turn_receiver_rejects_remote_frame_and_aggregate_overflow() {
+        let (server, client, receiver_connection, sender_connection) =
+            direct_connection_pair().await;
+        let mut raw = sender_connection
+            .inner
+            .open_uni()
+            .await
+            .expect("raw oversized stream");
+        raw.write_all(UNI_TURN_MAGIC).await.expect("turn preamble");
+        raw.write_all(
+            &u32::try_from(DEFAULT_MAX_EXCHANGE_BYTES + 1)
+                .unwrap()
+                .to_be_bytes(),
+        )
+        .await
+        .expect("oversized length");
+        raw.finish().expect("finish oversized stream");
+        let mut turn = receiver_connection
+            .accept_uni(uni_deadline(), usize::MAX)
+            .await
+            .expect("accept oversized stream");
+        assert!(matches!(
+            turn.read_frame().await,
+            Err(CarrierError::FrameTooLarge {
+                actual,
+                maximum: DEFAULT_MAX_EXCHANGE_BYTES
+            }) if actual == DEFAULT_MAX_EXCHANGE_BYTES + 1
+        ));
+        sender_connection.close();
+        client.close().await;
+        server.close().await;
+
+        let (server, client, receiver_connection, sender_connection) =
+            direct_connection_pair().await;
+        let mut raw = sender_connection
+            .inner
+            .open_uni()
+            .await
+            .expect("raw aggregate stream");
+        raw.write_all(UNI_TURN_MAGIC).await.expect("turn preamble");
+        raw.write_all(&4u32.to_be_bytes())
+            .await
+            .expect("first length");
+        raw.write_all(b"four").await.expect("first frame");
+        raw.write_all(&1u32.to_be_bytes())
+            .await
+            .expect("second length");
+        raw.write_all(b"x").await.expect("second frame");
+        raw.finish().expect("finish aggregate stream");
+        let mut turn = receiver_connection
+            .accept_uni(uni_deadline(), 8)
+            .await
+            .expect("accept aggregate stream");
+        assert_eq!(
+            turn.read_frame().await.expect("first frame"),
+            Some(b"four".to_vec())
+        );
+        assert!(matches!(
+            turn.read_frame().await,
+            Err(CarrierError::TurnTooLarge {
+                actual: 13,
+                maximum: 8
+            })
+        ));
+        sender_connection.close();
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn uni_turn_rejects_concurrent_reordered_and_extra_phases() {
+        let (server, client, responder, initiator) = direct_connection_pair().await;
+        assert!(responder.open_send_uni(uni_deadline(), 8).await.is_err());
+        assert!(initiator.accept_uni(uni_deadline(), 8).await.is_err());
+
+        let mut first = initiator
+            .open_send_uni(uni_deadline(), 8)
+            .await
+            .expect("open first phase");
+        assert!(initiator.open_send_uni(uni_deadline(), 8).await.is_err());
+        assert!(initiator.accept_uni(uni_deadline(), 8).await.is_err());
+        first.finish().await.expect("finish first phase");
+        assert!(initiator.open_send_uni(uni_deadline(), 8).await.is_err());
+
+        let mut first = responder
+            .accept_uni(uni_deadline(), 8)
+            .await
+            .expect("accept first phase");
+        assert_eq!(first.read_frame().await.expect("first EOF"), None);
+        assert!(responder.accept_uni(uni_deadline(), 8).await.is_err());
+
+        let mut second = responder
+            .open_send_uni(uni_deadline(), 8)
+            .await
+            .expect("open second phase");
+        second.finish().await.expect("finish second phase");
+        let mut second = initiator
+            .accept_uni(uni_deadline(), 8)
+            .await
+            .expect("accept second phase");
+        assert_eq!(second.read_frame().await.expect("second EOF"), None);
+
+        assert!(initiator.open_send_uni(uni_deadline(), 8).await.is_err());
+        assert!(initiator.accept_uni(uni_deadline(), 8).await.is_err());
+        assert!(responder.open_send_uni(uni_deadline(), 8).await.is_err());
+        assert!(responder.accept_uni(uni_deadline(), 8).await.is_err());
+
+        initiator.close();
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn uni_turn_skip_advances_an_omitted_first_phase_without_opening_a_stream() {
+        let (server, client, responder, initiator) = direct_connection_pair().await;
+        initiator
+            .skip_uni_turn()
+            .expect("skip initiator send phase");
+        responder
+            .skip_uni_turn()
+            .expect("skip responder receive phase");
+
+        let mut second = responder
+            .open_send_uni(uni_deadline(), 8)
+            .await
+            .expect("open second phase");
+        second.finish().await.expect("finish second phase");
+        let mut second = initiator
+            .accept_uni(uni_deadline(), 8)
+            .await
+            .expect("accept second phase");
+        assert_eq!(second.read_frame().await.expect("second EOF"), None);
+        assert!(initiator.skip_uni_turn().is_err());
+        assert!(responder.skip_uni_turn().is_err());
+
+        initiator.close();
         client.close().await;
         server.close().await;
     }

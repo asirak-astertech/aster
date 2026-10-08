@@ -140,6 +140,7 @@ name = "aster-fuzz"
 version = "0.0.0"
 dependencies = [
  "aster-core",
+ "aster-iroh",
  "aster-negentropy",
  "aster-node",
  "aster-profile",

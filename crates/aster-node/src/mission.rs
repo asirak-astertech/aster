@@ -2323,6 +2323,65 @@ impl MissionSession {
         self.inner.open_frame(frame).map_err(Into::into)
     }
 
+    /// Protects one semantic-v7 record with exact negotiated profile, lane,
+    /// and direction context as authenticated associated data.
+    pub(crate) fn seal_v7_application_frame(
+        &mut self,
+        transfer_profile_digest: [u8; 32],
+        lane: crate::event_pages::LaneId,
+        profile: crate::event_pages::TransferProfileId,
+        direction: crate::frame::EventDirection,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, MissionSessionError> {
+        let context =
+            self.v7_application_record_context(transfer_profile_digest, lane, profile, direction)?;
+        self.inner
+            .seal_frame_with_context(plaintext, &context)
+            .map_err(Into::into)
+    }
+
+    /// Opens one semantic-v7 record only under the exact negotiated profile,
+    /// lane, and direction context supplied by the local state machine.
+    pub(crate) fn open_v7_application_frame(
+        &mut self,
+        transfer_profile_digest: [u8; 32],
+        lane: crate::event_pages::LaneId,
+        profile: crate::event_pages::TransferProfileId,
+        direction: crate::frame::EventDirection,
+        frame: &[u8],
+    ) -> Result<Vec<u8>, MissionSessionError> {
+        let context =
+            self.v7_application_record_context(transfer_profile_digest, lane, profile, direction)?;
+        self.inner
+            .open_frame_with_context(frame, &context)
+            .map_err(Into::into)
+    }
+
+    fn v7_application_record_context(
+        &self,
+        transfer_profile_digest: [u8; 32],
+        lane: crate::event_pages::LaneId,
+        profile: crate::event_pages::TransferProfileId,
+        direction: crate::frame::EventDirection,
+    ) -> Result<Vec<u8>, MissionSessionError> {
+        if self.semantic_version() != crate::event_pages::SEMANTIC_PROTOCOL_V7 {
+            return Err(MissionSessionError::Authentication(EnvelopeError(
+                "semantic-v7 record context is unavailable for this session".into(),
+            )));
+        }
+        let mut context = Vec::with_capacity(24 + 2 + 32 + 2 + 2 + 1);
+        context.extend_from_slice(b"ASTER/v7-lane-record/v1\0");
+        context.extend_from_slice(&self.semantic_version().to_be_bytes());
+        context.extend_from_slice(&transfer_profile_digest);
+        context.extend_from_slice(&(lane as u16).to_be_bytes());
+        context.extend_from_slice(&(profile as u16).to_be_bytes());
+        context.push(match direction {
+            crate::frame::EventDirection::ToSessionInitiator => 1,
+            crate::frame::EventDirection::ToSessionResponder => 2,
+        });
+        Ok(context)
+    }
+
     /// Protects one exact semantic-v3 custody claim in its dedicated record domain.
     pub fn seal_custody_wrapper(
         &mut self,
@@ -2362,12 +2421,18 @@ impl fmt::Debug for MissionSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event_pages::{
+        ChangePageCustody, ChangePageEntry, ChangePageV7, LaneId, TransferProfileId,
+        schedule_digest, transfer_profile_digest,
+    };
     use crate::frame::{EventDirection, Frame};
     use aster_iroh::{CarrierSecurityProfile, Endpoint, EndpointConfig, ExpectedPeer, SecretKey};
     use aster_mesh::{
-        ClassicalProvisioner, ClassicalProvisioningAccess, ProvisioningAccess,
+        ClassicalProvisioner, ClassicalProvisioningAccess, CustodyHop, CustodySample,
+        CustodyTransferClaims, CustodyTransferId, Priority, ProvisioningAccess,
         ProvisioningLoadReceipt, ReferenceEnvelopeSealer, ReferenceProvisioner, Scope, Topic,
     };
+    use aster_redb_store::EventTransferId;
     use std::{collections::BTreeSet, net::SocketAddr, time::Duration};
 
     struct IssuedNode {
@@ -3141,6 +3206,321 @@ mod tests {
         server_task.await.expect("server task");
         client.close().await;
         server.close().await;
+    }
+
+    #[test]
+    fn semantic_v7_application_records_bind_profile_lane_and_direction() {
+        let mut provisioner = ReferenceProvisioner::from_seed([0x40; 32]).expect("provisioner");
+        let initiator = issue(&mut provisioner, 1);
+        let responder = issue(&mut provisioner, 2);
+        let (mut initiator_session, mut responder_session) =
+            establish(&initiator, &responder).expect("establish session");
+        let offer = crate::event_pages::TransferProfileOfferV1::current();
+        let negotiated = crate::event_pages::negotiate_transfer_profiles(&offer, &offer)
+            .expect("negotiate profiles");
+        let digest = crate::event_pages::transfer_profile_digest(&offer, &offer, &negotiated);
+
+        let protected = initiator_session
+            .seal_v7_application_frame(
+                digest,
+                crate::event_pages::LaneId::Event,
+                crate::event_pages::TransferProfileId::EventPagesV1,
+                EventDirection::ToSessionResponder,
+                b"page",
+            )
+            .expect("seal contextual v7 frame");
+
+        let mut wrong_digest = digest;
+        wrong_digest[0] ^= 1;
+        assert!(
+            responder_session
+                .open_v7_application_frame(
+                    wrong_digest,
+                    crate::event_pages::LaneId::Event,
+                    crate::event_pages::TransferProfileId::EventPagesV1,
+                    EventDirection::ToSessionResponder,
+                    &protected,
+                )
+                .is_err()
+        );
+        assert!(
+            responder_session
+                .open_v7_application_frame(
+                    digest,
+                    crate::event_pages::LaneId::State,
+                    crate::event_pages::TransferProfileId::EventPagesV1,
+                    EventDirection::ToSessionResponder,
+                    &protected,
+                )
+                .is_err()
+        );
+        assert!(
+            responder_session
+                .open_v7_application_frame(
+                    digest,
+                    crate::event_pages::LaneId::Event,
+                    crate::event_pages::TransferProfileId::LegacyV6,
+                    EventDirection::ToSessionResponder,
+                    &protected,
+                )
+                .is_err()
+        );
+        assert!(
+            responder_session
+                .open_v7_application_frame(
+                    digest,
+                    crate::event_pages::LaneId::Event,
+                    crate::event_pages::TransferProfileId::EventPagesV1,
+                    EventDirection::ToSessionInitiator,
+                    &protected,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            responder_session
+                .open_v7_application_frame(
+                    digest,
+                    crate::event_pages::LaneId::Event,
+                    crate::event_pages::TransferProfileId::EventPagesV1,
+                    EventDirection::ToSessionResponder,
+                    &protected,
+                )
+                .expect("open exact contextual v7 frame"),
+            b"page"
+        );
+    }
+
+    #[test]
+    fn semantic_v7_record_domains_reject_cross_domain_auth_without_poisoning_replay() {
+        const RECORD_SEQUENCE_OFFSET: usize = 8 + 2 + 2;
+
+        let mut provisioner = ReferenceProvisioner::from_seed([0x42; 32]).expect("provisioner");
+        let initiator = issue(&mut provisioner, 1);
+        let responder = issue(&mut provisioner, 2);
+        let (mut sender, mut receiver) =
+            establish(&initiator, &responder).expect("establish session");
+        let offer = crate::event_pages::TransferProfileOfferV1::current();
+        let negotiated = crate::event_pages::negotiate_transfer_profiles(&offer, &offer)
+            .expect("negotiate profiles");
+        let digest = crate::event_pages::transfer_profile_digest(&offer, &offer, &negotiated);
+        let lane = crate::event_pages::LaneId::Event;
+        let profile = crate::event_pages::TransferProfileId::EventPagesV1;
+        let direction = EventDirection::ToSessionResponder;
+
+        let contextual = sender
+            .seal_v7_application_frame(digest, lane, profile, direction, b"contextual")
+            .expect("seal contextual record");
+        assert!(
+            receiver.open_application_frame(&contextual).is_err(),
+            "contextual ciphertext must not authenticate in the ordinary domain"
+        );
+        let mut forged_high_contextual = contextual.clone();
+        forged_high_contextual[RECORD_SEQUENCE_OFFSET..RECORD_SEQUENCE_OFFSET + 8]
+            .copy_from_slice(&u64::MAX.to_be_bytes());
+        assert!(
+            receiver
+                .open_application_frame(&forged_high_contextual)
+                .is_err(),
+            "failed ordinary-domain authentication must not advance ordinary replay state"
+        );
+
+        let ordinary = sender
+            .seal_application_frame(b"ordinary")
+            .expect("seal ordinary record");
+        assert!(
+            receiver
+                .open_v7_application_frame(digest, lane, profile, direction, &ordinary)
+                .is_err(),
+            "ordinary ciphertext must not authenticate in the contextual domain"
+        );
+        let mut forged_high_ordinary = ordinary.clone();
+        forged_high_ordinary[RECORD_SEQUENCE_OFFSET..RECORD_SEQUENCE_OFFSET + 8]
+            .copy_from_slice(&u64::MAX.to_be_bytes());
+        assert!(
+            receiver
+                .open_v7_application_frame(digest, lane, profile, direction, &forged_high_ordinary,)
+                .is_err(),
+            "failed contextual authentication must not advance contextual replay state"
+        );
+
+        assert_eq!(
+            receiver
+                .open_v7_application_frame(digest, lane, profile, direction, &contextual)
+                .expect("cross-domain failures must not poison contextual replay state"),
+            b"contextual"
+        );
+        assert_eq!(
+            receiver
+                .open_application_frame(&ordinary)
+                .expect("cross-domain failures must not poison ordinary replay state"),
+            b"ordinary"
+        );
+        assert!(
+            receiver
+                .open_v7_application_frame(digest, lane, profile, direction, &contextual)
+                .is_err(),
+            "contextual replay must still be rejected"
+        );
+        assert!(
+            receiver.open_application_frame(&ordinary).is_err(),
+            "ordinary replay must still be rejected"
+        );
+    }
+
+    fn finite_page_fixture(
+        sender: &mut MissionSession,
+        finite_entries: usize,
+        durable_entries: usize,
+    ) -> (Vec<u8>, Vec<(Vec<u8>, CustodyExpectation)>) {
+        let current = crate::event_pages::TransferProfileOfferV1::current();
+        let profiles = crate::event_pages::negotiate_transfer_profiles(&current, &current)
+            .expect("negotiate current profiles");
+        let digest = transfer_profile_digest(&current, &current, &profiles);
+        let direction = EventDirection::ToSessionResponder;
+        let mut entries = Vec::with_capacity(finite_entries + durable_entries);
+        let mut custody = Vec::with_capacity(finite_entries);
+
+        for index in 0..finite_entries {
+            let mut exact_hash = [0u8; 32];
+            exact_hash[..8].copy_from_slice(&u64::try_from(index + 1).unwrap().to_be_bytes());
+            let transfer_id = CustodyTransferId::from_exact_hash(exact_hash);
+            let transfer =
+                CustodyTransferClaims::new(transfer_id, 1, Some(60_000), Priority::Routine)
+                    .expect("finite transfer claims");
+            let exchange_id = u64::try_from(index + 1).expect("bounded exchange ID");
+            let claims = CustodyClaims::new(
+                transfer,
+                exchange_id,
+                1,
+                CustodyHop::new(
+                    1,
+                    CustodySample {
+                        clock_id: [0x61; 16],
+                        tick_ms: 1,
+                    },
+                    0,
+                )
+                .expect("finite custody hop"),
+            )
+            .expect("finite custody claims");
+            let wrapper = sender
+                .seal_custody_wrapper(&claims)
+                .expect("seal finite custody wrapper");
+            entries.push(ChangePageEntry {
+                id: EventTransferId::new(exact_hash),
+                custody: Some(ChangePageCustody {
+                    exchange_id,
+                    wrapper: wrapper.clone(),
+                }),
+                source_event: vec![0x41],
+            });
+            custody.push((wrapper, CustodyExpectation::new(transfer, exchange_id)));
+        }
+        for index in 0..durable_entries {
+            let mut exact_hash = [0u8; 32];
+            exact_hash[0] = 0xff;
+            exact_hash[24..].copy_from_slice(&u64::try_from(index + 1).unwrap().to_be_bytes());
+            entries.push(ChangePageEntry {
+                id: EventTransferId::new(exact_hash),
+                custody: None,
+                source_event: vec![0x42],
+            });
+        }
+        let scheduled = entries.iter().map(|entry| entry.id).collect::<Vec<_>>();
+        let page = Frame::ChangePage(ChangePageV7 {
+            direction,
+            transfer_profile_digest: digest,
+            schedule_digest: schedule_digest(&scheduled),
+            page_number: 0,
+            entries,
+            remaining: 0,
+        })
+        .encode_for_semantic_version(crate::event_pages::SEMANTIC_PROTOCOL_V7)
+        .expect("encode valid finite Event page");
+        let protected = sender
+            .seal_v7_application_frame(
+                digest,
+                LaneId::Event,
+                TransferProfileId::EventPagesV1,
+                direction,
+                &page,
+            )
+            .expect("protect valid finite Event page");
+        (protected, custody)
+    }
+
+    fn open_finite_page_fixture(
+        receiver: &mut MissionSession,
+        protected: &[u8],
+        custody: &[(Vec<u8>, CustodyExpectation)],
+    ) {
+        let current = crate::event_pages::TransferProfileOfferV1::current();
+        let profiles = crate::event_pages::negotiate_transfer_profiles(&current, &current)
+            .expect("negotiate current profiles");
+        let digest = transfer_profile_digest(&current, &current, &profiles);
+        let plaintext = receiver
+            .open_v7_application_frame(
+                digest,
+                LaneId::Event,
+                TransferProfileId::EventPagesV1,
+                EventDirection::ToSessionResponder,
+                protected,
+            )
+            .expect("authenticate complete Event page before embedded evidence");
+        assert!(
+            receiver
+                .open_v7_application_frame(
+                    digest,
+                    LaneId::Event,
+                    TransferProfileId::EventPagesV1,
+                    EventDirection::ToSessionResponder,
+                    protected,
+                )
+                .is_err(),
+            "the context-bound page replay domain must reject a duplicate outer page"
+        );
+        let frame = Frame::decode_for_semantic_version(
+            &plaintext,
+            crate::event_pages::SEMANTIC_PROTOCOL_V7,
+        )
+        .expect("decode authenticated Event page");
+        let Frame::ChangePage(page) = frame else {
+            panic!("fixture did not decode as an Event page");
+        };
+        assert_eq!(
+            page.entries
+                .iter()
+                .filter(|entry| entry.custody.is_some())
+                .count(),
+            custody.len()
+        );
+        for (wrapper, expected) in custody {
+            receiver
+                .open_custody_wrapper(wrapper, *expected)
+                .expect("embedded custody evidence remains replay-valid after outer page");
+        }
+        if let Some((wrapper, expected)) = custody.first() {
+            assert!(
+                receiver.open_custody_wrapper(wrapper, *expected).is_err(),
+                "the ordinary custody replay domain must reject duplicate evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_v7_page_authentication_does_not_age_out_embedded_custody_evidence() {
+        for (finite_entries, durable_entries) in [(127, 0), (127, 1), (128, 0), (128, 1)] {
+            let mut provisioner =
+                ReferenceProvisioner::from_seed([finite_entries as u8; 32]).expect("provisioner");
+            let initiator = issue(&mut provisioner, 1);
+            let responder = issue(&mut provisioner, 2);
+            let (mut sender, mut receiver) =
+                establish(&initiator, &responder).expect("establish session");
+
+            let (protected, custody) =
+                finite_page_fixture(&mut sender, finite_entries, durable_entries);
+            open_finite_page_fixture(&mut receiver, &protected, &custody);
+        }
     }
 
     #[test]

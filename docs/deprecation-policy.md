@@ -27,20 +27,29 @@ Unknown optional extensions remain ignorable throughout a major version.
 Unknown critical values fail only the containing object/session and never cause
 silent reinterpretation. Stable replication-wire, credential/envelope, crypto-
 profile, and handshake-framing encodings remain version `1`. The current
-handshake separately negotiates semantic versions `6`, `5`, `4`, `3`, `2`, and
-`1` and complete suite `0x0001`; a default offer is `[6, 5, 4, 3, 2, 1]`, and an honest responder selects the
+handshake separately negotiates semantic versions `7`, `6`, `5`, `4`, `3`,
+`2`, and `1` and complete suite `0x0001`; a default offer is
+`[7, 6, 5, 4, 3, 2, 1]`, and an honest responder selects the
 highest common semantic version. Offer and selection are transcript, KDF,
 confirmation, and hybrid-authentication bound, so an unauthenticated on-path
 rewrite fails.
+
+Semantic version `7` inherits every semantic-v6 lane and adds a mandatory
+post-handshake per-lane transfer-profile exchange. Every lane must retain
+`LegacyV6`; Event directions may select `EventPagesV1` for exact durable,
+finite-TTL, tombstone, route-only, mixed, and bounded blind ReceiveOnly
+traffic. Semantic-v7 page frames are invalid in v1-v6 sessions, and v7
+does not reinterpret any v1-v6 byte or stable object.
 
 Semantic version `4` adds the selected protected, class- and direction-separated
 State/Record mechanics lanes; semantic version `5` inherits them and adds the
 selected direct-content Blob source/carrier mechanics. Semantic version `6`
 inherits every v5 ordinary lane unchanged and adds an opt-in selected Event
 bridge lane that runs only when both authenticated endpoints enable it. Event
-remains compatible across semantic versions `1` through `6`; State/Record
+remains compatible across semantic versions `1` through `7`; State/Record
 frames are absent from v1-v3 contacts, Blob frames are absent from v1-v4
-contacts, and Event-bridge frames are absent from v1-v5 contacts.
+contacts, Event-bridge frames are absent from v1-v5 contacts, and v7 profile/page
+frames are absent from v1-v6 contacts.
 This is a negotiated-behavior addition: stable wire/profile, handshake framing,
 suite, and source-object formats are not renumbered. A v4 State/Record object is
 therefore never silently downgraded into an Event or processed by a v1-v3

@@ -185,7 +185,7 @@ evidence statuses below do not move.
 | `aster-redb-store` | One mission-bound transaction authority for ordered control/policy, content-verified Event/State/Record/Blob publication, the shared causal frontier, Event/State/Record delivery ledgers, the metadata-only exact-publication Blob delivery ledger, Event custody, class-specific operations/cursors, guarded Record resolution, route-only Event cache, Blob depot markers, and v5 exact pending Blob source plans plus peer-neutral carrier prefixes. An additive open path binds one exact mission/profile/generation and rejects mismatch, rollback, or implicit advance. It grants ordinary Blob visibility only after exact depot, fresh full-content, and fresh current-lineage completion agree atomically. | Authenticating the caller-supplied profile generation, snapshot/backup-resistant rollback, deriving identity from unverified bytes, route-only Blob relay/custody, executing application merge code, State/Record/Blob TTL or GC, complete physical allocation/sanitization, automatic revoke-plus-rekey, or a second authority |
 | `aster-negentropy` | Sole bounded set-difference mechanism over class-specific exact Event, State, Record, and v5 Blob source transfer identities, with timestamp zero | Object transfer, Blob carrier-prefix ownership, semantic identity, policy, or durable contact progress |
 | `aster-iroh` | Direct endpoint lifecycle, exact carrier authentication, rostered allowlist admission, unrostered carrier acceptance only into the higher-layer mission handshake, bounded exchange, opt-in exact carrier ALPN selection and TLS-exporter channel binding, an opt-in singleton controlled HTTPS relay with explicit WebPKI or replacement DER-root trust and observation-only path telemetry, and default-off short-lived nearby lookup or sanitized locator browsing on the default IPv4 multicast interface or an explicit sorted, deduplicated bounded interface set | Mission identity, item/source authorization, production/hosted discovery or public/default relay fallback, port mapping, hostile-bounded upstream discovery state, lifetime IP pinning, representative or physical NAT acceptance, or physical-path proof |
-| `aster-node` | Sole stock composition root for mission-before-inventory/control-before-data; exact rostered carrier/mission checks or bounded authority-authenticated automatic LAN admission; exact control/Event/State/Record transfer; semantic-v3/v4/v5/v6 Event custody; semantic-v4/v5/v6 State/Record lanes; semantic-v5/v6 direct content-capable Blob source-before-carrier transfer; semantic-v6 static selected Event bridge negotiation, peer-route filtering, bounded rotation, durable receiver outcomes, and restart promotion; constrained emission with ReceiveOnly zero Blob; caller-provided protected live `NodeConfig`; actor-owned live Event/State/Record/Blob and privileged control handles; durable Event delivery, retained-bounded State positive-current-version, Record whole-key active-head, and metadata-only exact-publication Blob delivery with local State/Record/Blob delivery-ledger status and local durable Blob transfer progress; capacity-one joined Blob worker with bounded regular-file publication and zeroize-on-drop plaintext pages; exclusive stopped Event/State/Record/Blob/control facades; local zeroization; receipts and CLI. Its mission module additionally exposes an owned, cancellation-safe two-node profile-`0x0002` Iroh authorization/raw-exchange path. | Supported bridge administration or dynamic hierarchy lifecycle, stock runtime/CLI profile selection, production or hostile-LAN discovery qualification, production SecretStore or protected stock CLI/bindings, cross-process admin IPC, automatic revoke-plus-rekey, global convergence claims, State materialized-view or synthetic-withdrawal delivery, dynamic `NodeConfig` interest mutation through State/Record/Blob application subscriptions, State/Record/Blob peer/contact/convergence status, route-only Blob relay/custody, State/Record/Blob TTL/GC, broader State/Record partitions/relays, physical RF silence, automatic merge, generalized policy, coordinated provider destruction, platform-complete zeroization, or release authorization |
+| `aster-node` | Sole stock composition root for mission-before-inventory/control-before-data; exact rostered carrier/mission checks or bounded authority-authenticated automatic LAN admission; exact control/Event/State/Record transfer; semantic-v3/v4/v5/v6/v7 Event custody; semantic-v4/v5/v6/v7 State/Record lanes; semantic-v5/v6/v7 direct content-capable Blob source-before-carrier transfer; semantic-v6/v7 static selected Event bridge negotiation, peer-route filtering, bounded rotation, durable receiver outcomes, and restart promotion; semantic-v7 negotiated receipt-free Event pages; constrained emission with ReceiveOnly zero Blob; caller-provided protected live `NodeConfig`; actor-owned live Event/State/Record/Blob and privileged control handles; durable Event delivery, retained-bounded State positive-current-version, Record whole-key active-head, and metadata-only exact-publication Blob delivery with local State/Record/Blob delivery-ledger status and local durable Blob transfer progress; capacity-one joined Blob worker with bounded regular-file publication and zeroize-on-drop plaintext pages; exclusive stopped Event/State/Record/Blob/control facades; local zeroization; receipts and CLI. Its mission module additionally exposes an owned, cancellation-safe two-node profile-`0x0002` Iroh authorization/raw-exchange path. | Supported bridge administration or dynamic hierarchy lifecycle, stock runtime/CLI profile selection, production or hostile-LAN discovery qualification, production SecretStore or protected stock CLI/bindings, cross-process admin IPC, automatic revoke-plus-rekey, global convergence claims, State materialized-view or synthetic-withdrawal delivery, dynamic `NodeConfig` interest mutation through State/Record/Blob application subscriptions, State/Record/Blob peer/contact/convergence status, route-only Blob relay/custody, State/Record/Blob TTL/GC, broader State/Record partitions/relays, physical RF silence, automatic merge, generalized policy, coordinated provider destruction, platform-complete zeroization, or release authorization |
 | `aster-core` | Profile-`0x0001` mission/control/source security and recipient-filtered rekey planning; additive profile-`0x0002` provisioned singleton policy, P-256 semantic-v1 Event/control forms, four-flight exporter-bound session, and exact-magic facade; provider-neutral bounded provisioning protection plus operation-bound opaque SecretStore install/load/destroy contracts | A production SecretStore/protection backend, stock runtime profile selection, profile-`0x0002` State/Record/Blob/batch/bridge/rekey, hardware/platform custody policy, operational recovery or physical-erasure assurance; the core remains authoritative migration source and is not deleted while replacements lack equivalent tests |
 
 Each control transfer ID is the exact envelope digest authenticated against its
@@ -199,14 +199,14 @@ indexes plus one authenticated publisher-dot and causal-frontier authority
 across Event, State, Record, and Blob. Canonical strict kind-2 Blob carrier IDs
 enter only the v5 carrier-range grammar.
 
-The selected handshake default/highest semantic version is 6 with offer
-`[6, 5, 4, 3, 2, 1]`. Event remains compatible across all six values;
-State/Record mechanics run in v4-v6, and Blob mechanics run in v5/v6. The
-static selected Event bridge lane is v6-only. V6 ordinary lane encodings are
-byte-identical to v5, and a peer without v6 negotiates the prior behavior.
-V1-v4 emit zero Blob frames. Stable
-wire/profile, ABI, handshake framing, and source-object formats remain version
-1. Current-code v4-v6 automation does not alter any retained v1-v3 receipt.
+The selected handshake default/highest semantic version is 7 with offer
+`[7, 6, 5, 4, 3, 2, 1]`. Event remains compatible across all seven values;
+State/Record mechanics run in v4-v7, Blob mechanics run in v5-v7, and the
+static selected Event bridge lane runs in v6-v7. V7 preserves the v6 legacy
+lanes and adds negotiated receipt-free Event pages; a peer without v7 negotiates
+the prior behavior. V1-v4 emit zero Blob frames. Stable wire/profile, ABI,
+handshake framing, and source-object formats remain version 1. Current-code
+v4-v7 automation does not alter any retained v1-v3 receipt.
 
 The selected node's normal dependency graph contains neither SQLite nor
 `rusqlite`. The old caller-ID opaque `put` path remains isolated for compatibility
@@ -1035,10 +1035,11 @@ independent interoperability, or release credit is claimed.
 
 ### Semantic-v5 selected Blob network slice
 
-The current selected offer is `[6, 5, 4, 3, 2, 1]`. The semantic-v5 slice
+The current selected offer is `[7, 6, 5, 4, 3, 2, 1]`. The semantic-v5 slice
 inherits Event v1-v4 and State/Record v4 behavior and adds Blob class `3`
 source lanes plus one carrier range lane. Semantic v6 inherits those ordinary
-lanes unchanged and adds only the opt-in Event-bridge mechanics lane. V1-v4
+lanes unchanged and adds only the opt-in Event-bridge mechanics lane; semantic
+v7 preserves those paths and adds negotiated receipt-free Event pages. V1-v4
 emit and accept zero Blob frames. Stable wire/ABI version 1, session framing,
 `ASTRENV2`/`ASTRENV3`, manifests, `ASTRBT01`, typed ObjectIDs, and cryptographic
 suite remain unchanged.
@@ -3202,9 +3203,10 @@ build, C11 and C++17 syntax plus linked-runtime smoke tests, Python 12/12, and
 the complete Go suite. At that pre-v4 source freeze, ABI and wire versions were
 1 and the default/highest semantic version was 3, with semantic versions 2 and
 1 retained for negotiated compatibility. Current code instead offers
-`[6, 5, 4, 3, 2, 1]`; v4 through v6 inherit the same Event custody mechanics
-without changing this receipt, and v6 separately adds the opt-in Event-bridge
-lane.
+`[7, 6, 5, 4, 3, 2, 1]`; v4 through v7 inherit the same Event custody mechanics
+without changing this receipt, v6 adds the opt-in Event-bridge lane, and v7
+adds negotiated receipt-free Event pages without changing this historical
+receipt.
 
 This evidence moves exactly `DM-11-15`, `DM-11-17`, `DM-5.4-05`,
 `DM-5.4-09`, `DM-5.4-10`, `DM-5.4-12` through `DM-5.4-19`, `DM-5.4-21`,

@@ -2,9 +2,9 @@
 ; Source envelopes, custody wrappers, handshakes, Blob manifests, and Blob
 ; chunk carriers use the separately specified bounded binary security profile
 ; in envelope.md. This CDDL defines only deterministic-CBOR messages.
-; Semantic-v2/v3/v4/v5/v6 ASTRENV3 batch proof/item bytes are the same fixed binary
+; Semantic-v2/v3/v4/v5/v6/v7 ASTRENV3 batch proof/item bytes are the same fixed binary
 ; profile in protocol.md section 6.1 and MUST NOT be decoded or normalized as
-; CBOR. Semantic versions 3, 4, 5, and 6 additionally carry semantic-v3-format custody
+; CBOR. Semantic versions 3 through 7 additionally carry semantic-v3-format custody
 ; in a distinct fixed binary session-record domain; they do not allocate another
 ; deterministic-CBOR kind.
 ; A receiver on semantic version 1 MUST reject raw input beginning "ASTRENV3"
@@ -26,7 +26,7 @@ extension-value = uint / nint / bytes / tstr / bool / null /
 
 ; object-id is exactly kind:u8 || digest:bytes .size 32.
 ; Semantic version 1 permits 1=stable source envelope and 2=Blob chunk carrier.
-; Semantic versions 2, 3, 4, 5, and 6 additionally permit 3=source-batch proof,
+; Semantic versions 2 through 7 additionally permit 3=source-batch proof,
 ; 4=bridge authorization, and 5=bridge-route wrapper. A semantic-v1 reader
 ; suppresses those extended kinds before inventory construction and rejects
 ; them in every received Offer, Want, Data, and Receipt. Collections sort the
@@ -38,6 +38,7 @@ semantic-v3-object-kind = semantic-v2-object-kind
 semantic-v4-object-kind = semantic-v3-object-kind
 semantic-v5-object-kind = semantic-v4-object-kind
 semantic-v6-object-kind = semantic-v5-object-kind
+semantic-v7-object-kind = semantic-v6-object-kind
 object-id = bytes .size 33
 hash-256 = bytes .size 32
 priority = 0..3
@@ -137,3 +138,10 @@ receipt = {
 }
 
 sync-message = interest / summary / probe / radix-node / offer / want / data / receipt
+
+; Semantic-v7 transfer-profile and Event-page mechanics are canonical fixed
+; binary plaintexts inside protected ASTRFR01 records, not deterministic-CBOR
+; replication messages. Their lane/profile/frame registries and exact field
+; order are specified in protocol.md section 9.4 and locked by the executable
+; conformance/vectors/event-pages-v7.tsv corpus. They allocate no ObjectKind and
+; do not change any sync-message encoding above.
