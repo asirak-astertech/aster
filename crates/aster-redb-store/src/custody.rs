@@ -7393,6 +7393,9 @@ impl Store {
 
         if due_expirations.is_empty() && retiring_keys.is_empty() {
             write.commit()?;
+            *writer_commits = (*writer_commits)
+                .checked_add(1)
+                .ok_or(CustodyStoreError::CounterOverflow)?;
             return Ok(report);
         }
 
@@ -7638,6 +7641,9 @@ impl Store {
         let usage = custody_usage_write(&write, scope)?;
         if require_quota_capacity(usage, &quota, demand.usage.items, demand.usage.bytes).is_ok() {
             write.commit()?;
+            *writer_commits = (*writer_commits)
+                .checked_add(1)
+                .ok_or(CustodyStoreError::CounterOverflow)?;
             return Ok(CustodyGcReport::default());
         }
         let mut candidates = BinaryHeap::new();

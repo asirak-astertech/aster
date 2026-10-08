@@ -10522,7 +10522,7 @@ impl Store {
                         if intent_digest != operation.intent_digest {
                             return Err(StoreError::EventOperationConflict);
                         }
-                        match custody::event_custody_authority_write(&write, transfer_id)? {
+                        match custody::event_custody_authority_write(write, transfer_id)? {
                             custody::EventCustodyAuthority::Retired { reason, .. } => {
                                 return Ok(PreparedEventStage::NoCommit(
                                     EventCommitResult::RetiredOperation { reason },
@@ -10651,7 +10651,7 @@ impl Store {
                 acceptance_marker,
                 reason,
                 ..
-            } = custody::event_custody_authority_write(&write, accepted)?
+            } = custody::event_custody_authority_write(write, accepted)?
             {
                 let metadata = write
                     .open_table(EVENTS)?

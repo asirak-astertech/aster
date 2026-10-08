@@ -27583,6 +27583,7 @@ mod tests {
                     zeroization_queued,
                     blob_worker_fatal_on_shutdown: false,
                     blob_final_read_gate: None,
+                    event_group_execution_gate: None,
                     outbound_contact: None,
                     contact_lifecycle: Some(lifecycle),
                     initial_peer_contact_activity: vec![
@@ -27819,6 +27820,7 @@ mod tests {
                     zeroization_queued,
                     blob_worker_fatal_on_shutdown: false,
                     blob_final_read_gate: None,
+                    event_group_execution_gate: None,
                     outbound_contact: Some(contact_hook),
                     contact_lifecycle: None,
                     initial_peer_contact_activity: vec![(peer_id, initial_activity)],
