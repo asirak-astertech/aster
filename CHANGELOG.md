@@ -16,6 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `asterctl` CLI utility.
 - Local delivery and transfer status for State, Record, and Blob operations.
 - Numbered Event publication with durable operation tracking and crash-safe recovery.
+- Separately bounded, non-evictable Blob physical-lineage and publication-replay
+  fences; typed publication/pending-source variant references; and exact
+  lifecycle accounting with audit-first atomic predecessor migration.
+- Persistent six-class Blob maintenance discovery with independently nonzero
+  row/file/byte budgets, durable fair cursors, and automatic bounded startup and
+  periodic background turns. Destructive handlers remain disabled: this does
+  not add retention/retirement expiry, physical reclamation or deletion
+  manifests, pressure eviction, or finite Blob TTL.
 
 ### Changed
 
@@ -29,7 +37,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   clock-continuity loss. Finite Event/RouteEvent rows remain withheld below TTL,
   re-anchor through the existing bounded expiration index across restarts, and
   expire once their conservative lower bound reaches TTL. The change is
-  wire-neutral; finite Blob lifecycle remains separate follow-up work.
+  wire-neutral; finite Blob TTL and expiry remain separate follow-up work.
+- Made local Blob admission, network staging, publication promotion, and pending
+  abort transactionally update their lifecycle fences, typed roots, counters,
+  and ordinary visibility without changing semantic-v5 wire bytes or public
+  application behavior.
 
 ### Security
 
