@@ -9,6 +9,7 @@
 //! file bytes. They do not claim a bound on unmarked, temporary, or hostile
 //! untracked filesystem allocation.
 
+pub(crate) mod deletion;
 pub(crate) mod depot;
 #[allow(dead_code)] // Lifecycle authority becomes active in Tasks 2-4.
 pub(crate) mod lifecycle;
@@ -1242,6 +1243,7 @@ fn test_pending_blob_source_rows_visited() -> u64 {
 #[derive(Default)]
 pub(crate) struct BlobAuditSnapshot {
     pub stats: BlobStoreStats,
+    pub(crate) deletion_schema_migrated: bool,
 }
 
 impl Store {
@@ -6209,6 +6211,7 @@ pub(crate) fn blob_schema_present_write(
     if legacy_present == 0 && network_present == 0 && global_present.iter().all(|present| !present)
     {
         lifecycle::require_blob_lifecycle_absent_write(write)?;
+        deletion::require_blob_deletion_absent_write(write)?;
         return Ok(false);
     }
     if legacy_present != legacy.len()
@@ -6232,6 +6235,9 @@ pub(crate) fn audit_blob_tables_write(
     if !blob_schema_present_write(write)? {
         initialize_blob_schema(write)?;
     }
+    let deletion_owner_binding = depot::depot_owner_binding_if_present_write(write)?;
+    let (deletion_schema_migrated, deletion_audit) =
+        deletion::audit_or_migrate_blob_deletion_write(write, deletion_owner_binding)?;
     let publications = write.open_table(BLOB_PUBLICATIONS)?;
     let bytes = write.open_table(BLOB_BYTES)?;
     let markers = write.open_table(BLOB_ACCEPTANCE_MARKERS)?;
@@ -6477,7 +6483,7 @@ pub(crate) fn audit_blob_tables_write(
             "Blob operation usage exceeds its durable safety caps",
         )));
     }
-    let depot_stats = depot::audit_depot_metadata_write(write)?;
+    let depot_stats = depot::audit_depot_metadata_write(write, &deletion_audit)?;
     stats.variants = depot_stats.variants;
     stats.finalized_variants = depot_stats.finalized_variants;
     stats.committed_chunks = depot_stats.committed_chunks;
@@ -6506,7 +6512,10 @@ pub(crate) fn audit_blob_tables_write(
         BLOB_OPERATION_TOTAL_BYTES,
         stats.operation_bytes,
     )?;
-    Ok(BlobAuditSnapshot { stats })
+    Ok(BlobAuditSnapshot {
+        stats,
+        deletion_schema_migrated,
+    })
 }
 
 pub(crate) fn inspect_blob_tables_read(
@@ -6544,6 +6553,7 @@ pub(crate) fn inspect_blob_tables_read(
     if legacy_present == 0 && network_present == 0 && global_present.iter().all(|present| !present)
     {
         lifecycle::require_blob_lifecycle_absent_read(read)?;
+        deletion::require_blob_deletion_absent_read(read)?;
         return Ok(BlobAuditSnapshot::default());
     }
     if legacy_present != legacy.len()
@@ -6555,6 +6565,8 @@ pub(crate) fn inspect_blob_tables_read(
         )));
     }
     drop(metadata);
+    let deletion_owner_binding = depot::depot_owner_binding_if_present_read(read)?;
+    let deletion_audit = deletion::inspect_blob_deletion_read(read, deletion_owner_binding)?;
 
     // The read-only audit uses a temporary shared snapshot and verifies Blob
     // rows directly; the caller later checks the complete shared ledgers after
@@ -6712,7 +6724,7 @@ pub(crate) fn inspect_blob_tables_read(
             "Blob operation usage exceeds its durable safety caps",
         )));
     }
-    let depot_stats = depot::inspect_depot_metadata_read(read)?;
+    let depot_stats = depot::inspect_depot_metadata_read(read, &deletion_audit)?;
     stats.variants = depot_stats.variants;
     stats.finalized_variants = depot_stats.finalized_variants;
     stats.committed_chunks = depot_stats.committed_chunks;
@@ -6746,7 +6758,10 @@ pub(crate) fn inspect_blob_tables_read(
         }
     }
     lifecycle::inspect_blob_lifecycle_read(read)?.apply_to_stats(&mut stats);
-    Ok(BlobAuditSnapshot { stats })
+    Ok(BlobAuditSnapshot {
+        stats,
+        deletion_schema_migrated: false,
+    })
 }
 
 /// Extends the exact shared causal-ledger reconstruction used by strict inspection.
@@ -8237,8 +8252,8 @@ mod tests {
 
     use aster_mesh::{
         BlobContentVerification, BlobMetadata as CoreBlobMetadata, BlobStore as CoreBlobStore,
-        EventContentVerification, FinishedBlob, ProvisioningAccess, ReferenceEnvelopeSealer,
-        ReferenceProvisioner, ScopeRekeyRecipient, prepare_blob,
+        CustodySample, EventContentVerification, FinishedBlob, ProvisioningAccess,
+        ReferenceEnvelopeSealer, ReferenceProvisioner, ScopeRekeyRecipient, prepare_blob,
     };
 
     use super::*;
@@ -13241,6 +13256,30 @@ mod tests {
                 .expect("delete orphan maintenance cursors");
             write.commit().expect("commit absent lifecycle schema");
         }
+        assert!(matches!(
+            Store::inspect_existing(&legacy.database)
+                .expect_err("orphan deletion authority is not an absent Blob schema"),
+            StoreError::Blob(BlobStoreError::SchemaInvariant(
+                "Blob deletion authority exists without its base schema"
+            ))
+        ));
+        {
+            let database = Database::open(&legacy.database).expect("orphan deletion database");
+            let write = database.begin_write().expect("orphan deletion cleanup");
+            write
+                .delete_table(deletion::BLOB_DELETION_METADATA)
+                .expect("delete orphan deletion metadata");
+            write
+                .delete_table(deletion::BLOB_DELETION_MANIFESTS)
+                .expect("delete orphan deletion manifests");
+            write
+                .delete_table(deletion::BLOB_DELETION_CHUNKS)
+                .expect("delete orphan deletion chunks");
+            write
+                .delete_table(deletion::BLOB_DELETION_CONTINUITY)
+                .expect("delete orphan deletion continuity");
+            write.commit().expect("commit absent deletion schema");
+        }
         assert_eq!(
             Store::inspect_existing(&legacy.database)
                 .expect("inspect whole-absent Blob group")
@@ -17720,5 +17759,550 @@ mod tests {
                 .expect_err("structural contradiction fails maintenance"),
         );
         assert_eq!(blob_current_admission_digest(&store), before);
+    }
+
+    #[test]
+    fn blob_deletion_manifest_audit_reproduces_exact_variant_chunks_root_and_charge() {
+        let root = BlobTestRoot::new("deletion-exact-audit");
+        let services = blob_services(0xa1);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("deletion audit store");
+        let plaintext = vec![0x41; SELECTED_BLOB_CHUNK_SIZE as usize + 7];
+        let prepared = prepared_blob(&plaintext);
+        finish_variant(&store, &services.publisher, &prepared, &plaintext, 1)
+            .expect("finish unreferenced deletion variant");
+        let stats = store.blob_stats().expect("pre-deletion depot stats");
+        let variant = {
+            let read = store.database.begin_read().expect("read deletion import");
+            let imports = read.open_table(BLOB_IMPORTS).expect("deletion imports");
+            let (key, _) = imports
+                .iter()
+                .expect("deletion import rows")
+                .next()
+                .expect("one deletion import")
+                .expect("deletion import row");
+            BlobVariantId::from_bytes(key.value().try_into().expect("variant key"))
+        };
+        let chunk_files_before = (0..2)
+            .map(|index| {
+                std::fs::read(root.chunk_path(variant, index))
+                    .expect("read protected deletion chunk before audit")
+            })
+            .collect::<Vec<_>>();
+
+        let write = store
+            .database
+            .begin_write()
+            .expect("begin deletion audit fixture");
+        let staged = deletion::move_finalized_variant_to_manifest_for_test(&write, variant)
+            .expect("move exact variant into deletion authority");
+        let audited =
+            deletion::audit_blob_deletion_write(&write, Some(store.blob_depot_owner_binding))
+                .expect("audit exact deletion authority");
+        let reproduced = audited
+            .manifests
+            .get(&variant)
+            .expect("audited deletion manifest");
+        assert_eq!(reproduced, &staged);
+        assert_eq!(reproduced.totals.chunks, 2);
+        assert_eq!(reproduced.totals.queued, 2);
+        assert_eq!(reproduced.totals.deleted, 0);
+        assert_eq!(reproduced.totals.charged_variants, 1);
+        assert_eq!(reproduced.totals.charged_files, 2);
+        assert!(reproduced.finalized_root.is_some());
+        assert_eq!(audited.stats.manifests, 1);
+        assert_eq!(audited.stats.chunks, 2);
+        assert_eq!(
+            audited.stats.charged_committed_bytes,
+            stats.committed_file_bytes
+        );
+        assert_eq!(
+            audited.stats.charged_reserved_bytes,
+            stats.reserved_file_bytes
+        );
+        depot::audit_depot_write(
+            &write,
+            &store.path,
+            store.backing_identity,
+            store.blob_depot_owner_token,
+            stats,
+        )
+        .expect("queued deletion files pass manifest-first physical audit");
+        for (index, before) in chunk_files_before.iter().enumerate() {
+            assert_eq!(
+                std::fs::read(
+                    root.chunk_path(variant, u64::try_from(index).expect("chunk index"),)
+                )
+                .expect("protected queued deletion chunk survives generic cleanup"),
+                *before,
+            );
+        }
+        write.commit().expect("commit exact deletion fixture");
+    }
+
+    #[test]
+    fn blob_deletion_depot_audit_accepts_absent_sparse_expected_only_staging_directory() {
+        // Break caught: an expected-only staging row reserves quota but proves
+        // no committed file ever existed, so GC may audit it without a variant
+        // directory even when the retained row indices are sparse.
+        let root = BlobTestRoot::new("deletion-sparse-expected-only");
+        let source_root = BlobTestRoot::new("deletion-sparse-expected-only-source");
+        let mut services = blob_services(0xa2);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("sparse expected-only target");
+        let source = Store::open_for_mission(&source_root.database, services.authority)
+            .expect("sparse expected-only source");
+        let plaintext = vec![0x42; SELECTED_BLOB_CHUNK_SIZE as usize * 2 + 9];
+        let prepared = prepared_blob(&plaintext);
+        let proof = prepare_blob_proof(&source, &mut services, &prepared, &plaintext, 1);
+        let plan = proof
+            .blob
+            .transfer_plan(&proof.manifest_bytes)
+            .expect("sparse expected-only plan");
+        let variant = BlobVariantId::for_content(
+            plan.manifest().id(),
+            plan.manifest().content_group(),
+            plan.manifest().content_epoch(),
+        );
+        {
+            let mut depot = store.blob_depot().expect("sparse expected-only depot");
+            CoreBlobStore::begin_blob_with_lineage(
+                &mut depot,
+                plan.manifest(),
+                plan.physical_lineage(),
+            )
+            .expect("begin sparse expected-only import");
+            CoreBlobStore::put_expected_chunk_record(
+                &mut depot,
+                plan.manifest().id(),
+                1,
+                plan.chunk_records()[1],
+            )
+            .expect("stage only the middle expected chunk");
+        }
+        let variant_directory = root.depot().join(test_hex32(variant.as_bytes()));
+        std::fs::remove_dir(&variant_directory)
+            .expect("remove empty expected-only staging directory");
+        assert!(!variant_directory.exists());
+        let stats = store.blob_stats().expect("sparse expected-only stats");
+        let write = store
+            .database
+            .begin_write()
+            .expect("begin sparse expected-only deletion fixture");
+        let manifest = deletion::move_variant_to_manifest_for_test(&write, variant)
+            .expect("move sparse expected-only staging into deletion authority");
+        assert_eq!(manifest.totals.chunks, 1);
+        assert_eq!(manifest.chunks[0].index, 1);
+        assert_eq!(manifest.totals.charged_files, 0);
+        depot::audit_depot_write(
+            &write,
+            &store.path,
+            store.backing_identity,
+            store.blob_depot_owner_token,
+            stats,
+        )
+        .expect("absent directory is canonical for sparse expected-only staging");
+        write
+            .commit()
+            .expect("commit sparse expected-only deletion fixture");
+    }
+
+    #[test]
+    fn blob_deletion_audit_rejects_manifest_storage_or_accounting_mismatch() {
+        for (index, corruption) in [
+            "root",
+            "accounting",
+            "deleted-file-present",
+            "live-reference",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let root = BlobTestRoot::new(&format!("deletion-{corruption}"));
+            let services = blob_services(0xb1 + u8::try_from(index).expect("fixture seed"));
+            let store = Store::open_for_mission(&root.database, services.authority)
+                .expect("deletion corruption store");
+            let plaintext = vec![0x51 + u8::try_from(index).expect("fixture byte"); 4_097];
+            let prepared = prepared_blob(&plaintext);
+            finish_variant(&store, &services.publisher, &prepared, &plaintext, 1)
+                .expect("finish deletion corruption variant");
+            let stats = store.blob_stats().expect("deletion corruption stats");
+            let variant = {
+                let read = store.database.begin_read().expect("read corruption import");
+                let imports = read.open_table(BLOB_IMPORTS).expect("corruption imports");
+                let (key, _) = imports
+                    .iter()
+                    .expect("corruption import rows")
+                    .next()
+                    .expect("one corruption import")
+                    .expect("corruption import row");
+                BlobVariantId::from_bytes(key.value().try_into().expect("variant key"))
+            };
+            let write = store
+                .database
+                .begin_write()
+                .expect("begin deletion corruption fixture");
+            deletion::move_finalized_variant_to_manifest_for_test(&write, variant)
+                .expect("move corruption variant into deletion authority");
+            deletion::corrupt_blob_deletion_for_test(&write, variant, corruption)
+                .expect("apply typed deletion corruption");
+
+            if corruption == "deleted-file-present" {
+                deletion::audit_blob_deletion_write(&write, Some(store.blob_depot_owner_binding))
+                    .expect("storage-only corruption remains structurally canonical");
+                assert_depot_integrity(
+                    &depot::audit_depot_write(
+                        &write,
+                        &store.path,
+                        store.backing_identity,
+                        store.blob_depot_owner_token,
+                        stats,
+                    )
+                    .expect_err("durably deleted manifest file must be absent"),
+                );
+            } else {
+                assert_blob_schema_invariant(
+                    &deletion::audit_blob_deletion_write(
+                        &write,
+                        Some(store.blob_depot_owner_binding),
+                    )
+                    .expect_err("manifest, root, or accounting mismatch must fail closed"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn blob_deletion_age_audit_requires_exact_durable_continuity() {
+        // Break caught: durable deletion age cannot claim a checkpoint from a
+        // missing/future/currently mismatched clock authority. Older-generation
+        // checkpoints remain conservative after an A->B->A clock sequence.
+        let clock_a = [0xd1; 16];
+        let clock_b = [0xd2; 16];
+        for (index, label, age, continuity, valid) in [
+            (
+                0u8,
+                "missing",
+                deletion::BlobDeletionAge {
+                    cumulative_age_ms: 7,
+                    checkpoint: Some(CustodySample {
+                        clock_id: clock_a,
+                        tick_ms: 10,
+                    }),
+                    continuity_generation: 1,
+                    continuity_lost: false,
+                },
+                None,
+                false,
+            ),
+            (
+                1,
+                "future-generation",
+                deletion::BlobDeletionAge {
+                    cumulative_age_ms: 7,
+                    checkpoint: Some(CustodySample {
+                        clock_id: clock_a,
+                        tick_ms: 10,
+                    }),
+                    continuity_generation: 2,
+                    continuity_lost: false,
+                },
+                Some(deletion::BlobDeletionContinuity {
+                    generation: 1,
+                    last_sample: CustodySample {
+                        clock_id: clock_a,
+                        tick_ms: 20,
+                    },
+                }),
+                false,
+            ),
+            (
+                2,
+                "current-clock-mismatch",
+                deletion::BlobDeletionAge {
+                    cumulative_age_ms: 7,
+                    checkpoint: Some(CustodySample {
+                        clock_id: clock_a,
+                        tick_ms: 10,
+                    }),
+                    continuity_generation: 1,
+                    continuity_lost: false,
+                },
+                Some(deletion::BlobDeletionContinuity {
+                    generation: 1,
+                    last_sample: CustodySample {
+                        clock_id: clock_b,
+                        tick_ms: 20,
+                    },
+                }),
+                false,
+            ),
+            (
+                3,
+                "current-tick-regression",
+                deletion::BlobDeletionAge {
+                    cumulative_age_ms: 7,
+                    checkpoint: Some(CustodySample {
+                        clock_id: clock_a,
+                        tick_ms: 21,
+                    }),
+                    continuity_generation: 1,
+                    continuity_lost: false,
+                },
+                Some(deletion::BlobDeletionContinuity {
+                    generation: 1,
+                    last_sample: CustodySample {
+                        clock_id: clock_a,
+                        tick_ms: 20,
+                    },
+                }),
+                false,
+            ),
+            (
+                4,
+                "old-generation-a-b-a",
+                deletion::BlobDeletionAge {
+                    cumulative_age_ms: 7,
+                    checkpoint: Some(CustodySample {
+                        clock_id: clock_a,
+                        tick_ms: 21,
+                    }),
+                    continuity_generation: 1,
+                    continuity_lost: true,
+                },
+                Some(deletion::BlobDeletionContinuity {
+                    generation: 3,
+                    last_sample: CustodySample {
+                        clock_id: clock_a,
+                        tick_ms: 5,
+                    },
+                }),
+                true,
+            ),
+        ] {
+            let root = BlobTestRoot::new(&format!("deletion-age-{label}"));
+            let services = blob_services(0xd3 + index);
+            let store = Store::open_for_mission(&root.database, services.authority)
+                .expect("deletion-age store");
+            let plaintext = vec![0x71 + index; 4_097];
+            let prepared = prepared_blob(&plaintext);
+            finish_variant(&store, &services.publisher, &prepared, &plaintext, 1)
+                .expect("finish deletion-age variant");
+            let variant = {
+                let read = store
+                    .database
+                    .begin_read()
+                    .expect("read deletion-age import");
+                let imports = read.open_table(BLOB_IMPORTS).expect("deletion-age imports");
+                let (key, _) = imports
+                    .iter()
+                    .expect("deletion-age import rows")
+                    .next()
+                    .expect("one deletion-age import")
+                    .expect("deletion-age import row");
+                BlobVariantId::from_bytes(key.value().try_into().expect("variant key"))
+            };
+            let write = store
+                .database
+                .begin_write()
+                .expect("begin deletion-age fixture");
+            deletion::move_finalized_variant_to_manifest_for_test(&write, variant)
+                .expect("move deletion-age variant");
+            deletion::set_blob_deletion_age_for_test(&write, variant, age, continuity)
+                .expect("set deletion-age continuity fixture");
+            let result =
+                deletion::audit_blob_deletion_write(&write, Some(store.blob_depot_owner_binding));
+            if valid {
+                result.expect("old-generation checkpoint remains conservative");
+            } else {
+                assert_blob_schema_invariant(
+                    &result.expect_err("invalid deletion-age continuity must fail closed"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn blob_deletion_audit_allows_permanent_fences_after_finalized_reclamation() {
+        let root = BlobTestRoot::new("deletion-permanent-fence");
+        let services = blob_services(0xc1);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("permanent-fence store");
+        let plaintext = vec![0x61; 4_097];
+        let prepared = prepared_blob(&plaintext);
+        finish_variant(&store, &services.publisher, &prepared, &plaintext, 1)
+            .expect("finish permanent-fence variant");
+        let variant = {
+            let read = store.database.begin_read().expect("read fence import");
+            let imports = read.open_table(BLOB_IMPORTS).expect("fence imports");
+            let (key, _) = imports
+                .iter()
+                .expect("fence import rows")
+                .next()
+                .expect("one fence import")
+                .expect("fence import row");
+            BlobVariantId::from_bytes(key.value().try_into().expect("variant key"))
+        };
+        drop(store);
+
+        std::fs::remove_file(root.chunk_path(variant, 0)).expect("remove reclaimed chunk file");
+        std::fs::remove_dir(root.depot().join(test_hex32(variant.as_bytes())))
+            .expect("remove reclaimed variant directory");
+        {
+            let database = Database::open(&root.database).expect("open reclaimed metadata");
+            let write = database.begin_write().expect("begin reclaimed metadata");
+            let lineage_evidence = write
+                .open_table(lifecycle::BLOB_LINEAGE_FENCES)
+                .expect("reclaimed lineage fences")
+                .get(variant.as_bytes().as_slice())
+                .expect("read reclaimed lineage")
+                .expect("reclaimed lineage exists")
+                .value()
+                .to_vec();
+            lifecycle::mark_lineage_bulk_reclamation_observed(&write, variant, &lineage_evidence)
+                .expect("authorize finalized bulk reclamation");
+            write
+                .open_table(BLOB_IMPORTS)
+                .expect("reclaimed imports")
+                .remove(variant.as_bytes().as_slice())
+                .expect("remove reclaimed import")
+                .expect("reclaimed import exists");
+            write
+                .open_table(BLOB_CHUNKS)
+                .expect("reclaimed chunks")
+                .remove(depot::test_chunk_key(variant, 0).as_slice())
+                .expect("remove reclaimed chunk")
+                .expect("reclaimed chunk exists");
+            let mut metadata = write
+                .open_table(BLOB_DEPOT_METADATA)
+                .expect("reclaimed depot metadata");
+            for field in [
+                DEPOT_VARIANT_COUNT,
+                DEPOT_COMMITTED_CHUNK_COUNT,
+                DEPOT_COMMITTED_FILE_BYTES,
+                DEPOT_RESERVED_FILE_BYTES,
+            ] {
+                metadata.insert(field, 0).expect("clear reclaimed charge");
+            }
+            drop(metadata);
+            write
+                .commit()
+                .expect("commit finalized reclamation fixture");
+        }
+
+        let reopened = Store::open_for_mission(&root.database, services.authority)
+            .expect("canonical permanent fence survives finalized reclamation");
+        let stats = reopened.blob_stats().expect("permanent-fence stats");
+        assert_eq!(stats.variants, 0);
+        assert_eq!(stats.committed_chunks, 0);
+        assert_eq!(stats.lineage_fences, 1);
+        {
+            let read = reopened
+                .database
+                .begin_read()
+                .expect("read permanent fence");
+            let fences = read
+                .open_table(lifecycle::BLOB_LINEAGE_FENCES)
+                .expect("permanent lineage fences");
+            let encoded = fences
+                .get(variant.as_bytes().as_slice())
+                .expect("read retained fence")
+                .expect("retained fence exists");
+            assert!(
+                lifecycle::LineageFence::decode(encoded.value())
+                    .expect("decode reclaimed lineage fence")
+                    .bulk_reclamation_observed()
+            );
+        }
+
+        let depot = reopened.blob_depot().expect("matching reimport depot");
+        let mut service = services
+            .publisher
+            .blob_service_with_store(&blob_scope(), &blob_topic(), 1, depot)
+            .expect("matching reimport service");
+        service
+            .install_prepared(&prepared)
+            .expect("matching reimport coexists with reclaimed fence");
+        let read = reopened
+            .database
+            .begin_read()
+            .expect("read reimported fence");
+        let fences = read
+            .open_table(lifecycle::BLOB_LINEAGE_FENCES)
+            .expect("reimported lineage fences");
+        let encoded = fences
+            .get(variant.as_bytes().as_slice())
+            .expect("read reimported fence")
+            .expect("reimported fence exists");
+        assert!(
+            lifecycle::LineageFence::decode(encoded.value())
+                .expect("decode reimported lineage fence")
+                .bulk_reclamation_observed(),
+            "matching reimport must not clear reclamation authorization",
+        );
+    }
+
+    #[test]
+    fn blob_deletion_audit_rejects_fabricated_non_reclaimed_orphan_lineage_fence() {
+        // Break caught: canonical encoding and owner binding alone must not
+        // authorize a lineage fence after its import authority disappears.
+        let root = BlobTestRoot::new("deletion-fabricated-orphan-fence");
+        let services = blob_services(0xc2);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("fabricated-orphan store");
+        let plaintext = vec![0x62; 4_097];
+        let prepared = prepared_blob(&plaintext);
+        finish_variant(&store, &services.publisher, &prepared, &plaintext, 1)
+            .expect("finish fabricated-orphan variant");
+        let variant = {
+            let read = store.database.begin_read().expect("read orphan import");
+            let imports = read.open_table(BLOB_IMPORTS).expect("orphan imports");
+            let (key, _) = imports
+                .iter()
+                .expect("orphan import rows")
+                .next()
+                .expect("one orphan import")
+                .expect("orphan import row");
+            BlobVariantId::from_bytes(key.value().try_into().expect("variant key"))
+        };
+        drop(store);
+
+        std::fs::remove_file(root.chunk_path(variant, 0)).expect("remove orphan chunk file");
+        std::fs::remove_dir(root.depot().join(test_hex32(variant.as_bytes())))
+            .expect("remove orphan variant directory");
+        {
+            let database = Database::open(&root.database).expect("open orphan metadata");
+            let write = database.begin_write().expect("begin orphan metadata");
+            write
+                .open_table(BLOB_IMPORTS)
+                .expect("orphan imports")
+                .remove(variant.as_bytes().as_slice())
+                .expect("remove orphan import")
+                .expect("orphan import exists");
+            write
+                .open_table(BLOB_CHUNKS)
+                .expect("orphan chunks")
+                .remove(depot::test_chunk_key(variant, 0).as_slice())
+                .expect("remove orphan chunk")
+                .expect("orphan chunk exists");
+            let mut metadata = write
+                .open_table(BLOB_DEPOT_METADATA)
+                .expect("orphan depot metadata");
+            for field in [
+                DEPOT_VARIANT_COUNT,
+                DEPOT_COMMITTED_CHUNK_COUNT,
+                DEPOT_COMMITTED_FILE_BYTES,
+                DEPOT_RESERVED_FILE_BYTES,
+            ] {
+                metadata.insert(field, 0).expect("clear orphan charge");
+            }
+            drop(metadata);
+            write.commit().expect("commit fabricated orphan fixture");
+        }
+
+        match Store::open_for_mission(&root.database, services.authority) {
+            Ok(_) => panic!("unmarked orphan lineage fence must fail closed"),
+            Err(error) => assert_blob_schema_invariant(&error),
+        }
     }
 }

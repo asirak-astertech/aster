@@ -340,6 +340,25 @@ pub(super) struct MaintenanceImportProjection {
     pub(super) finalized: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct DeletionImportProjection {
+    pub(super) variant_id: BlobVariantId,
+    pub(super) blob_id: BlobId,
+    pub(super) content_group: [u8; 32],
+    pub(super) epoch: u64,
+    pub(super) total_len: u64,
+    pub(super) chunk_count: u64,
+    pub(super) physical_lineage: [u8; 32],
+    pub(super) finalized_root: Option<[u8; 32]>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct DeletionChunkProjection {
+    pub(super) record: Option<BlobChunkRecord>,
+    pub(super) charged_reserved_bytes: u64,
+    pub(super) charged_committed_bytes: u64,
+}
+
 impl ImportRecord {
     fn from_manifest(
         manifest: &BlobManifest,
@@ -1011,11 +1030,10 @@ impl<'a> BlobDepot<'a> {
             .get(key.as_slice())?
             .map(|value| decode_chunk_state(value.value()))
             .transpose()?;
-        if existing.is_none()
-            && write.open_table(BLOB_CHUNKS)?.len()? >= self.store.blob_depot_limits.max_chunks
-        {
+        let charged_chunk_rows = charged_chunk_rows_write(&write)?;
+        if existing.is_none() && charged_chunk_rows >= self.store.blob_depot_limits.max_chunks {
             return Err(blob_error(BlobStoreError::DepotChunkLimitExceeded {
-                current: write.open_table(BLOB_CHUNKS)?.len()?,
+                current: charged_chunk_rows,
                 limit: self.store.blob_depot_limits.max_chunks,
             }));
         }
@@ -1536,6 +1554,7 @@ impl CoreBlobStore for BlobDepot<'_> {
 
 pub(super) fn audit_depot_metadata_write(
     write: &redb::WriteTransaction,
+    deletion: &super::deletion::BlobDeletionAudit,
 ) -> Result<DepotStats, StoreError> {
     let _owner_token = depot_owner_token_write(write)?;
     let imports = write.open_table(BLOB_IMPORTS)?;
@@ -1604,6 +1623,28 @@ pub(super) fn audit_depot_metadata_write(
             )));
         }
     }
+    for manifest in deletion.manifests.values() {
+        if per_variant
+            .insert(manifest.variant_id, manifest.totals.charged_files)
+            .is_some()
+        {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob variant has duplicate active and deletion chunk charge",
+            )));
+        }
+    }
+    stats.committed_chunks = stats
+        .committed_chunks
+        .checked_add(deletion.stats.charged_files)
+        .ok_or(StoreError::ItemCountAccountingOverflow)?;
+    stats.committed_file_bytes = stats
+        .committed_file_bytes
+        .checked_add(deletion.stats.charged_committed_bytes)
+        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    stats.reserved_file_bytes = stats
+        .reserved_file_bytes
+        .checked_add(deletion.stats.charged_reserved_bytes)
+        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
     for import in imported.values() {
         if import.finalized_manifest_digest.is_some()
             && per_variant.get(&import.variant_id).copied().unwrap_or(0) != import.chunk_count
@@ -1653,6 +1694,7 @@ pub(super) fn audit_depot_metadata_write(
 
 pub(super) fn inspect_depot_metadata_read(
     read: &redb::ReadTransaction,
+    deletion: &super::deletion::BlobDeletionAudit,
 ) -> Result<DepotStats, StoreError> {
     let _owner_token = depot_owner_token_read(read)?;
     let imports = read.open_table(BLOB_IMPORTS)?;
@@ -1718,6 +1760,28 @@ pub(super) fn inspect_depot_metadata_read(
             )));
         }
     }
+    for manifest in deletion.manifests.values() {
+        if per_variant
+            .insert(manifest.variant_id, manifest.totals.charged_files)
+            .is_some()
+        {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob variant has duplicate active and deletion chunk charge",
+            )));
+        }
+    }
+    stats.committed_chunks = stats
+        .committed_chunks
+        .checked_add(deletion.stats.charged_files)
+        .ok_or(StoreError::ItemCountAccountingOverflow)?;
+    stats.committed_file_bytes = stats
+        .committed_file_bytes
+        .checked_add(deletion.stats.charged_committed_bytes)
+        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    stats.reserved_file_bytes = stats
+        .reserved_file_bytes
+        .checked_add(deletion.stats.charged_reserved_bytes)
+        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
     for import in imported.values() {
         if import.finalized_manifest_digest.is_some()
             && per_variant.get(&import.variant_id).copied().unwrap_or(0) != import.chunk_count
@@ -1818,6 +1882,99 @@ pub(super) fn maintenance_import_projection(
         physical_lineage: audited.physical_lineage,
         finalized,
     })
+}
+
+/// Decodes the exact import evidence retained by a deletion
+/// manifest. This is a read-only projection and cannot admit deletion work.
+pub(super) fn deletion_import_projection(
+    key: &[u8],
+    value: &[u8],
+) -> Result<DeletionImportProjection, StoreError> {
+    let variant = parse_variant_id(key)?;
+    let import = decode_import(value)?;
+    let audited = lifecycle_import_from_record(variant, import.clone())?;
+    Ok(DeletionImportProjection {
+        variant_id: audited.variant_id,
+        blob_id: import.blob_id,
+        content_group: import.content_group,
+        epoch: import.epoch,
+        total_len: import.total_len,
+        chunk_count: import.chunk_count,
+        physical_lineage: audited.physical_lineage,
+        finalized_root: import.finalized_manifest_digest,
+    })
+}
+
+/// Validates one exact original chunk row retained by a deletion manifest and
+/// returns its optional physical identity plus its existing quota charge.
+pub(super) fn deletion_chunk_projection(
+    import_value: &[u8],
+    index: u64,
+    chunk_value: &[u8],
+) -> Result<DeletionChunkProjection, StoreError> {
+    let import = decode_import(import_value)?;
+    if index >= import.chunk_count {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob deletion chunk index is outside its import",
+        )));
+    }
+    let state = decode_chunk_state(chunk_value)?;
+    validate_chunk_state_lengths(&import, index, state)?;
+    let charged_reserved_bytes = state.expected.map(chunk_file_len).transpose()?.unwrap_or(0);
+    let charged_committed_bytes = state
+        .committed
+        .map(chunk_file_len)
+        .transpose()?
+        .unwrap_or(0);
+    if state.committed.is_some_and(|record| {
+        state.expected != Some(record) || state.plaintext_digest != Some(*record.plaintext_sha256())
+    }) || state.committed_file_bytes != charged_committed_bytes
+    {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob deletion chunk evidence is not a canonical original row",
+        )));
+    }
+    Ok(DeletionChunkProjection {
+        record: state.committed,
+        charged_reserved_bytes,
+        charged_committed_bytes,
+    })
+}
+
+fn charged_chunk_rows_write(write: &redb::WriteTransaction) -> Result<u64, StoreError> {
+    write
+        .open_table(BLOB_CHUNKS)?
+        .len()?
+        .checked_add(
+            write
+                .open_table(super::deletion::BLOB_DELETION_CHUNKS)?
+                .len()?,
+        )
+        .ok_or(StoreError::ItemCountAccountingOverflow)
+}
+
+/// Reconstructs the finalized canonical manifest digest from the exact
+/// retained import and ordered committed chunk records.
+pub(super) fn validate_deletion_manifest_root(
+    import_value: &[u8],
+    records: &[BlobChunkRecord],
+    expected: Option<[u8; 32]>,
+) -> Result<(), StoreError> {
+    let import = decode_import(import_value)?;
+    if import.finalized_manifest_digest != expected {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob deletion manifest root differs from its exact retained import",
+        )));
+    }
+    if let Some(expected) = expected
+        && (u64::try_from(records.len()).ok() != Some(import.chunk_count)
+            || exact_pending_manifest_digest(&import, records)? != expected)
+    {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob deletion manifest root differs from its exact retained chunks",
+        )));
+    }
+    Ok(())
 }
 
 /// Returns only the audited import identity and authenticated lineage needed
@@ -2112,6 +2269,58 @@ pub(super) fn depot_owner_binding_read(
     Ok(binding)
 }
 
+fn optional_depot_owner_binding(
+    mut read: impl FnMut(&'static str) -> Result<Option<u64>, StoreError>,
+) -> Result<Option<[u8; 32]>, StoreError> {
+    let values = depot_owner_binding_fields()
+        .into_iter()
+        .map(&mut read)
+        .collect::<Result<Vec<_>, _>>()?;
+    if values.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    if values.iter().any(Option::is_none) {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob depot owner binding is incomplete",
+        )));
+    }
+    let mut binding = [0u8; 32];
+    for (index, value) in values.into_iter().enumerate() {
+        binding[index * 8..(index + 1) * 8]
+            .copy_from_slice(&value.expect("all binding fields checked").to_be_bytes());
+    }
+    if binding == [0; 32] {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob depot owner binding is invalid",
+        )));
+    }
+    Ok(Some(binding))
+}
+
+pub(super) fn depot_owner_binding_if_present_write(
+    write: &redb::WriteTransaction,
+) -> Result<Option<[u8; 32]>, StoreError> {
+    let table = write.open_table(BLOB_DEPOT_METADATA)?;
+    optional_depot_owner_binding(|field| {
+        table
+            .get(field)
+            .map(|value| value.map(|value| value.value()))
+            .map_err(StoreError::from)
+    })
+}
+
+pub(super) fn depot_owner_binding_if_present_read(
+    read: &redb::ReadTransaction,
+) -> Result<Option<[u8; 32]>, StoreError> {
+    let table = read.open_table(BLOB_DEPOT_METADATA)?;
+    optional_depot_owner_binding(|field| {
+        table
+            .get(field)
+            .map(|value| value.map(|value| value.value()))
+            .map_err(StoreError::from)
+    })
+}
+
 pub(super) fn require_depot_owner_binding_write(
     write: &redb::WriteTransaction,
     store_path: &Path,
@@ -2210,7 +2419,9 @@ pub(crate) fn audit_depot_write(
     owner_token: [u8; 32],
     expected: BlobStoreStats,
 ) -> Result<(), StoreError> {
-    require_depot_owner_binding_write(write, store_path, backing_identity, owner_token)?;
+    let owner_binding =
+        require_depot_owner_binding_write(write, store_path, backing_identity, owner_token)?;
+    let deletion = super::deletion::audit_blob_deletion_write(write, Some(owner_binding))?;
     if expected == BlobStoreStats::default() {
         if let Some(root) = OwnedDirectory::open_root_if_present(store_path)? {
             match root.read_owner_marker()? {
@@ -2233,9 +2444,12 @@ pub(crate) fn audit_depot_write(
         ))
     })?;
     root.require_store_binding(store_path, backing_identity, owner_token)?;
-    let committed = committed_chunk_map_write(write)?;
-    verify_all_marked_files_write(write, &root, &committed)?;
-    reclaim_unmarked_artifacts(write, &root, &committed)
+    audit_deletion_storage(&root, &deletion, false)?;
+    let mut committed = committed_chunk_map_write(write)?;
+    let deletion_variants = protect_queued_deletion_chunks(&mut committed, &deletion)?;
+    verify_all_marked_files_write(write, &root, &committed, &deletion_variants)?;
+    reclaim_unmarked_artifacts(write, &root, &committed)?;
+    audit_deletion_storage(&root, &deletion, true)
 }
 
 pub(crate) fn audit_depot_read(
@@ -2245,7 +2459,9 @@ pub(crate) fn audit_depot_read(
     owner_token: [u8; 32],
     expected: BlobStoreStats,
 ) -> Result<(), StoreError> {
-    require_depot_owner_binding_read(read, store_path, backing_identity, owner_token)?;
+    let owner_binding =
+        require_depot_owner_binding_read(read, store_path, backing_identity, owner_token)?;
+    let deletion = super::deletion::inspect_blob_deletion_read(read, Some(owner_binding))?;
     let Some(root) = OwnedDirectory::open_root_if_present(store_path)? else {
         if expected.variants == 0 {
             return Ok(());
@@ -2255,11 +2471,13 @@ pub(crate) fn audit_depot_read(
         )));
     };
     root.require_store_binding(store_path, backing_identity, owner_token)?;
-    if expected.committed_chunks == 0 {
+    audit_deletion_storage(&root, &deletion, true)?;
+    if expected.committed_chunks == 0 && deletion.manifests.is_empty() {
         return Ok(());
     }
-    let committed = committed_chunk_map_read(read)?;
-    verify_all_marked_files_read(read, &root, &committed)
+    let mut committed = committed_chunk_map_read(read)?;
+    let deletion_variants = protect_queued_deletion_chunks(&mut committed, &deletion)?;
+    verify_all_marked_files_read(read, &root, &committed, &deletion_variants)
 }
 
 pub(super) fn verify_completion(
@@ -2670,14 +2888,134 @@ fn audit_domain_hasher(domain: &[u8]) -> Sha256 {
     digest
 }
 
+fn audit_deletion_storage(
+    root: &OwnedDirectory,
+    deletion: &super::deletion::BlobDeletionAudit,
+    require_pending_directory_empty: bool,
+) -> Result<(), StoreError> {
+    let root_entries = root.entry_names()?.into_iter().collect::<BTreeSet<_>>();
+    for manifest in deletion.manifests.values() {
+        let directory_name = hex32(manifest.variant_id.as_bytes());
+        let directory_present = root_entries.contains(&directory_name);
+        if !directory_present {
+            if manifest.phase == super::deletion::BlobDeletionPhase::DeletingChunks
+                && manifest.chunks.iter().try_fold(false, |committed, chunk| {
+                    Ok::<_, StoreError>(
+                        committed
+                            || deletion_chunk_projection(
+                                &manifest.original_import,
+                                chunk.index,
+                                &chunk.original_chunk,
+                            )?
+                            .record
+                            .is_some(),
+                    )
+                })?
+            {
+                return Err(blob_error(BlobStoreError::DepotIntegrity(
+                    "deleting Blob variant directory is missing despite committed-file authority",
+                )));
+            }
+            continue;
+        }
+        let directory = root
+            .open_child_directory(&directory_name, false)
+            .map_err(|_| {
+                blob_error(BlobStoreError::DepotIntegrity(
+                    "Blob deletion variant is not an owned directory",
+                ))
+            })?;
+        let names = directory
+            .entry_names()?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        if require_pending_directory_empty
+            && manifest.phase == super::deletion::BlobDeletionPhase::DirectoryDeletePending
+            && !names.is_empty()
+        {
+            return Err(blob_error(BlobStoreError::DepotIntegrity(
+                "directory-pending Blob variant directory is not empty",
+            )));
+        }
+        let import = decode_import(&manifest.original_import)?;
+        let active = active_from_import(&import);
+        for chunk in &manifest.chunks {
+            let name = chunk_file_name(chunk.index);
+            let present = names.contains(&name);
+            let projected = deletion_chunk_projection(
+                &manifest.original_import,
+                chunk.index,
+                &chunk.original_chunk,
+            )?;
+            match chunk.state {
+                super::deletion::BlobDeletionChunkState::DeleteQueued
+                    if present && projected.record.is_some() =>
+                {
+                    verify_chunk_file(
+                        &directory,
+                        &name,
+                        active,
+                        chunk.index,
+                        projected.record.expect("checked committed deletion record"),
+                        projected.charged_committed_bytes,
+                    )?;
+                }
+                super::deletion::BlobDeletionChunkState::DeleteQueued => {
+                    // The unlink may have completed before its containing
+                    // directory sync and durable state advancement.
+                }
+                super::deletion::BlobDeletionChunkState::DeletedDurable
+                    if present && projected.record.is_some() =>
+                {
+                    return Err(blob_error(BlobStoreError::DepotIntegrity(
+                        "durably deleted Blob chunk file is still present",
+                    )));
+                }
+                super::deletion::BlobDeletionChunkState::DeletedDurable => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn protect_queued_deletion_chunks(
+    committed: &mut BTreeMap<BlobVariantId, Vec<(u64, ChunkState)>>,
+    deletion: &super::deletion::BlobDeletionAudit,
+) -> Result<BTreeSet<BlobVariantId>, StoreError> {
+    let mut variants = BTreeSet::new();
+    for manifest in deletion.manifests.values() {
+        if committed.contains_key(&manifest.variant_id) {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob variant has duplicate active and deletion file authority",
+            )));
+        }
+        variants.insert(manifest.variant_id);
+        let mut queued = Vec::new();
+        for chunk in &manifest.chunks {
+            if chunk.state == super::deletion::BlobDeletionChunkState::DeleteQueued {
+                let state = decode_chunk_state(&chunk.original_chunk)?;
+                if state.committed.is_some() {
+                    queued.push((chunk.index, state));
+                }
+            }
+        }
+        committed.insert(manifest.variant_id, queued);
+    }
+    Ok(variants)
+}
+
 fn verify_all_marked_files_write(
     write: &redb::WriteTransaction,
     root: &OwnedDirectory,
     committed: &BTreeMap<BlobVariantId, Vec<(u64, ChunkState)>>,
+    deletion_variants: &BTreeSet<BlobVariantId>,
 ) -> Result<(), StoreError> {
     for row in write.open_table(BLOB_IMPORTS)?.iter()? {
         let (_, value) = row?;
         let import = decode_import(value.value())?;
+        if deletion_variants.contains(&import.variant_id) {
+            continue;
+        }
         verify_import_files_from_rows(
             root,
             &import,
@@ -2691,10 +3029,14 @@ fn verify_all_marked_files_read(
     read: &redb::ReadTransaction,
     root: &OwnedDirectory,
     committed: &BTreeMap<BlobVariantId, Vec<(u64, ChunkState)>>,
+    deletion_variants: &BTreeSet<BlobVariantId>,
 ) -> Result<(), StoreError> {
     for row in read.open_table(BLOB_IMPORTS)?.iter()? {
         let (_, value) = row?;
         let import = decode_import(value.value())?;
+        if deletion_variants.contains(&import.variant_id) {
+            continue;
+        }
         verify_import_files_from_rows(
             root,
             &import,
@@ -3079,7 +3421,7 @@ pub(super) fn stage_verified_plan_write(
             limit: limits.max_variants,
         }));
     }
-    let current_chunks = write.open_table(BLOB_CHUNKS)?.len()?;
+    let current_chunks = charged_chunk_rows_write(write)?;
     if current_chunks
         .checked_add(missing_chunks)
         .ok_or(StoreError::ItemCountAccountingOverflow)?

@@ -3059,6 +3059,87 @@ struct CustodyAgeEvaluation {
     needs_write: bool,
 }
 
+/// Class-neutral conservative elapsed-age checkpoint.
+///
+/// The checkpoint deliberately carries only a lower bound. A continuity loss
+/// reanchors without adding the unknowable gap and makes the loss bit sticky.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LowerBoundAgeCheckpoint {
+    pub(crate) cumulative_age_ms: u64,
+    pub(crate) checkpoint: Option<CustodySample>,
+    pub(crate) continuity_generation: u64,
+    pub(crate) continuity_lost: bool,
+}
+
+/// One durable elapsed-clock continuity authority used by the pure lower-bound
+/// projection primitive.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LowerBoundContinuity {
+    pub(crate) generation: u64,
+    pub(crate) sample: CustodySample,
+}
+
+/// Projects a conservative cumulative-age lower bound without mutating any
+/// custody policy, retry, revision, or durable record.
+pub(crate) fn project_lower_bound_age(
+    record: LowerBoundAgeCheckpoint,
+    continuity: Option<LowerBoundContinuity>,
+    sample: Option<CustodySample>,
+) -> LowerBoundAgeCheckpoint {
+    let current = match (continuity, sample) {
+        (Some(continuity), Some(sample)) if continuity.sample.clock_id == sample.clock_id => {
+            Some((
+                continuity.generation,
+                if sample.tick_ms < continuity.sample.tick_ms {
+                    continuity.sample
+                } else {
+                    sample
+                },
+            ))
+        }
+        _ => None,
+    };
+    if let Some((generation, current)) = current {
+        let same_domain = record.checkpoint.is_some_and(|checkpoint| {
+            record.continuity_generation == generation
+                && checkpoint.clock_id == current.clock_id
+                && current.tick_ms >= checkpoint.tick_ms
+        });
+        if same_domain {
+            let checkpoint = record.checkpoint.expect("checked same-domain checkpoint");
+            return match record
+                .cumulative_age_ms
+                .checked_add(current.tick_ms - checkpoint.tick_ms)
+            {
+                Some(cumulative_age_ms) => LowerBoundAgeCheckpoint {
+                    cumulative_age_ms,
+                    checkpoint: Some(current),
+                    continuity_generation: generation,
+                    continuity_lost: record.continuity_lost,
+                },
+                None => LowerBoundAgeCheckpoint {
+                    cumulative_age_ms: u64::MAX,
+                    checkpoint: Some(current),
+                    continuity_generation: generation,
+                    continuity_lost: true,
+                },
+            };
+        }
+        return LowerBoundAgeCheckpoint {
+            cumulative_age_ms: record.cumulative_age_ms,
+            checkpoint: Some(current),
+            continuity_generation: generation,
+            continuity_lost: true,
+        };
+    }
+    LowerBoundAgeCheckpoint {
+        cumulative_age_ms: record.cumulative_age_ms,
+        checkpoint: None,
+        continuity_generation: 0,
+        continuity_lost: true,
+    }
+}
+
 fn evaluate_item_age(
     record: &CustodyItemRecord,
     continuity: Option<ContinuityRecord>,
@@ -3082,41 +3163,23 @@ fn evaluate_item_age(
         }));
     }
 
-    let current = match (continuity, sample) {
-        (Some(continuity), Some(sample)) if continuity.sample.clock_id == sample.clock_id => {
-            Some((
-                continuity.generation,
-                if sample.tick_ms < continuity.sample.tick_ms {
-                    continuity.sample
-                } else {
-                    sample
-                },
-            ))
-        }
-        _ => None,
-    };
-    let (lower_bound_ms, checkpoint, continuity_generation, continuity_lost) =
-        if let Some((generation, current)) = current {
-            let same_domain = record.checkpoint.is_some_and(|checkpoint| {
-                record.continuity_generation == generation
-                    && checkpoint.clock_id == current.clock_id
-                    && current.tick_ms >= checkpoint.tick_ms
-            });
-            if same_domain {
-                let checkpoint = record.checkpoint.expect("checked same-domain checkpoint");
-                match record
-                    .cumulative_age_ms
-                    .checked_add(current.tick_ms - checkpoint.tick_ms)
-                {
-                    Some(age_ms) => (age_ms, Some(current), generation, record.continuity_lost),
-                    None => (u64::MAX, Some(current), generation, true),
-                }
-            } else {
-                (record.cumulative_age_ms, Some(current), generation, true)
-            }
-        } else {
-            (record.cumulative_age_ms, None, 0, true)
-        };
+    let projected = project_lower_bound_age(
+        LowerBoundAgeCheckpoint {
+            cumulative_age_ms: record.cumulative_age_ms,
+            checkpoint: record.checkpoint,
+            continuity_generation: record.continuity_generation,
+            continuity_lost: record.continuity_lost,
+        },
+        continuity.map(|continuity| LowerBoundContinuity {
+            generation: continuity.generation,
+            sample: continuity.sample,
+        }),
+        sample,
+    );
+    let lower_bound_ms = projected.cumulative_age_ms;
+    let checkpoint = projected.checkpoint;
+    let continuity_generation = projected.continuity_generation;
+    let continuity_lost = projected.continuity_lost;
     let status = if lower_bound_ms >= ttl {
         CustodyAgeStatus::Expired {
             age_ms: lower_bound_ms,

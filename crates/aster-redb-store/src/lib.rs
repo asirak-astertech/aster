@@ -5952,7 +5952,7 @@ impl Store {
             event_operation::stage_legacy_event_operations_write(&write, operation_limits)?;
         // Audit all retained metadata, predecessor relations, witnesses and
         // legacy accounting before replacing any legacy row.
-        let mut blob_stats = audit_semantic_tables(&write, limits)?;
+        let (mut blob_stats, blob_deletion_migration) = audit_semantic_tables(&write, limits)?;
         if let Some(migration) = &operation_migration {
             migration.apply(&write)?;
         }
@@ -6021,7 +6021,10 @@ impl Store {
         }
         custody::audit_custody_tables_write(&write, limits, mission_authority)?;
         numbered_event_operation::audit_numbered_result_authority_write(&write)?;
-        if operation_migration.is_some() || blob_lifecycle_migration.is_some() {
+        if operation_migration.is_some()
+            || blob_lifecycle_migration.is_some()
+            || blob_deletion_migration
+        {
             // A failed physical audit must not leave a committed database
             // migration behind. Keep all fallible depot validation/reclaim in
             // this same transaction for the bounded conversions. The
@@ -6057,6 +6060,7 @@ impl Store {
         // effects. A migration already completed this audit before its commit.
         if operation_migration.is_none()
             && blob_lifecycle_migration.is_none()
+            && !blob_deletion_migration
             && let Some(authority) = mission_authority
         {
             let physical = database.begin_write()?;
@@ -18081,7 +18085,7 @@ fn audit_record_tables(
 fn audit_semantic_tables(
     write: &redb::WriteTransaction,
     _limits: StoreLimits,
-) -> Result<BlobStoreStats, StoreError> {
+) -> Result<(BlobStoreStats, bool), StoreError> {
     // Opening every table here is the non-destructive schema extension for old
     // stores. Existing v1 opaque item/effect bytes remain untouched and use a
     // disjoint caller-controlled key namespace.
@@ -18800,7 +18804,7 @@ fn audit_semantic_tables(
     state_subscription::audit_state_subscription_tables(write, exact_legacy_state_extensions)?;
     record_subscription::audit_record_subscription_tables(write, exact_legacy_record_extensions)?;
     blob_subscription::audit_blob_subscription_tables(write)?;
-    Ok(blob_audit.stats)
+    Ok((blob_audit.stats, blob_audit.deletion_schema_migrated))
 }
 
 fn parse_event_subscription_id(bytes: &[u8]) -> Result<EventSubscriptionId, StoreError> {

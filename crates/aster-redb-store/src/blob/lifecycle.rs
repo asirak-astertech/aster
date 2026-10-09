@@ -137,6 +137,7 @@ const BLOB_LIFECYCLE_METADATA_FIELDS: [&str; 7] = [
 const CURRENT_PUBLICATION_RECORD_VERSION: u8 = 3;
 
 const RECORD_VERSION: u8 = 1;
+const RECLAIMED_LINEAGE_FENCE_VERSION: u8 = 2;
 const PUBLICATION_STATE_LIVE_TAG: u8 = 1;
 const OPERATION_STATE_ACTIVE_TAG: u8 = 1;
 const VARIANT_REFERENCE_PUBLICATION_TAG: u8 = 1;
@@ -149,6 +150,8 @@ const MAINTENANCE_PUBLICATION_SOURCE_TAG: u8 = 1;
 const MAINTENANCE_PENDING_SOURCE_TAG: u8 = 2;
 const MAINTENANCE_INVALID_PENDING_SOURCE_TAG: u8 = 1;
 const MAINTENANCE_CARRIER_SOURCE_TAG: u8 = 2;
+const MAINTENANCE_DELETION_MANIFEST_TAG: u8 = 1;
+const MAINTENANCE_DELETION_CHUNK_TAG: u8 = 2;
 
 /// Canonical lifecycle state for a publication row.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -227,6 +230,7 @@ impl VariantReferenceOwner {
 pub(crate) struct LineageFence {
     physical_lineage: [u8; 32],
     owner_binding: [u8; 32],
+    bulk_reclamation_observed: bool,
 }
 
 impl LineageFence {
@@ -236,12 +240,30 @@ impl LineageFence {
         Self {
             physical_lineage,
             owner_binding,
+            bulk_reclamation_observed: false,
         }
+    }
+
+    const fn with_bulk_reclamation_observed(mut self) -> Self {
+        self.bulk_reclamation_observed = true;
+        self
+    }
+
+    fn same_authority(self, other: Self) -> bool {
+        self.physical_lineage == other.physical_lineage && self.owner_binding == other.owner_binding
+    }
+
+    pub(crate) const fn bulk_reclamation_observed(self) -> bool {
+        self.bulk_reclamation_observed
     }
 
     pub(crate) const fn encode(self) -> [u8; Self::ENCODED_BYTES] {
         let mut bytes = [0; Self::ENCODED_BYTES];
-        bytes[0] = RECORD_VERSION;
+        bytes[0] = if self.bulk_reclamation_observed {
+            RECLAIMED_LINEAGE_FENCE_VERSION
+        } else {
+            RECORD_VERSION
+        };
         let mut index = 0;
         while index < 32 {
             bytes[1 + index] = self.physical_lineage[index];
@@ -255,15 +277,20 @@ impl LineageFence {
         let bytes: [u8; Self::ENCODED_BYTES] = bytes.try_into().map_err(|_| {
             BlobStoreError::SchemaInvariant("Blob lineage fence has an invalid canonical length")
         })?;
-        if bytes[0] != RECORD_VERSION {
-            return Err(BlobStoreError::SchemaInvariant(
-                "Blob lineage fence has an unknown encoding version",
-            ));
-        }
-        Ok(Self::new(
-            bytes[1..33].try_into().expect("fixed lineage fence slice"),
-            bytes[33..].try_into().expect("fixed lineage fence slice"),
-        ))
+        let bulk_reclamation_observed = match bytes[0] {
+            RECORD_VERSION => false,
+            RECLAIMED_LINEAGE_FENCE_VERSION => true,
+            _ => {
+                return Err(BlobStoreError::SchemaInvariant(
+                    "Blob lineage fence has an unknown encoding version",
+                ));
+            }
+        };
+        Ok(Self {
+            physical_lineage: bytes[1..33].try_into().expect("fixed lineage fence slice"),
+            owner_binding: bytes[33..].try_into().expect("fixed lineage fence slice"),
+            bulk_reclamation_observed,
+        })
     }
 }
 
@@ -604,7 +631,7 @@ pub(crate) fn require_lineage_fence(
             "retained Blob variant is missing its lineage fence",
         )))?;
     let fence = LineageFence::decode(&encoded).map_err(StoreError::Blob)?;
-    if fence != LineageFence::new(physical_lineage, owner_binding) {
+    if !fence.same_authority(LineageFence::new(physical_lineage, owner_binding)) {
         return Err(StoreError::Blob(BlobStoreError::PhysicalLineageConflict));
     }
     if lifecycle_counter(write, BLOB_LINEAGE_ROWS)? == 0
@@ -639,7 +666,7 @@ pub(crate) fn ensure_lineage_fence(
     };
     if let Some(encoded) = existing {
         let existing = LineageFence::decode(&encoded).map_err(StoreError::Blob)?;
-        if existing != expected {
+        if !existing.same_authority(expected) {
             return Err(StoreError::Blob(BlobStoreError::PhysicalLineageConflict));
         }
         return require_lineage_fence(write, variant, physical_lineage, owner_binding);
@@ -673,6 +700,42 @@ pub(crate) fn ensure_lineage_fence(
     }
     set_lifecycle_counter(write, BLOB_LINEAGE_ROWS, required_rows)?;
     set_lifecycle_counter(write, BLOB_LINEAGE_BYTES, required_bytes)
+}
+
+/// Marks the exact retained fence after its protected bulk state reaches the
+/// final reclamation transaction. The fixed-width state change preserves the
+/// existing row and byte accounting and is idempotent across recovery.
+pub(crate) fn mark_lineage_bulk_reclamation_observed(
+    write: &redb::WriteTransaction,
+    variant: super::BlobVariantId,
+    expected_evidence: &[u8],
+) -> Result<(), StoreError> {
+    if !admission_schema_is_current(write)? {
+        return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+            "Blob lineage reclamation requires current lifecycle authority",
+        )));
+    }
+    let expected = LineageFence::decode(expected_evidence).map_err(StoreError::Blob)?;
+    let key = variant.as_bytes().as_slice();
+    let encoded = write
+        .open_table(BLOB_LINEAGE_FENCES)?
+        .get(key)?
+        .map(|value| value.value().to_vec())
+        .ok_or(StoreError::Blob(BlobStoreError::SchemaInvariant(
+            "reclaimed Blob variant is missing its lineage fence",
+        )))?;
+    let current = LineageFence::decode(&encoded).map_err(StoreError::Blob)?;
+    if !current.same_authority(expected) {
+        return Err(StoreError::Blob(BlobStoreError::PhysicalLineageConflict));
+    }
+    if current.bulk_reclamation_observed() {
+        return Ok(());
+    }
+    let reclaimed = current.with_bulk_reclamation_observed().encode();
+    write
+        .open_table(BLOB_LINEAGE_FENCES)?
+        .insert(key, reclaimed.as_slice())?;
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1196,11 +1259,13 @@ fn audit_current_rows(
     replays: &impl ReadableTable<&'static [u8], &'static [u8]>,
     cursors: &impl ReadableTable<u8, &'static [u8]>,
     expected: &ExpectedLifecycleImage,
-) -> Result<(), StoreError> {
-    audit_metadata(metadata, expected.usage)?;
+    owner_binding: [u8; 32],
+) -> Result<BlobLifecycleUsage, StoreError> {
     validate_maintenance_cursors(cursors)?;
 
     let mut actual_lineages = BTreeMap::new();
+    let mut actual_usage = expected.usage;
+    actual_usage.lineage_bytes = 0;
     for row in lineages.iter()? {
         let (key, value) = row?;
         if key.value().len() != 32 {
@@ -1208,9 +1273,25 @@ fn audit_current_rows(
                 "Blob lineage fence has an invalid variant key",
             )));
         }
-        LineageFence::decode(value.value()).map_err(StoreError::Blob)?;
+        let fence = LineageFence::decode(value.value()).map_err(StoreError::Blob)?;
+        if fence.owner_binding != owner_binding {
+            return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+                "Blob lineage fence has the wrong depot owner binding",
+            )));
+        }
+        actual_usage.lineage_bytes = actual_usage
+            .lineage_bytes
+            .checked_add(entry_bytes(key.value(), value.value())?)
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        if !expected.lineages.contains_key(key.value()) && !fence.bulk_reclamation_observed() {
+            return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+                "orphan Blob lineage fence lacks finalized reclamation authority",
+            )));
+        }
         actual_lineages.insert(key.value().to_vec(), value.value().to_vec());
     }
+    actual_usage.lineage_rows = u64::try_from(actual_lineages.len())
+        .map_err(|_| StoreError::ItemCountAccountingOverflow)?;
     let mut actual_replays = BTreeMap::new();
     for row in replays.iter()? {
         let (key, value) = row?;
@@ -1239,15 +1320,27 @@ fn audit_current_rows(
         VariantReferenceOwner::decode(&key.value()[32..33]).map_err(StoreError::Blob)?;
         actual_references.insert(key.value().to_vec(), value.value().to_vec());
     }
-    if actual_lineages != expected.lineages
-        || actual_replays != expected.replays
-        || actual_references != expected.references
-    {
+    if actual_replays != expected.replays || actual_references != expected.references {
         return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
             "Blob lifecycle authority relations are incomplete or mismatched",
         )));
     }
-    Ok(())
+    for (key, value) in &expected.lineages {
+        let Some(actual) = actual_lineages.get(key) else {
+            return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+                "Blob lifecycle authority relations are incomplete or mismatched",
+            )));
+        };
+        let actual = LineageFence::decode(actual).map_err(StoreError::Blob)?;
+        let expected = LineageFence::decode(value).map_err(StoreError::Blob)?;
+        if !actual.same_authority(expected) {
+            return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+                "Blob lifecycle authority relations are incomplete or mismatched",
+            )));
+        }
+    }
+    audit_metadata(metadata, actual_usage)?;
+    Ok(actual_usage)
 }
 
 fn preflight_migration_limits(
@@ -1345,15 +1438,17 @@ pub(crate) fn stage_blob_lifecycle_migration_write(
                     "Blob lifecycle wrappers are not bidirectionally complete",
                 )));
             }
-            audit_current_rows(
+            let actual_usage = audit_current_rows(
                 &write.open_table(BLOB_LIFECYCLE_METADATA)?,
                 &write.open_table(BLOB_VARIANT_REFERENCES)?,
                 &write.open_table(BLOB_LINEAGE_FENCES)?,
                 &write.open_table(BLOB_REPLAY_FENCES)?,
                 &write.open_table(BLOB_MAINTENANCE_CURSORS)?,
                 &expected,
+                owner_binding,
             )?;
-            expected.usage.apply_to_stats(stats);
+            preflight_migration_limits(actual_usage, limits)?;
+            actual_usage.apply_to_stats(stats);
             Ok(None)
         }
     }
@@ -1380,24 +1475,26 @@ pub(crate) fn inspect_blob_lifecycle_read(
     } else {
         Vec::new()
     };
+    let owner_binding = depot::depot_owner_binding_read(read)?;
     let expected = reconstruct_expected_image(
         &read.open_table(super::BLOB_PUBLICATIONS)?,
         &read.open_table(super::BLOB_BYTES)?,
         &read.open_table(super::BLOB_OPERATIONS)?,
         pending_rows,
         depot::audited_lifecycle_imports_read(read)?,
-        depot::depot_owner_binding_read(read)?,
+        owner_binding,
         schema,
     )?;
     if schema == LifecycleSchemaState::Current {
-        audit_current_rows(
+        return audit_current_rows(
             &read.open_table(BLOB_LIFECYCLE_METADATA)?,
             &read.open_table(BLOB_VARIANT_REFERENCES)?,
             &read.open_table(BLOB_LINEAGE_FENCES)?,
             &read.open_table(BLOB_REPLAY_FENCES)?,
             &read.open_table(BLOB_MAINTENANCE_CURSORS)?,
             &expected,
-        )?;
+            owner_binding,
+        );
     }
     Ok(expected.usage)
 }
@@ -1614,7 +1711,10 @@ fn validate_class_position(class: BlobMaintenanceClass, position: &[u8]) -> Resu
         BlobMaintenanceClass::ExpiredRetirementRecords => {
             !position.is_empty() && position.len() <= super::MAX_BLOB_OPERATION_KEY_BYTES
         }
-        BlobMaintenanceClass::ManifestBackedPhysicalDeletion => false,
+        BlobMaintenanceClass::ManifestBackedPhysicalDeletion => {
+            (position.len() == 33 && position[0] == MAINTENANCE_DELETION_MANIFEST_TAG)
+                || (position.len() == 41 && position[0] == MAINTENANCE_DELETION_CHUNK_TAG)
+        }
     };
     if canonical {
         Ok(())
@@ -1817,7 +1917,7 @@ pub(crate) fn validate_maintenance_lineage_evidence(
     encoded: &[u8],
 ) -> Result<(), StoreError> {
     let fence = LineageFence::decode(encoded).map_err(StoreError::Blob)?;
-    if fence != LineageFence::new(physical_lineage, owner_binding) {
+    if !fence.same_authority(LineageFence::new(physical_lineage, owner_binding)) {
         return Err(cursor_invariant(
             "retained Blob import conflicts with its lineage fence",
         ));
@@ -1903,8 +2003,15 @@ mod tests {
             lineage
         );
         assert!(LineageFence::decode(&expected_lineage[..64]).is_err());
+        let mut reclaimed_lineage = expected_lineage;
+        reclaimed_lineage[0] = RECLAIMED_LINEAGE_FENCE_VERSION;
+        assert!(
+            LineageFence::decode(&reclaimed_lineage)
+                .expect("canonical reclaimed lineage")
+                .bulk_reclamation_observed()
+        );
         let mut lineage_with_unknown_version = expected_lineage;
-        lineage_with_unknown_version[0] = 2;
+        lineage_with_unknown_version[0] = 3;
         assert!(LineageFence::decode(&lineage_with_unknown_version).is_err());
         let mut lineage_with_trailing = expected_lineage.to_vec();
         lineage_with_trailing.push(0);
@@ -1982,6 +2089,33 @@ mod tests {
         assert_eq!(BlobMaintenanceClass::from_cursor_key(0), None);
         assert_eq!(BlobMaintenanceClass::from_cursor_key(7), None);
         assert_eq!(BlobMaintenanceClass::from_cursor_key(u8::MAX), None);
+    }
+
+    #[test]
+    fn blob_manifest_deletion_cursor_accepts_only_canonical_manifest_or_chunk_positions() {
+        let class = BlobMaintenanceClass::ManifestBackedPhysicalDeletion;
+        let mut manifest = [0x11; 33];
+        manifest[0] = MAINTENANCE_DELETION_MANIFEST_TAG;
+        let mut chunk = [0x22; 41];
+        chunk[0] = MAINTENANCE_DELETION_CHUNK_TAG;
+
+        assert_eq!(
+            decode_class_cursor(class, &encode_class_cursor(Some(&manifest)))
+                .expect("canonical manifest cursor"),
+            Some(manifest.to_vec())
+        );
+        assert_eq!(
+            decode_class_cursor(class, &encode_class_cursor(Some(&chunk)))
+                .expect("canonical chunk cursor"),
+            Some(chunk.to_vec())
+        );
+
+        manifest[0] = MAINTENANCE_DELETION_CHUNK_TAG;
+        chunk[0] = MAINTENANCE_DELETION_MANIFEST_TAG;
+        assert!(validate_class_position(class, &manifest).is_err());
+        assert!(validate_class_position(class, &chunk).is_err());
+        assert!(validate_class_position(class, &[MAINTENANCE_DELETION_MANIFEST_TAG; 32]).is_err());
+        assert!(validate_class_position(class, &[MAINTENANCE_DELETION_CHUNK_TAG; 40]).is_err());
     }
 
     mod blob_lifecycle_budget {
