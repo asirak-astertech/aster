@@ -534,6 +534,16 @@ depot capability, or post-commit verification is `FatalBlobCoherence` and
 terminates the actor after closing application admission; it is not downgraded
 to an ordinary per-request error.
 
+Durable Blob lifecycle authority is local and wire-neutral. Permanent physical-
+lineage fences and accepted-publication replay fences are independently bounded
+by row and canonical encoded-byte caps; publication lifecycle rows have a
+separate row cap. Selected defaults are 65,536 rows/16 MiB per fence class and
+65,536 publication lifecycle rows. Typed variant references distinguish exact
+publication roots from exact pending-source roots. These are non-evictable
+security/accounting records, not TTL or reclamation policy, and semantic-v5
+source, carrier, and result bytes remain unchanged. This increment is durable-
+only: it adds no wire frame or public application operation.
+
 The manifest is the payload of a source-authenticated envelope whose signed
 header commits BlobID, nonzero chunk count, and a route Merkle root. Encrypted
 chunks travel as canonical `ASTRBT01` objects under kind-`2` typed ObjectIDs and
@@ -762,6 +772,17 @@ The subsequent schema-15-to-16 migration likewise rebuilds only
 provenance, and permits v6 provenance across restart. It changes no stable
 source, carrier, bridge authorization, or bridge-route-wrapper bytes.
 
+The selected redb store separately performs an audit-first Blob lifecycle
+migration. A complete predecessor schema is reconstructed before mutation,
+checked against lineage/replay/publication capacities and the paired depot, and
+then gains publication/operation lifecycle wrappers, permanent fences, typed
+variant references, exact accounting, and persistent maintenance cursors in one
+transaction. Failure leaves the predecessor unchanged. A complete current
+schema is audited strictly and bidirectionally on every open; partial current
+groups, missing/orphan relations, noncanonical cursors, and accounting mismatch
+fail rather than being repaired. Read-only predecessor inspection does not
+migrate it.
+
 The v5 protected-frame allocation is `0x6b` BlobInterest, `0x6c`
 BlobInterestReply, Blob class `3` under the existing mutable source tags
 `0x71..0x92`, and `0xa1` BlobRangeFetch, `0xa2` BlobRange, `0xa5`
@@ -865,6 +886,34 @@ and depot completion to agree, installs the ordinary publication/index/counter
 rows, and removes the pending source and prefixes. Failure leaves no partial
 publication; an exact duplicate promotion is idempotent. A completed source is
 served only after the same current policy and lineage checks.
+
+Lifecycle authority changes share the corresponding redb transactions. Local
+admission installs the replay fence, live publication/accounting, typed
+publication root, ordinary indexes, causal authority, and operation result
+atomically. Network staging installs the permanent lineage fence,
+pending-source root, depot plan, pending metadata, and staging accounting
+atomically. Promotion adds replay and publication authority while moving the
+typed root from pending source to publication and removing pending rows in the
+same commit. Terminal abort removes the pending source/prefix visibility and
+its typed root atomically, but retains the non-evictable lineage fence and
+bounded depot import.
+
+The store persists a fair six-class maintenance schedule in eligibility order:
+expired publications/pending sources, invalid pending work, unreferenced local
+import staging, unreferenced completed variants, expired retirement records,
+and manifest-backed physical deletion. Each turn inspects one wrapping page
+under independently nonzero row, file, and encoded-byte budgets, commits that
+class's cursor, and rotates the persisted next class. The selected node's turn
+is capped at 16 rows, one file, and 2 MiB. It runs once after startup audit and
+thereafter at most once in the background per periodic actor turn, after
+operational work has had an opportunity to run.
+
+This maintenance surface is deliberately non-destructive. Discovery of an
+unreferenced staging or completed variant returns a candidate, keeps it
+revisitable, and waits for a later handler; current turns inspect zero files and
+delete no durable row or depot artifact. Retention/retirement expiry, physical
+reclamation or deletion manifests, pressure eviction, and finite Blob TTL are
+not part of this increment. There is no public garbage-collection operation.
 
 `Normal` and every `AtLeast(priority)` run Blob source and carrier work because
 `AtLeast` filters Event emission only. `ReceiveOnly` initiates, requests,

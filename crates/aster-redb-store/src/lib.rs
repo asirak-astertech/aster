@@ -24,7 +24,14 @@
 //! have separate caps, while accepted-dot and causal-frontier aggregate
 //! retirement remains an explicit open boundary. [`BlobDepotLimits`] separately
 //! bound durable depot import/chunk rows and redb-marked chunk-file bytes, without
-//! claiming a bound on untracked filesystem allocation.
+//! claiming a bound on untracked filesystem allocation. [`BlobLifecycleLimits`]
+//! independently bound non-evictable physical-lineage and accepted-publication
+//! replay fences plus publication lifecycle rows. Exact typed references keep
+//! publication and pending-source ownership of depot variants distinct. A
+//! persistent six-class scheduler performs row/file/byte-bounded, fair discovery,
+//! but destructive candidates remain pending: retention/retirement expiry,
+//! physical reclamation or deletion manifests, pressure eviction, and finite Blob
+//! TTL are not implemented by this crate boundary.
 
 #![forbid(unsafe_code)]
 
@@ -5207,11 +5214,13 @@ pub struct Store {
     limits: StoreLimits,
     blob_depot_limits: BlobDepotLimits,
     operation_limits: EventOperationLimits,
+    blob_lifecycle_limits: BlobLifecycleLimits,
     mission_authority: Option<NodeId>,
     live: AtomicBool,
     blob_depot_lock: std::sync::Mutex<()>,
     blob_completion_authority: std::sync::Arc<()>,
     blob_depot_owner_token: [u8; 32],
+    blob_depot_owner_binding: [u8; 32],
     #[cfg(test)]
     blob_depot_test_counters: BlobDepotTestCounters,
     #[cfg(test)]
@@ -5607,6 +5616,7 @@ impl Store {
             StoreLimits::default(),
             BlobDepotLimits::default(),
             EventOperationLimits::DEFAULT,
+            BlobLifecycleLimits::default(),
             Some(binding.mission_authority),
             Some(expectation),
         )?;
@@ -5658,6 +5668,28 @@ impl Store {
         operation_limits: EventOperationLimits,
         mission_authority: NodeId,
     ) -> Result<Self, StoreError> {
+        Self::open_with_all_limits_for_mission(
+            path,
+            limits,
+            blob_depot_limits,
+            operation_limits,
+            BlobLifecycleLimits::default(),
+            mission_authority,
+        )
+    }
+
+    /// Opens a mission-bound store with every independent durable admission limit.
+    ///
+    /// Lifecycle fences and publication rows are a separate non-evictable
+    /// authority from ordinary store, Blob-depot, and Event-operation limits.
+    pub fn open_with_all_limits_for_mission(
+        path: impl AsRef<Path>,
+        limits: StoreLimits,
+        blob_depot_limits: BlobDepotLimits,
+        operation_limits: EventOperationLimits,
+        blob_lifecycle_limits: BlobLifecycleLimits,
+        mission_authority: NodeId,
+    ) -> Result<Self, StoreError> {
         let path = path.as_ref();
         let readable_preflight = if path.exists() {
             match reject_terminal_normal_open(path) {
@@ -5686,6 +5718,7 @@ impl Store {
             limits,
             blob_depot_limits,
             operation_limits,
+            blob_lifecycle_limits,
             Some(mission_authority),
             None,
         )?;
@@ -5788,6 +5821,7 @@ impl Store {
             limits,
             BlobDepotLimits::default(),
             EventOperationLimits::DEFAULT,
+            BlobLifecycleLimits::default(),
             None,
             None,
         )
@@ -5798,6 +5832,7 @@ impl Store {
         limits: StoreLimits,
         blob_depot_limits: BlobDepotLimits,
         operation_limits: EventOperationLimits,
+        blob_lifecycle_limits: BlobLifecycleLimits,
         expected_mission_authority: Option<NodeId>,
         expected_security_profile_policy: Option<SecurityProfilePolicyExpectation>,
     ) -> Result<Self, StoreError> {
@@ -5917,7 +5952,7 @@ impl Store {
             event_operation::stage_legacy_event_operations_write(&write, operation_limits)?;
         // Audit all retained metadata, predecessor relations, witnesses and
         // legacy accounting before replacing any legacy row.
-        let blob_stats = audit_semantic_tables(&write, limits)?;
+        let mut blob_stats = audit_semantic_tables(&write, limits)?;
         if let Some(migration) = &operation_migration {
             migration.apply(&write)?;
         }
@@ -5925,13 +5960,22 @@ impl Store {
         let numbered_operation_stats =
             numbered_event_operation::audit_numbered_tables_write(&write)?;
         let blob_depot_owner_token = blob::depot::depot_owner_token_write(&write)?;
-        blob::depot::bind_depot_owner_write(
+        let blob_depot_owner_binding = blob::depot::bind_depot_owner_write(
             &write,
             &path,
             backing_identity,
             blob_depot_owner_token,
             blob_stats,
         )?;
+        let blob_lifecycle_migration = blob::lifecycle::stage_blob_lifecycle_migration_write(
+            &write,
+            blob_lifecycle_limits,
+            blob_depot_owner_binding,
+            &mut blob_stats,
+        )?;
+        if let Some(migration) = &blob_lifecycle_migration {
+            migration.apply(&write)?;
+        }
         audit_control_tables(&write)?;
         let mut mission_authority = read_mission_binding(&write)?;
         let bridge_event_stats =
@@ -5977,10 +6021,10 @@ impl Store {
         }
         custody::audit_custody_tables_write(&write, limits, mission_authority)?;
         numbered_event_operation::audit_numbered_result_authority_write(&write)?;
-        if operation_migration.is_some() {
-            // A failed physical audit must not leave a committed operation
+        if operation_migration.is_some() || blob_lifecycle_migration.is_some() {
+            // A failed physical audit must not leave a committed database
             // migration behind. Keep all fallible depot validation/reclaim in
-            // this same transaction for the bounded legacy conversion. The
+            // this same transaction for the bounded conversions. The
             // token/binding checks above forbid adopting an existing root with
             // a newly generated owner token; this audit never creates a root.
             blob::depot::audit_depot_write(
@@ -5997,13 +6041,22 @@ impl Store {
                 "injected Event operation migration abort",
             ));
         }
+        #[cfg(test)]
+        if blob_lifecycle_migration.is_some()
+            && blob::lifecycle::TEST_BLOB_LIFECYCLE_MIGRATION_FAULT.get()
+        {
+            return Err(StoreError::SemanticInvariant(
+                "injected Blob lifecycle migration abort",
+            ));
+        }
         write.commit()?;
 
-        // Opens without an operation migration retain the separate physical
+        // Opens without either database migration retain the separate physical
         // audit after persisting their database owner token. The second exact
         // writer transaction rechecks terminal and mission truth before depot
         // effects. A migration already completed this audit before its commit.
         if operation_migration.is_none()
+            && blob_lifecycle_migration.is_none()
             && let Some(authority) = mission_authority
         {
             let physical = database.begin_write()?;
@@ -6026,11 +6079,13 @@ impl Store {
             limits,
             blob_depot_limits,
             operation_limits,
+            blob_lifecycle_limits,
             mission_authority,
             live: AtomicBool::new(true),
             blob_depot_lock: std::sync::Mutex::new(()),
             blob_completion_authority: std::sync::Arc::new(()),
             blob_depot_owner_token,
+            blob_depot_owner_binding,
             #[cfg(test)]
             blob_depot_test_counters: BlobDepotTestCounters::default(),
             #[cfg(test)]
@@ -6048,6 +6103,11 @@ impl Store {
     /// Returns the permanent Event-operation ledger limits active on this handle.
     pub const fn operation_limits(&self) -> EventOperationLimits {
         self.operation_limits
+    }
+
+    /// Returns the non-evictable Blob lifecycle authority limits active on this handle.
+    pub const fn blob_lifecycle_limits(&self) -> BlobLifecycleLimits {
+        self.blob_lifecycle_limits
     }
 
     /// Returns exact logical usage charged against this handle's aggregate
@@ -6386,11 +6446,13 @@ impl Store {
             limits: _,
             blob_depot_limits: _,
             operation_limits: _,
+            blob_lifecycle_limits: _,
             mission_authority: _,
             live: _,
             blob_depot_lock: _,
             blob_completion_authority: _,
             blob_depot_owner_token: _,
+            blob_depot_owner_binding: _,
             #[cfg(test)]
                 blob_depot_test_counters: _,
             #[cfg(test)]
