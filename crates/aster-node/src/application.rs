@@ -2801,7 +2801,10 @@ fn custody_store_error_kind(error: &CustodyStoreError) -> ApplicationErrorKind {
         CustodyStoreError::MissionNotBound
         | CustodyStoreError::MissionMismatch
         | CustodyStoreError::ItemNotFound
-        | CustodyStoreError::LeaseNotFound => ApplicationErrorKind::StateUnavailable,
+        | CustodyStoreError::LeaseNotFound
+        | CustodyStoreError::LegacyCustodyMigrationRequired => {
+            ApplicationErrorKind::StateUnavailable
+        }
         // A recognized predecessor schema is not corrupt. It requires the
         // same explicit fresh-store boundary as other non-migratable legacy
         // application state.

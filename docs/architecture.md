@@ -125,6 +125,18 @@ per-priority cursor rotates attempts only within the same priority tier and is
 never delivery evidence. Its allocation and the sender page-packing target are
 local implementation details, not wire limits.
 
+Event/RouteEvent finite lifetime uses one shared lower-bound custody state
+machine in core and redb. Exact continuity permits normal forwarding. Once
+continuity is lost, forwarding remains permanently disabled for that row, while
+valid later clock domains are used only to accumulate provable same-domain
+intervals. The redb expiration index doubles as a bounded re-anchor queue:
+unanchored rows use a sentinel, older generations are processed before current
+deadlines, and every age/checkpoint/index change commits atomically. This avoids
+both wall-clock reconstruction and an unbounded restart scan. Reaching TTL on
+the conservative lower bound feeds the existing marked-then-retired Event
+lifecycle, including lease drain. Wire claims and durable item encoding do not
+change. Blob finite lifetime and Blob route-only custody remain later work.
+
 Each mission-authenticated contact runs class-separated State and Record
 Negentropy/fetch lanes after its control and Event lanes. A receiver supplies
 canonical topic/scope interests independently for each class; empty means

@@ -1191,16 +1191,34 @@ Normal reconciliation may settle a retry when its authenticated common set
 proves the peer already holds the transfer. Blind ReceiveOnly contacts cannot
 make that inference.
 
-If finite-TTL age cannot be bounded across reboot or power loss, the node MUST
-mark the item non-forwardable until a trusted time source proves it unexpired; it
-MAY retain it locally with an indeterminate-age annotation. Durable items are not
-affected. An item known locally to have `age >= TTL` MUST NOT be offered,
-requested, retransmitted, or sent and MUST enter garbage collection.
+If exact clock continuity is lost across reboot, power loss, a changed clock
+identity, a missing sample, tick rollback, or checked-arithmetic overflow, the
+node MUST make that loss sticky and MUST withhold the finite item. The durable
+age remains a conservative lower bound. An unmeasurable interval adds zero; the
+first valid sample in a later continuity domain becomes a new lower-bound
+anchor and also adds zero. Each later nondecreasing sample in that same domain
+adds only its proven monotonic delta. A further domain change repeats this rule,
+so no restart or inter-domain gap is ever inferred or charged.
 
-That trusted-time recovery rule is available to profiles that define such a
-proof. The selected Event implementation does not: clock-domain loss is sticky,
-the exact transfer remains withheld, and recovery requires an
-application-specific replacement or a new source revision.
+Below TTL, a continuity-lost finite item remains `WithheldUnknownAge` and is
+never offered, requested, retransmitted, delivered, or used to create a send
+lease. At `lower_bound >= TTL`, expiry is certain even though exact age remains
+unknown; the item MUST enter the existing expiry-retirement path. Checked age
+overflow saturates the lower bound at `u64::MAX`, retains sticky loss, and is
+therefore certain expiry for every representable finite TTL. Authenticated
+duplicates merge `max(local_lower_bound, received_age)` and cannot reduce the
+age, move a same-domain anchor backward, or restore exact continuity.
+
+Selected Event/RouteEvent storage indexes every live finite row in the existing
+custody-expiration index. Continuous and lost-anchored rows use their exact
+domain/generation deadline; a lost unanchored row uses the generation-zero,
+zero-clock, zero-tick sentinel. Each maintenance transaction processes at most
+the caller's existing 1,024-row limit, prioritizing sentinel and older-generation
+re-anchor work before current-generation due deadlines. Re-anchoring, age/index
+mutation, and retirement marking are atomic and restart-safe. The change is
+wire-neutral: custody claims and item encoding are unchanged. This behavior is
+currently exercised for Event/RouteEvent; finite Blob lifecycle work consumes
+the same policy in a later implementation.
 
 Session counters/windows, full ItemID deduplication, publisher counter ledgers,
 mission epochs, and control-chain rollback checks ensure captured traffic is not

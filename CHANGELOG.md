@@ -25,6 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Aligned the wire and envelope contract with semantic protocol version 6.
 - Bounded indexed Event-custody expiry and retirement to a resumable 1,024-dependency-unit cleanup pass. Pressure eviction still scans all retained custody rows while keeping at most 1,024 candidates in scratch memory. New local and selected-reconciliation Events schedule coalesced prompt contact attempts, with failed attempts falling back to periodic retry; bridge propagation is unchanged. Custody schema v1/v2 stores require recreation, and the supporting measurements are current-code engineering evidence rather than target qualification.
 - Reused custody authorization decisions within each send attempt.
+- Continued accumulating only provable monotonic custody intervals after exact
+  clock-continuity loss. Finite Event/RouteEvent rows remain withheld below TTL,
+  re-anchor through the existing bounded expiration index across restarts, and
+  expire once their conservative lower bound reaches TTL. The change is
+  wire-neutral; finite Blob lifecycle remains separate follow-up work.
 
 ### Security
 
