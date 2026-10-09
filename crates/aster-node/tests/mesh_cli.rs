@@ -897,8 +897,15 @@ fn live_event_process_worker() {
                 );
             }
             "sync-receiver" => {
+                let path = state.join("consumer-journal.redb");
+                let id = b"test.mesh.consumer.v1";
+                if true { aster_node::publication_journal::Journal::initialize(&path, id).unwrap(); }
+                let mut journal = aster_node::publication_journal::Journal::open(&path, id).unwrap();
+                journal.recover(&mut aster_node::publication_journal::Backend::Live(&events)).await.unwrap();
+                let client = journal.client_context().unwrap();
                 let subscription = events
                     .subscribe(EventSubscriptionRequest {
+                        client: client.clone(),
                         operation_key: b"process-later-sync-subscription".to_vec(),
                         topic,
                         scope,
@@ -915,6 +922,7 @@ fn live_event_process_worker() {
                 while Instant::now() < receiver_deadline {
                     let page = events
                         .poll(EventPollRequest {
+                            client: client.clone(),
                             subscription: subscription.id,
                             delivery_limit: 8,
                             scan_limit: 8,
@@ -934,7 +942,7 @@ fn live_event_process_worker() {
                 );
                 assert_eq!(
                     events
-                        .acknowledge(subscription.id, delivery.event.id)
+                        .acknowledge(client.clone(), subscription.id, delivery.event.id)
                         .await
                         .expect("receiver acknowledge"),
                     EventAcknowledgement::Acknowledged
@@ -942,6 +950,7 @@ fn live_event_process_worker() {
                 assert!(
                     events
                         .poll(EventPollRequest {
+                            client: client.clone(),
                             subscription: subscription.id,
                             delivery_limit: 8,
                             scan_limit: 8,
@@ -985,8 +994,15 @@ fn live_event_process_worker() {
                 );
             }
             "restart-receiver" => {
+                let path = state.join("consumer-journal.redb");
+                let id = b"test.mesh.consumer.v1";
+                if false { aster_node::publication_journal::Journal::initialize(&path, id).unwrap(); }
+                let mut journal = aster_node::publication_journal::Journal::open(&path, id).unwrap();
+                journal.recover(&mut aster_node::publication_journal::Backend::Live(&events)).await.unwrap();
+                let client = journal.client_context().unwrap();
                 let subscription = events
                     .subscribe(EventSubscriptionRequest {
+                        client: client.clone(),
                         operation_key: b"process-later-sync-subscription".to_vec(),
                         topic,
                         scope,
@@ -998,6 +1014,7 @@ fn live_event_process_worker() {
                 assert!(
                     events
                         .poll(EventPollRequest {
+                            client: client.clone(),
                             subscription: subscription.id,
                             delivery_limit: 8,
                             scan_limit: 8,

@@ -5303,8 +5303,18 @@ fn seed_demo_event_subscription(
 ) -> Result<(), NodeError> {
     let store = Store::open_for_mission(state.join(STORE_FILE), mission.mission_authority_id())?;
     store.require_process_exclusive_lock()?;
+    let journal = crate::demo_publication::Journal::open(
+        &store,
+        aster_redb_store::EventClientId::new(b"aster.native.demo-subscriptions.v1".to_vec())
+            .map_err(StoreError::from)?,
+    )?;
+    let client = aster_redb_store::EventClientContext {
+        client_id: journal.client.clone(),
+        session: journal.session()?,
+    };
     let policy = store.control_policy_snapshot()?;
     store.create_event_subscription_with_policy(
+        &client,
         &policy,
         &EventSubscriptionKey::new(DEMO_EVENT_SUBSCRIPTION_KEY.to_vec())?,
         EventSubscriptionSpec {
@@ -14900,6 +14910,12 @@ fn execute_selected_event_command(
             let result = application.acknowledge_publication_result(&client_id, session, sequence);
             let _ = response.send(result);
         }
+        SelectedEventCommand::ClientStatus { client, response } => {
+            let _ = response.send(application.client_status(&client));
+        }
+        SelectedEventCommand::RequireClientContext { client, response } => {
+            let _ = response.send(application.require_client_context(&client));
+        }
         SelectedEventCommand::ListSubscriptions { response } => {
             let _ = response.send(application.list_subscriptions());
         }
@@ -14916,18 +14932,20 @@ fn execute_selected_event_command(
             let _ = response.send(result);
         }
         SelectedEventCommand::Acknowledge {
+            client,
             subscription,
             event,
             response,
         } => {
-            let result = application.acknowledge(subscription, event);
+            let result = application.acknowledge(client, subscription, event);
             let _ = response.send(result);
         }
         SelectedEventCommand::Unsubscribe {
+            client,
             subscription,
             response,
         } => {
-            let result = application.unsubscribe(subscription);
+            let result = application.unsubscribe(client, subscription);
             let _ = response.send(result);
         }
         SelectedEventCommand::Gaps { query, response } => {
@@ -20363,6 +20381,9 @@ fn apply_test_page_boundary_state_change(
         }) => {
             let policy = store.control_policy_snapshot()?;
             store.create_event_subscription_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
                 &policy,
                 &EventSubscriptionKey::new(key).map_err(NodeError::Store)?,
                 EventSubscriptionSpec {
@@ -33022,6 +33043,7 @@ mod tests {
             EventSubscriptionKey::new(b"status/policy-change".to_vec()).expect("selector key");
         store
             .create_event_subscription_with_policy(
+                &store.test_event_client_context().unwrap(),
                 initial.control_policy(),
                 &selector_key,
                 EventSubscriptionSpec {
@@ -37564,6 +37586,9 @@ mod tests {
             .expect("settled subscription policy");
         store
             .create_event_subscription_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
                 &policy,
                 &EventSubscriptionKey::new(key.to_vec()).expect("subscription key"),
                 EventSubscriptionSpec {
@@ -42333,8 +42358,8 @@ mod tests {
     async fn live_selected_event_actor_is_peerless_durable_and_closes_admission() {
         use crate::application::{
             ApplicationErrorKind, EventAcknowledgement, EventGapQuery, EventPollRequest,
-            EventPublishRequest, EventQuery, EventSubscriptionRequest, EventSyncStatus,
-            EventUnsubscribe,
+            EventPublishOptions, EventQuery, EventSubscriptionRequest, EventSyncStatus,
+            EventUnsubscribe, NumberedEventPublishRequest,
         };
 
         let state = root("live-selected-event-actor");
@@ -42360,6 +42385,7 @@ mod tests {
 
         let subscription = selected
             .subscribe(EventSubscriptionRequest {
+                client: subscription_fixture_client(&selected).await,
                 operation_key: b"runtime-live-subscription".to_vec(),
                 topic: topic.clone(),
                 scope: scope.clone(),
@@ -42368,18 +42394,26 @@ mod tests {
             .await
             .expect("subscribe while live");
         let published = selected
-            .publish(EventPublishRequest {
-                operation_key: b"runtime-live-publish".to_vec(),
-                predecessor: None,
-                topic: topic.clone(),
-                scope: scope.clone(),
-                priority: Priority::Priority,
-                logical_key: b"runtime-live-key".to_vec(),
-                payload: b"published while peerless".to_vec(),
-                tombstone: false,
-            })
+            .publish_numbered(
+                NumberedEventPublishRequest {
+                    client_id: subscription_fixture_client(&selected).await.client_id,
+                    session: subscription_fixture_client(&selected).await.session,
+                    sequence: aster_redb_store::EventOperationSequence::new(1).unwrap(),
+                    predecessor: None,
+                    topic: topic.clone(),
+                    scope: scope.clone(),
+                    priority: Priority::Priority,
+                    logical_key: b"runtime-live-key".to_vec(),
+                    payload: b"published while peerless".to_vec(),
+                    tombstone: false,
+                },
+                EventPublishOptions::durable(),
+            )
             .await
             .expect("publish while live");
+        let published = published.result.receipt;
+        let published_id =
+            crate::application::EventId::from_bytes(*published.semantic_id.as_bytes());
         let queried = selected
             .query(EventQuery {
                 after_acceptance_marker: 0,
@@ -42391,10 +42425,11 @@ mod tests {
             .await
             .expect("query while live");
         assert_eq!(queried.items.len(), 1);
-        assert_eq!(queried.items[0].id, published.id);
+        assert_eq!(queried.items[0].id, published_id);
 
         let delivered = selected
             .poll(EventPollRequest {
+                client: subscription_fixture_client(&selected).await,
                 subscription: subscription.id,
                 delivery_limit: 8,
                 scan_limit: 8,
@@ -42402,11 +42437,15 @@ mod tests {
             .await
             .expect("poll while live");
         assert_eq!(delivered.deliveries.len(), 1);
-        assert_eq!(delivered.deliveries[0].event.id, published.id);
+        assert_eq!(delivered.deliveries[0].event.id, published_id);
         assert_eq!(delivered.deliveries[0].attempt, 1);
         assert_eq!(
             selected
-                .acknowledge(subscription.id, published.id)
+                .acknowledge(
+                    subscription_fixture_client(&selected).await,
+                    subscription.id,
+                    published_id
+                )
                 .await
                 .expect("acknowledge while live"),
             EventAcknowledgement::Acknowledged
@@ -42414,6 +42453,7 @@ mod tests {
         assert!(
             selected
                 .poll(EventPollRequest {
+                    client: subscription_fixture_client(&selected).await,
                     subscription: subscription.id,
                     delivery_limit: 8,
                     scan_limit: 8,
@@ -42435,33 +42475,36 @@ mod tests {
             .await
             .expect("authenticated gap projection");
         assert!(gaps.gaps.is_empty());
-        assert_eq!(gaps.scanned_through_sequence, published.event_sequence);
+        assert_eq!(gaps.scanned_through_sequence, 1);
         assert!(!gaps.has_more);
         let beyond_high_water = selected
             .gaps(EventGapQuery {
                 publisher: selected.identity(),
                 topic,
                 scope,
-                after_sequence: published.event_sequence + 10,
+                after_sequence: 1 + 10,
                 scan_limit: 8,
             })
             .await
             .expect("empty gap scan beyond high-water");
         assert!(beyond_high_water.gaps.is_empty());
-        assert_eq!(
-            beyond_high_water.scanned_through_sequence,
-            published.event_sequence + 10
-        );
+        assert_eq!(beyond_high_water.scanned_through_sequence, 1 + 10);
         assert_eq!(
             selected
-                .unsubscribe(subscription.id)
+                .unsubscribe(
+                    subscription_fixture_client(&selected).await,
+                    subscription.id
+                )
                 .await
                 .expect("unsubscribe while live"),
             EventUnsubscribe::Removed
         );
         assert_eq!(
             selected
-                .unsubscribe(subscription.id)
+                .unsubscribe(
+                    subscription_fixture_client(&selected).await,
+                    subscription.id
+                )
                 .await
                 .expect("idempotent unsubscribe while live"),
             EventUnsubscribe::AlreadyAbsent
@@ -42579,6 +42622,7 @@ mod tests {
         let scope = Scope::new("test/runtime-contact").expect("scope");
         let subscription = lower_events
             .subscribe(EventSubscriptionRequest {
+                client: subscription_fixture_client(&lower_events).await,
                 operation_key: b"higher-normal-to-lower-receive-only".to_vec(),
                 topic: topic.clone(),
                 scope: scope.clone(),
@@ -42608,6 +42652,7 @@ mod tests {
             loop {
                 let page = lower_events
                     .poll(EventPollRequest {
+                        client: subscription_fixture_client(&lower_events).await,
                         subscription: subscription.id,
                         delivery_limit: 8,
                         scan_limit: 8,
@@ -43489,6 +43534,41 @@ mod tests {
             .expect("running node IPv4 socket")
     }
 
+    async fn subscription_fixture_client(
+        events: &crate::application::SelectedEventHandle,
+    ) -> crate::application::EventClientContext {
+        use crate::application::{EventClientContext, EventClientId, EventPublicationSession};
+        let client_id = EventClientId::new(b"test.subscription-owner".to_vec()).unwrap();
+        let probe = EventClientContext {
+            client_id: client_id.clone(),
+            session: EventPublicationSession::new(1).unwrap(),
+        };
+        if let Ok(status) = events.client_status(probe).await {
+            return EventClientContext {
+                client_id,
+                session: status.current_session,
+            };
+        }
+        let mut claim = [0; 32];
+        getrandom::fill(&mut claim).unwrap();
+        let snapshot = events
+            .begin_publication_session(client_id.clone(), 0, claim.to_vec())
+            .await
+            .unwrap();
+        events
+            .complete_publication_recovery(
+                client_id.clone(),
+                snapshot.session,
+                snapshot.snapshot_revision,
+            )
+            .await
+            .unwrap();
+        EventClientContext {
+            client_id,
+            session: snapshot.session,
+        }
+    }
+
     async fn seed_peerless_consume_subscription(
         state: PathBuf,
         mission: UnprotectedReferenceMission,
@@ -43511,6 +43591,7 @@ mod tests {
         let subscription = node
             .selected_events()
             .subscribe(crate::application::EventSubscriptionRequest {
+                client: subscription_fixture_client(&node.selected_events()).await,
                 operation_key: operation_key.to_vec(),
                 topic,
                 scope,
@@ -43557,6 +43638,7 @@ mod tests {
             loop {
                 let page = events
                     .poll(crate::application::EventPollRequest {
+                        client: subscription_fixture_client(events).await,
                         subscription,
                         delivery_limit: 8,
                         scan_limit: 8,
@@ -43703,6 +43785,7 @@ mod tests {
         let subscription = receiver_offline
             .selected_events()
             .subscribe(EventSubscriptionRequest {
+                client: subscription_fixture_client(&receiver_offline.selected_events()).await,
                 operation_key: b"event-wake-subscription".to_vec(),
                 topic: topic.clone(),
                 scope: scope.clone(),
@@ -43791,6 +43874,7 @@ mod tests {
             loop {
                 let page = receiver_events
                     .poll(EventPollRequest {
+                        client: subscription_fixture_client(&receiver_events).await,
                         subscription: subscription.id,
                         delivery_limit: 8,
                         scan_limit: 8,
@@ -46802,6 +46886,38 @@ mod tests {
             payload,
             tombstone,
         } = publication;
+        if store.numbered_event_operation_stats().unwrap().clients > 0 {
+            let client = store.test_event_client_context().unwrap();
+            let sequence = store.test_next_event_operation_sequence(&client).unwrap();
+            let policy = store.control_policy_snapshot().unwrap();
+            let outcome = publish_selected_numbered_event_once(
+                store,
+                &policy,
+                sealer,
+                NumberedEventPublishRequest {
+                    client_id: client.client_id,
+                    session: client.session,
+                    sequence,
+                    predecessor: None,
+                    topic: topic.clone(),
+                    scope: scope.clone(),
+                    priority,
+                    logical_key: payload.to_vec(),
+                    payload: payload.to_vec(),
+                    tombstone,
+                },
+                match ttl_ms {
+                    Some(ttl) => EventPublishOptions::finite_ttl_ms(ttl).unwrap(),
+                    None => EventPublishOptions::durable(),
+                },
+                Some(sample),
+            )
+            .unwrap();
+            return store
+                .get_event(outcome.result.receipt.transfer_id)
+                .unwrap()
+                .unwrap();
+        }
         let operation = EventOperationKey::new(operation.to_vec()).expect("operation key");
         let policy = store.control_policy_snapshot().expect("settled policy");
         publish_selected_event_once(
