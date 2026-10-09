@@ -303,6 +303,16 @@ are recorded separately in the
   session-record AAD, bind the exact transfer/source fields, exchange, nonzero
   policy revision, session ID, and checked cumulative age, and are
   replay-checked before store admission.
+- Exact custody-clock continuity loss is sticky. Finite Event/RouteEvent data
+  stays non-forwardable below TTL, but later same-domain monotonic intervals
+  continue increasing a durable conservative lower bound. Unknown intervals
+  contribute zero, authenticated duplicates cannot rejuvenate data, and
+  arithmetic overflow saturates the lower bound. Once that lower bound reaches
+  TTL, expiry is certain and the existing bounded retirement path is safe.
+  Lost unanchored and prior-generation rows remain present in the audited
+  expiration index, so restart cannot strand them outside bounded maintenance.
+  This is a local storage/lifecycle change with no new wire evidence; Blob does
+  not gain finite lifecycle or route-only custody in this change.
 - Protected v3-format Event interests used in v3/v4/v5/v6/v7 `LegacyV6` bind an opaque receiver
   selector generation.
   Receipts suppress only that generation; `Satisfied` hides Carry versus
