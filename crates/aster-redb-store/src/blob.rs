@@ -10942,9 +10942,28 @@ mod tests {
                 b"original-operation",
             );
             let write = store.database.begin_write().expect("seed operation ledger");
+            let mut tracked_byte_cap_bytes = None;
             {
                 let mut operations = write.open_table(BLOB_OPERATIONS).expect("operations");
                 if byte_cap {
+                    let mut operation_bytes = operations
+                        .iter()
+                        .expect("operation rows")
+                        .map(|row| {
+                            row.map(|(key, value)| {
+                                let key_bytes =
+                                    u64::try_from(key.value().len()).expect("operation key bytes");
+                                let value_bytes = u64::try_from(value.value().len())
+                                    .expect("operation value bytes");
+                                key_bytes
+                                    .checked_add(value_bytes)
+                                    .expect("operation row bytes")
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                        .expect("operation row lengths")
+                        .into_iter()
+                        .sum::<u64>();
                     let mut index = 0u32;
                     loop {
                         let mut key = vec![b'b'; 200];
@@ -10953,27 +10972,26 @@ mod tests {
                             transfer_id: stored.transfer_id,
                             intent_digest: [u8::try_from(index % 251).expect("intent byte"); 32],
                         });
-                        let current_bytes = operations
-                            .iter()
-                            .expect("operation rows")
-                            .map(|row| {
-                                row.map(|(key, value)| key.value().len() + value.value().len())
-                            })
-                            .collect::<Result<Vec<_>, _>>()
-                            .expect("operation row lengths")
-                            .into_iter()
-                            .sum::<usize>();
-                        if u64::try_from(current_bytes + key.len() + encoded.len())
-                            .expect("operation bytes")
-                            > MAX_BLOB_OPERATION_BYTES - 64
-                        {
+                        let incoming_bytes = u64::try_from(key.len())
+                            .expect("incoming operation key bytes")
+                            .checked_add(
+                                u64::try_from(encoded.len())
+                                    .expect("incoming operation value bytes"),
+                            )
+                            .expect("incoming operation bytes");
+                        let next_bytes = operation_bytes
+                            .checked_add(incoming_bytes)
+                            .expect("operation bytes");
+                        if next_bytes > MAX_BLOB_OPERATION_BYTES - 64 {
                             break;
                         }
                         operations
                             .insert(key.as_slice(), encoded.as_slice())
                             .expect("seed byte-cap operation");
+                        operation_bytes = next_bytes;
                         index = index.checked_add(1).expect("operation index");
                     }
+                    tracked_byte_cap_bytes = Some(operation_bytes);
                 } else {
                     for index in 1..MAX_BLOB_OPERATIONS {
                         let key = format!("r{index:04}").into_bytes();
@@ -11005,6 +11023,12 @@ mod tests {
                     .sum::<u64>();
                 (count, bytes)
             };
+            if byte_cap {
+                assert_eq!(
+                    bytes,
+                    tracked_byte_cap_bytes.expect("tracked byte-cap operation bytes")
+                );
+            }
             {
                 let mut metadata = write.open_table(METADATA).expect("metadata");
                 metadata
