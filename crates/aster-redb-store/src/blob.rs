@@ -10620,7 +10620,8 @@ mod tests {
 
     #[test]
     fn completion_capability_rejects_every_exact_import_identity_mutation() {
-        for (index, field) in [
+        let mut services = blob_services(0xa0);
+        for field in [
             "whole_plaintext_sha256",
             "media_type",
             "schema_id",
@@ -10631,10 +10632,8 @@ mod tests {
             "chunk_count",
         ]
         .into_iter()
-        .enumerate()
         {
             let root = BlobTestRoot::new(field);
-            let mut services = blob_services(0xa0 + u8::try_from(index).expect("mutation index"));
             let plaintext = vec![0xa5; 2_048];
             let prepared = prepared_blob(&plaintext);
             let store =
