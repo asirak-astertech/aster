@@ -32701,19 +32701,25 @@ mod tests {
         let mut authority =
             ReferenceEnvelopeSealer::open(authority_bundle).expect("authority sealer");
         let mut verifier = ReferenceEnvelopeSealer::open(verifier_bundle).expect("verifier sealer");
-        let mut recipients = vec![
-            ScopeRekeyRecipient::member(authority.identity(), vec![event_topic()])
-                .expect("authority recipient"),
-            ScopeRekeyRecipient::member(verifier.identity(), vec![event_topic()])
-                .expect("verifier recipient"),
-        ];
         for serial in 3..=MAX_CONTROL_INTENT_RECIPIENTS as u64 {
-            let relay = provisioner
+            let relay_bundle = provisioner
                 .issue_node(serial, std::slice::from_ref(&relay_access))
-                .and_then(ReferenceEnvelopeSealer::open)
                 .expect("relay recipient");
-            recipients.push(ScopeRekeyRecipient::route_only(relay.identity()));
+            drop(relay_bundle);
         }
+        let authority_recipient = authority.identity();
+        let verifier_recipient = verifier.identity();
+        let recipients = provisioner
+            .rekey_registry_recipient_nodes()
+            .map(|recipient| {
+                if recipient == authority_recipient || recipient == verifier_recipient {
+                    ScopeRekeyRecipient::member(recipient, vec![event_topic()])
+                        .expect("member recipient")
+                } else {
+                    ScopeRekeyRecipient::route_only(recipient)
+                }
+            })
+            .collect::<Vec<_>>();
         assert_eq!(recipients.len(), MAX_CONTROL_INTENT_RECIPIENTS);
         let registry = provisioner
             .export_rekey_registry()
