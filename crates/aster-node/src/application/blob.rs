@@ -27,17 +27,20 @@ use aster_mesh::{
     PreparedBlob, Priority, ReferenceEnvelopeSealer, SELECTED_BLOB_CHUNK_SIZE, Scope, Topic,
     prepare_blob,
 };
-pub use aster_redb_store::BlobDepotLimits;
 use aster_redb_store::{
     BlobDeliveryAck as StoreBlobDeliveryAck, BlobDeliveryToken as StoreBlobDeliveryToken,
-    BlobDepotCompletion, BlobOperationKey, BlobOperationRequest, BlobPublicationDisposition,
-    BlobPublicationIntent, BlobReadPlan, BlobSemanticId, BlobSourceProjection, BlobSourceRetention,
-    BlobStoreError, BlobSubscriptionId as StoreBlobSubscriptionId, BlobSubscriptionKey,
+    BlobDepotCompletion, BlobMaintenanceBudget, BlobOperationKey, BlobOperationRequest,
+    BlobPublicationDisposition, BlobPublicationIntent, BlobReadPlan, BlobSemanticId,
+    BlobSourceProjection, BlobSourceRetention, BlobStoreError,
+    BlobSubscriptionId as StoreBlobSubscriptionId, BlobSubscriptionKey,
     BlobSubscriptionPollSelection, BlobSubscriptionRemoveOutcome, BlobSubscriptionSpec,
     BlobTransferStatusSnapshot as StoreBlobTransferStatusSnapshot, BlobVariantId,
     ControlPolicySnapshot, ControlTransferId, MAX_BLOB_OPERATION_KEY_BYTES,
     MAX_BLOB_POLL_DELIVERIES, MAX_BLOB_SUBSCRIPTION_SCAN, MAX_NETWORK_BLOB_BYTES,
     MAX_NETWORK_BLOB_CHUNKS, Store, StoreError, StoreLimits, StoredBlob,
+};
+pub use aster_redb_store::{
+    BlobDepotLimits, BlobGcFailureCategory, BlobGcRetryState, BlobGcStatus,
 };
 use tokio::sync::{mpsc, oneshot};
 use zeroize::{Zeroize as _, Zeroizing};
@@ -50,7 +53,7 @@ use crate::{
     NodeError,
     mission::UnprotectedReferenceMission,
     runtime::{
-        AuthenticatedEventRouteCache, STORE_FILE, StartupEventVerification,
+        AuthenticatedEventRouteCache, NodeCustodyClock, STORE_FILE, StartupEventVerification,
         cache_authenticated_blob_route_claim, ensure_principal_active,
         ensure_state_accepts_normal_operation, open_startup_event_verifier_and_cache,
         refresh_application_policy,
@@ -516,6 +519,8 @@ pub struct BlobTransferStatus {
     pub retained_pending_transfers: u64,
     pub network_staging_bytes: u64,
     pub reserved_file_bytes: u64,
+    /// Sanitized pending reclamation and permanent lifecycle-capacity usage.
+    pub gc: BlobGcStatus,
     pub pending: Vec<PendingBlobTransferStatus>,
 }
 
@@ -560,10 +565,11 @@ fn blob_transfer_phase(
 /// positioned at exactly zero. Exact-operation retry remains available only
 /// while the publisher and Store are authorized and not zeroized. A failed
 /// publication may leave bounded, quota-charged unfinished or
-/// completed-but-unpublished depot staging with no semantic/operation row;
-/// this profile has no staging garbage collection. An authorized publisher can
-/// therefore exhaust the default 512-MiB depot with roughly eight maximum-size
-/// Blobs, before separately bounded carrier-prefix staging.
+/// completed-but-unpublished depot staging with no semantic/operation row.
+/// Exact already-unreferenced variants are eligible for manifest-authorized,
+/// bounded background reclamation and remain fully charged until deletion
+/// finalizes. Capacity admission may run one cursor-neutral bounded reclamation
+/// attempt and retry once; it never retires or evicts live content.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlobPublishRequest {
     pub operation_key: Vec<u8>,
@@ -707,9 +713,10 @@ pub struct BlobReadResult {
 /// The byte cap covers marked committed chunk files (including their fixed
 /// file headers) plus the incoming serialized file before its marker. Chunk
 /// and variant caps count all durable chunk-metadata and import rows, including
-/// unfinished staging; abandoned durable rows remain charged until a future
-/// explicit garbage-collection design removes them. Unmarked temporary or
-/// otherwise untracked filesystem allocation is outside these counters.
+/// unfinished staging; exact already-unreferenced durable rows remain charged
+/// until bounded manifest-backed maintenance reaches finalization. Unmarked
+/// temporary or otherwise untracked filesystem allocation is outside these
+/// counters.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SelectedBlobOptions {
     pub depot_limits: BlobDepotLimits,
@@ -761,9 +768,11 @@ impl SelectedBlobHandle {
     /// result only while that publisher and Store remain authorized and have
     /// not been zeroized. A failed or concurrently mutated source can leave
     /// bounded, quota-charged unfinished or completed-but-unpublished depot
-    /// staging without a semantic or operation row; this profile does not yet
-    /// garbage-collect that staging. An authorized publisher can therefore
-    /// exhaust the default 512-MiB depot with roughly eight maximum-size Blobs,
+    /// staging without a semantic or operation row. Bounded maintenance can
+    /// reclaim that exact already-unreferenced staging, but it remains charged
+    /// through finalization and provides no live-retirement or pressure-eviction
+    /// guarantee. An authorized publisher can therefore exhaust the default
+    /// 512-MiB depot with roughly eight maximum-size Blobs before cleanup, and
     /// before separately bounded carrier-prefix staging.
     /// Admitted file syscalls run on the joined blocking worker, so a hostile or
     /// delayed FUSE/NFS/other filesystem can delay rekey, shutdown, and
@@ -1138,6 +1147,7 @@ pub struct SelectedBlobNode {
     verifier: ReferenceEnvelopeSealer,
     verifier_head: Option<(u64, ControlTransferId)>,
     source_route_cache: Arc<AuthenticatedEventRouteCache>,
+    custody_clock: NodeCustodyClock,
     #[cfg(test)]
     final_read_gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
     #[cfg(test)]
@@ -1152,6 +1162,12 @@ pub struct SelectedBlobNode {
     live_poll_coherence_fault: bool,
     #[cfg(test)]
     live_poll_postcommit_completion_fault: bool,
+    #[cfg(test)]
+    capacity_gc_attempts: u64,
+    #[cfg(test)]
+    publish_attempts: u64,
+    #[cfg(test)]
+    last_live_publish_source_bytes_read: u64,
 }
 
 impl SelectedBlobNode {
@@ -1207,12 +1223,15 @@ impl SelectedBlobNode {
         let verifier_head = store
             .control_head()
             .map_err(|error| application_error("blob open", error.into()))?;
+        let custody_clock = NodeCustodyClock::open(verifier.identity())
+            .map_err(|error| application_error("blob open", error))?;
         let mut selected = Self {
             mission,
             store: Arc::new(store),
             verifier,
             verifier_head,
             source_route_cache,
+            custody_clock,
             #[cfg(test)]
             final_read_gate: None,
             #[cfg(test)]
@@ -1227,6 +1246,12 @@ impl SelectedBlobNode {
             live_poll_coherence_fault: false,
             #[cfg(test)]
             live_poll_postcommit_completion_fault: false,
+            #[cfg(test)]
+            capacity_gc_attempts: 0,
+            #[cfg(test)]
+            publish_attempts: 0,
+            #[cfg(test)]
+            last_live_publish_source_bytes_read: 0,
         };
         selected.current_policy("blob open")?;
         Ok(selected)
@@ -1238,6 +1263,7 @@ impl SelectedBlobNode {
         verifier: ReferenceEnvelopeSealer,
         verifier_head: Option<(u64, ControlTransferId)>,
         source_route_cache: Arc<AuthenticatedEventRouteCache>,
+        custody_clock: NodeCustodyClock,
     ) -> Self {
         Self {
             mission,
@@ -1245,6 +1271,7 @@ impl SelectedBlobNode {
             verifier,
             verifier_head,
             source_route_cache,
+            custody_clock,
             #[cfg(test)]
             final_read_gate: None,
             #[cfg(test)]
@@ -1259,6 +1286,12 @@ impl SelectedBlobNode {
             live_poll_coherence_fault: false,
             #[cfg(test)]
             live_poll_postcommit_completion_fault: false,
+            #[cfg(test)]
+            capacity_gc_attempts: 0,
+            #[cfg(test)]
+            publish_attempts: 0,
+            #[cfg(test)]
+            last_live_publish_source_bytes_read: 0,
         }
     }
 
@@ -1437,7 +1470,17 @@ impl SelectedBlobNode {
         request: BlobPublishRequest,
         source: &mut R,
     ) -> Result<BlobPublishResult, ApplicationError> {
-        self.publish_inner(request, source, None)
+        let retry_request = request.clone();
+        match self.publish_inner(request, source, None) {
+            Err(error) if error.is_recoverable_blob_depot_capacity() => {
+                self.run_capacity_gc_before_retry()?;
+                source
+                    .seek(std::io::SeekFrom::Start(0))
+                    .map_err(|error| application_error("blob publish", error.into()))?;
+                self.publish_inner(retry_request, source, None)
+            }
+            result => result,
+        }
     }
 
     /// Executes one live publication after accepting ownership of its file.
@@ -1513,7 +1556,41 @@ impl SelectedBlobNode {
             #[cfg(test)]
             total_bytes_read: 0,
         };
-        self.publish_inner(request, &mut source, Some(&mut context))
+        let retry_request = request.clone();
+        let result = match self.publish_inner(request, &mut source, Some(&mut context)) {
+            Err(error) if error.is_recoverable_blob_depot_capacity() => {
+                context.require_admission()?;
+                self.run_capacity_gc_before_retry()?;
+                context.require_admission()?;
+                source
+                    .seek(std::io::SeekFrom::Start(0))
+                    .map_err(|error| application_error("blob publish", error.into()))?;
+                self.publish_inner(retry_request, &mut source, Some(&mut context))
+            }
+            result => result,
+        };
+        #[cfg(test)]
+        {
+            self.last_live_publish_source_bytes_read = source.total_bytes_read;
+        }
+        result
+    }
+
+    fn run_capacity_gc_before_retry(&mut self) -> Result<(), ApplicationError> {
+        #[cfg(test)]
+        {
+            self.capacity_gc_attempts = self.capacity_gc_attempts.saturating_add(1);
+        }
+        let budget = BlobMaintenanceBudget::new(64, 16, 128 * 1024 * 1024)
+            .expect("selected capacity GC bounds are nonzero");
+        let sample = self
+            .custody_clock
+            .sample()
+            .map_err(|error| application_error("blob publish", error))?;
+        self.store
+            .run_blob_capacity_gc(budget, Some(sample))
+            .map(|_| ())
+            .map_err(|error| application_error("blob publish", error.into()))
     }
 
     fn publish_inner<R: Read + Seek>(
@@ -1522,6 +1599,10 @@ impl SelectedBlobNode {
         source: &mut R,
         mut live: Option<&mut LivePublishContext<'_>>,
     ) -> Result<BlobPublishResult, ApplicationError> {
+        #[cfg(test)]
+        {
+            self.publish_attempts = self.publish_attempts.saturating_add(1);
+        }
         let BlobPublishRequest {
             operation_key,
             topic,
@@ -2205,12 +2286,21 @@ impl SelectedBlobNode {
             .store
             .pending_blob_transfer_progress_with_policy(&policy)
             .map_err(|error| application_error("blob transfer status", error.into()))?;
-        self.map_transfer_status(snapshot)
+        let gc = self
+            .store
+            .blob_gc_status(Some(
+                self.custody_clock
+                    .sample()
+                    .map_err(|error| application_error("blob transfer status", error))?,
+            ))
+            .map_err(|error| application_error("blob transfer status", error.into()))?;
+        self.map_transfer_status(snapshot, gc)
     }
 
     fn map_transfer_status(
         &self,
         snapshot: StoreBlobTransferStatusSnapshot,
+        gc: BlobGcStatus,
     ) -> Result<BlobTransferStatus, ApplicationError> {
         let mut pending = Vec::with_capacity(snapshot.pending.len());
         for progress in snapshot.pending {
@@ -2249,6 +2339,7 @@ impl SelectedBlobNode {
             retained_pending_transfers: snapshot.stats.pending_sources,
             network_staging_bytes: snapshot.stats.network_staging_bytes,
             reserved_file_bytes: snapshot.stats.reserved_file_bytes,
+            gc,
             pending,
         })
     }
@@ -3422,30 +3513,53 @@ fn blob_prepare_error(error: BlobError) -> ApplicationError {
     }
 }
 
+fn blob_store_error_recoverable_capacity(error: &BlobStoreError) -> bool {
+    matches!(
+        error,
+        BlobStoreError::DepotByteLimitExceeded { .. }
+            | BlobStoreError::DepotChunkLimitExceeded { .. }
+            | BlobStoreError::DepotVariantLimitExceeded { .. }
+    )
+}
+
+fn blob_error_recoverable_capacity(error: &BlobError) -> bool {
+    let BlobError::Store(adapter) = error else {
+        return false;
+    };
+    adapter
+        .downcast_ref::<StoreError>()
+        .is_some_and(|error| matches!(error, StoreError::Blob(error) if blob_store_error_recoverable_capacity(error)))
+}
+
 fn live_blob_core_error(
     _store: &Store,
     error: BlobError,
     live: &mut Option<&mut LivePublishContext<'_>>,
 ) -> ApplicationError {
-    if let Some(context) = live.as_deref_mut()
-        && let BlobError::Store(adapter) = &error
-    {
+    if let BlobError::Store(adapter) = &error {
         // The core keeps the concrete adapter error as a typed source while
         // its public display remains sanitized. This preserves the exact
         // quota/conflict versus durable-coherence boundary even when a marked
         // target chunk fails during an otherwise opaque core operation.
         if let Some(store_error) = adapter.downcast_ref::<StoreError>() {
-            if live_blob_durable_coherence_error(store_error) {
+            if let Some(context) = live.as_deref_mut()
+                && live_blob_durable_coherence_error(store_error)
+            {
                 *context.fatal = Some(NodeError::FatalBlobCoherence(
                     "live Blob core adapter reported durable coherence loss".into(),
                 ));
                 return ApplicationError::new(ApplicationErrorKind::Integrity, "blob publish");
             }
+            if blob_error_recoverable_capacity(&error) {
+                return ApplicationError::recoverable_blob_depot_capacity("blob publish");
+            }
             return ApplicationError::new(store_error_kind(store_error), "blob publish");
         }
-        *context.fatal = Some(NodeError::FatalBlobCoherence(
-            "live Blob core adapter returned an unexpected error type".into(),
-        ));
+        if let Some(context) = live.as_deref_mut() {
+            *context.fatal = Some(NodeError::FatalBlobCoherence(
+                "live Blob core adapter returned an unexpected error type".into(),
+            ));
+        }
         return ApplicationError::new(ApplicationErrorKind::Integrity, "blob publish");
     }
     blob_core_error("blob publish", error)
@@ -3478,7 +3592,7 @@ fn blob_core_error(operation: &'static str, error: BlobError) -> ApplicationErro
 mod tests {
     use std::{
         fs,
-        io::Cursor,
+        io::{Cursor, SeekFrom},
         path::{Path, PathBuf},
         sync::atomic::{AtomicU64, Ordering},
     };
@@ -3713,12 +3827,71 @@ mod tests {
         (0..length).map(|index| (index % 251) as u8).collect()
     }
 
+    struct CountingCursor {
+        inner: Cursor<Vec<u8>>,
+        bytes_read: u64,
+    }
+
+    impl CountingCursor {
+        fn new(bytes: Vec<u8>) -> Self {
+            Self {
+                inner: Cursor::new(bytes),
+                bytes_read: 0,
+            }
+        }
+    }
+
+    impl Read for CountingCursor {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            let read = self.inner.read(output)?;
+            self.bytes_read = self
+                .bytes_read
+                .checked_add(u64::try_from(read).map_err(std::io::Error::other)?)
+                .ok_or_else(|| std::io::Error::other("test source byte count overflowed"))?;
+            Ok(read)
+        }
+    }
+
+    impl Seek for CountingCursor {
+        fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(position)
+        }
+    }
+
+    fn install_unreferenced_completed_variant(node: &SelectedBlobNode, plaintext: &[u8]) {
+        let metadata = CoreBlobMetadata::new(
+            Some("application/x-aster-test".into()),
+            b"schema/blob-v1".to_vec(),
+        )
+        .expect("unreferenced fixture metadata");
+        let mut first_pass = Cursor::new(plaintext);
+        let prepared = prepare_blob(&mut first_pass, SELECTED_BLOB_CHUNK_SIZE, metadata)
+            .expect("prepare unreferenced fixture");
+        let depot = node.store.blob_depot().expect("unreferenced fixture depot");
+        let mut service = node
+            .verifier
+            .blob_service_with_store(&blob_scope(), &blob_topic(), 1, depot)
+            .expect("unreferenced fixture service");
+        let manifest = service
+            .install_prepared(&prepared)
+            .expect("install unreferenced fixture");
+        let mut second_pass = Cursor::new(plaintext);
+        let progress = service
+            .encrypt_some(&mut second_pass, &manifest, prepared.chunk_count())
+            .expect("encrypt unreferenced fixture");
+        assert!(progress.complete);
+        service
+            .finish_manifest(&manifest)
+            .expect("finish unreferenced fixture");
+    }
+
     #[test]
     fn transfer_status_separates_retained_publications_from_pending_network_work() {
         // Break caught: treating accepted local publications as pending network
         // transfers gives operators a permanently nonzero transfer backlog.
         let root = TestRoot::new("transfer-status-local");
         let mut node = selected_node(&root);
+        let limits = node.store.blob_lifecycle_limits();
         assert_eq!(
             node.transfer_status().expect("empty Blob transfer status"),
             BlobTransferStatus {
@@ -3726,6 +3899,14 @@ mod tests {
                 retained_pending_transfers: 0,
                 network_staging_bytes: 0,
                 reserved_file_bytes: 0,
+                gc: BlobGcStatus {
+                    lineage_fence_row_cap: limits.max_lineage_rows(),
+                    lineage_fence_byte_cap: limits.max_lineage_bytes(),
+                    replay_fence_row_cap: limits.max_replay_rows(),
+                    replay_fence_byte_cap: limits.max_replay_bytes(),
+                    publication_lifecycle_row_cap: limits.max_publication_rows(),
+                    ..BlobGcStatus::default()
+                },
                 pending: Vec::new(),
             }
         );
@@ -3743,6 +3924,23 @@ mod tests {
         assert_eq!(status.network_staging_bytes, 0);
         assert!(status.reserved_file_bytes > 0);
         assert!(status.pending.is_empty());
+    }
+
+    #[test]
+    fn blob_gc_status_reports_security_fence_and_publication_lifecycle_usage_and_caps() {
+        // Break caught: the application status projection must retain the
+        // store's security-authority usage and configured caps verbatim.
+        let root = TestRoot::new("application-gc-status-security-capacity");
+        let mut node = selected_node(&root);
+        let status = node.transfer_status().expect("Blob GC transfer status");
+        let limits = node.store.blob_lifecycle_limits();
+        assert_eq!(status.gc.lineage_fence_row_cap, limits.max_lineage_rows());
+        assert_eq!(status.gc.replay_fence_row_cap, limits.max_replay_rows());
+        assert_eq!(
+            status.gc.publication_lifecycle_row_cap,
+            limits.max_publication_rows()
+        );
+        assert_eq!(status.gc.last_failure, None);
     }
 
     #[test]
@@ -4593,6 +4791,118 @@ mod tests {
     }
 
     #[test]
+    fn blob_capacity_failure_runs_bounded_gc_then_retries_admission_once() {
+        // Break caught: stopped and live publication must preserve the exact
+        // depot-capacity cause, reclaim a real abandoned completed variant,
+        // and perform exactly one fresh preparation/admission retry.
+        for live in [false, true] {
+            let root = TestRoot::new(if live {
+                "live-capacity-gc-success"
+            } else {
+                "stopped-capacity-gc-success"
+            });
+            persist_member_mission(&root);
+            let mut node = SelectedBlobNode::open_unprotected_reference_with_options(
+                root.path(),
+                root.mission_path(),
+                SelectedBlobOptions {
+                    depot_limits: BlobDepotLimits::new(1_000_000, 4, 1)
+                        .expect("one-variant depot limits"),
+                },
+            )
+            .expect("open capacity retry node");
+            install_unreferenced_completed_variant(&node, &[0x59; 128]);
+            let plaintext = vec![0x5a; 129];
+
+            if live {
+                let source_path = root.path().join("live-capacity-gc-success.bin");
+                fs::write(&source_path, &plaintext).expect("write live capacity retry source");
+                node.publish_live(
+                    request(b"blob/live-capacity-gc-success"),
+                    fs::File::open(source_path).expect("open live capacity retry source"),
+                )
+                .expect("live publication succeeds after exact reclamation");
+                assert_eq!(
+                    node.last_live_publish_source_bytes_read,
+                    3 * u64::try_from(plaintext.len()).expect("source length"),
+                    "failed preparation plus successful preparation/encryption is exactly three passes",
+                );
+            } else {
+                let mut source = CountingCursor::new(plaintext.clone());
+                node.publish(request(b"blob/stopped-capacity-gc-success"), &mut source)
+                    .expect("stopped publication succeeds after exact reclamation");
+                assert_eq!(
+                    source.bytes_read,
+                    3 * u64::try_from(plaintext.len()).expect("source length"),
+                    "failed preparation plus successful preparation/encryption is exactly three passes",
+                );
+            }
+            assert_eq!(node.capacity_gc_attempts, 1);
+            assert_eq!(node.publish_attempts, 2);
+            let stats = node.store.blob_stats().expect("post-retry Blob stats");
+            assert_eq!(stats.publications, 1);
+            assert_eq!(stats.variants, 1);
+        }
+    }
+
+    #[test]
+    fn blob_unrecoverable_depot_capacity_retries_once_without_extra_source_pass() {
+        // Break caught: eligible but unsatisfiable depot pressure must stop
+        // after one targeted attempt and one admission retry.
+        for live in [false, true] {
+            let root = TestRoot::new(if live {
+                "live-capacity-gc-unsatisfied"
+            } else {
+                "stopped-capacity-gc-unsatisfied"
+            });
+            persist_member_mission(&root);
+            let mut node = SelectedBlobNode::open_unprotected_reference_with_options(
+                root.path(),
+                root.mission_path(),
+                SelectedBlobOptions {
+                    depot_limits: BlobDepotLimits::new(1, 4, 1).expect("tiny depot limits"),
+                },
+            )
+            .expect("open unsatisfied capacity node");
+            let plaintext = vec![0x5b; 128];
+
+            let error = if live {
+                let source_path = root.path().join("live-capacity-gc-unsatisfied.bin");
+                fs::write(&source_path, &plaintext).expect("write live unsatisfied source");
+                let error = node
+                    .publish_live(
+                        request(b"blob/live-capacity-gc-unsatisfied"),
+                        fs::File::open(source_path).expect("open live unsatisfied source"),
+                    )
+                    .expect_err("live tiny depot remains exhausted");
+                assert_eq!(
+                    node.last_live_publish_source_bytes_read,
+                    4 * u64::try_from(plaintext.len()).expect("source length"),
+                    "two failed attempts perform exactly prepare/encrypt and no third source pass",
+                );
+                error
+            } else {
+                let mut source = CountingCursor::new(plaintext.clone());
+                let error = node
+                    .publish(
+                        request(b"blob/stopped-capacity-gc-unsatisfied"),
+                        &mut source,
+                    )
+                    .expect_err("stopped tiny depot remains exhausted");
+                assert_eq!(
+                    source.bytes_read,
+                    4 * u64::try_from(plaintext.len()).expect("source length"),
+                    "two failed attempts perform exactly prepare/encrypt and no third source pass",
+                );
+                error
+            };
+            assert_eq!(error.kind(), ApplicationErrorKind::ResourceLimit);
+            assert_eq!(node.capacity_gc_attempts, 1);
+            assert_eq!(node.publish_attempts, 2);
+        }
+    }
+
+    #[test]
     fn live_blob_orphan_preflights_are_actor_fatal_but_absence_is_ordinary() {
         let publish_root = TestRoot::new("live-orphan-operation");
         let source_path = publish_root.path().join("source.bin");
@@ -5165,6 +5475,110 @@ mod tests {
             blob_core_error("blob publish", BlobError::InvalidManifest).kind(),
             ApplicationErrorKind::Integrity
         );
+    }
+
+    #[test]
+    fn blob_capacity_gc_classifier_accepts_only_recoverable_depot_limits() {
+        // Break caught: sanitized ResourceLimit is broader than physical depot
+        // exhaustion and must never authorize targeted GC by itself.
+        for error in [
+            BlobStoreError::DepotByteLimitExceeded {
+                current: 10,
+                incoming: 1,
+                limit: 10,
+            },
+            BlobStoreError::DepotChunkLimitExceeded {
+                current: 10,
+                limit: 10,
+            },
+            BlobStoreError::DepotVariantLimitExceeded {
+                current: 10,
+                limit: 10,
+            },
+        ] {
+            assert!(blob_store_error_recoverable_capacity(&error));
+        }
+
+        for error in [
+            BlobStoreError::PublicationLimitExceeded {
+                current: 1,
+                limit: 1,
+            },
+            BlobStoreError::CausalFrontierLimitExceeded {
+                current: 1,
+                limit: 1,
+            },
+            BlobStoreError::OperationLimitExceeded {
+                current: 1,
+                limit: 1,
+            },
+            BlobStoreError::OperationByteLimitExceeded {
+                current: 1,
+                incoming: 1,
+                limit: 1,
+            },
+            BlobStoreError::LineageFenceCapacity {
+                required_rows: 2,
+                required_bytes: 2,
+                max_rows: 1,
+                max_bytes: 1,
+            },
+            BlobStoreError::ReplayFenceCapacity {
+                required_rows: 2,
+                required_bytes: 2,
+                max_rows: 1,
+                max_bytes: 1,
+            },
+            BlobStoreError::PublicationLifecycleCapacity {
+                required_rows: 2,
+                max_rows: 1,
+            },
+            BlobStoreError::NetworkBlobTooLarge {
+                total_len: 2,
+                chunk_count: 2,
+            },
+            BlobStoreError::NetworkSourceTooLarge {
+                sealed_len: 2,
+                limit: 1,
+            },
+            BlobStoreError::NetworkStagingRowLimitExceeded {
+                current: 1,
+                incoming: 1,
+                limit: 1,
+            },
+            BlobStoreError::NetworkStagingByteLimitExceeded {
+                current: 1,
+                incoming: 1,
+                limit: 1,
+            },
+            BlobStoreError::LeaseCapacity,
+        ] {
+            assert!(!blob_store_error_recoverable_capacity(&error));
+        }
+
+        for error in [
+            BlobError::InvalidManifest,
+            BlobError::LengthOverflow,
+            BlobError::Io(std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                "test length limit",
+            )),
+            BlobError::Store(Box::new(StoreError::Blob(
+                BlobStoreError::PublicationLimitExceeded {
+                    current: 1,
+                    limit: 1,
+                },
+            ))),
+        ] {
+            assert!(!blob_error_recoverable_capacity(&error));
+        }
+        assert!(blob_error_recoverable_capacity(&BlobError::Store(
+            Box::new(StoreError::Blob(BlobStoreError::DepotByteLimitExceeded {
+                current: 10,
+                incoming: 1,
+                limit: 10,
+            }))
+        )));
     }
 
     #[test]

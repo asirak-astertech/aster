@@ -55,8 +55,6 @@ use aster_negentropy::{
     MAX_ROUND_LIMIT, ReconciliationError, ReconciliationLimits, Responder,
 };
 use aster_profile::{InventorySnapshot, ItemId};
-#[cfg(test)]
-use aster_redb_store::BlobMaintenanceClass;
 use aster_redb_store::{
     ApplyOutcome, BlobCarrierAppendOutcome, BlobCarrierCommitOutcome, BlobCarrierFetchCursor,
     BlobCarrierObjectId, BlobCarrierPrefixStatus, BlobDepotCompletion, BlobDepotLimits,
@@ -13154,6 +13152,7 @@ fn blob_maintenance_runtime_budget() -> BlobMaintenanceBudget {
 fn spawn_blob_maintenance_turn_background(
     store: Arc<Store>,
     budget: BlobMaintenanceBudget,
+    custody_sample: Option<CustodySample>,
     #[cfg(all(test, unix))] gate: Option<BlobMaintenanceTestGate>,
 ) -> JoinHandle<Result<BlobMaintenanceProgress, NodeError>> {
     tokio::task::spawn_blocking(move || {
@@ -13162,7 +13161,7 @@ fn spawn_blob_maintenance_turn_background(
             gate.enter();
         }
         store
-            .run_blob_maintenance_turn(budget)
+            .run_blob_maintenance_turn_with_sample(budget, custody_sample)
             .map_err(NodeError::from)
     })
 }
@@ -13180,17 +13179,30 @@ fn finish_blob_maintenance_turn_background(
 async fn run_blob_maintenance_turn_background(
     store: Arc<Store>,
     budget: BlobMaintenanceBudget,
-    #[cfg(all(test, unix))] gate: Option<BlobMaintenanceTestGate>,
+    custody_sample: Option<CustodySample>,
+    #[cfg(all(test, unix))] startup_gate: Option<BlobMaintenanceTestGate>,
 ) -> Result<BlobMaintenanceProgress, NodeError> {
-    finish_blob_maintenance_turn_background(
+    #[cfg(all(test, unix))]
+    if let Some(gate) = startup_gate.as_ref() {
+        gate.observe_startup_page_entry();
+    }
+    let result = finish_blob_maintenance_turn_background(
         spawn_blob_maintenance_turn_background(
             store,
             budget,
+            custody_sample,
             #[cfg(all(test, unix))]
-            gate,
+            None,
         )
         .await,
-    )
+    );
+    #[cfg(all(test, unix))]
+    if result.is_ok()
+        && let Some(gate) = startup_gate.as_ref()
+    {
+        gate.observe_startup_page_completion();
+    }
+    result
 }
 
 async fn run_selected_blob_worker(
@@ -13198,6 +13210,7 @@ async fn run_selected_blob_worker(
     mut commands: mpsc::Receiver<BlobWorkerCommand>,
     admission: Arc<AtomicBool>,
     inject_fatal_on_shutdown: bool,
+    #[cfg(all(test, unix))] test_gate: Option<BlobMaintenanceTestGate>,
 ) -> Result<(), NodeError> {
     // `execute_live` owns a caller-provided `std::fs::File`. Admission is
     // checked at bounded Blob-engine checkpoints, but Rust cannot preempt a
@@ -13213,6 +13226,10 @@ async fn run_selected_blob_worker(
         if !admission.load(Ordering::Acquire) {
             command.reject();
             continue;
+        }
+        #[cfg(all(test, unix))]
+        if let Some(gate) = test_gate.as_ref() {
+            gate.enter_worker().await;
         }
         // A queued Blob command carries no actor policy guard. The facade
         // replays the latest policy immediately before durable work and
@@ -13737,6 +13754,13 @@ struct BlobMaintenanceTestGate {
     first_reached: Arc<std::sync::Barrier>,
     first_release: Arc<std::sync::Barrier>,
     schedule_observations: Option<mpsc::UnboundedSender<BlobMaintenanceScheduleObservation>>,
+    block_periodic: bool,
+    startup_page_entries: Arc<std::sync::atomic::AtomicUsize>,
+    startup_pages: Arc<std::sync::atomic::AtomicUsize>,
+    startup_before_worker: Arc<AtomicBool>,
+    worker_constructed: Arc<AtomicBool>,
+    worker_reached: Option<mpsc::UnboundedSender<()>>,
+    worker_release: Option<Arc<tokio::sync::Notify>>,
 }
 
 #[cfg(all(test, unix))]
@@ -13762,9 +13786,33 @@ impl BlobMaintenanceTestGate {
     }
 
     fn enter(&self) {
-        if self.starts.fetch_add(1, Ordering::AcqRel) == 0 {
+        if self.starts.fetch_add(1, Ordering::AcqRel) == 0 && self.block_periodic {
             self.first_reached.wait();
             self.first_release.wait();
+        }
+    }
+
+    fn observe_startup_page_entry(&self) {
+        self.startup_page_entries.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn observe_startup_page_completion(&self) {
+        self.startup_pages.fetch_add(1, Ordering::AcqRel);
+        if !self.worker_constructed.load(Ordering::Acquire) {
+            self.startup_before_worker.store(true, Ordering::Release);
+        }
+    }
+
+    fn observe_worker_constructed(&self) {
+        self.worker_constructed.store(true, Ordering::Release);
+    }
+
+    async fn enter_worker(&self) {
+        if let Some(reached) = self.worker_reached.as_ref() {
+            let _ = reached.send(());
+        }
+        if let Some(release) = self.worker_release.as_ref() {
+            release.notified().await;
         }
     }
 }
@@ -14256,13 +14304,25 @@ async fn run_node_actor_inner(
         let store_identity = local_store_identity(&store_path)?;
         require_store_backing_identity(store.backing_identity(), store_identity)?;
     }
+    // Mission identity is available before any runtime maintenance. Reuse this
+    // one clock domain for Blob deletion age and later custody maintenance.
+    let custody_clock = NodeCustodyClock::open(config.mission.identity())?;
+    #[cfg(all(test, unix))]
+    let custody_clock = test_control
+        .as_ref()
+        .and_then(|control| control.event_operation_audit.as_ref())
+        .and_then(|control| control.custody_clock.clone())
+        .unwrap_or(custody_clock);
     // The writable open above completed the strict startup audit. Run exactly
     // one persisted bounded turn before the Blob command worker exists.
     run_blob_maintenance_turn_background(
         store.clone(),
         blob_maintenance_runtime_budget(),
+        Some(custody_clock.sample()?),
         #[cfg(all(test, unix))]
-        None,
+        test_control
+            .as_ref()
+            .and_then(|control| control.blob_maintenance_gate.clone()),
     )
     .await?;
     let (event_bridge, bridge_initialization) = match forwarding.event_bridge.clone() {
@@ -14327,13 +14387,6 @@ async fn run_node_actor_inner(
     let global_custody_quota =
         CustodyQuota::for_store_limits(forwarding.store_limits()).map_err(StoreError::from)?;
     store.replace_custody_quotas(global_custody_quota, forwarding.scope_quotas())?;
-    let custody_clock = NodeCustodyClock::open(application_sealer.identity())?;
-    #[cfg(all(test, unix))]
-    let custody_clock = test_control
-        .as_ref()
-        .and_then(|control| control.event_operation_audit.as_ref())
-        .and_then(|control| control.custody_clock.clone())
-        .unwrap_or(custody_clock);
     drive_custody_maintenance(&store, &custody_clock, forwarding.scope_quotas())?;
     prune_authenticated_event_route_cache_to_sender_projection(
         &store,
@@ -14373,6 +14426,7 @@ async fn run_node_actor_inner(
         blob_application_sealer,
         application_control_head,
         event_route_cache.clone(),
+        custody_clock.clone(),
     );
     let initial_status_metrics = SelectedEventStoreMetrics::read(&store)?;
     let identity = NodeIdentity::load_or_create(&config.state)?;
@@ -14679,11 +14733,17 @@ async fn run_node_actor_inner(
     let mut zeroization_task = None::<tokio::task::JoinHandle<()>>;
 
     let blob_operational_priority = BlobOperationalPriorityGate::default();
+    #[cfg(all(test, unix))]
+    if let Some(gate) = blob_maintenance_gate.as_ref() {
+        gate.observe_worker_constructed();
+    }
     let (blob_worker_channel, blob_worker_receiver) = mpsc::channel(BLOB_WORKER_CAPACITY);
     let blob_worker_sender = BlobWorkerSender {
         sender: blob_worker_channel,
         priority: blob_operational_priority.clone(),
     };
+    #[cfg(all(test, unix))]
+    let blob_worker_test_gate = blob_maintenance_gate.clone();
     let (blob_worker_completion_sender, mut blob_worker_completion_receiver) = oneshot::channel();
     let blob_worker_task = {
         let admission = application_admission.clone();
@@ -14693,6 +14753,8 @@ async fn run_node_actor_inner(
                 blob_worker_receiver,
                 admission,
                 blob_worker_fatal_on_shutdown,
+                #[cfg(all(test, unix))]
+                blob_worker_test_gate,
             )
             .await;
             let _ = blob_worker_completion_sender.send(result);
@@ -15285,9 +15347,17 @@ async fn run_node_actor_inner(
                     application_receive_held_for_maintenance_test = false;
                 }
                 if start_blob_maintenance {
+                    let custody_sample = match custody_clock.sample() {
+                        Ok(sample) => sample,
+                        Err(error) => {
+                            fatal_error = Some(error);
+                            break;
+                        }
+                    };
                     blob_maintenance_task = Some(spawn_blob_maintenance_turn_background(
                         store.clone(),
                         blob_maintenance_runtime_budget(),
+                        Some(custody_sample),
                         #[cfg(all(test, unix))]
                         blob_maintenance_gate.clone(),
                     ));
@@ -28366,7 +28436,7 @@ mod tests {
     use std::sync::{Barrier, mpsc as std_mpsc};
 
     use super::*;
-    use crate::application::{RecordProjection, StateProjection};
+    use crate::application::{BlobSubscriptionRequest, RecordProjection, StateProjection};
     use crate::bridge_runtime::SelectedEventBridgeEdge;
     use crate::mission::initiate_over_iroh;
     use aster_mesh::{
@@ -28403,42 +28473,103 @@ mod tests {
         assert_eq!(gate.outstanding(), 0);
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn blob_maintenance_runtime_turn_uses_one_bounded_background_page() {
-        // Break caught: runtime maintenance must use the bounded Store turn
-        // from blocking-worker context instead of entering the Blob command
-        // worker or running an unbounded sweep on the async scheduler.
-        let state = root("blob-maintenance-background-turn");
-        fs::create_dir_all(&state).expect("maintenance runtime state");
-        let store = Arc::new(
-            Store::open(state.join("maintenance.redb")).expect("maintenance runtime store"),
-        );
-        let budget =
-            BlobMaintenanceBudget::new(3, 1, 2 * 1024 * 1024).expect("runtime maintenance budget");
-        let first = run_blob_maintenance_turn_background(store.clone(), budget, None)
+    async fn blob_gc_startup_runs_at_most_one_bounded_page() {
+        // Break caught: the real actor startup must complete exactly one
+        // bounded page before constructing the Blob command worker.
+        let state = root("blob-maintenance-real-startup-order");
+        let mission = test_mission();
+        let (_application_sender, application_receiver) =
+            mpsc::channel(APPLICATION_COMMAND_CAPACITY);
+        let application_admission = Arc::new(AtomicBool::new(true));
+        let (_control_sender, control_receiver) = mpsc::channel(CONTROL_COMMAND_CAPACITY);
+        let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
+        let (ready_sender, ready_receiver) = oneshot::channel();
+        let (before_loop_ready, before_loop_reached) = oneshot::channel();
+        let (before_loop_release, release_loop) = oneshot::channel();
+        let (zeroization_queued, _zeroization_observer) = oneshot::channel();
+        let startup_page_entries = Arc::new(AtomicUsize::new(0));
+        let startup_pages = Arc::new(AtomicUsize::new(0));
+        let startup_before_worker = Arc::new(AtomicBool::new(false));
+        let worker_constructed = Arc::new(AtomicBool::new(false));
+        let gate = BlobMaintenanceTestGate {
+            starts: Arc::new(AtomicUsize::new(0)),
+            first_reached: Arc::new(Barrier::new(1)),
+            first_release: Arc::new(Barrier::new(1)),
+            schedule_observations: None,
+            block_periodic: false,
+            startup_page_entries: startup_page_entries.clone(),
+            startup_pages: startup_pages.clone(),
+            startup_before_worker: startup_before_worker.clone(),
+            worker_constructed: worker_constructed.clone(),
+            worker_reached: None,
+            worker_release: None,
+        };
+        let actor = tokio::spawn(run_node_actor_inner(
+            NodeConfig {
+                state: state.clone(),
+                bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                mission,
+                peers: Vec::new(),
+                mutable_interests: Default::default(),
+                sync_interval: Duration::from_secs(60),
+                run_for: None,
+                application: NodeApplication::Relay,
+            },
+            SelectedForwardingConfig::default(),
+            Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+            NodeActorChannels {
+                handle_sigint: false,
+                application_receiver,
+                application_admission,
+                control_receiver,
+                shutdown_receiver,
+                ready: ready_sender,
+                contact_activity: Arc::new(ContactActivityProbe::default()),
+                test_control: Some(RunNodeActorTestControl {
+                    event_operation_audit: None,
+                    before_loop_ready,
+                    before_loop_release: release_loop,
+                    zeroization_queued,
+                    blob_worker_fatal_on_shutdown: false,
+                    blob_maintenance_gate: Some(gate),
+                    blob_final_read_gate: None,
+                    event_group_execution_gate: None,
+                    outbound_contact: None,
+                    contact_lifecycle: None,
+                    initial_peer_contact_activity: Vec::new(),
+                }),
+            },
+        ));
+        match timeout(Duration::from_secs(10), ready_receiver)
             .await
-            .expect("first runtime maintenance turn");
-        let second = run_blob_maintenance_turn_background(store, budget, None)
-            .await
-            .expect("second runtime maintenance turn");
-        assert_eq!(
-            [first.class, second.class],
-            [
-                BlobMaintenanceClass::ExpiredPublicationsAndPendingSources,
-                BlobMaintenanceClass::InvalidPendingWork,
-            ]
-        );
-        for progress in [first, second] {
-            assert!(progress.rows_examined <= budget.rows());
-            assert!(progress.files_examined <= budget.files());
-            assert!(progress.bytes_examined <= budget.bytes());
+            .expect("startup readiness deadline")
+        {
+            Ok(_) => {}
+            Err(error) => panic!(
+                "startup readiness failed ({error}); actor={:?}",
+                actor.await
+            ),
         }
+        before_loop_reached.await.expect("startup loop gate");
+        assert_eq!(startup_page_entries.load(Ordering::Acquire), 1);
+        assert_eq!(startup_pages.load(Ordering::Acquire), 1);
+        assert!(startup_before_worker.load(Ordering::Acquire));
+        assert!(worker_constructed.load(Ordering::Acquire));
+        shutdown_sender.try_send(()).expect("startup shutdown");
+        before_loop_release.send(()).expect("release startup actor");
+        timeout(Duration::from_secs(10), actor)
+            .await
+            .expect("startup actor shutdown deadline")
+            .expect("startup actor task")
+            .expect("startup actor shutdown");
         fs::remove_dir_all(state).expect("maintenance runtime cleanup");
     }
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn blob_maintenance_periodic_turn_does_not_block_actor_or_duplicate_work() {
+    async fn blob_gc_yields_to_operational_priority_gate() {
         // Break caught: a slow periodic maintenance page must not hold the
         // actor select branch (or its policy lease) while operational work is
         // queued, and a later tick must not launch a second page concurrently.
@@ -28449,7 +28580,7 @@ mod tests {
         let (application_sender, application_receiver) =
             mpsc::channel(APPLICATION_COMMAND_CAPACITY);
         let application_admission = Arc::new(AtomicBool::new(true));
-        let selected = SelectedEventHandle::new(
+        let selected = SelectedBlobHandle::new(
             application_sender.clone(),
             application_admission.clone(),
             identity,
@@ -28465,6 +28596,8 @@ mod tests {
         let first_reached = Arc::new(Barrier::new(2));
         let first_release = Arc::new(Barrier::new(2));
         let (schedule_sender, mut schedule_receiver) = mpsc::unbounded_channel();
+        let (worker_reached_sender, mut worker_reached_receiver) = mpsc::unbounded_channel();
+        let worker_release = Arc::new(tokio::sync::Notify::new());
         let mut actor = tokio::spawn(run_node_actor_inner(
             NodeConfig {
                 state: state.clone(),
@@ -28497,6 +28630,13 @@ mod tests {
                         first_reached: first_reached.clone(),
                         first_release: first_release.clone(),
                         schedule_observations: Some(schedule_sender),
+                        block_periodic: true,
+                        startup_page_entries: Arc::new(AtomicUsize::new(0)),
+                        startup_pages: Arc::new(AtomicUsize::new(0)),
+                        startup_before_worker: Arc::new(AtomicBool::new(false)),
+                        worker_constructed: Arc::new(AtomicBool::new(false)),
+                        worker_reached: Some(worker_reached_sender),
+                        worker_release: Some(worker_release.clone()),
                     }),
                     blob_final_read_gate: None,
                     event_group_execution_gate: None,
@@ -28520,32 +28660,48 @@ mod tests {
             .await
             .expect("maintenance actor loop-gate deadline")
             .expect("maintenance actor loop gate");
-        let (mutation_response, mutation_received) = oneshot::channel();
-        application_sender
-            .try_send(SelectedApplicationCommand::Event(
-                SelectedEventCommand::Publish {
-                    request: EventPublishRequest {
-                        operation_key: b"maintenance-priority-event".to_vec(),
-                        predecessor: None,
-                        topic: Topic::new("opaque").expect("priority event topic"),
-                        scope: Scope::new("test/runtime").expect("priority event scope"),
-                        priority: Priority::Priority,
-                        logical_key: b"maintenance-priority-event".to_vec(),
-                        payload: b"operational mutation precedes maintenance".to_vec(),
-                        tombstone: false,
-                    },
-                    options: EventPublishOptions::durable(),
-                    response: mutation_response,
-                },
-            ))
-            .expect("prequeue operational mutation");
+        let mut blob_operation = tokio::spawn(async move {
+            selected
+                .subscribe(BlobSubscriptionRequest {
+                    operation_key: b"maintenance-priority-blob".to_vec(),
+                    topic: Topic::new("opaque").expect("priority Blob topic"),
+                    scope: Scope::new("test/runtime").expect("priority Blob scope"),
+                    include_descendant_scopes: false,
+                })
+                .await
+        });
         before_loop_release
             .send(())
             .expect("release maintenance actor loop");
-        let first_schedule = timeout(Duration::from_secs(10), schedule_receiver.recv())
+        timeout(Duration::from_secs(10), worker_reached_receiver.recv())
             .await
-            .expect("maintenance schedule observation deadline")
-            .expect("maintenance schedule observation");
+            .expect("Blob worker permit deadline")
+            .expect("Blob worker permit observation");
+        let first_schedule = timeout(Duration::from_secs(10), async {
+            loop {
+                let observation = schedule_receiver
+                    .recv()
+                    .await
+                    .expect("maintenance schedule observation");
+                if matches!(
+                    observation,
+                    BlobMaintenanceScheduleObservation::Deferred {
+                        blob_outstanding: 1,
+                        ..
+                    }
+                ) {
+                    break observation;
+                }
+            }
+        })
+        .await
+        .expect("Blob-priority schedule observation deadline");
+        assert_eq!(starts.load(Ordering::Acquire), 0);
+        worker_release.notify_one();
+        let mutation_result = timeout(Duration::from_secs(10), &mut blob_operation)
+            .await
+            .expect("Blob operation response deadline")
+            .expect("Blob operation task");
         let reached = first_reached.clone();
         timeout(
             Duration::from_secs(10),
@@ -28555,9 +28711,6 @@ mod tests {
         .expect("periodic maintenance reaches blocking gate")
         .expect("maintenance gate waiter");
 
-        let mut status = tokio::spawn(async move { selected.status().await });
-        let status_while_blocked = timeout(Duration::from_secs(1), &mut status).await;
-        let status_completed = matches!(status_while_blocked, Ok(Ok(Ok(_))));
         shutdown_sender
             .try_send(())
             .expect("queue shutdown while maintenance remains blocked");
@@ -28569,27 +28722,15 @@ mod tests {
         .await
         .is_ok();
         let starts_while_blocked = starts.load(Ordering::Acquire);
-        let mutation_result = timeout(Duration::from_secs(10), mutation_received)
-            .await
-            .expect("operational mutation response deadline")
-            .expect("operational mutation response channel");
-
         let release = first_release.clone();
         tokio::task::spawn_blocking(move || release.wait())
             .await
             .expect("release periodic maintenance");
-        if !status.is_finished() {
-            let _ = status.await;
-        }
         timeout(Duration::from_secs(10), actor)
             .await
             .expect("maintenance actor shutdown deadline")
             .expect("maintenance actor task")
             .expect("maintenance actor shutdown");
-        assert!(
-            status_completed,
-            "application status was not serviced while maintenance was blocked"
-        );
         assert!(
             shutdown_observed,
             "shutdown was not observed while maintenance was blocked"
@@ -28602,10 +28743,10 @@ mod tests {
         assert_eq!(
             first_schedule,
             BlobMaintenanceScheduleObservation::Deferred {
-                queued_application: true,
-                blob_outstanding: 0,
+                queued_application: false,
+                blob_outstanding: 1,
             },
-            "periodic maintenance did not yield to a queued durable mutation"
+            "periodic maintenance did not yield to an outstanding Blob worker permit"
         );
         fs::remove_dir_all(state).expect("maintenance responsiveness cleanup");
     }

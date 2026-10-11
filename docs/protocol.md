@@ -908,22 +908,29 @@ is capped at 16 rows, one file, and 2 MiB. It runs once after startup audit and
 thereafter at most once in the background per periodic actor turn, after
 operational work has had an opportunity to run.
 
-This maintenance surface is deliberately non-destructive. Discovery of an
-unreferenced staging or completed variant returns a candidate, keeps it
-revisitable, and waits for a later handler; current turns inspect zero files and
-delete no durable row or depot artifact. Retention/retirement expiry, physical
-reclamation or deletion manifests, pressure eviction, and finite Blob TTL are
-not part of this increment. There is no public garbage-collection operation.
+For an exact staging or completed variant with no durable reference or active
+lease, maintenance first persists a deletion manifest and only then removes the
+import and chunk rows it captured. Bounded descriptor-relative physical units
+resume after restart, reconcile ambiguous filesystem state, and retain the
+variant's full accounting charge until finalization. Runtime startup executes
+one bounded page before Blob commands; periodic pages remain behind operational
+priority and yield between filesystem units. Capacity admission can perform one
+separately bounded, cursor-neutral pass over this already-unreferenced work and
+retry once. It never selects a live candidate. Live retirement,
+retention/retirement expiry, pressure eviction, and finite Blob TTL are not part
+of this increment. No garbage-collection operation is selected into the
+application/protocol surface or exposed as an end-user API; the store's
+doc-hidden bounded maintenance methods remain an internal integration seam.
 
 `Normal` and every `AtLeast(priority)` run Blob source and carrier work because
 `AtLeast` filters Event emission only. `ReceiveOnly` initiates, requests,
 advertises, sends, accepts, reserves, and counts zero selected Blob work. This
 separate selected application layer has a durable metadata-only publication
 queue, but it does not alter this wire path or its configured interests. The
-selected profile defines no route-only Blob relay or custody, Blob TTL, expiry,
-or garbage collection, or metadata-independent whole-byte identity or
-deduplication. These selected behaviors do not establish large-file,
-physical-carrier, mixed-implementation, or release acceptance.
+selected profile defines no route-only Blob relay or custody, Blob TTL or
+retention expiry, live retirement, pressure eviction, or metadata-independent
+whole-byte identity or deduplication. These selected behaviors do not establish
+large-file, physical-carrier, mixed-implementation, or release acceptance.
 
 The reference driver can initiate an exchange and can answer one through its
 responder-with-start path, so its in-memory authenticated flow is bidirectional.

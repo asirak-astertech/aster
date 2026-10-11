@@ -50,6 +50,9 @@ const DELETION_METADATA_FIELDS: [&str; 12] = [
 const MANIFEST_VERSION: u8 = 1;
 const CHUNK_VERSION: u8 = 1;
 const CONTINUITY_VERSION: u8 = 1;
+const PREVIOUS_CONTINUITY_STATE_VERSION: u8 = 2;
+const PENDING_CONTINUITY_STATE_VERSION: u8 = 3;
+const CONTINUITY_STATE_VERSION: u8 = 4;
 const CONTINUITY_KEY: u8 = 0;
 const MAX_LINEAGE_FENCE_EVIDENCE_BYTES: usize = 256;
 const MAX_IMPORT_EVIDENCE_BYTES: usize = 1024 * 1024;
@@ -241,9 +244,21 @@ impl BlobDeletionRetry {
     fn validate(self) -> Result<(), StoreError> {
         match self.category {
             None if self.attempts == 0 && self.next_retry_turn == 0 => Ok(()),
-            Some(_) if self.attempts != 0 && self.next_retry_turn != 0 => Ok(()),
+            Some(_)
+                if self.attempts != 0
+                    && self.next_retry_turn != 0
+                    && self.failure_turn().is_some() =>
+            {
+                Ok(())
+            }
             _ => Err(invariant("Blob deletion retry state is not canonical")),
         }
+    }
+
+    pub(crate) fn failure_turn(self) -> Option<u64> {
+        let exponent = self.attempts.checked_sub(1)?.min(6);
+        self.next_retry_turn
+            .checked_sub(1u64.checked_shl(exponent)?)
     }
 
     /// Returns the next durable retry checkpoint using bounded exponential
@@ -285,6 +300,7 @@ impl BlobDeletionAge {
     fn validate(self) -> Result<(), StoreError> {
         match self.checkpoint {
             None if self.continuity_generation == 0 => Ok(()),
+            None if self.continuity_lost => Ok(()),
             Some(_) if self.continuity_generation != 0 => Ok(()),
             _ => Err(invariant("Blob deletion age checkpoint is not canonical")),
         }
@@ -295,6 +311,41 @@ impl BlobDeletionAge {
 pub(crate) struct BlobDeletionContinuity {
     pub(crate) generation: u64,
     pub(crate) last_sample: CustodySample,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BlobDeletionContinuityTransition {
+    previous: BlobDeletionContinuity,
+    anchor: CustodySample,
+    after: Option<BlobVariantId>,
+    remaining: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BlobDeletionPendingContinuity {
+    current: BlobDeletionContinuity,
+    anchor: CustodySample,
+    remaining: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BlobDeletionContinuityState {
+    /// Newest authority whose transition is actively checkpointing.
+    current: BlobDeletionContinuity,
+    /// Fixed membership moving from `previous` to `current`.
+    transition: Option<BlobDeletionContinuityTransition>,
+    /// At most one fixed next transition; further domains remain deferred.
+    pending: Option<BlobDeletionPendingContinuity>,
+    /// Exact unanchored rows admitted at the newest current/pending generation.
+    /// These rows do not join either frozen membership.
+    deferred: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct BlobDeletionAgeMaintenanceProgress {
+    pub(crate) rows_examined: u64,
+    pub(crate) bytes_examined: u64,
+    pub(crate) has_more: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1116,6 +1167,7 @@ pub(crate) fn admit_variant_write(
     expected_import: &[u8],
     expected_lineage: &[u8],
     owner_binding: [u8; 32],
+    custody_sample: Option<CustodySample>,
 ) -> Result<bool, StoreError> {
     let existing_stats = require_admission_accounting(write)?;
     if variant_has_deletion_manifest_write(write, variant)? {
@@ -1246,6 +1298,38 @@ pub(crate) fn admit_variant_write(
     )?;
     let chunk_count =
         u64::try_from(chunks.len()).map_err(|_| StoreError::ItemCountAccountingOverflow)?;
+    let initial_age = match custody_sample {
+        Some(sample) => {
+            let continuity = observe_blob_deletion_continuity_write(write, sample)?;
+            if continuity.last_sample.clock_id == sample.clock_id
+                && continuity.last_sample.tick_ms == sample.tick_ms
+            {
+                BlobDeletionAge {
+                    cumulative_age_ms: 0,
+                    checkpoint: Some(sample),
+                    continuity_generation: continuity.generation,
+                    continuity_lost: false,
+                }
+            } else {
+                BlobDeletionAge {
+                    cumulative_age_ms: 0,
+                    checkpoint: None,
+                    continuity_generation: continuity.generation,
+                    continuity_lost: true,
+                }
+            }
+        }
+        None => {
+            let continuity =
+                blob_deletion_continuity_state_write(write)?.map(newest_blob_deletion_continuity);
+            BlobDeletionAge {
+                cumulative_age_ms: 0,
+                checkpoint: None,
+                continuity_generation: continuity.map_or(0, |continuity| continuity.generation),
+                continuity_lost: continuity.is_some(),
+            }
+        }
+    };
     let manifest = BlobDeletionManifest {
         variant_id: variant,
         blob_id: import.blob_id,
@@ -1258,12 +1342,7 @@ pub(crate) fn admit_variant_write(
         finalized_root: import.finalized_root,
         phase: BlobDeletionPhase::DeletingChunks,
         retry: BlobDeletionRetry::default(),
-        age: BlobDeletionAge {
-            cumulative_age_ms: 0,
-            checkpoint: None,
-            continuity_generation: 0,
-            continuity_lost: false,
-        },
+        age: initial_age,
         totals: BlobDeletionTotals {
             chunks: chunk_count,
             queued,
@@ -1305,6 +1384,7 @@ pub(crate) fn admit_variant_write(
     write
         .open_table(BLOB_DELETION_MANIFESTS)?
         .insert(variant.as_bytes().as_slice(), encoded_manifest.as_slice())?;
+    account_admitted_manifest_in_continuity_transition(write, manifest.variant_id, manifest.age)?;
     manifest_admission_mutation_boundary()?;
     let mut deletion_chunks = write.open_table(BLOB_DELETION_CHUNKS)?;
     for (chunk, encoded) in manifest.chunks.iter().zip(&encoded_chunks) {
@@ -1627,7 +1707,7 @@ fn audit_blob_deletion_rows(
     owner_binding: Option<[u8; 32]>,
 ) -> Result<BlobDeletionAudit, StoreError> {
     let allocation = preflight_allocation_bounds(metadata, manifests, deletion_chunks, imports)?;
-    let continuity = audited_continuity(continuity)?;
+    let continuity_state = audited_continuity_state(continuity)?;
     let maintenance_turn = metadata
         .get(BLOB_DELETION_MAINTENANCE_TURN)?
         .map(|value| value.value())
@@ -1635,6 +1715,9 @@ fn audit_blob_deletion_rows(
     let mut headers = BTreeMap::<BlobVariantId, BlobDeletionManifestHeader>::new();
     let mut manifest_rows = 0u64;
     let mut manifest_bytes = 0u64;
+    let mut transition_remaining = 0u64;
+    let mut pending_remaining = 0u64;
+    let mut deferred = 0u64;
     for row in manifests.iter()? {
         let (key, value) = row?;
         manifest_rows = manifest_rows
@@ -1650,7 +1733,7 @@ fn audit_blob_deletion_rows(
         }
         let variant = parse_variant_key(key.value())?;
         let header = decode_manifest_header(value.value())?;
-        validate_age_against_continuity(header.age, continuity)?;
+        validate_age_against_continuity(header.age, continuity_state)?;
         if header.variant_id != variant || headers.contains_key(&variant) {
             return Err(invariant(
                 "Blob deletion manifest key differs from its exact variant",
@@ -1661,7 +1744,66 @@ fn audit_blob_deletion_rows(
                 "Blob deletion manifest owner binding is unavailable or mismatched",
             ));
         }
+        if let Some(state) = continuity_state
+            && let Some(transition) = state.transition
+            && header.age.continuity_generation < state.current.generation
+        {
+            if transition.after.is_some_and(|after| variant <= after) {
+                return Err(invariant(
+                    "Blob deletion continuity position precedes an uncheckpointed manifest",
+                ));
+            }
+            transition_remaining = transition_remaining
+                .checked_add(1)
+                .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        }
+        if let Some(state) = continuity_state
+            && let Some(pending) = state.pending
+            && header.age.continuity_generation < pending.current.generation
+        {
+            pending_remaining = pending_remaining
+                .checked_add(1)
+                .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        }
+        if let Some(state) = continuity_state {
+            let newest_generation = state.pending.map_or(state.current.generation, |pending| {
+                pending.current.generation
+            });
+            if header.age.checkpoint.is_none()
+                && header.age.continuity_generation == newest_generation
+            {
+                if header.age.cumulative_age_ms != 0 {
+                    return Err(invariant("Blob deletion deferred age is not canonical"));
+                }
+                deferred = deferred
+                    .checked_add(1)
+                    .ok_or(StoreError::ItemCountAccountingOverflow)?;
+            }
+        }
         headers.insert(variant, header);
+    }
+    if let Some(state) = continuity_state
+        && let Some(transition) = state.transition
+        && transition_remaining != transition.remaining
+    {
+        return Err(invariant(
+            "Blob deletion continuity remaining count is not exact",
+        ));
+    }
+    if let Some(state) = continuity_state
+        && let Some(pending) = state.pending
+        && pending_remaining != pending.remaining
+    {
+        return Err(invariant(
+            "Blob deletion pending continuity remaining count is not exact",
+        ));
+    }
+    if let Some(state) = continuity_state
+        && deferred != state.deferred
+    {
+        return Err(invariant(
+            "Blob deletion deferred continuity count is not exact",
+        ));
     }
 
     for row in variant_references.iter()? {
@@ -2584,6 +2726,7 @@ pub(crate) fn finalize_manifest_write(
         .ok_or_else(|| invariant("Blob deletion finalization manifest is missing"))?
         .value()
         .to_vec();
+    account_finalized_manifest_in_continuity_transition(write, manifest.variant_id, manifest.age)?;
     manifest_finalization_mutation_boundary()?;
     let manifest_bytes = encoded_row_bytes(manifest.variant_id.as_bytes(), &encoded_manifest)?;
     let mut chunk_bytes = 0u64;
@@ -3004,6 +3147,58 @@ pub(crate) fn set_blob_deletion_age_for_test(
     Ok(())
 }
 
+#[cfg(test)]
+pub(crate) fn set_blob_deletion_deferred_count_for_test(
+    write: &redb::WriteTransaction,
+    deferred: u64,
+) -> Result<(), StoreError> {
+    let mut state = blob_deletion_continuity_state_write(write)?
+        .ok_or_else(|| invariant("Blob deletion test continuity state is missing"))?;
+    state.deferred = deferred;
+    store_blob_deletion_continuity_state(write, state)
+}
+
+#[cfg(test)]
+pub(crate) fn corrupt_blob_deletion_cumulative_age_for_test(
+    write: &redb::WriteTransaction,
+    variant: BlobVariantId,
+    cumulative_age_ms: u64,
+) -> Result<(), StoreError> {
+    let mut manifest = load_manifest_write(write, variant)?;
+    manifest.age.cumulative_age_ms = cumulative_age_ms;
+    manifest.validate()?;
+    let encoded = encode_manifest_record(&manifest)?;
+    write
+        .open_table(BLOB_DELETION_MANIFESTS)?
+        .insert(variant.as_bytes().as_slice(), encoded.as_slice())?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn set_blob_deletion_continuity_transition_for_test(
+    write: &redb::WriteTransaction,
+    previous: BlobDeletionContinuity,
+    current: BlobDeletionContinuity,
+    anchor: CustodySample,
+    after: Option<BlobVariantId>,
+    remaining: u64,
+) -> Result<(), StoreError> {
+    store_blob_deletion_continuity_state(
+        write,
+        BlobDeletionContinuityState {
+            current,
+            transition: Some(BlobDeletionContinuityTransition {
+                previous,
+                anchor,
+                after,
+                remaining,
+            }),
+            pending: None,
+            deferred: 0,
+        },
+    )
+}
+
 #[allow(dead_code)]
 fn encode_continuity(continuity: BlobDeletionContinuity) -> [u8; 33] {
     let mut encoded = [0u8; 33];
@@ -3014,7 +3209,7 @@ fn encode_continuity(continuity: BlobDeletionContinuity) -> [u8; 33] {
     encoded
 }
 
-fn decode_continuity(bytes: &[u8]) -> Result<BlobDeletionContinuity, StoreError> {
+fn decode_legacy_continuity(bytes: &[u8]) -> Result<BlobDeletionContinuity, StoreError> {
     let bytes: [u8; 33] = bytes
         .try_into()
         .map_err(|_| invariant("Blob deletion continuity record has invalid length"))?;
@@ -3048,9 +3243,211 @@ fn decode_continuity(bytes: &[u8]) -> Result<BlobDeletionContinuity, StoreError>
     })
 }
 
-fn audited_continuity(
+fn validate_continuity_state(state: BlobDeletionContinuityState) -> Result<(), StoreError> {
+    if state.current.generation == 0 {
+        return Err(invariant(
+            "Blob deletion continuity generation must be nonzero",
+        ));
+    }
+    if let Some(transition) = state.transition
+        && (transition.remaining == 0
+            || transition
+                .previous
+                .generation
+                .checked_add(1)
+                .is_none_or(|generation| generation != state.current.generation)
+            || transition.anchor.clock_id != state.current.last_sample.clock_id
+            || transition.anchor.tick_ms > state.current.last_sample.tick_ms)
+    {
+        return Err(invariant(
+            "Blob deletion continuity transition is not canonical",
+        ));
+    }
+    if let Some(pending) = state.pending
+        && (state.transition.is_none()
+            || pending.remaining == 0
+            || state
+                .current
+                .generation
+                .checked_add(1)
+                .is_none_or(|generation| generation != pending.current.generation)
+            || pending.anchor.clock_id != pending.current.last_sample.clock_id
+            || pending.anchor.tick_ms > pending.current.last_sample.tick_ms)
+    {
+        return Err(invariant(
+            "Blob deletion pending continuity is not canonical",
+        ));
+    }
+    Ok(())
+}
+
+fn encode_continuity_state(state: BlobDeletionContinuityState) -> Result<Vec<u8>, StoreError> {
+    validate_continuity_state(state)?;
+    let mut encoded = Vec::with_capacity(
+        35 + usize::from(state.transition.is_some()) * 97
+            + usize::from(state.pending.is_some()) * 64
+            + 8,
+    );
+    encoded.push(CONTINUITY_STATE_VERSION);
+    encoded.extend_from_slice(&state.current.generation.to_be_bytes());
+    encoded.extend_from_slice(&state.current.last_sample.clock_id);
+    encoded.extend_from_slice(&state.current.last_sample.tick_ms.to_be_bytes());
+    match state.transition {
+        None => encoded.push(0),
+        Some(transition) => {
+            encoded.push(1);
+            encoded.extend_from_slice(&transition.previous.generation.to_be_bytes());
+            encoded.extend_from_slice(&transition.previous.last_sample.clock_id);
+            encoded.extend_from_slice(&transition.previous.last_sample.tick_ms.to_be_bytes());
+            encoded.extend_from_slice(&transition.anchor.clock_id);
+            encoded.extend_from_slice(&transition.anchor.tick_ms.to_be_bytes());
+            encoded.extend_from_slice(&transition.remaining.to_be_bytes());
+            encoded.push(u8::from(transition.after.is_some()));
+            encoded.extend_from_slice(
+                transition
+                    .after
+                    .map_or([0; 32], |variant| *variant.as_bytes())
+                    .as_slice(),
+            );
+        }
+    }
+    match state.pending {
+        None => encoded.push(0),
+        Some(pending) => {
+            encoded.push(1);
+            encoded.extend_from_slice(&pending.current.generation.to_be_bytes());
+            encoded.extend_from_slice(&pending.current.last_sample.clock_id);
+            encoded.extend_from_slice(&pending.current.last_sample.tick_ms.to_be_bytes());
+            encoded.extend_from_slice(&pending.anchor.clock_id);
+            encoded.extend_from_slice(&pending.anchor.tick_ms.to_be_bytes());
+            encoded.extend_from_slice(&pending.remaining.to_be_bytes());
+        }
+    }
+    encoded.extend_from_slice(&state.deferred.to_be_bytes());
+    Ok(encoded)
+}
+
+fn decode_continuity_state(bytes: &[u8]) -> Result<BlobDeletionContinuityState, StoreError> {
+    if bytes.first() == Some(&CONTINUITY_VERSION) {
+        return Ok(BlobDeletionContinuityState {
+            current: decode_legacy_continuity(bytes)?,
+            transition: None,
+            pending: None,
+            deferred: 0,
+        });
+    }
+    let mut cursor = SliceCursor::new(bytes);
+    let version = cursor.u8()?;
+    if !matches!(
+        version,
+        PREVIOUS_CONTINUITY_STATE_VERSION
+            | PENDING_CONTINUITY_STATE_VERSION
+            | CONTINUITY_STATE_VERSION
+    ) {
+        return Err(invariant(
+            "Blob deletion continuity record has unknown version",
+        ));
+    }
+    let current = BlobDeletionContinuity {
+        generation: cursor.u64()?,
+        last_sample: CustodySample {
+            clock_id: cursor.array()?,
+            tick_ms: cursor.u64()?,
+        },
+    };
+    let transition = match cursor.u8()? {
+        0 => None,
+        1 => {
+            let previous = BlobDeletionContinuity {
+                generation: cursor.u64()?,
+                last_sample: CustodySample {
+                    clock_id: cursor.array()?,
+                    tick_ms: cursor.u64()?,
+                },
+            };
+            let anchor = CustodySample {
+                clock_id: cursor.array()?,
+                tick_ms: cursor.u64()?,
+            };
+            let remaining = cursor.u64()?;
+            let after_present = match cursor.u8()? {
+                0 => false,
+                1 => true,
+                _ => {
+                    return Err(invariant(
+                        "Blob deletion continuity position flag is invalid",
+                    ));
+                }
+            };
+            let after_bytes: [u8; 32] = cursor.array()?;
+            let after = if after_present {
+                Some(BlobVariantId::from_bytes(after_bytes))
+            } else {
+                if after_bytes != [0; 32] {
+                    return Err(invariant(
+                        "Blob deletion absent continuity position retains evidence",
+                    ));
+                }
+                None
+            };
+            Some(BlobDeletionContinuityTransition {
+                previous,
+                anchor,
+                after,
+                remaining,
+            })
+        }
+        _ => {
+            return Err(invariant(
+                "Blob deletion continuity transition flag is invalid",
+            ));
+        }
+    };
+    let pending = if version == PREVIOUS_CONTINUITY_STATE_VERSION {
+        None
+    } else {
+        match cursor.u8()? {
+            0 => None,
+            1 => Some(BlobDeletionPendingContinuity {
+                current: BlobDeletionContinuity {
+                    generation: cursor.u64()?,
+                    last_sample: CustodySample {
+                        clock_id: cursor.array()?,
+                        tick_ms: cursor.u64()?,
+                    },
+                },
+                anchor: CustodySample {
+                    clock_id: cursor.array()?,
+                    tick_ms: cursor.u64()?,
+                },
+                remaining: cursor.u64()?,
+            }),
+            _ => {
+                return Err(invariant(
+                    "Blob deletion pending continuity flag is invalid",
+                ));
+            }
+        }
+    };
+    let deferred = if version == CONTINUITY_STATE_VERSION {
+        cursor.u64()?
+    } else {
+        0
+    };
+    cursor.finish()?;
+    let state = BlobDeletionContinuityState {
+        current,
+        transition,
+        pending,
+        deferred,
+    };
+    validate_continuity_state(state)?;
+    Ok(state)
+}
+
+fn audited_continuity_state(
     table: &impl ReadableTable<u8, &'static [u8]>,
-) -> Result<Option<BlobDeletionContinuity>, StoreError> {
+) -> Result<Option<BlobDeletionContinuityState>, StoreError> {
     if table.len()? > 1 {
         return Err(invariant(
             "Blob deletion continuity table contains unknown rows",
@@ -3062,26 +3459,57 @@ fn audited_continuity(
         if key.value() != CONTINUITY_KEY {
             return Err(invariant("Blob deletion continuity key is not canonical"));
         }
-        continuity = Some(decode_continuity(value.value())?);
+        continuity = Some(decode_continuity_state(value.value())?);
     }
     Ok(continuity)
 }
 
 fn audit_continuity_table(table: &impl ReadableTable<u8, &'static [u8]>) -> Result<(), StoreError> {
-    audited_continuity(table).map(|_| ())
+    match audited_continuity_state(table)? {
+        Some(state)
+            if state.transition.is_some() || state.pending.is_some() || state.deferred != 0 =>
+        {
+            Err(invariant(
+                "Blob deletion continuity transition has no pending manifests",
+            ))
+        }
+        _ => Ok(()),
+    }
 }
 
 fn validate_age_against_continuity(
     age: BlobDeletionAge,
-    continuity: Option<BlobDeletionContinuity>,
+    state: Option<BlobDeletionContinuityState>,
 ) -> Result<(), StoreError> {
     age.validate()?;
     let Some(checkpoint) = age.checkpoint else {
+        if age.continuity_generation == 0 {
+            return Ok(());
+        }
+        let state = state.ok_or_else(|| {
+            invariant("Blob deletion deferred age has no durable continuity authority")
+        })?;
+        let matches_current = age.continuity_generation == state.current.generation;
+        let matches_previous = state
+            .transition
+            .is_some_and(|transition| age.continuity_generation == transition.previous.generation);
+        let matches_pending = state
+            .pending
+            .is_some_and(|pending| age.continuity_generation == pending.current.generation);
+        if !(matches_current || matches_previous || matches_pending) {
+            return Err(invariant(
+                "Blob deletion deferred age generation is not reachable",
+            ));
+        }
         return Ok(());
     };
-    let continuity = continuity.ok_or_else(|| {
+    let state = state.ok_or_else(|| {
         invariant("Blob deletion age checkpoint has no durable continuity authority")
     })?;
+    let continuity = state
+        .pending
+        .filter(|pending| age.continuity_generation == pending.current.generation)
+        .map_or(state.current, |pending| pending.current);
     if age.continuity_generation > continuity.generation {
         return Err(invariant(
             "Blob deletion age generation is ahead of durable continuity",
@@ -3102,11 +3530,151 @@ fn validate_age_against_continuity(
 fn blob_deletion_continuity_write(
     write: &redb::WriteTransaction,
 ) -> Result<Option<BlobDeletionContinuity>, StoreError> {
+    Ok(blob_deletion_continuity_state_write(write)?.map(|state| state.current))
+}
+
+fn blob_deletion_continuity_state_write(
+    write: &redb::WriteTransaction,
+) -> Result<Option<BlobDeletionContinuityState>, StoreError> {
     write
         .open_table(BLOB_DELETION_CONTINUITY)?
         .get(CONTINUITY_KEY)?
-        .map(|value| decode_continuity(value.value()))
+        .map(|value| decode_continuity_state(value.value()))
         .transpose()
+}
+
+fn store_blob_deletion_continuity_state(
+    write: &redb::WriteTransaction,
+    state: BlobDeletionContinuityState,
+) -> Result<(), StoreError> {
+    let encoded = encode_continuity_state(state)?;
+    write
+        .open_table(BLOB_DELETION_CONTINUITY)?
+        .insert(CONTINUITY_KEY, encoded.as_slice())?;
+    Ok(())
+}
+
+fn newest_blob_deletion_continuity(state: BlobDeletionContinuityState) -> BlobDeletionContinuity {
+    state
+        .pending
+        .map_or(state.current, |pending| pending.current)
+}
+
+fn promote_pending_blob_deletion_continuity_if_ready(state: &mut BlobDeletionContinuityState) {
+    if !state
+        .transition
+        .is_some_and(|transition| transition.remaining == 0)
+    {
+        return;
+    }
+    let Some(pending) = state.pending.take() else {
+        state.transition = None;
+        return;
+    };
+    let previous = state.current;
+    state.current = pending.current;
+    state.transition = (pending.remaining != 0).then_some(BlobDeletionContinuityTransition {
+        previous,
+        anchor: pending.anchor,
+        after: None,
+        remaining: pending.remaining,
+    });
+}
+
+fn account_finalized_manifest_in_continuity_transition(
+    write: &redb::WriteTransaction,
+    variant: BlobVariantId,
+    age: BlobDeletionAge,
+) -> Result<(), StoreError> {
+    let Some(mut state) = blob_deletion_continuity_state_write(write)? else {
+        return Ok(());
+    };
+    let newest_generation = newest_blob_deletion_continuity(state).generation;
+    let mut changed = false;
+    if let Some(mut transition) = state.transition
+        && age.continuity_generation < state.current.generation
+    {
+        if transition.after.is_some_and(|after| variant <= after) {
+            return Err(invariant(
+                "Blob deletion finalization found a stale continuity position",
+            ));
+        }
+        transition.remaining = transition
+            .remaining
+            .checked_sub(1)
+            .ok_or_else(|| invariant("Blob deletion continuity transition count underflowed"))?;
+        state.transition = Some(transition);
+        changed = true;
+    }
+    if let Some(mut pending) = state.pending
+        && age.continuity_generation < pending.current.generation
+    {
+        pending.remaining = pending
+            .remaining
+            .checked_sub(1)
+            .ok_or_else(|| invariant("Blob deletion pending continuity count underflowed"))?;
+        state.pending = Some(pending);
+        changed = true;
+    }
+    if age.checkpoint.is_none() && age.continuity_generation == newest_generation {
+        state.deferred = state
+            .deferred
+            .checked_sub(1)
+            .ok_or_else(|| invariant("Blob deletion deferred continuity count underflowed"))?;
+        changed = true;
+    }
+    if !changed {
+        return Ok(());
+    }
+    promote_pending_blob_deletion_continuity_if_ready(&mut state);
+    store_blob_deletion_continuity_state(write, state)
+}
+
+fn account_admitted_manifest_in_continuity_transition(
+    write: &redb::WriteTransaction,
+    _variant: BlobVariantId,
+    age: BlobDeletionAge,
+) -> Result<(), StoreError> {
+    let Some(mut state) = blob_deletion_continuity_state_write(write)? else {
+        return Ok(());
+    };
+    let newest_generation = newest_blob_deletion_continuity(state).generation;
+    let mut changed = false;
+    if let Some(mut transition) = state.transition
+        && age.continuity_generation < state.current.generation
+    {
+        transition.remaining = transition
+            .remaining
+            .checked_add(1)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        // A newly admitted variant can sort before the private transition
+        // position. Restart the bounded scan; already checkpointed rows are
+        // idempotent and do not consume `remaining` again.
+        transition.after = None;
+        state.transition = Some(transition);
+        changed = true;
+    }
+    if let Some(mut pending) = state.pending
+        && age.continuity_generation < pending.current.generation
+    {
+        pending.remaining = pending
+            .remaining
+            .checked_add(1)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        state.pending = Some(pending);
+        changed = true;
+    }
+    if age.checkpoint.is_none() && age.continuity_generation == newest_generation {
+        state.deferred = state
+            .deferred
+            .checked_add(1)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        changed = true;
+    }
+    if changed {
+        store_blob_deletion_continuity_state(write, state)?;
+    }
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -3114,36 +3682,278 @@ pub(crate) fn observe_blob_deletion_continuity_write(
     write: &redb::WriteTransaction,
     sample: CustodySample,
 ) -> Result<BlobDeletionContinuity, StoreError> {
-    let current = blob_deletion_continuity_write(write)?;
-    let next = match current {
-        None => BlobDeletionContinuity {
-            generation: 1,
-            last_sample: sample,
-        },
-        Some(current)
-            if current.last_sample.clock_id == sample.clock_id
-                && sample.tick_ms >= current.last_sample.tick_ms =>
-        {
-            BlobDeletionContinuity {
-                generation: current.generation,
-                last_sample: sample,
+    let previous_state = blob_deletion_continuity_state_write(write)?;
+    let (state, observed) =
+        match previous_state {
+            None => {
+                let current = BlobDeletionContinuity {
+                    generation: 1,
+                    last_sample: sample,
+                };
+                (
+                    BlobDeletionContinuityState {
+                        current,
+                        transition: None,
+                        pending: None,
+                        deferred: 0,
+                    },
+                    current,
+                )
+            }
+            Some(mut state) if state.pending.is_some() => {
+                let mut pending = state.pending.expect("matched pending continuity");
+                if pending.current.last_sample.clock_id != sample.clock_id
+                    || sample.tick_ms < pending.current.last_sample.tick_ms
+                {
+                    // Keep draining the two frozen memberships. The caller uses
+                    // the returned mismatch to admit this later-domain row as an
+                    // age-zero deferred member instead of extending old work.
+                    (state, pending.current)
+                } else {
+                    pending.current.last_sample = sample;
+                    state.pending = Some(pending);
+                    (state, pending.current)
+                }
+            }
+            Some(mut state)
+                if state.current.last_sample.clock_id == sample.clock_id
+                    && sample.tick_ms >= state.current.last_sample.tick_ms =>
+            {
+                state.current.last_sample = sample;
+                let observed = state.current;
+                (state, observed)
+            }
+            Some(mut state) if state.transition.is_some() => {
+                let next = BlobDeletionContinuity {
+                    generation: state.current.generation.checked_add(1).ok_or_else(|| {
+                        invariant("Blob deletion continuity generation overflowed")
+                    })?,
+                    last_sample: sample,
+                };
+                let remaining = write.open_table(BLOB_DELETION_MANIFESTS)?.len()?;
+                if remaining == 0 {
+                    return Err(invariant(
+                        "Blob deletion continuity transition lost its manifest membership",
+                    ));
+                }
+                state.pending = Some(BlobDeletionPendingContinuity {
+                    current: next,
+                    anchor: sample,
+                    remaining,
+                });
+                state.deferred = 0;
+                (state, next)
+            }
+            Some(state) => {
+                let next = BlobDeletionContinuity {
+                    generation: state.current.generation.checked_add(1).ok_or_else(|| {
+                        invariant("Blob deletion continuity generation overflowed")
+                    })?,
+                    last_sample: sample,
+                };
+                let remaining = write.open_table(BLOB_DELETION_MANIFESTS)?.len()?;
+                (
+                    BlobDeletionContinuityState {
+                        current: next,
+                        transition: (remaining != 0).then_some(BlobDeletionContinuityTransition {
+                            previous: state.current,
+                            anchor: sample,
+                            after: None,
+                            remaining,
+                        }),
+                        pending: None,
+                        deferred: 0,
+                    },
+                    next,
+                )
+            }
+        };
+    if previous_state != Some(state) {
+        store_blob_deletion_continuity_state(write, state)?;
+    }
+    Ok(observed)
+}
+
+fn project_blob_deletion_age_with_state(
+    mut age: BlobDeletionAge,
+    state: Option<BlobDeletionContinuityState>,
+    sample: Option<CustodySample>,
+) -> Result<BlobDeletionAge, StoreError> {
+    let Some(state) = state else {
+        return project_blob_deletion_age(age, None, sample);
+    };
+    if age.checkpoint.is_none() {
+        let deferred_generation = age.continuity_generation;
+        let (continuity, effective_sample) =
+            if state.transition.is_some() && age.continuity_generation < state.current.generation {
+                (state.current, Some(state.current.last_sample))
+            } else {
+                (newest_blob_deletion_continuity(state), sample)
+            };
+        let mut projected = project_blob_deletion_age(age, Some(continuity), effective_sample)?;
+        if projected.checkpoint.is_none() && deferred_generation != 0 {
+            projected.continuity_generation = deferred_generation;
+            projected.continuity_lost = true;
+        }
+        return Ok(projected);
+    }
+    if let Some(pending) = state.pending
+        && age.continuity_generation == pending.current.generation
+    {
+        let pending_sample = sample
+            .filter(|sample| sample.clock_id == pending.current.last_sample.clock_id)
+            .or(Some(pending.current.last_sample));
+        return project_blob_deletion_age(age, Some(pending.current), pending_sample);
+    }
+    if let Some(transition) = state.transition
+        && age.continuity_generation < state.current.generation
+    {
+        age = project_blob_deletion_age(
+            age,
+            Some(transition.previous),
+            Some(transition.previous.last_sample),
+        )?;
+        age = project_blob_deletion_age(
+            age,
+            Some(BlobDeletionContinuity {
+                generation: state.current.generation,
+                last_sample: transition.anchor,
+            }),
+            Some(transition.anchor),
+        )?;
+    }
+    let current_sample = state
+        .pending
+        .map_or(sample, |_| Some(state.current.last_sample));
+    project_blob_deletion_age(age, Some(state.current), current_sample)
+}
+
+pub(crate) fn checkpoint_blob_deletion_ages_write(
+    write: &redb::WriteTransaction,
+    sample: CustodySample,
+    rows_budget: u64,
+    bytes_budget: u64,
+) -> Result<BlobDeletionAgeMaintenanceProgress, StoreError> {
+    observe_blob_deletion_continuity_write(write, sample)?;
+    let Some(mut state) = blob_deletion_continuity_state_write(write)? else {
+        return Err(invariant("Blob deletion continuity update disappeared"));
+    };
+    let Some(mut transition) = state.transition else {
+        return Ok(BlobDeletionAgeMaintenanceProgress::default());
+    };
+    let mut rows = Vec::new();
+    let mut rows_examined = 0u64;
+    let mut bytes_examined = 0u64;
+    let mut range_exhausted = false;
+    {
+        let manifests = write.open_table(BLOB_DELETION_MANIFESTS)?;
+        let after_bytes = transition.after.map(|variant| *variant.as_bytes());
+        let lower = after_bytes
+            .as_ref()
+            .map_or(std::ops::Bound::Unbounded, |variant| {
+                std::ops::Bound::Excluded(variant.as_slice())
+            });
+        let mut range = manifests.range::<&[u8]>((lower, std::ops::Bound::Unbounded))?;
+        while rows_examined < rows_budget {
+            let Some(row) = range.next() else {
+                range_exhausted = true;
+                break;
+            };
+            let (key, value) = row?;
+            let row_bytes = encoded_row_bytes(key.value(), value.value())?;
+            let next_bytes = bytes_examined
+                .checked_add(row_bytes)
+                .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+            if next_bytes > bytes_budget {
+                break;
+            }
+            let variant = BlobVariantId::from_bytes(key.value().try_into().map_err(|_| {
+                invariant("Blob deletion manifest key is not a variant identifier")
+            })?);
+            let mut header = decode_manifest_header(value.value())?;
+            if header.variant_id != variant {
+                return Err(invariant(
+                    "Blob deletion manifest key does not match its record",
+                ));
+            }
+            let was_previous = header.age.continuity_generation < state.current.generation;
+            let was_pending = state.pending.is_some_and(|pending| {
+                header.age.continuity_generation < pending.current.generation
+            });
+            let was_deferred = header.age.checkpoint.is_none()
+                && header.age.continuity_generation
+                    == newest_blob_deletion_continuity(state).generation;
+            header.age =
+                project_blob_deletion_age_with_state(header.age, Some(state), Some(sample))?;
+            let completed_pending = was_pending
+                && state.pending.is_some_and(|pending| {
+                    header.age.continuity_generation >= pending.current.generation
+                });
+            let completed_deferred = was_deferred && header.age.checkpoint.is_some();
+            rows.push((
+                variant,
+                encode_manifest_header(&header)?,
+                was_previous,
+                completed_pending,
+                completed_deferred,
+            ));
+            rows_examined = rows_examined
+                .checked_add(1)
+                .ok_or(StoreError::ItemCountAccountingOverflow)?;
+            bytes_examined = next_bytes;
+            transition.after = Some(variant);
+        }
+    }
+    if rows.is_empty() && transition.remaining != 0 {
+        if range_exhausted {
+            return Err(invariant(
+                "Blob deletion continuity transition exhausted before its remaining count",
+            ));
+        }
+        return Ok(BlobDeletionAgeMaintenanceProgress {
+            rows_examined,
+            bytes_examined,
+            has_more: true,
+        });
+    }
+    {
+        let mut manifests = write.open_table(BLOB_DELETION_MANIFESTS)?;
+        for (variant, encoded, was_previous, completed_pending, completed_deferred) in rows {
+            manifests.insert(variant.as_bytes().as_slice(), encoded.as_slice())?;
+            if was_previous {
+                transition.remaining = transition.remaining.checked_sub(1).ok_or_else(|| {
+                    invariant("Blob deletion continuity transition count underflowed")
+                })?;
+            }
+            if completed_pending {
+                let mut pending = state
+                    .pending
+                    .ok_or_else(|| invariant("Blob deletion pending continuity disappeared"))?;
+                pending.remaining = pending.remaining.checked_sub(1).ok_or_else(|| {
+                    invariant("Blob deletion pending continuity count underflowed")
+                })?;
+                state.pending = Some(pending);
+            }
+            if completed_deferred {
+                state.deferred = state.deferred.checked_sub(1).ok_or_else(|| {
+                    invariant("Blob deletion deferred continuity count underflowed")
+                })?;
             }
         }
-        Some(current) => BlobDeletionContinuity {
-            generation: current
-                .generation
-                .checked_add(1)
-                .ok_or_else(|| invariant("Blob deletion continuity generation overflowed"))?,
-            last_sample: sample,
-        },
-    };
-    if current != Some(next) {
-        let encoded = encode_continuity(next);
-        write
-            .open_table(BLOB_DELETION_CONTINUITY)?
-            .insert(CONTINUITY_KEY, encoded.as_slice())?;
     }
-    Ok(next)
+    if range_exhausted && transition.remaining != 0 {
+        return Err(invariant(
+            "Blob deletion continuity transition exhausted before its remaining count",
+        ));
+    }
+    state.transition = Some(transition);
+    promote_pending_blob_deletion_continuity_if_ready(&mut state);
+    store_blob_deletion_continuity_state(write, state)?;
+    Ok(BlobDeletionAgeMaintenanceProgress {
+        rows_examined,
+        bytes_examined,
+        has_more: state.transition.is_some(),
+    })
 }
 
 #[allow(dead_code)]
@@ -3175,6 +3985,23 @@ pub(crate) fn project_blob_deletion_age(
         continuity_generation: projected.continuity_generation,
         continuity_lost: projected.continuity_lost,
     })
+}
+
+pub(crate) fn project_blob_deletion_age_read(
+    read: &redb::ReadTransaction,
+    age: BlobDeletionAge,
+    sample: Option<CustodySample>,
+) -> Result<BlobDeletionAge, StoreError> {
+    let table = read.open_table(BLOB_DELETION_CONTINUITY)?;
+    let state = if table.len()? == 0 {
+        None
+    } else {
+        let value = table
+            .get(CONTINUITY_KEY)?
+            .ok_or_else(|| invariant("Blob deletion continuity key is not canonical"))?;
+        Some(decode_continuity_state(value.value())?)
+    };
+    project_blob_deletion_age_with_state(age, state, sample)
 }
 
 #[cfg(test)]
@@ -3682,5 +4509,240 @@ mod tests {
             1
         );
         write.commit().expect("commit new deletion clock domain");
+    }
+
+    #[test]
+    fn blob_deletion_continuity_v2_v3_decode_and_upgrade_canonically_to_v4() {
+        let previous = BlobDeletionContinuity {
+            generation: 1,
+            last_sample: CustodySample {
+                clock_id: [0x81; 16],
+                tick_ms: 40,
+            },
+        };
+        let current = BlobDeletionContinuity {
+            generation: 2,
+            last_sample: CustodySample {
+                clock_id: [0x82; 16],
+                tick_ms: 9,
+            },
+        };
+        let transition = BlobDeletionContinuityTransition {
+            previous,
+            anchor: CustodySample {
+                clock_id: current.last_sample.clock_id,
+                tick_ms: 3,
+            },
+            after: Some(BlobVariantId::from_bytes([0x55; 32])),
+            remaining: 2,
+        };
+        let expected = BlobDeletionContinuityState {
+            current,
+            transition: Some(transition),
+            pending: None,
+            deferred: 0,
+        };
+        let mut encoded = Vec::new();
+        encoded.push(PREVIOUS_CONTINUITY_STATE_VERSION);
+        encoded.extend_from_slice(&current.generation.to_be_bytes());
+        encoded.extend_from_slice(&current.last_sample.clock_id);
+        encoded.extend_from_slice(&current.last_sample.tick_ms.to_be_bytes());
+        encoded.push(1);
+        encoded.extend_from_slice(&previous.generation.to_be_bytes());
+        encoded.extend_from_slice(&previous.last_sample.clock_id);
+        encoded.extend_from_slice(&previous.last_sample.tick_ms.to_be_bytes());
+        encoded.extend_from_slice(&transition.anchor.clock_id);
+        encoded.extend_from_slice(&transition.anchor.tick_ms.to_be_bytes());
+        encoded.extend_from_slice(&transition.remaining.to_be_bytes());
+        encoded.push(1);
+        encoded.extend_from_slice(transition.after.expect("v2 cursor").as_bytes().as_slice());
+
+        assert_eq!(
+            decode_continuity_state(&encoded).expect("decode v2 continuity"),
+            expected
+        );
+        let upgraded = encode_continuity_state(expected).expect("encode v4 continuity");
+        assert_eq!(upgraded[0], CONTINUITY_STATE_VERSION);
+        assert_eq!(
+            decode_continuity_state(&upgraded).expect("decode upgraded continuity"),
+            expected
+        );
+
+        let pending = BlobDeletionPendingContinuity {
+            current: BlobDeletionContinuity {
+                generation: 3,
+                last_sample: CustodySample {
+                    clock_id: [0x83; 16],
+                    tick_ms: 17,
+                },
+            },
+            anchor: CustodySample {
+                clock_id: [0x83; 16],
+                tick_ms: 11,
+            },
+            remaining: 4,
+        };
+        let expected_v3 = BlobDeletionContinuityState {
+            current,
+            transition: Some(transition),
+            pending: Some(pending),
+            deferred: 0,
+        };
+        let mut encoded_v3 = encoded;
+        encoded_v3[0] = PENDING_CONTINUITY_STATE_VERSION;
+        encoded_v3.push(1);
+        encoded_v3.extend_from_slice(&pending.current.generation.to_be_bytes());
+        encoded_v3.extend_from_slice(&pending.current.last_sample.clock_id);
+        encoded_v3.extend_from_slice(&pending.current.last_sample.tick_ms.to_be_bytes());
+        encoded_v3.extend_from_slice(&pending.anchor.clock_id);
+        encoded_v3.extend_from_slice(&pending.anchor.tick_ms.to_be_bytes());
+        encoded_v3.extend_from_slice(&pending.remaining.to_be_bytes());
+        let decoded_v3 = decode_continuity_state(&encoded_v3).expect("decode v3 continuity");
+        assert_eq!(decoded_v3, expected_v3);
+        let upgraded_v3 = encode_continuity_state(decoded_v3).expect("upgrade v3 continuity to v4");
+        assert_eq!(upgraded_v3[0], CONTINUITY_STATE_VERSION);
+        assert_eq!(
+            decode_continuity_state(&upgraded_v3).expect("decode upgraded v3 continuity"),
+            expected_v3
+        );
+
+        let expected_v4 = BlobDeletionContinuityState {
+            deferred: 5,
+            ..expected_v3
+        };
+        let encoded_v4 = encode_continuity_state(expected_v4).expect("encode v4 continuity");
+        assert_eq!(encoded_v4[0], CONTINUITY_STATE_VERSION);
+        assert_eq!(
+            decode_continuity_state(&encoded_v4).expect("decode v4 continuity"),
+            expected_v4
+        );
+        assert!(decode_continuity_state(&encoded_v4[..encoded_v4.len() - 1]).is_err());
+        let mut trailing_v4 = encoded_v4;
+        trailing_v4.push(0);
+        assert!(decode_continuity_state(&trailing_v4).is_err());
+    }
+
+    #[test]
+    fn blob_deletion_age_transition_accounts_concurrent_admission_and_finalization() {
+        let file = DeletionTestFile::new("age-transition-membership");
+        drop(Store::open(&file.0).expect("create deletion continuity schema"));
+        let database = Database::open(&file.0).expect("open deletion continuity database");
+        let write = database.begin_write().expect("begin transition membership");
+        let previous = BlobDeletionContinuity {
+            generation: 1,
+            last_sample: CustodySample {
+                clock_id: [0xc1; 16],
+                tick_ms: 40,
+            },
+        };
+        let current = BlobDeletionContinuity {
+            generation: 2,
+            last_sample: CustodySample {
+                clock_id: [0xc2; 16],
+                tick_ms: 5,
+            },
+        };
+        let pending = BlobDeletionPendingContinuity {
+            current: BlobDeletionContinuity {
+                generation: 3,
+                last_sample: CustodySample {
+                    clock_id: [0xc3; 16],
+                    tick_ms: 7,
+                },
+            },
+            anchor: CustodySample {
+                clock_id: [0xc3; 16],
+                tick_ms: 2,
+            },
+            remaining: 2,
+        };
+        store_blob_deletion_continuity_state(
+            &write,
+            BlobDeletionContinuityState {
+                current,
+                transition: Some(BlobDeletionContinuityTransition {
+                    previous,
+                    anchor: current.last_sample,
+                    after: Some(BlobVariantId::from_bytes([0xfe; 32])),
+                    remaining: 2,
+                }),
+                pending: Some(pending),
+                deferred: 0,
+            },
+        )
+        .expect("store active transition");
+        let variant = BlobVariantId::from_bytes([0x01; 32]);
+        let unanchored = BlobDeletionAge {
+            cumulative_age_ms: 0,
+            checkpoint: None,
+            continuity_generation: 0,
+            continuity_lost: true,
+        };
+        account_admitted_manifest_in_continuity_transition(&write, variant, unanchored)
+            .expect("account concurrent admission");
+        let after_admission = blob_deletion_continuity_state_write(&write)
+            .expect("read transition after admission")
+            .expect("transition state");
+        assert_eq!(after_admission.transition.expect("active").remaining, 3);
+        assert_eq!(after_admission.transition.expect("active").after, None);
+        assert_eq!(after_admission.pending.expect("pending").remaining, 3);
+
+        account_finalized_manifest_in_continuity_transition(&write, variant, unanchored)
+            .expect("account concurrent finalization");
+        let after_finalization = blob_deletion_continuity_state_write(&write)
+            .expect("read transition after finalization")
+            .expect("transition state");
+        assert_eq!(after_finalization.transition.expect("active").remaining, 2);
+        assert_eq!(after_finalization.transition.expect("active").after, None);
+        assert_eq!(after_finalization.pending.expect("pending").remaining, 2);
+
+        let deferred = BlobDeletionAge {
+            cumulative_age_ms: 0,
+            checkpoint: None,
+            continuity_generation: pending.current.generation,
+            continuity_lost: true,
+        };
+        account_admitted_manifest_in_continuity_transition(&write, variant, deferred)
+            .expect("account admission beyond the queued domain");
+        let after_deferred_admission = blob_deletion_continuity_state_write(&write)
+            .expect("read transition after deferred admission")
+            .expect("transition state");
+        assert_eq!(
+            after_deferred_admission
+                .transition
+                .expect("active")
+                .remaining,
+            2
+        );
+        assert_eq!(
+            after_deferred_admission.transition.expect("active").after,
+            None
+        );
+        assert_eq!(
+            after_deferred_admission.pending.expect("pending").remaining,
+            2
+        );
+        assert_eq!(after_deferred_admission.deferred, 1);
+
+        account_finalized_manifest_in_continuity_transition(&write, variant, deferred)
+            .expect("account finalization beyond the queued domain");
+        let after_deferred_finalization = blob_deletion_continuity_state_write(&write)
+            .expect("read transition after deferred finalization")
+            .expect("transition state");
+        assert_eq!(
+            after_deferred_finalization
+                .transition
+                .expect("active")
+                .remaining,
+            2
+        );
+        assert_eq!(
+            after_deferred_finalization
+                .pending
+                .expect("pending")
+                .remaining,
+            2
+        );
+        assert_eq!(after_deferred_finalization.deferred, 0);
     }
 }

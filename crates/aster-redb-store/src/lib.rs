@@ -28,10 +28,12 @@
 //! independently bound non-evictable physical-lineage and accepted-publication
 //! replay fences plus publication lifecycle rows. Exact typed references keep
 //! publication and pending-source ownership of depot variants distinct. A
-//! persistent six-class scheduler performs row/file/byte-bounded, fair discovery,
-//! but destructive candidates remain pending: retention/retirement expiry,
-//! physical reclamation or deletion manifests, pressure eviction, and finite Blob
-//! TTL are not implemented by this crate boundary.
+//! persistent six-class scheduler performs row/file/byte-bounded fair discovery
+//! and exact manifest-authorized reclamation of already-unreferenced staging and
+//! completed variants. Charged physical accounting remains in force until
+//! deletion finalization, and durable manifests resume safely after restart.
+//! This is not live retirement, retention expiry, pressure eviction, or finite
+//! Blob TTL.
 
 #![forbid(unsafe_code)]
 

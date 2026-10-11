@@ -746,10 +746,15 @@ independent nonzero row, file, and byte budgets. Startup runs one bounded turn;
 periodic turns run one at a time in a background worker only after operational
 actor work has had an opportunity to proceed. Before cursor advance, each page
 validates the lifecycle/accounting evidence it depends on and fails closed on a
-contradiction. Candidate discovery is not deletion authority: an unreferenced
-staging or completed variant remains durable and revisitable when no destructive
-handler exists. Retention/retirement expiry, physical reclamation and deletion
-manifests, pressure eviction, and finite Blob TTL are not implemented.
+contradiction. Candidate discovery alone is not deletion authority. An exact
+unreferenced staging or completed variant must pass reference and lease
+revalidation before an atomic manifest admission removes captured depot rows.
+Physical deletion then uses descriptor-relative bounded units, records retryable
+failures without exposing paths, reconciles ambiguous restart state, and keeps
+all captured accounting charged until finalization. Operational work retains
+priority over periodic pages, while the capacity-only pass is cursor-neutral and
+never chooses live content. Live retirement, retention/retirement expiry,
+pressure eviction, and finite Blob TTL are not implemented.
 
 ### Selected semantic-v6 Event-bridge isolation
 

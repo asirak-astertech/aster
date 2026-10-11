@@ -401,10 +401,10 @@ route-only Blob relay or custody.
 expected chunk record and bound durable per-chunk metadata rows and
 epoch-specific import variants. Rows and variants include retained unpublished
 imports, whether expected-only or already finalized, and continue to consume
-admission until a future explicit-GC policy exists. The limits do not claim to
-measure redb allocation, directory blocks, snapshots, backups, swap, unrelated
-attacker-created directory entries, or every filesystem overhead. Unix
-depot operations use owner-controlled directory descriptors, no-follow checks,
+admission through any deletion attempt until durable finalization. The limits
+do not claim to measure redb allocation, directory blocks, snapshots, backups,
+swap, unrelated attacker-created directory entries, or every filesystem
+overhead. Unix depot operations use owner-controlled directory descriptors, no-follow checks,
 and private modes; the non-Unix fallback is not credited with equivalent
 filesystem hardening. Terminal software zeroization destroys the retained
 mission/content and identity secrets and locks the store, but deliberately
@@ -425,12 +425,19 @@ after the strict startup audit before Blob command admission, then schedules at
 most one background turn after operational application/control work on each
 periodic actor tick; the actor remains available while that blocking page runs.
 
-This scheduler is discovery and structural validation only in this increment.
-Unreferenced staging/completed-variant candidates are reported, leave their
-cursor revisitable, and set the later-handler boundary; no row or file is
-deleted. The other future destructive classes likewise have no expiry or
-deletion handler. Retention/retirement expiry, physical reclamation and deletion
-manifests, pressure eviction, and finite Blob TTL are not implemented.
+For an exact staging or completed variant with no durable reference or active
+lease, admission atomically persists a deletion manifest before removing its
+import and chunk rows. Descriptor-relative physical work is bounded and
+restartable: completed filesystem units are durably marked, ambiguous units are
+reconciled, and full depot accounting remains charged until finalization. The
+runtime performs exactly one bounded startup page before Blob command admission,
+then schedules background pages behind operational priority and yields between
+bounded filesystem units. An exact depot byte, chunk, or variant capacity
+failure may run one separately bounded, cursor-neutral pass over exact
+already-unreferenced work and retry the admission once. Other resource limits
+do not trigger that pass. It does not select live content. Live retirement,
+retention/retirement expiry, pressure eviction, and finite Blob TTL are not
+implemented.
 
 ## Live application command and status flow
 

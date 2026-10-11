@@ -68,10 +68,11 @@ mod state;
 pub(crate) use blob::SelectedBlobCommand;
 pub use blob::{
     BLOB_DELIVERY_TOKEN_BYTES, BlobAcknowledgement, BlobDelivery, BlobDeliveryPage,
-    BlobDeliveryStatus, BlobDeliveryToken, BlobDepotLimits, BlobId, BlobPollRequest,
-    BlobPublicationId, BlobPublishRequest, BlobPublishResult, BlobReadPage, BlobReadPageRequest,
-    BlobReadRequest, BlobReadResult, BlobSubscription, BlobSubscriptionId, BlobSubscriptionRequest,
-    BlobTransferPhase, BlobTransferStatus, BlobUnsubscribe, MAX_SELECTED_BLOB_DELIVERIES,
+    BlobDeliveryStatus, BlobDeliveryToken, BlobDepotLimits, BlobGcFailureCategory,
+    BlobGcRetryState, BlobGcStatus, BlobId, BlobPollRequest, BlobPublicationId, BlobPublishRequest,
+    BlobPublishResult, BlobReadPage, BlobReadPageRequest, BlobReadRequest, BlobReadResult,
+    BlobSubscription, BlobSubscriptionId, BlobSubscriptionRequest, BlobTransferPhase,
+    BlobTransferStatus, BlobUnsubscribe, MAX_SELECTED_BLOB_DELIVERIES,
     MAX_SELECTED_BLOB_PAGE_BYTES, MAX_SELECTED_BLOB_SUBSCRIPTION_SCAN,
     MAX_SELECTED_LIVE_BLOB_BYTES, MAX_SELECTED_LIVE_BLOB_CHUNKS, PendingBlobTransferStatus,
     SelectedBlobHandle, SelectedBlobNode, SelectedBlobOptions,
@@ -136,10 +137,36 @@ pub enum ApplicationErrorKind {
 /// The underlying store, source-envelope, carrier, and provider errors remain
 /// private so an application cannot couple itself to privileged mechanics or
 /// learn exact transfer/schema details through an error path.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy)]
 pub struct ApplicationError {
     kind: ApplicationErrorKind,
     operation: &'static str,
+    cause: ApplicationErrorCause,
+}
+
+impl fmt::Debug for ApplicationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ApplicationError")
+            .field("kind", &self.kind)
+            .field("operation", &self.operation)
+            .finish()
+    }
+}
+
+impl PartialEq for ApplicationError {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind && self.operation == other.operation
+    }
+}
+
+impl Eq for ApplicationError {}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ApplicationErrorCause {
+    #[default]
+    None,
+    RecoverableBlobDepotCapacity,
 }
 
 impl ApplicationError {
@@ -154,7 +181,26 @@ impl ApplicationError {
     }
 
     const fn new(kind: ApplicationErrorKind, operation: &'static str) -> Self {
-        Self { kind, operation }
+        Self {
+            kind,
+            operation,
+            cause: ApplicationErrorCause::None,
+        }
+    }
+
+    pub(crate) const fn recoverable_blob_depot_capacity(operation: &'static str) -> Self {
+        Self {
+            kind: ApplicationErrorKind::ResourceLimit,
+            operation,
+            cause: ApplicationErrorCause::RecoverableBlobDepotCapacity,
+        }
+    }
+
+    pub(crate) const fn is_recoverable_blob_depot_capacity(&self) -> bool {
+        matches!(
+            self.cause,
+            ApplicationErrorCause::RecoverableBlobDepotCapacity
+        )
     }
 }
 
@@ -2880,6 +2926,29 @@ mod tests {
     };
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn application_error_public_projection_omits_private_capacity_cause() {
+        let ordinary = ApplicationError::new(
+            ApplicationErrorKind::ResourceLimit,
+            "Blob publication admission",
+        );
+        let recoverable =
+            ApplicationError::recoverable_blob_depot_capacity("Blob publication admission");
+
+        assert_eq!(ordinary.kind(), ApplicationErrorKind::ResourceLimit);
+        assert_eq!(recoverable.kind(), ApplicationErrorKind::ResourceLimit);
+        assert_eq!(ordinary.operation(), "Blob publication admission");
+        assert_eq!(recoverable.operation(), "Blob publication admission");
+        assert_eq!(ordinary, recoverable);
+        assert_eq!(format!("{ordinary:?}"), format!("{recoverable:?}"));
+        assert_eq!(ordinary.to_string(), recoverable.to_string());
+        assert!(std::error::Error::source(&recoverable).is_none());
+        assert!(!format!("{recoverable:?}").contains("RecoverableBlobDepotCapacity"));
+        assert!(!format!("{recoverable:?}").contains("cause"));
+        assert!(!ordinary.is_recoverable_blob_depot_capacity());
+        assert!(recoverable.is_recoverable_blob_depot_capacity());
+    }
 
     #[test]
     fn mutable_cursor_and_frontier_store_errors_have_narrow_application_kinds() {

@@ -164,10 +164,12 @@ pub const DEFAULT_MAX_BLOB_DEPOT_VARIANTS: u64 = 4_096;
 /// file header, for every durable expected chunk record; committed files are a
 /// subset. `max_chunks` counts all durable chunk metadata rows, including
 /// digest/expected-record staging. `max_variants` counts every durable import
-/// row, public or unpublished. Abandoned staging remains durable until a future
-/// explicit garbage-collection design; writable reopen reclaims only unmarked
-/// physical artifacts. These limits intentionally do not bound unmarked,
-/// temporary, or hostile untracked filesystem allocation.
+/// row, public or unpublished. Exact already-unreferenced staging and completed
+/// variants remain fully charged while a durable deletion manifest authorizes
+/// bounded physical reclamation; only finalization releases that accounting.
+/// These limits intentionally do not bound unmarked, temporary, or hostile
+/// untracked filesystem allocation, and reclamation does not provide live
+/// retirement, retention expiry, pressure eviction, or finite-TTL semantics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BlobDepotLimits {
     max_bytes: u64,
@@ -1153,6 +1155,115 @@ pub struct BlobStoreStats {
     pub variant_references: u64,
 }
 
+/// Sanitized durable failure class for background Blob reclamation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum BlobGcFailureCategory {
+    VariantDirectoryAccess,
+    ChunkUnlink,
+    ChunkDirectorySync,
+    VariantDirectoryRemove,
+    DepotDirectorySync,
+}
+
+/// Turn-relative state of the earliest durable Blob reclamation retry.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum BlobGcRetryState {
+    #[default]
+    Idle,
+    Ready,
+    Deferred,
+}
+
+/// Audited, path-free local Blob reclamation and lifecycle-capacity status.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BlobGcStatus {
+    /// Retained file charge of pending manifests through finalization. This can
+    /// include files whose physical unlink has already completed durably.
+    pub deletion_pending_files: u64,
+    /// Retained committed-byte charge through manifest finalization. This can
+    /// include bytes for files whose physical unlink has already completed.
+    pub deletion_pending_bytes: u64,
+    pub retry_attempts: u64,
+    pub oldest_pending_age_ms: Option<u64>,
+    pub oldest_pending_age_is_lower_bound: bool,
+    pub maintenance_turn: u64,
+    pub next_retry_turn: Option<u64>,
+    pub retry_state: BlobGcRetryState,
+    pub last_failure: Option<BlobGcFailureCategory>,
+    pub lineage_fence_rows: u64,
+    pub lineage_fence_bytes: u64,
+    pub lineage_fence_row_cap: u64,
+    pub lineage_fence_byte_cap: u64,
+    pub replay_fence_rows: u64,
+    pub replay_fence_bytes: u64,
+    pub replay_fence_row_cap: u64,
+    pub replay_fence_byte_cap: u64,
+    pub publication_lifecycle_rows: u64,
+    pub publication_lifecycle_row_cap: u64,
+}
+
+/// Result of one cursor-neutral, bounded capacity-reclamation attempt.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BlobCapacityGcProgress {
+    pub rows_examined: u64,
+    pub files_examined: u64,
+    pub bytes_examined: u64,
+    pub manifests_admitted: u64,
+    pub manifests_finalized: u64,
+}
+
+struct BlobCapacityPhysicalUnitProgress {
+    rows_examined: u64,
+    files_examined: u64,
+    bytes_examined: u64,
+    finalized: bool,
+    next_position: Option<Vec<u8>>,
+}
+
+enum BlobCapacityPhysicalStep {
+    Unit(BlobCapacityPhysicalUnitProgress),
+    Continue {
+        rows_examined: u64,
+        bytes_examined: u64,
+        next_position: Option<Vec<u8>>,
+    },
+    Exhausted {
+        rows_examined: u64,
+        bytes_examined: u64,
+    },
+    Blocked {
+        rows_examined: u64,
+        bytes_examined: u64,
+    },
+}
+
+enum BlobCapacityAdmissionStep {
+    Admitted {
+        rows_examined: u64,
+        bytes_examined: u64,
+        next_position: Vec<u8>,
+    },
+    Continue {
+        rows_examined: u64,
+        bytes_examined: u64,
+        next_position: Vec<u8>,
+    },
+    Exhausted {
+        rows_examined: u64,
+        bytes_examined: u64,
+    },
+    Blocked {
+        rows_examined: u64,
+        bytes_examined: u64,
+    },
+}
+
+const BLOB_CAPACITY_ADMISSION_PAGE_ROWS: u64 = 16;
+const BLOB_CAPACITY_ADMISSION_PAGE_BYTES: u64 = 256 * 1024;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BlobMetadata {
     transfer_id: BlobTransferId,
@@ -1236,6 +1347,19 @@ thread_local! {
     static TEST_BLOB_MANIFEST_ADMISSION_GENERATION_CHURN: std::cell::Cell<bool> = const {
         std::cell::Cell::new(false)
     };
+    static TEST_BLOB_CAPACITY_ADMISSION_PAGES: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+fn reset_capacity_admission_pages_for_test() {
+    TEST_BLOB_CAPACITY_ADMISSION_PAGES.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn take_capacity_admission_pages_for_test() -> u64 {
+    TEST_BLOB_CAPACITY_ADMISSION_PAGES.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
@@ -1282,6 +1406,7 @@ impl Store {
         &self,
         cursor: lifecycle::BlobMaintenanceCursor,
         budget: BlobMaintenanceBudget,
+        custody_sample: Option<aster_mesh::CustodySample>,
     ) -> Result<BlobMaintenanceProgress, StoreError> {
         let read = self.database.begin_read()?;
         if lifecycle::load_maintenance_cursor_read(&read)? != cursor {
@@ -1516,6 +1641,7 @@ impl Store {
             &candidate.import,
             &candidate.lineage,
             self.blob_depot_owner_binding,
+            custody_sample,
         )? {
             return Err(blob_error(BlobStoreError::SchemaInvariant(
                 "Blob manifest admission lost its exact candidate",
@@ -2111,6 +2237,100 @@ impl Store {
             stats,
         )?;
         Ok(stats)
+    }
+
+    /// Returns a sanitized audited snapshot of pending exact-manifest
+    /// reclamation and the permanent lifecycle authorities it cannot recover.
+    pub fn blob_gc_status(
+        &self,
+        sample: Option<aster_mesh::CustodySample>,
+    ) -> Result<BlobGcStatus, StoreError> {
+        self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        let stats = inspect_blob_tables_read(&read)?.stats;
+        let deletion =
+            deletion::audit_blob_deletion_read(&read, Some(self.blob_depot_owner_binding))?;
+        let mut retry_attempts = 0u64;
+        let mut oldest_pending_age_ms = None;
+        let mut oldest_pending_age_is_lower_bound = false;
+        let mut next_retry_turn = None;
+        let mut last_failure = None;
+        let mut last_failure_order = None;
+        for manifest in deletion.manifests.values() {
+            retry_attempts = retry_attempts
+                .checked_add(u64::from(manifest.retry.attempts))
+                .ok_or(StoreError::ItemCountAccountingOverflow)?;
+            let age = deletion::project_blob_deletion_age_read(&read, manifest.age, sample)?;
+            oldest_pending_age_is_lower_bound |= age.continuity_lost;
+            match oldest_pending_age_ms {
+                None => {
+                    oldest_pending_age_ms = Some(age.cumulative_age_ms);
+                }
+                Some(oldest) if age.cumulative_age_ms > oldest => {
+                    oldest_pending_age_ms = Some(age.cumulative_age_ms);
+                }
+                Some(_) => {}
+            }
+            if manifest.retry.next_retry_turn != 0
+                && next_retry_turn.is_none_or(|turn| manifest.retry.next_retry_turn < turn)
+            {
+                next_retry_turn = Some(manifest.retry.next_retry_turn);
+            }
+            if let (Some(failure_turn), Some(category)) =
+                (manifest.retry.failure_turn(), manifest.retry.category)
+                && last_failure_order.is_none_or(|(turn, variant)| {
+                    (failure_turn, manifest.variant_id) > (turn, variant)
+                })
+            {
+                last_failure_order = Some((failure_turn, manifest.variant_id));
+                last_failure = Some(match category {
+                    deletion::BlobDeletionFailureCategory::VariantDirectoryAccess => {
+                        BlobGcFailureCategory::VariantDirectoryAccess
+                    }
+                    deletion::BlobDeletionFailureCategory::ChunkUnlink => {
+                        BlobGcFailureCategory::ChunkUnlink
+                    }
+                    deletion::BlobDeletionFailureCategory::ChunkDirectorySync => {
+                        BlobGcFailureCategory::ChunkDirectorySync
+                    }
+                    deletion::BlobDeletionFailureCategory::VariantDirectoryRemove => {
+                        BlobGcFailureCategory::VariantDirectoryRemove
+                    }
+                    deletion::BlobDeletionFailureCategory::DepotDirectorySync => {
+                        BlobGcFailureCategory::DepotDirectorySync
+                    }
+                });
+            }
+        }
+        let retry_state = match next_retry_turn {
+            None => BlobGcRetryState::Idle,
+            Some(turn) if turn <= deletion.stats.maintenance_turn.saturating_add(1) => {
+                BlobGcRetryState::Ready
+            }
+            Some(_) => BlobGcRetryState::Deferred,
+        };
+        let limits = self.blob_lifecycle_limits;
+        Ok(BlobGcStatus {
+            deletion_pending_files: deletion.stats.charged_files,
+            deletion_pending_bytes: deletion.stats.charged_committed_bytes,
+            retry_attempts,
+            oldest_pending_age_ms,
+            oldest_pending_age_is_lower_bound,
+            maintenance_turn: deletion.stats.maintenance_turn,
+            next_retry_turn,
+            retry_state,
+            last_failure,
+            lineage_fence_rows: stats.lineage_fences,
+            lineage_fence_bytes: stats.lineage_fence_bytes,
+            lineage_fence_row_cap: limits.max_lineage_rows(),
+            lineage_fence_byte_cap: limits.max_lineage_bytes(),
+            replay_fence_rows: stats.replay_fences,
+            replay_fence_bytes: stats.replay_fence_bytes,
+            replay_fence_row_cap: limits.max_replay_rows(),
+            replay_fence_byte_cap: limits.max_replay_bytes(),
+            publication_lifecycle_rows: stats.publication_lifecycle_rows,
+            publication_lifecycle_row_cap: limits.max_publication_rows(),
+        })
     }
 
     /// Atomically stages one complete source-authenticated manifest and its
@@ -3098,8 +3318,9 @@ impl Store {
     /// Depot import/chunk staging is deliberately retained and remains charged
     /// to the configured physical quotas. That fail-closed choice avoids an
     /// unbounded global reference scan on a contact-triggered abort and
-    /// preserves the same-epoch physical-lineage fence. A future explicit
-    /// garbage-collection protocol may reclaim such abandoned staging.
+    /// preserves the same-epoch physical-lineage fence. Bounded background
+    /// maintenance may later admit the now-unreferenced exact variant to a
+    /// durable deletion manifest; the abort itself never deletes depot files.
     pub fn abort_pending_blob_source(&self, source: BlobTransferId) -> Result<bool, StoreError> {
         self.require_live()?;
         let authority = self.require_bound_mission()?;
@@ -5419,6 +5640,36 @@ fn bounded_import_maintenance_page_read(
     })
 }
 
+fn bounded_capacity_import_page_read(
+    read: &redb::ReadTransaction,
+    after: Option<&[u8]>,
+    budget: BlobMaintenanceBudget,
+) -> Result<MaintenancePage, StoreError> {
+    let total_rows = read.open_table(BLOB_IMPORTS)?.len()?;
+    let mut rows = Vec::new();
+    let mut charge = MaintenanceCharge {
+        budget,
+        rows: 0,
+        bytes: 0,
+    };
+    let complete = append_import_maintenance_range_read(
+        read,
+        after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
+        std::ops::Bound::Unbounded,
+        total_rows,
+        &mut rows,
+        &mut charge,
+    )?;
+    #[cfg(test)]
+    TEST_BLOB_CAPACITY_ADMISSION_PAGES.with(|count| count.set(count.get().saturating_add(1)));
+    Ok(MaintenancePage {
+        rows,
+        rows_examined: charge.rows,
+        bytes: charge.bytes,
+        complete,
+    })
+}
+
 fn validate_reference_root_read(
     read: &redb::ReadTransaction,
     evidence: &MaintenanceReferenceEvidence,
@@ -5585,6 +5836,442 @@ fn manifest_admission_progress(
 }
 
 impl Store {
+    fn admit_one_capacity_manifest(
+        &self,
+        after: Option<&[u8]>,
+        rows_budget: u64,
+        bytes_budget: u64,
+        custody_sample: Option<aster_mesh::CustodySample>,
+    ) -> Result<BlobCapacityAdmissionStep, StoreError> {
+        let page_rows = rows_budget.min(BLOB_CAPACITY_ADMISSION_PAGE_ROWS);
+        let page_bytes = bytes_budget.min(BLOB_CAPACITY_ADMISSION_PAGE_BYTES);
+        let read = self.database.begin_read()?;
+        let page = bounded_capacity_import_page_read(
+            &read,
+            after,
+            BlobMaintenanceBudget::new(page_rows, 1, page_bytes)?,
+        )?;
+        let mut candidates = Vec::new();
+        for row in &page.rows {
+            let MaintenanceEvidence::Import(evidence) = &row.evidence else {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob capacity import row has wrong evidence",
+                )));
+            };
+            let projection = depot::maintenance_import_projection(&row.key, &row.value)?;
+            lifecycle::validate_maintenance_lineage_evidence(
+                projection.physical_lineage,
+                self.blob_depot_owner_binding,
+                &evidence.lineage,
+            )?;
+            let manifested =
+                deletion::variant_has_deletion_manifest_read(&read, projection.variant_id)?;
+            if let Some(reference) = evidence.reference.as_ref() {
+                validate_reference_root_read(&read, reference, projection.variant_id)?;
+                if manifested {
+                    return Err(blob_error(BlobStoreError::SchemaInvariant(
+                        "Blob deletion manifest has a live variant reference",
+                    )));
+                }
+                continue;
+            }
+            if !manifested {
+                candidates.push((
+                    row.position.clone(),
+                    projection.variant_id,
+                    row.value.clone(),
+                    evidence.lineage.clone(),
+                ));
+            }
+        }
+        drop(read);
+
+        for (candidate_position, variant, expected_import, expected_lineage) in candidates {
+            let _depot_guard = match self.blob_depot_lock.try_lock() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    return Ok(BlobCapacityAdmissionStep::Blocked {
+                        rows_examined: page.rows_examined,
+                        bytes_examined: page.bytes,
+                    });
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(blob_error(BlobStoreError::DepotIntegrity(
+                        "depot lock is poisoned",
+                    )));
+                }
+            };
+            let target = lease::BlobLeaseTarget::Variant(variant);
+            let snapshot = self
+                .blob_lease_registry
+                .snapshot(self.blob_depot_owner_binding, target)
+                .map_err(lease::store_error)?;
+            let write = self.database.begin_write()?;
+            enforce_live_write(&write)?;
+            if variant_has_valid_reference_write(&write, variant)?
+                || deletion::variant_has_deletion_manifest_write(&write, variant)?
+            {
+                continue;
+            }
+            let admission = match self.blob_lease_registry.try_mark_delete_pending(snapshot) {
+                Ok(admission) => admission,
+                Err(
+                    lease::BlobLeaseAcquireError::ActiveLeases
+                    | lease::BlobLeaseAcquireError::GenerationChanged
+                    | lease::BlobLeaseAcquireError::DeletePending,
+                ) => continue,
+                Err(error) => return Err(lease::store_error(error)),
+            };
+            if !deletion::admit_variant_write(
+                &write,
+                variant,
+                &expected_import,
+                &expected_lineage,
+                self.blob_depot_owner_binding,
+                custody_sample,
+            )? {
+                continue;
+            }
+            write.commit()?;
+            admission.durable_committed().map_err(lease::store_error)?;
+            return Ok(BlobCapacityAdmissionStep::Admitted {
+                rows_examined: page.rows_examined,
+                bytes_examined: page.bytes,
+                next_position: candidate_position,
+            });
+        }
+        if page.complete {
+            return Ok(BlobCapacityAdmissionStep::Exhausted {
+                rows_examined: page.rows_examined,
+                bytes_examined: page.bytes,
+            });
+        }
+        let Some(last) = page.rows.last() else {
+            return Ok(BlobCapacityAdmissionStep::Blocked {
+                rows_examined: page.rows_examined,
+                bytes_examined: page.bytes,
+            });
+        };
+        Ok(BlobCapacityAdmissionStep::Continue {
+            rows_examined: page.rows_examined,
+            bytes_examined: page.bytes,
+            next_position: last.position.clone(),
+        })
+    }
+
+    fn run_one_capacity_physical_unit(
+        &self,
+        position: Option<&[u8]>,
+        rows_budget: u64,
+        bytes_budget: u64,
+    ) -> Result<BlobCapacityPhysicalStep, StoreError> {
+        let read = self.database.begin_read()?;
+        let selection =
+            deletion::select_physical_work_read(&read, position, rows_budget, bytes_budget)?;
+        drop(read);
+        let work = match selection {
+            deletion::BlobDeletionSelection::Work(work) => *work,
+            deletion::BlobDeletionSelection::Continue {
+                position,
+                rows_examined,
+                bytes_examined,
+            } => {
+                self.require_live()?;
+                let write = self.database.begin_write()?;
+                enforce_live_write(&write)?;
+                deletion::advance_blob_deletion_maintenance_turn(&write)?;
+                write.commit()?;
+                return Ok(BlobCapacityPhysicalStep::Continue {
+                    rows_examined,
+                    bytes_examined,
+                    next_position: position,
+                });
+            }
+            deletion::BlobDeletionSelection::Complete {
+                rows_examined,
+                bytes_examined,
+            } => {
+                self.require_live()?;
+                let write = self.database.begin_write()?;
+                enforce_live_write(&write)?;
+                deletion::advance_blob_deletion_maintenance_turn(&write)?;
+                write.commit()?;
+                return Ok(BlobCapacityPhysicalStep::Exhausted {
+                    rows_examined,
+                    bytes_examined,
+                });
+            }
+        };
+        let _depot_guard = match self.blob_depot_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Ok(BlobCapacityPhysicalStep::Blocked {
+                    rows_examined: work.rows_examined,
+                    bytes_examined: work.bytes_examined,
+                });
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(blob_error(BlobStoreError::DepotIntegrity(
+                    "depot lock is poisoned",
+                )));
+            }
+        };
+        self.require_live()?;
+        let write = self.database.begin_write()?;
+        enforce_live_write(&write)?;
+        deletion::revalidate_physical_work_write(&write, &work)?;
+        let turn = deletion::advance_blob_deletion_maintenance_turn(&write)?;
+        write.commit()?;
+        let filesystem = match &work.kind {
+            deletion::BlobDeletionWorkKind::Chunk(chunk)
+            | deletion::BlobDeletionWorkKind::ReconcileUnmarkedChunk(chunk) => {
+                depot::delete_manifest_chunk(
+                    &self.path,
+                    self.backing_identity,
+                    self.blob_depot_owner_token,
+                    &work.manifest,
+                    chunk,
+                )
+                .map(|bytes| (1u64, bytes))
+            }
+            deletion::BlobDeletionWorkKind::AdvanceDirectoryPhase => Ok((0, 0)),
+            deletion::BlobDeletionWorkKind::RemoveDirectoryAndFinalize => {
+                depot::delete_manifest_variant_directory(
+                    &self.path,
+                    self.backing_identity,
+                    self.blob_depot_owner_token,
+                    work.manifest.variant_id,
+                )
+                .map(|()| (1, 0))
+            }
+        };
+        let (files, physical_bytes) = match filesystem {
+            Ok(progress) => progress,
+            Err(depot::ManifestDeletionError {
+                retry: Some(category),
+                files_examined,
+                bytes_examined,
+                ..
+            }) => {
+                let write = self.database.begin_write()?;
+                enforce_live_write(&write)?;
+                deletion::record_physical_failure_write(&write, &work, turn, category)?;
+                write.commit()?;
+                return Ok(BlobCapacityPhysicalStep::Unit(
+                    BlobCapacityPhysicalUnitProgress {
+                        rows_examined: work.rows_examined,
+                        files_examined,
+                        bytes_examined: work
+                            .bytes_examined
+                            .checked_add(bytes_examined)
+                            .ok_or(StoreError::PayloadByteAccountingOverflow)?,
+                        finalized: false,
+                        next_position: Some(work.position.clone()),
+                    },
+                ));
+            }
+            Err(error) => return Err(*error.error),
+        };
+        let finalized = matches!(
+            work.kind,
+            deletion::BlobDeletionWorkKind::RemoveDirectoryAndFinalize
+        );
+        let next_position = match &work.kind {
+            deletion::BlobDeletionWorkKind::AdvanceDirectoryPhase => None,
+            _ => Some(work.position.clone()),
+        };
+        let write = self.database.begin_write()?;
+        enforce_live_write(&write)?;
+        match work.kind {
+            deletion::BlobDeletionWorkKind::Chunk(_) => {
+                deletion::mark_chunk_deleted_write(&write, &work)?
+            }
+            deletion::BlobDeletionWorkKind::ReconcileUnmarkedChunk(_) => {
+                deletion::mark_unmarked_reconciled_write(&write, &work)?
+            }
+            deletion::BlobDeletionWorkKind::AdvanceDirectoryPhase => {
+                deletion::advance_directory_phase_write(&write, &work)?
+            }
+            deletion::BlobDeletionWorkKind::RemoveDirectoryAndFinalize => {
+                deletion::finalize_manifest_write(&write, &work)?;
+                deletion::manifest_finalization_mutation_boundary()?;
+            }
+        }
+        write.commit()?;
+        Ok(BlobCapacityPhysicalStep::Unit(
+            BlobCapacityPhysicalUnitProgress {
+                rows_examined: work.rows_examined,
+                files_examined: files,
+                bytes_examined: work
+                    .bytes_examined
+                    .checked_add(physical_bytes)
+                    .ok_or(StoreError::PayloadByteAccountingOverflow)?,
+                finalized,
+                next_position,
+            },
+        ))
+    }
+
+    /// Reclaims only already-unreferenced exact variants under independent
+    /// bounds. This path never opens the routine maintenance-cursor table.
+    #[doc(hidden)]
+    pub fn run_blob_capacity_gc(
+        &self,
+        budget: BlobMaintenanceBudget,
+        custody_sample: Option<aster_mesh::CustodySample>,
+    ) -> Result<BlobCapacityGcProgress, StoreError> {
+        self.require_live()?;
+        let mut progress = BlobCapacityGcProgress::default();
+        let mut physical_position = None;
+        let mut admission_position = None;
+        while progress.rows_examined < budget.rows
+            && progress.files_examined < budget.files
+            && progress.bytes_examined < budget.bytes
+        {
+            let rows_left = budget.rows - progress.rows_examined;
+            let bytes_left = budget.bytes - progress.bytes_examined;
+            match self.run_one_capacity_physical_unit(
+                physical_position.as_deref(),
+                rows_left,
+                bytes_left,
+            )? {
+                BlobCapacityPhysicalStep::Unit(unit) => {
+                    physical_position = unit.next_position;
+                    progress.rows_examined = progress
+                        .rows_examined
+                        .checked_add(unit.rows_examined)
+                        .ok_or(StoreError::ItemCountAccountingOverflow)?;
+                    progress.files_examined = progress
+                        .files_examined
+                        .checked_add(unit.files_examined)
+                        .ok_or(StoreError::ItemCountAccountingOverflow)?;
+                    progress.bytes_examined = progress
+                        .bytes_examined
+                        .checked_add(unit.bytes_examined)
+                        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+                    progress.manifests_finalized = progress
+                        .manifests_finalized
+                        .checked_add(u64::from(unit.finalized))
+                        .ok_or(StoreError::ItemCountAccountingOverflow)?;
+                    std::thread::yield_now();
+                    continue;
+                }
+                BlobCapacityPhysicalStep::Continue {
+                    rows_examined,
+                    bytes_examined,
+                    next_position,
+                } => {
+                    physical_position = next_position;
+                    progress.rows_examined = progress
+                        .rows_examined
+                        .checked_add(rows_examined)
+                        .ok_or(StoreError::ItemCountAccountingOverflow)?;
+                    progress.bytes_examined = progress
+                        .bytes_examined
+                        .checked_add(bytes_examined)
+                        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+                    if rows_examined == 0 && bytes_examined == 0 {
+                        break;
+                    }
+                    std::thread::yield_now();
+                    continue;
+                }
+                BlobCapacityPhysicalStep::Blocked {
+                    rows_examined,
+                    bytes_examined,
+                } => {
+                    progress.rows_examined = progress
+                        .rows_examined
+                        .checked_add(rows_examined)
+                        .ok_or(StoreError::ItemCountAccountingOverflow)?;
+                    progress.bytes_examined = progress
+                        .bytes_examined
+                        .checked_add(bytes_examined)
+                        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+                    break;
+                }
+                BlobCapacityPhysicalStep::Exhausted {
+                    rows_examined,
+                    bytes_examined,
+                } => {
+                    progress.rows_examined = progress
+                        .rows_examined
+                        .checked_add(rows_examined)
+                        .ok_or(StoreError::ItemCountAccountingOverflow)?;
+                    progress.bytes_examined = progress
+                        .bytes_examined
+                        .checked_add(bytes_examined)
+                        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+                }
+            }
+            if progress.rows_examined >= budget.rows || progress.bytes_examined >= budget.bytes {
+                break;
+            }
+            loop {
+                let rows_left = budget.rows - progress.rows_examined;
+                let bytes_left = budget.bytes - progress.bytes_examined;
+                let step = self.admit_one_capacity_manifest(
+                    admission_position.as_deref(),
+                    rows_left,
+                    bytes_left,
+                    custody_sample,
+                )?;
+                let (rows, bytes) = match &step {
+                    BlobCapacityAdmissionStep::Admitted {
+                        rows_examined,
+                        bytes_examined,
+                        ..
+                    }
+                    | BlobCapacityAdmissionStep::Continue {
+                        rows_examined,
+                        bytes_examined,
+                        ..
+                    }
+                    | BlobCapacityAdmissionStep::Exhausted {
+                        rows_examined,
+                        bytes_examined,
+                    }
+                    | BlobCapacityAdmissionStep::Blocked {
+                        rows_examined,
+                        bytes_examined,
+                    } => (*rows_examined, *bytes_examined),
+                };
+                progress.rows_examined = progress
+                    .rows_examined
+                    .checked_add(rows)
+                    .ok_or(StoreError::ItemCountAccountingOverflow)?;
+                progress.bytes_examined = progress
+                    .bytes_examined
+                    .checked_add(bytes)
+                    .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+                match step {
+                    BlobCapacityAdmissionStep::Admitted { next_position, .. } => {
+                        admission_position = Some(next_position);
+                        physical_position = None;
+                        progress.manifests_admitted = progress
+                            .manifests_admitted
+                            .checked_add(1)
+                            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+                        std::thread::yield_now();
+                        break;
+                    }
+                    BlobCapacityAdmissionStep::Continue { next_position, .. } => {
+                        admission_position = Some(next_position);
+                        if progress.rows_examined >= budget.rows
+                            || progress.bytes_examined >= budget.bytes
+                        {
+                            return Ok(progress);
+                        }
+                        std::thread::yield_now();
+                    }
+                    BlobCapacityAdmissionStep::Exhausted { .. }
+                    | BlobCapacityAdmissionStep::Blocked { .. } => return Ok(progress),
+                }
+            }
+        }
+        Ok(progress)
+    }
+
     fn run_blob_physical_deletion_turn(
         &self,
         cursor: lifecycle::BlobMaintenanceCursor,
@@ -5805,6 +6492,17 @@ impl Store {
         &self,
         budget: BlobMaintenanceBudget,
     ) -> Result<BlobMaintenanceProgress, StoreError> {
+        self.run_blob_maintenance_turn_with_sample(budget, None)
+    }
+
+    /// Runs one bounded maintenance turn while advancing conservative
+    /// monotonic deletion-age continuity from the runtime's mission clock.
+    #[doc(hidden)]
+    pub fn run_blob_maintenance_turn_with_sample(
+        &self,
+        budget: BlobMaintenanceBudget,
+        custody_sample: Option<aster_mesh::CustodySample>,
+    ) -> Result<BlobMaintenanceProgress, StoreError> {
         self.require_live()?;
         if budget.rows == 0 || budget.files == 0 || budget.bytes == 0 {
             return Err(blob_error(BlobStoreError::InvalidMaintenanceBudget));
@@ -5812,12 +6510,38 @@ impl Store {
         let read = self.database.begin_read()?;
         let discovered_cursor = lifecycle::load_maintenance_cursor_read(&read)?;
         drop(read);
+        if let Some(sample) = custody_sample {
+            let write = self.database.begin_write()?;
+            enforce_live_write(&write)?;
+            let age_progress = deletion::checkpoint_blob_deletion_ages_write(
+                &write,
+                sample,
+                budget.rows,
+                budget.bytes,
+            )?;
+            write.commit()?;
+            if age_progress.rows_examined != 0 || age_progress.has_more {
+                return Ok(BlobMaintenanceProgress {
+                    class: discovered_cursor.class,
+                    rows_examined: age_progress.rows_examined,
+                    files_examined: 0,
+                    bytes_examined: age_progress.bytes_examined,
+                    candidates: Vec::new(),
+                    class_has_more_work: age_progress.has_more,
+                    awaiting_later_handler: false,
+                });
+            }
+        }
         if matches!(
             discovered_cursor.class,
             BlobMaintenanceClass::UnreferencedLocalImportStaging
                 | BlobMaintenanceClass::UnreferencedCompletedVariants
         ) {
-            return self.run_blob_manifest_admission_turn(discovered_cursor, budget);
+            return self.run_blob_manifest_admission_turn(
+                discovered_cursor,
+                budget,
+                custody_sample,
+            );
         }
         if discovered_cursor.class == BlobMaintenanceClass::ManifestBackedPhysicalDeletion {
             return self.run_blob_physical_deletion_turn(discovered_cursor, budget);
@@ -11524,7 +12248,7 @@ mod tests {
         );
         assert!(
             target_root.chunk_path(old_variant, 0).is_file(),
-            "abandoned ciphertext remains quota-charged without an explicit GC protocol"
+            "abandoned ciphertext remains charged until bounded GC finalization"
         );
         let retired_stats = target.blob_stats().expect("retired lineage stats");
         assert_eq!(retired_stats.variants, 1);
@@ -21201,7 +21925,7 @@ mod tests {
     }
 
     #[test]
-    fn blob_maintenance_restart_preserves_the_exact_next_class() {
+    fn blob_gc_persists_fair_cursor_across_bounded_pages() {
         // Break caught: startup must not reconstruct scheduling at the first
         // precedence class after a clean restart.
         let budget = maintenance_budget(2);
@@ -22314,6 +23038,1224 @@ mod tests {
     }
 
     #[test]
+    fn blob_gc_status_reports_sanitized_pending_files_bytes_retries() {
+        // Break caught: deletion manifests that still own physical charge must
+        // be visible without exposing a variant, lineage, or filesystem path.
+        let root = BlobTestRoot::new("gc-status-pending");
+        let services = blob_services(0xb1);
+        let store =
+            Store::open_for_mission(&root.database, services.authority).expect("GC status store");
+        let variant = install_unreferenced_variant(
+            &store,
+            &services,
+            &vec![0x51; SELECTED_BLOB_CHUNK_SIZE as usize + 9],
+            1,
+            true,
+        );
+        store
+            .test_admit_blob_deletion_manifest(variant)
+            .expect("admit GC status manifest");
+        let read = store.database.begin_read().expect("select retry fixture");
+        let deletion::BlobDeletionSelection::Work(work) =
+            deletion::select_physical_work_read(&read, None, u64::MAX, u64::MAX)
+                .expect("select retry work")
+        else {
+            panic!("pending manifest must select physical work");
+        };
+        drop(read);
+        let write = store.database.begin_write().expect("record retry fixture");
+        let turn = deletion::advance_blob_deletion_maintenance_turn(&write)
+            .expect("advance retry fixture turn");
+        deletion::record_physical_failure_write(
+            &write,
+            &work,
+            turn,
+            deletion::BlobDeletionFailureCategory::ChunkUnlink,
+        )
+        .expect("record sanitized retry");
+        write.commit().expect("commit retry fixture");
+
+        let status = store
+            .blob_gc_status(Some(CustodySample {
+                clock_id: [0x11; 16],
+                tick_ms: 40,
+            }))
+            .expect("GC status");
+        assert_eq!(status.deletion_pending_files, 2);
+        assert!(status.deletion_pending_bytes > 0);
+        assert_eq!(status.retry_attempts, 1);
+        assert_eq!(status.next_retry_turn, Some(2));
+        assert_eq!(status.retry_state, BlobGcRetryState::Ready);
+        assert_eq!(
+            status.last_failure,
+            Some(BlobGcFailureCategory::ChunkUnlink)
+        );
+        assert_eq!(status.oldest_pending_age_ms, Some(0));
+    }
+
+    #[test]
+    fn blob_gc_status_reports_security_fence_and_publication_lifecycle_usage_and_caps() {
+        // Break caught: status must not describe reclaimable bulk bytes while
+        // omitting the permanent security authorities that GC cannot recover.
+        let root = BlobTestRoot::new("gc-status-security-capacity");
+        let services = blob_services(0xb2);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("GC capacity status store");
+        let status = store.blob_gc_status(None).expect("empty GC status");
+        let limits = store.blob_lifecycle_limits();
+        assert_eq!(status.lineage_fence_rows, 0);
+        assert_eq!(status.lineage_fence_row_cap, limits.max_lineage_rows());
+        assert_eq!(status.lineage_fence_byte_cap, limits.max_lineage_bytes());
+        assert_eq!(status.replay_fence_rows, 0);
+        assert_eq!(status.replay_fence_row_cap, limits.max_replay_rows());
+        assert_eq!(status.replay_fence_byte_cap, limits.max_replay_bytes());
+        assert_eq!(status.publication_lifecycle_rows, 0);
+        assert_eq!(
+            status.publication_lifecycle_row_cap,
+            limits.max_publication_rows()
+        );
+    }
+
+    #[test]
+    fn blob_gc_oldest_pending_age_is_conservative_across_clock_domain_loss() {
+        // Break caught: loss of monotonic-domain continuity must preserve the
+        // accumulated lower bound and mark it conservative, never synthesize
+        // elapsed wall-clock time.
+        let root = BlobTestRoot::new("gc-status-age-domain-loss");
+        let services = blob_services(0xb5);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("GC age status store");
+        let variant =
+            install_unreferenced_variant(&store, &services, b"pending deletion age", 1, true);
+        store
+            .test_admit_blob_deletion_manifest(variant)
+            .expect("admit deletion-age manifest");
+        let first = CustodySample {
+            clock_id: [0x31; 16],
+            tick_ms: 10,
+        };
+        let write = store.database.begin_write().expect("age fixture write");
+        let continuity = deletion::observe_blob_deletion_continuity_write(&write, first)
+            .expect("initial deletion continuity");
+        deletion::set_blob_deletion_age_for_test(
+            &write,
+            variant,
+            deletion::BlobDeletionAge {
+                cumulative_age_ms: 7,
+                checkpoint: Some(first),
+                continuity_generation: continuity.generation,
+                continuity_lost: false,
+            },
+            Some(continuity),
+        )
+        .expect("set deletion age");
+        write.commit().expect("commit deletion age");
+
+        let same = store
+            .blob_gc_status(Some(CustodySample {
+                clock_id: first.clock_id,
+                tick_ms: 43,
+            }))
+            .expect("same-domain deletion age");
+        assert_eq!(same.oldest_pending_age_ms, Some(40));
+        assert!(!same.oldest_pending_age_is_lower_bound);
+        let lost = store
+            .blob_gc_status(Some(CustodySample {
+                clock_id: [0x32; 16],
+                tick_ms: 9_999_999,
+            }))
+            .expect("lost-domain deletion age");
+        assert_eq!(lost.oldest_pending_age_ms, Some(7));
+        assert!(lost.oldest_pending_age_is_lower_bound);
+    }
+
+    #[test]
+    fn blob_gc_oldest_pending_age_flag_covers_any_lower_bound_manifest() {
+        // Break caught: the aggregate flag describes the whole pending set,
+        // not only the manifest with the numerically greatest age.
+        let root = BlobTestRoot::new("gc-status-age-aggregate-lower-bound");
+        let services = blob_services(0xb9);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("aggregate age status store");
+        let exact = install_unreferenced_variant(&store, &services, b"older exact age", 1, true);
+        let lower =
+            install_unreferenced_variant(&store, &services, b"younger lower-bound age", 1, true);
+        store
+            .test_admit_blob_deletion_manifest(exact)
+            .expect("admit exact age manifest");
+        store
+            .test_admit_blob_deletion_manifest(lower)
+            .expect("admit lower-bound age manifest");
+        let sample = CustodySample {
+            clock_id: [0x41; 16],
+            tick_ms: 10,
+        };
+        let write = store.database.begin_write().expect("aggregate age write");
+        let continuity = deletion::observe_blob_deletion_continuity_write(&write, sample)
+            .expect("aggregate age continuity");
+        deletion::set_blob_deletion_age_for_test(
+            &write,
+            exact,
+            deletion::BlobDeletionAge {
+                cumulative_age_ms: 100,
+                checkpoint: Some(sample),
+                continuity_generation: continuity.generation,
+                continuity_lost: false,
+            },
+            Some(continuity),
+        )
+        .expect("set exact age");
+        deletion::set_blob_deletion_age_for_test(
+            &write,
+            lower,
+            deletion::BlobDeletionAge {
+                cumulative_age_ms: 10,
+                checkpoint: Some(sample),
+                continuity_generation: continuity.generation,
+                continuity_lost: true,
+            },
+            Some(continuity),
+        )
+        .expect("set lower-bound age");
+        write.commit().expect("commit aggregate ages");
+
+        let status = store
+            .blob_gc_status(Some(sample))
+            .expect("aggregate status");
+        assert_eq!(status.oldest_pending_age_ms, Some(100));
+        assert!(status.oldest_pending_age_is_lower_bound);
+    }
+
+    #[test]
+    fn blob_gc_maintenance_durably_reanchors_pending_ages_within_budget() {
+        // Break caught: a clock-domain change must checkpoint every pending
+        // manifest's known old-domain elapsed time before the old anchor is
+        // retired, then accumulate only trusted new-domain elapsed time.
+        let root = BlobTestRoot::new("gc-age-production-reanchor");
+        let services = blob_services(0xba);
+        let mut store = Store::open_for_mission(&root.database, services.authority)
+            .expect("age reanchor store");
+        let variants = [
+            install_unreferenced_variant(&store, &services, b"age reanchor one", 1, true),
+            install_unreferenced_variant(&store, &services, b"age reanchor two", 1, true),
+            install_unreferenced_variant(&store, &services, b"age reanchor three", 1, true),
+        ];
+        for variant in variants {
+            store
+                .test_admit_blob_deletion_manifest(variant)
+                .expect("admit age reanchor manifest");
+        }
+        let old_start = CustodySample {
+            clock_id: [0x51; 16],
+            tick_ms: 10,
+        };
+        let write = store.database.begin_write().expect("age reanchor fixture");
+        let continuity = deletion::observe_blob_deletion_continuity_write(&write, old_start)
+            .expect("initial age continuity");
+        for variant in variants {
+            deletion::set_blob_deletion_age_for_test(
+                &write,
+                variant,
+                deletion::BlobDeletionAge {
+                    cumulative_age_ms: 7,
+                    checkpoint: Some(old_start),
+                    continuity_generation: continuity.generation,
+                    continuity_lost: false,
+                },
+                Some(continuity),
+            )
+            .expect("set initial manifest age");
+        }
+        write.commit().expect("commit initial ages");
+
+        let old_high_water = CustodySample {
+            clock_id: old_start.clock_id,
+            tick_ms: 50,
+        };
+        store
+            .run_blob_maintenance_turn_with_sample(
+                BlobMaintenanceBudget::new(1, 1, 1).expect("continuity-only budget"),
+                Some(old_high_water),
+            )
+            .expect("persist old high water");
+        let new_anchor = CustodySample {
+            clock_id: [0x52; 16],
+            tick_ms: 5,
+        };
+        for index in 0..variants.len() {
+            let progress = store
+                .run_blob_maintenance_turn_with_sample(
+                    BlobMaintenanceBudget::new(1, 1, 2 * 1024 * 1024)
+                        .expect("one-manifest age budget"),
+                    Some(new_anchor),
+                )
+                .expect("bounded age reanchor unit");
+            assert_eq!(progress.rows_examined, 1);
+            assert_eq!(progress.files_examined, 0);
+            assert!(progress.bytes_examined <= 2 * 1024 * 1024);
+            if index == 0 {
+                drop(store);
+                store = Store::open_for_mission(&root.database, services.authority)
+                    .expect("reopen valid mid-transition age checkpoint");
+            }
+        }
+        for variant in variants {
+            let manifest = deletion_manifest_for_test(&store, variant);
+            assert_eq!(manifest.age.cumulative_age_ms, 47);
+            assert_eq!(manifest.age.checkpoint, Some(new_anchor));
+            assert!(manifest.age.continuity_lost);
+        }
+
+        let new_high_water = CustodySample {
+            clock_id: new_anchor.clock_id,
+            tick_ms: 25,
+        };
+        store
+            .run_blob_maintenance_turn_with_sample(
+                BlobMaintenanceBudget::new(1, 1, 1).expect("new continuity budget"),
+                Some(new_high_water),
+            )
+            .expect("advance new-domain high water");
+        let before_restart = store
+            .blob_gc_status(Some(new_high_water))
+            .expect("age before restart");
+        assert_eq!(before_restart.oldest_pending_age_ms, Some(67));
+        assert!(before_restart.oldest_pending_age_is_lower_bound);
+        drop(store);
+
+        let reopened = Store::open_for_mission(&root.database, services.authority)
+            .expect("reopen age reanchor store");
+        let after_restart = reopened
+            .blob_gc_status(Some(new_high_water))
+            .expect("age after restart");
+        assert_eq!(after_restart.oldest_pending_age_ms, Some(67));
+        assert!(after_restart.oldest_pending_age_is_lower_bound);
+    }
+
+    #[test]
+    fn blob_gc_recurring_clock_domain_churn_makes_bounded_restart_progress() {
+        // Break caught: startup-style one-page turns supplied only by later
+        // clock domains must keep draining frozen age transitions. Manifests
+        // admitted after D and E appear start at zero, never join historical
+        // A/B/C work, and survive reopen without requiring C to reappear.
+        let root = BlobTestRoot::new("gc-age-recurring-domain-churn");
+        let services = blob_services(0xca);
+        let mut store = Store::open_for_mission(&root.database, services.authority)
+            .expect("domain-churn store");
+        let old_variants = [
+            install_unreferenced_variant(&store, &services, b"nested old one", 1, true),
+            install_unreferenced_variant(&store, &services, b"nested old two", 1, true),
+            install_unreferenced_variant(&store, &services, b"nested old three", 1, true),
+            install_unreferenced_variant(&store, &services, b"nested old four", 1, true),
+            install_unreferenced_variant(&store, &services, b"nested old five", 1, true),
+        ];
+        for variant in old_variants {
+            store
+                .test_admit_blob_deletion_manifest(variant)
+                .expect("admit nested old manifest");
+        }
+        let a_start = CustodySample {
+            clock_id: [0xa1; 16],
+            tick_ms: 10,
+        };
+        let write = store.database.begin_write().expect("nested age fixture");
+        let continuity = deletion::observe_blob_deletion_continuity_write(&write, a_start)
+            .expect("anchor A continuity");
+        for variant in old_variants {
+            deletion::set_blob_deletion_age_for_test(
+                &write,
+                variant,
+                deletion::BlobDeletionAge {
+                    cumulative_age_ms: 7,
+                    checkpoint: Some(a_start),
+                    continuity_generation: continuity.generation,
+                    continuity_lost: false,
+                },
+                Some(continuity),
+            )
+            .expect("set A-domain old age");
+        }
+        write.commit().expect("commit nested fixture");
+
+        let a_high = CustodySample {
+            clock_id: a_start.clock_id,
+            tick_ms: 50,
+        };
+        store
+            .run_blob_maintenance_turn_with_sample(maintenance_budget(1), Some(a_high))
+            .expect("persist A high water");
+        let b_anchor = CustodySample {
+            clock_id: [0xb2; 16],
+            tick_ms: 5,
+        };
+        let first_b_page = store
+            .run_blob_maintenance_turn_with_sample(maintenance_budget(1), Some(b_anchor))
+            .expect("start bounded A to B transition");
+        assert_eq!(first_b_page.rows_examined, 1);
+        assert!(first_b_page.class_has_more_work);
+        let b_high = CustodySample {
+            clock_id: b_anchor.clock_id,
+            tick_ms: 100,
+        };
+        store
+            .run_blob_maintenance_turn_with_sample(
+                BlobMaintenanceBudget::new(1, 1, 1).expect("continuity-only budget"),
+                Some(b_high),
+            )
+            .expect("advance B high water without finishing transition");
+        drop(store);
+
+        store = Store::open_for_mission(&root.database, services.authority)
+            .expect("reopen active A to B transition");
+        let c_anchor = CustodySample {
+            clock_id: [0xc3; 16],
+            tick_ms: 7,
+        };
+        store
+            .run_blob_maintenance_turn_with_sample(
+                BlobMaintenanceBudget::new(1, 1, 1).expect("nested-domain observation budget"),
+                Some(c_anchor),
+            )
+            .expect("persist C while A to B remains active");
+
+        let new_variant =
+            install_unreferenced_variant(&store, &services, b"admitted after C", 1, true);
+        match store
+            .admit_one_capacity_manifest(None, 16, 2 * 1024 * 1024, Some(c_anchor))
+            .expect("production capacity admission after C")
+        {
+            BlobCapacityAdmissionStep::Admitted { .. } => {}
+            _ => panic!("C-domain capacity admission must select its only import"),
+        }
+        let admitted = deletion_manifest_for_test(&store, new_variant);
+        assert_eq!(admitted.age.cumulative_age_ms, 0);
+        assert_eq!(admitted.age.checkpoint, Some(c_anchor));
+
+        let c_high = CustodySample {
+            clock_id: c_anchor.clock_id,
+            tick_ms: 27,
+        };
+        store
+            .run_blob_maintenance_turn_with_sample(
+                BlobMaintenanceBudget::new(1, 1, 1).expect("C high-water budget"),
+                Some(c_high),
+            )
+            .expect("advance frozen C high water");
+
+        let d_anchor = CustodySample {
+            clock_id: [0xd4; 16],
+            tick_ms: 3,
+        };
+        let bounded = store
+            .run_blob_maintenance_turn_with_sample(maintenance_budget(1), Some(d_anchor))
+            .expect("D must continue the frozen transition without C returning");
+        assert_eq!(bounded.rows_examined, 1);
+        assert!(bounded.bytes_examined <= maintenance_budget(1).bytes);
+        assert!(bounded.class_has_more_work);
+        drop(store);
+        store = Store::open_for_mission(&root.database, services.authority)
+            .expect("reopen after first D startup page");
+
+        let d_variant =
+            install_unreferenced_variant(&store, &services, b"admitted after D", 1, true);
+        match store
+            .admit_one_capacity_manifest(None, 16, 2 * 1024 * 1024, Some(d_anchor))
+            .expect("production capacity admission after D")
+        {
+            BlobCapacityAdmissionStep::Admitted { .. } => {}
+            _ => panic!("D-domain capacity admission must select its only import"),
+        }
+        let d_admitted = deletion_manifest_for_test(&store, d_variant);
+        assert_eq!(d_admitted.age.cumulative_age_ms, 0);
+        assert_eq!(d_admitted.age.checkpoint, None);
+
+        let bounded = store
+            .run_blob_maintenance_turn_with_sample(maintenance_budget(1), Some(d_anchor))
+            .expect("recurring D must keep draining frozen work after admission");
+        assert_eq!(bounded.rows_examined, 1);
+        assert!(bounded.bytes_examined <= maintenance_budget(1).bytes);
+        assert!(bounded.class_has_more_work);
+        drop(store);
+        store = Store::open_for_mission(&root.database, services.authority)
+            .expect("reopen after recurring D startup page");
+
+        let e_anchor = CustodySample {
+            clock_id: [0xe5; 16],
+            tick_ms: 11,
+        };
+        let bounded = store
+            .run_blob_maintenance_turn_with_sample(maintenance_budget(1), Some(e_anchor))
+            .expect("E must continue frozen work while D is queued");
+        assert_eq!(bounded.rows_examined, 1);
+        assert!(bounded.bytes_examined <= maintenance_budget(1).bytes);
+        assert!(bounded.class_has_more_work);
+        drop(store);
+        store = Store::open_for_mission(&root.database, services.authority)
+            .expect("reopen after first E startup page");
+
+        let e_variant =
+            install_unreferenced_variant(&store, &services, b"admitted after E", 1, true);
+        match store
+            .admit_one_capacity_manifest(None, 16, 2 * 1024 * 1024, Some(e_anchor))
+            .expect("production capacity admission during unrepresentable E churn")
+        {
+            BlobCapacityAdmissionStep::Admitted { .. } => {}
+            _ => panic!("E-domain capacity admission must select its only import"),
+        }
+        let e_admitted = deletion_manifest_for_test(&store, e_variant);
+        assert_eq!(e_admitted.age.cumulative_age_ms, 0);
+        assert_eq!(e_admitted.age.checkpoint, None);
+
+        let mut completed = false;
+        for turn in 0..64 {
+            let progress = store
+                .run_blob_maintenance_turn_with_sample(maintenance_budget(1), Some(e_anchor))
+                .expect("recurring E must complete queued work one bounded row at a time");
+            assert!(progress.rows_examined <= 1);
+            assert!(progress.bytes_examined <= maintenance_budget(1).bytes);
+            if progress.rows_examined != 0 && !progress.class_has_more_work {
+                completed = true;
+                break;
+            }
+            drop(store);
+            store = Store::open_for_mission(&root.database, services.authority).unwrap_or_else(
+                |error| panic!("reopen between startup-style E pages at turn {turn}: {error:?}"),
+            );
+        }
+        assert!(
+            completed,
+            "recurring later-domain turns must complete every fixed membership"
+        );
+
+        let new_after = deletion_manifest_for_test(&store, new_variant);
+        assert_eq!(new_after.age.cumulative_age_ms, 20);
+        assert_eq!(new_after.age.checkpoint, Some(e_anchor));
+        for variant in old_variants {
+            let old = deletion_manifest_for_test(&store, variant);
+            assert_eq!(old.age.cumulative_age_ms, 162);
+            assert_eq!(old.age.checkpoint, Some(e_anchor));
+            assert!(old.age.continuity_lost);
+        }
+        let d_after = deletion_manifest_for_test(&store, d_variant);
+        assert_eq!(d_after.age.cumulative_age_ms, 0);
+        assert_eq!(d_after.age.checkpoint, Some(e_anchor));
+        let e_after = deletion_manifest_for_test(&store, e_variant);
+        assert_eq!(e_after.age.cumulative_age_ms, 0);
+        assert_eq!(e_after.age.checkpoint, Some(e_anchor));
+        assert!(e_after.age.continuity_lost);
+
+        let e_high = CustodySample {
+            clock_id: e_anchor.clock_id,
+            tick_ms: 31,
+        };
+        let read = store.database.begin_read().expect("read final nested ages");
+        let projected_c =
+            deletion::project_blob_deletion_age_read(&read, new_after.age, Some(e_high))
+                .expect("project C-admitted age after E");
+        assert_eq!(projected_c.cumulative_age_ms, 40);
+        for variant in old_variants {
+            let projected_old = deletion::project_blob_deletion_age_read(
+                &read,
+                deletion_manifest_for_test(&store, variant).age,
+                Some(e_high),
+            )
+            .expect("project old nested age");
+            assert_eq!(projected_old.cumulative_age_ms, 182);
+        }
+        let projected_d =
+            deletion::project_blob_deletion_age_read(&read, d_after.age, Some(e_high))
+                .expect("project D-admitted age after E");
+        assert_eq!(projected_d.cumulative_age_ms, 20);
+        let projected_e =
+            deletion::project_blob_deletion_age_read(&read, e_after.age, Some(e_high))
+                .expect("project E-admitted age after E");
+        assert_eq!(projected_e.cumulative_age_ms, 20);
+        drop(read);
+        drop(store);
+
+        let reopened = Store::open_for_mission(&root.database, services.authority)
+            .expect("reopen after arbitrary-domain continuity completion");
+        let after_restart = reopened
+            .blob_gc_status(Some(e_high))
+            .expect("audit completed arbitrary-domain continuity");
+        assert_eq!(after_restart.oldest_pending_age_ms, Some(182));
+        assert!(after_restart.oldest_pending_age_is_lower_bound);
+    }
+
+    #[test]
+    fn blob_gc_reopen_rejects_inconsistent_continuity_transition_membership() {
+        // Break caught: a structurally valid v2 record is still corrupt when
+        // its durable remaining membership or cursor disagrees with manifests.
+        for (index, label) in [
+            "remaining-overstated",
+            "remaining-understated",
+            "cursor-skips-old-row",
+            "cursor-orders-after-old-row",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let root = BlobTestRoot::new(&format!("gc-transition-audit-{label}"));
+            let services = blob_services(0xc4 + u8::try_from(index).expect("case index"));
+            let store = Store::open_for_mission(&root.database, services.authority)
+                .expect("transition audit store");
+            let mut variants = [
+                install_unreferenced_variant(&store, &services, &[0x71, index as u8], 1, true),
+                install_unreferenced_variant(&store, &services, &[0x81, index as u8], 1, true),
+            ];
+            variants.sort_unstable();
+            for variant in variants {
+                store
+                    .test_admit_blob_deletion_manifest(variant)
+                    .expect("admit transition audit manifest");
+            }
+            let previous_sample = CustodySample {
+                clock_id: [0x61; 16],
+                tick_ms: 50,
+            };
+            let previous = deletion::BlobDeletionContinuity {
+                generation: 1,
+                last_sample: previous_sample,
+            };
+            let anchor = CustodySample {
+                clock_id: [0x62; 16],
+                tick_ms: 5,
+            };
+            let current = deletion::BlobDeletionContinuity {
+                generation: 2,
+                last_sample: anchor,
+            };
+            let write = store.database.begin_write().expect("transition fixture");
+            for variant in variants {
+                deletion::set_blob_deletion_age_for_test(
+                    &write,
+                    variant,
+                    deletion::BlobDeletionAge {
+                        cumulative_age_ms: 10,
+                        checkpoint: Some(previous_sample),
+                        continuity_generation: previous.generation,
+                        continuity_lost: false,
+                    },
+                    Some(previous),
+                )
+                .expect("set previous-generation age");
+            }
+            if label == "cursor-orders-after-old-row" {
+                deletion::set_blob_deletion_age_for_test(
+                    &write,
+                    variants[1],
+                    deletion::BlobDeletionAge {
+                        cumulative_age_ms: 10,
+                        checkpoint: Some(anchor),
+                        continuity_generation: current.generation,
+                        continuity_lost: true,
+                    },
+                    Some(previous),
+                )
+                .expect("set checkpointed later row");
+            }
+            let (after, remaining) = match label {
+                "remaining-overstated" => (None, 3),
+                "remaining-understated" => (None, 1),
+                "cursor-skips-old-row" => (Some(variants[0]), 2),
+                "cursor-orders-after-old-row" => (Some(variants[1]), 1),
+                _ => unreachable!(),
+            };
+            deletion::set_blob_deletion_continuity_transition_for_test(
+                &write, previous, current, anchor, after, remaining,
+            )
+            .expect("write well-formed inconsistent transition");
+            write.commit().expect("commit transition corruption");
+            let read = store.database.begin_read().expect("full audit read");
+            let audit_error =
+                deletion::inspect_blob_deletion_read(&read, Some(store.blob_depot_owner_binding))
+                    .expect_err("full audit must reject inconsistent transition");
+            assert_blob_schema_invariant(&audit_error);
+            drop(read);
+            drop(store);
+
+            let error = match Store::open_for_mission(&root.database, services.authority) {
+                Ok(_) => panic!("reopen must reject {label}"),
+                Err(error) => error,
+            };
+            assert_blob_schema_invariant(&error);
+        }
+    }
+
+    #[test]
+    fn blob_gc_reopen_rejects_inexact_deferred_continuity_membership() {
+        // Break caught: the bounded v4 state must audit the exact set of
+        // unanchored rows excluded from frozen active and queued transitions.
+        for (index, durable_deferred) in [0u64, 2].into_iter().enumerate() {
+            let root = BlobTestRoot::new(&format!("gc-deferred-audit-{durable_deferred}"));
+            let services = blob_services(0xce + u8::try_from(index).expect("case index"));
+            let store = Store::open_for_mission(&root.database, services.authority)
+                .expect("deferred audit store");
+            let variant = install_unreferenced_variant(
+                &store,
+                &services,
+                &[0x91, u8::try_from(index).expect("fixture byte")],
+                1,
+                true,
+            );
+            store
+                .test_admit_blob_deletion_manifest(variant)
+                .expect("admit deferred audit manifest");
+            let authority = deletion::BlobDeletionContinuity {
+                generation: 1,
+                last_sample: CustodySample {
+                    clock_id: [0x91; 16],
+                    tick_ms: 10,
+                },
+            };
+            let write = store
+                .database
+                .begin_write()
+                .expect("deferred audit fixture");
+            deletion::set_blob_deletion_age_for_test(
+                &write,
+                variant,
+                deletion::BlobDeletionAge {
+                    cumulative_age_ms: 0,
+                    checkpoint: None,
+                    continuity_generation: authority.generation,
+                    continuity_lost: true,
+                },
+                Some(authority),
+            )
+            .expect("set deferred manifest age");
+            deletion::set_blob_deletion_deferred_count_for_test(&write, durable_deferred)
+                .expect("corrupt deferred count");
+            write.commit().expect("commit deferred corruption");
+
+            let read = store
+                .database
+                .begin_read()
+                .expect("deferred full audit read");
+            let audit_error =
+                deletion::inspect_blob_deletion_read(&read, Some(store.blob_depot_owner_binding))
+                    .expect_err("full audit must reject inexact deferred membership");
+            assert_blob_schema_invariant(&audit_error);
+            drop(read);
+            drop(store);
+
+            let error = match Store::open_for_mission(&root.database, services.authority) {
+                Ok(_) => panic!("reopen must reject deferred count {durable_deferred}"),
+                Err(error) => error,
+            };
+            assert_blob_schema_invariant(&error);
+        }
+    }
+
+    #[test]
+    fn blob_gc_reopen_rejects_nonzero_deferred_age() {
+        // Break caught: an exact-counted v4 deferred row is newly admitted at
+        // age zero. Corrupt cumulative age must fail every full audit before
+        // status can expose the fabricated lower bound.
+        for (index, cumulative_age_ms) in [1u64, u64::MAX].into_iter().enumerate() {
+            let root = BlobTestRoot::new(&format!("gc-deferred-age-canonical-{cumulative_age_ms}"));
+            let services = blob_services(0xd8 + u8::try_from(index).expect("case index"));
+            let store = Store::open_for_mission(&root.database, services.authority)
+                .expect("deferred age canonicality store");
+            let variant = install_unreferenced_variant(
+                &store,
+                &services,
+                &[0xa1, u8::try_from(index).expect("fixture byte")],
+                1,
+                true,
+            );
+            store
+                .test_admit_blob_deletion_manifest(variant)
+                .expect("admit deferred age manifest");
+            let authority = deletion::BlobDeletionContinuity {
+                generation: 1,
+                last_sample: CustodySample {
+                    clock_id: [0xa1; 16],
+                    tick_ms: 10,
+                },
+            };
+            let write = store
+                .database
+                .begin_write()
+                .expect("canonical deferred age fixture");
+            deletion::set_blob_deletion_age_for_test(
+                &write,
+                variant,
+                deletion::BlobDeletionAge {
+                    cumulative_age_ms: 0,
+                    checkpoint: None,
+                    continuity_generation: authority.generation,
+                    continuity_lost: true,
+                },
+                Some(authority),
+            )
+            .expect("set canonical deferred age");
+            deletion::set_blob_deletion_deferred_count_for_test(&write, 1)
+                .expect("set exact deferred membership");
+            write.commit().expect("commit canonical deferred age");
+
+            let canonical = store
+                .blob_gc_status(None)
+                .expect("canonical deferred age status");
+            assert_eq!(canonical.oldest_pending_age_ms, Some(0));
+
+            let write = store
+                .database
+                .begin_write()
+                .expect("corrupt deferred cumulative age");
+            deletion::corrupt_blob_deletion_cumulative_age_for_test(
+                &write,
+                variant,
+                cumulative_age_ms,
+            )
+            .expect("mutate only deferred cumulative age");
+            write.commit().expect("commit deferred age corruption");
+
+            let write = store
+                .database
+                .begin_write()
+                .expect("writable deferred age audit");
+            let write_error =
+                deletion::audit_blob_deletion_write(&write, Some(store.blob_depot_owner_binding))
+                    .expect_err("writable audit must reject nonzero deferred age");
+            assert_blob_schema_invariant(&write_error);
+            drop(write);
+
+            let read = store
+                .database
+                .begin_read()
+                .expect("read deferred age audit");
+            let read_error =
+                deletion::inspect_blob_deletion_read(&read, Some(store.blob_depot_owner_binding))
+                    .expect_err("full read audit must reject nonzero deferred age");
+            assert_blob_schema_invariant(&read_error);
+            drop(read);
+
+            let status_error = store
+                .blob_gc_status(None)
+                .expect_err("status must not expose nonzero deferred age");
+            assert_blob_schema_invariant(&status_error);
+            drop(store);
+
+            let reopen_error = match Store::open_for_mission(&root.database, services.authority) {
+                Ok(_) => panic!("reopen must reject deferred age {cumulative_age_ms}"),
+                Err(error) => error,
+            };
+            assert_blob_schema_invariant(&reopen_error);
+        }
+    }
+
+    #[test]
+    fn blob_gc_age_checkpoint_rejects_exhausted_inexact_transition() {
+        // Break caught: an exhausted manifest range with a nonzero durable
+        // remainder must fail closed, not report `has_more` forever.
+        let root = BlobTestRoot::new("gc-transition-exhausted-range");
+        let services = blob_services(0xc8);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("exhausted transition store");
+        let variant = install_unreferenced_variant(&store, &services, b"one old age", 1, true);
+        store
+            .test_admit_blob_deletion_manifest(variant)
+            .expect("admit exhausted transition manifest");
+        let old_sample = CustodySample {
+            clock_id: [0x71; 16],
+            tick_ms: 10,
+        };
+        let previous = deletion::BlobDeletionContinuity {
+            generation: 1,
+            last_sample: old_sample,
+        };
+        let anchor = CustodySample {
+            clock_id: [0x72; 16],
+            tick_ms: 2,
+        };
+        let current = deletion::BlobDeletionContinuity {
+            generation: 2,
+            last_sample: anchor,
+        };
+        let write = store.database.begin_write().expect("exhausted fixture");
+        deletion::set_blob_deletion_age_for_test(
+            &write,
+            variant,
+            deletion::BlobDeletionAge {
+                cumulative_age_ms: 1,
+                checkpoint: Some(old_sample),
+                continuity_generation: 1,
+                continuity_lost: false,
+            },
+            Some(previous),
+        )
+        .expect("set exhausted old age");
+        deletion::set_blob_deletion_continuity_transition_for_test(
+            &write, previous, current, anchor, None, 2,
+        )
+        .expect("set inexact exhausted transition");
+        let error =
+            deletion::checkpoint_blob_deletion_ages_write(&write, anchor, 8, 8 * 1024 * 1024)
+                .expect_err("exhausted inexact transition must fail closed");
+        assert_blob_schema_invariant(&error);
+    }
+
+    #[test]
+    fn blob_gc_last_failure_uses_newest_failure_turn_and_deterministic_ties() {
+        let root = BlobTestRoot::new("gc-status-last-failure");
+        let services = blob_services(0xbb);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("last-failure store");
+        let first = install_unreferenced_variant(&store, &services, b"failure first", 1, true);
+        let second = install_unreferenced_variant(&store, &services, b"failure second", 1, true);
+        for variant in [first, second] {
+            store
+                .test_admit_blob_deletion_manifest(variant)
+                .expect("admit failure manifest");
+        }
+        let write = store.database.begin_write().expect("failure fixture write");
+        deletion::set_blob_deletion_phase_for_test(
+            &write,
+            first,
+            deletion::BlobDeletionPhase::DeletingChunks,
+            deletion::BlobDeletionRetry::default()
+                .after_failure(10, deletion::BlobDeletionFailureCategory::ChunkUnlink)
+                .expect("first failure"),
+        )
+        .expect("set first failure");
+        deletion::set_blob_deletion_phase_for_test(
+            &write,
+            second,
+            deletion::BlobDeletionPhase::DeletingChunks,
+            deletion::BlobDeletionRetry::default()
+                .after_failure(
+                    20,
+                    deletion::BlobDeletionFailureCategory::DepotDirectorySync,
+                )
+                .expect("second failure"),
+        )
+        .expect("set second failure");
+        write.commit().expect("commit failure fixture");
+        assert_eq!(
+            store
+                .blob_gc_status(None)
+                .expect("newest failure status")
+                .last_failure,
+            Some(BlobGcFailureCategory::DepotDirectorySync)
+        );
+        drop(store);
+
+        let reopened = Store::open_for_mission(&root.database, services.authority)
+            .expect("reopen last-failure store");
+        assert_eq!(
+            reopened
+                .blob_gc_status(None)
+                .expect("restarted newest failure status")
+                .last_failure,
+            Some(BlobGcFailureCategory::DepotDirectorySync)
+        );
+
+        let (low, high) = if first < second {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let write = reopened.database.begin_write().expect("failure tie write");
+        deletion::set_blob_deletion_phase_for_test(
+            &write,
+            low,
+            deletion::BlobDeletionPhase::DeletingChunks,
+            deletion::BlobDeletionRetry::default()
+                .after_failure(
+                    30,
+                    deletion::BlobDeletionFailureCategory::VariantDirectoryAccess,
+                )
+                .expect("low tie failure"),
+        )
+        .expect("set low tie failure");
+        deletion::set_blob_deletion_phase_for_test(
+            &write,
+            high,
+            deletion::BlobDeletionPhase::DeletingChunks,
+            deletion::BlobDeletionRetry::default()
+                .after_failure(
+                    30,
+                    deletion::BlobDeletionFailureCategory::VariantDirectoryRemove,
+                )
+                .expect("high tie failure"),
+        )
+        .expect("set high tie failure");
+        write.commit().expect("commit failure tie");
+        assert_eq!(
+            reopened
+                .blob_gc_status(None)
+                .expect("failure tie status")
+                .last_failure,
+            Some(BlobGcFailureCategory::VariantDirectoryRemove)
+        );
+    }
+
+    #[test]
+    fn blob_capacity_failure_fast_path_preserves_all_routine_cursors_exactly() {
+        // Break caught: admission-pressure work must not borrow, reset, or
+        // restore any routine fairness cursor as an implementation shortcut.
+        let root = BlobTestRoot::new("capacity-gc-cursor-neutral");
+        let services = blob_services(0xb3);
+        let store =
+            Store::open_for_mission(&root.database, services.authority).expect("capacity GC store");
+        install_unreferenced_variant(
+            &store,
+            &services,
+            &vec![0x61; SELECTED_BLOB_CHUNK_SIZE as usize + 5],
+            1,
+            true,
+        );
+        let before = blob_maintenance_cursor_rows(&store);
+        let progress = store
+            .run_blob_capacity_gc(
+                BlobMaintenanceBudget::new(64, 8, 8 * 1024 * 1024).expect("capacity GC budget"),
+                Some(CustodySample {
+                    clock_id: [0x23; 16],
+                    tick_ms: 9,
+                }),
+            )
+            .expect("capacity GC");
+        assert_eq!(progress.manifests_admitted, 1);
+        assert_eq!(progress.manifests_finalized, 1);
+        assert!(progress.rows_examined <= 64);
+        assert!(progress.files_examined <= 8);
+        assert!(progress.bytes_examined <= 8 * 1024 * 1024);
+        assert_eq!(blob_maintenance_cursor_rows(&store), before);
+
+        let no_work_before = blob_maintenance_cursor_rows(&store);
+        let no_work = store
+            .run_blob_capacity_gc(maintenance_budget(4), None)
+            .expect("no-work capacity GC");
+        assert_eq!(no_work.manifests_admitted, 0);
+        assert_eq!(no_work.manifests_finalized, 0);
+        assert_eq!(blob_maintenance_cursor_rows(&store), no_work_before);
+
+        let locked_root = BlobTestRoot::new("capacity-gc-cursor-neutral-locked");
+        let locked_services = blob_services(0xb7);
+        let locked = Store::open_for_mission(&locked_root.database, locked_services.authority)
+            .expect("locked capacity GC store");
+        install_unreferenced_variant(
+            &locked,
+            &locked_services,
+            b"locked cursor-neutral target",
+            1,
+            true,
+        );
+        let locked_before = blob_maintenance_cursor_rows(&locked);
+        let depot_guard = locked.blob_depot_lock.lock().expect("depot guard");
+        let blocked = locked
+            .run_blob_capacity_gc(maintenance_budget(8), None)
+            .expect("lock contention is bounded no-progress");
+        drop(depot_guard);
+        assert_eq!(blocked.manifests_admitted, 0);
+        assert_eq!(blocked.manifests_finalized, 0);
+        assert_eq!(blob_maintenance_cursor_rows(&locked), locked_before);
+
+        let error_root = BlobTestRoot::new("capacity-gc-cursor-neutral-error");
+        let mut error_services = blob_services(0xb8);
+        let error_store = Store::open_for_mission(&error_root.database, error_services.authority)
+            .expect("error capacity GC store");
+        let plaintext = b"malformed live reference for cursor-neutral error".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let (stored, _, _) = publish_blob(
+            &error_store,
+            &mut error_services,
+            &prepared,
+            &plaintext,
+            1,
+            b"capacity-cursor-error",
+        );
+        let write = error_store
+            .database
+            .begin_write()
+            .expect("error fixture write");
+        write
+            .open_table(BLOB_PUBLICATIONS)
+            .expect("error fixture publications")
+            .remove(stored.transfer_id.as_bytes().as_slice())
+            .expect("remove exact publication");
+        write.commit().expect("commit error fixture");
+        let error_before = blob_maintenance_cursor_rows(&error_store);
+        assert!(
+            error_store
+                .run_blob_capacity_gc(maintenance_budget(8), None)
+                .is_err()
+        );
+        assert_eq!(blob_maintenance_cursor_rows(&error_store), error_before);
+    }
+
+    #[test]
+    fn blob_capacity_gc_advances_retry_turn_without_routine_cursor_mutation() {
+        // Break caught: after exponential backoff exceeds the next physical
+        // unit, capacity-only scans must advance the deletion turn or every
+        // later capacity retry remains deferred forever.
+        let root = BlobTestRoot::new("capacity-gc-retry-turn-liveness");
+        let services = blob_services(0xde);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("capacity retry store");
+        let variant = install_unreferenced_variant(
+            &store,
+            &services,
+            b"capacity-only retry turn liveness",
+            1,
+            true,
+        );
+        store
+            .test_admit_blob_deletion_manifest(variant)
+            .expect("admit capacity retry manifest");
+        let routine_cursors = blob_maintenance_cursor_rows(&store);
+        let budget = maintenance_budget(2);
+
+        for expected_attempts in 1..=2 {
+            depot::inject_test_fault(
+                &root.path,
+                depot::DepotFaultPoint::ManifestChunkBeforeUnlink,
+            );
+            let progress = store
+                .run_blob_capacity_gc(budget, None)
+                .expect("record capacity-only transient failure");
+            assert!(progress.rows_examined <= budget.rows());
+            assert!(progress.files_examined <= budget.files());
+            assert!(progress.bytes_examined <= budget.bytes());
+            let manifest = deletion_manifest_for_test(&store, variant);
+            assert_eq!(manifest.retry.attempts, expected_attempts);
+            assert_eq!(blob_maintenance_cursor_rows(&store), routine_cursors);
+        }
+
+        let deferred = store.blob_gc_status(None).expect("deferred retry status");
+        assert_eq!(deferred.maintenance_turn, 2);
+        assert_eq!(deferred.next_retry_turn, Some(4));
+        assert_eq!(deferred.retry_state, BlobGcRetryState::Deferred);
+
+        let skipped = store
+            .run_blob_capacity_gc(budget, None)
+            .expect("bounded capacity scan advances deferred retry turn");
+        assert!(skipped.rows_examined <= budget.rows());
+        assert_eq!(skipped.files_examined, 0);
+        assert_eq!(
+            deletion_manifest_for_test(&store, variant).retry.attempts,
+            2
+        );
+        assert_eq!(blob_maintenance_cursor_rows(&store), routine_cursors);
+
+        let retried = store
+            .run_blob_capacity_gc(budget, None)
+            .expect("capacity retry becomes eligible without routine maintenance");
+        assert_eq!(
+            store
+                .blob_gc_status(None)
+                .expect("successful capacity retry status")
+                .maintenance_turn,
+            4
+        );
+        assert!(retried.rows_examined <= budget.rows());
+        assert_eq!(retried.files_examined, 1);
+        let succeeded = deletion_manifest_for_test(&store, variant);
+        assert_eq!(succeeded.retry, deletion::BlobDeletionRetry::default());
+        assert_eq!(succeeded.totals.queued, 0);
+        assert_eq!(succeeded.totals.deleted, 1);
+        assert_eq!(blob_maintenance_cursor_rows(&store), routine_cursors);
+    }
+
+    #[test]
+    fn blob_capacity_admission_pages_past_live_prefixes_without_routine_cursor_mutation() {
+        // Break caught: capacity admission must carry only a private in-memory
+        // position across bounded pages instead of stopping after the first
+        // page of live imports or borrowing a routine durable cursor.
+        let root = BlobTestRoot::new("capacity-gc-pages-live-prefixes");
+        let mut services = blob_services(0xb6);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("capacity pagination store");
+        let target = install_unreferenced_variant(
+            &store,
+            &services,
+            b"capacity pagination reclaimable target",
+            1,
+            true,
+        );
+        let mut lower_live = 0usize;
+        for index in 0..128u16 {
+            let plaintext = format!("capacity live prefix {index:03}").into_bytes();
+            let prepared = prepared_blob(&plaintext);
+            let (stored, _, _) = publish_blob(
+                &store,
+                &mut services,
+                &prepared,
+                &plaintext,
+                1,
+                format!("capacity-prefix-{index:03}").as_bytes(),
+            );
+            if stored.variant_id < target {
+                lower_live += 1;
+                if lower_live == 8 {
+                    break;
+                }
+            }
+        }
+        assert_eq!(lower_live, 8, "fixture needs two bounded live prefixes");
+
+        let before = blob_maintenance_cursor_rows(&store);
+        reset_capacity_admission_pages_for_test();
+        let progress = store
+            .run_blob_capacity_gc(
+                BlobMaintenanceBudget::new(128, 8, 16 * 1024 * 1024)
+                    .expect("capacity pagination budget"),
+                None,
+            )
+            .expect("capacity pagination GC");
+        assert_eq!(progress.manifests_admitted, 1);
+        assert_eq!(progress.manifests_finalized, 1);
+        assert!(
+            take_capacity_admission_pages_for_test() >= 2,
+            "reclaimable work must be reached through multiple bounded pages"
+        );
+        assert_eq!(blob_maintenance_cursor_rows(&store), before);
+    }
+
+    #[test]
+    fn blob_gc_never_recovers_lineage_or_replay_fence_capacity() {
+        // Break caught: bulk reclamation removes depot charge, never permanent
+        // signed-identity or accepted-publication replay authority.
+        let root = BlobTestRoot::new("capacity-gc-keeps-security-fences");
+        let mut services = blob_services(0xb4);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("security-fence GC store");
+        let live_plaintext = b"live publication retains replay authority".to_vec();
+        let live_prepared = prepared_blob(&live_plaintext);
+        publish_blob(
+            &store,
+            &mut services,
+            &live_prepared,
+            &live_plaintext,
+            1,
+            b"gc-retained-replay-fence",
+        );
+        install_unreferenced_variant(
+            &store,
+            &services,
+            b"unreferenced content with retained lineage authority",
+            1,
+            true,
+        );
+        let before = store.blob_gc_status(None).expect("before fence status");
+        assert!(before.lineage_fence_rows > 0);
+        assert!(before.replay_fence_rows > 0);
+        store
+            .run_blob_capacity_gc(
+                BlobMaintenanceBudget::new(64, 8, 8 * 1024 * 1024)
+                    .expect("security-fence GC budget"),
+                None,
+            )
+            .expect("security-fence capacity GC");
+        let after = store.blob_gc_status(None).expect("after fence status");
+        assert_eq!(after.lineage_fence_rows, before.lineage_fence_rows);
+        assert_eq!(after.lineage_fence_bytes, before.lineage_fence_bytes);
+        assert_eq!(after.replay_fence_rows, before.replay_fence_rows);
+        assert_eq!(after.replay_fence_bytes, before.replay_fence_bytes);
+    }
+
+    #[test]
     fn blob_delete_pending_fences_every_root_attachment_path() {
         let root = BlobTestRoot::new("delete-pending-root-fence");
         let services = blob_services(0xad);
@@ -22727,7 +24669,7 @@ mod tests {
     }
 
     #[test]
-    fn blob_deletion_audit_allows_permanent_fences_after_finalized_reclamation() {
+    fn blob_post_gc_restart_preserves_lineage_acceptance_and_conflict() {
         let root = BlobTestRoot::new("deletion-permanent-fence");
         let services = blob_services(0xc1);
         let store = Store::open_for_mission(&root.database, services.authority)
@@ -22747,52 +24689,27 @@ mod tests {
                 .expect("fence import row");
             BlobVariantId::from_bytes(key.value().try_into().expect("variant key"))
         };
+        let before = store.blob_gc_status(None).expect("before production GC");
+        let progress = store
+            .run_blob_capacity_gc(
+                BlobMaintenanceBudget::new(128, 16, 16 * 1024 * 1024)
+                    .expect("production GC budget"),
+                Some(CustodySample {
+                    clock_id: [0x61; 16],
+                    tick_ms: 1,
+                }),
+            )
+            .expect("production manifest admission and physical GC");
+        assert_eq!(progress.manifests_admitted, 1);
+        assert_eq!(progress.manifests_finalized, 1);
+        assert!(progress.rows_examined <= 128);
+        assert!(progress.files_examined <= 16);
+        assert!(progress.bytes_examined <= 16 * 1024 * 1024);
+        let after = store.blob_gc_status(None).expect("after production GC");
+        assert_eq!(after.lineage_fence_rows, before.lineage_fence_rows);
+        assert_eq!(after.lineage_fence_bytes, before.lineage_fence_bytes);
+        assert!(!root.depot().join(test_hex32(variant.as_bytes())).exists());
         drop(store);
-
-        std::fs::remove_file(root.chunk_path(variant, 0)).expect("remove reclaimed chunk file");
-        std::fs::remove_dir(root.depot().join(test_hex32(variant.as_bytes())))
-            .expect("remove reclaimed variant directory");
-        {
-            let database = Database::open(&root.database).expect("open reclaimed metadata");
-            let write = database.begin_write().expect("begin reclaimed metadata");
-            let lineage_evidence = write
-                .open_table(lifecycle::BLOB_LINEAGE_FENCES)
-                .expect("reclaimed lineage fences")
-                .get(variant.as_bytes().as_slice())
-                .expect("read reclaimed lineage")
-                .expect("reclaimed lineage exists")
-                .value()
-                .to_vec();
-            lifecycle::mark_lineage_bulk_reclamation_observed(&write, variant, &lineage_evidence)
-                .expect("authorize finalized bulk reclamation");
-            write
-                .open_table(BLOB_IMPORTS)
-                .expect("reclaimed imports")
-                .remove(variant.as_bytes().as_slice())
-                .expect("remove reclaimed import")
-                .expect("reclaimed import exists");
-            write
-                .open_table(BLOB_CHUNKS)
-                .expect("reclaimed chunks")
-                .remove(depot::test_chunk_key(variant, 0).as_slice())
-                .expect("remove reclaimed chunk")
-                .expect("reclaimed chunk exists");
-            let mut metadata = write
-                .open_table(BLOB_DEPOT_METADATA)
-                .expect("reclaimed depot metadata");
-            for field in [
-                DEPOT_VARIANT_COUNT,
-                DEPOT_COMMITTED_CHUNK_COUNT,
-                DEPOT_COMMITTED_FILE_BYTES,
-                DEPOT_RESERVED_FILE_BYTES,
-            ] {
-                metadata.insert(field, 0).expect("clear reclaimed charge");
-            }
-            drop(metadata);
-            write
-                .commit()
-                .expect("commit finalized reclamation fixture");
-        }
 
         let reopened = Store::open_for_mission(&root.database, services.authority)
             .expect("canonical permanent fence survives finalized reclamation");
@@ -22844,6 +24761,34 @@ mod tests {
                 .bulk_reclamation_observed(),
             "matching reimport must not clear reclamation authorization",
         );
+        let import = read
+            .open_table(BLOB_IMPORTS)
+            .expect("reimported imports")
+            .get(variant.as_bytes().as_slice())
+            .expect("read reimported import")
+            .expect("reimported import exists")
+            .value()
+            .to_vec();
+        let mut conflicting_lineage =
+            depot::maintenance_import_projection(variant.as_bytes().as_slice(), &import)
+                .expect("decode reimported import")
+                .physical_lineage;
+        conflicting_lineage[0] ^= 1;
+        drop(read);
+        let write = reopened
+            .database
+            .begin_write()
+            .expect("conflicting lineage check");
+        assert!(matches!(
+            lifecycle::ensure_lineage_fence(
+                &write,
+                reopened.blob_lifecycle_limits,
+                variant,
+                conflicting_lineage,
+                reopened.blob_depot_owner_binding,
+            ),
+            Err(StoreError::Blob(BlobStoreError::PhysicalLineageConflict))
+        ));
     }
 
     #[test]
