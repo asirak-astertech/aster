@@ -11090,6 +11090,9 @@ mod tests {
 
     #[test]
     fn depot_owner_staging_recovers_every_durable_first_install_boundary() {
+        let services = blob_services(0xa0);
+        let authority = services.authority;
+        drop(services);
         for (index, point) in [
             depot::DepotFaultPoint::OwnerStagingCreated,
             depot::DepotFaultPoint::OwnerTempCreated,
@@ -11105,13 +11108,11 @@ mod tests {
         .enumerate()
         {
             let root = BlobTestRoot::new(&format!("owner-crash-{index}"));
-            let services = blob_services(0xa0 + u8::try_from(index).expect("fault index"));
-            let store =
-                Store::open_for_mission(&root.database, services.authority).expect("empty store");
+            let store = Store::open_for_mission(&root.database, authority).expect("empty store");
             depot::inject_test_fault(&root.path, point);
             assert!(store.blob_depot().is_err(), "fault {point:?} must fire");
             drop(store);
-            let reopened = Store::open_for_mission(&root.database, services.authority)
+            let reopened = Store::open_for_mission(&root.database, authority)
                 .expect("reopen interrupted owner election");
             drop(reopened.blob_depot().expect("same-DB owner-election retry"));
             assert_eq!(
