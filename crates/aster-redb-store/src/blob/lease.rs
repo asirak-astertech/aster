@@ -409,7 +409,7 @@ impl BlobLifecycleLeaseRegistry {
     }
 
     #[cfg(test)]
-    fn active_watches(&self) -> usize {
+    pub(crate) fn active_watches(&self) -> usize {
         self.inner.state.lock().expect("lease registry").watches
     }
 }

@@ -77,6 +77,16 @@ const PHASE_DIRECTORY_DELETE_PENDING: u8 = 2;
 const CHUNK_DELETE_QUEUED: u8 = 1;
 const CHUNK_DELETED_DURABLE: u8 = 2;
 
+#[cfg(test)]
+thread_local! {
+    static TEST_MANIFEST_ADMISSION_FAULT_ORDINAL: std::cell::Cell<Option<u64>> = const {
+        std::cell::Cell::new(None)
+    };
+    static TEST_MANIFEST_ADMISSION_MUTATIONS: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
 fn invariant(reason: &'static str) -> StoreError {
     StoreError::Blob(BlobStoreError::SchemaInvariant(reason))
 }
@@ -875,6 +885,387 @@ pub(crate) fn require_variant_available_write(
         ));
     }
     Err(StoreError::Blob(BlobStoreError::VariantDeleting))
+}
+
+pub(crate) fn variant_has_deletion_manifest_read(
+    read: &redb::ReadTransaction,
+    variant: BlobVariantId,
+) -> Result<bool, StoreError> {
+    let manifests = read.open_table(BLOB_DELETION_MANIFESTS)?;
+    let Some(encoded) = manifests.get(variant.as_bytes().as_slice())? else {
+        return Ok(false);
+    };
+    if decode_manifest_header(encoded.value())?.variant_id != variant {
+        return Err(invariant(
+            "Blob deletion manifest key differs from its identity",
+        ));
+    }
+    Ok(true)
+}
+
+pub(crate) fn variant_has_deletion_manifest_write(
+    write: &redb::WriteTransaction,
+    variant: BlobVariantId,
+) -> Result<bool, StoreError> {
+    let manifests = write.open_table(BLOB_DELETION_MANIFESTS)?;
+    let Some(encoded) = manifests.get(variant.as_bytes().as_slice())? else {
+        return Ok(false);
+    };
+    if decode_manifest_header(encoded.value())?.variant_id != variant {
+        return Err(invariant(
+            "Blob deletion manifest key differs from its identity",
+        ));
+    }
+    Ok(true)
+}
+
+#[cfg(test)]
+pub(crate) fn set_manifest_admission_fault_ordinal_for_test(ordinal: Option<u64>) {
+    TEST_MANIFEST_ADMISSION_FAULT_ORDINAL.set(ordinal);
+    TEST_MANIFEST_ADMISSION_MUTATIONS.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn manifest_admission_mutations_for_test() -> u64 {
+    TEST_MANIFEST_ADMISSION_MUTATIONS.get()
+}
+
+pub(crate) fn begin_manifest_admission_mutations() {
+    #[cfg(test)]
+    TEST_MANIFEST_ADMISSION_MUTATIONS.set(0);
+}
+
+pub(crate) fn manifest_admission_mutation_boundary() -> Result<(), StoreError> {
+    #[cfg(test)]
+    {
+        let ordinal = TEST_MANIFEST_ADMISSION_MUTATIONS
+            .get()
+            .checked_add(1)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        TEST_MANIFEST_ADMISSION_MUTATIONS.set(ordinal);
+        if TEST_MANIFEST_ADMISSION_FAULT_ORDINAL.get() == Some(ordinal) {
+            return Err(invariant(
+                "injected Blob manifest admission mutation failure",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn require_admission_accounting(
+    write: &redb::WriteTransaction,
+) -> Result<BlobDeletionStats, StoreError> {
+    let metadata = write.open_table(BLOB_DELETION_METADATA)?;
+    if metadata.len()? != DELETION_METADATA_FIELDS.len() as u64
+        || required_deletion_counter(&metadata, BLOB_DELETION_SCHEMA_VERSION_FIELD)?
+            != BLOB_DELETION_SCHEMA_VERSION
+    {
+        return Err(invariant(
+            "Blob deletion metadata is incomplete or has an unknown version",
+        ));
+    }
+    let stats = BlobDeletionStats {
+        manifests: required_deletion_counter(&metadata, BLOB_DELETION_MANIFEST_ROWS)?,
+        manifest_bytes: required_deletion_counter(&metadata, BLOB_DELETION_MANIFEST_BYTES)?,
+        chunks: required_deletion_counter(&metadata, BLOB_DELETION_CHUNK_ROWS)?,
+        chunk_bytes: required_deletion_counter(&metadata, BLOB_DELETION_CHUNK_BYTES)?,
+        queued_chunks: required_deletion_counter(&metadata, BLOB_DELETION_QUEUED_CHUNKS)?,
+        deleted_chunks: required_deletion_counter(&metadata, BLOB_DELETION_DELETED_CHUNKS)?,
+        charged_variants: required_deletion_counter(&metadata, BLOB_DELETION_CHARGED_VARIANTS)?,
+        charged_files: required_deletion_counter(&metadata, BLOB_DELETION_CHARGED_FILES)?,
+        charged_reserved_bytes: required_deletion_counter(
+            &metadata,
+            BLOB_DELETION_CHARGED_RESERVED_BYTES,
+        )?,
+        charged_committed_bytes: required_deletion_counter(
+            &metadata,
+            BLOB_DELETION_CHARGED_COMMITTED_BYTES,
+        )?,
+        maintenance_turn: required_deletion_counter(&metadata, BLOB_DELETION_MAINTENANCE_TURN)?,
+    };
+    if write.open_table(BLOB_DELETION_MANIFESTS)?.len()? != stats.manifests
+        || write.open_table(BLOB_DELETION_CHUNKS)?.len()? != stats.chunks
+    {
+        return Err(invariant(
+            "Blob deletion table cardinality disagrees with durable accounting",
+        ));
+    }
+    Ok(stats)
+}
+
+/// Atomically replaces one exact variant's ordinary chunk authority with its
+/// durable deletion-manifest authority. The caller owns the surrounding write
+/// transaction, the depot coordination lock, and the provisional lease fence.
+pub(crate) fn admit_variant_write(
+    write: &redb::WriteTransaction,
+    variant: BlobVariantId,
+    expected_import: &[u8],
+    expected_lineage: &[u8],
+    owner_binding: [u8; 32],
+) -> Result<bool, StoreError> {
+    let existing_stats = require_admission_accounting(write)?;
+    if variant_has_deletion_manifest_write(write, variant)? {
+        return Ok(false);
+    }
+    let original_import = write
+        .open_table(super::BLOB_IMPORTS)?
+        .get(variant.as_bytes().as_slice())?
+        .ok_or_else(|| invariant("Blob manifest admission import is missing"))?
+        .value()
+        .to_vec();
+    if original_import != expected_import {
+        return Err(invariant(
+            "Blob manifest admission import changed after discovery",
+        ));
+    }
+    let import = super::depot::deletion_import_projection(variant.as_bytes(), &original_import)?;
+    let actual_owner = super::depot::depot_owner_binding_if_present_write(write)?
+        .ok_or_else(|| invariant("Blob manifest admission owner binding is missing"))?;
+    if actual_owner != owner_binding {
+        return Err(invariant("Blob manifest admission owner binding changed"));
+    }
+    let lineage_fence = write
+        .open_table(super::lifecycle::BLOB_LINEAGE_FENCES)?
+        .get(variant.as_bytes().as_slice())?
+        .ok_or_else(|| invariant("Blob manifest admission lineage fence is missing"))?
+        .value()
+        .to_vec();
+    if lineage_fence != expected_lineage {
+        return Err(invariant(
+            "Blob manifest admission lineage changed after discovery",
+        ));
+    }
+    super::lifecycle::validate_maintenance_lineage_evidence(
+        import.physical_lineage,
+        owner_binding,
+        &lineage_fence,
+    )?;
+
+    let first = chunk_key(variant, 0);
+    let last = chunk_key(variant, u64::MAX);
+    if write
+        .open_table(BLOB_DELETION_CHUNKS)?
+        .range::<&[u8]>((
+            std::ops::Bound::Included(first.as_slice()),
+            std::ops::Bound::Included(last.as_slice()),
+        ))?
+        .next()
+        .transpose()?
+        .is_some()
+    {
+        return Err(invariant(
+            "Blob manifest admission found pre-existing deletion chunk authority",
+        ));
+    }
+    let active_chunks = write.open_table(super::BLOB_CHUNKS)?;
+    let mut originals = Vec::new();
+    for row in active_chunks.range::<&[u8]>((
+        std::ops::Bound::Included(first.as_slice()),
+        std::ops::Bound::Included(last.as_slice()),
+    ))? {
+        let (key, value) = row?;
+        let (actual_variant, index) = parse_chunk_key(key.value())?;
+        if actual_variant != variant {
+            return Err(invariant(
+                "Blob manifest admission chunk range escaped its variant",
+            ));
+        }
+        if u64::try_from(originals.len()).ok() == Some(MAX_SELECTED_BLOB_CHUNKS) {
+            return Err(invariant(
+                "Blob manifest admission chunk set exceeds its structural bound",
+            ));
+        }
+        originals.push((index, value.value().to_vec()));
+    }
+    drop(active_chunks);
+
+    let mut chunks = Vec::with_capacity(originals.len());
+    let mut queued = 0u64;
+    let mut deleted = 0u64;
+    let mut charged_files = 0u64;
+    let mut charged_reserved_bytes = 0u64;
+    let mut charged_committed_bytes = 0u64;
+    let mut committed_records = Vec::new();
+    for (index, original_chunk) in &originals {
+        let projected =
+            super::depot::deletion_chunk_projection(&original_import, *index, original_chunk)?;
+        charged_reserved_bytes = charged_reserved_bytes
+            .checked_add(projected.charged_reserved_bytes)
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        charged_committed_bytes = charged_committed_bytes
+            .checked_add(projected.charged_committed_bytes)
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        let state = if let Some(record) = projected.record {
+            queued = queued
+                .checked_add(1)
+                .ok_or(StoreError::ItemCountAccountingOverflow)?;
+            charged_files = charged_files
+                .checked_add(1)
+                .ok_or(StoreError::ItemCountAccountingOverflow)?;
+            committed_records.push(record);
+            BlobDeletionChunkState::DeleteQueued
+        } else {
+            deleted = deleted
+                .checked_add(1)
+                .ok_or(StoreError::ItemCountAccountingOverflow)?;
+            BlobDeletionChunkState::DeletedDurable
+        };
+        chunks.push(BlobDeletionChunk {
+            index: *index,
+            state,
+            original_chunk: original_chunk.clone(),
+            charged_reserved_bytes: projected.charged_reserved_bytes,
+            charged_committed_bytes: projected.charged_committed_bytes,
+        });
+    }
+    if import.finalized_root.is_some()
+        && u64::try_from(chunks.len()).ok() != Some(import.chunk_count)
+    {
+        return Err(invariant(
+            "finalized Blob manifest admission has an incomplete chunk set",
+        ));
+    }
+    super::depot::validate_deletion_manifest_root(
+        &original_import,
+        &committed_records,
+        import.finalized_root,
+    )?;
+    let chunk_count =
+        u64::try_from(chunks.len()).map_err(|_| StoreError::ItemCountAccountingOverflow)?;
+    let manifest = BlobDeletionManifest {
+        variant_id: variant,
+        blob_id: import.blob_id,
+        content_group: import.content_group,
+        epoch: import.epoch,
+        physical_lineage: import.physical_lineage,
+        owner_binding,
+        lineage_fence,
+        original_import,
+        finalized_root: import.finalized_root,
+        phase: BlobDeletionPhase::DeletingChunks,
+        retry: BlobDeletionRetry::default(),
+        age: BlobDeletionAge {
+            cumulative_age_ms: 0,
+            checkpoint: None,
+            continuity_generation: 0,
+            continuity_lost: false,
+        },
+        totals: BlobDeletionTotals {
+            chunks: chunk_count,
+            queued,
+            deleted,
+            charged_variants: 1,
+            charged_files,
+            charged_reserved_bytes,
+            charged_committed_bytes,
+        },
+        chunks,
+    };
+    manifest.validate()?;
+    let encoded_manifest = encode_manifest_record(&manifest)?;
+    let encoded_chunks = manifest
+        .chunks
+        .iter()
+        .map(encode_chunk_record)
+        .collect::<Result<Vec<_>, _>>()?;
+    let manifest_bytes = encoded_row_bytes(variant.as_bytes(), &encoded_manifest)?;
+    let mut chunk_bytes = 0u64;
+    for (chunk, encoded) in manifest.chunks.iter().zip(&encoded_chunks) {
+        chunk_bytes = chunk_bytes
+            .checked_add(encoded_row_bytes(
+                &chunk_key(variant, chunk.index),
+                encoded,
+            )?)
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    }
+
+    begin_manifest_admission_mutations();
+    let mut active_chunks = write.open_table(super::BLOB_CHUNKS)?;
+    for (index, _) in &originals {
+        active_chunks
+            .remove(chunk_key(variant, *index).as_slice())?
+            .ok_or_else(|| invariant("Blob manifest admission lost ordinary chunk authority"))?;
+        manifest_admission_mutation_boundary()?;
+    }
+    drop(active_chunks);
+    write
+        .open_table(BLOB_DELETION_MANIFESTS)?
+        .insert(variant.as_bytes().as_slice(), encoded_manifest.as_slice())?;
+    manifest_admission_mutation_boundary()?;
+    let mut deletion_chunks = write.open_table(BLOB_DELETION_CHUNKS)?;
+    for (chunk, encoded) in manifest.chunks.iter().zip(&encoded_chunks) {
+        deletion_chunks.insert(
+            chunk_key(variant, chunk.index).as_slice(),
+            encoded.as_slice(),
+        )?;
+        manifest_admission_mutation_boundary()?;
+    }
+    drop(deletion_chunks);
+
+    let mut metadata = write.open_table(BLOB_DELETION_METADATA)?;
+    for (field, current, delta) in [
+        (BLOB_DELETION_MANIFEST_ROWS, existing_stats.manifests, 1),
+        (BLOB_DELETION_CHUNK_ROWS, existing_stats.chunks, chunk_count),
+        (
+            BLOB_DELETION_QUEUED_CHUNKS,
+            existing_stats.queued_chunks,
+            queued,
+        ),
+        (
+            BLOB_DELETION_DELETED_CHUNKS,
+            existing_stats.deleted_chunks,
+            deleted,
+        ),
+        (
+            BLOB_DELETION_CHARGED_VARIANTS,
+            existing_stats.charged_variants,
+            1,
+        ),
+        (
+            BLOB_DELETION_CHARGED_FILES,
+            existing_stats.charged_files,
+            charged_files,
+        ),
+    ] {
+        metadata.insert(
+            field,
+            current
+                .checked_add(delta)
+                .ok_or(StoreError::ItemCountAccountingOverflow)?,
+        )?;
+        manifest_admission_mutation_boundary()?;
+    }
+    for (field, current, delta) in [
+        (
+            BLOB_DELETION_MANIFEST_BYTES,
+            existing_stats.manifest_bytes,
+            manifest_bytes,
+        ),
+        (
+            BLOB_DELETION_CHUNK_BYTES,
+            existing_stats.chunk_bytes,
+            chunk_bytes,
+        ),
+        (
+            BLOB_DELETION_CHARGED_RESERVED_BYTES,
+            existing_stats.charged_reserved_bytes,
+            charged_reserved_bytes,
+        ),
+        (
+            BLOB_DELETION_CHARGED_COMMITTED_BYTES,
+            existing_stats.charged_committed_bytes,
+            charged_committed_bytes,
+        ),
+    ] {
+        metadata.insert(
+            field,
+            current
+                .checked_add(delta)
+                .ok_or(StoreError::PayloadByteAccountingOverflow)?,
+        )?;
+        manifest_admission_mutation_boundary()?;
+    }
+    Ok(true)
 }
 
 fn initialize_blob_deletion_schema(write: &redb::WriteTransaction) -> Result<(), StoreError> {

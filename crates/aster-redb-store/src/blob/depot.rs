@@ -3731,6 +3731,62 @@ pub(super) fn remove_completion_chunk_state_for_test(
 }
 
 #[cfg(test)]
+pub(super) fn set_expected_chunk_for_test(
+    write: &redb::WriteTransaction,
+    variant: BlobVariantId,
+    index: u64,
+    record: BlobChunkRecord,
+) -> Result<(), StoreError> {
+    let import = load_import_write(write, variant)?.ok_or_else(|| {
+        blob_error(BlobStoreError::SchemaInvariant(
+            "test Blob import is missing",
+        ))
+    })?;
+    validate_chunk_record_lengths(import.total_len, import.chunk_count, index, record)?;
+    let key = chunk_key(variant, index);
+    let mut state = write
+        .open_table(BLOB_CHUNKS)?
+        .get(key.as_slice())?
+        .map(|value| decode_chunk_state(value.value()))
+        .transpose()?
+        .ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "test Blob chunk state is missing",
+            ))
+        })?;
+    if state.plaintext_digest != Some(*record.plaintext_sha256())
+        || state.expected.is_some()
+        || state.committed.is_some()
+    {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "test Blob chunk is not digest-only",
+        )));
+    }
+    state.expected = Some(record);
+    let charge = chunk_file_len(record)?;
+    let mut metadata = write.open_table(BLOB_DEPOT_METADATA)?;
+    let reserved = metadata
+        .get(DEPOT_RESERVED_FILE_BYTES)?
+        .ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Blob depot reserved-byte counter is missing",
+            ))
+        })?
+        .value();
+    metadata.insert(
+        DEPOT_RESERVED_FILE_BYTES,
+        reserved
+            .checked_add(charge)
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?,
+    )?;
+    drop(metadata);
+    write
+        .open_table(BLOB_CHUNKS)?
+        .insert(key.as_slice(), encode_chunk_state(state).as_slice())?;
+    Ok(())
+}
+
+#[cfg(test)]
 pub(super) fn corrupt_import_profile_for_test(
     write: &redb::WriteTransaction,
     variant: BlobVariantId,

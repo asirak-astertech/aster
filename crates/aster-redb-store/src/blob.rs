@@ -1233,6 +1233,9 @@ thread_local! {
     static TEST_BLOB_DELETE_ADMISSION_PRE_COMMIT_FAULT: std::cell::Cell<bool> = const {
         std::cell::Cell::new(false)
     };
+    static TEST_BLOB_MANIFEST_ADMISSION_GENERATION_CHURN: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
 }
 
 #[cfg(test)]
@@ -1275,6 +1278,265 @@ pub(crate) struct BlobAuditSnapshot {
 }
 
 impl Store {
+    fn run_blob_manifest_admission_turn(
+        &self,
+        cursor: lifecycle::BlobMaintenanceCursor,
+        budget: BlobMaintenanceBudget,
+    ) -> Result<BlobMaintenanceProgress, StoreError> {
+        let read = self.database.begin_read()?;
+        if lifecycle::load_maintenance_cursor_read(&read)? != cursor {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob maintenance cursor changed during discovery",
+            )));
+        }
+        let page = bounded_import_maintenance_page_read(&read, cursor.position.as_deref(), budget)?;
+        let mut candidate = None;
+        let mut candidate_index = None;
+        for (index, row) in page.rows.iter().enumerate() {
+            let MaintenanceEvidence::Import(evidence) = &row.evidence else {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob import maintenance row has wrong evidence",
+                )));
+            };
+            let import = depot::maintenance_import_projection(&row.key, &row.value)?;
+            lifecycle::validate_maintenance_lineage_evidence(
+                import.physical_lineage,
+                self.blob_depot_owner_binding,
+                &evidence.lineage,
+            )?;
+            let manifested =
+                deletion::variant_has_deletion_manifest_read(&read, import.variant_id)?;
+            if let Some(reference) = evidence.reference.as_ref() {
+                validate_reference_root_read(&read, reference, import.variant_id)?;
+                if manifested {
+                    return Err(blob_error(BlobStoreError::SchemaInvariant(
+                        "Blob deletion manifest has a live variant reference",
+                    )));
+                }
+                continue;
+            }
+            if manifested {
+                continue;
+            }
+            let eligible = matches!(
+                (cursor.class, import.finalized),
+                (BlobMaintenanceClass::UnreferencedLocalImportStaging, false)
+                    | (BlobMaintenanceClass::UnreferencedCompletedVariants, true)
+            );
+            if eligible {
+                candidate = Some(BlobManifestAdmissionCandidate {
+                    position: row.position.clone(),
+                    variant: import.variant_id,
+                    import: row.value.clone(),
+                    lineage: evidence.lineage.clone(),
+                    finalized: import.finalized,
+                });
+                candidate_index = Some(index);
+                break;
+            }
+        }
+        drop(read);
+
+        let Some(candidate) = candidate else {
+            let next_position = if let Some(last) = page.rows.last() {
+                Some(last.position.as_slice())
+            } else if page.complete {
+                None
+            } else {
+                cursor.position.as_deref()
+            };
+            let write = self.database.begin_write()?;
+            enforce_live_write(&write)?;
+            lifecycle::require_maintenance_accounting(&write)?;
+            if lifecycle::load_maintenance_cursor(&write)? != cursor {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob maintenance cursor changed after discovery",
+                )));
+            }
+            lifecycle::advance_maintenance_cursor(&write, cursor.class, next_position)?;
+            write.commit()?;
+            return Ok(BlobMaintenanceProgress {
+                class: cursor.class,
+                rows_examined: page.rows_examined,
+                files_examined: 0,
+                bytes_examined: page.bytes,
+                candidates: Vec::new(),
+                class_has_more_work: !page.complete,
+                awaiting_later_handler: false,
+            });
+        };
+        let candidate_index = candidate_index.expect("candidate records its page index");
+
+        let _depot_guard = match self.blob_depot_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Ok(manifest_admission_progress(
+                    &cursor,
+                    &page,
+                    candidate_index,
+                    candidate.variant,
+                    true,
+                ));
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(blob_error(BlobStoreError::DepotIntegrity(
+                    "depot lock is poisoned",
+                )));
+            }
+        };
+        self.require_live()?;
+        let target = lease::BlobLeaseTarget::Variant(candidate.variant);
+        let snapshot = self
+            .blob_lease_registry
+            .snapshot(self.blob_depot_owner_binding, target)
+            .map_err(lease::store_error)?;
+        #[cfg(test)]
+        if TEST_BLOB_MANIFEST_ADMISSION_GENERATION_CHURN.get() {
+            drop(
+                self.blob_lease_registry
+                    .acquire(
+                        self.blob_depot_owner_binding,
+                        target,
+                        lease::BlobLeaseKind::InternalChunkWork,
+                    )
+                    .map_err(lease::store_error)?,
+            );
+        }
+
+        let write = self.database.begin_write()?;
+        enforce_live_write(&write)?;
+        lifecycle::require_maintenance_accounting(&write)?;
+        if lifecycle::load_maintenance_cursor(&write)? != cursor {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob maintenance cursor changed after discovery",
+            )));
+        }
+        let exact_import = write
+            .open_table(BLOB_IMPORTS)?
+            .get(candidate.variant.as_bytes().as_slice())?
+            .ok_or_else(|| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob manifest admission import disappeared",
+                ))
+            })?
+            .value()
+            .to_vec();
+        if exact_import != candidate.import {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob manifest admission import changed after discovery",
+            )));
+        }
+        let exact_projection =
+            depot::maintenance_import_projection(candidate.variant.as_bytes(), &exact_import)?;
+        if exact_projection.variant_id != candidate.variant
+            || exact_projection.finalized != candidate.finalized
+            || !matches!(
+                (cursor.class, exact_projection.finalized),
+                (BlobMaintenanceClass::UnreferencedLocalImportStaging, false)
+                    | (BlobMaintenanceClass::UnreferencedCompletedVariants, true)
+            )
+        {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob manifest admission class changed after discovery",
+            )));
+        }
+        let exact_lineage = write
+            .open_table(lifecycle::BLOB_LINEAGE_FENCES)?
+            .get(candidate.variant.as_bytes().as_slice())?
+            .ok_or_else(|| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob manifest admission lineage fence disappeared",
+                ))
+            })?
+            .value()
+            .to_vec();
+        if exact_lineage != candidate.lineage {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob manifest admission lineage changed after discovery",
+            )));
+        }
+        lifecycle::validate_maintenance_lineage_evidence(
+            exact_projection.physical_lineage,
+            self.blob_depot_owner_binding,
+            &exact_lineage,
+        )?;
+
+        let manifested = deletion::variant_has_deletion_manifest_write(&write, candidate.variant)?;
+        // Writable open audits the bidirectional publication/pending-source
+        // relation, and every in-process root mutation is mediated by the
+        // exact reference table. That exact variant prefix is therefore the
+        // bounded admission authority. Operations have no reverse index, but
+        // cannot outlive the publication whose exact reference is represented
+        // here; startup audit rejects a dangling operation. Do not replace
+        // this with an unbounded publication, pending, or operation scan.
+        let referenced = variant_has_valid_reference_write(&write, candidate.variant)?;
+        if manifested && referenced {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob deletion manifest has a live variant reference",
+            )));
+        }
+        if manifested || referenced {
+            lifecycle::advance_maintenance_cursor(
+                &write,
+                cursor.class,
+                Some(candidate.position.as_slice()),
+            )?;
+            write.commit()?;
+            return Ok(BlobMaintenanceProgress {
+                class: cursor.class,
+                rows_examined: page.rows_examined,
+                files_examined: 0,
+                bytes_examined: page.bytes,
+                candidates: Vec::new(),
+                class_has_more_work: !page.complete || candidate_index + 1 < page.rows.len(),
+                awaiting_later_handler: false,
+            });
+        }
+
+        let admission = match self.blob_lease_registry.try_mark_delete_pending(snapshot) {
+            Ok(admission) => admission,
+            Err(
+                lease::BlobLeaseAcquireError::ActiveLeases
+                | lease::BlobLeaseAcquireError::GenerationChanged
+                | lease::BlobLeaseAcquireError::DeletePending,
+            ) => {
+                return Ok(manifest_admission_progress(
+                    &cursor,
+                    &page,
+                    candidate_index,
+                    candidate.variant,
+                    true,
+                ));
+            }
+            Err(error) => return Err(lease::store_error(error)),
+        };
+        if !deletion::admit_variant_write(
+            &write,
+            candidate.variant,
+            &candidate.import,
+            &candidate.lineage,
+            self.blob_depot_owner_binding,
+        )? {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob manifest admission lost its exact candidate",
+            )));
+        }
+        lifecycle::advance_maintenance_cursor(
+            &write,
+            cursor.class,
+            Some(candidate.position.as_slice()),
+        )?;
+        write.commit()?;
+        admission.durable_committed().map_err(lease::store_error)?;
+        Ok(manifest_admission_progress(
+            &cursor,
+            &page,
+            candidate_index,
+            candidate.variant,
+            false,
+        ))
+    }
+
     #[cfg(test)]
     fn test_admit_blob_deletion_manifest(&self, variant: BlobVariantId) -> Result<(), StoreError> {
         let _depot_guard = self
@@ -1336,6 +1598,11 @@ impl Store {
     #[cfg(test)]
     fn test_blob_lease_entries(&self) -> usize {
         self.blob_lease_registry.stored_entries()
+    }
+
+    #[cfg(test)]
+    fn test_blob_lease_watches(&self) -> usize {
+        self.blob_lease_registry.active_watches()
     }
 
     #[cfg(test)]
@@ -4221,7 +4488,6 @@ enum MaintenanceRowKind {
     Publication,
     Pending,
     Carrier,
-    Import,
     Operation,
 }
 
@@ -4347,45 +4613,6 @@ fn capture_exact_maintenance_reference(
         return Ok(None);
     };
     Ok(Some(MaintenanceReferenceEvidence { key, value }))
-}
-
-fn capture_any_maintenance_reference(
-    write: &redb::WriteTransaction,
-    variant: BlobVariantId,
-    charge: &mut MaintenanceCharge,
-) -> Result<Result<Option<MaintenanceReferenceEvidence>, ()>, StoreError> {
-    if charge.rows >= charge.budget.rows || charge.bytes >= charge.budget.bytes {
-        return Ok(Err(()));
-    }
-    let references = write.open_table(lifecycle::BLOB_VARIANT_REFERENCES)?;
-    let start = variant.as_bytes().as_slice();
-    let mut upper = start.to_vec();
-    let upper = upper
-        .iter_mut()
-        .rposition(|byte| *byte != u8::MAX)
-        .map(|index| {
-            upper[index] += 1;
-            upper.truncate(index + 1);
-            upper
-        });
-    let bounds = match upper.as_deref() {
-        Some(upper) => (
-            std::ops::Bound::Included(start),
-            std::ops::Bound::Excluded(upper),
-        ),
-        None => (std::ops::Bound::Included(start), std::ops::Bound::Unbounded),
-    };
-    let Some((key, value)) = references.range::<&[u8]>(bounds)?.next().transpose()? else {
-        return Ok(Ok(None));
-    };
-    debug_assert!(key.value().starts_with(start));
-    if !charge.charge(key.value(), value.value().len())? {
-        return Ok(Err(()));
-    }
-    Ok(Ok(Some(MaintenanceReferenceEvidence {
-        key: key.value().to_vec(),
-        value: value.value().to_vec(),
-    })))
 }
 
 fn capture_maintenance_evidence(
@@ -4593,20 +4820,6 @@ fn capture_maintenance_evidence(
                     conflicting_publication,
                 },
             })
-        }
-        MaintenanceRowKind::Import => {
-            let import = depot::maintenance_import_projection(key, value)?;
-            let reference =
-                match capture_any_maintenance_reference(write, import.variant_id, charge)? {
-                    Ok(value) => value,
-                    Err(()) => return Ok(None),
-                };
-            let lineage = required_bytes!(
-                lifecycle::BLOB_LINEAGE_FENCES,
-                import.variant_id.as_bytes(),
-                "retained Blob import is missing its lineage fence"
-            );
-            MaintenanceEvidence::Import(MaintenanceImportEvidence { lineage, reference })
         }
         MaintenanceRowKind::Operation => {
             let operation = decode_blob_operation_record(value)?;
@@ -5052,9 +5265,328 @@ fn validate_maintenance_operation(
     Ok(())
 }
 
+fn capture_any_maintenance_reference_read(
+    read: &redb::ReadTransaction,
+    variant: BlobVariantId,
+    charge: &mut MaintenanceCharge,
+) -> Result<Result<Option<MaintenanceReferenceEvidence>, ()>, StoreError> {
+    if charge.rows >= charge.budget.rows || charge.bytes >= charge.budget.bytes {
+        return Ok(Err(()));
+    }
+    let references = read.open_table(lifecycle::BLOB_VARIANT_REFERENCES)?;
+    let start = variant.as_bytes().as_slice();
+    let mut upper = start.to_vec();
+    let upper = upper
+        .iter_mut()
+        .rposition(|byte| *byte != u8::MAX)
+        .map(|index| {
+            upper[index] += 1;
+            upper.truncate(index + 1);
+            upper
+        });
+    let bounds = match upper.as_deref() {
+        Some(upper) => (
+            std::ops::Bound::Included(start),
+            std::ops::Bound::Excluded(upper),
+        ),
+        None => (std::ops::Bound::Included(start), std::ops::Bound::Unbounded),
+    };
+    let Some((key, value)) = references.range::<&[u8]>(bounds)?.next().transpose()? else {
+        return Ok(Ok(None));
+    };
+    if !charge.charge(key.value(), value.value().len())? {
+        return Ok(Err(()));
+    }
+    Ok(Ok(Some(MaintenanceReferenceEvidence {
+        key: key.value().to_vec(),
+        value: value.value().to_vec(),
+    })))
+}
+
+fn capture_import_maintenance_evidence_read(
+    read: &redb::ReadTransaction,
+    key: &[u8],
+    value: &[u8],
+    charge: &mut MaintenanceCharge,
+) -> Result<Option<MaintenanceEvidence>, StoreError> {
+    let import = depot::maintenance_import_projection(key, value)?;
+    let reference = match capture_any_maintenance_reference_read(read, import.variant_id, charge)? {
+        Ok(reference) => reference,
+        Err(()) => return Ok(None),
+    };
+    if charge.rows >= charge.budget.rows {
+        return Ok(None);
+    }
+    let lineage = read.open_table(lifecycle::BLOB_LINEAGE_FENCES)?;
+    let lineage = lineage
+        .get(import.variant_id.as_bytes().as_slice())?
+        .ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "retained Blob import is missing its lineage fence",
+            ))
+        })?;
+    if !charge.charge(import.variant_id.as_bytes(), lineage.value().len())? {
+        return Ok(None);
+    }
+    Ok(Some(MaintenanceEvidence::Import(
+        MaintenanceImportEvidence {
+            lineage: lineage.value().to_vec(),
+            reference,
+        },
+    )))
+}
+
+fn append_import_maintenance_range_read<'a>(
+    read: &redb::ReadTransaction,
+    lower: std::ops::Bound<&'a [u8]>,
+    upper: std::ops::Bound<&'a [u8]>,
+    total_rows: u64,
+    rows: &mut Vec<MaintenancePageRow>,
+    charge: &mut MaintenanceCharge,
+) -> Result<bool, StoreError> {
+    let imports = read.open_table(BLOB_IMPORTS)?;
+    let mut range = imports.range::<&[u8]>((lower, upper))?;
+    loop {
+        if charge.rows >= charge.budget.rows
+            || u64::try_from(rows.len()).map_err(|_| StoreError::ItemCountAccountingOverflow)?
+                >= total_rows
+        {
+            return Ok(false);
+        }
+        let Some(row) = range.next() else {
+            return Ok(true);
+        };
+        let (key, value) = row?;
+        if !charge.charge(key.value(), value.value().len())? {
+            return Ok(false);
+        }
+        let key = key.value().to_vec();
+        let value = value.value().to_vec();
+        let Some(evidence) = capture_import_maintenance_evidence_read(read, &key, &value, charge)?
+        else {
+            return Ok(false);
+        };
+        rows.push(MaintenancePageRow {
+            position: key.clone(),
+            key,
+            value,
+            evidence,
+        });
+    }
+}
+
+fn bounded_import_maintenance_page_read(
+    read: &redb::ReadTransaction,
+    after: Option<&[u8]>,
+    budget: BlobMaintenanceBudget,
+) -> Result<MaintenancePage, StoreError> {
+    let total_rows = read.open_table(BLOB_IMPORTS)?.len()?;
+    let mut rows = Vec::new();
+    let mut charge = MaintenanceCharge {
+        budget,
+        rows: 0,
+        bytes: 0,
+    };
+    let first_complete = append_import_maintenance_range_read(
+        read,
+        after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
+        std::ops::Bound::Unbounded,
+        total_rows,
+        &mut rows,
+        &mut charge,
+    )?;
+    if first_complete
+        && u64::try_from(rows.len()).map_err(|_| StoreError::ItemCountAccountingOverflow)?
+            < total_rows
+        && let Some(after) = after
+    {
+        append_import_maintenance_range_read(
+            read,
+            std::ops::Bound::Unbounded,
+            std::ops::Bound::Included(after),
+            total_rows,
+            &mut rows,
+            &mut charge,
+        )?;
+    }
+    let examined_rows =
+        u64::try_from(rows.len()).map_err(|_| StoreError::ItemCountAccountingOverflow)?;
+    Ok(MaintenancePage {
+        complete: examined_rows == total_rows,
+        rows,
+        rows_examined: charge.rows,
+        bytes: charge.bytes,
+    })
+}
+
+fn validate_reference_root_read(
+    read: &redb::ReadTransaction,
+    evidence: &MaintenanceReferenceEvidence,
+    variant: BlobVariantId,
+) -> Result<(), StoreError> {
+    let key: [u8; 65] = evidence.key.as_slice().try_into().map_err(|_| {
+        blob_error(BlobStoreError::SchemaInvariant(
+            "Blob variant reference is not canonical",
+        ))
+    })?;
+    if key[..32] != variant.as_bytes()[..] || !evidence.value.is_empty() {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob variant reference is not canonical",
+        )));
+    }
+    let owner = lifecycle::VariantReferenceOwner::decode(&key[32..33]).map_err(StoreError::Blob)?;
+    let transfer = BlobTransferId::new(key[33..].try_into().expect("fixed transfer key"));
+    match owner {
+        lifecycle::VariantReferenceOwner::Publication => {
+            let publication = read
+                .open_table(BLOB_PUBLICATIONS)?
+                .get(transfer.as_bytes().as_slice())?
+                .map(|value| decode_blob_metadata(value.value()))
+                .transpose()?
+                .ok_or_else(|| {
+                    blob_error(BlobStoreError::SchemaInvariant(
+                        "Blob publication reference has no exact publication",
+                    ))
+                })?;
+            if publication.transfer_id != transfer || publication.variant_id != variant {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob publication reference conflicts with its exact publication",
+                )));
+            }
+        }
+        lifecycle::VariantReferenceOwner::PendingSource => {
+            let pending = read
+                .open_table(BLOB_PENDING_SOURCES)?
+                .get(transfer.as_bytes().as_slice())?
+                .map(|value| decode_pending_blob_source(value.value()))
+                .transpose()?
+                .ok_or_else(|| {
+                    blob_error(BlobStoreError::SchemaInvariant(
+                        "Blob pending reference has no exact pending source",
+                    ))
+                })?;
+            if pending.metadata.transfer_id != transfer || pending.metadata.variant_id != variant {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob pending reference conflicts with its exact pending source",
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn variant_has_valid_reference_write(
+    write: &redb::WriteTransaction,
+    variant: BlobVariantId,
+) -> Result<bool, StoreError> {
+    let start = variant.as_bytes().as_slice();
+    let evidence = {
+        let references = write.open_table(lifecycle::BLOB_VARIANT_REFERENCES)?;
+        let Some((key, value)) = references.range(start..)?.next().transpose()? else {
+            return Ok(false);
+        };
+        if !key.value().starts_with(start) {
+            return Ok(false);
+        }
+        MaintenanceReferenceEvidence {
+            key: key.value().to_vec(),
+            value: value.value().to_vec(),
+        }
+    };
+    let key: [u8; 65] = evidence.key.as_slice().try_into().map_err(|_| {
+        blob_error(BlobStoreError::SchemaInvariant(
+            "Blob variant reference is not canonical",
+        ))
+    })?;
+    if !evidence.value.is_empty() {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob variant reference is not canonical",
+        )));
+    }
+    let owner = lifecycle::VariantReferenceOwner::decode(&key[32..33]).map_err(StoreError::Blob)?;
+    let transfer = BlobTransferId::new(key[33..].try_into().expect("fixed transfer key"));
+    match owner {
+        lifecycle::VariantReferenceOwner::Publication => {
+            let publication = write
+                .open_table(BLOB_PUBLICATIONS)?
+                .get(transfer.as_bytes().as_slice())?
+                .map(|value| decode_blob_metadata(value.value()))
+                .transpose()?
+                .ok_or_else(|| {
+                    blob_error(BlobStoreError::SchemaInvariant(
+                        "Blob publication reference has no exact publication",
+                    ))
+                })?;
+            if publication.transfer_id != transfer || publication.variant_id != variant {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob publication reference conflicts with its exact publication",
+                )));
+            }
+        }
+        lifecycle::VariantReferenceOwner::PendingSource => {
+            let pending = write
+                .open_table(BLOB_PENDING_SOURCES)?
+                .get(transfer.as_bytes().as_slice())?
+                .map(|value| decode_pending_blob_source(value.value()))
+                .transpose()?
+                .ok_or_else(|| {
+                    blob_error(BlobStoreError::SchemaInvariant(
+                        "Blob pending reference has no exact pending source",
+                    ))
+                })?;
+            if pending.metadata.transfer_id != transfer || pending.metadata.variant_id != variant {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob pending reference conflicts with its exact pending source",
+                )));
+            }
+        }
+    }
+    Ok(true)
+}
+
+#[derive(Debug)]
+struct BlobManifestAdmissionCandidate {
+    position: Vec<u8>,
+    variant: BlobVariantId,
+    import: Vec<u8>,
+    lineage: Vec<u8>,
+    finalized: bool,
+}
+
+fn manifest_admission_progress(
+    cursor: &lifecycle::BlobMaintenanceCursor,
+    page: &MaintenancePage,
+    candidate_index: usize,
+    variant: BlobVariantId,
+    awaiting_later_handler: bool,
+) -> BlobMaintenanceProgress {
+    let selected = match cursor.class {
+        BlobMaintenanceClass::UnreferencedLocalImportStaging => {
+            BlobMaintenanceCandidate::UnreferencedLocalImport {
+                staging_variant: variant,
+            }
+        }
+        BlobMaintenanceClass::UnreferencedCompletedVariants => {
+            BlobMaintenanceCandidate::UnreferencedCompletedVariant { variant }
+        }
+        _ => unreachable!("manifest admission only runs for import classes"),
+    };
+    BlobMaintenanceProgress {
+        class: cursor.class,
+        rows_examined: page.rows_examined,
+        files_examined: 0,
+        bytes_examined: page.bytes,
+        candidates: vec![selected],
+        class_has_more_work: awaiting_later_handler
+            || !page.complete
+            || candidate_index + 1 < page.rows.len(),
+        awaiting_later_handler,
+    }
+}
+
 impl Store {
     /// Runs one internal, durable, independently bounded maintenance selection
-    /// turn. Destructive candidates are discovery-only in this increment.
+    /// turn.
     #[doc(hidden)]
     pub fn run_blob_maintenance_turn(
         &self,
@@ -5063,6 +5595,16 @@ impl Store {
         self.require_live()?;
         if budget.rows == 0 || budget.files == 0 || budget.bytes == 0 {
             return Err(blob_error(BlobStoreError::InvalidMaintenanceBudget));
+        }
+        let read = self.database.begin_read()?;
+        let discovered_cursor = lifecycle::load_maintenance_cursor_read(&read)?;
+        drop(read);
+        if matches!(
+            discovered_cursor.class,
+            BlobMaintenanceClass::UnreferencedLocalImportStaging
+                | BlobMaintenanceClass::UnreferencedCompletedVariants
+        ) {
+            return self.run_blob_manifest_admission_turn(discovered_cursor, budget);
         }
         let write = self.database.begin_write()?;
         enforce_live_write(&write)?;
@@ -5091,13 +5633,7 @@ impl Store {
             )?,
             BlobMaintenanceClass::UnreferencedLocalImportStaging
             | BlobMaintenanceClass::UnreferencedCompletedVariants => {
-                bounded_single_maintenance_page(
-                    &write,
-                    BLOB_IMPORTS,
-                    MaintenanceRowKind::Import,
-                    cursor.position.as_deref(),
-                    budget,
-                )?
+                unreachable!("import maintenance classes use exact manifest admission")
             }
             BlobMaintenanceClass::ExpiredRetirementRecords => bounded_single_maintenance_page(
                 &write,
@@ -12858,26 +13394,40 @@ mod tests {
         );
     }
 
-    fn depot_file_snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
-        fn visit(base: &Path, current: &Path, output: &mut BTreeMap<PathBuf, Vec<u8>>) {
+    fn depot_file_snapshot(root: &Path) -> BTreeMap<PathBuf, (u8, Vec<u8>)> {
+        const DIRECTORY: u8 = 1;
+        const FILE: u8 = 2;
+        const SYMLINK: u8 = 3;
+        const OTHER: u8 = 4;
+
+        fn visit(base: &Path, current: &Path, output: &mut BTreeMap<PathBuf, (u8, Vec<u8>)>) {
             for entry in std::fs::read_dir(current).expect("read depot snapshot") {
                 let entry = entry.expect("depot snapshot entry");
                 let path = entry.path();
-                if entry.file_type().expect("depot snapshot type").is_dir() {
+                let relative = path
+                    .strip_prefix(base)
+                    .expect("depot snapshot relative path")
+                    .to_path_buf();
+                let file_type = entry.file_type().expect("depot snapshot type");
+                if file_type.is_dir() {
+                    output.insert(relative, (DIRECTORY, Vec::new()));
                     visit(base, &path, output);
-                } else {
+                } else if file_type.is_file() {
                     output.insert(
-                        path.strip_prefix(base)
-                            .expect("depot snapshot relative path")
-                            .to_path_buf(),
-                        std::fs::read(path).expect("depot snapshot bytes"),
+                        relative,
+                        (FILE, std::fs::read(path).expect("depot snapshot bytes")),
                     );
+                } else if file_type.is_symlink() {
+                    output.insert(relative, (SYMLINK, Vec::new()));
+                } else {
+                    output.insert(relative, (OTHER, Vec::new()));
                 }
             }
         }
 
         let mut output = BTreeMap::new();
         if root.exists() {
+            output.insert(PathBuf::from("."), (DIRECTORY, Vec::new()));
             visit(root, root, &mut output);
         }
         output
@@ -17430,6 +17980,1105 @@ mod tests {
         write.commit().expect("commit maintenance cursor");
     }
 
+    fn deletion_manifest_for_test(
+        store: &Store,
+        variant: BlobVariantId,
+    ) -> deletion::BlobDeletionManifest {
+        let read = store.database.begin_read().expect("read deletion manifest");
+        deletion::inspect_blob_deletion_read(&read, Some(store.blob_depot_owner_binding))
+            .expect("audit deletion manifest")
+            .manifests
+            .get(&variant)
+            .cloned()
+            .expect("exact deletion manifest")
+    }
+
+    fn blob_maintenance_cursor_rows(store: &Store) -> Vec<(u8, Vec<u8>)> {
+        let read = store
+            .database
+            .begin_read()
+            .expect("read maintenance cursors");
+        read.open_table(lifecycle::BLOB_MAINTENANCE_CURSORS)
+            .expect("maintenance cursors")
+            .iter()
+            .expect("maintenance cursor rows")
+            .map(|row| {
+                let (key, value) = row.expect("maintenance cursor row");
+                (key.value(), value.value().to_vec())
+            })
+            .collect()
+    }
+
+    fn blob_manifest_admission_digest(store: &Store) -> [u8; 32] {
+        fn field(digest: &mut Sha256, label: &[u8], key: &[u8], value: &[u8]) {
+            for bytes in [label, key, value] {
+                digest.update(
+                    u64::try_from(bytes.len())
+                        .expect("admission digest field length")
+                        .to_be_bytes(),
+                );
+                digest.update(bytes);
+            }
+        }
+
+        let read = store.database.begin_read().expect("admission digest read");
+        let mut digest = Sha256::new();
+        for row in read
+            .open_table(deletion::BLOB_DELETION_METADATA)
+            .expect("deletion metadata")
+            .iter()
+            .expect("deletion metadata rows")
+        {
+            let (key, value) = row.expect("deletion metadata row");
+            field(
+                &mut digest,
+                b"deletion-metadata",
+                key.value().as_bytes(),
+                &value.value().to_be_bytes(),
+            );
+        }
+        for (label, definition) in [
+            (
+                b"deletion-manifests".as_slice(),
+                deletion::BLOB_DELETION_MANIFESTS,
+            ),
+            (
+                b"deletion-chunks".as_slice(),
+                deletion::BLOB_DELETION_CHUNKS,
+            ),
+            (b"active-imports".as_slice(), BLOB_IMPORTS),
+            (b"active-chunks".as_slice(), BLOB_CHUNKS),
+        ] {
+            for row in read
+                .open_table(definition)
+                .expect("admission byte table")
+                .iter()
+                .expect("admission byte rows")
+            {
+                let (key, value) = row.expect("admission byte row");
+                field(&mut digest, label, key.value(), value.value());
+            }
+        }
+        for row in read
+            .open_table(deletion::BLOB_DELETION_CONTINUITY)
+            .expect("deletion continuity")
+            .iter()
+            .expect("deletion continuity rows")
+        {
+            let (key, value) = row.expect("deletion continuity row");
+            field(
+                &mut digest,
+                b"deletion-continuity",
+                &[key.value()],
+                value.value(),
+            );
+        }
+        for row in read
+            .open_table(BLOB_DEPOT_METADATA)
+            .expect("depot metadata")
+            .iter()
+            .expect("depot metadata rows")
+        {
+            let (key, value) = row.expect("depot metadata row");
+            field(
+                &mut digest,
+                b"depot-metadata",
+                key.value().as_bytes(),
+                &value.value().to_be_bytes(),
+            );
+        }
+        for row in read
+            .open_table(lifecycle::BLOB_MAINTENANCE_CURSORS)
+            .expect("maintenance cursors")
+            .iter()
+            .expect("maintenance cursor rows")
+        {
+            let (key, value) = row.expect("maintenance cursor row");
+            field(
+                &mut digest,
+                b"maintenance-cursors",
+                &[key.value()],
+                value.value(),
+            );
+        }
+        digest.finalize().into()
+    }
+
+    #[test]
+    fn blob_unreferenced_staging_and_completed_variants_enter_exact_manifests() {
+        // Break caught: maintenance must not stop at discovery or admit a
+        // different variant than the exact already-unreferenced import.
+        for (label, finalized, class) in [
+            (
+                "staging",
+                false,
+                lifecycle::BlobMaintenanceClass::UnreferencedLocalImportStaging,
+            ),
+            (
+                "completed",
+                true,
+                lifecycle::BlobMaintenanceClass::UnreferencedCompletedVariants,
+            ),
+        ] {
+            let root = BlobTestRoot::new(&format!("manifest-admission-{label}"));
+            let services = blob_services(if finalized { 0xc2 } else { 0xc1 });
+            let store = Store::open_for_mission(&root.database, services.authority)
+                .expect("manifest admission store");
+            let variant = install_unreferenced_variant(
+                &store,
+                &services,
+                format!("exact unreferenced {label}").as_bytes(),
+                1,
+                finalized,
+            );
+            set_maintenance_next_class(&store, class);
+
+            let progress = store
+                .run_blob_maintenance_turn(maintenance_budget(16))
+                .expect("admit exact unreferenced variant");
+
+            assert_eq!(progress.class, class);
+            assert!(!progress.awaiting_later_handler);
+            let manifest = deletion_manifest_for_test(&store, variant);
+            assert_eq!(manifest.variant_id, variant);
+            assert_eq!(manifest.finalized_root.is_some(), finalized);
+            let read = store.database.begin_read().expect("read moved authority");
+            assert!(
+                read.open_table(BLOB_CHUNKS)
+                    .expect("active chunks")
+                    .iter()
+                    .expect("active chunk rows")
+                    .all(|row| !row
+                        .expect("active chunk row")
+                        .0
+                        .value()
+                        .starts_with(variant.as_bytes()))
+            );
+        }
+    }
+
+    #[test]
+    fn blob_manifest_admission_preserves_full_charge_and_import_metadata() {
+        // Break caught: admission must not release quota, rewrite import
+        // evidence, or charge deletion rows a second time.
+        let root = BlobTestRoot::new("manifest-admission-accounting");
+        let services = blob_services(0xc3);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("manifest accounting store");
+        let plaintext = vec![0xc3; SELECTED_BLOB_CHUNK_SIZE as usize + 97];
+        let variant = install_unreferenced_variant(&store, &services, &plaintext, 1, true);
+        let (before_stats, before_import) = {
+            let stats = store.blob_stats().expect("pre-admission Blob stats");
+            let read = store.database.begin_read().expect("read original import");
+            let import = read
+                .open_table(BLOB_IMPORTS)
+                .expect("imports")
+                .get(variant.as_bytes().as_slice())
+                .expect("import lookup")
+                .expect("exact import")
+                .value()
+                .to_vec();
+            (stats, import)
+        };
+        set_maintenance_next_class(
+            &store,
+            lifecycle::BlobMaintenanceClass::UnreferencedCompletedVariants,
+        );
+
+        store
+            .run_blob_maintenance_turn(maintenance_budget(16))
+            .expect("admit charged variant");
+
+        assert_eq!(
+            store.blob_stats().expect("post-admission Blob stats"),
+            before_stats
+        );
+        let manifest = deletion_manifest_for_test(&store, variant);
+        assert_eq!(manifest.original_import, before_import);
+        assert_eq!(manifest.totals.charged_variants, 1);
+        assert_eq!(manifest.totals.chunks, 2);
+        assert_eq!(manifest.totals.charged_files, 2);
+        assert_eq!(
+            manifest.totals.charged_reserved_bytes,
+            before_stats.reserved_file_bytes
+        );
+        assert_eq!(
+            manifest.totals.charged_committed_bytes,
+            before_stats.committed_file_bytes
+        );
+    }
+
+    #[test]
+    fn blob_shared_reference_and_active_lease_prevent_manifest_admission() {
+        // Break caught: neither a durable typed root nor a process-local exact
+        // lease may be retired by maintenance discovery.
+        let rooted_root = BlobTestRoot::new("manifest-admission-rooted");
+        let mut rooted_services = blob_services(0xc4);
+        let rooted = Store::open_for_mission(&rooted_root.database, rooted_services.authority)
+            .expect("rooted admission store");
+        let rooted_plaintext = b"live rooted completed variant".to_vec();
+        let rooted_prepared = prepared_blob(&rooted_plaintext);
+        let (publication, _, _) = publish_blob(
+            &rooted,
+            &mut rooted_services,
+            &rooted_prepared,
+            &rooted_plaintext,
+            1,
+            b"rooted-manifest-admission",
+        );
+        set_maintenance_next_class(
+            &rooted,
+            lifecycle::BlobMaintenanceClass::UnreferencedCompletedVariants,
+        );
+        rooted
+            .run_blob_maintenance_turn(maintenance_budget(16))
+            .expect("skip rooted completed variant");
+        let read = rooted.database.begin_read().expect("read rooted result");
+        assert!(
+            deletion::inspect_blob_deletion_read(&read, Some(rooted.blob_depot_owner_binding))
+                .expect("audit rooted result")
+                .manifests
+                .is_empty()
+        );
+        assert!(
+            rooted
+                .get_blob(publication.transfer_id)
+                .expect("rooted publication lookup")
+                .is_some()
+        );
+        drop(read);
+
+        let leased_root = BlobTestRoot::new("manifest-admission-leased");
+        let mut leased_services = blob_services(0xc5);
+        let leased = Store::open_for_mission(&leased_root.database, leased_services.authority)
+            .expect("leased admission store");
+        let leased_plaintext = b"actively leased completed variant".to_vec();
+        let leased_prepared = prepared_blob(&leased_plaintext);
+        let proof = prepare_blob_proof(
+            &leased,
+            &mut leased_services,
+            &leased_prepared,
+            &leased_plaintext,
+            1,
+        );
+        let variant = proof.completion.variant_id();
+        let held = leased
+            .blob_depot_for_authenticated_read(&proof.completion)
+            .expect("hold exact application read lease");
+        set_maintenance_next_class(
+            &leased,
+            lifecycle::BlobMaintenanceClass::UnreferencedCompletedVariants,
+        );
+        let before_cursor = blob_maintenance_cursor_rows(&leased);
+        let progress = leased
+            .run_blob_maintenance_turn(maintenance_budget(16))
+            .expect("active operation defers maintenance");
+        assert!(progress.awaiting_later_handler);
+        assert!(progress.class_has_more_work);
+        assert_eq!(blob_maintenance_cursor_rows(&leased), before_cursor);
+        let read = leased.database.begin_read().expect("read leased result");
+        deletion::require_variant_available_read(&read, variant)
+            .expect("lease kept variant available");
+        drop(read);
+        drop(held);
+    }
+
+    #[test]
+    fn blob_inactivity_alone_never_makes_a_variant_collectible() {
+        // Break caught: repeated maintenance turns must not reinterpret an
+        // authenticated pending source as abandoned merely because it is idle.
+        let source_root = BlobTestRoot::new("manifest-inactivity-source");
+        let target_root = BlobTestRoot::new("manifest-inactivity-target");
+        let mut services = blob_services(0xc6);
+        let source = Store::open_for_mission(&source_root.database, services.authority)
+            .expect("inactivity source");
+        let target = Store::open_for_mission(&target_root.database, services.authority)
+            .expect("inactivity target");
+        let transfer = stage_pending_source_for_maintenance(
+            &source,
+            &target,
+            &mut services,
+            b"valid pending source has no inactivity timeout",
+            1,
+            false,
+        );
+        for _ in 0..4 {
+            set_maintenance_next_class(
+                &target,
+                lifecycle::BlobMaintenanceClass::UnreferencedLocalImportStaging,
+            );
+            target
+                .run_blob_maintenance_turn(maintenance_budget(16))
+                .expect("idle pending source remains rooted");
+        }
+        assert!(
+            target
+                .pending_blob_source(transfer)
+                .expect("pending source lookup")
+                .is_some()
+        );
+        let read = target
+            .database
+            .begin_read()
+            .expect("read inactivity result");
+        assert!(
+            deletion::inspect_blob_deletion_read(&read, Some(target.blob_depot_owner_binding))
+                .expect("audit inactivity result")
+                .manifests
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn blob_manifest_preserves_expected_only_and_committed_chunk_states() {
+        // Break caught: only a committed-file row may authorize unlink;
+        // expected-only and digest-only rows must remain exact evidence but be
+        // born already DeletedDurable in the manifest.
+        let root = BlobTestRoot::new("manifest-admission-chunk-states");
+        let services = blob_services(0xc7);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("chunk-state admission store");
+        let plaintext = vec![0xc7; (2 * SELECTED_BLOB_CHUNK_SIZE as usize) + 31];
+        let prepared = prepared_blob(&plaintext);
+        let depot = store.blob_depot().expect("chunk-state depot");
+        let mut service = services
+            .publisher
+            .blob_service_with_store(&blob_scope(), &blob_topic(), 1, depot)
+            .expect("chunk-state Blob service");
+        let manifest = service
+            .install_prepared(&prepared)
+            .expect("install digest-only rows");
+        service
+            .encrypt_some(&mut Cursor::new(&plaintext), &manifest, 1)
+            .expect("commit one exact chunk");
+        let second =
+            &plaintext[SELECTED_BLOB_CHUNK_SIZE as usize..2 * SELECTED_BLOB_CHUNK_SIZE as usize];
+        let expected_only = aster_mesh::BlobChunkRecord::from_parts(
+            Sha256::digest(second).into(),
+            [0x5e; 32],
+            SELECTED_BLOB_CHUNK_SIZE,
+            SELECTED_BLOB_CHUNK_SIZE + 16,
+        )
+        .expect("canonical expected-only record");
+        drop(service);
+        let variant = BlobVariantId::for_content(
+            manifest.id(),
+            manifest.content_group(),
+            manifest.content_epoch(),
+        );
+        let write = store
+            .database
+            .begin_write()
+            .expect("stage expected-only test row");
+        depot::set_expected_chunk_for_test(&write, variant, 1, expected_only)
+            .expect("stage expected-only row");
+        write.commit().expect("commit expected-only row");
+        let (before_stats, original_rows) = {
+            let stats = store.blob_stats().expect("mixed-state before stats");
+            let read = store
+                .database
+                .begin_read()
+                .expect("read original chunk rows");
+            let import = read
+                .open_table(BLOB_IMPORTS)
+                .expect("mixed-state imports")
+                .get(variant.as_bytes().as_slice())
+                .expect("mixed-state import lookup")
+                .expect("mixed-state import")
+                .value()
+                .to_vec();
+            let chunks = read.open_table(BLOB_CHUNKS).expect("ordinary chunks");
+            let rows = chunks
+                .iter()
+                .expect("ordinary chunk rows")
+                .filter_map(|row| {
+                    let (key, value) = row.expect("ordinary chunk row");
+                    if !key.value().starts_with(variant.as_bytes()) {
+                        return None;
+                    }
+                    let index = u64::from_be_bytes(
+                        key.value()[32..]
+                            .try_into()
+                            .expect("mixed-state chunk index"),
+                    );
+                    let original = value.value().to_vec();
+                    let charge = depot::deletion_chunk_projection(&import, index, &original)
+                        .expect("mixed-state chunk charge");
+                    Some((index, original, charge))
+                })
+                .collect::<Vec<_>>();
+            (stats, rows)
+        };
+        assert_eq!(original_rows.len(), 3);
+        set_maintenance_next_class(
+            &store,
+            lifecycle::BlobMaintenanceClass::UnreferencedLocalImportStaging,
+        );
+
+        store
+            .run_blob_maintenance_turn(maintenance_budget(16))
+            .expect("admit mixed-state staging");
+
+        let deletion = deletion_manifest_for_test(&store, variant);
+        assert_eq!(
+            deletion
+                .chunks
+                .iter()
+                .map(|chunk| chunk.original_chunk.clone())
+                .collect::<Vec<_>>(),
+            original_rows
+                .iter()
+                .map(|(_, original, _)| original.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(deletion.totals.queued, 1);
+        assert_eq!(deletion.totals.deleted, 2);
+        assert_eq!(
+            deletion
+                .chunks
+                .iter()
+                .map(|chunk| chunk.state)
+                .collect::<Vec<_>>(),
+            vec![
+                deletion::BlobDeletionChunkState::DeleteQueued,
+                deletion::BlobDeletionChunkState::DeletedDurable,
+                deletion::BlobDeletionChunkState::DeletedDurable,
+            ]
+        );
+        for (chunk, (index, _, charge)) in deletion.chunks.iter().zip(&original_rows) {
+            assert_eq!(chunk.index, *index);
+            assert_eq!(chunk.charged_reserved_bytes, charge.charged_reserved_bytes);
+            assert_eq!(
+                chunk.charged_committed_bytes,
+                charge.charged_committed_bytes
+            );
+        }
+        assert_eq!(
+            deletion.totals.charged_reserved_bytes,
+            original_rows
+                .iter()
+                .map(|(_, _, charge)| charge.charged_reserved_bytes)
+                .sum()
+        );
+        assert_eq!(
+            deletion.totals.charged_committed_bytes,
+            original_rows
+                .iter()
+                .map(|(_, _, charge)| charge.charged_committed_bytes)
+                .sum()
+        );
+        assert_eq!(
+            store.blob_stats().expect("mixed-state after stats"),
+            before_stats
+        );
+    }
+
+    #[test]
+    fn blob_manifest_admission_fault_rolls_back_exact_before_image() {
+        // Break caught: every table mutation, including cursor mutation, must
+        // remain inside the one admission transaction and reproduce the exact
+        // before-image when its ordinal fault fires.
+        let control_root = BlobTestRoot::new("manifest-admission-fault-control");
+        let mut control_services = blob_services(0xc8);
+        let control = Store::open_for_mission(&control_root.database, control_services.authority)
+            .expect("fault-control store");
+        let plaintext = vec![0xc8; SELECTED_BLOB_CHUNK_SIZE as usize + 9];
+        let prepared = prepared_blob(&plaintext);
+        prepare_blob_proof(&control, &mut control_services, &prepared, &plaintext, 1);
+        set_maintenance_next_class(
+            &control,
+            lifecycle::BlobMaintenanceClass::UnreferencedCompletedVariants,
+        );
+        deletion::set_manifest_admission_fault_ordinal_for_test(None);
+        control
+            .run_blob_maintenance_turn(maintenance_budget(16))
+            .expect("successful mutation-count control admission");
+        let mutation_count = deletion::manifest_admission_mutations_for_test();
+        assert!(
+            mutation_count > 2,
+            "admission must cover more than cursor writes"
+        );
+
+        for ordinal in 1..=mutation_count {
+            let root = BlobTestRoot::new(&format!("manifest-admission-fault-{ordinal}"));
+            let mut services = blob_services(0xc8);
+            let store = Store::open_for_mission(&root.database, services.authority)
+                .expect("fault fixture store");
+            let prepared = prepared_blob(&plaintext);
+            let proof = prepare_blob_proof(&store, &mut services, &prepared, &plaintext, 1);
+            let variant = proof.completion.variant_id();
+            set_maintenance_next_class(
+                &store,
+                lifecycle::BlobMaintenanceClass::UnreferencedCompletedVariants,
+            );
+            let before = blob_manifest_admission_digest(&store);
+            let before_cursor = blob_maintenance_cursor_rows(&store);
+            let before_registry = (
+                store.test_blob_lease_entries(),
+                store.test_blob_lease_watches(),
+                store.test_blob_lease_active(variant),
+            );
+            deletion::set_manifest_admission_fault_ordinal_for_test(Some(ordinal));
+            let result = store.run_blob_maintenance_turn(maintenance_budget(16));
+            deletion::set_manifest_admission_fault_ordinal_for_test(None);
+
+            assert!(matches!(
+                result,
+                Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+                    "injected Blob manifest admission mutation failure"
+                )))
+            ));
+            assert_eq!(blob_manifest_admission_digest(&store), before);
+            assert_eq!(blob_maintenance_cursor_rows(&store), before_cursor);
+            assert_eq!(
+                (
+                    store.test_blob_lease_entries(),
+                    store.test_blob_lease_watches(),
+                    store.test_blob_lease_active(variant),
+                ),
+                before_registry,
+                "fault ordinal {ordinal} must restore the production lease registry"
+            );
+            let read = store
+                .database
+                .begin_read()
+                .expect("fault availability read");
+            deletion::require_variant_available_read(&read, variant)
+                .expect("failed admission keeps variant available");
+            drop(read);
+            let authenticated = store
+                .blob_depot_for_authenticated_read(&proof.completion)
+                .expect("fault rollback permits a fresh authenticated read lease");
+            assert_eq!(store.test_blob_lease_active(variant), 1);
+            drop(authenticated);
+            assert_eq!(
+                (
+                    store.test_blob_lease_entries(),
+                    store.test_blob_lease_watches(),
+                    store.test_blob_lease_active(variant),
+                ),
+                before_registry,
+                "fresh authenticated read release restores the registry"
+            );
+            store
+                .run_blob_maintenance_turn(maintenance_budget(16))
+                .expect("clean retry admits the exact variant");
+            deletion_manifest_for_test(&store, variant);
+        }
+    }
+
+    #[test]
+    fn blob_structural_contradiction_fails_before_cursor_advance() {
+        // Break caught: a bounded exact reference is not a root unless its
+        // named owner row exists and agrees with the referenced variant.
+        let root = BlobTestRoot::new("manifest-admission-contradiction");
+        let services = blob_services(0xc9);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("contradiction store");
+        let variant = install_unreferenced_variant(
+            &store,
+            &services,
+            b"manifest admission contradiction",
+            1,
+            true,
+        );
+        let missing_publication = BlobTransferId::new([0xc9; 32]);
+        let write = store.database.begin_write().expect("contradiction write");
+        lifecycle::insert_variant_reference(
+            &write,
+            variant,
+            lifecycle::VariantReferenceOwner::Publication,
+            missing_publication,
+        )
+        .expect("insert contradictory exact reference");
+        write.commit().expect("commit contradiction");
+        set_maintenance_next_class(
+            &store,
+            lifecycle::BlobMaintenanceClass::UnreferencedCompletedVariants,
+        );
+        let before_cursor = blob_maintenance_cursor_rows(&store);
+
+        assert!(matches!(
+            store.run_blob_maintenance_turn(maintenance_budget(16)),
+            Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+                "Blob publication reference has no exact publication"
+            )))
+        ));
+        assert_eq!(blob_maintenance_cursor_rows(&store), before_cursor);
+        let read = store
+            .database
+            .begin_read()
+            .expect("contradiction result read");
+        assert!(
+            !deletion::variant_has_deletion_manifest_read(&read, variant)
+                .expect("manifest absence")
+        );
+    }
+
+    #[test]
+    fn blob_manifest_admission_rechecks_generation_after_discovery() {
+        // Break caught: an acquire/release between the snapshot and the
+        // provisional fence changes the exact generation and makes the turn
+        // deferred without changing durable authority or cursor state.
+        let root = BlobTestRoot::new("manifest-admission-generation");
+        let services = blob_services(0xca);
+        let store =
+            Store::open_for_mission(&root.database, services.authority).expect("generation store");
+        install_unreferenced_variant(
+            &store,
+            &services,
+            b"manifest admission generation recheck",
+            1,
+            true,
+        );
+        set_maintenance_next_class(
+            &store,
+            lifecycle::BlobMaintenanceClass::UnreferencedCompletedVariants,
+        );
+        let before = blob_manifest_admission_digest(&store);
+        let before_cursor = blob_maintenance_cursor_rows(&store);
+        TEST_BLOB_MANIFEST_ADMISSION_GENERATION_CHURN.set(true);
+        let progress = store
+            .run_blob_maintenance_turn(maintenance_budget(16))
+            .expect("generation change defers maintenance");
+        TEST_BLOB_MANIFEST_ADMISSION_GENERATION_CHURN.set(false);
+
+        assert!(progress.awaiting_later_handler);
+        assert!(progress.class_has_more_work);
+        assert_eq!(blob_manifest_admission_digest(&store), before);
+        assert_eq!(blob_maintenance_cursor_rows(&store), before_cursor);
+    }
+
+    #[test]
+    fn blob_manifest_and_live_reference_is_a_nonadvancing_contradiction() {
+        let root = BlobTestRoot::new("manifest-admission-manifest-with-root");
+        let mut services = blob_services(0xcb);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("manifest-with-root store");
+        let plaintext = b"manifest and live reference contradiction".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let (stored, _, _) = publish_blob(
+            &store,
+            &mut services,
+            &prepared,
+            &plaintext,
+            1,
+            b"manifest-with-root",
+        );
+        let write = store
+            .database
+            .begin_write()
+            .expect("force manifest-with-root fixture");
+        deletion::move_finalized_variant_to_manifest_for_test(&write, stored.variant_id)
+            .expect("force contradictory manifest");
+        write.commit().expect("commit contradictory manifest");
+        set_maintenance_next_class(
+            &store,
+            lifecycle::BlobMaintenanceClass::UnreferencedCompletedVariants,
+        );
+        let before_cursor = blob_maintenance_cursor_rows(&store);
+
+        assert!(matches!(
+            store.run_blob_maintenance_turn(maintenance_budget(16)),
+            Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+                "Blob deletion manifest has a live variant reference"
+            )))
+        ));
+        assert_eq!(blob_maintenance_cursor_rows(&store), before_cursor);
+
+        let clean_root = BlobTestRoot::new("manifest-admission-manifest-zero-root");
+        let clean_services = blob_services(0xcc);
+        let clean = Store::open_for_mission(&clean_root.database, clean_services.authority)
+            .expect("manifest-zero-root store");
+        let clean_variant = install_unreferenced_variant(
+            &clean,
+            &clean_services,
+            b"manifest without live reference",
+            1,
+            true,
+        );
+        set_maintenance_next_class(
+            &clean,
+            lifecycle::BlobMaintenanceClass::UnreferencedCompletedVariants,
+        );
+        clean
+            .run_blob_maintenance_turn(maintenance_budget(16))
+            .expect("admit zero-root manifest");
+        set_maintenance_cursor(
+            &clean,
+            lifecycle::BlobMaintenanceClass::UnreferencedCompletedVariants,
+            None,
+        );
+        let progress = clean
+            .run_blob_maintenance_turn(maintenance_budget(16))
+            .expect("skip already-manifested zero-root import");
+        assert!(progress.candidates.is_empty());
+        let cursors = blob_maintenance_cursor_rows(&clean);
+        assert!(cursors.contains(&(
+            lifecycle::BlobMaintenanceClass::UnreferencedCompletedVariants.cursor_key(),
+            maintenance_cursor_value(Some(clean_variant.as_bytes())),
+        )));
+    }
+
+    #[test]
+    fn blob_manifest_admission_rejects_preexisting_deletion_chunk_authority() {
+        let root = BlobTestRoot::new("manifest-admission-existing-deletion-chunk");
+        let services = blob_services(0xcd);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("existing deletion-chunk store");
+        let variant = install_unreferenced_variant(
+            &store,
+            &services,
+            b"pre-existing deletion chunk authority",
+            1,
+            true,
+        );
+        let mut key = Vec::with_capacity(40);
+        key.extend_from_slice(variant.as_bytes());
+        key.extend_from_slice(&0u64.to_be_bytes());
+        let write = store
+            .database
+            .begin_write()
+            .expect("pre-existing deletion chunk write");
+        write
+            .open_table(deletion::BLOB_DELETION_CHUNKS)
+            .expect("deletion chunks")
+            .insert(key.as_slice(), [0xff].as_slice())
+            .expect("insert pre-existing deletion chunk");
+        write
+            .open_table(deletion::BLOB_DELETION_METADATA)
+            .expect("deletion metadata")
+            .insert(deletion::BLOB_DELETION_CHUNK_ROWS, 1)
+            .expect("account pre-existing deletion chunk row");
+        write.commit().expect("commit pre-existing deletion chunk");
+        set_maintenance_next_class(
+            &store,
+            lifecycle::BlobMaintenanceClass::UnreferencedCompletedVariants,
+        );
+        let before = blob_manifest_admission_digest(&store);
+        let before_cursor = blob_maintenance_cursor_rows(&store);
+
+        assert!(matches!(
+            store.run_blob_maintenance_turn(maintenance_budget(16)),
+            Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+                "Blob manifest admission found pre-existing deletion chunk authority"
+            )))
+        ));
+        assert_eq!(blob_manifest_admission_digest(&store), before);
+        assert_eq!(blob_maintenance_cursor_rows(&store), before_cursor);
+    }
+
+    #[test]
+    fn blob_manifest_admission_reports_typed_counter_overflow() {
+        for (name, field, count_overflow) in [
+            ("count", deletion::BLOB_DELETION_QUEUED_CHUNKS, true),
+            ("bytes", deletion::BLOB_DELETION_MANIFEST_BYTES, false),
+        ] {
+            let root = BlobTestRoot::new(&format!("manifest-admission-{name}-overflow"));
+            let services = blob_services(0xcd);
+            let store = Store::open_for_mission(&root.database, services.authority)
+                .expect("overflow store");
+            install_unreferenced_variant(
+                &store,
+                &services,
+                format!("manifest admission {name} overflow").as_bytes(),
+                1,
+                true,
+            );
+            let write = store
+                .database
+                .begin_write()
+                .expect("overflow fixture write");
+            write
+                .open_table(deletion::BLOB_DELETION_METADATA)
+                .expect("overflow deletion metadata")
+                .insert(field, u64::MAX)
+                .expect("set overflowing deletion counter");
+            write.commit().expect("commit overflow fixture");
+            set_maintenance_next_class(
+                &store,
+                lifecycle::BlobMaintenanceClass::UnreferencedCompletedVariants,
+            );
+            let before = blob_manifest_admission_digest(&store);
+            let before_cursor = blob_maintenance_cursor_rows(&store);
+
+            let error = store
+                .run_blob_maintenance_turn(maintenance_budget(16))
+                .expect_err("manifest admission must reject counter overflow");
+            assert!(if count_overflow {
+                matches!(error, StoreError::ItemCountAccountingOverflow)
+            } else {
+                matches!(error, StoreError::PayloadByteAccountingOverflow)
+            });
+            assert_eq!(blob_manifest_admission_digest(&store), before);
+            assert_eq!(blob_maintenance_cursor_rows(&store), before_cursor);
+        }
+    }
+
+    #[test]
+    fn blob_production_manifest_admission_reopens_with_durable_fences() {
+        let root = BlobTestRoot::new("manifest-admission-production-reopen");
+        let mut services = blob_services(0xce);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("production-reopen store");
+        let plaintext = vec![0xce; SELECTED_BLOB_CHUNK_SIZE as usize + 23];
+        let prepared = prepared_blob(&plaintext);
+        let proof = prepare_blob_proof(&store, &mut services, &prepared, &plaintext, 1);
+        let variant = proof.completion.variant_id();
+        let before_stats = store.blob_stats().expect("production-reopen before stats");
+        set_maintenance_next_class(
+            &store,
+            lifecycle::BlobMaintenanceClass::UnreferencedCompletedVariants,
+        );
+        store
+            .run_blob_maintenance_turn(maintenance_budget(16))
+            .expect("production admission");
+        let committed_cursor = blob_maintenance_cursor_rows(&store);
+        let committed_digest = blob_manifest_admission_digest(&store);
+        let committed_manifest = deletion_manifest_for_test(&store, variant);
+        assert_eq!(store.blob_stats().expect("committed stats"), before_stats);
+        drop(store);
+
+        let reopened = Store::open_for_mission(&root.database, services.authority)
+            .expect("reopen audits production manifest");
+        assert_eq!(reopened.blob_stats().expect("reopened stats"), before_stats);
+        assert_eq!(blob_maintenance_cursor_rows(&reopened), committed_cursor);
+        assert_eq!(blob_manifest_admission_digest(&reopened), committed_digest);
+        assert_eq!(
+            deletion_manifest_for_test(&reopened, variant),
+            committed_manifest
+        );
+        let read = reopened.database.begin_read().expect("durable fence read");
+        assert!(matches!(
+            deletion::require_variant_available_read(&read, variant),
+            Err(StoreError::Blob(BlobStoreError::VariantDeleting))
+        ));
+        drop(read);
+        assert!(matches!(
+            reopened.blob_depot_for_authenticated_read(&proof.completion),
+            Err(StoreError::Blob(BlobStoreError::CompletionMismatch))
+        ));
+        // Completion capabilities are deliberately bound to one Store
+        // instance. Rebind only the private test copy so this post-reopen
+        // assertion reaches the durable deletion fence with an otherwise
+        // exact completion.
+        let mut reopened_completion = proof.completion.clone();
+        reopened_completion.authority = Arc::clone(&reopened.blob_completion_authority);
+        reopened_completion.backing_identity = reopened.backing_identity;
+        assert!(matches!(
+            reopened.blob_depot_for_authenticated_read(&reopened_completion),
+            Err(StoreError::Blob(BlobStoreError::VariantDeleting))
+        ));
+        let write = reopened.database.begin_write().expect("root fence write");
+        assert!(matches!(
+            lifecycle::insert_variant_reference(
+                &write,
+                variant,
+                lifecycle::VariantReferenceOwner::Publication,
+                BlobTransferId::new([0xce; 32]),
+            ),
+            Err(StoreError::Blob(BlobStoreError::VariantDeleting))
+        ));
+        drop(write);
+        let operation = BlobOperationKey::new(b"durable-import-fence".to_vec())
+            .expect("durable import operation");
+        let (mut depot, _attempt) = reopened
+            .blob_depot_for_local_publish_with_operation(&operation, false)
+            .expect("open durable import attempt");
+        assert!(matches!(
+            CoreBlobStore::begin_blob_with_lineage(
+                &mut depot,
+                proof.blob.manifest(),
+                proof.blob.physical_lineage(),
+            ),
+            Err(StoreError::Blob(BlobStoreError::VariantDeleting))
+        ));
+    }
+
+    #[test]
+    fn blob_manifest_admission_moves_only_one_same_class_variant_per_turn() {
+        let root = BlobTestRoot::new("manifest-admission-one-per-turn");
+        let services = blob_services(0xcf);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("one-per-turn store");
+        let mut variants = [
+            install_unreferenced_variant(&store, &services, b"same class first", 1, true),
+            install_unreferenced_variant(&store, &services, b"same class second", 1, true),
+        ];
+        variants.sort_by_key(|variant| *variant.as_bytes());
+        let class = lifecycle::BlobMaintenanceClass::UnreferencedCompletedVariants;
+        set_maintenance_next_class(&store, class);
+
+        let first = store
+            .run_blob_maintenance_turn(maintenance_budget(16))
+            .expect("first same-class admission");
+        assert_eq!(
+            first.candidates,
+            vec![
+                lifecycle::BlobMaintenanceCandidate::UnreferencedCompletedVariant {
+                    variant: variants[0],
+                }
+            ]
+        );
+        let read = store
+            .database
+            .begin_read()
+            .expect("first-turn manifest read");
+        let deletion =
+            deletion::inspect_blob_deletion_read(&read, Some(store.blob_depot_owner_binding))
+                .expect("first-turn deletion audit");
+        assert_eq!(deletion.manifests.len(), 1);
+        assert!(deletion.manifests.contains_key(&variants[0]));
+        drop(read);
+        let first_cursors = blob_maintenance_cursor_rows(&store);
+        assert!(first_cursors.contains(&(
+            class.cursor_key(),
+            maintenance_cursor_value(Some(variants[0].as_bytes())),
+        )));
+        assert!(first_cursors.contains(&(0, vec![1, class.next().cursor_key()],)));
+
+        set_maintenance_next_class(&store, class);
+        let second = store
+            .run_blob_maintenance_turn(maintenance_budget(16))
+            .expect("second same-class admission");
+        assert_eq!(
+            second.candidates,
+            vec![
+                lifecycle::BlobMaintenanceCandidate::UnreferencedCompletedVariant {
+                    variant: variants[1],
+                }
+            ]
+        );
+        let read = store
+            .database
+            .begin_read()
+            .expect("second-turn manifest read");
+        let deletion =
+            deletion::inspect_blob_deletion_read(&read, Some(store.blob_depot_owner_binding))
+                .expect("second-turn deletion audit");
+        assert_eq!(deletion.manifests.len(), 2);
+        assert!(deletion.manifests.contains_key(&variants[1]));
+        drop(read);
+        let second_cursors = blob_maintenance_cursor_rows(&store);
+        assert!(second_cursors.contains(&(
+            class.cursor_key(),
+            maintenance_cursor_value(Some(variants[1].as_bytes())),
+        )));
+    }
+
+    #[test]
+    fn blob_open_audit_rejects_missing_root_reverse_edges_and_dangling_operations() {
+        let publication_root = BlobTestRoot::new("manifest-audit-missing-publication-reference");
+        let mut publication_services = blob_services(0xd0);
+        let publication_store =
+            Store::open_for_mission(&publication_root.database, publication_services.authority)
+                .expect("missing-publication-reference store");
+        let publication_plaintext = b"publication reverse edge".to_vec();
+        let publication_prepared = prepared_blob(&publication_plaintext);
+        let (publication, _, _) = publish_blob(
+            &publication_store,
+            &mut publication_services,
+            &publication_prepared,
+            &publication_plaintext,
+            1,
+            b"missing-publication-reference",
+        );
+        let write = publication_store
+            .database
+            .begin_write()
+            .expect("remove publication reverse edge");
+        lifecycle::remove_variant_reference(
+            &write,
+            publication.variant_id,
+            lifecycle::VariantReferenceOwner::Publication,
+            publication.transfer_id,
+        )
+        .expect("remove publication reverse edge");
+        write
+            .commit()
+            .expect("commit missing publication reverse edge");
+        drop(publication_store);
+        assert!(matches!(
+            Store::open_for_mission(&publication_root.database, publication_services.authority,),
+            Err(StoreError::Blob(BlobStoreError::SchemaInvariant(_)))
+        ));
+
+        let pending_source_root = BlobTestRoot::new("manifest-audit-pending-source");
+        let pending_root = BlobTestRoot::new("manifest-audit-missing-pending-reference");
+        let mut pending_services = blob_services(0xd1);
+        let pending_source =
+            Store::open_for_mission(&pending_source_root.database, pending_services.authority)
+                .expect("pending audit source");
+        let pending_store =
+            Store::open_for_mission(&pending_root.database, pending_services.authority)
+                .expect("missing-pending-reference store");
+        let transfer = stage_pending_source_for_maintenance(
+            &pending_source,
+            &pending_store,
+            &mut pending_services,
+            b"pending reverse edge",
+            1,
+            false,
+        );
+        let variant = pending_store
+            .pending_blob_source(transfer)
+            .expect("pending reverse-edge lookup")
+            .expect("pending reverse-edge row")
+            .variant_id;
+        let write = pending_store
+            .database
+            .begin_write()
+            .expect("remove pending reverse edge");
+        lifecycle::remove_variant_reference(
+            &write,
+            variant,
+            lifecycle::VariantReferenceOwner::PendingSource,
+            transfer,
+        )
+        .expect("remove pending reverse edge");
+        write.commit().expect("commit missing pending reverse edge");
+        drop(pending_store);
+        assert!(matches!(
+            Store::open_for_mission(&pending_root.database, pending_services.authority),
+            Err(StoreError::Blob(BlobStoreError::SchemaInvariant(_)))
+        ));
+
+        let operation_root = BlobTestRoot::new("manifest-audit-dangling-operation");
+        let mut operation_services = blob_services(0xd2);
+        let operation_store =
+            Store::open_for_mission(&operation_root.database, operation_services.authority)
+                .expect("dangling-operation store");
+        let operation_plaintext = b"dangling operation".to_vec();
+        let operation_prepared = prepared_blob(&operation_plaintext);
+        let (_, operation, intent) = publish_blob(
+            &operation_store,
+            &mut operation_services,
+            &operation_prepared,
+            &operation_plaintext,
+            1,
+            b"dangling-operation",
+        );
+        let encoded = encode_blob_operation_record(BlobOperationRecord {
+            transfer_id: BlobTransferId::new([0xd2; 32]),
+            intent_digest: intent.digest(),
+        });
+        let write = operation_store
+            .database
+            .begin_write()
+            .expect("dangling operation write");
+        write
+            .open_table(BLOB_OPERATIONS)
+            .expect("operations")
+            .insert(operation.as_bytes(), encoded.as_slice())
+            .expect("replace with dangling operation");
+        write.commit().expect("commit dangling operation");
+        drop(operation_store);
+        assert!(matches!(
+            Store::open_for_mission(&operation_root.database, operation_services.authority),
+            Err(StoreError::Blob(BlobStoreError::SchemaInvariant(_)))
+        ));
+    }
+
     #[derive(Clone, Copy, Debug)]
     enum MaintenancePublicationCorruption {
         LineageOwnerBinding,
@@ -18365,8 +20014,15 @@ mod tests {
                 );
             } else {
                 assert_eq!(progress.candidates.len(), 1);
-                assert!(progress.awaiting_later_handler);
-                assert_eq!(cursor.value(), maintenance_cursor_value(None));
+                assert!(!progress.awaiting_later_handler);
+                assert_eq!(
+                    cursor.value(),
+                    maintenance_cursor_value(Some(variant.as_bytes()))
+                );
+                assert!(
+                    deletion::variant_has_deletion_manifest_read(&read, variant)
+                        .expect("admitted manifest lookup")
+                );
             }
         }
     }
@@ -18549,9 +20205,9 @@ mod tests {
     }
 
     #[test]
-    fn blob_maintenance_destructive_candidates_remain_revisitable_without_mutation() {
-        // Break caught: discovery must not acknowledge or remove destructive
-        // work before the later retention/deletion handlers exist.
+    fn blob_maintenance_admits_manifests_without_physical_mutation() {
+        // Break caught: metadata admission may move exact chunk authority, but
+        // this increment must perform no physical deletion.
         let root = BlobTestRoot::new("maintenance-nondestructive");
         let source_root = BlobTestRoot::new("maintenance-nondestructive-source");
         let mut services = blob_services(0x6a);
@@ -18599,13 +20255,7 @@ mod tests {
             1,
             true,
         );
-        let before_rows = {
-            let read = store
-                .database
-                .begin_read()
-                .expect("maintenance before image");
-            blob_database_digest_read(&read)
-        };
+        let before_stats = store.blob_stats().expect("maintenance before stats");
         let before_files = depot_file_snapshot(&root.depot());
         let budget = maintenance_budget(64);
         let mut staging_candidates = Vec::new();
@@ -18616,34 +20266,28 @@ mod tests {
                 .expect("non-destructive maintenance turn");
             assert_eq!(progress.files_examined, 0);
             if progress.class == lifecycle::BlobMaintenanceClass::UnreferencedLocalImportStaging {
-                assert!(progress.awaiting_later_handler);
-                staging_candidates.push(progress.candidates.clone());
+                assert!(!progress.awaiting_later_handler);
+                staging_candidates.extend(progress.candidates.clone());
             }
             if progress.class == lifecycle::BlobMaintenanceClass::UnreferencedCompletedVariants {
-                assert!(progress.awaiting_later_handler);
-                completed_candidates.push(progress.candidates.clone());
+                assert!(!progress.awaiting_later_handler);
+                completed_candidates.extend(progress.candidates.clone());
             }
         }
-        assert_eq!(staging_candidates.len(), 2);
-        assert_eq!(staging_candidates[0], staging_candidates[1]);
-        assert!(staging_candidates[0].contains(
+        assert!(staging_candidates.contains(
             &lifecycle::BlobMaintenanceCandidate::UnreferencedLocalImport { staging_variant }
         ));
-        assert_eq!(completed_candidates.len(), 2);
-        assert_eq!(completed_candidates[0], completed_candidates[1]);
-        assert!(completed_candidates[0].contains(
+        assert!(completed_candidates.contains(
             &lifecycle::BlobMaintenanceCandidate::UnreferencedCompletedVariant {
                 variant: completed_variant,
             }
         ));
-        let after_rows = {
-            let read = store
-                .database
-                .begin_read()
-                .expect("maintenance after image");
-            blob_database_digest_read(&read)
-        };
-        assert_eq!(after_rows, before_rows);
+        assert_eq!(
+            store.blob_stats().expect("maintenance after stats"),
+            before_stats
+        );
+        deletion_manifest_for_test(&store, staging_variant);
+        deletion_manifest_for_test(&store, completed_variant);
         assert_eq!(depot_file_snapshot(&root.depot()), before_files);
     }
 

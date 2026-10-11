@@ -1827,6 +1827,24 @@ pub(crate) fn load_maintenance_cursor(
     })
 }
 
+pub(crate) fn load_maintenance_cursor_read(
+    read: &redb::ReadTransaction,
+) -> Result<BlobMaintenanceCursor, StoreError> {
+    let cursors = read.open_table(BLOB_MAINTENANCE_CURSORS)?;
+    validate_maintenance_cursors(&cursors)?;
+    let next = cursors
+        .get(MAINTENANCE_NEXT_CLASS_KEY)?
+        .ok_or_else(|| cursor_invariant("Blob maintenance next-class cursor is missing"))?;
+    let class = decode_next_class(next.value())?;
+    let position = cursors
+        .get(class.cursor_key())?
+        .ok_or_else(|| cursor_invariant("Blob maintenance class cursor is missing"))?;
+    Ok(BlobMaintenanceCursor {
+        class,
+        position: decode_class_cursor(class, position.value())?,
+    })
+}
+
 pub(crate) fn advance_maintenance_cursor(
     write: &redb::WriteTransaction,
     selected: BlobMaintenanceClass,
@@ -1840,10 +1858,12 @@ pub(crate) fn advance_maintenance_cursor(
         selected.cursor_key(),
         encode_class_cursor(position).as_slice(),
     )?;
+    super::deletion::manifest_admission_mutation_boundary()?;
     cursors.insert(
         MAINTENANCE_NEXT_CLASS_KEY,
         [MAINTENANCE_CURSOR_VERSION, selected.next().cursor_key()].as_slice(),
     )?;
+    super::deletion::manifest_admission_mutation_boundary()?;
     Ok(())
 }
 
