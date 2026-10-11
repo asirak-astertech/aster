@@ -843,6 +843,40 @@ pub(crate) fn require_blob_deletion_absent_read(
     Ok(())
 }
 
+pub(crate) fn require_variant_available_read(
+    read: &redb::ReadTransaction,
+    variant: BlobVariantId,
+) -> Result<(), StoreError> {
+    let manifests = read.open_table(BLOB_DELETION_MANIFESTS)?;
+    let Some(encoded) = manifests.get(variant.as_bytes().as_slice())? else {
+        return Ok(());
+    };
+    let header = decode_manifest_header(encoded.value())?;
+    if header.variant_id != variant {
+        return Err(invariant(
+            "Blob deletion manifest key differs from its identity",
+        ));
+    }
+    Err(StoreError::Blob(BlobStoreError::VariantDeleting))
+}
+
+pub(crate) fn require_variant_available_write(
+    write: &redb::WriteTransaction,
+    variant: BlobVariantId,
+) -> Result<(), StoreError> {
+    let manifests = write.open_table(BLOB_DELETION_MANIFESTS)?;
+    let Some(encoded) = manifests.get(variant.as_bytes().as_slice())? else {
+        return Ok(());
+    };
+    let header = decode_manifest_header(encoded.value())?;
+    if header.variant_id != variant {
+        return Err(invariant(
+            "Blob deletion manifest key differs from its identity",
+        ));
+    }
+    Err(StoreError::Blob(BlobStoreError::VariantDeleting))
+}
+
 fn initialize_blob_deletion_schema(write: &redb::WriteTransaction) -> Result<(), StoreError> {
     let _ = write.open_table(BLOB_DELETION_MANIFESTS)?;
     let _ = write.open_table(BLOB_DELETION_CHUNKS)?;
@@ -1728,6 +1762,56 @@ pub(crate) fn corrupt_blob_deletion_for_test(
             encoded_chunk.as_slice(),
         )?;
     }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn set_blob_deletion_phase_for_test(
+    write: &redb::WriteTransaction,
+    variant: BlobVariantId,
+    phase: BlobDeletionPhase,
+    retry: BlobDeletionRetry,
+) -> Result<(), StoreError> {
+    let mut manifest = load_manifest_for_test(write, variant)?;
+    let previous_queued = manifest.totals.queued;
+    let previous_deleted = manifest.totals.deleted;
+    if phase == BlobDeletionPhase::DirectoryDeletePending {
+        for chunk in &mut manifest.chunks {
+            chunk.state = BlobDeletionChunkState::DeletedDurable;
+            let encoded = encode_chunk_record(chunk)?;
+            write.open_table(BLOB_DELETION_CHUNKS)?.insert(
+                chunk_key(variant, chunk.index).as_slice(),
+                encoded.as_slice(),
+            )?;
+        }
+        manifest.totals.queued = 0;
+        manifest.totals.deleted = manifest.totals.chunks;
+    }
+    manifest.phase = phase;
+    manifest.retry = retry;
+    manifest.validate()?;
+    let mut metadata = write.open_table(BLOB_DELETION_METADATA)?;
+    let queued = metadata
+        .get(BLOB_DELETION_QUEUED_CHUNKS)?
+        .ok_or_else(|| invariant("Blob deletion queued total is missing"))?
+        .value()
+        .checked_sub(previous_queued)
+        .and_then(|value| value.checked_add(manifest.totals.queued))
+        .ok_or_else(|| invariant("Blob deletion queued total cannot be updated"))?;
+    let deleted = metadata
+        .get(BLOB_DELETION_DELETED_CHUNKS)?
+        .ok_or_else(|| invariant("Blob deletion deleted total is missing"))?
+        .value()
+        .checked_sub(previous_deleted)
+        .and_then(|value| value.checked_add(manifest.totals.deleted))
+        .ok_or_else(|| invariant("Blob deletion deleted total cannot be updated"))?;
+    set_metadata_for_test(&mut metadata, BLOB_DELETION_QUEUED_CHUNKS, queued)?;
+    set_metadata_for_test(&mut metadata, BLOB_DELETION_DELETED_CHUNKS, deleted)?;
+    drop(metadata);
+    let encoded = encode_manifest_record(&manifest)?;
+    write
+        .open_table(BLOB_DELETION_MANIFESTS)?
+        .insert(variant.as_bytes().as_slice(), encoded.as_slice())?;
     Ok(())
 }
 

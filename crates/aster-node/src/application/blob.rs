@@ -1649,12 +1649,11 @@ impl SelectedBlobNode {
         }
         drop(retry_lifecycle);
 
-        let finished = {
-            let depot = match if live.is_some() {
-                self.store.blob_depot_for_local_publish()
-            } else {
-                self.store.blob_depot()
-            } {
+        let (finished, local_import_lease) = {
+            let (depot, local_import_lease) = match self
+                .store
+                .blob_depot_for_local_publish_with_operation(&operation, live.is_none())
+            {
                 Ok(depot) => depot,
                 Err(error) => {
                     if live.is_some() && live_blob_durable_coherence_error(&error) {
@@ -1703,7 +1702,10 @@ impl SelectedBlobNode {
             }
             let result = service.finish_manifest(&manifest);
             drop(service);
-            result.map_err(|error| live_blob_core_error(&self.store, error, &mut live))?
+            (
+                result.map_err(|error| live_blob_core_error(&self.store, error, &mut live))?,
+                local_import_lease,
+            )
         };
 
         let reservation = self
@@ -1803,6 +1805,7 @@ impl SelectedBlobNode {
                 return Err(application_error("blob publish", error.into()));
             }
         };
+        drop(local_import_lease);
         let stored = match self.verify_stored_blob(
             outcome.blob(),
             Some(&intent),

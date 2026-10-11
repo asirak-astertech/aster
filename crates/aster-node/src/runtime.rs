@@ -60,20 +60,20 @@ use aster_redb_store::BlobMaintenanceClass;
 use aster_redb_store::{
     ApplyOutcome, BlobCarrierAppendOutcome, BlobCarrierCommitOutcome, BlobCarrierFetchCursor,
     BlobCarrierObjectId, BlobCarrierPrefixStatus, BlobDepotCompletion, BlobDepotLimits,
-    BlobMaintenanceBudget, BlobMaintenanceProgress, BlobSourceProjection, BlobSourceRetention,
-    BlobSourceStageOutcome, BlobStoreError, BlobTransferId, BlobVariantId, ControlOutcome,
-    ControlPolicySnapshot, ControlRejectionReason, ControlTransferId, CustodyObjectKey,
-    CustodyPeerApplyDisposition, CustodyPeerApplyEvidence, CustodyPeerSelectorRevision,
-    CustodyPolicyRevision, CustodyPressureDemand, CustodyQuota, CustodyReconciliationEvidence,
-    CustodyReconciliationSelection, CustodySendAuthorization, CustodySenderProjection,
-    CustodyStoreError, CustodyUsage, EventOnceOutcome, EventOperationAuditProgress,
-    EventOperationAuditState, EventOperationAuditStatus, EventOperationKey, EventOperationLimits,
-    EventOperationRequest, EventOperationResolution, EventPageAttemptCursor,
-    EventPageAttemptCursorUpdate, EventPublicationIntent, EventPublicationSpec,
-    EventReplicationPolicySnapshot, EventSemanticId, EventSubscriptionKey, EventSubscriptionMode,
-    EventSubscriptionSpec, EventTransferId, LocalCustodyCheckpoint, MAX_BLOB_NETWORK_RANGE_BYTES,
-    MAX_BLOB_NETWORK_SOURCE_BYTES, MAX_BLOB_NETWORK_STAGING_ROWS, MAX_CUSTODY_PAGE,
-    MAX_CUSTODY_RETIREMENTS, MAX_EVENT_PAGE, MAX_MUTABLE_TRANSFER_CURSOR_PEERS,
+    BlobLeaseLimits, BlobLifecycleLimits, BlobMaintenanceBudget, BlobMaintenanceProgress,
+    BlobSourceProjection, BlobSourceRetention, BlobSourceStageOutcome, BlobStoreError,
+    BlobTransferId, BlobVariantId, ControlOutcome, ControlPolicySnapshot, ControlRejectionReason,
+    ControlTransferId, CustodyObjectKey, CustodyPeerApplyDisposition, CustodyPeerApplyEvidence,
+    CustodyPeerSelectorRevision, CustodyPolicyRevision, CustodyPressureDemand, CustodyQuota,
+    CustodyReconciliationEvidence, CustodyReconciliationSelection, CustodySendAuthorization,
+    CustodySenderProjection, CustodyStoreError, CustodyUsage, EventOnceOutcome,
+    EventOperationAuditProgress, EventOperationAuditState, EventOperationAuditStatus,
+    EventOperationKey, EventOperationLimits, EventOperationRequest, EventOperationResolution,
+    EventPageAttemptCursor, EventPageAttemptCursorUpdate, EventPublicationIntent,
+    EventPublicationSpec, EventReplicationPolicySnapshot, EventSemanticId, EventSubscriptionKey,
+    EventSubscriptionMode, EventSubscriptionSpec, EventTransferId, LocalCustodyCheckpoint,
+    MAX_BLOB_NETWORK_RANGE_BYTES, MAX_BLOB_NETWORK_SOURCE_BYTES, MAX_BLOB_NETWORK_STAGING_ROWS,
+    MAX_CUSTODY_PAGE, MAX_CUSTODY_RETIREMENTS, MAX_EVENT_PAGE, MAX_MUTABLE_TRANSFER_CURSOR_PEERS,
     MAX_NETWORK_BLOB_BYTES, MAX_NETWORK_BLOB_CHUNKS, MAX_ROUTE_CACHE_ITEMS,
     MutableTransferCursorClass, MutableTransferCursorMode, NumberedEventOperationRequest,
     NumberedEventPublishOutcome, RecordSenderProjection, RecordTransferId, RejectedControl,
@@ -306,6 +306,18 @@ const MIN_NON_PREFERRED_CONTACT_FALLBACK_DELAY: Duration = Duration::from_secs(1
 const NON_PREFERRED_CONTACT_FALLBACK_INTERVALS: u32 = 3;
 const APPLICATION_COMMAND_CAPACITY: usize = 32;
 const BLOB_WORKER_CAPACITY: usize = 1;
+
+fn node_blob_lease_limits() -> Result<BlobLeaseLimits, NodeError> {
+    let network_sessions = MAX_INBOUND_CONTACTS
+        .checked_add(MAX_OUTBOUND_CONTACTS)
+        .ok_or_else(|| NodeError::Configuration("Blob network lease bound overflows".into()))?;
+    BlobLeaseLimits::new(
+        APPLICATION_COMMAND_CAPACITY,
+        network_sessions,
+        BLOB_WORKER_CAPACITY,
+    )
+    .map_err(|_| NodeError::Configuration("Blob lease bounds are invalid".into()))
+}
 const BLOB_MAINTENANCE_ROWS_PER_TURN: u64 = 16;
 const BLOB_MAINTENANCE_FILES_PER_TURN: u64 = 1;
 const BLOB_MAINTENANCE_BYTES_PER_TURN: u64 = 2 * 1024 * 1024;
@@ -7274,6 +7286,8 @@ enum TestBlobContactFault {
     PendingCompletion = 7,
     StageCoherence = 8,
     AppendCoherence = 9,
+    CommitLeaseCapacity = 10,
+    RangeLeaseCapacity = 11,
 }
 
 #[cfg(test)]
@@ -8190,12 +8204,6 @@ impl AuthenticatedEventRouteCache {
     #[cfg(test)]
     fn blob_source_authentications(&self) -> u64 {
         self.blob_source_authentications.load(Ordering::Relaxed)
-    }
-
-    #[cfg(test)]
-    fn record_blob_source_depot_authenticated_open(&self) {
-        self.blob_source_depot_authenticated_opens
-            .fetch_add(1, Ordering::Relaxed);
     }
 
     #[cfg(test)]
@@ -11352,7 +11360,7 @@ fn load_verified_mutable_for_peer(
                 "outbound Blob changed after its authenticated contact snapshot".into(),
             ));
         }
-        let (current, completion) = cache
+        let (current, _completion) = cache
             .verify_completed_blob_source_claim(
                 verifier,
                 &retained.source,
@@ -11370,13 +11378,9 @@ fn load_verified_mutable_for_peer(
                 "outbound Blob became historical before transfer".into(),
             ));
         }
-        let authenticated_depot = store
-            .blob_depot_for_authenticated_read(&completion)
-            .map_err(NodeError::from)
-            .map_err(|error| fatal_blob_coherence("outbound Blob depot completion", error))?;
-        #[cfg(test)]
-        cache.record_blob_source_depot_authenticated_open();
-        drop(authenticated_depot);
+        // Exact physical freshness is rechecked by each bounded carrier-range
+        // read. A whole-source preflight here would consume a page lease for
+        // the source lifetime rather than the bounded unit being served.
         ensure_mutable_active(store, blob.publisher(), blob.scope(), blob.key_epoch())?;
         verifier.verify_current_blob_lineage(&blob)?;
         let final_selector = interest
@@ -14234,13 +14238,18 @@ async fn run_node_actor_inner(
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    let store = Arc::new(Store::open_with_limits_and_operation_limits_for_mission(
-        &store_path,
-        forwarding.store_limits(),
-        forwarding.blob_depot_limits(),
-        forwarding.operation_limits(),
-        mission_authority,
-    )?);
+    let blob_lease_limits = node_blob_lease_limits()?;
+    let store = Arc::new(
+        Store::open_with_all_limits_and_blob_lease_limits_for_mission(
+            &store_path,
+            forwarding.store_limits(),
+            forwarding.blob_depot_limits(),
+            forwarding.operation_limits(),
+            BlobLifecycleLimits::default(),
+            blob_lease_limits,
+            mission_authority,
+        )?,
+    );
     store.require_process_exclusive_lock()?;
     #[cfg(unix)]
     {
@@ -21232,6 +21241,8 @@ fn blob_apply_capacity_error(error: &StoreError) -> bool {
                     | BlobStoreError::DepotVariantLimitExceeded { .. }
                     | BlobStoreError::NetworkStagingRowLimitExceeded { .. }
                     | BlobStoreError::NetworkStagingByteLimitExceeded { .. }
+                    | BlobStoreError::LeaseCapacity
+                    | BlobStoreError::VariantDeleting
             )
     )
 }
@@ -21244,6 +21255,7 @@ fn blob_publication_capacity_error(error: &StoreError) -> bool {
             | StoreError::Blob(
                 BlobStoreError::PublicationLimitExceeded { .. }
                     | BlobStoreError::CausalFrontierLimitExceeded { .. }
+                    | BlobStoreError::VariantDeleting
             )
     )
 }
@@ -21288,6 +21300,19 @@ fn blob_pending_completion_ordinary_error(error: &StoreError) -> bool {
             error,
             StoreError::Blob(BlobStoreError::PendingSourceMissing)
         )
+}
+
+fn blob_lease_backpressure_error(error: &StoreError) -> bool {
+    matches!(
+        error,
+        StoreError::Blob(BlobStoreError::LeaseCapacity | BlobStoreError::VariantDeleting)
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingBlobRecoveryDisposition {
+    Apply(MutableApplyDisposition),
+    DeferredLease,
 }
 
 fn canonical_blob_network_range(total_len: u64, offset: u64, requested_len: u32) -> bool {
@@ -21379,17 +21404,33 @@ fn recover_and_finalize_pending_blob(
     plan: &VerifiedBlobTransferPlan,
     work: &mut Vec<BlobCarrierPrefixStatus>,
     scheduler: Option<(NodeId, Option<BlobCarrierFetchCursor>)>,
-) -> Result<Option<MutableApplyDisposition>, NodeError> {
+) -> Result<Option<PendingBlobRecoveryDisposition>, NodeError> {
     guard.check(store)?;
     for status in work.iter().filter(|status| status.complete()) {
         guard.check(store)?;
-        match store.commit_complete_blob_carrier_with_policy(
+        #[cfg(test)]
+        let committed = if fire_test_blob_contact_fault(TestBlobContactFault::CommitLeaseCapacity) {
+            Err(StoreError::Blob(BlobStoreError::LeaseCapacity))
+        } else {
+            store.commit_complete_blob_carrier_with_policy(
+                guard.policy(),
+                source,
+                status.object(),
+                plan,
+            )
+        };
+        #[cfg(not(test))]
+        let committed = store.commit_complete_blob_carrier_with_policy(
             guard.policy(),
             source,
             status.object(),
             plan,
-        ) {
+        );
+        match committed {
             Ok(BlobCarrierCommitOutcome::Committed | BlobCarrierCommitOutcome::Duplicate) => {}
+            Err(error) if blob_lease_backpressure_error(&error) => {
+                return Ok(Some(PendingBlobRecoveryDisposition::DeferredLease));
+            }
             Err(error @ StoreError::Blob(BlobStoreError::Verification(_))) => {
                 if let Some((peer, cursor)) = scheduler {
                     let _ = store.compare_and_advance_blob_carrier_fetch_cursor(
@@ -21447,7 +21488,8 @@ fn recover_and_finalize_pending_blob(
                 "pending Blob completion memo differs from its selected source plan".into(),
             ));
         }
-        let authenticated_depot = store.blob_depot_for_authenticated_read(&memo.depot)?;
+        let authenticated_depot =
+            store.blob_depot_for_pending_completion_verification(source, &memo.depot)?;
         drop(authenticated_depot);
         Ok(Some(memo))
     })();
@@ -21495,17 +21537,18 @@ fn recover_and_finalize_pending_blob(
                 ));
             }
         };
-        let depot = match store.blob_depot_for_authenticated_read(&depot_completion) {
-            Ok(depot) => depot,
-            Err(error) => {
-                advance_terminal_blob_source_cursor(store, plan, source, scheduler)?;
-                abort_pending_blob_with_cached_claim(store, verifier, source)?;
-                return Err(fatal_blob_coherence(
-                    "pending Blob authenticated depot open",
-                    error.into(),
-                ));
-            }
-        };
+        let depot =
+            match store.blob_depot_for_pending_completion_verification(source, &depot_completion) {
+                Ok(depot) => depot,
+                Err(error) => {
+                    advance_terminal_blob_source_cursor(store, plan, source, scheduler)?;
+                    abort_pending_blob_with_cached_claim(store, verifier, source)?;
+                    return Err(fatal_blob_coherence(
+                        "pending Blob authenticated depot open",
+                        error.into(),
+                    ));
+                }
+            };
         let content_completion = {
             let mut service = match verifier.blob_service_with_store(
                 blob.scope(),
@@ -21603,7 +21646,9 @@ fn recover_and_finalize_pending_blob(
     ) {
         Ok(outcome) => outcome,
         Err(error) if blob_publication_capacity_error(&error) => {
-            return Ok(Some(MutableApplyDisposition::DeferredCapacity));
+            return Ok(Some(PendingBlobRecoveryDisposition::Apply(
+                MutableApplyDisposition::DeferredCapacity,
+            )));
         }
         Err(error) if blob_contact_policy_transition_error(&error) => return Err(error.into()),
         Err(error @ StoreError::Blob(BlobStoreError::CompletionMismatch)) => {
@@ -21633,11 +21678,13 @@ fn recover_and_finalize_pending_blob(
         blob,
         depot_completion,
     )?;
-    Ok(Some(if outcome.inserted() {
-        MutableApplyDisposition::Inserted
-    } else {
-        MutableApplyDisposition::Duplicate
-    }))
+    Ok(Some(PendingBlobRecoveryDisposition::Apply(
+        if outcome.inserted() {
+            MutableApplyDisposition::Inserted
+        } else {
+            MutableApplyDisposition::Duplicate
+        },
+    )))
 }
 
 fn advance_terminal_blob_source_cursor(
@@ -21820,7 +21867,13 @@ async fn sync_blob_carrier_lane(
             &mut work.carriers,
             Some((peer, cursor)),
         )? {
-            Some(MutableApplyDisposition::DeferredCapacity) => {
+            Some(PendingBlobRecoveryDisposition::DeferredLease) => {
+                receipt.blob_deferred = receipt.blob_deferred.saturating_add(1);
+                None
+            }
+            Some(PendingBlobRecoveryDisposition::Apply(
+                MutableApplyDisposition::DeferredCapacity,
+            )) => {
                 receipt.blob_deferred = receipt.blob_deferred.saturating_add(1);
                 // A fully installed source that cannot yet enter semantic
                 // publication remains retryable, but must not monopolize the
@@ -21833,7 +21886,9 @@ async fn sync_blob_carrier_lane(
                 )?;
                 None
             }
-            Some(MutableApplyDisposition::Inserted | MutableApplyDisposition::Duplicate) => None,
+            Some(PendingBlobRecoveryDisposition::Apply(
+                MutableApplyDisposition::Inserted | MutableApplyDisposition::Duplicate,
+            )) => None,
             None => {
                 let status = work.carriers.first().copied().ok_or_else(|| {
                     NodeError::FatalBlobCoherence(
@@ -21996,7 +22051,12 @@ async fn sync_blob_carrier_lane(
                                     &mut work.carriers,
                                     Some((peer, cursor)),
                                 )?,
-                                Some(MutableApplyDisposition::DeferredCapacity)
+                                Some(
+                                    PendingBlobRecoveryDisposition::DeferredLease
+                                        | PendingBlobRecoveryDisposition::Apply(
+                                            MutableApplyDisposition::DeferredCapacity,
+                                        )
+                                )
                             ) {
                                 receipt.blob_deferred = receipt.blob_deferred.saturating_add(1);
                             }
@@ -22047,7 +22107,12 @@ async fn sync_blob_carrier_lane(
                                     &mut work.carriers,
                                     Some((peer, cursor)),
                                 )?,
-                                Some(MutableApplyDisposition::DeferredCapacity)
+                                Some(
+                                    PendingBlobRecoveryDisposition::DeferredLease
+                                        | PendingBlobRecoveryDisposition::Apply(
+                                            MutableApplyDisposition::DeferredCapacity,
+                                        )
+                                )
                             ) {
                                 receipt.blob_deferred = receipt.blob_deferred.saturating_add(1);
                             }
@@ -22396,6 +22461,22 @@ fn serve_verified_blob_range(
     guard.check(store)?;
     #[cfg(test)]
     cache.record_blob_range_depot_recheck();
+    #[cfg(test)]
+    let result = if cache.fire_test_blob_contact_fault(TestBlobContactFault::RangeLeaseCapacity) {
+        Err(StoreError::Blob(BlobStoreError::LeaseCapacity))
+    } else {
+        store.read_completed_blob_carrier_range_with_policy(
+            guard.policy(),
+            &completion,
+            &lineage,
+            source,
+            object,
+            offset,
+            usize::try_from(requested_len).expect("u32 fits usize"),
+            &plan,
+        )
+    };
+    #[cfg(not(test))]
     let result = store.read_completed_blob_carrier_range_with_policy(
         guard.policy(),
         &completion,
@@ -22414,6 +22495,7 @@ fn serve_verified_blob_range(
     }
     let result = match result {
         Ok(result) => result,
+        Err(error) if blob_lease_backpressure_error(&error) => return Ok(None),
         Err(error) if blob_contact_policy_transition_error(&error) => return Err(error.into()),
         Err(error) => {
             return Err(fatal_blob_coherence(
@@ -32489,6 +32571,30 @@ mod tests {
                 limit: 1,
             }
         )));
+    }
+
+    #[test]
+    fn blob_node_lease_limits_match_every_bounded_runtime_source() {
+        let limits = node_blob_lease_limits().expect("checked node Blob lease bounds");
+        assert_eq!(limits.application_pages(), APPLICATION_COMMAND_CAPACITY);
+        assert_eq!(
+            limits.network_sessions(),
+            MAX_INBOUND_CONTACTS
+                .checked_add(MAX_OUTBOUND_CONTACTS)
+                .expect("network bound")
+        );
+        assert_eq!(limits.blob_workers(), BLOB_WORKER_CAPACITY);
+    }
+
+    #[test]
+    fn blob_variant_deleting_maps_to_deferred_existing_wire_outcomes() {
+        let deleting = StoreError::Blob(BlobStoreError::VariantDeleting);
+        let saturated = StoreError::Blob(BlobStoreError::LeaseCapacity);
+        assert!(blob_apply_capacity_error(&deleting));
+        assert!(blob_publication_capacity_error(&deleting));
+        assert!(blob_stage_ordinary_contact_error(&deleting));
+        assert!(blob_lease_backpressure_error(&deleting));
+        assert!(blob_lease_backpressure_error(&saturated));
     }
 
     #[test]
@@ -42795,6 +42901,10 @@ mod tests {
         );
         drop(oversized_plaintext);
         assert_ne!(source, oversized_source);
+        let range_capacity = install_test_blob_contact_fault(
+            services.member.identity(),
+            TestBlobContactFault::RangeLeaseCapacity,
+        );
         let StartupEventVerification {
             mut verifier,
             historical_verifier,
@@ -42982,6 +43092,28 @@ mod tests {
         assert_eq!(cache.blob_range_source_authentications(), 0);
         assert_eq!(cache.blob_range_depot_rechecks(), 0);
 
+        let saturated = CONTACT_EVENT_ROUTE_CACHE
+            .scope(cache.clone(), async {
+                serve_verified_blob_range(
+                    &store,
+                    &lane_guard,
+                    &mut verifier,
+                    peer,
+                    &commitments,
+                    &peer_interest,
+                    source,
+                    object,
+                    total_len,
+                    0,
+                    requested_len,
+                    &proof,
+                )
+            })
+            .await
+            .expect("range lease saturation is ordinary unavailability");
+        assert!(saturated.is_none());
+        assert!(range_capacity.fired.load(Ordering::Acquire));
+
         let served = CONTACT_EVENT_ROUTE_CACHE
             .scope(cache.clone(), async {
                 serve_verified_blob_range(
@@ -43003,8 +43135,8 @@ mod tests {
             .expect("bounded direct source request remains serviceable")
             .expect("bounded direct source range");
         assert_eq!(served.len(), requested_len as usize);
-        assert_eq!(cache.blob_range_source_authentications(), 1);
-        assert_eq!(cache.blob_range_depot_rechecks(), 1);
+        assert_eq!(cache.blob_range_source_authentications(), 2);
+        assert_eq!(cache.blob_range_depot_rechecks(), 2);
 
         let bounded_snapshot =
             AuthenticatedMutableSenderSnapshot::new_blob(BTreeMap::from([(source, original)]));
@@ -43025,7 +43157,7 @@ mod tests {
         assert_eq!(served_source, stored.sealed);
         assert_eq!(cache.blob_source_row_loads(), 1);
         assert_eq!(cache.blob_source_authentications(), 1);
-        assert_eq!(cache.blob_source_depot_authenticated_opens(), 1);
+        assert_eq!(cache.blob_source_depot_authenticated_opens(), 0);
 
         drop(store);
         fs::remove_dir_all(state).expect("oversized direct-range cleanup");
@@ -43721,8 +43853,8 @@ mod tests {
             .await;
             assert_eq!(
                 source_cache.blob_source_depot_authenticated_opens(),
-                u64::from(client.fetched == 1),
-                "each served source envelope uses one lightweight authenticated depot open",
+                0,
+                "source-envelope transfer defers physical access to bounded range serving",
             );
             assert_eq!(
                 source_cache.blob_source_row_loads(),
@@ -43760,7 +43892,7 @@ mod tests {
             interests(),
         )
         .await;
-        assert_eq!(source_cache.blob_source_depot_authenticated_opens(), 1);
+        assert_eq!(source_cache.blob_source_depot_authenticated_opens(), 0);
         assert_eq!(c_first.fetched, 1, "C fetches the source exactly once");
         assert_eq!(c_first.blob_ranges_fetched, 1);
         assert_eq!(
@@ -43945,9 +44077,14 @@ mod tests {
             b"occupied",
         );
         let source_cache = test_event_route_cache(&source_store, &source_mission.credentials);
+        let commit_capacity = install_test_blob_contact_fault(
+            receiver.credentials.identity(),
+            TestBlobContactFault::CommitLeaseCapacity,
+        );
         let receiver_cache = test_event_route_cache(&receiver_store, &receiver.credentials);
 
         let mut deferrals = 0usize;
+        let mut completion_deferrals = 0usize;
         for _ in 0..16 {
             let (receipt, _) = blob_contact_test_pair_with_caches(
                 source_store.clone(),
@@ -43966,18 +44103,39 @@ mod tests {
             )
             .await;
             deferrals = deferrals.saturating_add(receipt.blob_deferred);
-            if deferrals != 0 {
+            let completion_verifications =
+                receiver_cache.pending_blob_full_completion_verifications();
+            if completion_verifications != 0 {
                 assert_eq!(
-                    receiver_cache.pending_blob_full_completion_verifications(),
-                    1,
+                    completion_verifications, 1,
                     "capacity retry reuses one exact completion/content proof"
                 );
+                completion_deferrals = completion_deferrals.saturating_add(receipt.blob_deferred);
+            } else if commit_capacity.fired.load(Ordering::Acquire) {
+                assert!(
+                    receiver_store
+                        .pending_blob_source(source)
+                        .expect("lease-deferred source lookup")
+                        .is_some(),
+                    "worker-lease saturation preserves the pending source"
+                );
             }
-            if deferrals >= 2 {
+            if completion_deferrals >= 2 {
                 break;
             }
         }
-        assert!(deferrals >= 2, "two contacts observe capacity deferral");
+        assert!(
+            deferrals >= 3,
+            "lease saturation plus two publication-capacity retries defer"
+        );
+        assert!(
+            completion_deferrals >= 2,
+            "two contacts observe publication-capacity deferral"
+        );
+        assert!(
+            commit_capacity.fired.load(Ordering::Acquire),
+            "carrier commit lease saturation was exercised end to end"
+        );
         assert_eq!(
             receiver_cache.pending_blob_full_completion_verifications(),
             1

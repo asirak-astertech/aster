@@ -11,6 +11,7 @@
 
 pub(crate) mod deletion;
 pub(crate) mod depot;
+pub(crate) mod lease;
 #[allow(dead_code)] // Lifecycle authority becomes active in Tasks 2-4.
 pub(crate) mod lifecycle;
 
@@ -34,6 +35,7 @@ use redb::{ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle};
 use super::*;
 
 pub use depot::{AuthenticatedBlobReadDepot, BlobDepot, BlobDepotCompletion};
+pub use lease::{BlobLeaseLimitError, BlobLeaseLimits};
 
 pub(crate) const BLOB_PUBLICATIONS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.semantic-blob-publications.v1");
@@ -103,6 +105,7 @@ const PENDING_BLOB_SOURCE_VERSION: u8 = 1;
 const BLOB_CARRIER_PREFIX_VERSION: u8 = 1;
 const BLOB_PUBLICATION_INTENT_DOMAIN: &[u8] = b"aster/blob-publication-intent/v1";
 const BLOB_VARIANT_DOMAIN: &[u8] = b"aster/blob-depot-variant/v1";
+const BLOB_LOCAL_IMPORT_LEASE_DOMAIN: &[u8] = b"aster/blob-local-import-lease/v1";
 const BLOB_SOURCE_PROJECTION_DOMAIN: &[u8] = b"aster/blob-source-projection/v1";
 
 /// Selected interoperable Blob chunk size (64 KiB).
@@ -318,6 +321,10 @@ pub enum BlobStoreError {
     PhysicalLineageConflict,
     SourceRepresentationConflict,
     PhysicalLineageMigrationRequired,
+    #[doc(hidden)]
+    LeaseCapacity,
+    #[doc(hidden)]
+    VariantDeleting,
     SchemaInvariant(&'static str),
     DepotIntegrity(&'static str),
     CompletionMismatch,
@@ -477,6 +484,12 @@ impl fmt::Display for BlobStoreError {
                 .write_str("Blob source representation conflicts with permanent replay authority"),
             Self::PhysicalLineageMigrationRequired => formatter.write_str(
                 "legacy Blob depot staging has no unambiguous physical lineage; publish at a new epoch",
+            ),
+            Self::LeaseCapacity => {
+                formatter.write_str("bounded Blob operation lease capacity is exhausted")
+            }
+            Self::VariantDeleting => formatter.write_str(
+                "Blob variant is being reclaimed; retry after reclamation completes",
             ),
             Self::SchemaInvariant(reason) => {
                 write!(formatter, "durable Blob schema invariant failed: {reason}")
@@ -850,6 +863,18 @@ impl BlobOperationKey {
     }
 }
 
+fn local_import_staging_target(operation: &BlobOperationKey) -> Result<BlobTransferId, StoreError> {
+    let mut digest = Sha256::new();
+    digest.update(BLOB_LOCAL_IMPORT_LEASE_DOMAIN);
+    digest.update(
+        u64::try_from(operation.as_bytes().len())
+            .map_err(|_| StoreError::PayloadByteAccountingOverflow)?
+            .to_be_bytes(),
+    );
+    digest.update(operation.as_bytes());
+    Ok(BlobTransferId::new(digest.finalize().into()))
+}
+
 /// Canonical epoch-independent public request identity for Blob publication.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlobPublicationIntent {
@@ -1205,6 +1230,9 @@ thread_local! {
     static TEST_BLOB_ADMISSION_PRE_COMMIT_FAULT: std::cell::Cell<bool> = const {
         std::cell::Cell::new(false)
     };
+    static TEST_BLOB_DELETE_ADMISSION_PRE_COMMIT_FAULT: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
 }
 
 #[cfg(test)]
@@ -1247,6 +1275,84 @@ pub(crate) struct BlobAuditSnapshot {
 }
 
 impl Store {
+    #[cfg(test)]
+    fn test_admit_blob_deletion_manifest(&self, variant: BlobVariantId) -> Result<(), StoreError> {
+        let _depot_guard = self
+            .blob_depot_lock
+            .lock()
+            .map_err(|_| blob_error(BlobStoreError::DepotIntegrity("depot lock is poisoned")))?;
+        self.require_live()?;
+        let target = lease::BlobLeaseTarget::Variant(variant);
+        let snapshot = self
+            .blob_lease_registry
+            .snapshot(self.blob_depot_owner_binding, target)
+            .map_err(lease::store_error)?;
+        let write = self.database.begin_write()?;
+        enforce_live_write(&write)?;
+        let admission = self
+            .blob_lease_registry
+            .try_mark_delete_pending(snapshot)
+            .map_err(lease::store_error)?;
+        deletion::move_finalized_variant_to_manifest_for_test(&write, variant)?;
+        if TEST_BLOB_DELETE_ADMISSION_PRE_COMMIT_FAULT.get() {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "injected Blob delete admission pre-commit failure",
+            )));
+        }
+        write.commit()?;
+        admission.durable_committed().map_err(lease::store_error)?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn test_blob_lease_active(&self, variant: BlobVariantId) -> usize {
+        self.blob_lease_registry.active_leases(
+            self.blob_depot_owner_binding,
+            lease::BlobLeaseTarget::Variant(variant),
+        )
+    }
+
+    #[cfg(test)]
+    fn test_blob_staging_lease_active(&self, staging: BlobTransferId) -> usize {
+        self.blob_lease_registry.active_leases(
+            self.blob_depot_owner_binding,
+            lease::BlobLeaseTarget::Staging(staging),
+        )
+    }
+
+    #[cfg(test)]
+    fn test_blob_lease_active_kind(
+        &self,
+        variant: BlobVariantId,
+        kind: lease::BlobLeaseKind,
+    ) -> usize {
+        self.blob_lease_registry.active_leases_of_kind(
+            self.blob_depot_owner_binding,
+            lease::BlobLeaseTarget::Variant(variant),
+            kind,
+        )
+    }
+
+    #[cfg(test)]
+    fn test_blob_lease_entries(&self) -> usize {
+        self.blob_lease_registry.stored_entries()
+    }
+
+    #[cfg(test)]
+    fn test_acquire_blob_lease(
+        &self,
+        variant: BlobVariantId,
+        kind: lease::BlobLeaseKind,
+    ) -> Result<lease::BlobLeaseGuard, StoreError> {
+        self.blob_lease_registry
+            .acquire(
+                self.blob_depot_owner_binding,
+                lease::BlobLeaseTarget::Variant(variant),
+                kind,
+            )
+            .map_err(lease::store_error)
+    }
+
     #[cfg(test)]
     fn set_blob_carrier_range_post_read_gate(
         &self,
@@ -1295,6 +1401,27 @@ impl Store {
         BlobDepot::open_network_mutation(self, true)
     }
 
+    /// Node-internal local-publish seam which acquires a staging lease before
+    /// any durable import state is created and hands its opaque lifetime token
+    /// back to the node until publication commits or cancels.
+    #[doc(hidden)]
+    pub fn blob_depot_for_local_publish_with_operation(
+        &self,
+        operation: &BlobOperationKey,
+        audited: bool,
+    ) -> Result<(BlobDepot<'_>, impl Sized + use<>), StoreError> {
+        self.require_live()?;
+        self.require_bound_mission()?;
+        let staging = local_import_staging_target(operation)?;
+        let mut depot = if audited {
+            BlobDepot::open(self)?
+        } else {
+            BlobDepot::open_network_mutation(self, true)?
+        };
+        let lease = depot.acquire_local_import_attempt(staging)?;
+        Ok((depot, lease))
+    }
+
     /// Mints a completion for one freshly verified local publish without a
     /// global depot audit or publication-row dependency.
     pub fn completed_local_blob(
@@ -1322,6 +1449,22 @@ impl Store {
         self.require_live()?;
         self.require_bound_mission()?;
         BlobDepot::open_authenticated_read(self, completion)
+    }
+
+    /// Node-internal full-content verification seam for a still-pending source.
+    ///
+    /// The returned adapter denies mutation but intentionally consumes no
+    /// application-page lease: the caller's durable pending reference and the
+    /// adapter's depot lock already exclude lifecycle deletion.
+    #[doc(hidden)]
+    pub fn blob_depot_for_pending_completion_verification(
+        &self,
+        source: BlobTransferId,
+        completion: &BlobDepotCompletion,
+    ) -> Result<AuthenticatedBlobReadDepot<'_>, StoreError> {
+        self.require_live()?;
+        self.require_bound_mission()?;
+        BlobDepot::open_authenticated_read_without_lease(self, source, completion)
     }
 
     /// Mints one exact completion capability for an authenticated pending
@@ -2793,6 +2936,7 @@ impl Store {
 
         let expected = pending_blob_carrier(&pending, object)
             .ok_or_else(|| blob_error(BlobStoreError::InvalidCarrierObjectId))?;
+        depot.acquire_internal_chunk_work_lease(pending.metadata.variant_id)?;
         #[cfg(test)]
         if let Some((reached, release)) = self
             .blob_carrier_commit_post_snapshot_gate
@@ -3057,7 +3201,12 @@ impl Store {
         let carrier_index = plan
             .carrier_index(object.as_bytes())
             .map_err(|error| blob_error(BlobStoreError::Verification(error.to_string())))?;
-        let mut depot = self.blob_depot_for_authenticated_read(completion)?;
+        let mut depot = BlobDepot::open_authenticated_read_with_kind(
+            self,
+            completion,
+            lease::BlobLeaseKind::CarrierRange,
+        )?;
+        let _range_lease = depot.owned_lease_guard()?;
         depot.recheck_completion_range(completion, carrier_index, 1)?;
         let range = plan
             .read_carrier_range(&mut depot, object.as_bytes(), offset, max_bytes)
@@ -3529,10 +3678,14 @@ impl Store {
             .lock()
             .map_err(|_| blob_error(BlobStoreError::DepotIntegrity("depot lock is poisoned")))?;
         self.require_live()?;
+        let read = self.database.begin_read()?;
+        deletion::require_variant_available_read(&read, prepared.variant_id)?;
+        drop(read);
         depot::verify_completion(self, completion)?;
 
         let write = self.database.begin_write()?;
         enforce_live_write(&write)?;
+        deletion::require_variant_available_write(&write, prepared.variant_id)?;
         enforce_blob_policy_write(&write, prepared.mission_authority, policy, &prepared.header)?;
         let owner_binding = depot::require_depot_owner_binding_write(
             &write,
@@ -8485,6 +8638,586 @@ mod tests {
         (outcome.blob().clone(), operation, intent)
     }
 
+    #[test]
+    fn blob_authenticated_read_holds_exact_application_page_lease() {
+        let root = BlobTestRoot::new("authenticated-read-lease");
+        let mut services = blob_services(0x8d);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("authenticated-read lease store");
+        let plaintext = b"one bounded authenticated Blob page".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let proof = prepare_blob_proof(&store, &mut services, &prepared, &plaintext, 1);
+        let variant = proof.completion.variant_id();
+
+        assert_eq!(store.test_blob_lease_active(variant), 0);
+        let read = store
+            .blob_depot_for_authenticated_read(&proof.completion)
+            .expect("acquire exact read lease");
+        assert_eq!(store.test_blob_lease_active(variant), 1);
+        drop(read);
+        assert_eq!(store.test_blob_lease_active(variant), 0);
+    }
+
+    #[test]
+    fn blob_direct_core_full_read_selection_does_not_consume_page_lease() {
+        let root = BlobTestRoot::new("direct-core-read-lease");
+        let mut services = blob_services(0x91);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("direct-core read lease store");
+        let plaintext = b"direct generic core read".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let proof = prepare_blob_proof(&store, &mut services, &prepared, &plaintext, 1);
+        let variant = proof.completion.variant_id();
+        let mut depot = store.blob_depot().expect("direct-core read depot");
+
+        CoreBlobStore::select_blob_for_read_with_lineage(
+            &mut depot,
+            proof.blob.manifest(),
+            proof.blob.physical_lineage(),
+        )
+        .expect("select exact direct-core read");
+        assert_eq!(
+            store.test_blob_lease_active_kind(variant, lease::BlobLeaseKind::ApplicationPageRead),
+            0
+        );
+        drop(depot);
+        assert_eq!(store.test_blob_lease_active(variant), 0);
+    }
+
+    #[test]
+    fn blob_committed_delete_pending_fences_generic_selection_and_completion_mint() {
+        let root = BlobTestRoot::new("direct-core-delete-pending");
+        let mut services = blob_services(0xa3);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("direct-core deletion store");
+        let plaintext = b"generic reads obey durable deletion authority".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let proof = prepare_blob_proof(&store, &mut services, &prepared, &plaintext, 1);
+        let variant = proof.completion.variant_id();
+
+        store
+            .test_admit_blob_deletion_manifest(variant)
+            .expect("commit exact deletion manifest");
+
+        let mut depot = store.blob_depot().expect("generic depot");
+        assert!(matches!(
+            CoreBlobStore::begin_blob_with_lineage(
+                &mut depot,
+                proof.blob.manifest(),
+                proof.blob.physical_lineage(),
+            ),
+            Err(StoreError::Blob(BlobStoreError::VariantDeleting))
+        ));
+        assert!(matches!(
+            CoreBlobStore::select_blob_for_read_with_lineage(
+                &mut depot,
+                proof.blob.manifest(),
+                proof.blob.physical_lineage(),
+            ),
+            Err(StoreError::Blob(BlobStoreError::VariantDeleting))
+        ));
+        assert!(matches!(
+            depot.completed_blob(&proof.blob, &proof.manifest_bytes),
+            Err(StoreError::Blob(BlobStoreError::VariantDeleting))
+        ));
+    }
+
+    #[test]
+    fn blob_authenticated_page_read_cannot_authorize_mutation() {
+        let root = BlobTestRoot::new("same-target-read-cannot-mutate");
+        let mut services = blob_services(0x92);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("same-target lease-class store");
+        let plaintext = b"read lease cannot become a mutation lease".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let proof = prepare_blob_proof(&store, &mut services, &prepared, &plaintext, 1);
+        let mut depot = store
+            .blob_depot_for_authenticated_read(&proof.completion)
+            .expect("authenticated page depot");
+
+        CoreBlobStore::select_blob_for_read_with_lineage(
+            &mut depot,
+            proof.blob.manifest(),
+            proof.blob.physical_lineage(),
+        )
+        .expect("select exact authenticated read target");
+        assert!(matches!(
+            CoreBlobStore::begin_blob_with_lineage(
+                &mut depot,
+                proof.blob.manifest(),
+                proof.blob.physical_lineage(),
+            ),
+            Err(StoreError::Blob(BlobStoreError::CompletionMismatch))
+        ));
+    }
+
+    #[test]
+    fn blob_pending_full_verification_adapter_does_not_consume_page_lease() {
+        let root = BlobTestRoot::new("pending-full-verification-no-page-lease");
+        let mut services = blob_services(0xb1);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("pending verification store");
+        let plaintext = b"full verification is protected by pending root and depot lock".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let proof = prepare_blob_proof(&store, &mut services, &prepared, &plaintext, 1);
+        let variant = proof.completion.variant_id();
+        let source = BlobTransferId::new(proof.blob.envelope_id());
+        let plan = proof
+            .blob
+            .transfer_plan(&proof.manifest_bytes)
+            .expect("pending verification plan");
+        store
+            .stage_verified_blob_source_with_policy(
+                &proof.policy,
+                &proof.blob,
+                &proof.sealed,
+                &plan,
+            )
+            .expect("stage durable pending reference");
+
+        let verification = store
+            .blob_depot_for_pending_completion_verification(source, &proof.completion)
+            .expect("open hidden full-verification adapter");
+        assert_eq!(
+            store.test_blob_lease_active_kind(variant, lease::BlobLeaseKind::ApplicationPageRead),
+            0
+        );
+        drop(verification);
+        assert_eq!(store.test_blob_lease_active(variant), 0);
+    }
+
+    #[test]
+    fn blob_network_read_uses_carrier_range_lease_and_retains_owned_handoff() {
+        let root = BlobTestRoot::new("carrier-range-read-lease");
+        let mut services = blob_services(0x90);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("carrier-range lease store");
+        let plaintext = b"one bounded network carrier range".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let proof = prepare_blob_proof(&store, &mut services, &prepared, &plaintext, 1);
+        let variant = proof.completion.variant_id();
+
+        let read = BlobDepot::open_authenticated_read_with_kind(
+            &store,
+            &proof.completion,
+            lease::BlobLeaseKind::CarrierRange,
+        )
+        .expect("acquire carrier-range adapter");
+        let handoff = read
+            .owned_lease_guard()
+            .expect("retain exact network-range guard");
+        assert_eq!(
+            store.test_blob_lease_active_kind(variant, lease::BlobLeaseKind::CarrierRange),
+            1
+        );
+        assert_eq!(
+            store.test_blob_lease_active_kind(variant, lease::BlobLeaseKind::ApplicationPageRead),
+            0
+        );
+        drop(read);
+        assert_eq!(store.test_blob_lease_active(variant), 1);
+        drop(handoff);
+        assert_eq!(store.test_blob_lease_active(variant), 0);
+    }
+
+    #[test]
+    fn blob_import_lease_precedes_staging_and_survives_until_commit_or_cancel() {
+        let root = BlobTestRoot::new("local-import-owned-lease");
+        let services = blob_services(0x8e);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("local-import lease store");
+        let prepared = prepared_blob(b"owned local import handoff");
+        let operation =
+            BlobOperationKey::new(b"owned-local-import-handoff".to_vec()).expect("operation key");
+        let (depot, local_import_lease) = store
+            .blob_depot_for_local_publish_with_operation(&operation, false)
+            .expect("open local-import depot before staging");
+        let mut service = services
+            .publisher
+            .blob_service_with_store(&blob_scope(), &blob_topic(), 1, depot)
+            .expect("local-import service");
+        let manifest = service
+            .install_prepared(&prepared)
+            .expect("begin staging only after automatic lease acquisition");
+        let variant = blob_variant_id(
+            manifest.id(),
+            manifest.content_group(),
+            manifest.content_epoch(),
+        );
+        assert_eq!(store.test_blob_lease_active(variant), 1);
+
+        drop(service);
+        assert_eq!(store.test_blob_lease_active(variant), 1);
+        drop(local_import_lease);
+        assert_eq!(store.test_blob_lease_active(variant), 0);
+    }
+
+    #[test]
+    fn blob_direct_core_import_relies_on_exclusive_depot_lock_without_worker_lease() {
+        let root = BlobTestRoot::new("direct-core-import-lock-only");
+        let services = blob_services(0x8f);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("direct-core import store");
+        let prepared = prepared_blob(b"direct generic core import");
+        let depot = store.blob_depot().expect("direct-core depot");
+        let mut service = services
+            .publisher
+            .blob_service_with_store(&blob_scope(), &blob_topic(), 1, depot)
+            .expect("direct-core service");
+        let manifest = service
+            .install_prepared(&prepared)
+            .expect("direct core begin under the exclusive depot lock");
+        let variant = blob_variant_id(
+            manifest.id(),
+            manifest.content_group(),
+            manifest.content_epoch(),
+        );
+        assert_eq!(store.test_blob_lease_active(variant), 0);
+        drop(service);
+        assert_eq!(store.test_blob_lease_active(variant), 0);
+    }
+
+    #[test]
+    fn blob_local_import_rebind_rechecks_durable_delete_pending() {
+        let root = BlobTestRoot::new("local-import-rebind-delete-pending");
+        let mut services = blob_services(0x93);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("local-import rebind store");
+        let plaintext = b"durable deletion beats staging rebind".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let proof = prepare_blob_proof(&store, &mut services, &prepared, &plaintext, 1);
+        let variant = proof.completion.variant_id();
+        let write = store.database.begin_write().expect("deletion fixture");
+        deletion::move_finalized_variant_to_manifest_for_test(&write, variant)
+            .expect("move exact variant to delete-pending");
+        write.commit().expect("commit deletion fixture");
+
+        let operation =
+            BlobOperationKey::new(b"rebind-delete-pending".to_vec()).expect("operation key");
+        let staging = local_import_staging_target(&operation).expect("staging target");
+        let (mut depot, _attempt) = store
+            .blob_depot_for_local_publish_with_operation(&operation, false)
+            .expect("staging-scoped attempt");
+        assert_eq!(store.test_blob_staging_lease_active(staging), 1);
+        assert_eq!(store.test_blob_lease_active(variant), 0);
+        assert!(matches!(
+            CoreBlobStore::begin_blob_with_lineage(
+                &mut depot,
+                proof.blob.manifest(),
+                proof.blob.physical_lineage(),
+            ),
+            Err(StoreError::Blob(BlobStoreError::VariantDeleting))
+        ));
+        assert_eq!(store.test_blob_staging_lease_active(staging), 1);
+        assert_eq!(store.test_blob_lease_active(variant), 0);
+    }
+
+    #[test]
+    fn blob_completion_recheck_rejects_delete_pending_before_file_scan() {
+        let root = BlobTestRoot::new("completion-recheck-delete-pending");
+        let mut services = blob_services(0xa4);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("completion recheck store");
+        let plaintext = vec![0xa4; SELECTED_BLOB_CHUNK_SIZE as usize + 1];
+        let prepared = prepared_blob(&plaintext);
+        let proof = prepare_blob_proof(&store, &mut services, &prepared, &plaintext, 1);
+        let variant = proof.completion.variant_id();
+        let write = store.database.begin_write().expect("deletion fixture");
+        deletion::move_finalized_variant_to_manifest_for_test(&write, variant)
+            .expect("move exact variant to delete-pending");
+        write.commit().expect("commit deletion fixture");
+
+        let before = depot::test_depot_io_counts(&store);
+        assert!(matches!(
+            depot::verify_completion(&store, &proof.completion),
+            Err(StoreError::Blob(BlobStoreError::VariantDeleting))
+        ));
+        let after = depot::test_depot_io_counts(&store);
+        assert_eq!(
+            after.full_completion_rechecks,
+            before.full_completion_rechecks + 1
+        );
+        assert_eq!(
+            after.completion_chunk_rows_visited, before.completion_chunk_rows_visited,
+            "delete-pending completion must fail before scanning deletion-owned files"
+        );
+    }
+
+    #[test]
+    fn blob_delete_pending_fences_authenticated_read_and_pending_stage_entrypoints() {
+        let root = BlobTestRoot::new("delete-pending-production-entrypoints");
+        let mut services = blob_services(0x96);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("delete-pending entrypoint store");
+        let plaintext = b"production entrypoints observe durable deletion".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let proof = prepare_blob_proof(&store, &mut services, &prepared, &plaintext, 1);
+        let plan = proof
+            .blob
+            .transfer_plan(&proof.manifest_bytes)
+            .expect("transfer plan");
+        let variant = proof.completion.variant_id();
+        let write = store.database.begin_write().expect("deletion fixture");
+        deletion::move_finalized_variant_to_manifest_for_test(&write, variant)
+            .expect("move exact variant to delete-pending");
+        write.commit().expect("commit deletion fixture");
+
+        assert!(matches!(
+            store.blob_depot_for_authenticated_read(&proof.completion),
+            Err(StoreError::Blob(BlobStoreError::VariantDeleting))
+        ));
+        assert!(matches!(
+            store.stage_verified_blob_source_with_policy(
+                &proof.policy,
+                &proof.blob,
+                &proof.sealed,
+                &plan,
+            ),
+            Err(StoreError::Blob(BlobStoreError::VariantDeleting))
+        ));
+    }
+
+    #[test]
+    fn blob_delete_pending_fences_publication_and_operation_binding_entrypoint() {
+        let root = BlobTestRoot::new("delete-pending-publication-entrypoint");
+        let mut services = blob_services(0x97);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("delete-pending publication store");
+        let plaintext = b"publication cannot revive deleting content".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let proof = prepare_blob_proof(&store, &mut services, &prepared, &plaintext, 1);
+        let variant = proof.completion.variant_id();
+        let write = store.database.begin_write().expect("deletion fixture");
+        deletion::move_finalized_variant_to_manifest_for_test(&write, variant)
+            .expect("move exact variant to delete-pending");
+        write.commit().expect("commit deletion fixture");
+
+        let operation =
+            BlobOperationKey::new(b"delete-pending-operation".to_vec()).expect("operation key");
+        let intent = BlobPublicationIntent::new(
+            services.publisher.identity(),
+            blob_topic(),
+            blob_scope(),
+            Priority::Immediate,
+            proof.blob.blob_id(),
+        )
+        .expect("publication intent");
+        let request = BlobOperationRequest::new(&operation, &intent);
+        let publication = store.commit_reserved_blob_once_with_policy(
+            &proof.policy,
+            &request,
+            &proof.reservation,
+            &proof.blob,
+            &proof.sealed,
+            &proof.completion,
+        );
+        assert!(
+            matches!(
+                publication,
+                Err(StoreError::Blob(BlobStoreError::VariantDeleting))
+            ),
+            "unexpected delete-pending publication result: {publication:?}"
+        );
+        assert!(
+            store
+                .blob_for_operation(&operation)
+                .expect("failed operation lookup")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn blob_failed_generic_begin_does_not_install_worker_lease_on_reusable_depot() {
+        let root = BlobTestRoot::new("failed-generic-begin-lease");
+        let mut services = blob_services(0x94);
+        let store = Store::open_with_limits_and_blob_depot_limits_for_mission(
+            &root.database,
+            StoreLimits::default(),
+            BlobDepotLimits::new(u64::MAX, u64::MAX, 1).expect("one variant"),
+            services.authority,
+        )
+        .expect("variant-limited store");
+        let first_plaintext = b"existing limited variant".to_vec();
+        let first_prepared = prepared_blob(&first_plaintext);
+        let first = prepare_blob_proof(&store, &mut services, &first_prepared, &first_plaintext, 1);
+
+        let source_root = BlobTestRoot::new("failed-generic-begin-source");
+        let mut source_services = blob_services(0x94);
+        let source = Store::open_for_mission(&source_root.database, source_services.authority)
+            .expect("second-manifest source");
+        let second_plaintext = b"different variant exceeds target limit".to_vec();
+        let second_prepared = prepared_blob(&second_plaintext);
+        let second = prepare_blob_proof(
+            &source,
+            &mut source_services,
+            &second_prepared,
+            &second_plaintext,
+            1,
+        );
+
+        let mut depot = store.blob_depot().expect("reusable generic depot");
+        assert!(matches!(
+            CoreBlobStore::begin_blob_with_lineage(
+                &mut depot,
+                second.blob.manifest(),
+                second.blob.physical_lineage(),
+            ),
+            Err(StoreError::Blob(
+                BlobStoreError::DepotVariantLimitExceeded { .. }
+            ))
+        ));
+        CoreBlobStore::begin_blob_with_lineage(
+            &mut depot,
+            first.blob.manifest(),
+            first.blob.physical_lineage(),
+        )
+        .expect("failed begin must leave depot reusable for another target");
+    }
+
+    #[test]
+    fn blob_import_shutdown_leaves_durable_retryable_staging_and_unassigned_operation_key() {
+        let root = BlobTestRoot::new("local-import-restart-retry");
+        let services = blob_services(0x95);
+        let operation =
+            BlobOperationKey::new(b"restart-same-operation".to_vec()).expect("operation key");
+        let prepared = prepared_blob(b"durable unfinished local import");
+        {
+            let store = Store::open_for_mission(&root.database, services.authority)
+                .expect("initial local-import store");
+            let (depot, attempt) = store
+                .blob_depot_for_local_publish_with_operation(&operation, false)
+                .expect("initial staging attempt");
+            let mut service = services
+                .publisher
+                .blob_service_with_store(&blob_scope(), &blob_topic(), 1, depot)
+                .expect("initial local-import service");
+            service
+                .install_prepared(&prepared)
+                .expect("persist unfinished staging");
+            assert!(
+                store
+                    .blob_for_operation(&operation)
+                    .expect("initial operation lookup")
+                    .is_none()
+            );
+            drop(service);
+            drop(attempt);
+            drop(store);
+        }
+
+        let reopened = Store::open_for_mission(&root.database, services.authority)
+            .expect("reopen abandoned staging");
+        assert!(
+            reopened
+                .blob_for_operation(&operation)
+                .expect("reopened operation lookup")
+                .is_none()
+        );
+        let (depot, _attempt) = reopened
+            .blob_depot_for_local_publish_with_operation(&operation, false)
+            .expect("retry same operation key");
+        let mut retry = services
+            .publisher
+            .blob_service_with_store(&blob_scope(), &blob_topic(), 1, depot)
+            .expect("retry local-import service");
+        retry
+            .install_prepared(&prepared)
+            .expect("resume exact durable staging");
+    }
+
+    #[test]
+    fn blob_store_admission_and_delete_pending_race_has_exactly_one_winner() {
+        let root = BlobTestRoot::new("store-delete-pending-race");
+        let mut services = blob_services(0x98);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("delete-pending race store");
+        let plaintext = b"one exact store-level deletion race".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let proof = prepare_blob_proof(&store, &mut services, &prepared, &plaintext, 1);
+        let variant = proof.completion.variant_id();
+        let operation =
+            BlobOperationKey::new(b"delete-pending-race-attempt".to_vec()).expect("operation key");
+        let start = std::sync::Barrier::new(3);
+        let release_attempt = std::sync::Barrier::new(2);
+        let (import_send, import_receive) = std::sync::mpsc::sync_channel(1);
+        let (delete_send, delete_receive) = std::sync::mpsc::sync_channel(1);
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                start.wait();
+                let result = (|| {
+                    let (mut depot, attempt) =
+                        store.blob_depot_for_local_publish_with_operation(&operation, false)?;
+                    CoreBlobStore::begin_blob_with_lineage(
+                        &mut depot,
+                        proof.blob.manifest(),
+                        proof.blob.physical_lineage(),
+                    )?;
+                    drop(depot);
+                    Ok::<_, StoreError>(attempt)
+                })();
+                import_send
+                    .send(result.is_ok())
+                    .expect("report import contender");
+                if let Ok(attempt) = result {
+                    release_attempt.wait();
+                    drop(attempt);
+                }
+            });
+            scope.spawn(|| {
+                start.wait();
+                delete_send
+                    .send(store.test_admit_blob_deletion_manifest(variant).is_ok())
+                    .expect("report deletion contender");
+            });
+            start.wait();
+            let imported = import_receive.recv().expect("import result");
+            let deleted = delete_receive.recv().expect("deletion result");
+            assert_ne!(imported, deleted, "exactly one store contender must win");
+            if imported {
+                release_attempt.wait();
+            }
+            let read = store.database.begin_read().expect("race result read");
+            assert_eq!(
+                deletion::require_variant_available_read(&read, variant).is_err(),
+                deleted
+            );
+        });
+    }
+
+    #[test]
+    fn blob_delete_admission_fault_restores_registry_and_durable_before_image() {
+        let root = BlobTestRoot::new("delete-admission-rollback");
+        let mut services = blob_services(0xb2);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("delete admission rollback store");
+        let plaintext = b"provisional deletion must roll back completely".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let proof = prepare_blob_proof(&store, &mut services, &prepared, &plaintext, 1);
+        let variant = proof.completion.variant_id();
+        assert_eq!(store.test_blob_lease_entries(), 0);
+
+        TEST_BLOB_DELETE_ADMISSION_PRE_COMMIT_FAULT.set(true);
+        let result = store.test_admit_blob_deletion_manifest(variant);
+        TEST_BLOB_DELETE_ADMISSION_PRE_COMMIT_FAULT.set(false);
+        assert!(matches!(
+            result,
+            Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+                "injected Blob delete admission pre-commit failure"
+            )))
+        ));
+        assert_eq!(store.test_blob_lease_entries(), 0);
+        let read = store.database.begin_read().expect("rollback read");
+        deletion::require_variant_available_read(&read, variant)
+            .expect("durable deletion manifest rolled back");
+        drop(read);
+        drop(
+            store
+                .blob_depot_for_authenticated_read(&proof.completion)
+                .expect("process-local fence rolled back"),
+        );
+    }
+
     fn transfer_all_blob_carriers(
         source: &Store,
         target: &Store,
@@ -8531,6 +9264,187 @@ mod tests {
                 "one carrier commit cannot perform a global Blob-network audit"
             );
         }
+    }
+
+    #[test]
+    fn blob_store_one_slot_saturation_is_transient_and_non_destructive() {
+        let source_root = BlobTestRoot::new("lease-saturation-source");
+        let target_root = BlobTestRoot::new("lease-saturation-target");
+        let mut services = blob_services(0xc3);
+        let source = Store::open_for_mission(&source_root.database, services.authority)
+            .expect("lease saturation source");
+        let target = Store::open_with_all_limits_and_blob_lease_limits_for_mission(
+            &target_root.database,
+            StoreLimits::default(),
+            BlobDepotLimits::default(),
+            EventOperationLimits::DEFAULT,
+            BlobLifecycleLimits::default(),
+            BlobLeaseLimits::new(1, 1, 1).expect("one slot per Blob lease class"),
+            services.authority,
+        )
+        .expect("one-slot target");
+        let plaintext =
+            b"real registry saturation must leave durable transfer state intact".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let proof = prepare_blob_proof(&source, &mut services, &prepared, &plaintext, 1);
+        let plan = proof
+            .blob
+            .transfer_plan(&proof.manifest_bytes)
+            .expect("lease saturation plan");
+        let policy = target.control_policy_snapshot().expect("target policy");
+        let transfer = BlobTransferId::new(proof.blob.envelope_id());
+        target
+            .stage_verified_blob_source_with_policy(&policy, &proof.blob, &proof.sealed, &plan)
+            .expect("stage exact pending source");
+
+        let carrier = {
+            let mut depot = source.blob_depot().expect("source carrier depot");
+            CoreBlobStore::begin_blob_with_lineage(
+                &mut depot,
+                plan.manifest(),
+                plan.physical_lineage(),
+            )
+            .expect("activate source plan");
+            plan.build_carrier(&mut depot, 0)
+                .expect("build exact carrier")
+        };
+        let object = BlobCarrierObjectId::new(carrier.object_id().wire_bytes())
+            .expect("typed carrier object");
+        let total = u64::try_from(carrier.bytes().len()).expect("carrier total");
+        let mut offset = 0u64;
+        for range in carrier.bytes().chunks(MAX_BLOB_NETWORK_RANGE_BYTES) {
+            target
+                .append_blob_carrier_prefix_with_policy(
+                    &policy, transfer, object, total, offset, range,
+                )
+                .expect("append complete carrier prefix");
+            offset += u64::try_from(range.len()).expect("range length");
+        }
+
+        let prefix_before = target
+            .blob_carrier_prefix_status(transfer, object)
+            .expect("prefix before worker saturation");
+        let progress_before = target
+            .pending_blob_transfer_progress_with_policy(&policy)
+            .expect("progress before worker saturation");
+        let worker = target
+            .test_acquire_blob_lease(
+                proof.completion.variant_id(),
+                lease::BlobLeaseKind::InternalChunkWork,
+            )
+            .expect("occupy only worker slot");
+        assert!(matches!(
+            target.commit_complete_blob_carrier_with_policy(&policy, transfer, object, &plan,),
+            Err(StoreError::Blob(BlobStoreError::LeaseCapacity))
+        ));
+        assert_eq!(
+            target
+                .blob_carrier_prefix_status(transfer, object)
+                .expect("prefix after worker saturation"),
+            prefix_before
+        );
+        assert_eq!(
+            target
+                .pending_blob_transfer_progress_with_policy(&policy)
+                .expect("progress after worker saturation"),
+            progress_before
+        );
+        drop(worker);
+        assert_eq!(
+            target
+                .commit_complete_blob_carrier_with_policy(&policy, transfer, object, &plan,)
+                .expect("retry carrier commit"),
+            BlobCarrierCommitOutcome::Committed
+        );
+
+        let completion = target
+            .completed_pending_blob_with_policy(
+                &policy,
+                transfer,
+                &proof.blob,
+                &proof.manifest_bytes,
+                &plan,
+            )
+            .expect("pending completion");
+        let content_completion = {
+            let depot = target
+                .blob_depot_for_authenticated_read(&completion)
+                .expect("content verification depot");
+            let mut service = services
+                .reader
+                .blob_service_with_store(&blob_scope(), &blob_topic(), 1, depot)
+                .expect("content verification service");
+            service
+                .verify_blob_content_completion(&proof.blob, &proof.manifest_bytes)
+                .expect("verify completed content")
+        };
+        let lineage = services
+            .reader
+            .verify_current_blob_lineage(&proof.blob)
+            .expect("current lineage");
+        target
+            .apply_verified_blob_with_policy(
+                &policy,
+                &plan,
+                &lineage,
+                &completion,
+                &content_completion,
+            )
+            .expect("promote completed source");
+
+        let stats_before = target.blob_stats().expect("stats before range saturation");
+        let source_before = target
+            .get_blob(transfer)
+            .expect("source before range saturation");
+        let range = target
+            .test_acquire_blob_lease(
+                proof.completion.variant_id(),
+                lease::BlobLeaseKind::CarrierRange,
+            )
+            .expect("occupy only range slot");
+        let range_len = usize::try_from(
+            total.min(u64::try_from(MAX_BLOB_NETWORK_RANGE_BYTES).expect("range bound")),
+        )
+        .expect("canonical first range length");
+        assert!(matches!(
+            target.read_completed_blob_carrier_range_with_policy(
+                &policy,
+                &completion,
+                &lineage,
+                transfer,
+                object,
+                0,
+                range_len,
+                &plan,
+            ),
+            Err(StoreError::Blob(BlobStoreError::LeaseCapacity))
+        ));
+        assert_eq!(
+            target.blob_stats().expect("stats after range saturation"),
+            stats_before
+        );
+        assert_eq!(
+            target
+                .get_blob(transfer)
+                .expect("source after range saturation"),
+            source_before
+        );
+        drop(range);
+        let served = target
+            .read_completed_blob_carrier_range_with_policy(
+                &policy,
+                &completion,
+                &lineage,
+                transfer,
+                object,
+                0,
+                range_len,
+                &plan,
+            )
+            .expect("retry saturated range")
+            .expect("completed source remains available");
+        assert_eq!(served.0, total);
+        assert_eq!(served.1, carrier.bytes()[..range_len]);
     }
 
     #[test]
@@ -15612,13 +16526,29 @@ mod tests {
     }
 
     #[test]
-    fn depot_read_round_trips_with_one_core_bounded_chunk_buffer() {
+    fn stopped_whole_blob_read_ignores_saturated_worker_leases() {
         let root = BlobTestRoot::new("bounded-depot-read");
         let mut services = blob_services(0x95);
         let plaintext = vec![0x95; SELECTED_BLOB_CHUNK_SIZE as usize + 37];
         let prepared = prepared_blob(&plaintext);
-        let store = Store::open_for_mission(&root.database, services.authority).expect("store");
+        let store = Store::open_with_all_limits_and_blob_lease_limits_for_mission(
+            &root.database,
+            StoreLimits::default(),
+            BlobDepotLimits::default(),
+            EventOperationLimits::DEFAULT,
+            BlobLifecycleLimits::default(),
+            BlobLeaseLimits::new(1, 1, 1).expect("one slot per Blob lease class"),
+            services.authority,
+        )
+        .expect("store");
         let proof = prepare_blob_proof(&store, &mut services, &prepared, &plaintext, 1);
+        let variant = proof.completion.variant_id();
+        let saturated_worker = store
+            .test_acquire_blob_lease(
+                BlobVariantId::from_bytes([0xde; 32]),
+                lease::BlobLeaseKind::InternalChunkWork,
+            )
+            .expect("saturate the only worker lease slot");
         let depot = store.blob_depot().expect("read depot");
         let mut service = services
             .reader
@@ -15626,12 +16556,20 @@ mod tests {
             .expect("reader service");
         service
             .install_verified_manifest(&proof.blob, &proof.manifest_bytes)
-            .expect("install exact verified manifest");
+            .expect("whole read does not consume a worker lease");
+        assert_eq!(
+            store.test_blob_lease_active_kind(variant, lease::BlobLeaseKind::LocalImport),
+            0
+        );
         let mut reader = service
             .reader_for_verified(&proof.blob)
             .expect("verified reader");
         let mut output = Vec::new();
         let stats = reader.stream_into(&mut output).expect("stream Blob");
+        assert_eq!(
+            store.test_blob_lease_active_kind(variant, lease::BlobLeaseKind::LocalImport),
+            0
+        );
         assert_eq!(output, plaintext);
         assert_eq!(stats.plaintext_bytes, plaintext.len() as u64);
         assert_eq!(stats.verified_chunks, 2);
@@ -15639,6 +16577,7 @@ mod tests {
             stats.peak_working_buffer_bytes <= SELECTED_BLOB_CHUNK_SIZE as usize + 16,
             "depot adapter must read its fixed header on the stack and ciphertext directly into the core-owned chunk buffer"
         );
+        drop(saturated_worker);
     }
 
     #[test]
@@ -17838,6 +18777,137 @@ mod tests {
             );
         }
         write.commit().expect("commit exact deletion fixture");
+    }
+
+    #[test]
+    fn blob_delete_pending_fences_every_root_attachment_path() {
+        let root = BlobTestRoot::new("delete-pending-root-fence");
+        let services = blob_services(0xad);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("delete-pending root-fence store");
+        let plaintext = b"unreferenced root-fence variant".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        finish_variant(&store, &services.publisher, &prepared, &plaintext, 1)
+            .expect("finish root-fence variant");
+        let variant = {
+            let read = store.database.begin_read().expect("read root-fence import");
+            let imports = read.open_table(BLOB_IMPORTS).expect("root-fence imports");
+            let (key, _) = imports
+                .iter()
+                .expect("root-fence import rows")
+                .next()
+                .expect("one root-fence import")
+                .expect("root-fence import row");
+            BlobVariantId::from_bytes(key.value().try_into().expect("variant key"))
+        };
+        let write = store
+            .database
+            .begin_write()
+            .expect("begin root-fence deletion fixture");
+        deletion::move_finalized_variant_to_manifest_for_test(&write, variant)
+            .expect("admit durable delete-pending fixture");
+        let transfer = BlobTransferId::new([0x5e; 32]);
+        for result in [
+            lifecycle::insert_variant_reference(
+                &write,
+                variant,
+                lifecycle::VariantReferenceOwner::Publication,
+                transfer,
+            ),
+            lifecycle::insert_variant_reference(
+                &write,
+                variant,
+                lifecycle::VariantReferenceOwner::PendingSource,
+                transfer,
+            ),
+            lifecycle::move_variant_reference(
+                &write,
+                variant,
+                transfer,
+                lifecycle::VariantReferenceOwner::PendingSource,
+                lifecycle::VariantReferenceOwner::Publication,
+            ),
+        ] {
+            assert!(matches!(
+                result,
+                Err(StoreError::Blob(BlobStoreError::VariantDeleting))
+            ));
+        }
+        write.commit().expect("commit delete-pending fixture");
+    }
+
+    #[test]
+    fn blob_delete_pending_remains_uncancellable_through_every_deletion_phase() {
+        let root = BlobTestRoot::new("delete-pending-all-phases");
+        let mut services = blob_services(0xac);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("delete-pending phase store");
+        let plaintext = b"delete-pending phase fixture".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let proof = prepare_blob_proof(&store, &mut services, &prepared, &plaintext, 1);
+        let variant = proof.completion.variant_id();
+        let transfer = BlobTransferId::new([0x6d; 32]);
+        let write = store.database.begin_write().expect("begin phase fixture");
+        deletion::move_finalized_variant_to_manifest_for_test(&write, variant)
+            .expect("admit phase fixture");
+        write.commit().expect("commit phase fixture");
+
+        for (index, (phase, retry)) in [
+            (
+                deletion::BlobDeletionPhase::DeletingChunks,
+                deletion::BlobDeletionRetry::default(),
+            ),
+            (
+                deletion::BlobDeletionPhase::DeletingChunks,
+                deletion::BlobDeletionRetry {
+                    category: Some(deletion::BlobDeletionFailureCategory::ChunkUnlink),
+                    attempts: 1,
+                    next_retry_turn: 2,
+                },
+            ),
+            (
+                deletion::BlobDeletionPhase::DirectoryDeletePending,
+                deletion::BlobDeletionRetry::default(),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let write = store
+                .database
+                .begin_write()
+                .expect("begin phase transition");
+            deletion::set_blob_deletion_phase_for_test(&write, variant, phase, retry)
+                .expect("set exact deletion phase");
+            assert!(matches!(
+                lifecycle::insert_variant_reference(
+                    &write,
+                    variant,
+                    lifecycle::VariantReferenceOwner::Publication,
+                    transfer,
+                ),
+                Err(StoreError::Blob(BlobStoreError::VariantDeleting))
+            ));
+            write.commit().expect("commit phase transition");
+            assert!(matches!(
+                store.blob_depot_for_authenticated_read(&proof.completion),
+                Err(StoreError::Blob(BlobStoreError::VariantDeleting))
+            ));
+            let operation =
+                BlobOperationKey::new(format!("delete-pending-phase-{index}").into_bytes())
+                    .expect("phase operation key");
+            let (mut depot, _attempt) = store
+                .blob_depot_for_local_publish_with_operation(&operation, false)
+                .expect("phase local-import attempt");
+            assert!(matches!(
+                CoreBlobStore::begin_blob_with_lineage(
+                    &mut depot,
+                    proof.blob.manifest(),
+                    proof.blob.physical_lineage(),
+                ),
+                Err(StoreError::Blob(BlobStoreError::VariantDeleting))
+            ));
+        }
     }
 
     #[test]

@@ -5213,6 +5213,7 @@ pub struct Store {
     backing_identity: StoreBackingIdentity,
     limits: StoreLimits,
     blob_depot_limits: BlobDepotLimits,
+    blob_lease_registry: blob::lease::BlobLifecycleLeaseRegistry,
     operation_limits: EventOperationLimits,
     blob_lifecycle_limits: BlobLifecycleLimits,
     mission_authority: Option<NodeId>,
@@ -5617,6 +5618,7 @@ impl Store {
             BlobDepotLimits::default(),
             EventOperationLimits::DEFAULT,
             BlobLifecycleLimits::default(),
+            BlobLeaseLimits::default(),
             Some(binding.mission_authority),
             Some(expectation),
         )?;
@@ -5690,6 +5692,31 @@ impl Store {
         blob_lifecycle_limits: BlobLifecycleLimits,
         mission_authority: NodeId,
     ) -> Result<Self, StoreError> {
+        Self::open_with_all_limits_and_blob_lease_limits_for_mission(
+            path,
+            limits,
+            blob_depot_limits,
+            operation_limits,
+            blob_lifecycle_limits,
+            BlobLeaseLimits::default(),
+            mission_authority,
+        )
+    }
+
+    /// Node-internal open seam for process-local Blob concurrency bounds.
+    ///
+    /// The lease limits are reconstructed on every open and are never durable
+    /// lifecycle policy or wire-visible Blob state.
+    #[doc(hidden)]
+    pub fn open_with_all_limits_and_blob_lease_limits_for_mission(
+        path: impl AsRef<Path>,
+        limits: StoreLimits,
+        blob_depot_limits: BlobDepotLimits,
+        operation_limits: EventOperationLimits,
+        blob_lifecycle_limits: BlobLifecycleLimits,
+        blob_lease_limits: BlobLeaseLimits,
+        mission_authority: NodeId,
+    ) -> Result<Self, StoreError> {
         let path = path.as_ref();
         let readable_preflight = if path.exists() {
             match reject_terminal_normal_open(path) {
@@ -5719,6 +5746,7 @@ impl Store {
             blob_depot_limits,
             operation_limits,
             blob_lifecycle_limits,
+            blob_lease_limits,
             Some(mission_authority),
             None,
         )?;
@@ -5822,17 +5850,20 @@ impl Store {
             BlobDepotLimits::default(),
             EventOperationLimits::DEFAULT,
             BlobLifecycleLimits::default(),
+            BlobLeaseLimits::default(),
             None,
             None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)] // One internal seam carries independent durable and process-local limits.
     fn open_with_limits_internal(
         path: &Path,
         limits: StoreLimits,
         blob_depot_limits: BlobDepotLimits,
         operation_limits: EventOperationLimits,
         blob_lifecycle_limits: BlobLifecycleLimits,
+        blob_lease_limits: BlobLeaseLimits,
         expected_mission_authority: Option<NodeId>,
         expected_security_profile_policy: Option<SecurityProfilePolicyExpectation>,
     ) -> Result<Self, StoreError> {
@@ -6082,6 +6113,7 @@ impl Store {
             backing_identity,
             limits,
             blob_depot_limits,
+            blob_lease_registry: blob::lease::BlobLifecycleLeaseRegistry::new(blob_lease_limits),
             operation_limits,
             blob_lifecycle_limits,
             mission_authority,
@@ -6449,6 +6481,7 @@ impl Store {
             backing_identity,
             limits: _,
             blob_depot_limits: _,
+            blob_lease_registry: _,
             operation_limits: _,
             blob_lifecycle_limits: _,
             mission_authority: _,

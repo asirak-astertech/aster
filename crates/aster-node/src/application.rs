@@ -2852,12 +2852,11 @@ fn blob_store_error_kind(error: &BlobStoreError) -> ApplicationErrorKind {
         | BlobStoreError::NetworkSourceTooLarge { .. }
         | BlobStoreError::NetworkBlobTooLarge { .. }
         | BlobStoreError::NetworkStagingRowLimitExceeded { .. }
-        | BlobStoreError::NetworkStagingByteLimitExceeded { .. } => {
-            ApplicationErrorKind::ResourceLimit
-        }
-        BlobStoreError::PendingSourceMissing | BlobStoreError::Io(_) => {
-            ApplicationErrorKind::StateUnavailable
-        }
+        | BlobStoreError::NetworkStagingByteLimitExceeded { .. }
+        | BlobStoreError::LeaseCapacity => ApplicationErrorKind::ResourceLimit,
+        BlobStoreError::PendingSourceMissing
+        | BlobStoreError::VariantDeleting
+        | BlobStoreError::Io(_) => ApplicationErrorKind::StateUnavailable,
         BlobStoreError::Verification(_)
         | BlobStoreError::SchemaInvariant(_)
         | BlobStoreError::DepotIntegrity(_)
@@ -2955,6 +2954,14 @@ mod tests {
         assert_eq!(
             blob_store_error_kind(&BlobStoreError::SourceRepresentationConflict),
             ApplicationErrorKind::Conflict
+        );
+        assert_eq!(
+            blob_store_error_kind(&BlobStoreError::LeaseCapacity),
+            ApplicationErrorKind::ResourceLimit
+        );
+        assert_eq!(
+            blob_store_error_kind(&BlobStoreError::VariantDeleting),
+            ApplicationErrorKind::StateUnavailable
         );
     }
 

@@ -515,6 +515,7 @@ impl BlobDepotCompletion {
 pub struct BlobDepot<'a> {
     store: &'a Store,
     _guard: MutexGuard<'a, ()>,
+    _lease: Option<Arc<super::lease::BlobLeaseHandle>>,
     root: OwnedDirectory,
     active: Option<ActiveImport>,
     read_authorized_variant: Option<BlobVariantId>,
@@ -530,6 +531,16 @@ pub struct AuthenticatedBlobReadDepot<'a> {
 }
 
 impl AuthenticatedBlobReadDepot<'_> {
+    pub(super) fn owned_lease_guard(
+        &self,
+    ) -> Result<Arc<super::lease::BlobLeaseHandle>, StoreError> {
+        self.depot._lease.as_ref().map(Arc::clone).ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "authenticated Blob read adapter is missing its lease",
+            ))
+        })
+    }
+
     /// Rechecks the complete exact finalized variant authorized by the
     /// nonconstructible completion capability.
     pub fn recheck_completion(
@@ -656,6 +667,83 @@ impl CoreBlobStore for AuthenticatedBlobReadDepot<'_> {
 }
 
 impl<'a> BlobDepot<'a> {
+    pub(super) fn acquire_local_import_attempt(
+        &mut self,
+        staging: BlobTransferId,
+    ) -> Result<super::lease::BlobLocalImportLease, StoreError> {
+        if self._lease.is_some() {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob local-import attempt already has a lease",
+            )));
+        }
+        let guard = self
+            .store
+            .blob_lease_registry
+            .acquire(
+                self.store.blob_depot_owner_binding,
+                super::lease::BlobLeaseTarget::Staging(staging),
+                super::lease::BlobLeaseKind::LocalImport,
+            )
+            .map_err(super::lease::store_error)?;
+        let handle = Arc::new(super::lease::BlobLeaseHandle::new(guard));
+        self._lease = Some(Arc::clone(&handle));
+        Ok(super::lease::BlobLocalImportLease::new(handle))
+    }
+
+    fn ensure_variant_lease(
+        &mut self,
+        variant: BlobVariantId,
+        kind: super::lease::BlobLeaseKind,
+    ) -> Result<(), StoreError> {
+        let target = super::lease::BlobLeaseTarget::Variant(variant);
+        if let Some(existing) = self._lease.as_ref() {
+            let existing_target = existing.target().map_err(super::lease::store_error)?;
+            let existing_kind = existing.kind().map_err(super::lease::store_error)?;
+            if matches!(existing_target, super::lease::BlobLeaseTarget::Staging(_))
+                && existing_kind == super::lease::BlobLeaseKind::LocalImport
+                && kind == super::lease::BlobLeaseKind::LocalImport
+            {
+                self.store.require_live()?;
+                let read = self.store.database.begin_read()?;
+                super::deletion::require_variant_available_read(&read, variant)?;
+                drop(read);
+                existing
+                    .rebind_target(target)
+                    .map_err(super::lease::store_error)?;
+                return Ok(());
+            }
+            if existing_target == target && existing_kind.can_reuse_as(kind) {
+                return Ok(());
+            }
+            if existing_target == target {
+                return Err(blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob depot lease class cannot authorize this operation",
+                )));
+            }
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob depot lease target changed while the adapter remained active",
+            )));
+        }
+        self.store.require_live()?;
+        let read = self.store.database.begin_read()?;
+        super::deletion::require_variant_available_read(&read, variant)?;
+        drop(read);
+        let guard = self
+            .store
+            .blob_lease_registry
+            .acquire(self.store.blob_depot_owner_binding, target, kind)
+            .map_err(super::lease::store_error)?;
+        self._lease = Some(Arc::new(super::lease::BlobLeaseHandle::new(guard)));
+        Ok(())
+    }
+
+    pub(super) fn acquire_internal_chunk_work_lease(
+        &mut self,
+        variant: BlobVariantId,
+    ) -> Result<(), StoreError> {
+        self.ensure_variant_lease(variant, super::lease::BlobLeaseKind::InternalChunkWork)
+    }
+
     pub(super) fn open(store: &'a Store) -> Result<Self, StoreError> {
         let guard = store
             .blob_depot_lock
@@ -700,6 +788,7 @@ impl<'a> BlobDepot<'a> {
         Ok(Self {
             store,
             _guard: guard,
+            _lease: None,
             root,
             active: None,
             read_authorized_variant: None,
@@ -749,6 +838,7 @@ impl<'a> BlobDepot<'a> {
         Ok(Self {
             store,
             _guard: guard,
+            _lease: None,
             root,
             active: None,
             read_authorized_variant: None,
@@ -760,6 +850,39 @@ impl<'a> BlobDepot<'a> {
     pub(super) fn open_authenticated_read(
         store: &'a Store,
         completion: &BlobDepotCompletion,
+    ) -> Result<AuthenticatedBlobReadDepot<'a>, StoreError> {
+        Self::open_authenticated_read_with_kind(
+            store,
+            completion,
+            super::lease::BlobLeaseKind::ApplicationPageRead,
+        )
+    }
+
+    pub(super) fn open_authenticated_read_with_kind(
+        store: &'a Store,
+        completion: &BlobDepotCompletion,
+        lease_kind: super::lease::BlobLeaseKind,
+    ) -> Result<AuthenticatedBlobReadDepot<'a>, StoreError> {
+        Self::open_authenticated_read_internal(store, completion, Some(lease_kind), None)
+    }
+
+    /// Opens the same mutation-denying authenticated adapter without consuming
+    /// an application-page slot. The only caller is pending full-content
+    /// verification, whose durable pending reference and held depot lock
+    /// already exclude deletion for the adapter's complete lifetime.
+    pub(super) fn open_authenticated_read_without_lease(
+        store: &'a Store,
+        source: BlobTransferId,
+        completion: &BlobDepotCompletion,
+    ) -> Result<AuthenticatedBlobReadDepot<'a>, StoreError> {
+        Self::open_authenticated_read_internal(store, completion, None, Some(source))
+    }
+
+    fn open_authenticated_read_internal(
+        store: &'a Store,
+        completion: &BlobDepotCompletion,
+        lease_kind: Option<super::lease::BlobLeaseKind>,
+        required_pending: Option<BlobTransferId>,
     ) -> Result<AuthenticatedBlobReadDepot<'a>, StoreError> {
         let guard = store
             .blob_depot_lock
@@ -778,6 +901,19 @@ impl<'a> BlobDepot<'a> {
             store.backing_identity,
             store.blob_depot_owner_token,
         )?;
+        if let Some(source) = required_pending {
+            let pending = read
+                .open_table(super::BLOB_PENDING_SOURCES)?
+                .get(source.as_bytes().as_slice())?
+                .map(|value| super::decode_pending_blob_source(value.value()))
+                .transpose()?
+                .ok_or_else(|| blob_error(BlobStoreError::PendingSourceMissing))?;
+            if pending.metadata.transfer_id != source
+                || pending.metadata.variant_id != completion.variant_id
+            {
+                return Err(blob_error(BlobStoreError::CompletionMismatch));
+            }
+        }
         let root = OwnedDirectory::open_root_if_present(&store.path)?.ok_or_else(|| {
             blob_error(BlobStoreError::DepotIntegrity(
                 "completed Blob depot root is missing",
@@ -791,11 +927,27 @@ impl<'a> BlobDepot<'a> {
         let mut depot = Self {
             store,
             _guard: guard,
+            _lease: None,
             root,
             active: None,
             read_authorized_variant: Some(completion.variant_id),
         };
         let import = depot.exact_completion_import(&read, completion)?;
+        super::deletion::require_variant_available_read(&read, completion.variant_id)?;
+        drop(read);
+        depot._lease = lease_kind
+            .map(|kind| {
+                store
+                    .blob_lease_registry
+                    .acquire(
+                        store.blob_depot_owner_binding,
+                        super::lease::BlobLeaseTarget::Variant(completion.variant_id),
+                        kind,
+                    )
+                    .map(|guard| Arc::new(super::lease::BlobLeaseHandle::new(guard)))
+                    .map_err(super::lease::store_error)
+            })
+            .transpose()?;
         depot.active = Some(active_from_import(&import));
         #[cfg(test)]
         store
@@ -831,6 +983,7 @@ impl<'a> BlobDepot<'a> {
         let manifest_digest = *blob.manifest_digest();
         let variant_id = blob_variant_id(blob_id, &content_group, epoch);
         let read = self.store.database.begin_read()?;
+        super::deletion::require_variant_available_read(&read, variant_id)?;
         let import = load_import_read(&read, variant_id)?
             .ok_or_else(|| blob_error(BlobStoreError::CompletionMismatch))?;
         if !import.matches_manifest(blob.manifest())
@@ -1090,6 +1243,18 @@ impl<'a> BlobDepot<'a> {
     ) -> Result<(), StoreError> {
         self.store.require_live()?;
         let incoming = ImportRecord::from_manifest(manifest, physical_lineage)?;
+        // Explicit publish/chunk entrypoints install bounded leases because
+        // their exclusion claim can outlive this adapter. A generic depot is
+        // itself protected by the exclusive depot lock for its whole lifetime,
+        // so acquiring another worker lease here would turn a stopped whole-
+        // Blob read into unbounded worker work. The write-transaction check
+        // below remains the durable DeletePending fence for both cases.
+        if self._lease.is_some() {
+            self.ensure_variant_lease(
+                incoming.variant_id,
+                super::lease::BlobLeaseKind::LocalImport,
+            )?;
+        }
         #[cfg(test)]
         self.store
             .blob_depot_test_counters
@@ -1097,6 +1262,7 @@ impl<'a> BlobDepot<'a> {
             .fetch_add(1, Ordering::Relaxed);
         let write = self.store.database.begin_write()?;
         enforce_live_write(&write)?;
+        super::deletion::require_variant_available_write(&write, incoming.variant_id)?;
         super::lifecycle::require_import_lineage(&write, incoming.physical_lineage)?;
         let owner_binding = incoming
             .physical_lineage
@@ -1209,6 +1375,7 @@ impl CoreBlobStore for BlobDepot<'_> {
             return Err(blob_error(BlobStoreError::CompletionMismatch));
         }
         let read = self.store.database.begin_read()?;
+        super::deletion::require_variant_available_read(&read, expected.variant_id)?;
         let existing = load_import_read(&read, expected.variant_id)?
             .ok_or_else(|| blob_error(BlobStoreError::CompletionMismatch))?;
         if !existing.matches_manifest(manifest)
@@ -2495,6 +2662,8 @@ pub(super) fn verify_completion(
     {
         return Err(blob_error(BlobStoreError::CompletionMismatch));
     }
+    let read = store.database.begin_read()?;
+    super::deletion::require_variant_available_read(&read, completion.variant_id)?;
     let root = OwnedDirectory::open_root_if_present(&store.path)?.ok_or_else(|| {
         blob_error(BlobStoreError::DepotIntegrity(
             "completed Blob depot root is missing",
@@ -2505,7 +2674,6 @@ pub(super) fn verify_completion(
         store.backing_identity,
         store.blob_depot_owner_token,
     )?;
-    let read = store.database.begin_read()?;
     let import = load_import_read(&read, completion.variant_id)?
         .ok_or_else(|| blob_error(BlobStoreError::CompletionMismatch))?;
     let import_fingerprint = <[u8; 32]>::from(Sha256::digest(encode_import(&import)?));

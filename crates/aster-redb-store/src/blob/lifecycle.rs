@@ -856,6 +856,7 @@ pub(crate) fn require_variant_reference(
     if !admission_schema_is_current(write)? {
         return Ok(());
     }
+    super::deletion::require_variant_available_write(write, variant)?;
     let key = reference_key(variant, owner, transfer);
     let value = write
         .open_table(BLOB_VARIANT_REFERENCES)?
@@ -881,6 +882,7 @@ pub(crate) fn insert_variant_reference(
     if !admission_schema_is_current(write)? {
         return Ok(());
     }
+    super::deletion::require_variant_available_write(write, variant)?;
     let key = reference_key(variant, owner, transfer);
     if write
         .open_table(BLOB_VARIANT_REFERENCES)?
@@ -940,6 +942,7 @@ pub(crate) fn move_variant_reference(
     if !admission_schema_is_current(write)? {
         return Ok(());
     }
+    super::deletion::require_variant_available_write(write, variant)?;
     require_variant_reference(write, variant, from, transfer)?;
     let from_key = reference_key(variant, from, transfer);
     let to_key = reference_key(variant, to, transfer);
