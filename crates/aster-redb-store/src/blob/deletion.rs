@@ -54,6 +54,11 @@ const CONTINUITY_KEY: u8 = 0;
 const MAX_LINEAGE_FENCE_EVIDENCE_BYTES: usize = 256;
 const MAX_IMPORT_EVIDENCE_BYTES: usize = 1024 * 1024;
 const MAX_CHUNK_EVIDENCE_BYTES: usize = 256;
+const MAX_MANIFEST_ROW_BYTES: u64 = 32
+    + MANIFEST_FIXED_BYTES as u64
+    + MAX_LINEAGE_FENCE_EVIDENCE_BYTES as u64
+    + MAX_IMPORT_EVIDENCE_BYTES as u64;
+const MAX_CHUNK_ROW_BYTES: u64 = 40 + CHUNK_FIXED_BYTES as u64 + MAX_CHUNK_EVIDENCE_BYTES as u64;
 
 #[cfg(test)]
 const MANIFEST_PHASE_OFFSET: usize = 1;
@@ -85,6 +90,56 @@ thread_local! {
     static TEST_MANIFEST_ADMISSION_MUTATIONS: std::cell::Cell<u64> = const {
         std::cell::Cell::new(0)
     };
+    static TEST_MANIFEST_FINALIZATION_FAULT_ORDINAL: std::cell::Cell<Option<u64>> = const {
+        std::cell::Cell::new(None)
+    };
+    static TEST_MANIFEST_FINALIZATION_MUTATIONS: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
+    static TEST_DISCOVERY_ROWS_VISITED: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
+    static TEST_DISCOVERY_BYTES_VISITED: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+fn reset_discovery_observation() {
+    TEST_DISCOVERY_ROWS_VISITED.set(0);
+    TEST_DISCOVERY_BYTES_VISITED.set(0);
+}
+
+#[cfg(not(test))]
+fn reset_discovery_observation() {}
+
+#[cfg(test)]
+fn observe_discovery_row(bytes: u64) {
+    TEST_DISCOVERY_ROWS_VISITED.set(
+        TEST_DISCOVERY_ROWS_VISITED
+            .get()
+            .checked_add(1)
+            .expect("test discovery row observation overflow"),
+    );
+    TEST_DISCOVERY_BYTES_VISITED.set(
+        TEST_DISCOVERY_BYTES_VISITED
+            .get()
+            .checked_add(bytes)
+            .expect("test discovery byte observation overflow"),
+    );
+}
+
+#[cfg(not(test))]
+fn observe_discovery_row(_bytes: u64) {}
+
+#[cfg(test)]
+pub(crate) fn take_discovery_observation_for_test() -> (u64, u64) {
+    let observed = (
+        TEST_DISCOVERY_ROWS_VISITED.get(),
+        TEST_DISCOVERY_BYTES_VISITED.get(),
+    );
+    reset_discovery_observation();
+    observed
 }
 
 fn invariant(reason: &'static str) -> StoreError {
@@ -384,73 +439,100 @@ impl BlobDeletionManifest {
     }
 }
 
-#[derive(Clone, Debug)]
-struct BlobDeletionManifestHeader {
-    variant_id: BlobVariantId,
-    blob_id: BlobId,
-    content_group: [u8; 32],
-    epoch: u64,
-    physical_lineage: [u8; 32],
-    owner_binding: [u8; 32],
-    lineage_fence: Vec<u8>,
-    original_import: Vec<u8>,
-    finalized_root: Option<[u8; 32]>,
-    phase: BlobDeletionPhase,
-    retry: BlobDeletionRetry,
-    age: BlobDeletionAge,
-    totals: BlobDeletionTotals,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BlobDeletionManifestHeader {
+    pub(crate) variant_id: BlobVariantId,
+    pub(crate) blob_id: BlobId,
+    pub(crate) content_group: [u8; 32],
+    pub(crate) epoch: u64,
+    pub(crate) physical_lineage: [u8; 32],
+    pub(crate) owner_binding: [u8; 32],
+    pub(crate) lineage_fence: Vec<u8>,
+    pub(crate) original_import: Vec<u8>,
+    pub(crate) finalized_root: Option<[u8; 32]>,
+    pub(crate) phase: BlobDeletionPhase,
+    pub(crate) retry: BlobDeletionRetry,
+    pub(crate) age: BlobDeletionAge,
+    pub(crate) totals: BlobDeletionTotals,
 }
 
 #[allow(dead_code)]
 fn encode_manifest_record(manifest: &BlobDeletionManifest) -> Result<Vec<u8>, StoreError> {
     manifest.validate()?;
-    let lineage_len = u16::try_from(manifest.lineage_fence.len())
+    encode_manifest_header(&BlobDeletionManifestHeader {
+        variant_id: manifest.variant_id,
+        blob_id: manifest.blob_id,
+        content_group: manifest.content_group,
+        epoch: manifest.epoch,
+        physical_lineage: manifest.physical_lineage,
+        owner_binding: manifest.owner_binding,
+        lineage_fence: manifest.lineage_fence.clone(),
+        original_import: manifest.original_import.clone(),
+        finalized_root: manifest.finalized_root,
+        phase: manifest.phase,
+        retry: manifest.retry,
+        age: manifest.age,
+        totals: manifest.totals,
+    })
+}
+
+fn encode_manifest_header(header: &BlobDeletionManifestHeader) -> Result<Vec<u8>, StoreError> {
+    header.retry.validate()?;
+    header.age.validate()?;
+    if header.totals.chunks > MAX_SELECTED_BLOB_CHUNKS
+        || header.totals.queued.checked_add(header.totals.deleted) != Some(header.totals.chunks)
+    {
+        return Err(invariant(
+            "Blob deletion manifest header totals are not canonical",
+        ));
+    }
+    let lineage_len = u16::try_from(header.lineage_fence.len())
         .map_err(|_| invariant("Blob deletion lineage evidence exceeds its bound"))?;
-    let import_len = u32::try_from(manifest.original_import.len())
+    let import_len = u32::try_from(header.original_import.len())
         .map_err(|_| invariant("Blob deletion import evidence exceeds its bound"))?;
     let capacity = MANIFEST_FIXED_BYTES
-        .checked_add(manifest.lineage_fence.len())
-        .and_then(|value| value.checked_add(manifest.original_import.len()))
+        .checked_add(header.lineage_fence.len())
+        .and_then(|value| value.checked_add(header.original_import.len()))
         .ok_or(StoreError::PayloadByteAccountingOverflow)?;
     let mut output = Vec::with_capacity(capacity);
     output.push(MANIFEST_VERSION);
-    output.push(manifest.phase.encode());
+    output.push(header.phase.encode());
     output.extend_from_slice(&[0; 2]);
-    output.extend_from_slice(manifest.variant_id.as_bytes());
-    output.extend_from_slice(manifest.blob_id.as_bytes());
-    output.extend_from_slice(&manifest.content_group);
-    output.extend_from_slice(&manifest.epoch.to_be_bytes());
-    output.extend_from_slice(&manifest.physical_lineage);
-    output.extend_from_slice(&manifest.owner_binding);
-    output.push(u8::from(manifest.finalized_root.is_some()));
+    output.extend_from_slice(header.variant_id.as_bytes());
+    output.extend_from_slice(header.blob_id.as_bytes());
+    output.extend_from_slice(&header.content_group);
+    output.extend_from_slice(&header.epoch.to_be_bytes());
+    output.extend_from_slice(&header.physical_lineage);
+    output.extend_from_slice(&header.owner_binding);
+    output.push(u8::from(header.finalized_root.is_some()));
     output.extend_from_slice(&[0; 3]);
-    output.extend_from_slice(&manifest.finalized_root.unwrap_or([0; 32]));
+    output.extend_from_slice(&header.finalized_root.unwrap_or([0; 32]));
     for value in [
-        manifest.totals.chunks,
-        manifest.totals.queued,
-        manifest.totals.deleted,
-        manifest.totals.charged_variants,
-        manifest.totals.charged_files,
-        manifest.totals.charged_reserved_bytes,
-        manifest.totals.charged_committed_bytes,
+        header.totals.chunks,
+        header.totals.queued,
+        header.totals.deleted,
+        header.totals.charged_variants,
+        header.totals.charged_files,
+        header.totals.charged_reserved_bytes,
+        header.totals.charged_committed_bytes,
     ] {
         output.extend_from_slice(&value.to_be_bytes());
     }
     output.push(
-        manifest
+        header
             .retry
             .category
             .map_or(0, |category| category.encode()),
     );
     output.extend_from_slice(&[0; 3]);
-    output.extend_from_slice(&manifest.retry.attempts.to_be_bytes());
-    output.extend_from_slice(&manifest.retry.next_retry_turn.to_be_bytes());
-    output.extend_from_slice(&manifest.age.cumulative_age_ms.to_be_bytes());
-    output.push(u8::from(manifest.age.checkpoint.is_some()));
-    output.push(u8::from(manifest.age.continuity_lost));
+    output.extend_from_slice(&header.retry.attempts.to_be_bytes());
+    output.extend_from_slice(&header.retry.next_retry_turn.to_be_bytes());
+    output.extend_from_slice(&header.age.cumulative_age_ms.to_be_bytes());
+    output.push(u8::from(header.age.checkpoint.is_some()));
+    output.push(u8::from(header.age.continuity_lost));
     output.extend_from_slice(&[0; 2]);
-    output.extend_from_slice(&manifest.age.continuity_generation.to_be_bytes());
-    if let Some(checkpoint) = manifest.age.checkpoint {
+    output.extend_from_slice(&header.age.continuity_generation.to_be_bytes());
+    if let Some(checkpoint) = header.age.checkpoint {
         output.extend_from_slice(&checkpoint.clock_id);
         output.extend_from_slice(&checkpoint.tick_ms.to_be_bytes());
     } else {
@@ -458,8 +540,8 @@ fn encode_manifest_record(manifest: &BlobDeletionManifest) -> Result<Vec<u8>, St
     }
     output.extend_from_slice(&lineage_len.to_be_bytes());
     output.extend_from_slice(&import_len.to_be_bytes());
-    output.extend_from_slice(&manifest.lineage_fence);
-    output.extend_from_slice(&manifest.original_import);
+    output.extend_from_slice(&header.lineage_fence);
+    output.extend_from_slice(&header.original_import);
     debug_assert_eq!(output.len(), capacity);
     Ok(output)
 }
@@ -735,7 +817,6 @@ fn decode_chunk_record(bytes: &[u8]) -> Result<BlobDeletionChunk, StoreError> {
     Ok(chunk)
 }
 
-#[cfg(test)]
 fn decode_manifest_record(
     bytes: &[u8],
     encoded_chunks: &[Vec<u8>],
@@ -946,6 +1027,39 @@ pub(crate) fn manifest_admission_mutation_boundary() -> Result<(), StoreError> {
         if TEST_MANIFEST_ADMISSION_FAULT_ORDINAL.get() == Some(ordinal) {
             return Err(invariant(
                 "injected Blob manifest admission mutation failure",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn set_manifest_finalization_fault_ordinal_for_test(ordinal: Option<u64>) {
+    TEST_MANIFEST_FINALIZATION_FAULT_ORDINAL.set(ordinal);
+    TEST_MANIFEST_FINALIZATION_MUTATIONS.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn manifest_finalization_mutations_for_test() -> u64 {
+    TEST_MANIFEST_FINALIZATION_MUTATIONS.get()
+}
+
+pub(crate) fn begin_manifest_finalization_mutations() {
+    #[cfg(test)]
+    TEST_MANIFEST_FINALIZATION_MUTATIONS.set(0);
+}
+
+pub(crate) fn manifest_finalization_mutation_boundary() -> Result<(), StoreError> {
+    #[cfg(test)]
+    {
+        let ordinal = TEST_MANIFEST_FINALIZATION_MUTATIONS
+            .get()
+            .checked_add(1)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        TEST_MANIFEST_FINALIZATION_MUTATIONS.set(ordinal);
+        if TEST_MANIFEST_FINALIZATION_FAULT_ORDINAL.get() == Some(ordinal) {
+            return Err(invariant(
+                "injected Blob manifest finalization mutation failure",
             ));
         }
     }
@@ -1870,15 +1984,14 @@ fn set_metadata_for_test(
     Ok(())
 }
 
-#[cfg(test)]
-fn load_manifest_for_test(
+fn load_manifest_write(
     write: &redb::WriteTransaction,
     variant: BlobVariantId,
 ) -> Result<BlobDeletionManifest, StoreError> {
     let manifests = write.open_table(BLOB_DELETION_MANIFESTS)?;
     let encoded_manifest = manifests
         .get(variant.as_bytes().as_slice())?
-        .ok_or_else(|| invariant("Blob deletion test manifest is missing"))?
+        .ok_or_else(|| invariant("Blob deletion manifest is missing"))?
         .value()
         .to_vec();
     drop(manifests);
@@ -1894,6 +2007,664 @@ fn load_manifest_for_test(
         encoded_chunks.push(value.value().to_vec());
     }
     decode_manifest_record(&encoded_manifest, &encoded_chunks)
+}
+
+fn manifest_header(manifest: &BlobDeletionManifest) -> BlobDeletionManifestHeader {
+    BlobDeletionManifestHeader {
+        variant_id: manifest.variant_id,
+        blob_id: manifest.blob_id,
+        content_group: manifest.content_group,
+        epoch: manifest.epoch,
+        physical_lineage: manifest.physical_lineage,
+        owner_binding: manifest.owner_binding,
+        lineage_fence: manifest.lineage_fence.clone(),
+        original_import: manifest.original_import.clone(),
+        finalized_root: manifest.finalized_root,
+        phase: manifest.phase,
+        retry: manifest.retry,
+        age: manifest.age,
+        totals: manifest.totals,
+    }
+}
+
+fn load_manifest_header_write(
+    write: &redb::WriteTransaction,
+    variant: BlobVariantId,
+) -> Result<BlobDeletionManifestHeader, StoreError> {
+    let manifests = write.open_table(BLOB_DELETION_MANIFESTS)?;
+    let value = manifests
+        .get(variant.as_bytes().as_slice())?
+        .ok_or_else(|| invariant("Blob deletion manifest is missing"))?;
+    decode_manifest_header(value.value())
+}
+
+fn load_chunk_write(
+    write: &redb::WriteTransaction,
+    variant: BlobVariantId,
+    index: u64,
+) -> Result<BlobDeletionChunk, StoreError> {
+    let key = chunk_key(variant, index);
+    let chunks = write.open_table(BLOB_DELETION_CHUNKS)?;
+    let value = chunks
+        .get(key.as_slice())?
+        .ok_or_else(|| invariant("Blob deletion chunk is missing"))?;
+    let chunk = decode_chunk_record(value.value())?;
+    if chunk.index != index {
+        return Err(invariant(
+            "Blob deletion chunk key differs from its identity",
+        ));
+    }
+    Ok(chunk)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum BlobDeletionWorkKind {
+    Chunk(BlobDeletionChunk),
+    ReconcileUnmarkedChunk(BlobDeletionChunk),
+    AdvanceDirectoryPhase,
+    RemoveDirectoryAndFinalize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BlobDeletionWork {
+    pub(crate) manifest: BlobDeletionManifestHeader,
+    pub(crate) kind: BlobDeletionWorkKind,
+    pub(crate) position: Vec<u8>,
+    pub(crate) rows_examined: u64,
+    pub(crate) bytes_examined: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum BlobDeletionSelection {
+    Work(Box<BlobDeletionWork>),
+    Continue {
+        position: Option<Vec<u8>>,
+        rows_examined: u64,
+        bytes_examined: u64,
+    },
+    Complete {
+        rows_examined: u64,
+        bytes_examined: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BlobDeletionPosition {
+    Start,
+    ManifestWork(BlobVariantId),
+    ChunkAfter(BlobVariantId, u64),
+    ChunkResume(BlobVariantId, u64),
+    ManifestResume(BlobVariantId),
+}
+
+fn deletion_position_start(position: Option<&[u8]>) -> Result<BlobDeletionPosition, StoreError> {
+    let Some(position) = position else {
+        return Ok(BlobDeletionPosition::Start);
+    };
+    match position {
+        [1, variant @ ..] if variant.len() == 32 => Ok(BlobDeletionPosition::ManifestWork(
+            BlobVariantId::from_bytes(
+                variant
+                    .try_into()
+                    .map_err(|_| invariant("Blob deletion manifest cursor is malformed"))?,
+            ),
+        )),
+        [2, rest @ ..] if rest.len() == 40 => Ok(BlobDeletionPosition::ChunkAfter(
+            BlobVariantId::from_bytes(
+                rest[..32]
+                    .try_into()
+                    .map_err(|_| invariant("Blob deletion chunk cursor variant is malformed"))?,
+            ),
+            u64::from_be_bytes(
+                rest[32..]
+                    .try_into()
+                    .map_err(|_| invariant("Blob deletion chunk cursor index is malformed"))?,
+            ),
+        )),
+        [3, rest @ ..] if rest.len() == 40 => Ok(BlobDeletionPosition::ChunkResume(
+            BlobVariantId::from_bytes(
+                rest[..32]
+                    .try_into()
+                    .map_err(|_| invariant("Blob deletion resume cursor variant is malformed"))?,
+            ),
+            u64::from_be_bytes(
+                rest[32..]
+                    .try_into()
+                    .map_err(|_| invariant("Blob deletion resume cursor index is malformed"))?,
+            ),
+        )),
+        [4, variant @ ..] if variant.len() == 32 => Ok(BlobDeletionPosition::ManifestResume(
+            BlobVariantId::from_bytes(
+                variant
+                    .try_into()
+                    .map_err(|_| invariant("Blob deletion manifest resume cursor is malformed"))?,
+            ),
+        )),
+        _ => Err(invariant("Blob deletion maintenance cursor is malformed")),
+    }
+}
+
+/// Selects one exact structurally bounded manifest unit. The row/byte budget
+/// applies to discovery evidence; finalization remains one atomic exact-
+/// manifest transaction as required by the deletion protocol.
+pub(crate) fn select_physical_work_read(
+    read: &redb::ReadTransaction,
+    position: Option<&[u8]>,
+    rows_budget: u64,
+    bytes_budget: u64,
+) -> Result<BlobDeletionSelection, StoreError> {
+    reset_discovery_observation();
+    let start = deletion_position_start(position)?;
+    let start_variant = match start {
+        BlobDeletionPosition::Start => None,
+        BlobDeletionPosition::ManifestWork(variant)
+        | BlobDeletionPosition::ChunkAfter(variant, _)
+        | BlobDeletionPosition::ChunkResume(variant, _)
+        | BlobDeletionPosition::ManifestResume(variant) => Some(variant),
+    };
+    let turn = read
+        .open_table(BLOB_DELETION_METADATA)?
+        .get(BLOB_DELETION_MAINTENANCE_TURN)?
+        .ok_or_else(|| invariant("Blob deletion maintenance turn is missing"))?
+        .value();
+    let manifests = read.open_table(BLOB_DELETION_MANIFESTS)?;
+    let mut selected = None;
+    let lower = start_variant
+        .as_ref()
+        .map_or(std::ops::Bound::Unbounded, |variant| match start {
+            BlobDeletionPosition::ManifestResume(_) => {
+                std::ops::Bound::Excluded(variant.as_bytes().as_slice())
+            }
+            _ => std::ops::Bound::Included(variant.as_bytes().as_slice()),
+        });
+    let mut rows_examined = 0u64;
+    let mut bytes_examined = 0u64;
+    let mut last_scanned = None;
+    let mut exhausted_budget = false;
+    let mut manifest_rows = manifests.range::<&[u8]>((lower, std::ops::Bound::Unbounded))?;
+    loop {
+        if rows_examined >= rows_budget
+            || bytes_examined
+                .checked_add(MAX_MANIFEST_ROW_BYTES)
+                .ok_or(StoreError::PayloadByteAccountingOverflow)?
+                > bytes_budget
+        {
+            exhausted_budget = true;
+            break;
+        }
+        let Some(row) = manifest_rows.next() else {
+            break;
+        };
+        let (key, value) = row?;
+        let variant = parse_variant_key(key.value())?;
+        let header = decode_manifest_header(value.value())?;
+        if header.variant_id != variant {
+            return Err(invariant(
+                "Blob deletion manifest key differs from its identity",
+            ));
+        }
+        let row_bytes = encoded_row_bytes(key.value(), value.value())?;
+        observe_discovery_row(row_bytes);
+        rows_examined = rows_examined
+            .checked_add(1)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        bytes_examined = bytes_examined
+            .checked_add(row_bytes)
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        if header.retry.category.is_some() && header.retry.next_retry_turn > turn.saturating_add(1)
+        {
+            last_scanned =
+                Some(super::lifecycle::deletion_manifest_cursor_position(variant).to_vec());
+            continue;
+        }
+        last_scanned = Some(super::lifecycle::deletion_manifest_resume_position(variant).to_vec());
+        selected = Some((variant, header));
+        break;
+    }
+    drop(manifests);
+    let Some((variant, manifest)) = selected else {
+        return if exhausted_budget {
+            Ok(BlobDeletionSelection::Continue {
+                position: last_scanned,
+                rows_examined,
+                bytes_examined,
+            })
+        } else {
+            Ok(BlobDeletionSelection::Complete {
+                rows_examined,
+                bytes_examined,
+            })
+        };
+    };
+    let same_chunk_cursor = match start {
+        BlobDeletionPosition::ChunkAfter(start, index)
+        | BlobDeletionPosition::ChunkResume(start, index)
+            if start == variant =>
+        {
+            Some(index)
+        }
+        _ => None,
+    };
+    let inclusive_chunk_cursor = matches!(
+        start,
+        BlobDeletionPosition::ChunkResume(start, _) if start == variant
+    );
+    let retry_same_chunk = manifest.retry.category.is_some() && same_chunk_cursor.is_some();
+    let kind = match manifest.phase {
+        BlobDeletionPhase::DeletingChunks => {
+            let mut selected_chunk = None;
+            let first = chunk_key(variant, same_chunk_cursor.unwrap_or(0));
+            let last = chunk_key(variant, u64::MAX);
+            let lower = if retry_same_chunk || inclusive_chunk_cursor || same_chunk_cursor.is_none()
+            {
+                std::ops::Bound::Included(first.as_slice())
+            } else {
+                std::ops::Bound::Excluded(first.as_slice())
+            };
+            let mut next_index =
+                if retry_same_chunk || inclusive_chunk_cursor || same_chunk_cursor.is_none() {
+                    same_chunk_cursor.unwrap_or(0)
+                } else {
+                    same_chunk_cursor
+                        .unwrap_or(0)
+                        .checked_add(1)
+                        .ok_or(StoreError::ItemCountAccountingOverflow)?
+                };
+            let chunks = read.open_table(BLOB_DELETION_CHUNKS)?;
+            let mut chunk_rows =
+                chunks.range::<&[u8]>((lower, std::ops::Bound::Included(last.as_slice())))?;
+            loop {
+                if rows_examined >= rows_budget
+                    || bytes_examined
+                        .checked_add(MAX_CHUNK_ROW_BYTES)
+                        .ok_or(StoreError::PayloadByteAccountingOverflow)?
+                        > bytes_budget
+                {
+                    return Ok(BlobDeletionSelection::Continue {
+                        position: Some(
+                            super::lifecycle::deletion_chunk_resume_position(variant, next_index)
+                                .to_vec(),
+                        ),
+                        rows_examined,
+                        bytes_examined,
+                    });
+                }
+                let Some(row) = chunk_rows.next() else {
+                    break;
+                };
+                let (key, value) = row?;
+                let (chunk_variant, index) = parse_chunk_key(key.value())?;
+                if chunk_variant != variant {
+                    return Err(invariant("Blob deletion chunk range escaped its variant"));
+                }
+                let row_bytes = encoded_row_bytes(key.value(), value.value())?;
+                observe_discovery_row(row_bytes);
+                rows_examined = rows_examined
+                    .checked_add(1)
+                    .ok_or(StoreError::ItemCountAccountingOverflow)?;
+                bytes_examined = bytes_examined
+                    .checked_add(row_bytes)
+                    .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+                let chunk = decode_chunk_record(value.value())?;
+                if chunk.index != index {
+                    return Err(invariant(
+                        "Blob deletion chunk key differs from its identity",
+                    ));
+                }
+                last_scanned =
+                    Some(super::lifecycle::deletion_chunk_cursor_position(variant, index).to_vec());
+                next_index = index
+                    .checked_add(1)
+                    .ok_or(StoreError::ItemCountAccountingOverflow)?;
+                let projection = super::depot::deletion_chunk_projection(
+                    &manifest.original_import,
+                    chunk.index,
+                    &chunk.original_chunk,
+                )?;
+                if chunk.state == BlobDeletionChunkState::DeleteQueued {
+                    selected_chunk = Some(BlobDeletionWorkKind::Chunk(chunk));
+                    break;
+                }
+                if projection.record.is_none() {
+                    selected_chunk = Some(BlobDeletionWorkKind::ReconcileUnmarkedChunk(chunk));
+                    break;
+                }
+            }
+            selected_chunk.unwrap_or(BlobDeletionWorkKind::AdvanceDirectoryPhase)
+        }
+        BlobDeletionPhase::DirectoryDeletePending => {
+            BlobDeletionWorkKind::RemoveDirectoryAndFinalize
+        }
+    };
+    let position = match &kind {
+        BlobDeletionWorkKind::Chunk(chunk)
+        | BlobDeletionWorkKind::ReconcileUnmarkedChunk(chunk) => {
+            super::lifecycle::deletion_chunk_cursor_position(variant, chunk.index).to_vec()
+        }
+        BlobDeletionWorkKind::AdvanceDirectoryPhase
+        | BlobDeletionWorkKind::RemoveDirectoryAndFinalize => {
+            super::lifecycle::deletion_manifest_cursor_position(variant).to_vec()
+        }
+    };
+    let physical_bytes = match &kind {
+        BlobDeletionWorkKind::Chunk(chunk) => chunk.charged_committed_bytes,
+        BlobDeletionWorkKind::ReconcileUnmarkedChunk(chunk) => {
+            super::depot::deletion_chunk_projection(
+                &manifest.original_import,
+                chunk.index,
+                &chunk.original_chunk,
+            )?
+            .authorized_file_bytes
+        }
+        BlobDeletionWorkKind::AdvanceDirectoryPhase
+        | BlobDeletionWorkKind::RemoveDirectoryAndFinalize => 0,
+    };
+    if bytes_examined
+        .checked_add(physical_bytes)
+        .ok_or(StoreError::PayloadByteAccountingOverflow)?
+        > bytes_budget
+    {
+        return Ok(BlobDeletionSelection::Continue {
+            position: match &kind {
+                BlobDeletionWorkKind::Chunk(chunk)
+                | BlobDeletionWorkKind::ReconcileUnmarkedChunk(chunk) => Some(
+                    super::lifecycle::deletion_chunk_resume_position(variant, chunk.index).to_vec(),
+                ),
+                BlobDeletionWorkKind::AdvanceDirectoryPhase
+                | BlobDeletionWorkKind::RemoveDirectoryAndFinalize => last_scanned,
+            },
+            rows_examined,
+            bytes_examined,
+        });
+    }
+    Ok(BlobDeletionSelection::Work(Box::new(BlobDeletionWork {
+        manifest,
+        kind,
+        position,
+        rows_examined,
+        bytes_examined,
+    })))
+}
+
+pub(crate) fn revalidate_physical_work_write(
+    write: &redb::WriteTransaction,
+    work: &BlobDeletionWork,
+) -> Result<(), StoreError> {
+    let current = load_manifest_header_write(write, work.manifest.variant_id)?;
+    if current != work.manifest {
+        return Err(invariant("Blob deletion work changed after discovery"));
+    }
+    if let BlobDeletionWorkKind::Chunk(chunk) | BlobDeletionWorkKind::ReconcileUnmarkedChunk(chunk) =
+        &work.kind
+        && load_chunk_write(write, work.manifest.variant_id, chunk.index)? != *chunk
+    {
+        return Err(invariant("Blob deletion chunk changed after discovery"));
+    }
+    Ok(())
+}
+
+fn rewrite_manifest_header(
+    write: &redb::WriteTransaction,
+    manifest: &BlobDeletionManifestHeader,
+) -> Result<(), StoreError> {
+    let encoded = encode_manifest_header(manifest)?;
+    write.open_table(BLOB_DELETION_MANIFESTS)?.insert(
+        manifest.variant_id.as_bytes().as_slice(),
+        encoded.as_slice(),
+    )?;
+    Ok(())
+}
+
+pub(crate) fn mark_chunk_deleted_write(
+    write: &redb::WriteTransaction,
+    work: &BlobDeletionWork,
+) -> Result<(), StoreError> {
+    let BlobDeletionWorkKind::Chunk(selected) = &work.kind else {
+        return Err(invariant("Blob deletion work is not a chunk unit"));
+    };
+    let mut manifest = load_manifest_header_write(write, work.manifest.variant_id)?;
+    if manifest != work.manifest {
+        return Err(invariant(
+            "Blob deletion chunk changed during filesystem work",
+        ));
+    }
+    let mut chunk = load_chunk_write(write, manifest.variant_id, selected.index)?;
+    if chunk != *selected || chunk.state != BlobDeletionChunkState::DeleteQueued {
+        return Err(invariant("Blob deletion chunk is no longer queued"));
+    }
+    chunk.state = BlobDeletionChunkState::DeletedDurable;
+    let encoded_chunk = encode_chunk_record(&chunk)?;
+    manifest.totals.queued = manifest
+        .totals
+        .queued
+        .checked_sub(1)
+        .ok_or_else(|| invariant("Blob deletion queued count underflows"))?;
+    manifest.totals.deleted = manifest
+        .totals
+        .deleted
+        .checked_add(1)
+        .ok_or(StoreError::ItemCountAccountingOverflow)?;
+    manifest.retry = BlobDeletionRetry::default();
+    manifest.retry.validate()?;
+    write.open_table(BLOB_DELETION_CHUNKS)?.insert(
+        chunk_key(manifest.variant_id, selected.index).as_slice(),
+        encoded_chunk.as_slice(),
+    )?;
+    let mut metadata = write.open_table(BLOB_DELETION_METADATA)?;
+    let queued = required_deletion_counter(&metadata, BLOB_DELETION_QUEUED_CHUNKS)?
+        .checked_sub(1)
+        .ok_or_else(|| invariant("Blob deletion queued accounting underflows"))?;
+    let deleted = required_deletion_counter(&metadata, BLOB_DELETION_DELETED_CHUNKS)?
+        .checked_add(1)
+        .ok_or(StoreError::ItemCountAccountingOverflow)?;
+    metadata.insert(BLOB_DELETION_QUEUED_CHUNKS, queued)?;
+    metadata.insert(BLOB_DELETION_DELETED_CHUNKS, deleted)?;
+    drop(metadata);
+    rewrite_manifest_header(write, &manifest)
+}
+
+pub(crate) fn mark_unmarked_reconciled_write(
+    write: &redb::WriteTransaction,
+    work: &BlobDeletionWork,
+) -> Result<(), StoreError> {
+    let BlobDeletionWorkKind::ReconcileUnmarkedChunk(_) = &work.kind else {
+        return Err(invariant(
+            "Blob deletion work is not an unmarked reconciliation unit",
+        ));
+    };
+    let mut manifest = load_manifest_header_write(write, work.manifest.variant_id)?;
+    if manifest != work.manifest {
+        return Err(invariant(
+            "Blob deletion unmarked authority changed during filesystem work",
+        ));
+    }
+    manifest.retry = BlobDeletionRetry::default();
+    let BlobDeletionWorkKind::ReconcileUnmarkedChunk(selected) = &work.kind else {
+        unreachable!();
+    };
+    if load_chunk_write(write, manifest.variant_id, selected.index)? != *selected {
+        return Err(invariant(
+            "Blob deletion unmarked chunk changed during filesystem work",
+        ));
+    }
+    rewrite_manifest_header(write, &manifest)
+}
+
+pub(crate) fn advance_directory_phase_write(
+    write: &redb::WriteTransaction,
+    work: &BlobDeletionWork,
+) -> Result<(), StoreError> {
+    if work.kind != BlobDeletionWorkKind::AdvanceDirectoryPhase {
+        return Err(invariant("Blob deletion work is not a phase transition"));
+    }
+    let mut manifest = load_manifest_header_write(write, work.manifest.variant_id)?;
+    if manifest != work.manifest
+        || manifest.phase != BlobDeletionPhase::DeletingChunks
+        || manifest.totals.queued != 0
+        || manifest.totals.deleted != manifest.totals.chunks
+    {
+        return Err(invariant("Blob deletion directory phase is not ready"));
+    }
+    manifest.phase = BlobDeletionPhase::DirectoryDeletePending;
+    manifest.retry = BlobDeletionRetry::default();
+    rewrite_manifest_header(write, &manifest)
+}
+
+pub(crate) fn record_physical_failure_write(
+    write: &redb::WriteTransaction,
+    work: &BlobDeletionWork,
+    turn: u64,
+    category: BlobDeletionFailureCategory,
+) -> Result<(), StoreError> {
+    let mut manifest = load_manifest_header_write(write, work.manifest.variant_id)?;
+    if manifest != work.manifest {
+        return Err(invariant(
+            "Blob deletion work changed before retry recording",
+        ));
+    }
+    manifest.retry = manifest.retry.after_failure(turn, category)?;
+    rewrite_manifest_header(write, &manifest)
+}
+
+pub(crate) fn finalize_manifest_write(
+    write: &redb::WriteTransaction,
+    work: &BlobDeletionWork,
+) -> Result<(), StoreError> {
+    if work.kind != BlobDeletionWorkKind::RemoveDirectoryAndFinalize {
+        return Err(invariant("Blob deletion work is not a finalization unit"));
+    }
+    let manifest = load_manifest_write(write, work.manifest.variant_id)?;
+    if manifest_header(&manifest) != work.manifest
+        || manifest.phase != BlobDeletionPhase::DirectoryDeletePending
+        || manifest.totals.queued != 0
+        || manifest.totals.deleted != manifest.totals.chunks
+        || manifest
+            .chunks
+            .iter()
+            .any(|chunk| chunk.state != BlobDeletionChunkState::DeletedDurable)
+    {
+        return Err(invariant(
+            "Blob deletion finalization authority is incomplete",
+        ));
+    }
+    if write
+        .open_table(super::BLOB_CHUNKS)?
+        .range::<&[u8]>((
+            std::ops::Bound::Included(chunk_key(manifest.variant_id, 0).as_slice()),
+            std::ops::Bound::Included(chunk_key(manifest.variant_id, u64::MAX).as_slice()),
+        ))?
+        .next()
+        .transpose()?
+        .is_some()
+    {
+        return Err(invariant(
+            "Blob deletion finalization found active chunk authority",
+        ));
+    }
+    begin_manifest_finalization_mutations();
+    super::lifecycle::mark_lineage_bulk_reclamation_observed(
+        write,
+        manifest.variant_id,
+        &manifest.lineage_fence,
+    )?;
+    manifest_finalization_mutation_boundary()?;
+    let removed_import = write
+        .open_table(super::BLOB_IMPORTS)?
+        .remove(manifest.variant_id.as_bytes().as_slice())?
+        .ok_or_else(|| invariant("Blob deletion finalization import is missing"))?
+        .value()
+        .to_vec();
+    manifest_finalization_mutation_boundary()?;
+    if removed_import != manifest.original_import {
+        return Err(invariant("Blob deletion finalization import changed"));
+    }
+    let encoded_manifest = write
+        .open_table(BLOB_DELETION_MANIFESTS)?
+        .remove(manifest.variant_id.as_bytes().as_slice())?
+        .ok_or_else(|| invariant("Blob deletion finalization manifest is missing"))?
+        .value()
+        .to_vec();
+    manifest_finalization_mutation_boundary()?;
+    let manifest_bytes = encoded_row_bytes(manifest.variant_id.as_bytes(), &encoded_manifest)?;
+    let mut chunk_bytes = 0u64;
+    let mut deletion_chunks = write.open_table(BLOB_DELETION_CHUNKS)?;
+    for chunk in &manifest.chunks {
+        let key = chunk_key(manifest.variant_id, chunk.index);
+        let encoded = deletion_chunks
+            .remove(key.as_slice())?
+            .ok_or_else(|| invariant("Blob deletion finalization chunk is missing"))?
+            .value()
+            .to_vec();
+        manifest_finalization_mutation_boundary()?;
+        chunk_bytes = chunk_bytes
+            .checked_add(encoded_row_bytes(&key, &encoded)?)
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    }
+    drop(deletion_chunks);
+
+    let mut depot = write.open_table(super::BLOB_DEPOT_METADATA)?;
+    for (field, delta) in [
+        (super::DEPOT_VARIANT_COUNT, manifest.totals.charged_variants),
+        (
+            super::DEPOT_COMMITTED_CHUNK_COUNT,
+            manifest.totals.charged_files,
+        ),
+        (
+            super::DEPOT_COMMITTED_FILE_BYTES,
+            manifest.totals.charged_committed_bytes,
+        ),
+        (
+            super::DEPOT_RESERVED_FILE_BYTES,
+            manifest.totals.charged_reserved_bytes,
+        ),
+    ] {
+        let next = depot
+            .get(field)?
+            .ok_or_else(|| invariant("Blob depot finalization counter is missing"))?
+            .value()
+            .checked_sub(delta)
+            .ok_or_else(|| invariant("Blob depot finalization counter underflows"))?;
+        depot.insert(field, next)?;
+        manifest_finalization_mutation_boundary()?;
+    }
+    drop(depot);
+
+    let mut metadata = write.open_table(BLOB_DELETION_METADATA)?;
+    for (field, delta) in [
+        (BLOB_DELETION_MANIFEST_ROWS, 1),
+        (BLOB_DELETION_CHUNK_ROWS, manifest.totals.chunks),
+        (BLOB_DELETION_DELETED_CHUNKS, manifest.totals.deleted),
+        (
+            BLOB_DELETION_CHARGED_VARIANTS,
+            manifest.totals.charged_variants,
+        ),
+        (BLOB_DELETION_CHARGED_FILES, manifest.totals.charged_files),
+    ] {
+        let next = required_deletion_counter(&metadata, field)?
+            .checked_sub(delta)
+            .ok_or_else(|| invariant("Blob deletion finalization counter underflows"))?;
+        metadata.insert(field, next)?;
+        manifest_finalization_mutation_boundary()?;
+    }
+    for (field, delta) in [
+        (BLOB_DELETION_MANIFEST_BYTES, manifest_bytes),
+        (BLOB_DELETION_CHUNK_BYTES, chunk_bytes),
+        (
+            BLOB_DELETION_CHARGED_RESERVED_BYTES,
+            manifest.totals.charged_reserved_bytes,
+        ),
+        (
+            BLOB_DELETION_CHARGED_COMMITTED_BYTES,
+            manifest.totals.charged_committed_bytes,
+        ),
+    ] {
+        let next = required_deletion_counter(&metadata, field)?
+            .checked_sub(delta)
+            .ok_or_else(|| invariant("Blob deletion finalization byte counter underflows"))?;
+        metadata.insert(field, next)?;
+        manifest_finalization_mutation_boundary()?;
+    }
+    Ok(())
 }
 
 /// Builds deletion authority from one unreferenced variant for exact-audit
@@ -2099,7 +2870,7 @@ pub(crate) fn corrupt_blob_deletion_for_test(
                 .ok_or(StoreError::PayloadByteAccountingOverflow)?,
         );
     }
-    let mut manifest = load_manifest_for_test(write, variant)?;
+    let mut manifest = load_manifest_write(write, variant)?;
     match corruption {
         "root" => {
             manifest
@@ -2163,7 +2934,7 @@ pub(crate) fn set_blob_deletion_phase_for_test(
     phase: BlobDeletionPhase,
     retry: BlobDeletionRetry,
 ) -> Result<(), StoreError> {
-    let mut manifest = load_manifest_for_test(write, variant)?;
+    let mut manifest = load_manifest_write(write, variant)?;
     let previous_queued = manifest.totals.queued;
     let previous_deleted = manifest.totals.deleted;
     if phase == BlobDeletionPhase::DirectoryDeletePending {
@@ -2213,7 +2984,7 @@ pub(crate) fn set_blob_deletion_age_for_test(
     age: BlobDeletionAge,
     continuity: Option<BlobDeletionContinuity>,
 ) -> Result<(), StoreError> {
-    let mut manifest = load_manifest_for_test(write, variant)?;
+    let mut manifest = load_manifest_write(write, variant)?;
     manifest.age = age;
     manifest.validate()?;
     let encoded = encode_manifest_record(&manifest)?;

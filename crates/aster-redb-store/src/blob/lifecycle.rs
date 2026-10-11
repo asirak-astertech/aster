@@ -152,6 +152,41 @@ const MAINTENANCE_INVALID_PENDING_SOURCE_TAG: u8 = 1;
 const MAINTENANCE_CARRIER_SOURCE_TAG: u8 = 2;
 const MAINTENANCE_DELETION_MANIFEST_TAG: u8 = 1;
 const MAINTENANCE_DELETION_CHUNK_TAG: u8 = 2;
+const MAINTENANCE_DELETION_CHUNK_RESUME_TAG: u8 = 3;
+const MAINTENANCE_DELETION_MANIFEST_RESUME_TAG: u8 = 4;
+
+pub(crate) fn deletion_manifest_cursor_position(variant: super::BlobVariantId) -> [u8; 33] {
+    let mut position = [0u8; 33];
+    position[0] = MAINTENANCE_DELETION_MANIFEST_TAG;
+    position[1..].copy_from_slice(variant.as_bytes());
+    position
+}
+
+pub(crate) fn deletion_chunk_cursor_position(
+    variant: super::BlobVariantId,
+    index: u64,
+) -> [u8; 41] {
+    let mut position = [0u8; 41];
+    position[0] = MAINTENANCE_DELETION_CHUNK_TAG;
+    position[1..33].copy_from_slice(variant.as_bytes());
+    position[33..].copy_from_slice(&index.to_be_bytes());
+    position
+}
+
+pub(crate) fn deletion_chunk_resume_position(
+    variant: super::BlobVariantId,
+    index: u64,
+) -> [u8; 41] {
+    let mut position = deletion_chunk_cursor_position(variant, index);
+    position[0] = MAINTENANCE_DELETION_CHUNK_RESUME_TAG;
+    position
+}
+
+pub(crate) fn deletion_manifest_resume_position(variant: super::BlobVariantId) -> [u8; 33] {
+    let mut position = deletion_manifest_cursor_position(variant);
+    position[0] = MAINTENANCE_DELETION_MANIFEST_RESUME_TAG;
+    position
+}
 
 /// Canonical lifecycle state for a publication row.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1715,8 +1750,16 @@ fn validate_class_position(class: BlobMaintenanceClass, position: &[u8]) -> Resu
             !position.is_empty() && position.len() <= super::MAX_BLOB_OPERATION_KEY_BYTES
         }
         BlobMaintenanceClass::ManifestBackedPhysicalDeletion => {
-            (position.len() == 33 && position[0] == MAINTENANCE_DELETION_MANIFEST_TAG)
-                || (position.len() == 41 && position[0] == MAINTENANCE_DELETION_CHUNK_TAG)
+            (position.len() == 33
+                && matches!(
+                    position[0],
+                    MAINTENANCE_DELETION_MANIFEST_TAG | MAINTENANCE_DELETION_MANIFEST_RESUME_TAG
+                ))
+                || (position.len() == 41
+                    && matches!(
+                        position[0],
+                        MAINTENANCE_DELETION_CHUNK_TAG | MAINTENANCE_DELETION_CHUNK_RESUME_TAG
+                    ))
         }
     };
     if canonical {
@@ -2115,12 +2158,16 @@ mod tests {
     }
 
     #[test]
-    fn blob_manifest_deletion_cursor_accepts_only_canonical_manifest_or_chunk_positions() {
+    fn blob_manifest_deletion_cursor_accepts_canonical_work_and_resume_positions() {
         let class = BlobMaintenanceClass::ManifestBackedPhysicalDeletion;
         let mut manifest = [0x11; 33];
         manifest[0] = MAINTENANCE_DELETION_MANIFEST_TAG;
         let mut chunk = [0x22; 41];
         chunk[0] = MAINTENANCE_DELETION_CHUNK_TAG;
+        let mut manifest_resume = manifest;
+        manifest_resume[0] = MAINTENANCE_DELETION_MANIFEST_RESUME_TAG;
+        let mut chunk_resume = chunk;
+        chunk_resume[0] = MAINTENANCE_DELETION_CHUNK_RESUME_TAG;
 
         assert_eq!(
             decode_class_cursor(class, &encode_class_cursor(Some(&manifest)))
@@ -2132,6 +2179,8 @@ mod tests {
                 .expect("canonical chunk cursor"),
             Some(chunk.to_vec())
         );
+        assert!(validate_class_position(class, &manifest_resume).is_ok());
+        assert!(validate_class_position(class, &chunk_resume).is_ok());
 
         manifest[0] = MAINTENANCE_DELETION_CHUNK_TAG;
         chunk[0] = MAINTENANCE_DELETION_MANIFEST_TAG;

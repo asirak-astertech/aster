@@ -5585,6 +5585,219 @@ fn manifest_admission_progress(
 }
 
 impl Store {
+    fn run_blob_physical_deletion_turn(
+        &self,
+        cursor: lifecycle::BlobMaintenanceCursor,
+        budget: BlobMaintenanceBudget,
+    ) -> Result<BlobMaintenanceProgress, StoreError> {
+        let read = self.database.begin_read()?;
+        if lifecycle::load_maintenance_cursor_read(&read)? != cursor {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob maintenance cursor changed during deletion discovery",
+            )));
+        }
+        let selection = deletion::select_physical_work_read(
+            &read,
+            cursor.position.as_deref(),
+            budget.rows,
+            budget.bytes,
+        )?;
+        drop(read);
+
+        let work = match selection {
+            deletion::BlobDeletionSelection::Work(work) => *work,
+            deletion::BlobDeletionSelection::Continue {
+                position,
+                rows_examined,
+                bytes_examined,
+            } => {
+                let write = self.database.begin_write()?;
+                enforce_live_write(&write)?;
+                lifecycle::require_maintenance_accounting(&write)?;
+                if lifecycle::load_maintenance_cursor(&write)? != cursor {
+                    return Err(blob_error(BlobStoreError::SchemaInvariant(
+                        "Blob maintenance cursor changed after bounded deletion discovery",
+                    )));
+                }
+                deletion::advance_blob_deletion_maintenance_turn(&write)?;
+                lifecycle::advance_maintenance_cursor(&write, cursor.class, position.as_deref())?;
+                write.commit()?;
+                return Ok(BlobMaintenanceProgress {
+                    class: cursor.class,
+                    rows_examined,
+                    files_examined: 0,
+                    bytes_examined,
+                    candidates: Vec::new(),
+                    class_has_more_work: true,
+                    awaiting_later_handler: false,
+                });
+            }
+            deletion::BlobDeletionSelection::Complete {
+                rows_examined,
+                bytes_examined,
+            } => {
+                let write = self.database.begin_write()?;
+                enforce_live_write(&write)?;
+                lifecycle::require_maintenance_accounting(&write)?;
+                if lifecycle::load_maintenance_cursor(&write)? != cursor {
+                    return Err(blob_error(BlobStoreError::SchemaInvariant(
+                        "Blob maintenance cursor changed after deletion discovery",
+                    )));
+                }
+                deletion::advance_blob_deletion_maintenance_turn(&write)?;
+                lifecycle::advance_maintenance_cursor(&write, cursor.class, None)?;
+                write.commit()?;
+                return Ok(BlobMaintenanceProgress {
+                    class: cursor.class,
+                    rows_examined,
+                    files_examined: 0,
+                    bytes_examined,
+                    candidates: Vec::new(),
+                    class_has_more_work: false,
+                    awaiting_later_handler: false,
+                });
+            }
+        };
+
+        let _depot_guard = match self.blob_depot_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Ok(BlobMaintenanceProgress {
+                    class: cursor.class,
+                    rows_examined: work.rows_examined,
+                    files_examined: 0,
+                    bytes_examined: work.bytes_examined,
+                    candidates: Vec::new(),
+                    class_has_more_work: true,
+                    awaiting_later_handler: true,
+                });
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(blob_error(BlobStoreError::DepotIntegrity(
+                    "depot lock is poisoned",
+                )));
+            }
+        };
+        self.require_live()?;
+
+        // Short durable revalidation/turn transaction. It is released before
+        // the descriptor-relative filesystem unit begins.
+        let write = self.database.begin_write()?;
+        enforce_live_write(&write)?;
+        lifecycle::require_maintenance_accounting(&write)?;
+        if lifecycle::load_maintenance_cursor(&write)? != cursor {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob maintenance cursor changed before deletion work",
+            )));
+        }
+        deletion::revalidate_physical_work_write(&write, &work)?;
+        let turn = deletion::advance_blob_deletion_maintenance_turn(&write)?;
+        write.commit()?;
+
+        let filesystem = match &work.kind {
+            deletion::BlobDeletionWorkKind::Chunk(chunk)
+            | deletion::BlobDeletionWorkKind::ReconcileUnmarkedChunk(chunk) => {
+                depot::delete_manifest_chunk(
+                    &self.path,
+                    self.backing_identity,
+                    self.blob_depot_owner_token,
+                    &work.manifest,
+                    chunk,
+                )
+                .map(|bytes| (1u64, bytes))
+            }
+            deletion::BlobDeletionWorkKind::AdvanceDirectoryPhase => Ok((0, 0)),
+            deletion::BlobDeletionWorkKind::RemoveDirectoryAndFinalize => {
+                depot::delete_manifest_variant_directory(
+                    &self.path,
+                    self.backing_identity,
+                    self.blob_depot_owner_token,
+                    work.manifest.variant_id,
+                )
+                .map(|()| (1, 0))
+            }
+        };
+        let (files_examined, physical_bytes) = match filesystem {
+            Ok(progress) => progress,
+            Err(depot::ManifestDeletionError {
+                retry: Some(category),
+                files_examined,
+                bytes_examined: physical_bytes,
+                ..
+            }) => {
+                let write = self.database.begin_write()?;
+                enforce_live_write(&write)?;
+                deletion::record_physical_failure_write(&write, &work, turn, category)?;
+                lifecycle::advance_maintenance_cursor(
+                    &write,
+                    cursor.class,
+                    Some(work.position.as_slice()),
+                )?;
+                write.commit()?;
+                return Ok(BlobMaintenanceProgress {
+                    class: cursor.class,
+                    rows_examined: work.rows_examined,
+                    files_examined,
+                    bytes_examined: work
+                        .bytes_examined
+                        .checked_add(physical_bytes)
+                        .ok_or(StoreError::PayloadByteAccountingOverflow)?,
+                    candidates: Vec::new(),
+                    class_has_more_work: true,
+                    awaiting_later_handler: false,
+                });
+            }
+            Err(error) => return Err(*error.error),
+        };
+
+        let write = self.database.begin_write()?;
+        enforce_live_write(&write)?;
+        match work.kind {
+            deletion::BlobDeletionWorkKind::Chunk(_) => {
+                deletion::mark_chunk_deleted_write(&write, &work)?;
+                lifecycle::advance_maintenance_cursor(
+                    &write,
+                    cursor.class,
+                    Some(work.position.as_slice()),
+                )?;
+            }
+            deletion::BlobDeletionWorkKind::ReconcileUnmarkedChunk(_) => {
+                deletion::mark_unmarked_reconciled_write(&write, &work)?;
+                lifecycle::advance_maintenance_cursor(
+                    &write,
+                    cursor.class,
+                    Some(work.position.as_slice()),
+                )?;
+            }
+            deletion::BlobDeletionWorkKind::AdvanceDirectoryPhase => {
+                deletion::advance_directory_phase_write(&write, &work)?;
+                lifecycle::advance_maintenance_cursor(&write, cursor.class, None)?;
+            }
+            deletion::BlobDeletionWorkKind::RemoveDirectoryAndFinalize => {
+                deletion::finalize_manifest_write(&write, &work)?;
+                lifecycle::advance_maintenance_cursor(
+                    &write,
+                    cursor.class,
+                    Some(work.position.as_slice()),
+                )?;
+                deletion::manifest_finalization_mutation_boundary()?;
+            }
+        }
+        write.commit()?;
+        Ok(BlobMaintenanceProgress {
+            class: cursor.class,
+            rows_examined: work.rows_examined,
+            files_examined,
+            bytes_examined: work
+                .bytes_examined
+                .checked_add(physical_bytes)
+                .ok_or(StoreError::PayloadByteAccountingOverflow)?,
+            candidates: Vec::new(),
+            class_has_more_work: true,
+            awaiting_later_handler: false,
+        })
+    }
+
     /// Runs one internal, durable, independently bounded maintenance selection
     /// turn.
     #[doc(hidden)]
@@ -5605,6 +5818,9 @@ impl Store {
                 | BlobMaintenanceClass::UnreferencedCompletedVariants
         ) {
             return self.run_blob_manifest_admission_turn(discovered_cursor, budget);
+        }
+        if discovered_cursor.class == BlobMaintenanceClass::ManifestBackedPhysicalDeletion {
+            return self.run_blob_physical_deletion_turn(discovered_cursor, budget);
         }
         let write = self.database.begin_write()?;
         enforce_live_write(&write)?;
@@ -5642,12 +5858,9 @@ impl Store {
                 cursor.position.as_deref(),
                 budget,
             )?,
-            BlobMaintenanceClass::ManifestBackedPhysicalDeletion => MaintenancePage {
-                rows: Vec::new(),
-                rows_examined: 0,
-                bytes: 0,
-                complete: true,
-            },
+            BlobMaintenanceClass::ManifestBackedPhysicalDeletion => {
+                unreachable!("physical deletion uses descriptor-relative bounded work")
+            }
         };
 
         let mut candidates = Vec::new();
@@ -11788,10 +12001,19 @@ mod tests {
     }
 
     fn assert_depot_integrity(error: &StoreError) {
-        assert!(matches!(
-            error,
-            StoreError::Blob(BlobStoreError::DepotIntegrity(_))
-        ));
+        assert!(
+            matches!(error, StoreError::Blob(BlobStoreError::DepotIntegrity(_))),
+            "expected depot integrity error, got {error:?}"
+        );
+    }
+
+    fn assert_depot_integrity_reason(error: &StoreError, expected: &'static str) {
+        match error {
+            StoreError::Blob(BlobStoreError::DepotIntegrity(actual)) => {
+                assert_eq!(*actual, expected)
+            }
+            _ => panic!("expected depot integrity reason {expected:?}, got {error:?}"),
+        }
     }
 
     fn assert_blob_schema_invariant(error: &StoreError) {
@@ -13418,7 +13640,17 @@ mod tests {
                         (FILE, std::fs::read(path).expect("depot snapshot bytes")),
                     );
                 } else if file_type.is_symlink() {
-                    output.insert(relative, (SYMLINK, Vec::new()));
+                    output.insert(
+                        relative,
+                        (
+                            SYMLINK,
+                            std::fs::read_link(&path)
+                                .expect("depot snapshot symlink target")
+                                .as_os_str()
+                                .as_encoded_bytes()
+                                .to_vec(),
+                        ),
+                    );
                 } else {
                     output.insert(relative, (OTHER, Vec::new()));
                 }
@@ -17993,6 +18225,1392 @@ mod tests {
             .expect("exact deletion manifest")
     }
 
+    fn deletion_manifest_header_for_test(
+        manifest: &deletion::BlobDeletionManifest,
+    ) -> deletion::BlobDeletionManifestHeader {
+        deletion::BlobDeletionManifestHeader {
+            variant_id: manifest.variant_id,
+            blob_id: manifest.blob_id,
+            content_group: manifest.content_group,
+            epoch: manifest.epoch,
+            physical_lineage: manifest.physical_lineage,
+            owner_binding: manifest.owner_binding,
+            lineage_fence: manifest.lineage_fence.clone(),
+            original_import: manifest.original_import.clone(),
+            finalized_root: manifest.finalized_root,
+            phase: manifest.phase,
+            retry: manifest.retry,
+            age: manifest.age,
+            totals: manifest.totals,
+        }
+    }
+
+    fn run_physical_deletion_turn(store: &Store) -> BlobMaintenanceProgress {
+        set_maintenance_next_class(
+            store,
+            lifecycle::BlobMaintenanceClass::ManifestBackedPhysicalDeletion,
+        );
+        store
+            .run_blob_maintenance_turn(maintenance_budget(64))
+            .expect("physical deletion maintenance turn")
+    }
+
+    #[test]
+    fn blob_manifest_deletion_uses_only_validated_descriptor_relative_components() {
+        // Break caught: physical GC must derive the exact chunk name from the
+        // typed manifest identity instead of accepting a caller path.
+        let root = BlobTestRoot::new("manifest-delete-typed-components");
+        let services = blob_services(0x31);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("typed deletion store");
+        let plaintext = b"typed descriptor relative deletion".to_vec();
+        let variant = install_unreferenced_variant(&store, &services, &plaintext, 1, true);
+        let sibling = install_unreferenced_variant(
+            &store,
+            &services,
+            b"sibling variant must survive typed deletion",
+            2,
+            true,
+        );
+        let sibling_chunk = root.chunk_path(sibling, 0);
+        let sibling_before = std::fs::read(&sibling_chunk).expect("read sibling chunk");
+        let outside = root.path.join("outside-typed-delete-sentinel");
+        std::fs::write(&outside, b"outside sentinel").expect("write outside sentinel");
+        store
+            .test_admit_blob_deletion_manifest(variant)
+            .expect("admit exact manifest");
+        let chunk = root.chunk_path(variant, 0);
+        assert!(chunk.exists());
+        depot::reset_manifest_deletion_read_observation_for_test();
+
+        let progress = run_physical_deletion_turn(&store);
+        let (_, discovery_bytes) = deletion::take_discovery_observation_for_test();
+        let actual_file_bytes = depot::take_manifest_deletion_read_observation_for_test();
+
+        assert_eq!(
+            progress.class,
+            lifecycle::BlobMaintenanceClass::ManifestBackedPhysicalDeletion
+        );
+        assert_eq!(progress.files_examined, 1);
+        assert_eq!(progress.bytes_examined, discovery_bytes + actual_file_bytes);
+        assert!(!chunk.exists());
+        assert_eq!(
+            std::fs::read(&sibling_chunk).expect("read surviving sibling"),
+            sibling_before
+        );
+        assert_eq!(
+            std::fs::read(&outside).expect("read surviving outside sentinel"),
+            b"outside sentinel"
+        );
+        let manifest = deletion_manifest_for_test(&store, variant);
+        assert_eq!(
+            manifest.chunks[0].state,
+            deletion::BlobDeletionChunkState::DeletedDurable
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blob_manifest_deletion_never_follows_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        // Break caught: replacing an authorized chunk with a symlink must fail
+        // closed and preserve the symlink target.
+        let root = BlobTestRoot::new("manifest-delete-no-follow");
+        let services = blob_services(0x32);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("no-follow deletion store");
+        let variant =
+            install_unreferenced_variant(&store, &services, b"no-follow deletion", 1, true);
+        store
+            .test_admit_blob_deletion_manifest(variant)
+            .expect("admit exact manifest");
+        let chunk = root.chunk_path(variant, 0);
+        let outside = root.path.join("outside-must-survive");
+        std::fs::write(&outside, b"outside").expect("write outside target");
+        std::fs::remove_file(&chunk).expect("remove exact chunk");
+        symlink(&outside, &chunk).expect("replace chunk with symlink");
+
+        assert_depot_integrity(
+            &run_physical_deletion_turn_result(&store)
+                .expect_err("symlink replacement must fail closed"),
+        );
+        assert_eq!(
+            std::fs::read(&outside).expect("read outside target"),
+            b"outside"
+        );
+        assert!(
+            std::fs::symlink_metadata(&chunk)
+                .expect("symlink remains")
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blob_manifest_deletion_rejects_unexpected_or_replaced_artifacts() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        for (offset, mode) in [
+            "unexpected",
+            "public-mode",
+            "hard-link",
+            "chunk-directory",
+            "directory-symlink",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let root = BlobTestRoot::new(&format!("manifest-delete-reject-{mode}"));
+            let services = blob_services(0x40 + u8::try_from(offset).expect("fixture seed"));
+            let store = Store::open_for_mission(&root.database, services.authority)
+                .expect("replacement rejection store");
+            let variant = install_unreferenced_variant(
+                &store,
+                &services,
+                format!("replacement mode {mode}").as_bytes(),
+                1,
+                true,
+            );
+            store
+                .test_admit_blob_deletion_manifest(variant)
+                .expect("admit replacement fixture");
+            let directory = root.depot().join(test_hex32(variant.as_bytes()));
+            let chunk = root.chunk_path(variant, 0);
+            let outside = root.path.join(format!("outside-{mode}"));
+            match mode {
+                "unexpected" => {
+                    std::fs::write(directory.join("999.chunk"), b"unexpected")
+                        .expect("write unexpected artifact");
+                }
+                "public-mode" => {
+                    std::fs::set_permissions(&chunk, std::fs::Permissions::from_mode(0o644))
+                        .expect("make chunk public");
+                }
+                "hard-link" => {
+                    std::fs::hard_link(&chunk, &outside).expect("hard-link exact chunk");
+                }
+                "chunk-directory" => {
+                    std::fs::remove_file(&chunk)
+                        .expect("remove chunk before directory replacement");
+                    std::fs::create_dir(&chunk).expect("replace chunk with directory");
+                }
+                "directory-symlink" => {
+                    std::fs::create_dir(&outside).expect("outside directory");
+                    std::fs::write(outside.join("sentinel"), b"outside").expect("outside sentinel");
+                    std::fs::remove_file(&chunk).expect("remove chunk before directory swap");
+                    std::fs::remove_dir(&directory).expect("remove variant directory");
+                    symlink(&outside, &directory).expect("replace variant with symlink");
+                }
+                _ => unreachable!(),
+            }
+
+            if mode == "unexpected" {
+                run_physical_deletion_turn_result(&store)
+                    .expect("exact target deletion must not enumerate its sibling");
+                assert!(!chunk.exists());
+                assert!(directory.join("999.chunk").exists());
+                run_physical_deletion_turn_result(&store)
+                    .expect("advance exact manifest to directory phase");
+            }
+            assert_depot_integrity(
+                &run_physical_deletion_turn_result(&store)
+                    .expect_err("replacement must fail closed"),
+            );
+            match mode {
+                "unexpected" => assert!(directory.join("999.chunk").exists()),
+                "public-mode" => assert_eq!(
+                    std::fs::metadata(&chunk)
+                        .expect("public chunk metadata")
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o644
+                ),
+                "hard-link" => {
+                    assert!(chunk.exists());
+                    assert!(outside.exists());
+                }
+                "chunk-directory" => assert!(chunk.is_dir()),
+                "directory-symlink" => {
+                    assert!(
+                        std::fs::symlink_metadata(&directory)
+                            .expect("directory symlink remains")
+                            .file_type()
+                            .is_symlink()
+                    );
+                    assert_eq!(
+                        std::fs::read(outside.join("sentinel")).expect("outside sentinel remains"),
+                        b"outside"
+                    );
+                    assert_eq!(
+                        std::fs::read_link(&directory).expect("directory symlink target"),
+                        outside
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    fn run_physical_deletion_turn_result(
+        store: &Store,
+    ) -> Result<BlobMaintenanceProgress, StoreError> {
+        set_maintenance_next_class(
+            store,
+            lifecycle::BlobMaintenanceClass::ManifestBackedPhysicalDeletion,
+        );
+        store.run_blob_maintenance_turn(maintenance_budget(64))
+    }
+
+    #[test]
+    fn blob_partial_multichunk_deletion_retains_all_charge_import_and_directory_state() {
+        // Break caught: one durable chunk unlink must not release any quota or
+        // remove the import/variant directory while later chunks remain.
+        let root = BlobTestRoot::new("partial-multichunk-delete");
+        let services = blob_services(0x33);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("partial deletion store");
+        let plaintext = vec![0x33; SELECTED_BLOB_CHUNK_SIZE as usize + 7];
+        let variant = install_unreferenced_variant(&store, &services, &plaintext, 1, true);
+        let before = store.blob_stats().expect("stats before deletion");
+        store
+            .test_admit_blob_deletion_manifest(variant)
+            .expect("admit exact manifest");
+
+        run_physical_deletion_turn(&store);
+
+        assert_eq!(store.blob_stats().expect("stats after one chunk"), before);
+        assert!(root.depot().join(test_hex32(variant.as_bytes())).is_dir());
+        let read = store.database.begin_read().expect("read retained import");
+        assert!(
+            read.open_table(BLOB_IMPORTS)
+                .expect("imports")
+                .get(variant.as_bytes().as_slice())
+                .expect("import lookup")
+                .is_some()
+        );
+        let manifest = deletion_manifest_for_test(&store, variant);
+        assert_eq!(manifest.totals.deleted, 1);
+        assert_eq!(manifest.totals.queued, 1);
+        assert!(!root.chunk_path(variant, 0).exists());
+        assert!(root.chunk_path(variant, 1).exists());
+        assert_eq!(
+            manifest.chunks[0].state,
+            deletion::BlobDeletionChunkState::DeletedDurable
+        );
+        assert_eq!(
+            manifest.chunks[1].state,
+            deletion::BlobDeletionChunkState::DeleteQueued
+        );
+        drop(read);
+        drop(store);
+
+        let reopened = Store::open_for_mission(&root.database, services.authority)
+            .expect("reopen partial deletion store");
+        assert_eq!(
+            reopened.blob_stats().expect("reopened partial stats"),
+            before
+        );
+        let manifest = deletion_manifest_for_test(&reopened, variant);
+        assert_eq!(manifest.totals.deleted, 1);
+        assert_eq!(manifest.totals.queued, 1);
+        assert!(!root.chunk_path(variant, 0).exists());
+        assert!(root.chunk_path(variant, 1).exists());
+        assert!(root.depot().join(test_hex32(variant.as_bytes())).is_dir());
+    }
+
+    #[test]
+    fn blob_physical_deletion_progresses_when_manifest_exceeds_production_row_budget() {
+        let root = BlobTestRoot::new("physical-delete-over-row-budget");
+        let services = blob_services(0x4e);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("over-budget deletion store");
+        let plaintext = vec![0x4e; 16 * SELECTED_BLOB_CHUNK_SIZE as usize + 17];
+        let variant = install_unreferenced_variant(&store, &services, &plaintext, 1, true);
+        store
+            .test_admit_blob_deletion_manifest(variant)
+            .expect("admit over-budget manifest");
+
+        for deleted in 1..=17 {
+            set_maintenance_next_class(
+                &store,
+                lifecycle::BlobMaintenanceClass::ManifestBackedPhysicalDeletion,
+            );
+            let progress = store
+                .run_blob_maintenance_turn(maintenance_budget(16))
+                .expect("bounded physical deletion turn");
+            assert!(progress.rows_examined <= 16);
+            assert_eq!(
+                deletion_manifest_for_test(&store, variant).totals.deleted,
+                deleted
+            );
+        }
+        run_physical_deletion_turn(&store);
+        run_physical_deletion_turn(&store);
+        let read = store
+            .database
+            .begin_read()
+            .expect("read over-budget completion");
+        assert!(
+            !deletion::variant_has_deletion_manifest_read(&read, variant)
+                .expect("over-budget manifest completion")
+        );
+    }
+
+    #[test]
+    fn blob_physical_deletion_one_row_turn_is_honestly_bounded_and_advances_turn() {
+        fn deletion_turn(store: &Store) -> u64 {
+            store
+                .database
+                .begin_read()
+                .expect("one-row deletion turn read")
+                .open_table(deletion::BLOB_DELETION_METADATA)
+                .expect("one-row deletion metadata")
+                .get(deletion::BLOB_DELETION_MAINTENANCE_TURN)
+                .expect("one-row deletion turn lookup")
+                .expect("one-row deletion turn")
+                .value()
+        }
+
+        let root = BlobTestRoot::new("physical-delete-one-row-budget");
+        let services = blob_services(0x4f);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("one-row deletion store");
+        let plaintext = vec![0x4f; SELECTED_BLOB_CHUNK_SIZE as usize + 17];
+        let variant = install_unreferenced_variant(&store, &services, &plaintext, 1, true);
+        store
+            .test_admit_blob_deletion_manifest(variant)
+            .expect("admit one-row manifest");
+
+        let initial_turn = deletion_turn(&store);
+        set_maintenance_next_class(
+            &store,
+            lifecycle::BlobMaintenanceClass::ManifestBackedPhysicalDeletion,
+        );
+        let byte_bounded = store
+            .run_blob_maintenance_turn(
+                BlobMaintenanceBudget::new(64, 1, 1).expect("one-byte maintenance budget"),
+            )
+            .expect("one-byte physical deletion turn");
+        assert_eq!(deletion::take_discovery_observation_for_test(), (0, 0));
+        assert_eq!(byte_bounded.rows_examined, 0);
+        assert_eq!(byte_bounded.bytes_examined, 0);
+        assert_eq!(deletion_turn(&store), initial_turn + 1);
+
+        for page in 1..=3 {
+            set_maintenance_next_class(
+                &store,
+                lifecycle::BlobMaintenanceClass::ManifestBackedPhysicalDeletion,
+            );
+            let progress = store
+                .run_blob_maintenance_turn(maintenance_budget(1))
+                .expect("one-row physical deletion turn");
+            let observed = deletion::take_discovery_observation_for_test();
+            assert_eq!(observed, (progress.rows_examined, progress.bytes_examined));
+            assert_eq!(progress.rows_examined, 1);
+            assert!(progress.bytes_examined <= maintenance_budget(1).bytes());
+            assert_eq!(deletion_turn(&store), initial_turn + 1 + page);
+            assert_eq!(
+                deletion_manifest_for_test(&store, variant).totals.deleted,
+                0
+            );
+        }
+
+        for _ in 0..4 {
+            run_physical_deletion_turn(&store);
+        }
+        let read = store
+            .database
+            .begin_read()
+            .expect("read one-row completion");
+        assert!(
+            !deletion::variant_has_deletion_manifest_read(&read, variant)
+                .expect("one-row manifest completion")
+        );
+    }
+
+    #[test]
+    fn blob_restart_reconciles_unlink_before_phase_advance() {
+        let root = BlobTestRoot::new("restart-after-manifest-unlink");
+        let services = blob_services(0x35);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("restart deletion store");
+        let variant = install_unreferenced_variant(
+            &store,
+            &services,
+            b"restart after unlink before durable phase",
+            1,
+            true,
+        );
+        store
+            .test_admit_blob_deletion_manifest(variant)
+            .expect("admit restart fixture");
+        depot::inject_test_fault(&root.path, depot::DepotFaultPoint::ManifestChunkUnlinked);
+
+        let interrupted = run_physical_deletion_turn_result(&store)
+            .expect("ordinary injected I/O is recorded as retry state");
+        assert!(interrupted.class_has_more_work);
+        assert!(!root.chunk_path(variant, 0).exists());
+        let queued = deletion_manifest_for_test(&store, variant);
+        assert_eq!(queued.totals.queued, 1);
+        assert_eq!(queued.totals.deleted, 0);
+        assert_eq!(
+            queued.retry.category,
+            Some(deletion::BlobDeletionFailureCategory::ChunkDirectorySync)
+        );
+        drop(store);
+
+        let reopened = Store::open_for_mission(&root.database, services.authority)
+            .expect("writable reopen validates absent queued file");
+        assert_eq!(deletion_manifest_for_test(&reopened, variant), queued);
+        assert!(!root.chunk_path(variant, 0).exists());
+        run_physical_deletion_turn(&reopened);
+        let durable = deletion_manifest_for_test(&reopened, variant);
+        assert_eq!(durable.totals.queued, 0);
+        assert_eq!(durable.totals.deleted, 1);
+        assert_eq!(durable.retry, deletion::BlobDeletionRetry::default());
+    }
+
+    #[test]
+    fn blob_physical_deletion_crash_matrix_preserves_exact_authority() {
+        for (offset, point, file_survives, category) in [
+            (
+                0,
+                depot::DepotFaultPoint::ManifestVariantDirectoryAccess,
+                true,
+                deletion::BlobDeletionFailureCategory::VariantDirectoryAccess,
+            ),
+            (
+                1,
+                depot::DepotFaultPoint::ManifestChunkBeforeUnlink,
+                true,
+                deletion::BlobDeletionFailureCategory::ChunkUnlink,
+            ),
+            (
+                2,
+                depot::DepotFaultPoint::ManifestChunkUnlinked,
+                false,
+                deletion::BlobDeletionFailureCategory::ChunkDirectorySync,
+            ),
+            (
+                3,
+                depot::DepotFaultPoint::ManifestChunkDirectorySynced,
+                false,
+                deletion::BlobDeletionFailureCategory::ChunkDirectorySync,
+            ),
+        ] {
+            let root = BlobTestRoot::new(&format!("chunk-delete-crash-{offset}"));
+            let services = blob_services(0x45 + offset);
+            let store = Store::open_for_mission(&root.database, services.authority)
+                .expect("chunk crash fixture store");
+            let variant = install_unreferenced_variant(
+                &store,
+                &services,
+                format!("chunk crash boundary {offset}").as_bytes(),
+                1,
+                true,
+            );
+            store
+                .test_admit_blob_deletion_manifest(variant)
+                .expect("admit chunk crash fixture");
+            let target_bytes = std::fs::metadata(root.chunk_path(variant, 0))
+                .expect("chunk crash target metadata")
+                .len();
+            depot::reset_manifest_deletion_read_observation_for_test();
+            depot::inject_test_fault(&root.path, point);
+
+            let progress = run_physical_deletion_turn_result(&store)
+                .expect("retryable chunk boundary is sanitized and durable");
+            let (_, discovery_bytes) = deletion::take_discovery_observation_for_test();
+            let actual_file_bytes = depot::take_manifest_deletion_read_observation_for_test();
+            let expected_physical_bytes =
+                if category == deletion::BlobDeletionFailureCategory::VariantDirectoryAccess {
+                    0
+                } else {
+                    target_bytes
+                };
+            assert_eq!(actual_file_bytes, expected_physical_bytes);
+            assert_eq!(
+                progress.bytes_examined,
+                discovery_bytes + actual_file_bytes,
+                "retry stage {category:?} lost physically verified bytes"
+            );
+
+            let chunk = root.chunk_path(variant, 0);
+            assert_eq!(chunk.exists(), file_survives);
+            let retry = deletion_manifest_for_test(&store, variant);
+            assert_eq!(retry.totals.queued, 1);
+            assert_eq!(retry.totals.deleted, 0);
+            assert_eq!(retry.retry.attempts, 1);
+            assert_eq!(retry.retry.category, Some(category));
+            drop(store);
+
+            let reopened = Store::open_for_mission(&root.database, services.authority)
+                .expect("reopen chunk crash fixture");
+            assert_eq!(deletion_manifest_for_test(&reopened, variant), retry);
+            run_physical_deletion_turn(&reopened);
+            let durable = deletion_manifest_for_test(&reopened, variant);
+            assert_eq!(durable.totals.queued, 0);
+            assert_eq!(durable.totals.deleted, 1);
+            assert!(!chunk.exists());
+        }
+
+        for (offset, point, directory_survives, category) in [
+            (
+                0,
+                depot::DepotFaultPoint::ManifestVariantDirectoryAccess,
+                true,
+                deletion::BlobDeletionFailureCategory::VariantDirectoryAccess,
+            ),
+            (
+                1,
+                depot::DepotFaultPoint::ManifestVariantDirectoryRemove,
+                true,
+                deletion::BlobDeletionFailureCategory::VariantDirectoryRemove,
+            ),
+            (
+                2,
+                depot::DepotFaultPoint::ManifestVariantRemoved,
+                false,
+                deletion::BlobDeletionFailureCategory::DepotDirectorySync,
+            ),
+            (
+                3,
+                depot::DepotFaultPoint::ManifestParentSynced,
+                false,
+                deletion::BlobDeletionFailureCategory::DepotDirectorySync,
+            ),
+        ] {
+            let root = BlobTestRoot::new(&format!("directory-delete-crash-{offset}"));
+            let services = blob_services(0x48 + offset);
+            let store = Store::open_for_mission(&root.database, services.authority)
+                .expect("directory crash fixture store");
+            let variant = install_unreferenced_variant(
+                &store,
+                &services,
+                format!("directory crash boundary {offset}").as_bytes(),
+                1,
+                true,
+            );
+            store
+                .test_admit_blob_deletion_manifest(variant)
+                .expect("admit directory crash fixture");
+            run_physical_deletion_turn(&store);
+            run_physical_deletion_turn(&store);
+            let directory = root.depot().join(test_hex32(variant.as_bytes()));
+            depot::inject_test_fault(&root.path, point);
+
+            run_physical_deletion_turn_result(&store)
+                .expect("retryable directory boundary is sanitized and durable");
+
+            assert_eq!(directory.exists(), directory_survives);
+            let retry = deletion_manifest_for_test(&store, variant);
+            assert_eq!(
+                retry.phase,
+                deletion::BlobDeletionPhase::DirectoryDeletePending
+            );
+            assert_eq!(retry.retry.attempts, 1);
+            assert_eq!(retry.retry.category, Some(category));
+            drop(store);
+
+            let reopened = Store::open_for_mission(&root.database, services.authority)
+                .expect("reopen directory crash fixture");
+            assert_eq!(deletion_manifest_for_test(&reopened, variant), retry);
+            run_physical_deletion_turn(&reopened);
+            let read = reopened
+                .database
+                .begin_read()
+                .expect("read finalized retry");
+            assert!(
+                !deletion::variant_has_deletion_manifest_read(&read, variant)
+                    .expect("finalized retry manifest lookup")
+            );
+        }
+    }
+
+    #[test]
+    fn blob_physical_deletion_reports_exact_early_and_partial_read_bytes() {
+        // Break caught: a retryable read failure must report bytes actually
+        // consumed, not the target's conservatively budgeted canonical size.
+        for (offset, fail_after_bytes) in [0u64, 17].into_iter().enumerate() {
+            let root = BlobTestRoot::new(&format!("chunk-delete-read-fault-{offset}"));
+            let services = blob_services(0x55 + u8::try_from(offset).expect("fixture seed"));
+            let store = Store::open_for_mission(&root.database, services.authority)
+                .expect("read-fault fixture store");
+            let variant = install_unreferenced_variant(
+                &store,
+                &services,
+                format!("chunk read fault after {fail_after_bytes}").as_bytes(),
+                1,
+                true,
+            );
+            store
+                .test_admit_blob_deletion_manifest(variant)
+                .expect("admit read-fault manifest");
+            let chunk = root.chunk_path(variant, 0);
+            let depot_before = depot_file_snapshot(&root.depot());
+            depot::reset_manifest_deletion_read_observation_for_test();
+            depot::inject_manifest_deletion_read_fault_for_test(&chunk, fail_after_bytes);
+
+            let budget = maintenance_budget(64);
+            let progress = run_physical_deletion_turn_result(&store)
+                .expect("retryable exact read failure is sanitized");
+            let (_, discovery_bytes) = deletion::take_discovery_observation_for_test();
+            let actual_file_bytes = depot::take_manifest_deletion_read_observation_for_test();
+
+            assert_eq!(actual_file_bytes, fail_after_bytes);
+            assert_eq!(progress.bytes_examined, discovery_bytes + actual_file_bytes);
+            assert!(progress.bytes_examined <= budget.bytes());
+            assert_eq!(depot_file_snapshot(&root.depot()), depot_before);
+            let manifest = deletion_manifest_for_test(&store, variant);
+            assert_eq!(manifest.retry.attempts, 1);
+            assert_eq!(
+                manifest.retry.category,
+                Some(deletion::BlobDeletionFailureCategory::ChunkUnlink)
+            );
+        }
+    }
+
+    #[test]
+    fn blob_physical_deletion_retry_backoff_is_durable_and_resets_after_success() {
+        fn deletion_turn(store: &Store) -> u64 {
+            store
+                .database
+                .begin_read()
+                .expect("retry turn read")
+                .open_table(deletion::BLOB_DELETION_METADATA)
+                .expect("retry metadata")
+                .get(deletion::BLOB_DELETION_MAINTENANCE_TURN)
+                .expect("retry turn lookup")
+                .expect("retry turn")
+                .value()
+        }
+
+        let root = BlobTestRoot::new("physical-delete-durable-backoff");
+        let services = blob_services(0x4d);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("retry backoff store");
+        let variant = install_unreferenced_variant(
+            &store,
+            &services,
+            b"durable physical deletion backoff",
+            1,
+            true,
+        );
+        store
+            .test_admit_blob_deletion_manifest(variant)
+            .expect("admit retry backoff manifest");
+
+        for expected_attempts in 1..=2 {
+            depot::inject_test_fault(
+                &root.path,
+                depot::DepotFaultPoint::ManifestChunkBeforeUnlink,
+            );
+            run_physical_deletion_turn_result(&store).expect("record retryable unlink failure");
+            let manifest = deletion_manifest_for_test(&store, variant);
+            assert_eq!(manifest.retry.attempts, expected_attempts);
+            assert_eq!(
+                manifest.retry.next_retry_turn - deletion_turn(&store),
+                1u64 << (expected_attempts - 1)
+            );
+        }
+
+        depot::inject_test_fault(
+            &root.path,
+            depot::DepotFaultPoint::ManifestChunkBeforeUnlink,
+        );
+        set_maintenance_next_class(
+            &store,
+            lifecycle::BlobMaintenanceClass::ManifestBackedPhysicalDeletion,
+        );
+        let skipped = store
+            .run_blob_maintenance_turn(maintenance_budget(1))
+            .expect("bounded page skips ineligible retry turn");
+        assert_eq!(skipped.rows_examined, 1);
+        assert_eq!(
+            deletion_manifest_for_test(&store, variant).retry.attempts,
+            2
+        );
+        drop(store);
+
+        let reopened = Store::open_for_mission(&root.database, services.authority)
+            .expect("reopen durable retry backoff");
+        run_physical_deletion_turn_result(&reopened).expect("third eligible retry failure");
+        let third = deletion_manifest_for_test(&reopened, variant);
+        assert_eq!(third.retry.attempts, 3);
+        assert_eq!(third.retry.next_retry_turn - deletion_turn(&reopened), 4);
+        for _ in 0..3 {
+            run_physical_deletion_turn_result(&reopened).expect("skip exponential retry turn");
+            assert_eq!(deletion_manifest_for_test(&reopened, variant), third);
+        }
+        run_physical_deletion_turn_result(&reopened).expect("eligible retry succeeds");
+        let succeeded = deletion_manifest_for_test(&reopened, variant);
+        assert_eq!(succeeded.retry, deletion::BlobDeletionRetry::default());
+        assert_eq!(succeeded.totals.deleted, 1);
+    }
+
+    #[test]
+    fn blob_deletion_manifest_read_only_inspection_never_mutates() {
+        let root = BlobTestRoot::new("read-only-manifest-inspection");
+        let services = blob_services(0x36);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("read-only inspection fixture store");
+        let variant = install_unreferenced_variant(
+            &store,
+            &services,
+            b"read-only inspection of interrupted deletion",
+            1,
+            true,
+        );
+        store
+            .test_admit_blob_deletion_manifest(variant)
+            .expect("admit read-only fixture");
+        depot::inject_test_fault(&root.path, depot::DepotFaultPoint::ManifestChunkUnlinked);
+        run_physical_deletion_turn_result(&store).expect("record interrupted unlink");
+        let before_manifest = deletion_manifest_for_test(&store, variant);
+        drop(store);
+        let depot_before = depot_file_snapshot(&root.depot());
+        let database_before = file_digest(&root.database);
+
+        Store::inspect_existing(&root.database).expect("read-only deletion inspection");
+
+        assert_eq!(file_digest(&root.database), database_before);
+        assert_eq!(depot_file_snapshot(&root.depot()), depot_before);
+        assert!(!root.chunk_path(variant, 0).exists());
+        let reopened = Store::open_for_mission(&root.database, services.authority)
+            .expect("reopen after read-only inspection");
+        assert_eq!(
+            deletion_manifest_for_test(&reopened, variant),
+            before_manifest
+        );
+    }
+
+    #[test]
+    fn blob_deletion_manifest_writable_open_does_not_advance_deletion_state() {
+        let root = BlobTestRoot::new("writable-open-manifest-inspection");
+        let services = blob_services(0x37);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("writable inspection fixture store");
+        let variant = install_unreferenced_variant(
+            &store,
+            &services,
+            b"writable open validates without advancing",
+            1,
+            true,
+        );
+        store
+            .test_admit_blob_deletion_manifest(variant)
+            .expect("admit writable-open fixture");
+        let before = deletion_manifest_for_test(&store, variant);
+        let chunk = root.chunk_path(variant, 0);
+        let chunk_before = std::fs::read(&chunk).expect("read queued chunk before writable open");
+        let logical_before = blob_complete_logical_digest(&store);
+        let depot_before = depot_file_snapshot(&root.depot());
+        drop(store);
+
+        let reopened = Store::open_for_mission(&root.database, services.authority)
+            .expect("writable open validates manifest");
+
+        assert_eq!(deletion_manifest_for_test(&reopened, variant), before);
+        assert_eq!(blob_complete_logical_digest(&reopened), logical_before);
+        assert_eq!(depot_file_snapshot(&root.depot()), depot_before);
+        assert_eq!(
+            std::fs::read(&chunk).expect("read protected queued chunk after writable open"),
+            chunk_before
+        );
+    }
+
+    #[test]
+    fn blob_directory_delete_pending_resyncs_parent_when_directory_is_already_absent() {
+        let root = BlobTestRoot::new("directory-delete-absent-resync");
+        let services = blob_services(0x38);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("directory resync store");
+        let variant = install_unreferenced_variant(
+            &store,
+            &services,
+            b"directory delete pending absent retry",
+            1,
+            true,
+        );
+        store
+            .test_admit_blob_deletion_manifest(variant)
+            .expect("admit directory fixture");
+        run_physical_deletion_turn(&store);
+        run_physical_deletion_turn(&store);
+        assert_eq!(
+            deletion_manifest_for_test(&store, variant).phase,
+            deletion::BlobDeletionPhase::DirectoryDeletePending
+        );
+        let directory = root.depot().join(test_hex32(variant.as_bytes()));
+        std::fs::remove_dir(&directory).expect("simulate prior durable directory removal");
+        depot::inject_test_fault(&root.path, depot::DepotFaultPoint::ManifestParentSynced);
+
+        run_physical_deletion_turn_result(&store)
+            .expect("post-sync fault is durably represented as retry");
+
+        let manifest = deletion_manifest_for_test(&store, variant);
+        assert_eq!(
+            manifest.phase,
+            deletion::BlobDeletionPhase::DirectoryDeletePending
+        );
+        assert_eq!(
+            manifest.retry.category,
+            Some(deletion::BlobDeletionFailureCategory::DepotDirectorySync)
+        );
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn blob_missing_file_without_exact_manifest_remains_corruption() {
+        let root = BlobTestRoot::new("missing-without-delete-manifest");
+        let services = blob_services(0x39);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("missing-file fixture store");
+        let variant = install_unreferenced_variant(
+            &store,
+            &services,
+            b"missing committed file without deletion authority",
+            1,
+            true,
+        );
+        let chunk = root.chunk_path(variant, 0);
+        std::fs::remove_file(&chunk).expect("remove committed file without manifest");
+        drop(store);
+
+        match Store::open_for_mission(&root.database, services.authority) {
+            Ok(_) => panic!("missing committed file remains corruption"),
+            Err(error) => assert_depot_integrity(&error),
+        }
+        assert!(!chunk.exists());
+    }
+
+    #[test]
+    fn blob_expected_only_staging_chunk_completes_without_inventing_a_file() {
+        let root = BlobTestRoot::new("expected-only-physical-delete");
+        let source_root = BlobTestRoot::new("expected-only-physical-delete-source");
+        let mut services = blob_services(0x3a);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("expected-only target store");
+        let source = Store::open_for_mission(&source_root.database, services.authority)
+            .expect("expected-only source store");
+        let plaintext = b"expected-only deletion has metadata but no file".to_vec();
+        let prepared = prepared_blob(&plaintext);
+        let proof = prepare_blob_proof(&source, &mut services, &prepared, &plaintext, 1);
+        let plan = proof
+            .blob
+            .transfer_plan(&proof.manifest_bytes)
+            .expect("expected-only transfer plan");
+        let variant = BlobVariantId::for_content(
+            plan.manifest().id(),
+            plan.manifest().content_group(),
+            plan.manifest().content_epoch(),
+        );
+        {
+            let mut depot = store.blob_depot().expect("expected-only target depot");
+            CoreBlobStore::begin_blob_with_lineage(
+                &mut depot,
+                plan.manifest(),
+                plan.physical_lineage(),
+            )
+            .expect("begin expected-only import");
+            CoreBlobStore::put_expected_chunk_record(
+                &mut depot,
+                plan.manifest().id(),
+                0,
+                plan.chunk_records()[0],
+            )
+            .expect("stage expected-only record");
+        }
+        let chunk = root.chunk_path(variant, 0);
+        assert!(!chunk.exists());
+        let write = store
+            .database
+            .begin_write()
+            .expect("expected-only manifest transaction");
+        deletion::move_variant_to_manifest_for_test(&write, variant)
+            .expect("admit expected-only manifest");
+        write.commit().expect("commit expected-only manifest");
+
+        let progress = run_physical_deletion_turn(&store);
+        let (_, discovery_bytes) = deletion::take_discovery_observation_for_test();
+
+        assert!(!chunk.exists());
+        assert_eq!(
+            progress.bytes_examined, discovery_bytes,
+            "an absent crash-idempotent target performs no physical file reads"
+        );
+        let manifest = deletion_manifest_for_test(&store, variant);
+        assert_eq!(manifest.totals.deleted, 1);
+        assert_eq!(manifest.totals.queued, 0);
+        assert_eq!(manifest.totals.charged_files, 0);
+        assert_eq!(
+            manifest.chunks[0].state,
+            deletion::BlobDeletionChunkState::DeletedDurable
+        );
+        run_physical_deletion_turn(&store);
+        run_physical_deletion_turn(&store);
+        let read = store
+            .database
+            .begin_read()
+            .expect("read expected-only completion");
+        assert!(
+            !deletion::variant_has_deletion_manifest_read(&read, variant)
+                .expect("expected-only manifest completion")
+        );
+    }
+
+    #[test]
+    fn blob_known_unmarked_final_file_uses_existing_bounded_cleanup_authority() {
+        for (offset, mode) in ["expected", "digest"].into_iter().enumerate() {
+            let root = BlobTestRoot::new(&format!("known-unmarked-final-cleanup-{mode}"));
+            let services = blob_services(0x3b + u8::try_from(offset).expect("fixture seed"));
+            let plaintext = format!("known exact {mode} crash-gap final file").into_bytes();
+            let prepared = prepared_blob(&plaintext);
+            let store = Store::open_for_mission(&root.database, services.authority)
+                .expect("known-unmarked fixture store");
+            depot::inject_test_fault(&root.path, depot::DepotFaultPoint::Renamed);
+            finish_variant(&store, &services.publisher, &prepared, &plaintext, 1)
+                .expect_err("interrupt after exact final rename");
+            let variant = {
+                let read = store
+                    .database
+                    .begin_read()
+                    .expect("known-unmarked import read");
+                let imports = read
+                    .open_table(BLOB_IMPORTS)
+                    .expect("known-unmarked imports");
+                let (key, _) = imports
+                    .iter()
+                    .expect("iterate known-unmarked imports")
+                    .next()
+                    .expect("known-unmarked import")
+                    .expect("known-unmarked import row");
+                BlobVariantId::from_bytes(key.value().try_into().expect("known variant key"))
+            };
+            if mode == "digest" {
+                let write = store.database.begin_write().expect("digest-only downgrade");
+                depot::downgrade_expected_chunk_to_digest_for_test(&write, variant, 0)
+                    .expect("retain only digest cleanup authority");
+                write.commit().expect("commit digest-only downgrade");
+            }
+            let chunk = root.chunk_path(variant, 0);
+            assert!(chunk.exists());
+            let write = store
+                .database
+                .begin_write()
+                .expect("known-unmarked manifest");
+            deletion::move_variant_to_manifest_for_test(&write, variant)
+                .expect("admit known-unmarked manifest");
+            write.commit().expect("commit known-unmarked manifest");
+
+            for _ in 0..3 {
+                run_physical_deletion_turn(&store);
+            }
+
+            assert!(!chunk.exists());
+            let read = store.database.begin_read().expect("reclaimed import read");
+            assert!(
+                read.open_table(BLOB_IMPORTS)
+                    .expect("reclaimed imports")
+                    .get(variant.as_bytes().as_slice())
+                    .expect("reclaimed import lookup")
+                    .is_none()
+            );
+            assert!(
+                !deletion::variant_has_deletion_manifest_read(&read, variant)
+                    .expect("reclaimed manifest lookup")
+            );
+        }
+    }
+
+    #[test]
+    fn blob_unknown_or_wrong_unmarked_chunk_is_preserved_and_rejected() {
+        for (offset, mode) in ["unknown-index", "wrong-content"].into_iter().enumerate() {
+            let root = BlobTestRoot::new(&format!("unmarked-reject-{mode}"));
+            let services = blob_services(0x3c + u8::try_from(offset).expect("fixture seed"));
+            let plaintext = format!("unmarked cleanup rejection {mode}").into_bytes();
+            let prepared = prepared_blob(&plaintext);
+            let store = Store::open_for_mission(&root.database, services.authority)
+                .expect("unmarked rejection fixture store");
+            depot::inject_test_fault(&root.path, depot::DepotFaultPoint::Renamed);
+            finish_variant(&store, &services.publisher, &prepared, &plaintext, 1)
+                .expect_err("leave exact unmarked crash-gap file");
+            let variant = {
+                let read = store.database.begin_read().expect("unmarked import read");
+                let imports = read.open_table(BLOB_IMPORTS).expect("unmarked imports");
+                let (key, _) = imports
+                    .iter()
+                    .expect("iterate unmarked imports")
+                    .next()
+                    .expect("unmarked import")
+                    .expect("unmarked import row");
+                BlobVariantId::from_bytes(key.value().try_into().expect("variant key"))
+            };
+            let exact = root.chunk_path(variant, 0);
+            let artifact = if mode == "unknown-index" {
+                let unknown = root
+                    .depot()
+                    .join(test_hex32(variant.as_bytes()))
+                    .join("999.chunk");
+                std::fs::rename(&exact, &unknown).expect("make out-of-range artifact");
+                unknown
+            } else {
+                std::fs::write(&exact, b"wrong exact-index content")
+                    .expect("replace exact crash-gap bytes");
+                exact
+            };
+            let before = std::fs::read(&artifact).expect("read hostile artifact");
+            drop(store);
+            let database_before = file_digest(&root.database);
+            let depot_before = depot_file_snapshot(&root.depot());
+
+            assert_depot_integrity(
+                &Store::inspect_existing(&root.database)
+                    .expect_err("read-only inspection must reject hostile unmarked artifact"),
+            );
+            assert_eq!(file_digest(&root.database), database_before);
+            assert_eq!(depot_file_snapshot(&root.depot()), depot_before);
+            match Store::open_for_mission(&root.database, services.authority) {
+                Ok(_) => panic!("unknown/wrong unmarked artifact must fail closed"),
+                Err(error) => assert_depot_integrity(&error),
+            }
+            assert_eq!(
+                std::fs::read(&artifact).expect("hostile artifact remains"),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn blob_manifest_worker_preserves_wrong_authorized_unmarked_file_in_same_process() {
+        fn deletion_turn(store: &Store) -> u64 {
+            store
+                .database
+                .begin_read()
+                .expect("wrong unmarked turn read")
+                .open_table(deletion::BLOB_DELETION_METADATA)
+                .expect("wrong unmarked deletion metadata")
+                .get(deletion::BLOB_DELETION_MAINTENANCE_TURN)
+                .expect("wrong unmarked turn lookup")
+                .expect("wrong unmarked turn")
+                .value()
+        }
+
+        for (offset, mode) in ["expected", "digest"].into_iter().enumerate() {
+            let root = BlobTestRoot::new(&format!("manifest-wrong-unmarked-{mode}"));
+            let services = blob_services(0x51 + u8::try_from(offset).expect("fixture seed"));
+            let plaintext = format!("manifest wrong {mode} unmarked file").into_bytes();
+            let prepared = prepared_blob(&plaintext);
+            let store = Store::open_for_mission(&root.database, services.authority)
+                .expect("wrong unmarked fixture store");
+            depot::inject_test_fault(&root.path, depot::DepotFaultPoint::Renamed);
+            finish_variant(&store, &services.publisher, &prepared, &plaintext, 1)
+                .expect_err("leave exact unmarked crash-gap file");
+            let variant = {
+                let read = store
+                    .database
+                    .begin_read()
+                    .expect("wrong unmarked import read");
+                let imports = read
+                    .open_table(BLOB_IMPORTS)
+                    .expect("wrong unmarked imports");
+                let (key, _) = imports
+                    .iter()
+                    .expect("iterate wrong unmarked imports")
+                    .next()
+                    .expect("wrong unmarked import")
+                    .expect("wrong unmarked import row");
+                BlobVariantId::from_bytes(key.value().try_into().expect("variant key"))
+            };
+            let chunk = root.chunk_path(variant, 0);
+            let canonical_file = std::fs::read(&chunk).expect("read canonical crash-gap file");
+            let expected_reason = if mode == "expected" {
+                let write = store
+                    .database
+                    .begin_write()
+                    .expect("expected-authority mismatch");
+                depot::corrupt_expected_chunk_ciphertext_digest_for_test(&write, variant, 0)
+                    .expect("mismatch expected authority without changing canonical file");
+                write.commit().expect("commit expected-authority mismatch");
+                "manifest-authorized Blob chunk differs from its expected record"
+            } else {
+                let write = store.database.begin_write().expect("digest-only mismatch");
+                depot::downgrade_expected_chunk_to_digest_for_test(&write, variant, 0)
+                    .expect("retain digest-only cleanup authority");
+                depot::corrupt_digest_only_plaintext_digest_for_test(&write, variant, 0)
+                    .expect("mismatch digest authority without changing canonical file");
+                write.commit().expect("commit digest-authority mismatch");
+                "manifest-authorized Blob chunk plaintext digest differs from digest authority"
+            };
+            let write = store
+                .database
+                .begin_write()
+                .expect("wrong unmarked manifest");
+            deletion::move_variant_to_manifest_for_test(&write, variant)
+                .expect("admit wrong unmarked manifest");
+            write.commit().expect("commit wrong unmarked manifest");
+            let manifest_before = deletion_manifest_for_test(&store, variant);
+            let depot_before = depot_file_snapshot(&root.depot());
+            let read = store
+                .database
+                .begin_read()
+                .expect("wrong unmarked read-only audit");
+            let stats = inspect_blob_tables_read(&read)
+                .expect("wrong unmarked logical audit")
+                .stats;
+            assert_depot_integrity_reason(
+                &depot::audit_depot_read(
+                    &read,
+                    &store.path,
+                    store.backing_identity,
+                    store.blob_depot_owner_token,
+                    stats,
+                )
+                .expect_err("read-only depot audit rejects wrong manifest artifact"),
+                expected_reason,
+            );
+            drop(read);
+            assert_eq!(depot_file_snapshot(&root.depot()), depot_before);
+            assert_eq!(
+                std::fs::read(&chunk).expect("canonical hostile file remains after audit"),
+                canonical_file
+            );
+
+            depot::reset_manifest_deletion_read_observation_for_test();
+            let typed_failure = {
+                let _guard = store
+                    .blob_depot_lock
+                    .lock()
+                    .expect("hostile direct deletion depot lock");
+                depot::delete_manifest_chunk(
+                    &store.path,
+                    store.backing_identity,
+                    store.blob_depot_owner_token,
+                    &deletion_manifest_header_for_test(&manifest_before),
+                    &manifest_before.chunks[0],
+                )
+                .expect_err("authority mismatch must retain typed read progress")
+            };
+            let actual_file_bytes = depot::take_manifest_deletion_read_observation_for_test();
+            assert_eq!(
+                actual_file_bytes,
+                u64::try_from(canonical_file.len()).expect("canonical file length")
+            );
+            assert_eq!(typed_failure.bytes_examined, actual_file_bytes);
+            assert_eq!(typed_failure.files_examined, 1);
+            assert_eq!(typed_failure.retry, None);
+            assert_depot_integrity_reason(&typed_failure.error, expected_reason);
+
+            set_maintenance_next_class(
+                &store,
+                lifecycle::BlobMaintenanceClass::ManifestBackedPhysicalDeletion,
+            );
+            let logical_before = blob_complete_logical_digest_without_deletion_turn(&store);
+            let turn_before = deletion_turn(&store);
+            assert_depot_integrity_reason(
+                &store
+                    .run_blob_maintenance_turn(maintenance_budget(64))
+                    .expect_err("worker rejects wrong manifest artifact"),
+                expected_reason,
+            );
+
+            assert_eq!(deletion_turn(&store), turn_before + 1);
+            assert_eq!(
+                blob_complete_logical_digest_without_deletion_turn(&store),
+                logical_before
+            );
+            assert_eq!(deletion_manifest_for_test(&store, variant), manifest_before);
+            assert_eq!(depot_file_snapshot(&root.depot()), depot_before);
+            assert_eq!(
+                std::fs::read(&chunk).expect("canonical hostile file remains after worker"),
+                canonical_file
+            );
+            drop(store);
+
+            assert_depot_integrity_reason(
+                &Store::inspect_existing(&root.database)
+                    .expect_err("read-only inspect rejects wrong manifest artifact"),
+                expected_reason,
+            );
+            assert_eq!(depot_file_snapshot(&root.depot()), depot_before);
+        }
+    }
+
+    #[test]
+    fn blob_final_metadata_transaction_releases_charge_and_bulk_state_together() {
+        // Break caught: finalization must remove manifest/import/deletion rows
+        // and release every depot counter in one transaction.
+        let root = BlobTestRoot::new("final-delete-transaction");
+        let services = blob_services(0x34);
+        let store = Store::open_for_mission(&root.database, services.authority)
+            .expect("final deletion store");
+        let variant = install_unreferenced_variant(&store, &services, b"final deletion", 1, true);
+        let control = install_unreferenced_variant(
+            &store,
+            &services,
+            b"unrelated live control variant",
+            2,
+            true,
+        );
+        let control_chunk = root.chunk_path(control, 0);
+        store
+            .test_admit_blob_deletion_manifest(variant)
+            .expect("admit exact manifest");
+
+        for _ in 0..4 {
+            run_physical_deletion_turn(&store);
+        }
+
+        let stats = store.blob_stats().expect("fully reclaimed stats");
+        assert_eq!(stats.variants, 1);
+        assert_eq!(stats.finalized_variants, 1);
+        assert_eq!(stats.committed_chunks, 1);
+        assert!(stats.committed_file_bytes > 0);
+        assert!(stats.reserved_file_bytes > 0);
+        assert_eq!(stats.lineage_fences, 2);
+        assert!(control_chunk.exists());
+        let read = store.database.begin_read().expect("read final state");
+        assert!(
+            read.open_table(BLOB_IMPORTS)
+                .expect("imports")
+                .get(variant.as_bytes().as_slice())
+                .expect("import lookup")
+                .is_none()
+        );
+        assert!(
+            !deletion::variant_has_deletion_manifest_read(&read, variant).expect("manifest lookup")
+        );
+        assert!(
+            read.open_table(lifecycle::BLOB_LINEAGE_FENCES)
+                .expect("lineage fences")
+                .get(variant.as_bytes().as_slice())
+                .expect("lineage lookup")
+                .is_some()
+        );
+        assert!(
+            read.open_table(BLOB_IMPORTS)
+                .expect("control imports")
+                .get(control.as_bytes().as_slice())
+                .expect("control import lookup")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn blob_final_metadata_transaction_faults_roll_back_combined_snapshot() {
+        let control_root = BlobTestRoot::new("finalization-fault-count");
+        let control_services = blob_services(0x3d);
+        let control_store =
+            Store::open_for_mission(&control_root.database, control_services.authority)
+                .expect("finalization count store");
+        let target = install_unreferenced_variant(
+            &control_store,
+            &control_services,
+            b"finalization mutation count target",
+            1,
+            true,
+        );
+        install_unreferenced_variant(
+            &control_store,
+            &control_services,
+            b"finalization mutation count live control",
+            2,
+            true,
+        );
+        control_store
+            .test_admit_blob_deletion_manifest(target)
+            .expect("admit finalization count target");
+        run_physical_deletion_turn(&control_store);
+        run_physical_deletion_turn(&control_store);
+        std::fs::remove_dir(control_root.depot().join(test_hex32(target.as_bytes())))
+            .expect("remove count target directory before final transaction");
+        deletion::set_manifest_finalization_fault_ordinal_for_test(None);
+        run_physical_deletion_turn(&control_store);
+        let mutation_count = deletion::manifest_finalization_mutations_for_test();
+        assert!(
+            mutation_count > 8,
+            "finalization must cover every table group"
+        );
+
+        for ordinal in 1..=mutation_count {
+            let root = BlobTestRoot::new(&format!("finalization-fault-{ordinal}"));
+            let services = blob_services(0x3d);
+            let store = Store::open_for_mission(&root.database, services.authority)
+                .expect("finalization fault store");
+            let target = install_unreferenced_variant(
+                &store,
+                &services,
+                b"finalization mutation count target",
+                1,
+                true,
+            );
+            let live = install_unreferenced_variant(
+                &store,
+                &services,
+                b"finalization mutation count live control",
+                2,
+                true,
+            );
+            store
+                .test_admit_blob_deletion_manifest(target)
+                .expect("admit finalization fault target");
+            run_physical_deletion_turn(&store);
+            run_physical_deletion_turn(&store);
+            let target_directory = root.depot().join(test_hex32(target.as_bytes()));
+            std::fs::remove_dir(&target_directory)
+                .expect("remove fault target directory before final transaction");
+            let live_chunk = root.chunk_path(live, 0);
+            let live_before = std::fs::read(&live_chunk).expect("read live control chunk");
+            set_maintenance_next_class(
+                &store,
+                lifecycle::BlobMaintenanceClass::ManifestBackedPhysicalDeletion,
+            );
+            let before = blob_finalization_transaction_digest(&store);
+            deletion::set_manifest_finalization_fault_ordinal_for_test(Some(ordinal));
+
+            let result = run_physical_deletion_turn_result(&store);
+            deletion::set_manifest_finalization_fault_ordinal_for_test(None);
+
+            assert!(matches!(
+                result,
+                Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+                    "injected Blob manifest finalization mutation failure"
+                )))
+            ));
+            assert_eq!(
+                blob_finalization_transaction_digest(&store),
+                before,
+                "finalization ordinal {ordinal} changed the logical before-image"
+            );
+            assert!(!target_directory.exists());
+            assert_eq!(
+                std::fs::read(&live_chunk).expect("read retained live control"),
+                live_before
+            );
+            deletion_manifest_for_test(&store, target);
+
+            run_physical_deletion_turn(&store);
+            let read = store
+                .database
+                .begin_read()
+                .expect("read finalization retry");
+            assert!(
+                !deletion::variant_has_deletion_manifest_read(&read, target)
+                    .expect("target manifest lookup")
+            );
+            assert!(
+                read.open_table(BLOB_IMPORTS)
+                    .expect("retry control imports")
+                    .get(live.as_bytes().as_slice())
+                    .expect("retry control import lookup")
+                    .is_some()
+            );
+        }
+    }
+
     fn blob_maintenance_cursor_rows(store: &Store) -> Vec<(u8, Vec<u8>)> {
         let read = store
             .database
@@ -18048,6 +19666,7 @@ mod tests {
             ),
             (b"active-imports".as_slice(), BLOB_IMPORTS),
             (b"active-chunks".as_slice(), BLOB_CHUNKS),
+            (b"lineage-fences".as_slice(), lifecycle::BLOB_LINEAGE_FENCES),
         ] {
             for row in read
                 .open_table(definition)
@@ -18094,6 +19713,275 @@ mod tests {
             .expect("maintenance cursor rows")
         {
             let (key, value) = row.expect("maintenance cursor row");
+            field(
+                &mut digest,
+                b"maintenance-cursors",
+                &[key.value()],
+                value.value(),
+            );
+        }
+        digest.finalize().into()
+    }
+
+    fn blob_complete_logical_digest(store: &Store) -> [u8; 32] {
+        blob_complete_logical_digest_with_options(store, false)
+    }
+
+    fn blob_complete_logical_digest_without_deletion_turn(store: &Store) -> [u8; 32] {
+        blob_complete_logical_digest_with_options(store, true)
+    }
+
+    fn blob_complete_logical_digest_with_options(
+        store: &Store,
+        exclude_deletion_turn: bool,
+    ) -> [u8; 32] {
+        fn field(digest: &mut Sha256, label: &[u8], key: &[u8], value: &[u8]) {
+            for bytes in [label, key, value] {
+                digest.update(
+                    u64::try_from(bytes.len())
+                        .expect("complete Blob digest field length")
+                        .to_be_bytes(),
+                );
+                digest.update(bytes);
+            }
+        }
+
+        let read = store
+            .database
+            .begin_read()
+            .expect("complete Blob logical digest read");
+        let mut digest = Sha256::new();
+        field(
+            &mut digest,
+            b"base-blob-state",
+            b"",
+            &blob_database_digest_read(&read),
+        );
+        for key in [
+            BLOB_SUBSCRIPTION_COUNT,
+            BLOB_PENDING_DELIVERY_COUNT,
+            BLOB_ACKNOWLEDGEMENT_COUNT,
+            BLOB_DELIVERY_CURSOR_COUNT,
+            BLOB_SELECTOR_GENERATION,
+        ] {
+            let value = read
+                .open_table(METADATA)
+                .expect("complete Blob global metadata")
+                .get(key)
+                .expect("complete Blob global metadata read")
+                .map_or(u64::MAX, |value| value.value());
+            field(
+                &mut digest,
+                b"subscription-metadata",
+                key.as_bytes(),
+                &value.to_be_bytes(),
+            );
+        }
+        for (label, definition) in [(b"acceptance-order".as_slice(), BLOB_ACCEPTANCE_ORDER)] {
+            for row in read
+                .open_table(definition)
+                .expect("complete Blob u64/bytes table")
+                .iter()
+                .expect("complete Blob u64/bytes rows")
+            {
+                let (key, value) = row.expect("complete Blob u64/bytes row");
+                field(
+                    &mut digest,
+                    label,
+                    &key.value().to_be_bytes(),
+                    value.value(),
+                );
+            }
+        }
+        for (label, definition) in [
+            (b"subscriptions".as_slice(), BLOB_SUBSCRIPTIONS),
+            (
+                b"subscription-pending".as_slice(),
+                BLOB_SUBSCRIPTION_PENDING,
+            ),
+            (
+                b"delivery-acknowledgements".as_slice(),
+                BLOB_DELIVERY_ACKNOWLEDGEMENTS,
+            ),
+            (b"delivery-cursors".as_slice(), BLOB_DELIVERY_CURSORS),
+            (
+                b"variant-references".as_slice(),
+                lifecycle::BLOB_VARIANT_REFERENCES,
+            ),
+            (b"lineage-fences".as_slice(), lifecycle::BLOB_LINEAGE_FENCES),
+            (b"replay-fences".as_slice(), lifecycle::BLOB_REPLAY_FENCES),
+            (
+                b"deletion-manifests".as_slice(),
+                deletion::BLOB_DELETION_MANIFESTS,
+            ),
+            (
+                b"deletion-chunks".as_slice(),
+                deletion::BLOB_DELETION_CHUNKS,
+            ),
+        ] {
+            for row in read
+                .open_table(definition)
+                .expect("complete Blob bytes table")
+                .iter()
+                .expect("complete Blob bytes rows")
+            {
+                let (key, value) = row.expect("complete Blob bytes row");
+                field(&mut digest, label, key.value(), value.value());
+            }
+        }
+        for (label, definition) in [
+            (
+                b"lifecycle-metadata".as_slice(),
+                lifecycle::BLOB_LIFECYCLE_METADATA,
+            ),
+            (
+                b"deletion-metadata".as_slice(),
+                deletion::BLOB_DELETION_METADATA,
+            ),
+        ] {
+            for row in read
+                .open_table(definition)
+                .expect("complete Blob metadata table")
+                .iter()
+                .expect("complete Blob metadata rows")
+            {
+                let (key, value) = row.expect("complete Blob metadata row");
+                if exclude_deletion_turn
+                    && label == b"deletion-metadata"
+                    && key.value() == deletion::BLOB_DELETION_MAINTENANCE_TURN
+                {
+                    continue;
+                }
+                field(
+                    &mut digest,
+                    label,
+                    key.value().as_bytes(),
+                    &value.value().to_be_bytes(),
+                );
+            }
+        }
+        for row in read
+            .open_table(lifecycle::BLOB_MAINTENANCE_CURSORS)
+            .expect("complete Blob maintenance cursors")
+            .iter()
+            .expect("complete Blob maintenance cursor rows")
+        {
+            let (key, value) = row.expect("complete Blob maintenance cursor row");
+            field(
+                &mut digest,
+                b"maintenance-cursors",
+                &[key.value()],
+                value.value(),
+            );
+        }
+        for row in read
+            .open_table(deletion::BLOB_DELETION_CONTINUITY)
+            .expect("complete Blob deletion continuity")
+            .iter()
+            .expect("complete Blob deletion continuity rows")
+        {
+            let (key, value) = row.expect("complete Blob deletion continuity row");
+            field(
+                &mut digest,
+                b"deletion-continuity",
+                &[key.value()],
+                value.value(),
+            );
+        }
+        digest.finalize().into()
+    }
+
+    fn blob_finalization_transaction_digest(store: &Store) -> [u8; 32] {
+        fn field(digest: &mut Sha256, label: &[u8], key: &[u8], value: &[u8]) {
+            for bytes in [label, key, value] {
+                digest.update(
+                    u64::try_from(bytes.len())
+                        .expect("finalization digest field length")
+                        .to_be_bytes(),
+                );
+                digest.update(bytes);
+            }
+        }
+
+        let read = store
+            .database
+            .begin_read()
+            .expect("finalization digest read");
+        let mut digest = Sha256::new();
+        for row in read
+            .open_table(deletion::BLOB_DELETION_METADATA)
+            .expect("finalization deletion metadata")
+            .iter()
+            .expect("finalization deletion metadata rows")
+        {
+            let (key, value) = row.expect("finalization deletion metadata row");
+            if key.value() != deletion::BLOB_DELETION_MAINTENANCE_TURN {
+                field(
+                    &mut digest,
+                    b"deletion-metadata",
+                    key.value().as_bytes(),
+                    &value.value().to_be_bytes(),
+                );
+            }
+        }
+        for (label, definition) in [
+            (
+                b"deletion-manifests".as_slice(),
+                deletion::BLOB_DELETION_MANIFESTS,
+            ),
+            (
+                b"deletion-chunks".as_slice(),
+                deletion::BLOB_DELETION_CHUNKS,
+            ),
+            (b"active-imports".as_slice(), BLOB_IMPORTS),
+            (b"active-chunks".as_slice(), BLOB_CHUNKS),
+            (b"lineage-fences".as_slice(), lifecycle::BLOB_LINEAGE_FENCES),
+        ] {
+            for row in read
+                .open_table(definition)
+                .expect("finalization byte table")
+                .iter()
+                .expect("finalization byte rows")
+            {
+                let (key, value) = row.expect("finalization byte row");
+                field(&mut digest, label, key.value(), value.value());
+            }
+        }
+        for row in read
+            .open_table(deletion::BLOB_DELETION_CONTINUITY)
+            .expect("finalization deletion continuity")
+            .iter()
+            .expect("finalization deletion continuity rows")
+        {
+            let (key, value) = row.expect("finalization continuity row");
+            field(
+                &mut digest,
+                b"deletion-continuity",
+                &[key.value()],
+                value.value(),
+            );
+        }
+        for row in read
+            .open_table(BLOB_DEPOT_METADATA)
+            .expect("finalization depot metadata")
+            .iter()
+            .expect("finalization depot metadata rows")
+        {
+            let (key, value) = row.expect("finalization depot metadata row");
+            field(
+                &mut digest,
+                b"depot-metadata",
+                key.value().as_bytes(),
+                &value.value().to_be_bytes(),
+            );
+        }
+        for row in read
+            .open_table(lifecycle::BLOB_MAINTENANCE_CURSORS)
+            .expect("finalization maintenance cursors")
+            .iter()
+            .expect("finalization maintenance cursor rows")
+        {
+            let (key, value) = row.expect("finalization cursor row");
             field(
                 &mut digest,
                 b"maintenance-cursors",
@@ -20258,26 +22146,28 @@ mod tests {
         let before_stats = store.blob_stats().expect("maintenance before stats");
         let before_files = depot_file_snapshot(&root.depot());
         let budget = maintenance_budget(64);
-        let mut staging_candidates = Vec::new();
-        let mut completed_candidates = Vec::new();
-        for _ in 0..12 {
-            let progress = store
-                .run_blob_maintenance_turn(budget)
-                .expect("non-destructive maintenance turn");
-            assert_eq!(progress.files_examined, 0);
-            if progress.class == lifecycle::BlobMaintenanceClass::UnreferencedLocalImportStaging {
-                assert!(!progress.awaiting_later_handler);
-                staging_candidates.extend(progress.candidates.clone());
-            }
-            if progress.class == lifecycle::BlobMaintenanceClass::UnreferencedCompletedVariants {
-                assert!(!progress.awaiting_later_handler);
-                completed_candidates.extend(progress.candidates.clone());
-            }
-        }
-        assert!(staging_candidates.contains(
+        set_maintenance_next_class(
+            &store,
+            lifecycle::BlobMaintenanceClass::UnreferencedLocalImportStaging,
+        );
+        let staging_progress = store
+            .run_blob_maintenance_turn(budget)
+            .expect("non-destructive staging admission turn");
+        assert_eq!(staging_progress.files_examined, 0);
+        assert!(!staging_progress.awaiting_later_handler);
+        set_maintenance_next_class(
+            &store,
+            lifecycle::BlobMaintenanceClass::UnreferencedCompletedVariants,
+        );
+        let completed_progress = store
+            .run_blob_maintenance_turn(budget)
+            .expect("non-destructive completed admission turn");
+        assert_eq!(completed_progress.files_examined, 0);
+        assert!(!completed_progress.awaiting_later_handler);
+        assert!(staging_progress.candidates.contains(
             &lifecycle::BlobMaintenanceCandidate::UnreferencedLocalImport { staging_variant }
         ));
-        assert!(completed_candidates.contains(
+        assert!(completed_progress.candidates.contains(
             &lifecycle::BlobMaintenanceCandidate::UnreferencedCompletedVariant {
                 variant: completed_variant,
             }
