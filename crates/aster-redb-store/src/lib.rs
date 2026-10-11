@@ -24291,6 +24291,12 @@ mod tests {
                 std::process::id()
             )))
         }
+
+        fn copy_from(name: &str, source: &TestFile) -> Self {
+            let file = Self::new(name);
+            std::fs::copy(&source.0, &file.0).expect("copy test database");
+            file
+        }
     }
 
     impl Drop for TestFile {
@@ -41172,6 +41178,7 @@ mod tests {
         }
 
         for kind in 1_u8..=5 {
+            let (base, authority) = retirement_reference_fixture(kind, 0x20 + kind * 8);
             for (index, corruption) in [
                 Corruption::Missing,
                 Corruption::Orphaned,
@@ -41183,8 +41190,10 @@ mod tests {
             .into_iter()
             .enumerate()
             {
-                let (file, authority) =
-                    retirement_reference_fixture(kind, 0x20 + kind * 8 + index as u8);
+                let file = TestFile::copy_from(
+                    &format!("retirement reference kind {kind} corruption {index}"),
+                    &base,
+                );
                 let database = Database::open(&file.0).expect("raw database");
                 let write = database.begin_write().expect("raw write");
                 let reference_key = write
